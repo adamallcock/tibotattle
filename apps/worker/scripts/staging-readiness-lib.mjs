@@ -96,6 +96,9 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0045_attribution_domain_activation.sql",
     "0046_v1_quota_fit_projection.sql",
     "0047_community_analysis_work.sql",
+    // Separate, bounded historical-model checkpoints and terminal results.
+    // This does not activate telemetry v1.1 or rewrite accepted source rows.
+    "0048_community_model_history.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
@@ -113,6 +116,10 @@ export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
     "community_analysis_work",
     "community_analysis_work_parts",
     "community_analysis_work_stage",
+    "community_model_history_work",
+    "community_model_history_work_parts",
+    "community_model_history_work_stage",
+    "community_model_history_results",
     "community_analytical_input_versions",
     "attribution_enrollments",
     "telemetry_transport_formats",
@@ -129,6 +136,7 @@ export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
   ],
   index: [
     "telemetry_v1_quota_fit_rows_cursor",
+    "community_model_history_results_day",
     "telemetry_contributions_successor_compatibility",
     "telemetry_v11_consents_device",
     "telemetry_v11_manifests_device_day",
@@ -150,6 +158,18 @@ export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
   ],
   trigger: [
     "community_analysis_work_parts_immutable",
+    "community_model_history_work_parts_immutable",
+    "community_model_history_v1_insert",
+    "community_model_history_v1_update",
+    "community_model_history_v1_delete",
+    "community_model_history_legacy_insert",
+    "community_model_history_legacy_update",
+    "community_model_history_legacy_delete",
+    "community_model_history_successor_insert",
+    "community_model_history_successor_update",
+    "community_model_history_successor_delete",
+    "community_model_history_participant_state",
+    "community_model_history_participant_delete",
     "telemetry_v1_quota_fit_rows_insert",
     "telemetry_v1_quota_fit_rows_update",
     "telemetry_v1_quota_fit_rows_delete",
@@ -214,12 +234,16 @@ export const ATTRIBUTION_SCHEMA_COLUMNS = Object.freeze(Object.fromEntries(
     community_analysis_work: ["participant_id", "run_id", "input_revision", "input_fingerprint", "source_kind", "source_method_version", "fixed_now", "observed_at_cutoff", "resets_at_cutoff", "window_minutes", "max_quota_rows", "phase", "progress_revision", "control_json", "manifest_json", "state_sha256"],
     community_analysis_work_parts: ["participant_id", "run_id", "component", "payload_json", "payload_sha256", "payload_bytes"],
     community_analysis_work_stage: ["participant_id", "run_id", "stage_id", "base_progress_revision", "stage_revision", "mode", "target_phase", "target_control_json", "target_manifest_json", "write_manifest_json", "target_state_sha256", "replay_json", "write_offset", "verified_offset", "gc_component", "gc_sha256", "discard_input_revision", "state_sha256"],
+    community_model_history_work: ["participant_id", "run_id", "input_revision", "input_fingerprint", "source_kind", "source_method_version", "fixed_now", "observed_at_cutoff", "resets_at_cutoff", "window_minutes", "max_quota_rows", "phase", "progress_revision", "control_json", "manifest_json", "state_sha256"],
+    community_model_history_work_parts: ["participant_id", "run_id", "component", "payload_json", "payload_sha256", "payload_bytes"],
+    community_model_history_work_stage: ["participant_id", "run_id", "stage_id", "base_progress_revision", "stage_revision", "mode", "target_phase", "target_control_json", "target_manifest_json", "write_manifest_json", "target_state_sha256", "replay_json", "write_offset", "verified_offset", "gc_component", "gc_sha256", "discard_input_revision", "state_sha256"],
+    community_model_history_results: ["participant_id", "day", "input_revision", "input_fingerprint", "method_version", "result_json", "computed_at"],
     community_analytical_input_versions: ["participant_id", "revision"],
     community_allowance_publication_state: ["attribution_method_version"],
     admin_community_allowance_preview_cache: ["attribution_method_version", "source_mutation_epoch"],
     community_allowance_fit_cache: ["input_fingerprint", "source_method_version"],
     community_model_composition_cache: ["input_fingerprint", "source_method_version"],
-    community_model_composition_days: ["attribution_method_version", "source_mutation_epoch"],
+    community_model_composition_days: ["attribution_method_version", "source_mutation_epoch", "history_method_version"],
     device_credential_rotations: ["recovery_proof_hash"],
     attribution_enrollments: ["participant_id", "namespace", "created_at"],
     telemetry_transport_formats: ["schema_version", "format_rank", "lifecycle"],
@@ -376,10 +400,99 @@ END`,
 ) STRICT`,
 });
 
+// History reuses the independently reviewed checkpoint contract in a separate
+// fixed namespace. Never read these expectations from the migration under
+// test: a changed migration must not silently redefine its own proof.
+const COMMUNITY_MODEL_HISTORY_SCHEMA_SQL = Object.freeze({
+  ...Object.fromEntries(Object.entries(COMMUNITY_ANALYSIS_WORK_SCHEMA_SQL)
+    .map(([name, sql]) => [
+      name.replaceAll("community_analysis_work", "community_model_history_work"),
+      sql.replaceAll("community_analysis_work", "community_model_history_work"),
+    ])),
+  community_model_history_results: `CREATE TABLE community_model_history_results (
+  participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  day TEXT NOT NULL CHECK (day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  input_revision INTEGER NOT NULL CHECK (input_revision >= 0 AND input_revision < 9007199254740991),
+  input_fingerprint TEXT NOT NULL CHECK (length(input_fingerprint) = 64 AND input_fingerprint NOT GLOB '*[^0-9a-f]*'),
+  method_version TEXT NOT NULL CHECK (length(method_version) BETWEEN 1 AND 4096),
+  result_json TEXT NOT NULL CHECK (json_valid(result_json) AND length(CAST(result_json AS BLOB)) <= 16384),
+  computed_at TEXT NOT NULL,
+  PRIMARY KEY (participant_id, day)
+) STRICT, WITHOUT ROWID`,
+  community_model_history_results_day: `CREATE INDEX community_model_history_results_day ON community_model_history_results(day, participant_id)`,
+  // SQLite preserves earlier ALTER-added columns in the stored CREATE SQL.
+  // Pin the final table to reject provenance defaults, affinity, nullability,
+  // hidden expressions or constraints that change the snapshot basis.
+  community_model_composition_days: `CREATE TABLE community_model_composition_days (
+  day TEXT PRIMARY KEY CHECK (day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  payload_json TEXT NOT NULL CHECK (length(payload_json) <= 16384),
+  computed_at TEXT NOT NULL
+, attribution_method_version TEXT, source_mutation_epoch INTEGER, history_method_version TEXT) STRICT`,
+  community_model_history_v1_insert: `CREATE TRIGGER community_model_history_v1_insert
+AFTER INSERT ON telemetry_v1_chunks FOR EACH ROW WHEN NEW.superseded_at IS NULL
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL AND day BETWEEN NEW.chunk_day AND date(NEW.chunk_day, '+100 days');
+END`,
+  community_model_history_v1_update: `CREATE TRIGGER community_model_history_v1_update
+AFTER UPDATE ON telemetry_v1_chunks FOR EACH ROW WHEN OLD.superseded_at IS NULL OR NEW.superseded_at IS NULL
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL AND (day BETWEEN OLD.chunk_day AND date(OLD.chunk_day, '+100 days') OR day BETWEEN NEW.chunk_day AND date(NEW.chunk_day, '+100 days'));
+END`,
+  community_model_history_v1_delete: `CREATE TRIGGER community_model_history_v1_delete
+AFTER DELETE ON telemetry_v1_chunks FOR EACH ROW WHEN OLD.superseded_at IS NULL
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL AND day BETWEEN OLD.chunk_day AND date(OLD.chunk_day, '+100 days');
+END`,
+  community_model_history_legacy_insert: `CREATE TRIGGER community_model_history_legacy_insert
+AFTER INSERT ON telemetry_contributions FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_legacy_update: `CREATE TRIGGER community_model_history_legacy_update
+AFTER UPDATE ON telemetry_contributions FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_legacy_delete: `CREATE TRIGGER community_model_history_legacy_delete
+AFTER DELETE ON telemetry_contributions FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_successor_insert: `CREATE TRIGGER community_model_history_successor_insert
+AFTER INSERT ON telemetry_v11_domain_heads FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_successor_update: `CREATE TRIGGER community_model_history_successor_update
+AFTER UPDATE ON telemetry_v11_domain_heads FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_successor_delete: `CREATE TRIGGER community_model_history_successor_delete
+AFTER DELETE ON telemetry_v11_domain_heads FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_participant_state: `CREATE TRIGGER community_model_history_participant_state
+AFTER UPDATE OF state ON participants FOR EACH ROW WHEN OLD.state IS NOT NEW.state
+BEGIN
+  DELETE FROM community_model_history_work WHERE participant_id = NEW.id;
+  DELETE FROM community_model_history_results WHERE participant_id = NEW.id;
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_participant_delete: `CREATE TRIGGER community_model_history_participant_delete
+BEFORE DELETE ON participants FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+  DELETE FROM admin_community_allowance_preview_cache;
+END`,
+});
+
 function exactStoredSchemaProbe(objects) {
   return Object.entries(objects).map(([name, sql]) => `EXISTS (
   SELECT 1 FROM sqlite_master WHERE name = ${sqlStringLiteral(name)}
-    AND type = ${sqlStringLiteral(sql.startsWith("CREATE TABLE") ? "table" : "trigger")}
+    AND type = ${sqlStringLiteral(sql.startsWith("CREATE TABLE") ? "table"
+      : sql.startsWith("CREATE INDEX") ? "index" : "trigger")}
     AND sql IS ${sqlStringLiteral(sql)}
 )`).join(" AND ");
 }
@@ -415,6 +528,9 @@ AND ${exactStoredSchemaProbe(QUOTA_PROJECTION_SCHEMA_SQL)} AS v1_quota_fit_proje
 export const COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL = `
 SELECT ${exactStoredSchemaProbe(COMMUNITY_ANALYSIS_WORK_SCHEMA_SQL)} AS community_analysis_work_schema
 `;
+export const COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(COMMUNITY_MODEL_HISTORY_SCHEMA_SQL)} AS community_model_history_schema
+`;
 
 // One bounded metadata query: no contribution, identity, token or policy-state
 // values leave the database, and no table-per-column remote round trips.
@@ -433,7 +549,8 @@ SELECT NOT EXISTS (
      WHERE actual.type = expected.type AND actual.name = expected.name)
 ) AND (${V1_USAGE_CURSOR_INDEX_PROBE_SQL})
 AND (${V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL})
-AND (${COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL}) AS attribution_objects,
+AND (${COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL})
+AND (${COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL}) AS attribution_objects,
 NOT EXISTS (
   SELECT 1 FROM required_columns expected
    WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual

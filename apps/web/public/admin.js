@@ -2778,9 +2778,8 @@ function appendModelAllowanceSummaries(container, preview) {
   if (latest === null) {
     const empty = document.createElement("p");
     empty.className = "admin-allowance-empty";
-    empty.textContent = "No identification-passing per-model fits recorded"
-      + " yet. The series accrues from the first day the composition kernel"
-      + " accepts a fit.";
+    empty.textContent = "No identification-passing per-model fits are available yet."
+      + " Qualified historical points fill in as background calculations complete.";
     container.append(empty);
   }
   const grid = document.createElement("div");
@@ -2832,6 +2831,13 @@ function appendModelAllowanceSummaries(container, preview) {
       + ` contributing accounts pass on ${latest.day}.`)
     + " Catalog visibility does not imply Codex availability or an allowance estimate.";
   container.append(note);
+  const historyNote = document.createElement("p");
+  historyNote.className = "admin-allowance-meta admin-allowance-history-note";
+  historyNote.textContent = "Missing historical days are reconstructed from retained evidence,"
+    + " using the same 100-day lookback and only observations through each UTC day."
+    + " These are retrospective estimates, not a record of what was displayed then."
+    + " Unstable or unsupported periods remain gaps; later model usage is not carried backward.";
+  container.append(historyNote);
 }
 
 function renderAdminCommunityAllowance(preview) {

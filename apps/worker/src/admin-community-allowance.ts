@@ -66,7 +66,8 @@ export interface AdminCommunityAllowanceModels {
   readonly modelConfig: typeof ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
   readonly basis: typeof ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS;
   readonly gate: typeof ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE;
-  /** Ascending, at most the preview horizon; accrues forward from ship day. */
+  /** Ascending, at most the preview horizon. Forward snapshots are preserved;
+   * missing earlier dates may be independently reconstructed by the scheduler. */
   readonly days: readonly AdminCommunityModelCompositionDay[];
 }
 

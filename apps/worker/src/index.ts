@@ -1,6 +1,7 @@
 import { allowanceReconstructionMode } from "./allowance-reconstruction";
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
+import { warmCommunityModelHistory } from "./community-model-history";
 import { backfillV1QuotaFitProjection } from "./quota-fit-projection";
 import {
   assertAdmissionBindings,
@@ -3995,6 +3996,21 @@ export async function runScheduledMaintenance(
               {mode:"cache-only",budget:phaseBudget()});
             if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
               console.warn(JSON.stringify({level:"warn",event:"admin_allowance_preview_cache",outcome:"failure",code:allowanceCache.code}));
+            }
+            // Historical model fits are optional and last: required lifecycle,
+            // current-account reconstruction and graph publication keep priority.
+            if (queryMeter.remainingQueries >= 64 && Date.now() < optionalDeadlineMs) {
+              try {
+                const history = await warmCommunityModelHistory(env.USAGE_MONITOR_DB, scheduledTime,
+                  {meter:queryMeter,deadlineMs:optionalDeadlineMs,maintenanceLease});
+                console.log(JSON.stringify({level:"info",event:"scheduled_model_history",outcome:history.status,
+                  day:history.day,resolvedAccounts:history.resolvedAccounts,requiredAccounts:history.requiredAccounts,
+                  publishedDays:history.publishedDays,queriesUsed:queryMeter.queriesUsed}));
+              } catch (error) {
+                console.warn(JSON.stringify({level:"warn",event:"scheduled_model_history",outcome:"deferred",
+                  code:error instanceof D1InvocationBudgetExceededError ? error.code : "MODEL_HISTORY_UNAVAILABLE",
+                  queriesUsed:queryMeter.queriesUsed}));
+              }
             }
           } else {
             const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime);

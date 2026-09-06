@@ -1,14 +1,9 @@
 import { canonicalJson } from "./canonical-json";
 import {
-  beginCommunityAnalysisWork, readCommunityAnalysisWork, readCommunityAnalysisWorkParts,
-  prepareCommunityAnalysisWorkDelta, commitCommunityAnalysisWorkPage,
-  beginCommunityAnalysisStage, readCommunityAnalysisStage, writeCommunityAnalysisStagePage,
-  verifyCommunityAnalysisStagePage, promoteCommunityAnalysisStage, collectCommunityAnalysisWorkGarbage,
-  readCommunityAnalysisWorkForDiscard, beginCommunityAnalysisDiscard,
-  readCommunityAnalysisWorkForSupersession, beginCommunityAnalysisSupersession,
+  communityAnalysisWorkStore, createCommunityAnalysisWorkStore,
   COMMUNITY_ANALYSIS_PARTS_PER_READ,
   type CommunityAnalysisWorkIdentity, type CommunityAnalysisWorkBudget, type CommunityAnalysisWorkHead,
-  type CommunityAnalysisWorkStage, type CommunityAnalysisStageTarget,
+  type CommunityAnalysisWorkStage, type CommunityAnalysisStageTarget, type CommunityAnalysisWorkStore,
 } from "./community-analysis-work";
 import {
   advanceV1QuotaAcquisitionPage, createV1QuotaAcquisitionCheckpoint,
@@ -20,6 +15,10 @@ import {
 import { createV1QuotaPageReader, V1QuotaFitProjectionUnavailableError } from "./quota-fit-projection";
 import { loadV1SourcePin, type V1SourcePin } from "./telemetry-v1-source-selection";
 import type { V1AcquiredQuotaEvidence } from "./quota-analysis-v1";
+import { MODEL_HISTORY_METHOD_VERSION } from "./quota-analysis-v1";
+import { modelHistoryWindow } from "./model-history-window";
+
+const historyWorkStore = createCommunityAnalysisWorkStore("model-history");
 
 export type CommunityAnalysisRunResult =
   | { status: "ready"; evidence: V1AcquiredQuotaEvidence; head: CommunityAnalysisWorkHead }
@@ -61,7 +60,7 @@ async function sourceCurrent(db: D1Database, pin: V1SourcePin,
     ? "ready" : "stale";
 }
 
-async function loadCheckpoint(db: D1Database, head: CommunityAnalysisWorkHead,
+async function loadCheckpoint(work: CommunityAnalysisWorkStore, db: D1Database, head: CommunityAnalysisWorkHead,
   budget: CommunityAnalysisWorkBudget, progressReserve: number): Promise<
     | { status: "ready"; state: V1QuotaAcquisitionCheckpoint }
     | { status: "deferred" | "stale" | "corrupt" }> {
@@ -73,7 +72,7 @@ async function loadCheckpoint(db: D1Database, head: CommunityAnalysisWorkHead,
   const interner = createV1QuotaWorkInterner();
   try {
     for (let offset = 0; offset < head.manifest.length;) {
-      const page = await readCommunityAnalysisWorkParts(db, head, offset, budget);
+      const page = await work.readCommunityAnalysisWorkParts(db, head, offset, budget);
       if (page.status !== "ready") return page;
       for (const part of page.parts) {
         try { interner.internPart(part.component, part.value); }
@@ -119,12 +118,12 @@ async function acquirePage(reader: V1QuotaPageReader, head: CommunityAnalysisWor
     target: { phase: step.replay.through.phase, control: encoded.control, components: encoded.components } };
 }
 
-async function disposeObsolete(db: D1Database, identity: CommunityAnalysisWorkIdentity,
+async function disposeObsolete(work: CommunityAnalysisWorkStore, db: D1Database, identity: CommunityAnalysisWorkIdentity,
   budget: CommunityAnalysisWorkBudget): Promise<{ status: "discarded" | "deferred" | "stale" | "corrupt" }> {
-  let inspected = await readCommunityAnalysisWorkForDiscard(db, identity.participantId, identity.inputRevision, budget);
+  let inspected = await work.readCommunityAnalysisWorkForDiscard(db, identity.participantId, identity.inputRevision, budget);
   let supersession = false;
   if (inspected.status === "stale") {
-    inspected = await readCommunityAnalysisWorkForSupersession(db, identity, budget);
+    inspected = await work.readCommunityAnalysisWorkForSupersession(db, identity, budget);
     supersession = true;
   }
   if (inspected.status !== "ready") return { status: inspected.status === "absent" ? "stale" : inspected.status };
@@ -134,14 +133,14 @@ async function disposeObsolete(db: D1Database, identity: CommunityAnalysisWorkId
       version: "community-analysis-supersession-1", replacementIdentity: identity }));
   if (!sameDisposal) {
     const begun = supersession
-      ? await beginCommunityAnalysisSupersession(db, inspected.head, identity, budget, stage ?? undefined)
-      : await beginCommunityAnalysisDiscard(db, inspected.head, identity.inputRevision, budget, stage ?? undefined);
+      ? await work.beginCommunityAnalysisSupersession(db, inspected.head, identity, budget, stage ?? undefined)
+      : await work.beginCommunityAnalysisDiscard(db, inspected.head, identity.inputRevision, budget, stage ?? undefined);
     if (begun.status !== "ready") return { status: begun.status === "corrupt" ? "corrupt" : begun.status === "deferred" ? "deferred" : "stale" };
     stage = begun.stage;
   }
   if (!stage) return { status: "corrupt" };
   for (;;) {
-    const collected = await collectCommunityAnalysisWorkGarbage(db, inspected.head, stage, budget);
+    const collected = await work.collectCommunityAnalysisWorkGarbage(db, inspected.head, stage, budget);
     if (collected.status !== "ready") return collected;
     if (collected.done) return { status: "discarded" };
     stage = collected.stage;
@@ -154,12 +153,24 @@ async function disposeObsolete(db: D1Database, identity: CommunityAnalysisWorkId
  * uncommitted page is replayed, never interpreted as a partial result. */
 export async function advanceCommunityAnalysisRun(db: D1Database, options: {
   identity: CommunityAnalysisWorkIdentity; sourcePin: V1SourcePin; budget: CommunityAnalysisWorkBudget;
+  storage?: "current" | "model-history";
   /** Required follow-on allowance after rehydrating a completed head. This is
    * admission-only: incomplete acquisition still uses all its phase allocation,
    * and no queries are charged here for work the caller has not executed. */
   completedEvidenceReserveQueries?: number;
 }): Promise<CommunityAnalysisRunResult> {
   const { identity, sourcePin, budget } = options;
+  if (options.storage !== undefined && options.storage !== "current" && options.storage !== "model-history") {
+    throw new TypeError("community analysis storage invalid");
+  }
+  const work = options.storage === "model-history" ? historyWorkStore : communityAnalysisWorkStore;
+  const throughDay = "participantId" in sourcePin.scope ? sourcePin.scope.throughDay : undefined;
+  const history = options.storage === "model-history" && throughDay ? modelHistoryWindow(throughDay) : undefined;
+  if (options.storage === "model-history" ? !history || identity.fixedNow !== history.fixedNow
+    || identity.observedAtCutoff !== history.observedAtCutoff
+    || identity.sourceMethodVersion !== MODEL_HISTORY_METHOD_VERSION
+    || !("participantId" in sourcePin.scope) || sourcePin.scope.fromDay !== history.fromDay
+    : throughDay !== undefined) throw new TypeError("community analysis historical scope mismatch");
   const completedReserve = options.completedEvidenceReserveQueries === undefined ? 0 : options.completedEvidenceReserveQueries;
   if (!Number.isSafeInteger(completedReserve) || completedReserve < 0) throw new TypeError("community analysis completed reserve invalid");
   const acquisitionIdentity = communityAnalysisAcquisitionIdentity(identity);
@@ -170,19 +181,19 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
       [winner.participant_id, winner.observed_day, winner.device_id]))) throw new TypeError("community analysis run source mismatch");
   const current = await sourceCurrent(db, sourcePin, budget);
   if (current !== "ready") return { status: current };
-  let read = await readCommunityAnalysisWork(db, identity, budget);
+  let read = await work.readCommunityAnalysisWork(db, identity, budget);
   if (read.status === "stale") {
-    const disposed = await disposeObsolete(db, identity, budget);
+    const disposed = await disposeObsolete(work, db, identity, budget);
     if (disposed.status !== "discarded") return { status: disposed.status };
     read = { status: "absent" };
   }
   if (read.status === "absent") {
-    read = await beginCommunityAnalysisWork(db, identity,
+    read = await work.beginCommunityAnalysisWork(db, identity,
       encodeV1QuotaWorkCheckpoint(createV1QuotaAcquisitionCheckpoint(acquisitionIdentity)).control, budget);
   }
   if (read.status !== "ready") return { status: read.status === "absent" ? "stale" : read.status };
   let head = read.head;
-  const staged = await readCommunityAnalysisStage(db, head, budget);
+  const staged = await work.readCommunityAnalysisStage(db, head, budget);
   if (staged.status !== "ready" && staged.status !== "absent") return { status: staged.status === "deferred" ? "deferred" : staged.status === "corrupt" ? "corrupt" : "stale" };
   let stage: CommunityAnalysisWorkStage | null = staged.status === "ready" ? staged.stage : null;
   let state: V1QuotaAcquisitionCheckpoint | null = null;
@@ -191,7 +202,7 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
   const winners = new Map(sourcePin.winners.map(winner => [winner.observed_day, winner.device_id]));
   for (;;) {
     if (stage?.mode === "garbage_collecting" || stage?.mode === "discarding") {
-      const collected = await collectCommunityAnalysisWorkGarbage(db, head, stage, budget);
+      const collected = await work.collectCommunityAnalysisWorkGarbage(db, head, stage, budget);
       if (collected.status !== "ready") return collected;
       if (!collected.done) { stage = collected.stage; continue; }
       if (collected.discarded) return { status: "stale" };
@@ -199,11 +210,11 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
     }
     if (stage?.mode === "verifying") {
       if (stage.verifiedOffset < stage.target.manifest.length) {
-        const verified = await verifyCommunityAnalysisStagePage(db, head, stage, budget);
+        const verified = await work.verifyCommunityAnalysisStagePage(db, head, stage, budget);
         if (verified.status !== "ready") return { status: verified.status === "deferred" ? "deferred" : verified.status === "corrupt" ? "corrupt" : "stale" };
         stage = verified.stage; continue;
       }
-      const promoted = await promoteCommunityAnalysisStage(db, head, stage, budget);
+      const promoted = await work.promoteCommunityAnalysisStage(db, head, stage, budget);
       if (promoted.status !== "ready") return promoted;
       head = promoted.head; stage = promoted.stage; pending = null;
       continue;
@@ -212,7 +223,7 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
       const reserve = head.phase === "complete" ? 3 + completedReserve
         : stage?.mode === "writing" ? (reader ? 1 : 2) + Math.min(32, stage.writeManifest.length - stage.writeOffset) + 1
         : reader ? 2 : 3;
-      const loaded = await loadCheckpoint(db, head, budget, reserve);
+      const loaded = await loadCheckpoint(work, db, head, budget, reserve);
       if (loaded.status !== "ready") return loaded;
       state = loaded.state;
     }
@@ -221,7 +232,7 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
       if (!available(budget, 3)) return { status: "deferred" };
       const finalSource = await sourceCurrent(db, sourcePin, budget);
       if (finalSource !== "ready") return { status: finalSource };
-      const finalHead = await readCommunityAnalysisWork(db, identity, budget);
+      const finalHead = await work.readCommunityAnalysisWork(db, identity, budget);
       if (finalHead.status !== "ready" || canonicalJson(finalHead.head) !== canonicalJson(head)) return { status: finalHead.status === "corrupt" ? "corrupt" : finalHead.status === "deferred" ? "deferred" : "stale" };
       const acquisition = { planAnchors: state.plan.anchors, quotaRows: state.endpoints.map(endpoint => endpoint.row) };
       if (!validateV1CompletedQuotaAcquisition(acquisition)) return { status: "corrupt" };
@@ -231,7 +242,7 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
       if (!available(budget, reader ? 2 : 3)) return { status: "deferred" };
       if (!reader) {
         if (!spend(budget, 1)) return { status: "deferred" };
-        try { reader = await createV1QuotaPageReader(db, identity.participantId); }
+        try { reader = await createV1QuotaPageReader(db, identity.participantId, history?.observedAtBefore); }
         catch (error) { if (error instanceof V1QuotaFitProjectionUnavailableError) return { status: "projection_unavailable" }; throw error; }
       }
       const page = await acquirePage(reader, head, state, winners, budget);
@@ -239,7 +250,7 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
         if (!available(budget, 3)) return { status: "deferred" };
         const finalSource = await sourceCurrent(db, sourcePin, budget);
         if (finalSource !== "ready") return { status: finalSource };
-        const finalHead = await readCommunityAnalysisWork(db, identity, budget);
+        const finalHead = await work.readCommunityAnalysisWork(db, identity, budget);
         return finalHead.status === "ready" && canonicalJson(finalHead.head) === canonicalJson(head)
           ? page : { status: finalHead.status === "corrupt" ? "corrupt" : finalHead.status === "deferred" ? "deferred" : "stale" };
       }
@@ -247,19 +258,19 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
       pending = page; state = page.state;
     }
     if (!stage) {
-      const delta = await prepareCommunityAnalysisWorkDelta(head, pending.target.components);
+      const delta = await work.prepareCommunityAnalysisWorkDelta(head, pending.target.components);
       if (delta.status === "ready") {
-        const committed = await commitCommunityAnalysisWorkPage(db, head,
+        const committed = await work.commitCommunityAnalysisWorkPage(db, head,
           { control: pending.target.control, phase: pending.target.phase, parts: delta.parts }, budget);
         if (committed.status === "ready") { head = committed.head; pending = null; continue; }
         if (committed.status !== "deferred") return { status: committed.status === "corrupt" ? "corrupt" : "stale" };
       }
-      const begun = await beginCommunityAnalysisStage(db, head, pending.target, pending.replay, budget);
+      const begun = await work.beginCommunityAnalysisStage(db, head, pending.target, pending.replay, budget);
       if (begun.status !== "ready") return { status: begun.status === "deferred" ? "deferred" : begun.status === "corrupt" || begun.status === "replay_unresolved" ? "corrupt" : "stale" };
       stage = begun.stage;
     }
     if (stage.mode === "writing") {
-      const written = await writeCommunityAnalysisStagePage(db, head, stage, pending.target, pending.replay, budget);
+      const written = await work.writeCommunityAnalysisStagePage(db, head, stage, pending.target, pending.replay, budget);
       if (written.status !== "ready") return { status: written.status === "deferred" ? "deferred" : written.status === "corrupt" || written.status === "replay_unresolved" ? "corrupt" : "stale" };
       stage = written.stage;
     }

@@ -229,6 +229,38 @@ test("model cards use the existing responsive summary grid", async () => {
   assert.match(css, /@media \(max-width: 560px\)[\s\S]*\.admin-allowance-plan-summaries \{ grid-template-columns: 1fr; \}/u);
 });
 
+test("reconstructed model history keeps missing days and later model introductions as gaps", async () => {
+  const { adminAllowanceChartModel } = await importAdminModule();
+  const preview = allowancePreviewWithModels();
+  preview.models.modelConfig.push({ modelId: "gpt-6-astra", label: "GPT-6 Astra" });
+  const template = preview.models.days[0];
+  preview.models.days = preview.days.slice(-30).map((day, index) => ({
+    ...template,
+    day: day.day,
+    byModel: {
+      ...template.byModel,
+      "gpt-5.6-sol": { capacityUsd: index === 12 ? null : 2_000 + index * 10, participantCount: index === 12 ? 0 : 1 },
+      "gpt-6-astra": { capacityUsd: index < 27 ? null : 1_500 + index * 5, participantCount: index < 27 ? 0 : 1 },
+    },
+  }));
+  const model = adminAllowanceChartModel(preview, { mode: "models", rangeDays: 30 });
+  const sol = model.series.find(series => series.key === "gpt-5.6-sol");
+  const astra = model.series.find(series => series.key === "gpt-6-astra");
+  assert.equal(sol.points.length, 29);
+  assert.deepEqual(sol.segments.map(segment => segment.length), [12, 17]);
+  assert.equal(astra.points.length, 3);
+  assert.deepEqual(astra.points.map(point => point.day), preview.models.days.slice(-3).map(day => day.day));
+  assert.ok(astra.points.every(point => point.value > 0));
+});
+
+test("model history explains its retrospective cutoff without promising complete evidence", async () => {
+  const source = await readFile(new URL("../public/admin.js", import.meta.url), "utf8");
+  assert.ok(source.includes("same 100-day lookback and only observations through each UTC day"));
+  assert.ok(source.includes("retrospective estimates, not a record of what was displayed then"));
+  assert.ok(source.includes("later model usage is not carried backward"));
+  assert.ok(!source.includes("The series accrues from the first day"));
+});
+
 test("allowance preview switches series without changing its numerical axes", async () => {
   const { adminAllowanceChartModel } = await importAdminModule();
   const preview = allowancePreview();

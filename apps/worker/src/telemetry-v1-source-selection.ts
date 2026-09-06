@@ -9,7 +9,7 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-export type V1SourceScope = { participantId: string; fromDay?: string } | { day: string };
+export type V1SourceScope = { participantId: string; fromDay?: string; throughDay?: string } | { day: string };
 
 export interface V1SourceChunk {
   readonly id: string;
@@ -97,6 +97,19 @@ export function selectV1WinningDevices(chunks: readonly V1SourceChunk[]): V1Winn
 function sourceScope(scope: V1SourceScope): { sql: string; bindings: string[] } {
   if ("participantId" in scope) {
     if (!scope.participantId) throw new TypeError("v1 source participant scope required");
+    if (scope.throughDay !== undefined) {
+      const validDay = (day: unknown): day is string => typeof day === "string"
+        && /^\d{4}-\d{2}-\d{2}$/u.test(day)
+        && Number.isFinite(Date.parse(`${day}T00:00:00.000Z`))
+        && new Date(`${day}T00:00:00.000Z`).toISOString().slice(0, 10) === day;
+      if (!validDay(scope.fromDay) || !validDay(scope.throughDay) || scope.fromDay > scope.throughDay) {
+        throw new TypeError("v1 source historical range required");
+      }
+      // Scope the journal election as well as the record readers. A model or
+      // plan introduced after this day cannot enter its historical winner set.
+      return { sql: "c.participant_id = ? AND c.chunk_day >= ? AND c.chunk_day <= ?",
+        bindings: [scope.participantId, scope.fromDay, scope.throughDay] };
+    }
     return scope.fromDay === undefined
       ? { sql: "c.participant_id = ?", bindings: [scope.participantId] }
       : { sql: "c.participant_id = ? AND c.chunk_day >= ?", bindings: [scope.participantId, scope.fromDay] };

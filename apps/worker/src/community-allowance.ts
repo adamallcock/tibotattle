@@ -692,7 +692,7 @@ export function summarizeCommunityCapacityByPlanType(
 // refusals so a refusing participant stops re-running the raw corpus scan
 // every warm pass.
 const COMPOSITION_ADAPTER_VERSION = "v1-composition-3";
-const COMPOSITION_CACHE_KEY_SUFFIX =
+export const COMPOSITION_CACHE_KEY_SUFFIX =
   `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${COMPOSITION_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}:${COMMUNITY_ATTRIBUTION_METHOD_VERSION}`;
 // The composition JSON is a per-model vector plus diagnostics — a few hundred
 // bytes. The storage CHECK allows 32 KiB; enforcing half that here keeps a
@@ -999,7 +999,7 @@ function validCompositionFit(value: unknown): boolean {
     && Object.values(value.capacityUsdByModel).some(number => number !== null && number > 0);
 }
 
-function validCompleteCachedComposition(value: unknown, fingerprint: string, method: string): value is V1ModelCompositionResult {
+export function validCompleteCachedComposition(value: unknown, fingerprint: string, method: string): value is V1ModelCompositionResult {
   if (!cacheObject(value)) return false;
   if (value.status === "not_testable") {
     return (cacheKeys(value, ["status", "reason"])

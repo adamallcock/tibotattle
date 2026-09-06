@@ -92,6 +92,43 @@ maintenance first. Check `BOUNDED_ANALYSIS_PROGRESS`, deferred reasons and
 defer a large completed checkpoint before loading it. New activity-only days
 retain their queue entry for a later complete allowance rebuild.
 
+### Only one day in the admin "By model" chart
+
+The original per-model view recorded forward daily snapshots, whereas the
+plan view reconstructed its date range from scalar reset fits. Migration
+`0048_community_model_history.sql` and `community-model-history.ts` add a
+separate, low-priority historical model backfill. Source implementation is
+not proof that the migration or Worker has been deployed.
+
+- Each closed UTC day uses its own preceding 100-day acquisition horizon and
+  only observations through that day. The NNLS identification gates, pricing,
+  and Pro 20x normalization are unchanged. Today's fitted vector is never
+  copied backward, and later Astra usage cannot create pre-Astra points.
+- Up to 69 missing dates before today are reconstructed, newest first. A day
+  publishes only after the complete bounded cohort resolves. Sparse, unstable,
+  unsupported-source and incomplete evidence remains absent, never zero.
+  Activated v1.1 and overlapping legacy quota sources are not backfilled by
+  this v1-only lane; they are reported as unsupported, never downgraded.
+- Inspect aggregate `scheduled_model_history` progress, not private payloads.
+  `community_model_history_work`, its parts/stage tables, and
+  `community_model_history_results` are isolated from current-analysis caches
+  and checkpoints. They share the same actual query meter and defer behind
+  essential maintenance, current estimates and normal graph publication.
+- A non-null `community_model_composition_days.history_method_version` marks
+  a retrospective reconstruction. Existing current-method forward snapshots
+  are preserved. Late v1 corrections invalidate only reconstructed days whose
+  input window includes the corrected date; source transitions and withdrawal
+  invalidate affected reconstructed cohorts. Private derived work follows
+  participant erasure. Bounded cleanup removes only obsolete derived results.
+- The healthy preview stays available; new reconstructed points enter its
+  normal atomic refresh, not necessarily the next browser refresh. No forced
+  live replay or production cache clearing is part of local qualification.
+
+Historical reconstruction uses currently retained corrected evidence and
+surviving contributors, not an assertion of what the site displayed then.
+Separately authorize migration `0048` and deployment, then verify natural
+scheduled progress, the exact admin response and the rendered multi-day chart.
+
 ## 5. Confirm the participant is even selected
 
 The collector requires an active participant and the source selected by the

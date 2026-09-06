@@ -10,6 +10,7 @@ import {
   ATTRIBUTION_SCHEMA_OBJECTS,
   ATTRIBUTION_SCHEMA_PROBE_SQL,
   COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL,
+  COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
   attributionSchemaComplete,
   EXPECTED_STAGING_MIGRATIONS,
   GENERATED_WORKER_ASSET_DIRECTORY,
@@ -55,12 +56,13 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-5), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-6), [
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
     "0046_v1_quota_fit_projection.sql",
     "0047_community_analysis_work.sql",
+    "0048_community_model_history.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -70,6 +72,13 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
 
   inventory.USAGE_MONITOR_DB.pop();
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
+    ok: false,
+    code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+  });
+
+  const alteredHistory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
+  alteredHistory.USAGE_MONITOR_DB[47] = "0048_unreviewed_model_history.sql";
+  assert.deepEqual(validateStagingMigrationInventory(alteredHistory), {
     ok: false,
     code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
   });
@@ -107,10 +116,10 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0045_attribution_domain_activation.sql": "89f0df9e95eb98fa7ae8cb00dc82fe19f8933689a8002e647e638fdc870990fe",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 47);
+  assert.equal(names.length, 48);
   assert.deepEqual(names.slice(40, 45), Object.keys(expectedDigests));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 47 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 48 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -151,6 +160,18 @@ test("the local-only staged checkpoint migration is pinned to its reviewed immut
   assert.equal(ATTRIBUTION_SCHEMA_OBJECTS.some(([type, name]) =>
     type === "trigger" && name === "community_analysis_work_parts_immutable"), true);
   assert.equal(ATTRIBUTION_SCHEMA_COLUMNS.community_analysis_work_parts.includes("part_key"), false);
+});
+
+test("the historical-model migration is pinned independently of its derived schema proof", () => {
+  // A metadata-equivalent file could still add unreviewed data operations.
+  // Keep this local-only migration byte-pinned as well as shape-rehearsed;
+  // changing its expectation requires an explicit review before deployment.
+  const bytes = readFileSync(join(workerDirectory, "migrations", "0048_community_model_history.sql"));
+  assert.equal(createHash("sha256").update(bytes).digest("hex"),
+    "5b772c33723e2dd2d9f992738c731efea12831ba774806859ce6d16d481ceb29");
+  assert.equal(ATTRIBUTION_SCHEMA_OBJECTS.filter(([type, name]) =>
+    type === "table" && name.startsWith("community_model_history_")).length, 4);
+  assert.equal(ATTRIBUTION_SCHEMA_COLUMNS.community_model_composition_days.includes("history_method_version"), true);
 });
 
 test("historical production prefix upgrades forward without losing source rows or legacy schema", () => {
@@ -216,8 +237,8 @@ test("historical production prefix upgrades forward without losing source rows o
     // fits, not accepted source history or the historical refresh singleton.
     assert.equal(database.prepare("SELECT count(*) AS count FROM community_allowance_fit_cache").get().count, 0);
     assert.equal(database.prepare("SELECT count(*) AS count FROM community_model_composition_cache").get().count, 0);
-    assert.deepEqual(rows("SELECT day, payload_json, attribution_method_version, source_mutation_epoch FROM community_model_composition_days"), [{
-      day: "2026-08-29", payload_json: "{}", attribution_method_version: null, source_mutation_epoch: null,
+    assert.deepEqual(rows("SELECT day, payload_json, attribution_method_version, source_mutation_epoch, history_method_version FROM community_model_composition_days"), [{
+      day: "2026-08-29", payload_json: "{}", attribution_method_version: null, source_mutation_epoch: null, history_method_version: null,
     }]);
     assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
     assert.deepEqual(rows("SELECT minimum_rank, revision FROM telemetry_transport_participant_floors"), [{ minimum_rank: 1, revision: 0 }]);
@@ -299,6 +320,11 @@ test("fresh reconciled schema and attribution metadata probe cover every new gua
       ["attribution_enrollments", "namespace"],
       ["telemetry_v11_records", "legacy_record_json"],
       ["telemetry_v11_domains", "input_revision"],
+      ["community_model_history_work", "fixed_now"],
+      ["community_model_history_work_parts", "payload_json"],
+      ["community_model_history_work_stage", "replay_json"],
+      ["community_model_history_results", "input_fingerprint"],
+      ["community_model_composition_days", "history_method_version"],
     ]) {
       assert.equal(ATTRIBUTION_SCHEMA_COLUMNS[table].includes(column), true);
       database.exec(`SAVEPOINT missing_column; ALTER TABLE ${table} RENAME COLUMN ${column} TO omitted_column;`);
@@ -346,7 +372,7 @@ test("v1 cursor prerequisite requires id to be the rowid alias, not merely an in
   }
 });
 
-test("quota projection readiness requires 0046, its physical cursor, and the separate 0047 schema", () => {
+test("quota projection readiness retains 0046/0047 gates and requires the separate 0048 schema", () => {
   const database = new DatabaseSync(":memory:");
   const indexName = "telemetry_v1_quota_fit_rows_cursor";
   const apply = (name) => database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
@@ -357,12 +383,17 @@ test("quota projection readiness requires 0046, its physical cursor, and the sep
     assert.equal(names[44], "0045_attribution_domain_activation.sql");
     assert.equal(names[45], "0046_v1_quota_fit_projection.sql");
     assert.equal(names[46], "0047_community_analysis_work.sql");
+    assert.equal(names[47], "0048_community_model_history.sql");
     assert.equal(probe(), 0);
     assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
     apply(names[45]);
     assert.equal(probe(), 1);
     assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
     apply(names[46]);
+    assert.equal(database.prepare(COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL).get().community_analysis_work_schema, 1);
+    assert.equal(database.prepare(COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL).get().community_model_history_schema, 0);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    apply(names[47]);
     assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
     const original = database.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(indexName).sql;
     const variants = [
@@ -524,6 +555,270 @@ test("staged checkpoint schema rejects mutable parts and altered replay, progres
     ]);
 });
 
+test("model history readiness rejects changed checkpoint, result, provenance and correction contracts", () => {
+  const inObject = (name, change) => (sql) => {
+    const match = sql.match(new RegExp(`CREATE (TABLE|INDEX|TRIGGER) ${name}\\b`, "u"));
+    assert.notEqual(match, null, name);
+    const terminator = match[1] === "TRIGGER" ? "END;" : ";";
+    const end = sql.indexOf(terminator, match.index) + terminator.length;
+    assert.ok(end > match.index, name);
+    return sql.slice(0, match.index) + change(sql.slice(match.index, end)) + sql.slice(end);
+  };
+  const inResults = (change) => inObject("community_model_history_results", change);
+  const inStage = (change) => inObject("community_model_history_work_stage", change);
+  const historyTriggers = ATTRIBUTION_SCHEMA_OBJECTS.filter(([type, name]) =>
+    type === "trigger" && name.startsWith("community_model_history_")).map(([, name]) => name);
+  assert.equal(historyTriggers.length, 12);
+  assertMigrationSchemaVariants("0048_community_model_history.sql",
+    COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL, "community_model_history_schema", [
+      ["missing history stage", inObject("community_model_history_work_stage", () => "")],
+      ["history owner erasure weakened", sql => sql.replace("REFERENCES participants(id) ON DELETE CASCADE", "REFERENCES participants(id) ON DELETE RESTRICT")],
+      ["history namespace aliases current work", sql => sql.replace("REFERENCES community_model_history_work(participant_id, run_id)", "REFERENCES community_analysis_work(participant_id, run_id)")],
+      ["history quota cap widened", sql => sql.replace("BETWEEN 1 AND 60000", "BETWEEN 1 AND 60001")],
+      ["history revision bound widened", sql => sql.replace("input_revision < 9007199254740991", "input_revision <= 9007199254740991")],
+      ["history source changed", sql => sql.replace("source_kind = 'v1'", "source_kind = 'v1 '")],
+      ["history part digest vocabulary changed", sql => sql.replace("payload_sha256 NOT GLOB '*[^0-9a-f]*'", "payload_sha256 NOT GLOB '*[^0-9A-F]*'")],
+      ["history parts made mutable", inObject("community_model_history_work_parts_immutable", sql => sql.replace("SELECT RAISE(ABORT, 'community analysis part immutable');", "SELECT 1;"))],
+      ["history parts use character bounds", sql => sql.replace("length(CAST(payload_json AS BLOB))", "length(payload_json)")],
+      ["history stage wrong cascade", inStage(sql => sql.replace("ON DELETE CASCADE", "ON DELETE RESTRICT"))],
+      ["history stage replay byte cap widened", inStage(sql => sql.replace("length(CAST(replay_json AS BLOB)) <= 16384", "length(CAST(replay_json AS BLOB)) <= 16385"))],
+      ["history stage manifest cap widened", inStage(sql => sql.replace("json_array_length(write_manifest_json) <= 1024", "json_array_length(write_manifest_json) <= 1025"))],
+      ["history stage cleanup nullable", inStage(sql => sql.replace("gc_component TEXT NOT NULL", "gc_component TEXT"))],
+      ["history result owner erasure weakened", inResults(sql => sql.replace("ON DELETE CASCADE", "ON DELETE RESTRICT"))],
+      ["history result wrong owner target", inResults(sql => sql.replace("REFERENCES participants(id)", "REFERENCES web_sessions(id)"))],
+      ["history result uniqueness weakened", inResults(sql => sql.replace("PRIMARY KEY (participant_id, day)", "PRIMARY KEY (participant_id, day, input_revision)"))],
+      ["history result rowid introduced", inResults(sql => sql.replace("STRICT, WITHOUT ROWID", "STRICT"))],
+      ["history result strictness removed", inResults(sql => sql.replace("STRICT, WITHOUT ROWID", "WITHOUT ROWID"))],
+      ["history result day shape weakened", inResults(sql => sql.replace("CHECK (day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]')", ""))],
+      ["history result revision bound widened", inResults(sql => sql.replace("input_revision < 9007199254740991", "input_revision <= 9007199254740991"))],
+      ["history result fingerprint validation weakened", inResults(sql => sql.replace("AND input_fingerprint NOT GLOB '*[^0-9a-f]*'", ""))],
+      ["history result method cap widened", inResults(sql => sql.replace("BETWEEN 1 AND 4096", "BETWEEN 1 AND 4097"))],
+      ["history result JSON validation removed", inResults(sql => sql.replace("json_valid(result_json)", "length(result_json) > 0"))],
+      ["history result byte cap widened", inResults(sql => sql.replace("<= 16384", "<= 16385"))],
+      ["history result character bound", inResults(sql => sql.replace("length(CAST(result_json AS BLOB))", "length(result_json)"))],
+      ...[
+        ["reordered keys", "ON community_model_history_results(participant_id, day)"],
+        ["descending key", "ON community_model_history_results(day DESC, participant_id)"],
+        ["nonbinary key", "ON community_model_history_results(day COLLATE NOCASE, participant_id)"],
+        ["expression key", "ON community_model_history_results(substr(day, 1), participant_id)"],
+        ["extra key", "ON community_model_history_results(day, participant_id, input_revision)"],
+        ["partial index", "ON community_model_history_results(day, participant_id) WHERE day > ''"],
+      ].map(([label, replacement]) => [`history result index ${label}`,
+        sql => sql.replace("ON community_model_history_results(day, participant_id)", replacement)]),
+      ["history result unique index", sql => sql.replace("CREATE INDEX community_model_history_results_day", "CREATE UNIQUE INDEX community_model_history_results_day")],
+      ["missing history provenance", sql => sql.replace("ALTER TABLE community_model_composition_days ADD COLUMN history_method_version TEXT;", "")],
+      ["history provenance type changed", sql => sql.replace("ADD COLUMN history_method_version TEXT", "ADD COLUMN history_method_version INTEGER")],
+      ["history provenance invented default", sql => sql.replace("ADD COLUMN history_method_version TEXT", "ADD COLUMN history_method_version TEXT DEFAULT 'fixture-history'")],
+      ["history provenance nonnullable", sql => sql.replace("ADD COLUMN history_method_version TEXT", "ADD COLUMN history_method_version TEXT NOT NULL DEFAULT 'fixture-history'")],
+      ["history provenance generated", sql => sql.replace("ADD COLUMN history_method_version TEXT", "ADD COLUMN history_method_version TEXT GENERATED ALWAYS AS ('fixture-history') VIRTUAL")],
+      ...historyTriggers.flatMap(name => [
+        [`missing ${name}`, inObject(name, () => "")],
+        [`no-op ${name}`, inObject(name, sql => sql.replace(/BEGIN[\s\S]*END;/u, "BEGIN SELECT 1; END;"))],
+      ]),
+      ["history insert ignores active chunks", inObject("community_model_history_v1_insert", sql => sql.replace("NEW.superseded_at IS NULL", "NEW.superseded_at IS NOT NULL"))],
+      ["history correction ignores retired chunks", inObject("community_model_history_v1_update", sql => sql.replace("OLD.superseded_at IS NULL OR NEW.superseded_at IS NULL", "OLD.superseded_at IS NULL AND NEW.superseded_at IS NULL"))],
+      ["history delete ignores active chunks", inObject("community_model_history_v1_delete", sql => sql.replace("OLD.superseded_at IS NULL", "OLD.superseded_at IS NOT NULL"))],
+      ["history invalidation horizon shortened", sql => sql.replaceAll("'+100 days'", "'+99 days'")],
+      ["history correction old range lost", inObject("community_model_history_v1_update", sql => sql.replace("day BETWEEN OLD.chunk_day AND date(OLD.chunk_day, '+100 days') OR ", ""))],
+      ["history correction new range lost", inObject("community_model_history_v1_update", sql => sql.replace(" OR day BETWEEN NEW.chunk_day AND date(NEW.chunk_day, '+100 days')", ""))],
+      ["history insert overwrites snapshot basis", inObject("community_model_history_v1_insert", sql => sql.replace("history_method_version IS NOT NULL AND ", ""))],
+      ["history legacy invalidation reversed", inObject("community_model_history_legacy_update", sql => sql.replace("history_method_version IS NOT NULL", "history_method_version IS NULL"))],
+      ["history successor invalidation reversed", inObject("community_model_history_successor_update", sql => sql.replace("history_method_version IS NOT NULL", "history_method_version IS NULL"))],
+      ["history participant state clears wrong owner", inObject("community_model_history_participant_state", sql => sql.replace("participant_id = NEW.id", "participant_id <> NEW.id"))],
+      ["history participant deletion omits cached preview", inObject("community_model_history_participant_delete", sql => sql.replace("DELETE FROM admin_community_allowance_preview_cache;", "SELECT 1;"))],
+    ]);
+});
+
+test("0048 rollback preserves the existing schema and checkpoints, and owner cleanup reaches only owned history", () => {
+  const database = new DatabaseSync(":memory:");
+  const rows = (sql) => database.prepare(sql).all().map(row => ({ ...row }));
+  const apply = name => database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+  const timestamp = "2026-09-06T23:59:59.999Z";
+  const fingerprint = "a".repeat(64);
+  const checkpoint = (namespace, participantId) => {
+    assert.ok(["community_analysis_work", "community_model_history_work"].includes(namespace));
+    database.prepare(`INSERT INTO ${namespace}
+      (participant_id, run_id, input_revision, input_fingerprint, source_kind,
+       source_method_version, fixed_now, observed_at_cutoff, resets_at_cutoff,
+       window_minutes, max_quota_rows, phase, progress_revision, control_json,
+       manifest_json, state_sha256)
+      VALUES (?, 'fixture-run', 1, ?, 'v1', 'fixture-method', ?, ?, ?,
+        10080, 60000, 'plan', 0, '{}', '[]', ?)`).run(
+      participantId, fingerprint, timestamp, timestamp, timestamp, fingerprint,
+    );
+    database.prepare(`INSERT INTO ${namespace}_parts
+      (participant_id, run_id, component, payload_json, payload_sha256, payload_bytes)
+      VALUES (?, 'fixture-run', 'plan-anchors', '[]', ?, 2)`).run(participantId, fingerprint);
+    database.prepare(`INSERT INTO ${namespace}_stage
+      (participant_id, run_id, stage_id, base_progress_revision, stage_revision,
+       mode, target_phase, target_control_json, target_manifest_json,
+       write_manifest_json, target_state_sha256, replay_json, write_offset,
+       verified_offset, gc_component, gc_sha256, discard_input_revision, state_sha256)
+      VALUES (?, 'fixture-run', 'fixture-stage', 0, 0, 'writing', 'plan', '{}', '[]',
+        '[]', ?, '{}', 0, 0, '', '', NULL, ?)`).run(participantId, fingerprint, fingerprint);
+  };
+  try {
+    const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
+    for (const name of names.slice(0, 47)) apply(name);
+    for (const participantId of ["fixture-owner-a", "fixture-owner-b"]) {
+      database.prepare(`INSERT INTO participants (id, access_token_id, access_token_hash,
+        recovery_token_id, recovery_token_hash, consent_version, consented_at, created_at)
+        VALUES (?, ?, X'01', ?, X'02', 'fixture-consent', ?, ?)`).run(
+        participantId, `${participantId}-access`, `${participantId}-recovery`, timestamp, timestamp,
+      );
+      checkpoint("community_analysis_work", participantId);
+    }
+    database.prepare(`INSERT INTO community_model_composition_days
+      (day, payload_json, computed_at, attribution_method_version, source_mutation_epoch)
+      VALUES ('2026-09-06', '{}', ?, 'fixture-attribution', 1)`).run(timestamp);
+    const preservedTables = ["participants", "collection_controls", "telemetry_transport_formats",
+      "telemetry_transport_participant_floors", "community_analysis_work",
+      "community_analysis_work_parts", "community_analysis_work_stage"];
+    const before = Object.fromEntries(preservedTables.map(table => [table, rows(`SELECT * FROM ${table}`)]));
+    const schemaBefore = rows("SELECT type, name, sql FROM sqlite_master ORDER BY type, name");
+    const oldDays = rows("SELECT * FROM community_model_composition_days");
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+
+    database.exec("SAVEPOINT historical_migration;");
+    apply(names[47]);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.throws(() => database.exec("SELECT * FROM fixture_deliberate_migration_failure;"), /no such table/u);
+    database.exec("ROLLBACK TO historical_migration; RELEASE historical_migration;");
+    assert.deepEqual(rows("SELECT type, name, sql FROM sqlite_master ORDER BY type, name"), schemaBefore);
+    assert.deepEqual(rows("SELECT * FROM community_model_composition_days"), oldDays);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    for (const table of preservedTables) assert.deepEqual(rows(`SELECT * FROM ${table}`), before[table], table);
+
+    apply(names[47]);
+    for (const table of preservedTables) assert.deepEqual(rows(`SELECT * FROM ${table}`), before[table], table);
+    assert.deepEqual(rows("SELECT * FROM community_model_composition_days"), oldDays.map(row => ({ ...row, history_method_version: null })));
+    for (const table of ["community_model_history_work", "community_model_history_work_parts",
+      "community_model_history_work_stage", "community_model_history_results"]) {
+      assert.deepEqual(rows(`SELECT * FROM ${table}`), [], table);
+    }
+    const changesBeforeProbe = database.prepare("SELECT total_changes() AS n").get().n;
+    assert.equal(database.prepare(COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL).get().community_model_history_schema, 1);
+    assert.equal(database.prepare("SELECT total_changes() AS n").get().n, changesBeforeProbe);
+
+    for (const participantId of ["fixture-owner-a", "fixture-owner-b"]) {
+      checkpoint("community_model_history_work", participantId);
+      database.prepare(`INSERT INTO community_model_history_results
+        (participant_id, day, input_revision, input_fingerprint, method_version, result_json, computed_at)
+        VALUES (?, '2026-09-05', 1, ?, 'fixture-history', '{}', ?)`).run(participantId, fingerprint, timestamp);
+    }
+    database.prepare(`INSERT INTO community_model_composition_days
+      (day, payload_json, computed_at, history_method_version)
+      VALUES ('2026-09-05', '{}', ?, 'fixture-history')`).run(timestamp);
+    for (const namespace of ["community_analysis_work", "community_model_history_work"]) {
+      assert.throws(() => database.exec(`UPDATE ${namespace}_parts SET payload_json = '{}'`), /community analysis part immutable/u);
+    }
+    database.exec("UPDATE participants SET state = 'deleting' WHERE id = 'fixture-owner-a'");
+    for (const table of ["community_model_history_work", "community_model_history_work_parts",
+      "community_model_history_work_stage", "community_model_history_results"]) {
+      assert.deepEqual(rows(`SELECT participant_id FROM ${table}`), [{ participant_id: "fixture-owner-b" }], table);
+    }
+    assert.deepEqual(rows("SELECT * FROM community_model_composition_days"), []);
+    // Source withdrawal does not merge or rewrite the independent current
+    // namespace; its own existing source fences continue to govern it.
+    assert.deepEqual(rows("SELECT * FROM community_analysis_work"), before.community_analysis_work);
+
+    database.prepare(`INSERT INTO community_model_composition_days
+      (day, payload_json, computed_at, history_method_version)
+      VALUES ('2026-09-05', '{}', ?, 'fixture-history')`).run(timestamp);
+    database.prepare(`INSERT INTO admin_community_allowance_preview_cache
+      (singleton, generated_at, payload_json) VALUES (1, ?, '{}')`).run(timestamp);
+    database.exec("DELETE FROM participants WHERE id = 'fixture-owner-b'");
+    for (const table of ["community_model_history_work", "community_model_history_work_parts",
+      "community_model_history_work_stage", "community_model_history_results",
+      "community_model_composition_days", "admin_community_allowance_preview_cache"]) {
+      assert.deepEqual(rows(`SELECT * FROM ${table}`), [], table);
+    }
+    assert.deepEqual(rows("SELECT participant_id FROM community_analysis_work"), [{ participant_id: "fixture-owner-a" }]);
+    assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("0048 correction triggers invalidate the exact historical range without rewriting forward snapshots", () => {
+  // Minimal content-free source tables isolate the new invalidation triggers;
+  // this is not an ingest/activation fixture. The full migrated schema,
+  // source preservation and owner erasure are rehearsed independently above.
+  const database = new DatabaseSync(":memory:");
+  const timestamp = "2026-09-06T23:59:59.999Z";
+  const seedDays = (days) => {
+    database.exec("DELETE FROM community_model_composition_days;");
+    for (const day of days) database.prepare(`INSERT INTO community_model_composition_days
+      (day, payload_json, computed_at, history_method_version)
+      VALUES (?, '{}', ?, 'fixture-history')`).run(day, timestamp);
+    database.prepare(`INSERT INTO community_model_composition_days
+      (day, payload_json, computed_at) VALUES ('2026-09-02', '{}', ?)`).run(timestamp);
+  };
+  const dayRows = () => database.prepare(`SELECT day, history_method_version
+    FROM community_model_composition_days ORDER BY day`).all().map(row => ({ ...row }));
+  const retained = (days) => [...days.map(day => ({ day, history_method_version: "fixture-history" })),
+    { day: "2026-09-02", history_method_version: null }].sort((a, b) => a.day.localeCompare(b.day, "en"));
+  try {
+    database.exec(`PRAGMA foreign_keys = ON;
+      CREATE TABLE participants (id TEXT PRIMARY KEY, state TEXT NOT NULL);
+      CREATE TABLE telemetry_v1_chunks (id TEXT PRIMARY KEY, chunk_day TEXT NOT NULL, superseded_at TEXT);
+      CREATE TABLE telemetry_contributions (id TEXT PRIMARY KEY);
+      CREATE TABLE telemetry_v11_domain_heads (id TEXT PRIMARY KEY);
+      CREATE TABLE admin_community_allowance_preview_cache (singleton INTEGER PRIMARY KEY);
+      INSERT INTO participants VALUES ('fixture-owner', 'active');`);
+    database.exec(readFileSync(join(workerDirectory, "migrations", "0042_community_model_composition.sql"), "utf8"));
+    database.exec(`ALTER TABLE community_model_composition_days ADD COLUMN attribution_method_version TEXT;
+      ALTER TABLE community_model_composition_days ADD COLUMN source_mutation_epoch INTEGER;`);
+    database.exec(readFileSync(join(workerDirectory, "migrations", "0048_community_model_history.sql"), "utf8"));
+    assert.equal(database.prepare(COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL).get().community_model_history_schema, 1);
+
+    const allDays = ["2026-08-31", "2026-09-01", "2026-09-03", "2026-12-10", "2026-12-11", "2026-12-12", "2026-12-13"];
+    seedDays(allDays);
+    const before = dayRows();
+    database.exec("SAVEPOINT historical_correction;");
+    database.exec("INSERT INTO telemetry_v1_chunks VALUES ('fixture-live', '2026-09-01', NULL);");
+    assert.deepEqual(dayRows(), retained(["2026-08-31", "2026-12-11", "2026-12-12", "2026-12-13"]));
+    database.exec("ROLLBACK TO historical_correction; RELEASE historical_correction;");
+    assert.deepEqual(dayRows(), before);
+    assert.equal(database.prepare("SELECT count(*) AS n FROM telemetry_v1_chunks").get().n, 0);
+
+    database.exec("INSERT INTO telemetry_v1_chunks VALUES ('fixture-live', '2026-09-01', NULL);");
+    seedDays(allDays);
+    database.exec("UPDATE telemetry_v1_chunks SET chunk_day = '2026-09-03' WHERE id = 'fixture-live';");
+    assert.deepEqual(dayRows(), retained(["2026-08-31", "2026-12-13"]));
+    seedDays(allDays);
+    database.exec("DELETE FROM telemetry_v1_chunks WHERE id = 'fixture-live';");
+    assert.deepEqual(dayRows(), retained(["2026-08-31", "2026-09-01", "2026-12-13"]));
+
+    // A newly superseded live row still invalidates its old input range;
+    // already-superseded-only mutations do not erase unaffected history.
+    database.exec("INSERT INTO telemetry_v1_chunks VALUES ('fixture-retired', '2026-09-01', NULL);");
+    seedDays(allDays);
+    database.exec("UPDATE telemetry_v1_chunks SET superseded_at = '2026-09-06T00:00:00.000Z' WHERE id = 'fixture-retired';");
+    assert.deepEqual(dayRows(), retained(["2026-08-31", "2026-12-11", "2026-12-12", "2026-12-13"]));
+    seedDays(allDays);
+    database.exec(`INSERT INTO telemetry_v1_chunks VALUES ('fixture-old', '2026-09-01', '2026-09-06T00:00:00.000Z');
+      UPDATE telemetry_v1_chunks SET chunk_day = '2026-09-03' WHERE id = 'fixture-retired';
+      DELETE FROM telemetry_v1_chunks WHERE superseded_at IS NOT NULL;`);
+    assert.deepEqual(dayRows(), retained(allDays));
+
+    for (const table of ["telemetry_contributions", "telemetry_v11_domain_heads"]) {
+      for (const statement of [
+        `INSERT INTO ${table} VALUES ('fixture-source');`,
+        `UPDATE ${table} SET id = 'fixture-updated' WHERE id = 'fixture-source';`,
+        `DELETE FROM ${table} WHERE id = 'fixture-updated';`,
+      ]) {
+        seedDays(allDays);
+        database.exec(statement);
+        assert.deepEqual(dayRows(), retained([]), `${table}: ${statement.split(" ", 1)[0]}`);
+      }
+    }
+    assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+  } finally {
+    database.close();
+  }
+});
+
 test("projection metadata readiness accepts the intentionally incomplete populated-source backfill", () => {
   const database = new DatabaseSync(":memory:");
   try {
@@ -588,16 +883,18 @@ test("staging requires pending attribution migrations before its schema probe", 
   assert.equal(calls.some((args) => args.includes("apply")), false);
 });
 
-test("staging blocks incomplete 0045/0046 prefixes and unreviewed 0046/0047 before schema probing", () => {
+test("staging blocks incomplete 0045/0046/0047 prefixes and unreviewed 0046/0047/0048 before schema probing", () => {
   const config = provisionedConfig();
   const through45 = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 45);
   assert.equal(through45.at(-1), "0045_attribution_domain_activation.sql");
   for (const [names, expectedBlocker] of [
     [through45, "REMOTE_MIGRATIONS_PENDING"],
     [[...through45, "0046_v1_quota_fit_projection.sql"], "REMOTE_MIGRATIONS_PENDING"],
+    [EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 47), "REMOTE_MIGRATIONS_PENDING"],
     [[...through45, "0046_unreviewed_quota_index.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
     [[...through45, "0046_v1_quota_fit_cursor.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
     [[...through45, "0046_v1_quota_fit_projection.sql", "0047_unreviewed_work.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
+    [[...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 47), "0048_unreviewed_model_history.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
   ]) {
     const calls = [];
     const baseSpawn = successSpawn(config, calls);

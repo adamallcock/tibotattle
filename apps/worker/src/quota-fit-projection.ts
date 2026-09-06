@@ -117,20 +117,25 @@ export async function backfillV1QuotaFitProjection(
 
 // Explicit equal-time + id seek drains an arbitrarily large timestamp tie;
 // the next-key seek does not revisit it. Only these bounded pages materialize.
-export const V1_PLAN_QUOTA_PAGE_SQL = `WITH same_time AS MATERIALIZED (
+function planQuotaPageSql(historical: boolean): string {
+  const upperBound = historical ? " AND r.observed_at < ?5" : "";
+  return `WITH same_time AS MATERIALIZED (
   SELECT r.id, r.observed_at, r.observed_day, r.device_id, r.provider,
     r.limit_id, r.plan_type, r.plan_variant
   FROM telemetry_v1_records r INDEXED BY telemetry_v1_records_participant_stream_observed
-  WHERE r.participant_id = ?1 AND r.stream = 'quota' AND r.observed_at = ?2 AND r.id > ?3
+  WHERE r.participant_id = ?1 AND r.stream = 'quota' AND r.observed_at = ?2 AND r.id > ?3${upperBound}
   ORDER BY r.id LIMIT ?4
 ), later AS MATERIALIZED (
   SELECT r.id, r.observed_at, r.observed_day, r.device_id, r.provider,
     r.limit_id, r.plan_type, r.plan_variant
   FROM telemetry_v1_records r INDEXED BY telemetry_v1_records_participant_stream_observed
-  WHERE r.participant_id = ?1 AND r.stream = 'quota' AND r.observed_at > ?2
+  WHERE r.participant_id = ?1 AND r.stream = 'quota' AND r.observed_at > ?2${upperBound}
   ORDER BY r.observed_at, r.id LIMIT (SELECT ?4 - COUNT(*) FROM same_time)
 )
 SELECT * FROM same_time UNION ALL SELECT * FROM later ORDER BY observed_at, id`;
+}
+export const V1_PLAN_QUOTA_PAGE_SQL = planQuotaPageSql(false);
+export const V1_HISTORY_PLAN_QUOTA_PAGE_SQL = planQuotaPageSql(true);
 
 export const V1_FIT_QUOTA_PAGE_SQL = `WITH same_key AS MATERIALIZED (
   SELECT p.record_id, p.resets_at, p.observed_at FROM telemetry_v1_quota_fit_rows p
@@ -165,8 +170,11 @@ function validatePage(cursor: V1TimeCursor, limit: number): void {
  * losing-device and pre-cutoff rows. The acquisition engine applies residual
  * source filters and must retain its original/final source-pin fences.
  */
-export async function createV1QuotaPageReader(db: D1Database, participantId: string): Promise<V1QuotaPageReader> {
+export async function createV1QuotaPageReader(db: D1Database, participantId: string,
+  observedAtBefore?: string): Promise<V1QuotaPageReader> {
   if (typeof participantId !== "string" || participantId.length === 0) throw new TypeError("participant required");
+  if (observedAtBefore !== undefined && (!Number.isFinite(Date.parse(observedAtBefore))
+    || new Date(observedAtBefore).toISOString() !== observedAtBefore)) throw new TypeError("quota upper bound invalid");
   const ready = await db.prepare(`SELECT s.through_record_id, s.last_record_id, s.is_complete
     FROM telemetry_v1_quota_fit_backfill s JOIN participants p ON p.id = ? AND p.state = 'active'
     WHERE s.singleton_id = 1`).bind(participantId).first<BackfillState>();
@@ -174,11 +182,19 @@ export async function createV1QuotaPageReader(db: D1Database, participantId: str
   return {
     async readPlanPage(cursor, limit) {
       validatePage(cursor, limit);
+      if (observedAtBefore !== undefined) {
+        return (await db.prepare(V1_HISTORY_PLAN_QUOTA_PAGE_SQL)
+          .bind(participantId, cursor.observedAt, cursor.id, limit, observedAtBefore).all<V1PlanSourceRow>()).results;
+      }
       const result = await db.prepare(V1_PLAN_QUOTA_PAGE_SQL)
         .bind(participantId, cursor.observedAt, cursor.id, limit).all<V1PlanSourceRow>();
       return result.results;
     },
     async readFitPage(cursor: V1ResetCursor, limit) {
+      // The reset-first index cannot seek an observed-time upper bound across
+      // reset groups. Keep its physical LIMIT before residual filtering. The
+      // acquisition's closed day-winner map excludes all future rows; even a
+      // future-only page advances the cursor rather than pretending to be EOF.
       validatePage(cursor, limit);
       if (typeof cursor.resetsAt !== "string") throw new TypeError("reset cursor required");
       const result = await db.prepare(V1_FIT_QUOTA_PAGE_SQL)

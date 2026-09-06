@@ -35,6 +35,8 @@ import {
   V1_WINNER_FILTER_SQL,
 } from "./telemetry-v1-source-selection";
 import type { V1SourcePin } from "./telemetry-v1-source-selection";
+import { modelHistoryWindow, V1_ANALYSIS_WINDOW_DAYS, type ModelHistoryWindow } from "./model-history-window";
+export { V1_ANALYSIS_WINDOW_DAYS } from "./model-history-window";
 import {
   V1_QUOTA_ACQUISITION_VERSION,
   validateV1CompletedQuotaAcquisition,
@@ -51,6 +53,7 @@ export const V1_PLAN_ATTRIBUTION_ADAPTER_VERSION =
  * synchronous acquisition with the corrected equal-time plan barrier method. */
 export const V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION =
   `${V1_SOURCE_SELECTION_METHOD_VERSION}:${PLAN_ATTRIBUTION_POLICY.methodVersion}:v1-era-buckets-3:${V1_QUOTA_ACQUISITION_VERSION}`;
+export const MODEL_HISTORY_METHOD_VERSION = `${V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION}:model-history-1`;
 
 /**
  * Reset-fit analysis for the telemetry-contribution-v1.0 chunk corpus, computed
@@ -116,7 +119,6 @@ const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 // band's own trailing-30d window plus one 7d weekly cycle, snapped to whole
 // reset cycles (below). Reading only 30d would truncate the earliest in-window
 // weekly cycle and silently shift its span / capacity / lastObservedAt.
-export const V1_ANALYSIS_WINDOW_DAYS = 100;
 const V1_ANALYSIS_WINDOW_MS = V1_ANALYSIS_WINDOW_DAYS * MILLISECONDS_PER_DAY;
 const SEVEN_DAY_WINDOW_MS = SEVEN_DAY_WINDOW_MINUTES * 60_000;
 
@@ -324,16 +326,24 @@ function requireAcquiredQuotaEvidence(evidence: unknown): void {
 async function validateAcquiredQuotaEvidence(
   db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
   sourcePin: V1SourcePin, observedAtCutoff: string, resetsAtCutoff: string, maxQuotaRows: number,
+  history?: ModelHistoryWindow,
 ): Promise<{ attributionIndex: PlanAttributionIndex; results: DownsampledQuotaRow[] }> {
   const identity = evidence.identity;
   if (!identity || identity.participantId !== participantId
       || identity.inputFingerprint !== sourcePin.fingerprint
-      || identity.sourceMethodVersion !== V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION
+      || identity.sourceMethodVersion !== (history ? MODEL_HISTORY_METHOD_VERSION : V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION)
       || identity.observedAtCutoff !== observedAtCutoff || identity.resetsAtCutoff !== resetsAtCutoff
       || identity.windowMinutes !== SEVEN_DAY_WINDOW_MINUTES || identity.maxQuotaRows !== maxQuotaRows
       || !validateV1CompletedQuotaAcquisition(evidence.acquisition)
       || evidence.acquisition.quotaRows.length > maxQuotaRows) {
     throw new Error("v1 acquired quota evidence mismatch");
+  }
+  if (history) {
+    const lower = Date.parse(history.observedAtCutoff), upper = Date.parse(history.observedAtBefore);
+    if (evidence.acquisition.planAnchors.some(row => row.observedAtMs < lower || row.observedAtMs >= upper)
+      || evidence.acquisition.quotaRows.some(row => Date.parse(row.observed_at) < lower || Date.parse(row.observed_at) >= upper)) {
+      throw new Error("v1 historical evidence outside day range");
+    }
   }
   // Check before doing expensive fitting, not only after it. A stored payload
   // with a valid shape is never proof that its source is still current.
@@ -365,6 +375,21 @@ export async function finishAccountScopedModelCompositionV1(
   if (!options.sourcePin) throw new Error("v1 acquired finish requires source pin");
   if (!reserveV1QuotaFinish(budget, options)) return { status: "deferred" };
   const result = await finishAcquiredAnalyses(db, participantId, evidence, options, false, true);
+  return { status: "complete", analysis: result.modelComposition };
+}
+
+/** Retrospective, date-specific model fit. It requires its own closed source
+ * range and acquired checkpoint; today-only evidence cannot enter this path. */
+export async function finishHistoricalModelCompositionV1(
+  db: D1Database, participantId: string, day: string, evidence: V1AcquiredQuotaEvidence,
+  budget: V1QuotaInvocationBudget, options: Omit<V1AnalysisOptions, "nowMs"> & { sourcePin: V1SourcePin },
+): Promise<{ status: "deferred" } | { status: "complete"; analysis: V1ModelCompositionResult }> {
+  const history = modelHistoryWindow(day);
+  requireAcquiredQuotaEvidence(evidence);
+  if (!options.sourcePin) throw new Error("v1 historical finish requires source pin");
+  if (!reserveV1QuotaFinish(budget, options)) return { status: "deferred" };
+  const result = await finishAcquiredAnalyses(db, participantId, evidence,
+    { ...options, nowMs: Date.parse(history.fixedNow) }, false, true, history);
   return { status: "complete", analysis: result.modelComposition };
 }
 
@@ -800,11 +825,27 @@ export const V1_USAGE_PAGE_AFTER_TIME_SQL = `${V1_USAGE_PAGE_SELECT_SQL}
    ORDER BY r.observed_at, r.id
    LIMIT ?`;
 
+export const V1_HISTORY_USAGE_PAGE_AT_TIME_SQL = `${V1_USAGE_PAGE_SELECT_SQL}
+     AND r.observed_at = ? AND r.id > ? AND r.observed_at < ?
+   ORDER BY r.id LIMIT ?`;
+export const V1_HISTORY_USAGE_PAGE_AFTER_TIME_SQL = `${V1_USAGE_PAGE_SELECT_SQL}
+     AND r.observed_at > ? AND r.observed_at < ?
+   ORDER BY r.observed_at, r.id LIMIT ?`;
+
 /** Shared page/cursor contract for both scalar and model-composition readers. */
 export async function readV1UsagePage(
   db: D1Database, winnersJson: string, participantId: string,
   cursorObservedAt: string, cursorId: number, pageSize: number,
+  observedAtBefore?: string,
 ): Promise<WindowedUsageRow[]> {
+  if (observedAtBefore !== undefined) {
+    const sameTime = await db.prepare(V1_HISTORY_USAGE_PAGE_AT_TIME_SQL)
+      .bind(winnersJson, participantId, cursorObservedAt, cursorId, observedAtBefore, pageSize).all<WindowedUsageRow>();
+    if (sameTime.results.length === pageSize) return sameTime.results;
+    const later = await db.prepare(V1_HISTORY_USAGE_PAGE_AFTER_TIME_SQL)
+      .bind(winnersJson, participantId, cursorObservedAt, observedAtBefore, pageSize - sameTime.results.length).all<WindowedUsageRow>();
+    return sameTime.results.concat(later.results);
+  }
   const sameTime = await db.prepare(V1_USAGE_PAGE_AT_TIME_SQL)
     .bind(winnersJson, participantId, cursorObservedAt, cursorId, pageSize)
     .all<WindowedUsageRow>();
@@ -1007,6 +1048,7 @@ async function readAndBucketUsage(
   attributionIndex: PlanAttributionIndex,
   composition?: ReturnType<typeof createCompositionUsageAccumulator>,
   scalarEnabled = true,
+  observedAtBefore?: string,
 ): Promise<AttributedUsageEventPartial[] | "limit_exceeded" | "session_scope_limit_exceeded" | "cost_limit_exceeded"> {
   // Per provider: strictly-interior events keyed by their ceiling grid instant,
   // and grid-exact events kept as their own singleton at that instant (the
@@ -1079,7 +1121,7 @@ async function readAndBucketUsage(
   let cursorObs = observedAtCutoff;
   let cursorId = 0;
   for (;;) {
-    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE);
+    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) {
@@ -1355,11 +1397,14 @@ async function assertNoActiveV11Source(db: D1Database, participantId: string): P
 
 async function analysisSourcePin(
   db: D1Database, participantId: string, observedAtCutoff: string, supplied?: V1SourcePin,
+  history?: ModelHistoryWindow,
 ): Promise<V1SourcePin> {
   let sourcePin: V1SourcePin;
   if (supplied) {
     if (!("participantId" in supplied.scope) || supplied.scope.participantId !== participantId
         || (supplied.scope.fromDay !== undefined && supplied.scope.fromDay > observedAtCutoff.slice(0, 10))
+        || supplied.scope.throughDay !== history?.day
+        || (history && supplied.scope.fromDay !== history.fromDay)
         || supplied.methodVersion !== V1_SOURCE_SELECTION_METHOD_VERSION) {
       throw new Error("v1 source pin scope mismatch");
     }
@@ -1772,9 +1817,10 @@ async function finishAcquiredScalar(rows: DownsampledQuotaRow[], attributionInde
 async function collectAcquiredAnalyses(db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
   options: V1AnalysisOptions & { sourcePin: V1SourcePin }, scalarRequested: boolean, compositionRequested: boolean,
   sourcePin: V1SourcePin, observedAtCutoff: string, resetsAtCutoff: string,
+  history?: ModelHistoryWindow,
 ) {
   const prepared = await validateAcquiredQuotaEvidence(db, participantId, evidence, sourcePin,
-    observedAtCutoff, resetsAtCutoff, options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS);
+    observedAtCutoff, resetsAtCutoff, options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS, history);
   const { attributionIndex: index, results: rows } = prepared;
   let scalarReason: string | null = !scalarRequested ? "supported_quota_track_unavailable" : null;
   let compositionReason: string | null = !compositionRequested ? "supported_quota_track_unavailable" : null;
@@ -1817,7 +1863,7 @@ async function collectAcquiredAnalyses(db: D1Database, participantId: string, ev
     compositionQuotaBins(rows.filter(validCompositionQuotaRow).map(row => Date.parse(row.observed_at)))) : undefined;
   const usage = scalarReason === null || composition ? await readAndBucketUsage(db, participantId, datasetId,
     observedAtCutoff, accountTracks, gridByProvider, options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS,
-    sourcePin.winnersJson, index, composition, scalarReason === null) : [];
+    sourcePin.winnersJson, index, composition, scalarReason === null, history?.observedAtBefore) : [];
   gridByProvider.clear();
   if (scalarReason === null && typeof usage === "string") scalarReason = usage === "limit_exceeded"
     ? "windowed_usage_limit_exceeded" : usage === "session_scope_limit_exceeded"
@@ -1831,14 +1877,15 @@ async function collectAcquiredAnalyses(db: D1Database, participantId: string, ev
 
 async function finishAcquiredAnalyses(db: D1Database, participantId: string, evidence: V1AcquiredQuotaEvidence,
   options: V1AnalysisOptions & { sourcePin: V1SourcePin }, scalarRequested: boolean, compositionRequested: boolean,
+  history?: ModelHistoryWindow,
 ): Promise<{ quotaAnalysis: object; modelComposition: V1ModelCompositionResult }> {
   const nowMs = options.nowMs ?? Date.now();
   const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_MS).toISOString().slice(0, 10) + "T00:00:00.000Z";
   const resetsAtCutoff = new Date(Date.parse(observedAtCutoff) + SEVEN_DAY_WINDOW_MS).toISOString();
-  const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin);
+  const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin, history);
   const { quotaAnalysis, composition, compositionReason, compositionPlans, latestQuotaMs, rows } =
     await collectAcquiredAnalyses(db, participantId, evidence, options, scalarRequested, compositionRequested,
-      sourcePin, observedAtCutoff, resetsAtCutoff);
+      sourcePin, observedAtCutoff, resetsAtCutoff, history);
   let modelComposition: V1ModelCompositionResult = { status: "not_testable", reason: compositionReason ?? "supported_quota_track_unavailable" };
   if (composition) {
     const folded = composition.finish();
@@ -1853,7 +1900,7 @@ async function finishAcquiredAnalyses(db: D1Database, participantId: string, evi
         voidedBinCount: corpus.voidedBinCount, poolCount: corpus.poolCount, quotaRowCount: quotaRows.length,
         usageEventCount: folded.usageEventCount, unpricedUsageEventCount: folded.unpricedUsageEventCount,
         poisonedBinCount: folded.poisonedBinCount, latestQuotaObservedAt: new Date(latestQuotaMs).toISOString(),
-        attributionStatus: "legacy_conditional", attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+        attributionStatus: "legacy_conditional", attributionMethod: history ? MODEL_HISTORY_METHOD_VERSION : V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
         inputFingerprint: sourcePin.fingerprint };
     }
   }

@@ -1093,6 +1093,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       "USAGE_MONITOR_DB:0045_attribution_domain_activation.sql",
       "USAGE_MONITOR_DB:0046_v1_quota_fit_projection.sql",
       "USAGE_MONITOR_DB:0047_community_analysis_work.sql",
+      "USAGE_MONITOR_DB:0048_community_model_history.sql",
     ],
   });
   const through45 = expected.USAGE_MONITOR_DB.slice(0, 45);
@@ -1103,18 +1104,28 @@ test("reconciled production ledger preserves the historical prefix and refuses a
     pending: [
       "USAGE_MONITOR_DB:0046_v1_quota_fit_projection.sql",
       "USAGE_MONITOR_DB:0047_community_analysis_work.sql",
+      "USAGE_MONITOR_DB:0048_community_model_history.sql",
     ],
   });
   assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB.slice(0, 46)), {
     ok: true,
     code: null,
-    pending: ["USAGE_MONITOR_DB:0047_community_analysis_work.sql"],
+    pending: [
+      "USAGE_MONITOR_DB:0047_community_analysis_work.sql",
+      "USAGE_MONITOR_DB:0048_community_model_history.sql",
+    ],
+  });
+  assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB.slice(0, 47)), {
+    ok: true,
+    code: null,
+    pending: ["USAGE_MONITOR_DB:0048_community_model_history.sql"],
   });
   for (const applied of [
     [...through45, "0046_unreviewed_quota_index.sql"],
     [...through45, "0046_v1_quota_fit_cursor.sql"],
     [...through45.slice(0, 44), "0046_v1_quota_fit_projection.sql"],
     [...through45, "0046_v1_quota_fit_projection.sql", "0047_unreviewed_work.sql"],
+    [...expected.USAGE_MONITOR_DB.slice(0, 47), "0048_unreviewed_model_history.sql"],
   ]) {
     const index = applied.findIndex((name, item) => name !== expected.USAGE_MONITOR_DB[item]);
     assert.deepEqual(await inspect(applied), {
@@ -1123,7 +1134,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 47,
+        localCount: 48,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });
@@ -1144,7 +1155,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 47,
+        localCount: 48,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });
