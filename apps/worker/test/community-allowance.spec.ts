@@ -28,6 +28,7 @@ import {
   downsampleQuotaForTest,
   MAX_DOWNSAMPLED_QUOTA_ROWS,
   MAX_WINDOWED_USAGE_ROWS,
+  QUOTA_DOWNSAMPLE_SQL,
   V1_ANALYSIS_WINDOW_DAYS,
   V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
   V1_USAGE_PAGE_AT_TIME_SQL,
@@ -1668,6 +1669,133 @@ describe("v1 plan attribution before fit and cost reduction", () => {
 });
 
 describe("v1 analyzer scale fix — fit-preserving reduction", () => {
+  it("keeps exact tied endpoints across winning devices, partitions and era gaps", async () => {
+    const participantId = await newV1Participant("quota-neighbors");
+    const devices = ["v1-device-quota-neighbors", "v1-device-quota-neighbors-next"];
+    const loser = "v1-device-quota-neighbors-loser";
+    for (const device of [devices[1]!, loser]) {
+      await seedV1Device(participantId, device, "v1-session-quota-neighbors");
+    }
+    const foreign = await newV1Participant("quota-neighbors-foreign");
+    const baseMs = SCALE_NOW - 3 * DAY_MS;
+    const at = (minutes: number) => new Date(baseMs + minutes * MINUTE_MS).toISOString();
+    const resetsAt = new Date(baseMs + 7 * DAY_MS).toISOString();
+    const markers = [
+      ["openai_codex", "codex", "pro", "unknown", "first", "", at(20), 1],
+      ["openai_codex", "codex", "pro", "unknown", "return", at(1440), null, 2],
+      ["other_provider", "codex", "pro", "unknown", "other", "", null, 3],
+    ];
+    const expected: Array<V1SeedRecord & { plan_era_key: string; insertion: number }> = [];
+    let insertion = 0;
+    for (const [dayIndex, offset] of [0, 1440].entries()) {
+      const day = at(offset).slice(0, 10);
+      const records: V1SeedRecord[] = [];
+      for (const provider of ["openai_codex", "other_provider"]) for (const slot of ["seven_day", "secondary"]) {
+        for (let level = 0; level <= 10; level++) for (let repeat = 0; repeat < 3; repeat++) {
+          const row = { occurrence_id: `neighbor-${offset}-${provider}-${slot}-${level}-${2 - repeat}`,
+            observed_at: at(offset + level), provider, plan_type: "pro", plan_variant: "unknown",
+            limit_id: "codex", slot, used_percent: level * 10, window_duration_minutes: 10_080,
+            resets_at: resetsAt };
+          records.push(row);
+          // Literal fixture oracle: each three-row flat run retains its first
+          // and last INSERTED id, not the opposite lexical occurrence order.
+          if (repeat !== 1) expected.push({ ...row, insertion,
+            plan_era_key: provider === "other_provider" ? "other" : offset === 0 ? "first" : "return" });
+          insertion += 1;
+        }
+      }
+      const exemplar = records[0]!;
+      const noise = records.map((row) => ({ ...row, occurrence_id: `loser-${row.occurrence_id}`, used_percent: 0.5 }));
+      if (offset === 0) records.push(
+        { ...exemplar, occurrence_id: "neighbor-before-cutoff", observed_at: at(-1) },
+        { ...exemplar, occurrence_id: "neighbor-era-gap", observed_at: at(60) },
+        { ...exemplar, occurrence_id: "neighbor-short-window", used_percent: 0.5, window_duration_minutes: 300 },
+        { ...exemplar, occurrence_id: "neighbor-other-variant", used_percent: 0.5, plan_variant: "other" },
+        { ...exemplar, occurrence_id: "neighbor-short-reset", used_percent: 0.5,
+          resets_at: new Date(baseMs + 6 * DAY_MS).toISOString() },
+        ...[0, 1, 2].map((minute) => ({ ...exemplar, occurrence_id: `neighbor-nonfit-${minute}`,
+          observed_at: at(minute), used_percent: 20, resets_at: new Date(baseMs + 8 * DAY_MS).toISOString() })),
+      );
+      await seedChunkedRecords(participantId, devices[dayIndex]!, "quota", day, records);
+      await seedChunkedRecords(participantId, loser, "quota", day, noise, `${day}T19:00:00.000Z`);
+      await seedChunkedRecords(foreign, "v1-device-quota-neighbors-foreign", "quota", day, noise);
+    }
+    const pin = await loadV1SourcePin(db(), { participantId, fromDay: at(0).slice(0, 10) });
+    expect(pin.winners.map((entry) => entry.device_id)).toEqual(devices);
+    const oracle = expected.sort((left, right) => left.observed_at.localeCompare(right.observed_at)
+      || left.insertion - right.insertion).map(({ insertion: _insertion, ...row }) => row);
+    expect(oracle).toHaveLength(176);
+    // Ingest admits finite0..100 (including zero), never the -1 absence sentinel.
+    expect(oracle.filter((row) => row.used_percent === 0)).toHaveLength(16);
+    expect(oracle.filter((row) => row.used_percent === 100)).toHaveLength(16);
+    for (const limit of [1, oracle.length - 1, oracle.length, oracle.length + 1]) {
+      const result = await db().prepare(QUOTA_DOWNSAMPLE_SQL).bind(JSON.stringify(markers), pin.winnersJson,
+        participantId, at(0), resetsAt, 10_080, QUOTA_CALIBRATION_POLICY.minimumBoundaries,
+        QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, limit).all();
+      expect(result.results).toEqual(oracle.slice(0, limit));
+    }
+    expect((await db().prepare(QUOTA_DOWNSAMPLE_SQL).bind(JSON.stringify(markers), pin.winnersJson,
+      participantId, at(0), resetsAt, 10_080, 1000,
+      QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, 1).all()).results).toEqual([]);
+  });
+
+  it("reduces dense quota before materializing and preserves exact run endpoints and fits", async () => {
+    const participantId = await newV1Participant("quota-working-set");
+    const device = "v1-device-quota-working-set";
+    const baseMs = SCALE_NOW - 2 * DAY_MS;
+    const resetsAt = new Date(baseMs + 7 * DAY_MS).toISOString();
+    const day = new Date(baseMs).toISOString().slice(0, 10);
+    const dense = buildDenseReset({ tag: "quota-working-set", baseMs, resetsAt,
+      levels: 17, startPp: 5, stepPp: 5, repeats: 300, snapshotStepMs: 1_000,
+      usageOffsetMs: 500, gridExactLevels: [3, 8] });
+    await seedChunkedRecords(participantId, device, "quota", day, dense.quota);
+    await seedChunkedRecords(participantId, device, "usage", day, dense.usage);
+    const pin = await loadV1SourcePin(db(), { participantId, fromDay: day });
+    const markers = JSON.stringify([["openai_codex", "codex", "pro", "unknown", "synthetic-era", "", null, 1]]);
+    const cutoff = new Date(SCALE_NOW - V1_ANALYSIS_WINDOW_DAYS * DAY_MS)
+      .toISOString().slice(0, 10) + "T00:00:00.000Z";
+    const plan = await db().prepare("EXPLAIN QUERY PLAN " + QUOTA_DOWNSAMPLE_SQL)
+      .bind(markers, pin.winnersJson, participantId, cutoff,
+        new Date(Date.parse(cutoff) + 7 * DAY_MS).toISOString(), 10_080,
+        QUOTA_CALIBRATION_POLICY.minimumBoundaries,
+        QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp,
+        MAX_DOWNSAMPLED_QUOTA_ROWS + 1)
+      .all<{ id: number; parent: number; detail: string }>();
+    const materialized = plan.results.map((row) => row.detail)
+      .filter((detail) => detail.startsWith("MATERIALIZE "));
+    // No wide raw/assigned/survivor table may be retained before the dense
+    // stream is reduced. The bounded era vector and endpoint table may be.
+    expect(materialized).not.toEqual([]);
+    expect(materialized.every((detail) => ["MATERIALIZE era_markers", "MATERIALIZE endpoints", "MATERIALIZE fitable"]
+      .includes(detail)), materialized.join("\n")).toBe(true);
+    expect(plan.results.some(({ detail }) => detail.includes("telemetry_v1_records_participant_stream_observed")
+      && detail.includes("participant_id=? AND stream=? AND observed_at>? AND observed_at<?"))).toBe(true);
+    expect(plan.results.some(({ detail }) => detail.includes("SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"))).toBe(true);
+    const endpointNode = plan.results.find(({ detail }) => detail === "MATERIALIZE endpoints");
+    expect(endpointNode).toBeDefined();
+    const endpointDescendants = new Set([endpointNode!.id]);
+    for (const row of plan.results) {
+      if (endpointDescendants.has(row.parent)) endpointDescendants.add(row.id);
+    }
+    expect(plan.results.filter((row) => endpointDescendants.has(row.id))
+      .some(({ detail }) => /TEMP B-TREE/u.test(detail))).toBe(false);
+    const neighborSeeks = plan.results.filter(({ detail }) => detail.includes("SEARCH n USING INDEX telemetry_v1_records_participant_stream_observed"));
+    expect(neighborSeeks).toHaveLength(4);
+    for (const predicate of ["observed_at=? AND rowid<?", "observed_at=? AND rowid>?", "observed_at>? AND observed_at<?"]) {
+      expect(neighborSeeks.some(({ detail }) => detail.includes(predicate)), predicate).toBe(true);
+    }
+    const reducedRows = await downsampleQuotaForTest(db(), participantId, SCALE_NOW);
+    expect(reducedRows.map((row) => row.occurrence_id)).toEqual(
+      Array.from({ length: 17 }, (_, level) => [
+        `q-quota-working-set-${level}-0`, `q-quota-working-set-${level}-299`,
+      ]).flat(),
+    );
+    const reference = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), participantId) as AnalysisLike;
+    const actual = await accountScopedQuotaAnalysisV1(db(), participantId, { nowMs: SCALE_NOW }) as AnalysisLike;
+    expect(bandResets(actual)).toHaveLength(1);
+    expect(bandResets(actual)).toEqual(bandResets(reference));
+  }, 20_000);
+
   it("preserves occurrence-first same-session intervals when insertion order disagrees", async () => {
     const scenario = await seedPlanEraScenario("tie-order", [
       { plan: "pro", offsetMinutes: 0, sharedSession: true },

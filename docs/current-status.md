@@ -3,250 +3,106 @@ title: Current product and release status
 date: 2026-09-05
 type: status
 status: current
-source_commit: 68d7451be10b5b7ac098591863ad11e76b6523e5
+source_commit: 55c813a1bf7e67c00e47410b760104c0d9fbc0ea
 observation_date: 2026-09-05
 ---
 
 # Current product and release status
 
-This page is the maintained starting point for “what is current?” It separates
-the checked-out source, the public service, published artifacts, and platform
-support because those are independent facts. Re-check the named source before
-using this page for a later release or operational decision.
+This is the maintained starting point for “what is current?” Source, installed
+applications, public downloads, update feeds and hosted service behavior are
+independent observations. Re-check their own source of truth for a later
+operational decision.
 
-Continuation on 2026-09-05: both first-attempt stable `1026` installers from
-`eac8df45` pass final native artifact checks, but remain unpublished pre-repair
-evidence. The reviewed existing-index repair passed the complete Worker gate,
-and all four approved production migrations `0042`–`0045` are now applied.
-After the original `0044` refusal, a read-only probe reproduced D1's
-CASE-expression trigger parser issue. The parentheses-only repair passed
-543 Worker tests, 185 script checks, all three dry bundles and both pinned
-R7 runtime checks. The owner explicitly approved a
-data-preserving repair and source/build requalification. The [execution plan](./plans/2026-09-05-public-0-1-18-release.md#approved-migration-repair-continuation)
-records the active boundary; the frozen pre-repair artifacts are not public.
+## Published release
 
-The earlier 200-record decrease is fully reconciled to normal concurrent
-corrections: 748 exact predecessor/successor pairs contribute a net -374
-records, and four first revisions add 174. No revision links are unmatched;
-one read-only statement matches current journal and record totals exactly.
-The 05:47 UTC post-migration check verifies exact prefix 45, the complete
-schema, unchanged collection controls, zero new consent/domain data and
-unchanged transport floors. The exact record count is 3,208,989; retained
-snapshot counts are separate observations, not payload-level identity proof.
-The 05:53 UTC independent reconciliation exactly explains the full +16,172
-before/after delta and matches both reconstructed historical totals and the
-same-statement current view, with all sixteen checks passing and zero writes.
+[TiboTattle 0.1.18](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18)
+is public and immutable. Both macOS 14+ installers are stable build `1026`,
+bound to annotated tag `v0.1.18` at exact source
+`55c813a1bf7e67c00e47410b760104c0d9fbc0ea`.
+[PR #104](https://github.com/adamallcock/tibotattle/pull/104) merged that source
+normally; the release tag and public artifacts must not be rewritten.
 
-## Snapshot identity
-
-| Boundary | Verified state |
+| Distribution boundary | Verified on 2026-09-05 |
 |---|---|
-| Documentation/source review | Combined Astra/Intel `0.1.18` remains based on requested `9e1c3333`. Parser v14, copy-only preservation/accounting proof, ten fresh R7 receipts and the 3,859-pass root qualification are retained. Both first-attempt stable `1026` artifacts from `eac8df45` passed native finalization; their local-only annotated tag and bytes are preserved, not published. The approved Worker migration repair requires a new final source freeze and fresh exact-source artifacts. R7 resource decisions remain open |
-| Combined signed RC3 | ARM and Intel `0.1.18` build `1025.2` dogfood DMGs from common clean `7701debf` and a local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc3-signed-candidates.md). Both signed/notarized/stapled with independent final-byte and RC2-to-RC3 replacement checks; real installed runtime, manual lifecycle and physical Intel remain separate |
-| Combined signed RC2 | ARM and Intel `0.1.18` build `1025.1` dogfood DMGs from common source `4ea16586` and a new local annotated tag; [exact receipt](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md). Both signed/notarized/stapled with independent exact-byte and same-architecture replacement checks; not installed-upgrade, manual lifecycle or physical Intel proof |
-| Earlier Intel tester artifact | Preserved signed/notarized `0.1.18` build `1025` dogfood DMG from source `18c7065b`; [historical receipt](./receipts/2026-09-03-macos-intel-signed-candidate.md). Predates combined Astra changes; remains immutable rollback/test evidence, not physically Intel-qualified |
-| Installed app | Final signed ARM RC3 `0.1.18` / `1025.2`, source `7701debf`, passes production installed-artifact validation. After owner unlock, a native-menu detailed refresh completed at 2026-09-05 03:58 UTC with replay-safe accounting bound to exact v14 generation 71, complete usage coverage and zero fallback. Stopped-state verification preserves all baseline/rehearsal historical keys, reviewed counter changes, salt and paused contribution settings; SQLite quick checks pass. Normal relaunch is observed; stable `1026` installation remains a separate gate |
-| Public service | Health HTTP 200 at 2026-09-05 05:47 UTC, source `b4c8f103bf697fb530434e6de196f2c187645661`; no Worker deployment has occurred. All approved migrations are applied, with exact primary prefix 45 and complete schema verified. Controls/consent and staged transport lifecycle remain unchanged. The earlier count decrease is reconciled to concurrent corrections. Recovery bookmarks are retained; no v1.1 activation operation has been performed |
-| Public updater | Stable `0.1.16`; read-only feed check recorded 2026-09-03 in the release plan |
-| Published release | Immutable GitHub `v0.1.17`, published 2026-09-03 at 19:47:43 UTC; ARM DMG, appcast, manifest, checksums and verification guide; exact source tag commit `aa660b24a66196155ba59267ab832cc4ef6e1c7d` |
+| GitHub release | All seven public assets independently re-downloaded and matched to the canonical manifest and checksums; immutable release and asset attestations verified |
+| Apple silicon installer | 49,908,061 bytes; SHA-256 `2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae` |
+| Intel installer | 52,128,441 bytes; SHA-256 `70630ba90e92a1cd8cb904e66e1aebe85b04e9d23a50bef7e4e41aca84c4d2f6` |
+| Native trust | Both final artifacts pass their own Developer ID signing, Apple notarization/stapling, Gatekeeper, source/payload and architecture checks |
+| Update feeds | [Apple silicon](https://updates.tibotattle.com/appcast.xml) and [Intel](https://updates.tibotattle.com/intel/appcast.xml) both publish 0.1.18 / 1026; independent signed-XML and streamed enclosure checksum checks passed at 19:38 UTC |
+| Homebrew | Apple silicon cask updated to 0.1.18 with the exact ARM checksum; [update workflow](https://github.com/adamallcock/homebrew-tap/actions/runs/33973076582) succeeded and the live cask was checked |
+| Website | [Both macOS tabs](https://tibotattle.com/#download) show 0.1.18 and their own correct public installer URL, minimum OS and architecture |
+| Installed ARM application | Final stable 1026 passes installed-artifact validation, ordinary launch, detailed replay-safe accounting refresh and restart, with matching generation and zero fallback |
 
-This is a snapshot, not an automatic monitor. A newer commit, deployment, feed,
-or release makes the corresponding row stale without changing the other rows.
+The manifest honestly leaves optional SBOM, source-to-binary provenance and
+store fields unset. GitHub's immutable release/asset attestations are not
+substitutes for SLSA build provenance. Follow
+[verify-release.md](./verify-release.md) for independent artifact verification.
 
-## Source tree
+## Hosted service and current graph incident
 
-The reviewed source implements a local-first macOS product, a loopback local
-analysis service, the public website and optional hosted contribution service,
-and release tooling. The maintained architecture, interface, privacy, schema,
-and command contracts are indexed in [the documentation index](./README.md).
+All approved forward migrations `0042`–`0045` are applied. Exact migration
+prefix 45, complete schema and the preservation reconciliation were verified
+without deleting telemetry, restoring production, changing consent or
+activating v1.1 transport. Applied migration files must not be rewritten.
 
-The source snapshot and live Worker identity below are separate observations.
-Source merge does not prove public deployment.
+[PR #105](https://github.com/adamallcock/tibotattle/pull/105) repaired the
+authenticated admin module dependency and atomic weekly revision replacement.
+The website deployment is source
+`26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad`, whose tree matches that reviewed
+repair. Public downloads and the optional hosted analyzer have separate gates.
 
-### Source-only amendments through 2026-08-31
+The remaining graph incident is a database memory-limit failure in quota
+endpoint sampling. The website truthfully displays history-updating status
+instead of an incomplete estimate. A bounded-memory query repair is being
+qualified separately from the frozen desktop release. Recovery requires
+successful scheduled rebuilding, a subsequent valid preview cache and a
+rendered live graph; health HTTP 200 alone is not sufficient.
 
-The [approved self-service deletion retirement](./decisions/2026-08-30-self-service-deletion-retirement.md)
-retires `DELETE /api/v1/me` as `404 NOT_FOUND` without D1 access or participant
-mutation. It replaces the app control with confirmed **Disconnect this Mac**,
-preserving hosted/local history, and retains private owner erasure through
-admin maintenance. The source health contract is `participantDeletion: false`
-with `deletionSafeRestoreReplay: true`. No migration or retention change is
-part of that retirement. This amendment does not refresh or supersede the
-independent live-service, installed-artifact, release, or updater observations
-below; deployment and release remain separate gates.
+The existing dated social preview was temporarily retained to prioritize the
+verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;
+do not describe that retained image as a new release preview.
 
-[PR #89](https://github.com/adamallcock/tibotattle/pull/89) adds a hosted
-admin-only per-model allowance series and **By model** view. Its original
-migration 0041 is now the distinct forward migration 0042 under the
-[verified lineage reconciliation](./reviews/2026-09-04-hosted-migration-lineage-reconciliation.md).
-Worker deployment, warming, and real cohort evidence remain separate; desktop
-installation does not activate it.
+The admin per-model view supports the reviewed model catalog, including Astra
+and older model families. Source support does not establish that its live
+preview has recovered. Contribution consent and staged v1.1 activation remain
+unchanged. The source health contract retains `participantDeletion: false`
+and `deletionSafeRestoreReplay: true`; these flags do not prove every route.
 
-[PR #94](https://github.com/adamallcock/tibotattle/pull/94) adds local plan-era
-attribution plus a staged telemetry v1.1 transport and device-continuity repair.
-Local estimates, history, ranges, forecasts, and share cards use one compatible
-selected population; missing or conflicting identity remains unavailable.
-Current migrations 0043-0045 (originally 0042-0044), stronger-format hosted activation, and new explicit
-consent are not supplied by installing the desktop app.
+## Platform support and qualification limits
 
-[PR #95](https://github.com/adamallcock/tibotattle/pull/95) makes compatible
-Keychain migration bounded and non-interactive, with an explained approval
-fallback available only through a deliberate Settings action. Automatic
-security prompts are release-blocking.
+- **Supported:** macOS 14+ Apple silicon and Intel through the published 0.1.18
+  artifacts and their independent update feeds.
+- **Not released or supported:** Windows, Linux or Electron.
+- Homebrew support remains Apple silicon only; the Intel DMG is distributed
+  directly through the website and GitHub release.
 
-[PR #96](https://github.com/adamallcock/tibotattle/pull/96) makes native startup
-use the bounded primary projection and recover from readiness that arrives after
-the initial wait without retaining a stale timeout page. These entries describe
-merged source at the release-preparation base; they are not installed-artifact,
-hosted-deployment, updater, or stable-release evidence.
+The owner explicitly accepted the unavailable disposable-profile/manual Login
+Item matrix and formal physical Intel install/runtime/update/upload evidence
+**for 0.1.18 only**. These observations are waived, not passed. User-reported
+tester success is not a retained hardware-bound qualification receipt.
+See the [release-specific decision](./decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+and [platform support authority](./reference/platform-support.md).
 
-## Public service
+Data preservation, exact source/artifact binding, native trust, updater
+integrity and unexpected automatic Keychain prompts were not waived.
+Fresh R7 evidence and both pinned-runtime checks were retained; the existing
+open resource decisions are not relabeled as `release_ready`. The supported
+paginated-history reset subset is documented in the
+[qualification review](./reviews/2026-09-04-paginated-export-qualification.md);
+physical-base continuations remain refused.
 
-The earlier 2026-08-31 `/api/health` observation returned HTTP 200 and source
-commit `304f3d736b6f9451d32a616bf3046ea628e828a3`. That deployment predates PR
-#94's device-continuity protocol. It can treat replay of one pairing identifier
-idempotently, but does not establish the fresh-pairing recovery protocol needed
-for an already registered local device.
+Private RC1, RC2 and RC3 candidates, the first pre-repair stable attempt, and
+compatible application/state recovery pairs remain preserved historical
+evidence. They are not the published stable bytes. Do not downgrade upgraded
+state by replacing only its application with an older writer.
 
-The Intel handoff recheck returned health/readiness HTTP 200, open enrollment,
-enabled v1.0 uploads and deployment source
-`b4c8f103bf697fb530434e6de196f2c187645661`. This supersedes the older identity
-observation, but does not independently qualify PR #89/94 migrations, device
-repair or optional v1.1 grants. Those routes and migrations require their own
-evidence. A later read-only inspection found 41 applied primary migrations,
-ending in historical `0041_community_model_composition_cache.sql`, not the
-different composition migration inherited by the candidate. Schema metadata
-confirms the historical column/table and absence of the new composition tables
-and withdrawal trigger. Both deletion-ledger migrations are applied. No
-configured staging database appears in the current account's database-name
-inventory. This is a forward-sequence repair requirement, not permission to
-rewrite the ledger or apply migrations; no live account upload was performed.
-The local reconciliation restores all 41 historical SQL files byte-identically
-to the deployed source and moves only the four unapplied successors to unique
-0042-0045 names, without SQL edits. Alternative applied histories still fail
-the unchanged ordered-prefix deployment gate.
+## Maintaining this snapshot
 
-## Published macOS release and updater
-
-GitHub's release API confirmed immutable stable release `v0.1.17`, published
-2026-09-03 at 19:47:43 UTC. Its exact source tag commit is
-`aa660b24a66196155ba59267ab832cc4ef6e1c7d`; its five assets are the Apple silicon
-DMG, appcast, release manifest, checksums and verification guide.
-
-The earlier public appcast observation advertised `0.1.16`. A fresh read during
-Intel implementation returned HTTP 403, as did the public health endpoint, so
-this document does not claim current feed or service state from that attempt.
-GitHub publication alone does not prove updater or website deployment.
-
-These observations prove public availability of the named release endpoints.
-They do not re-run code signing, notarization, Gatekeeper, clean-install, or
-update-install qualification. Use [verify-release.md](./verify-release.md) for
-artifact verification and the retained release receipts for their exact
-point-in-time evidence only.
-
-## Platform support
-
-- **Supported:** macOS 14 or later on Apple silicon, through the published
-  `v0.1.17` stable artifact described above.
-- **Not supported:** Intel macOS, Windows and Linux. Source, contract, or simulated lanes do
-  not establish an installed, signed, updateable product on those platforms.
-The complete qualification matrix and rules for changing these claims are in
-[platform-support.md](./reference/platform-support.md).
-
-## Release qualification and known boundaries
-
-- The subsequent [publication preparation](./plans/2026-09-04-release-0-1-18-publication-preparation.md)
-  closes two native qualification-tooling gaps: architecture/channel selection
-  and cross-target manual receipt reuse. Current v2 receipts bind inspected
-  source/payload and require explicit human-observed native hardware/OS; they
-  cannot turn synthetic tests into physical qualification. Local checks and
-  [combined RC2 signing/notarization](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md)
-  pass on their named source. Corrected parser v14 and its upgrade deadline now
-  have fresh [signed RC3 evidence](./receipts/2026-09-04-macos-combined-rc3-signed-candidates.md).
-  Final ARM installation, production installed-artifact checks, detailed
-  accounting and stopped-state preservation now pass; normal relaunch is observed.
-  The owner explicitly authorized publication and separately accepted the
-  [0.1.18-only manual/physical waiver](./decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
-  Those unavailable tests are waived, not passed; the 0.1.17 decision does not
-  carry forward. Follow the [current execution plan](./plans/2026-09-05-public-0-1-18-release.md)
-  for remaining stable-artifact, installed-stable, CI, publication and hosted gates.
-  No publication or update activation is claimed by this snapshot.
-
-- The [Intel implementation plan](./plans/2026-09-03-macos-intel-release.md)
-  records separate thin builds, architecture-specific update/publication
-  contracts and manifest-driven website availability. Native/Rosetta and Worker
-  checks passed on that Intel branch. Its owner-authorized R7 regeneration refreshed all ten receipts;
-  both pinned-runtime freshness checks pass. The final root run has 3,738 passes,
-  zero failures and 17 existing conditional skips. The
-  [Intel dogfood candidate](./receipts/2026-09-03-macos-intel-signed-candidate.md)
-  passes signing/notarization and local artifact checks for source `18c7065b`.
-  The combined Astra/Intel workload invalidates those inherited R7 receipts.
-  The owner-authorized [RC2 proof](./reviews/2026-09-04-release-0-1-18-rc2-build-proof.md)
-  passed optimized builds and isolated smokes on both architectures, but the
-  fresh R7 attempt refused paginated Codex history in resumable export source
-  planning. The [approved reset compatibility fix](./reviews/2026-09-04-paginated-export-qualification.md)
-  now passes focused tests; complete R7 regeneration and both runtime freshness
-  checks pass. Both optimized development artifacts, twelve isolated smokes,
-  the full root suite and all 108 retained macOS tests pass. RC2
-  allocation was `1025.1`, stable remains `1026`, and both signed
-  combined candidates pass exact-artifact and replacement checks in the
-  [RC2 receipt](./receipts/2026-09-04-macos-combined-rc2-signed-candidates.md). Physical Intel,
-  actual consented upload and installed update qualification remain separate
-  gates. No public Intel release, feed or website was published.
-
-- The [public-release plan](./plans/2026-09-03-public-0.1.17-release.md)
-  tracks final build `1024`, exact signed-artifact and prior-stable replacement
-  checks, immutable GitHub publication, Sparkle, and Homebrew independently.
-  Source preparation and a dated changelog are not publication evidence.
-- The accepted RC9 runtime has one manual Refresh for quota and detailed
-  accounting, quick startup/automatic checks, at-most-hourly automatic detailed
-  attempts, selected-plan Trends, retained authoritative snapshots, and the
-  measured accounting optimization. The
-  [performance receipt](./receipts/2026-09-03-optimized-rc9-accounting-comparison.md)
-  measures the accounting child, not end-to-end refresh latency.
-- PR #94's local qualification passed with the historical artifact refusal
-  explicitly recorded; the final candidate passes its strict cache validator. The
-  [local qualification receipt](./receipts/2026-09-03-pr94-account-plan-attribution-qualification.md)
-  binds the exact before, after, and final revisions to one immutable admitted
-  index. Its scope is accounting, attribution, calibration, and isolated-child
-  resources; it does not prove raw ingestion, account-exact identity, hosted
-  activation, or installed native lifecycle behavior.
-- The earlier 2026-08-31 raw-source attempt failed closed at
-  `codex_rollout_content_invalid` / `benchmark_cold_rebuild_incomplete` and
-  produced no comparison receipt. Later admitted-index qualification does not
-  relabel that attempt as passed or establish repair of its raw sources.
-- Retained dual-runtime R7 receipts were fully regenerated on the combined
-  source snapshot above and pass both pinned-runtime freshness checks. The earlier protected
-  [R7 attempt](./reviews/2026-09-04-release-0-1-18-rc2-build-proof.md)
-  completed six runtime profiles, then stopped at
-  `export_source_codex_rollout_checkpoint_history_unsupported`. The current
-  selected corpus genuinely declares paginated history. The approved ordinal-zero,
-  no-physical-base reset subset is implemented; the new complete
-  [R7 run](./reviews/2026-09-04-paginated-export-qualification.md#fresh-r7-evidence)
-  completed all ten validated receipts on frozen source. Actual physical-base
-  continuations remain refused.
-  Do not narrow the corpus or bypass the guard to obtain a receipt. Earlier
-  decisions remain
-  `release_open` with unresolved export resource ceilings; that expected state
-  is not a generic macOS release blocker. Receipt freshness is a separate gate,
-  and neither inherited files nor new synthetic tests establish fresh evidence.
-- Following the owner's 2026-09-03 confidence-based release direction, the full
-  clean-profile/physical Login Item matrix is deferred for 0.1.17, not passed.
-  The release still stops for data loss, invalid signatures or updater bytes,
-  and unexpected Keychain prompts. Isolated-profile and fake-manager smokes
-  do not establish the deferred manual evidence.
-- Hosted migrations/deployment, plan-transport consent activation, and repaired
-  device pairing remain separate. Website validator backport/deployment is
-  separately held; publishing the desktop must not deploy current-main Worker
-  code or mutate hosted data.
-- Remote health and availability can change after this snapshot. Public health
-  is not proof of every admin, identity, contribution, deletion, or updater path.
-
-## How to refresh this page
-
-Update each row from its own source of truth: exact Git commit, read-only public
-health response, public appcast bytes, and the GitHub release API. Record the
-observation date, preserve any disagreement, and never infer deployment or
-platform support from source alone. If the page cannot be refreshed in the same
-change as a material claim, narrow or remove the claim instead of carrying it
-forward.
+Update each boundary from exact source, artifact checks, read-only public
+responses, signed feed bytes and actual rendered behavior. Preserve any
+disagreement instead of inferring publication from a build, service recovery
+from health, or physical qualification from a simulated lane. The
+[documentation index](./README.md) and
+[release execution plan](./plans/2026-09-05-public-0-1-18-release.md) retain the
+implementation and historical qualification context.
