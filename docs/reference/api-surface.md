@@ -78,7 +78,7 @@ site.
 | `GET` | `/api/v1/envelope-key` | Native or web client | Public | Returns the public wrapping key; never returns private key material. | Contribution crypto |
 | `POST` | `/api/v1/contributions` | Prepared uploader | Upload | Validates and deduplicates an encrypted contribution, writes D1 state and quarantined R2 object data, and schedules aggregation. | Contribution ingestion |
 | `GET` | `/api/v1/me/export` | Participant browser | Session | Returns a bounded export of the participant's hosted data. | Participant data |
-| `GET` | `/api/v1/community/daily` | Website | Public | Reads a bounded published daily range and omits unavailable allowance evidence. | Community publication |
+| `GET` | `/api/v1/community/daily` | Website | Public | Reads a bounded published daily range; omits unavailable allowance evidence and stale or invalid optional API-equivalent spend. | Community publication |
 
 Production admin API and UI paths are served only on the configured admin host.
 Public-host requests to those paths are deliberately 404. Static site assets

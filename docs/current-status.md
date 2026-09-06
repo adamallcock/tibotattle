@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-05
+date: 2026-09-06
 type: status
 status: current
 source_commit: 55c813a1bf7e67c00e47410b760104c0d9fbc0ea
-observation_date: 2026-09-05
+observation_date: 2026-09-06
 ---
 
 # Current product and release status
@@ -48,16 +48,29 @@ activating v1.1 transport. Applied migration files must not be rewritten.
 
 [PR #105](https://github.com/adamallcock/tibotattle/pull/105) repaired the
 authenticated admin module dependency and atomic weekly revision replacement.
-The website deployment is source
-`26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad`, whose tree matches that reviewed
-repair. Public downloads and the optional hosted analyzer have separate gates.
+Its merged source `26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad` is the
+schema-compatible code rollback target, with both 0.1.18 website downloads.
+Public downloads and the optional hosted analyzer have separate gates.
 
-The remaining graph incident is a database memory-limit failure in quota
-endpoint sampling. The website truthfully displays history-updating status
-instead of an incomplete estimate. A bounded-memory query repair is being
-qualified separately from the frozen desktop release. Recovery requires
-successful scheduled rebuilding, a subsequent valid preview cache and a
-rendered live graph; health HTTP 200 alone is not sufficient.
+[PR #106](https://github.com/adamallcock/tibotattle/pull/106) deployed quota
+sampling source `39e35686480ec0c41a54f29ec42a469a80491fc5`. Its dense synthetic
+memory checks passed, but production exposed quadratic work on sparse quota
+partitions. Cloudflare reported database CPU exhaustion/reset (7429), and some
+public data and health requests returned 503. The earlier memory failure is
+not resolved by replacing it with this timeout.
+
+On 2026-09-06, protected code-only rollback attempts passed freshly retried
+migration checks but still failed the required health check before deployment.
+Do not claim rollback or graph recovery. The rejected query is reverted in
+the pending website branch; the previously released desktop remains unchanged.
+Recovery requires successful scheduled rebuilding, a subsequent valid preview
+cache and a rendered live graph; health HTTP 200 alone is not sufficient.
+
+The requested [all-token detail and API-equivalent spend](./decisions/2026-09-06-community-detail-totals.md)
+are implemented and locally rendered, but not deployed. Price backfill still
+depends on allowance analysis. Production maintenance containment and a new
+bounded-streaming allowance refusal policy await separate owner decisions;
+neither is silently authorized by the display change.
 
 The existing dated social preview was temporarily retained to prioritize the
 verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;
