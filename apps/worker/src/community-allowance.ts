@@ -88,7 +88,9 @@ const FIT_ADAPTER_VERSION = "v1-fit-7";
 export const COMMUNITY_ATTRIBUTION_METHOD_VERSION =
   [PLAN_ATTRIBUTION_POLICY.methodVersion, V1_SOURCE_SELECTION_METHOD_VERSION,
     V1_PLAN_ATTRIBUTION_ADAPTER_VERSION, V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
-    V11_DOMAIN_METHOD_VERSION].join(":");
+    // Public readiness and derived admin output must invalidate alongside the
+    // fit caches when the dollar-equivalent pricing semantics change.
+    V11_DOMAIN_METHOD_VERSION, SERVER_PRICING_METHOD_VERSION].join(":");
 // The tail of every v1 fit-cache key beyond the participant's chunk epoch.
 // One constant serves the writer and both readers so they can never diverge
 // (a 2026-08-30 regression had the corpus reader expecting one fewer segment,

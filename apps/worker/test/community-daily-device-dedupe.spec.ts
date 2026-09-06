@@ -259,18 +259,21 @@ describe("community daily aggregate cross-device dedupe", () => {
     await seedDevice(participant, "spend-old");
     await seedDevice(participant, "spend-new");
     const full = spendRecord();
-    const partial = spendRecord({ components: { inputUncachedTokens: 100, inputCacheReadTokens: null,
+    // Known context permits pricing observed components without guessing the missing cache read.
+    const partial = spendRecord({ totalInputContextTokens: 1000, components: { inputUncachedTokens: 100, inputCacheReadTokens: null,
       inputCacheWriteTokens: 0, outputTextTokens: 50, outputReasoningTokens: 25, outputCombinedTokens: null } });
+    const unknownContext = { ...partial, totalInputContextTokens: null };
     const unknown = spendRecord({ modelId: "unknown-model" });
     await seedChunk({ participantId: participant, deviceId: "spend-old", createdAt: "2026-08-02T00:00:00.000Z",
       records: [{ occurrenceId: "old-copy", recordJson: full }] });
     await seedChunk({ participantId: participant, deviceId: "spend-new", createdAt: "2026-08-03T00:00:00.000Z",
-      records: [full, partial, unknown, {}].map((recordJson, index) => ({ occurrenceId: `spend-${index}`, recordJson })) });
+      records: [full, partial, unknown, {}, unknownContext].map((recordJson, index) => ({ occurrenceId: `spend-${index}`, recordJson })) });
     const payload = await rebuildAndReadDay("2026-08-04T00:00:00.000Z");
     const price = (value: Record<string, unknown>) => priceChunkUsageRecord(JSON.stringify(value), `${DAY}T10:00:00.000Z`)!;
     expect(price(full).pricingStatus).toBe("fully_priced");
     expect(price(partial).pricingStatus).toBe("partially_priced");
     expect(price(partial).costNanousd).toBeGreaterThan(0);
+    expect(price(unknownContext)).toMatchObject({ pricingStatus: "unpriced", costNanousd: 0 });
     // Combined output and its splits represent the same tokens, not two bills.
     expect(price(full).costNanousd).toBe(price(spendRecord({ components: {
       inputUncachedTokens: 100, inputCacheReadTokens: 900, inputCacheWriteTokens: 0,
@@ -278,7 +281,7 @@ describe("community daily aggregate cross-device dedupe", () => {
     } })).costNanousd);
     const expected = Number((BigInt(price(full).costNanousd) + BigInt(price(partial).costNanousd) + 50_000n) / 100_000n) / 10_000;
     expect(payload.apiEquivalentSpend).toMatchObject({ currency: "USD", knownCostUsd: expected,
-      coverage: "partial", usageEvents: 4, fullyPricedUsageEvents: 1, partiallyPricedUsageEvents: 1, unpricedUsageEvents: 2 });
+      coverage: "partial", usageEvents: 5, fullyPricedUsageEvents: 1, partiallyPricedUsageEvents: 1, unpricedUsageEvents: 3 });
     expect(payload.totals.usageEvents).toBe(payload.apiEquivalentSpend.usageEvents);
     expect(isCurrentCommunityDailySpend(payload.apiEquivalentSpend)).toBe(true);
   });

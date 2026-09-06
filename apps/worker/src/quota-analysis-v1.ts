@@ -295,8 +295,8 @@ function usageTrackEpochKey(
 /**
  * Build a TelemetryUsageEvent-shaped object for `priceTelemetryUsageEvent` from
  * a stored v1 usage record. The six v1 component keys map 1:1; the two
- * anthropic-only cache-write split keys the v0.1 pricing shape carries are set
- * to null (v1 does not split them). `modelRecognition` is 'recognized' and
+ * anthropic-only cache-write split keys the v0.1 pricing shape carries remain
+ * unknown unless aggregate writes are explicitly zero. `modelRecognition` is 'recognized' and
  * `modelFingerprint` null — the v1 record has neither; everything the pricer
  * reads (provider, model, billing surface, service tier, speed mode, event
  * time, total input context, components) comes straight from the record.
@@ -327,22 +327,24 @@ function buildPricingEvent(
       && outputReasoningTokens === null && outputCombinedTokens === null) {
     return null;
   }
-  // v1 records do not carry totalInputContextTokens, but the OpenAI
-  // context-sensitive price tiers require it — server-pricing fails closed with
-  // total_input_context_missing (unpriced) otherwise, which refused EVERY reset
-  // of a v1-only participant. Derive it from the input token components: the
-  // total input context is the uncached + cache-read + cache-write input the
-  // request billed.
-  const tokenNumber = (value: unknown): number =>
-    typeof value === "number" && Number.isFinite(value) ? value : 0;
-  const derivedInputContext = tokenNumber(inputUncachedTokens)
-    + tokenNumber(inputCacheReadTokens)
-    + tokenNumber(inputCacheWriteTokens);
+  // A supplied context is authoritative. Older v1 records often omit it, so
+  // derive only from three known input components; a partial sum is merely a
+  // lower bound and must not select a guessed short-context price band.
+  const inputComponents = [inputUncachedTokens, inputCacheReadTokens, inputCacheWriteTokens];
+  const knownInputComponents = inputComponents.every(value =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0);
+  const inputSum = knownInputComponents
+    ? (inputComponents as number[]).reduce((sum, value) => sum + value, 0)
+    : null;
+  const derivedInputContext = inputSum !== null && Number.isSafeInteger(inputSum) ? inputSum : null;
   const suppliedContext = rec.totalInputContextTokens;
   const totalInputContextTokens =
-    typeof suppliedContext === "number" && Number.isFinite(suppliedContext)
+    typeof suppliedContext === "number" && Number.isSafeInteger(suppliedContext) && suppliedContext >= 0
       ? suppliedContext
       : derivedInputContext;
+  // Nonnegative TTL buckets must both be zero when their aggregate is known
+  // zero. Positive/unknown aggregate writes still cannot invent a TTL split.
+  const cacheWriteTtlTokens = rec.provider === "anthropic_claude_code" && inputCacheWriteTokens === 0 ? 0 : null;
   const event = {
     schemaVersion: "usage-event-v0.1",
     eventTime: observedAt,
@@ -358,8 +360,8 @@ function buildPricingEvent(
       inputUncachedTokens,
       inputCacheReadTokens,
       inputCacheWriteTokens,
-      inputCacheWrite5mTokens: null,
-      inputCacheWrite1hTokens: null,
+      inputCacheWrite5mTokens: cacheWriteTtlTokens,
+      inputCacheWrite1hTokens: cacheWriteTtlTokens,
       outputTextTokens,
       outputReasoningTokens,
       outputCombinedTokens,
