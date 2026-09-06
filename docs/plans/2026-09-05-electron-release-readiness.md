@@ -98,6 +98,22 @@ no 0047 migration or ownership route has been added. An independent review of
 the local credential and IPC boundary found no blocking issue. These results
 do not remove the pending source-migration approval or hosted end-to-end gate.
 
+## Packaged startup rejection
+
+Source `88245f7d5bcbdb764751e83a185a8739bb48c373` passed all four development
+builds in [run 34011211557](https://github.com/adamallcock/tibotattle/actions/runs/34011211557),
+but its actual Mac startup failed before opening the dashboard. The explicit
+Electron file inventory omitted `desktop-contribution-credential.js`; exact-set
+artifact verification compared against that same incomplete inventory. This
+candidate is rejected for user testing, with its bundle and failure evidence
+preserved and its launcher disabled. A corrected inventory and a module-linkage
+gate must pass before a fresh package is handed over. A green build receipt is
+not evidence that the app starts.
+
+The Mac subsequently locked during the requested native UI inspection. The
+user has been asked to unlock it; source checks and packaging can continue,
+but rendered window/tray qualification remains pending that access.
+
 Earlier detailed implementation and evidence remain in the
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
 and [desktop convergence plan](2026-09-04-desktop-convergence.md). This short

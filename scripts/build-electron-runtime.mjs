@@ -12,21 +12,24 @@
  * digests; it never records a checkout path, account value, or file contents.
  */
 
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { constants as fileSystemConstants } from "node:fs";
 import {
+  cp,
   lstat as fsLstat,
   mkdir,
   mkdtemp,
   open,
+  readFile,
   readdir,
   realpath,
   rename,
   rm,
   writeFile,
 } from "node:fs/promises";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import {
   basename,
   dirname,
@@ -37,7 +40,7 @@ import {
   sep,
   win32,
 } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   LOCAL_COMPANION_STATIC_FILES,
@@ -57,6 +60,7 @@ import {
   canonicalElectronBuilderPackageJsonBytes,
   ELECTRON_BUILDER_PACKAGE_PROFILES,
 } from "./lib/electron-builder-package-json.mjs";
+import { extractEsmImports } from "./lib/esm-imports.mjs";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -67,6 +71,7 @@ const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_MANIFEST_BYTES = 1 * 1024 * 1024;
 const DEFAULT_PACKAGING_PROFILE = "development";
 const DEFAULT_TARGET = "darwin-arm64";
+const STAGED_ELECTRON_MODULE_LINKAGE_TIMEOUT_MS = 10_000;
 const DARWIN_ARM64_TARGET = "darwin-arm64";
 const DARWIN_X64_TARGET = "darwin-x64";
 const WINDOWS_X64_TARGET = "win32-x64";
@@ -139,6 +144,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/desktop-automatic-refresh-cadence.js",
   "apps/electron/desktop-command.js",
   "apps/electron/desktop-contract.js",
+  "apps/electron/desktop-contribution-credential.js",
   "apps/electron/desktop-codex-roots.js",
   "apps/electron/desktop-deep-links.js",
   "apps/electron/desktop-diagnostics.js",
@@ -601,6 +607,197 @@ function outputPath(root, relativePath) {
     fail("UNSAFE_OUTPUT", `Staged path escapes the output: ${selected}`);
   }
   return resolved;
+}
+
+function failStagedElectronModuleLinkage() {
+  fail("STAGED_MODULE_LINKAGE", "Electron shell module linkage is incomplete");
+}
+
+async function stagedElectronModuleFile(stagingRoot, candidate) {
+  const root = resolve(stagingRoot);
+  const selected = resolve(candidate);
+  if (selected === root || !pathIsInside(root, selected)) {
+    failStagedElectronModuleLinkage();
+  }
+  let metadata;
+  try {
+    metadata = await lstatForRuntime(selected);
+  } catch {
+    failStagedElectronModuleLinkage();
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    failStagedElectronModuleLinkage();
+  }
+  let realRoot;
+  let realSelected;
+  try {
+    [realRoot, realSelected] = await Promise.all([realpath(root), realpath(selected)]);
+  } catch {
+    failStagedElectronModuleLinkage();
+  }
+  if (!pathIsInside(realRoot, realSelected)) failStagedElectronModuleLinkage();
+  return selected;
+}
+
+function stagedBarePackageManifest(stagingRoot, specifier) {
+  if (typeof specifier !== "string"
+      || specifier.length === 0
+      || specifier.includes("\\")
+      || specifier.includes("\0")
+      || specifier.startsWith("/")
+      || specifier.startsWith(".")) {
+    failStagedElectronModuleLinkage();
+  }
+  const segments = specifier.split("/");
+  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+    failStagedElectronModuleLinkage();
+  }
+  const packageSegments = specifier.startsWith("@") ? segments.slice(0, 2) : segments.slice(0, 1);
+  if (packageSegments.length === 0 || packageSegments.some((segment) => segment.length === 0)) {
+    failStagedElectronModuleLinkage();
+  }
+  return join(stagingRoot, "node_modules", ...packageSegments, "package.json");
+}
+
+/**
+ * Prove the staged Electron entrypoint's static ESM graph stays inside the
+ * staged runtime. This runs before the atomic publish, so a newly imported
+ * source file or direct package cannot be masked by a checkout ancestor.
+ * Electron itself remains an explicit runtime-only dynamic import.
+ */
+export async function assertStagedElectronShellModuleLinkage(stagingRoot) {
+  if (typeof stagingRoot !== "string" || !isAbsolute(stagingRoot)) {
+    failStagedElectronModuleLinkage();
+  }
+  const root = resolve(stagingRoot);
+  let rootMetadata;
+  try {
+    rootMetadata = await lstatForRuntime(root);
+  } catch {
+    failStagedElectronModuleLinkage();
+  }
+  if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
+    failStagedElectronModuleLinkage();
+  }
+  const pending = [await stagedElectronModuleFile(
+    root,
+    outputPath(root, "apps/electron/main.js"),
+  )];
+  const visited = new Set();
+  while (pending.length > 0) {
+    const importer = pending.pop();
+    if (visited.has(importer)) continue;
+    visited.add(importer);
+    let source;
+    let imports;
+    try {
+      source = await readFile(importer, "utf8");
+      imports = await extractEsmImports(source, { sourceName: importer });
+    } catch {
+      failStagedElectronModuleLinkage();
+    }
+    for (const { kind, specifier } of imports) {
+      if (kind === "dynamic-import" && specifier === null) failStagedElectronModuleLinkage();
+      if (typeof specifier !== "string") failStagedElectronModuleLinkage();
+      if (specifier.startsWith(".")) {
+        pending.push(await stagedElectronModuleFile(
+          root,
+          resolve(dirname(importer), specifier),
+        ));
+      } else if (!specifier.startsWith("node:")
+          && !(kind === "dynamic-import" && specifier === "electron")) {
+        await stagedElectronModuleFile(root, stagedBarePackageManifest(root, specifier));
+      }
+    }
+  }
+  return Object.freeze([...visited]
+    .map((path) => relative(root, path).split(sep).join("/"))
+    .sort(comparePathBytes));
+}
+
+function stagedElectronModuleLinkageEnvironment(environment = process.env) {
+  const selected = {};
+  // Do not pass Node flags, Electron mode, credentials, or application state
+  // into the import-only child. Windows retains only process-launch essentials.
+  for (const key of ["PATH", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"]) {
+    if (typeof environment[key] === "string") selected[key] = environment[key];
+  }
+  return selected;
+}
+
+async function assertNoAncestorNodeModules(stagingRoot) {
+  let current = dirname(resolve(stagingRoot));
+  while (true) {
+    try {
+      await lstatForRuntime(join(current, "node_modules"));
+      failStagedElectronModuleLinkage();
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        if (error?.code === "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE") throw error;
+        failStagedElectronModuleLinkage();
+      }
+    }
+    const parent = dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
+
+async function importStagedElectronMain(stagingRoot) {
+  const entrypoint = pathToFileURL(join(stagingRoot, "apps/electron/main.js")).href;
+  const source = `await import(${JSON.stringify(entrypoint)});`;
+  let child;
+  try {
+    child = spawn(process.execPath, ["--input-type=module", "--eval", source], {
+      cwd: stagingRoot,
+      env: stagedElectronModuleLinkageEnvironment(),
+      stdio: "ignore",
+      windowsHide: true,
+    });
+  } catch {
+    failStagedElectronModuleLinkage();
+  }
+  const linked = await new Promise((resolveLinked) => {
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, STAGED_ELECTRON_MODULE_LINKAGE_TIMEOUT_MS);
+    child.once("error", () => {
+      clearTimeout(timeout);
+      resolveLinked(false);
+    });
+    child.once("exit", (code) => {
+      clearTimeout(timeout);
+      resolveLinked(!timedOut && code === 0);
+    });
+  });
+  if (linked !== true) failStagedElectronModuleLinkage();
+}
+
+/**
+ * Link the staged Electron main process with plain Node from an external
+ * temporary root. The entrypoint's Electron guard prevents a desktop launch;
+ * no target-native binding is imported by this ESM-only check.
+ */
+export async function assertStagedElectronShellNodeLinkage(stagingRoot) {
+  await assertStagedElectronShellModuleLinkage(stagingRoot);
+  const isolatedParent = await mkdtemp(join(tmpdir(), "tibotattle-electron-linkage-"));
+  const isolatedRuntime = join(isolatedParent, "app");
+  try {
+    await cp(stagingRoot, isolatedRuntime, {
+      errorOnExist: true,
+      force: false,
+      recursive: true,
+    });
+    await assertNoAncestorNodeModules(isolatedRuntime);
+    await importStagedElectronMain(isolatedRuntime);
+  } catch (error) {
+    if (error?.code === "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE") throw error;
+    failStagedElectronModuleLinkage();
+  } finally {
+    await rm(isolatedParent, { force: true, recursive: true });
+  }
 }
 
 async function stageRepositoryFile({ repositoryRoot, stagingRoot, relativePath, kind }) {
@@ -1338,6 +1535,8 @@ export async function buildElectronRuntime({
         status: "not_requested",
       });
     }
+
+    if (includeElectronShell) await assertStagedElectronShellNodeLinkage(temporaryRoot);
 
     const inventory = await collectInventory(temporaryRoot);
     if (windowsBinding.included) {

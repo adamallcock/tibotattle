@@ -7,23 +7,12 @@ import {
   lstat,
   mkdtemp,
   readFile,
-  realpath,
   rm,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import {
-  dirname,
-  extname,
-  isAbsolute,
-  join,
-  relative,
-  resolve,
-  sep,
-} from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
-
-import { extractEsmImports } from "../scripts/lib/esm-imports.mjs";
 
 import {
   buildElectronApp,
@@ -31,6 +20,9 @@ import {
   parseElectronAppArguments,
 } from "../scripts/build-electron-app.mjs";
 import {
+  assertStagedElectronShellModuleLinkage,
+  assertStagedElectronShellNodeLinkage,
+  buildElectronRuntime,
   ELECTRON_TARGETS,
   ELECTRON_SHELL_RUNTIME_FILES,
 } from "../scripts/build-electron-runtime.mjs";
@@ -54,71 +46,6 @@ function loadBuilderConfigForTarget(target) {
 
 function sha256(bytes) {
   return createHash("sha256").update(bytes).digest("hex");
-}
-
-function isPathInside(parent, child) {
-  const suffix = relative(resolve(parent), resolve(child));
-  return suffix === ""
-    || (suffix !== ".." && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix));
-}
-
-async function assertStagedPathInsideAppRoot(appRoot, candidate) {
-  const lexicalRoot = resolve(appRoot);
-  const lexicalCandidate = resolve(candidate);
-  if (!isPathInside(lexicalRoot, lexicalCandidate)) {
-    throw new Error("Staged Electron shell import escapes the app root");
-  }
-  const rootMetadata = await lstat(lexicalRoot);
-  if (rootMetadata.isSymbolicLink() || !rootMetadata.isDirectory()) {
-    throw new Error("Staged Electron shell app root is not a real directory");
-  }
-  const [realRoot, realCandidate] = await Promise.all([
-    realpath(lexicalRoot),
-    realpath(lexicalCandidate),
-  ]);
-  if (!isPathInside(realRoot, realCandidate)) {
-    throw new Error("Staged Electron shell import traverses an external symlink");
-  }
-}
-
-async function resolveStagedRelativeImport(appRoot, importer, specifier) {
-  const candidate = resolve(dirname(importer), specifier);
-  const candidates = extname(candidate)
-    ? [candidate]
-    : [candidate, `${candidate}.js`, join(candidate, "index.js")];
-  for (const selected of candidates) {
-    try {
-      await assertStagedPathInsideAppRoot(appRoot, selected);
-      const metadata = await lstat(selected);
-      if (metadata.isFile() && !metadata.isSymbolicLink()) return selected;
-      if (metadata.isSymbolicLink()) {
-        throw new Error("Staged Electron shell import traverses a symlink");
-      }
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
-    }
-  }
-  throw new Error(`Staged Electron shell import is missing: ${specifier}`);
-}
-
-async function assertStagedElectronShellClosure(appRoot) {
-  const pending = [join(appRoot, "apps/electron/main.js")];
-  const visited = new Set();
-  while (pending.length > 0) {
-    const importer = pending.pop();
-    if (visited.has(importer)) continue;
-    visited.add(importer);
-    const source = await readFile(importer, "utf8");
-    const imports = await extractEsmImports(source, { sourceName: importer });
-    for (const { kind, specifier } of imports) {
-      if (kind === "dynamic-import" && specifier === null) {
-        throw new Error("Nonliteral Electron shell dynamic imports are not reviewable");
-      }
-      if (typeof specifier !== "string" || !specifier.startsWith(".")) continue;
-      pending.push(await resolveStagedRelativeImport(appRoot, importer, specifier));
-    }
-  }
-  return visited;
 }
 
 async function withTemporaryDirectory(run) {
@@ -147,10 +74,8 @@ test("Electron app staging includes the shell and keeps the companion manifest v
       assert.ok(paths.includes(relativePath), relativePath);
     }
     assert.ok(paths.includes("src/platform/windows-credential-manager-probe.js"));
-    const shellClosure = await assertStagedElectronShellClosure(result.output);
-    assert.ok(shellClosure.has(
-      join(result.output, "src/platform/windows-credential-manager-probe.js"),
-    ));
+    const shellClosure = await assertStagedElectronShellModuleLinkage(result.output);
+    assert.ok(shellClosure.includes("src/platform/windows-credential-manager-probe.js"));
     await access(join(result.output, "apps/local/server.js"));
     await access(join(result.output, "apps/web/public/index.html"));
     assert.ok(paths.every((path) => !/(^|\/)(?:docs?|tests?)(?:\/|$)/iu.test(path)));
@@ -305,6 +230,68 @@ test("Electron app staging supports the non-Windows target-specific shell inputs
   });
 });
 
+test("staged Electron main links in isolated plain Node for every target", async () => {
+  await withTemporaryDirectory(async (root) => {
+    for (const target of Object.keys(ELECTRON_TARGETS)) {
+      const result = await buildElectronRuntime({
+        output: join(root, target),
+        target,
+        includeElectronShell: true,
+      });
+      const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+      assert.equal(manifest.windowsBinding.included, false, target);
+      const shellClosure = await assertStagedElectronShellModuleLinkage(result.output);
+      assert.ok(shellClosure.includes("apps/electron/desktop-contribution-credential.js"), target);
+      // buildElectronRuntime runs the same isolated plain-Node linkage check
+      // before publishing the staged tree for every target.
+    }
+  });
+});
+
+test("staged Electron linkage fails closed for missing modules and packages", async () => {
+  await withTemporaryDirectory(async (root) => {
+    const relative = await buildElectronRuntime({
+      output: join(root, "missing-relative"),
+      includeElectronShell: true,
+    });
+    await rm(join(relative.output, "apps/electron/desktop-contribution-credential.js"));
+    await assert.rejects(
+      () => assertStagedElectronShellModuleLinkage(relative.output),
+      (error) => error?.code === "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE",
+    );
+    await assert.rejects(
+      () => assertStagedElectronShellNodeLinkage(relative.output),
+      (error) => error?.code === "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE",
+    );
+
+    const packageManifest = await buildElectronRuntime({
+      output: join(root, "missing-workspace-manifest"),
+      includeElectronShell: true,
+    });
+    await rm(join(
+      packageManifest.output,
+      "node_modules/@app-usagemonitor/telemetry-contract/package.json",
+    ));
+    await assert.rejects(
+      () => assertStagedElectronShellModuleLinkage(packageManifest.output),
+      (error) => error?.code === "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE",
+    );
+
+    const workspaceFile = await buildElectronRuntime({
+      output: join(root, "missing-workspace-file"),
+      includeElectronShell: true,
+    });
+    await rm(join(
+      workspaceFile.output,
+      "node_modules/@app-usagemonitor/telemetry-contract/src/constants.js",
+    ));
+    await assert.rejects(
+      () => assertStagedElectronShellNodeLinkage(workspaceFile.output),
+      (error) => error?.code === "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE",
+    );
+  });
+});
+
 test("Windows Electron staging requires the reviewed native binding pair", async () => {
   await withTemporaryDirectory(async (root) => {
     await assert.rejects(
@@ -360,10 +347,8 @@ test("Windows Electron staging includes the exact binding pair and shell", async
       await access(join(result.output, relativePath));
       assert.ok(paths.includes(relativePath), relativePath);
     }
-    const shellClosure = await assertStagedElectronShellClosure(result.output);
-    assert.ok(shellClosure.has(
-      join(result.output, "src/platform/windows-credential-manager-probe.js"),
-    ));
+    const shellClosure = await assertStagedElectronShellModuleLinkage(result.output);
+    assert.ok(shellClosure.includes("src/platform/windows-credential-manager-probe.js"));
     assert.ok(!paths.some((path) => path.includes("windows_filesystem_qualification")));
     assert.ok(!paths.some((path) => /(^|\/)(?:docs?|tests?)(?:\/|$)/iu.test(path)));
   });
