@@ -4,6 +4,14 @@ import {
 } from "./telemetry-shared.generated.js";
 
 const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.3";
+const ADMIN_RECONSTRUCTION_SCHEMA_VERSION = "admin-reconstruction-progress-v0.1";
+const ADMIN_RECONSTRUCTION_STATUSES = new Set(["available", "unavailable"]);
+const ADMIN_RECONSTRUCTION_MODES = new Set([
+  "resumable", "synchronous", "paused", "unknown",
+]);
+const ADMIN_RECONSTRUCTION_PUBLICATION_STATES = new Set([
+  "updating", "ready", "unknown",
+]);
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
 const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
   "admin-community-allowance-preview-v0.3";
@@ -1118,6 +1126,90 @@ function projectIngress(value) {
   });
 }
 
+/**
+ * Reconstruction is additive operational evidence, not a prerequisite for the
+ * existing overview. Omit invalid evidence without concealing other sections.
+ */
+function projectReconstruction(value) {
+  if (value === null || value === undefined) return null;
+  const code = "ADMIN_RECONSTRUCTION_INVALID";
+  const timestamp = (value) => {
+    const result = isoTimestamp(value, code);
+    if (new Date(result).toISOString() !== result) invalid(code);
+    return result;
+  };
+  const nullableTimestamp = (value) => value === null ? null : timestamp(value);
+  try {
+    const reconstruction = record(value, code);
+    if (reconstruction.schemaVersion !== ADMIN_RECONSTRUCTION_SCHEMA_VERSION) {
+      invalid(code);
+    }
+    const base = {
+      schemaVersion: ADMIN_RECONSTRUCTION_SCHEMA_VERSION,
+      status: enumValue(reconstruction.status, ADMIN_RECONSTRUCTION_STATUSES, code),
+      observedAt: timestamp(reconstruction.observedAt),
+      mode: enumValue(reconstruction.mode, ADMIN_RECONSTRUCTION_MODES, code),
+    };
+    if (base.status === "unavailable") return Object.freeze(base);
+
+    const lookup = record(reconstruction.lookup, code);
+    const calculations = record(reconstruction.calculations, code);
+    const maintenance = record(reconstruction.maintenance, code);
+    const publication = record(reconstruction.publication, code);
+    const projectedLookup = Object.freeze({
+      complete: boolean(lookup.complete, code),
+      lastRecordId: count(lookup.lastRecordId, code),
+      throughRecordId: count(lookup.throughRecordId, code),
+    });
+    if (projectedLookup.lastRecordId > projectedLookup.throughRecordId
+        || (projectedLookup.complete
+          && projectedLookup.lastRecordId !== projectedLookup.throughRecordId)) invalid(code);
+    const projectedCalculations = Object.freeze({
+      trackedAccounts: count(calculations.trackedAccounts, code),
+      completedAccounts: count(calculations.completedAccounts, code),
+      preparingAccounts: count(calculations.preparingAccounts, code),
+      scanningAccounts: count(calculations.scanningAccounts, code),
+      finalizingAccounts: count(calculations.finalizingAccounts, code),
+      sourceChangedAccounts: count(calculations.sourceChangedAccounts, code),
+      checkpointsWritten: count(calculations.checkpointsWritten, code),
+      bounded: boolean(calculations.bounded, code),
+      newestResultAt: nullableTimestamp(calculations.newestResultAt),
+    });
+    const phaseCount = projectedCalculations.completedAccounts
+      + projectedCalculations.preparingAccounts
+      + projectedCalculations.scanningAccounts
+      + projectedCalculations.finalizingAccounts
+      + projectedCalculations.sourceChangedAccounts;
+    if (!Number.isSafeInteger(phaseCount)
+        || phaseCount !== projectedCalculations.trackedAccounts) invalid(code);
+    const publishedDays = count(publication.publishedDays, code);
+    const pricedDays = count(publication.pricedDays, code);
+    if (pricedDays > publishedDays) invalid(code);
+
+    return Object.freeze({
+      ...base,
+      lookup: projectedLookup,
+      calculations: projectedCalculations,
+      maintenance: Object.freeze({
+        running: boolean(maintenance.running, code),
+        lastRunAt: nullableTimestamp(maintenance.lastRunAt),
+        leaseExpiresAt: nullableTimestamp(maintenance.leaseExpiresAt),
+      }),
+      publication: Object.freeze({
+        state: enumValue(publication.state, ADMIN_RECONSTRUCTION_PUBLICATION_STATES, code),
+        pendingDays: count(publication.pendingDays, code),
+        pendingDaysBounded: boolean(publication.pendingDaysBounded, code),
+        publishedDays,
+        pricedDays,
+        latestPublishedAt: nullableTimestamp(publication.latestPublishedAt),
+      }),
+    });
+  } catch (error) {
+    if (error instanceof AdminResponseError && error.code === code) return null;
+    throw error;
+  }
+}
+
 function projectErrors(value) {
   const errors = record(value, "ADMIN_OVERVIEW_INVALID");
   const groups = array(errors.groups, "ADMIN_OVERVIEW_INVALID").map((value) => {
@@ -1227,6 +1319,7 @@ export function projectAdminOverview(value) {
     lifecycle: projectLifecycle(overview.lifecycle),
     reconciliation: projectReconciliation(overview.reconciliation),
     ingress: projectIngress(overview.ingress),
+    reconstruction: projectReconstruction(overview.reconstruction),
     distribution: projectDistribution(overview.distribution),
     snapshots: Object.freeze(snapshots),
     dailyPublication: projectDailyPublication(overview.dailyPublication),

@@ -21,6 +21,40 @@ const fixture = async (name) => JSON.parse(await readFile(
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 
+function reconstructionPayload() {
+  return {
+    schemaVersion: "admin-reconstruction-progress-v0.1",
+    status: "available",
+    observedAt: "2026-09-06T20:34:00.000Z",
+    mode: "resumable",
+    lookup: { complete: false, lastRecordId: 200, throughRecordId: 1_000 },
+    calculations: {
+      trackedAccounts: 15,
+      completedAccounts: 8,
+      preparingAccounts: 2,
+      scanningAccounts: 2,
+      finalizingAccounts: 2,
+      sourceChangedAccounts: 1,
+      checkpointsWritten: 84,
+      bounded: false,
+      newestResultAt: "2026-09-06T20:30:00.000Z",
+    },
+    maintenance: {
+      running: true,
+      lastRunAt: "2026-09-06T20:33:00.000Z",
+      leaseExpiresAt: "2026-09-06T20:35:00.000Z",
+    },
+    publication: {
+      state: "updating",
+      pendingDays: 238,
+      pendingDaysBounded: false,
+      publishedDays: 70,
+      pricedDays: 1,
+      latestPublishedAt: "2026-09-06T20:31:00.000Z",
+    },
+  };
+}
+
 function emptyAllowanceSummary() {
   return {
     fitCount: 0,
@@ -281,6 +315,7 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
   const overview = projectAdminOverview(await fixture("admin-overview-valid.json"));
   assert.deepEqual(overview, {
     generatedAt: "2026-08-17T12:00:00.000Z",
+    reconstruction: null,
     service: { environment: "production" },
     collection: {
       state: "operational",
@@ -504,6 +539,153 @@ test("admin overview fixture projects to the renderer's explicit contract", asyn
   });
   assert.equal(Object.isFrozen(overview), true);
   assert.equal(Object.isFrozen(overview.collection), true);
+});
+
+test("admin overview projects isolated reconstruction evidence and omits unknown fields", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  payload.reconstruction = reconstructionPayload();
+  payload.reconstruction.unreviewed = "omit-me";
+  for (const section of ["lookup", "calculations", "maintenance", "publication"]) {
+    payload.reconstruction[section].unreviewed = "omit-me";
+  }
+  const projected = projectAdminOverview(payload).reconstruction;
+  assert.deepEqual(projected, reconstructionPayload());
+  assert.equal(Object.isFrozen(projected), true);
+  for (const section of ["lookup", "calculations", "maintenance", "publication"]) {
+    assert.equal(Object.isFrozen(projected[section]), true, section);
+    assert.notEqual(projected[section], payload.reconstruction[section], section);
+  }
+});
+
+test("reconstruction unavailable status is minimal and legacy overview remains valid", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  const legacy = projectAdminOverview(payload);
+  assert.equal(legacy.reconstruction, null);
+  payload.reconstruction = null;
+  assert.deepEqual(projectAdminOverview(payload), legacy);
+  for (const mode of ["resumable", "synchronous", "paused", "unknown"]) {
+    const minimal = {
+      schemaVersion: "admin-reconstruction-progress-v0.1",
+      status: "unavailable",
+      observedAt: "2026-09-06T20:34:00.000Z",
+      mode,
+    };
+    payload.reconstruction = { ...reconstructionPayload(), ...minimal };
+    assert.deepEqual(projectAdminOverview(payload).reconstruction, minimal);
+    payload.reconstruction = minimal;
+    assert.deepEqual(projectAdminOverview(payload).reconstruction, minimal);
+  }
+});
+
+test("reconstruction permits explicit unknown freshness and zero progress", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  const progress = reconstructionPayload();
+  progress.lookup = { complete: true, lastRecordId: 0, throughRecordId: 0 };
+  for (const name of Object.keys(progress.calculations)) {
+    if (name.endsWith("Accounts") || name === "checkpointsWritten") {
+      progress.calculations[name] = 0;
+    }
+  }
+  progress.calculations.bounded = true;
+  progress.calculations.newestResultAt = null;
+  progress.maintenance = { running: false, lastRunAt: null, leaseExpiresAt: null };
+  progress.publication = {
+    state: "unknown", pendingDays: 0, pendingDaysBounded: true,
+    publishedDays: 0, pricedDays: 0, latestPublishedAt: null,
+  };
+  for (const mode of ["resumable", "synchronous", "paused", "unknown"]) {
+    for (const state of ["updating", "ready", "unknown"]) {
+      progress.mode = mode;
+      progress.publication.state = state;
+      payload.reconstruction = progress;
+      assert.deepEqual(projectAdminOverview(payload).reconstruction, progress);
+    }
+  }
+});
+
+test("invalid reconstruction structure, states and phase totals cannot reject a valid overview", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  const legacy = projectAdminOverview(payload);
+  for (const malformed of [false, [], "available", {}, undefined]) {
+    payload.reconstruction = malformed;
+    assert.deepEqual(projectAdminOverview(payload), legacy);
+  }
+  const mutations = [
+    (value) => { value.schemaVersion = "admin-reconstruction-progress-v0.2"; },
+    (value) => { value.status = "ready"; },
+    (value) => { value.mode = "automatic"; },
+    (value) => { value.publication.state = "published"; },
+    (value) => { value.lookup.complete = 1; },
+    (value) => { value.calculations.bounded = 1; },
+    (value) => { value.maintenance.running = 1; },
+    (value) => { value.publication.pendingDaysBounded = 1; },
+    (value) => { value.calculations.trackedAccounts += 1; },
+    (value) => { value.calculations.completedAccounts += 1; },
+    (value) => { value.calculations.sourceChangedAccounts += 1; },
+    (value) => { value.lookup.lastRecordId = value.lookup.throughRecordId + 1; },
+    (value) => { value.lookup.complete = true; },
+    (value) => { value.publication.pricedDays = value.publication.publishedDays + 1; },
+    ...["lookup", "calculations", "maintenance", "publication"].map((section) =>
+      (value) => { delete value[section]; }),
+  ];
+  for (const mutate of mutations) {
+    payload.reconstruction = reconstructionPayload();
+    mutate(payload.reconstruction);
+    assert.deepEqual(projectAdminOverview(payload), legacy);
+  }
+});
+
+test("reconstruction requires nonnegative safe integer counts in every section", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  const legacy = projectAdminOverview(payload);
+  const fields = {
+    lookup: ["lastRecordId", "throughRecordId"],
+    calculations: ["trackedAccounts", "completedAccounts", "preparingAccounts",
+      "scanningAccounts", "finalizingAccounts", "sourceChangedAccounts", "checkpointsWritten"],
+    publication: ["pendingDays", "publishedDays", "pricedDays"],
+  };
+  for (const [section, names] of Object.entries(fields)) {
+    for (const name of names) {
+      for (const invalid of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, Infinity, "0", null, undefined]) {
+        payload.reconstruction = reconstructionPayload();
+        payload.reconstruction[section][name] = invalid;
+        assert.deepEqual(projectAdminOverview(payload), legacy, `${section}.${name}: ${invalid}`);
+      }
+    }
+  }
+});
+
+test("reconstruction accepts safe integer boundaries without rounding progress", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  payload.reconstruction = reconstructionPayload();
+  payload.reconstruction.lookup = {
+    complete: true,
+    lastRecordId: Number.MAX_SAFE_INTEGER,
+    throughRecordId: Number.MAX_SAFE_INTEGER,
+  };
+  payload.reconstruction.calculations.checkpointsWritten = Number.MAX_SAFE_INTEGER;
+  assert.deepEqual(projectAdminOverview(payload).reconstruction, payload.reconstruction);
+});
+
+test("reconstruction validates each timestamp and isolates unavailable metadata errors", async () => {
+  const payload = await fixture("admin-overview-valid.json");
+  const legacy = projectAdminOverview(payload);
+  const fields = [[null, "observedAt"], ["calculations", "newestResultAt"],
+    ["maintenance", "lastRunAt"], ["maintenance", "leaseExpiresAt"],
+    ["publication", "latestPublishedAt"]];
+  for (const [section, name] of fields) {
+    for (const invalid of ["not-a-date", "September 6, 2026", "2026-02-30T00:00:00.000Z", 0, undefined]) {
+      payload.reconstruction = reconstructionPayload();
+      const target = section ? payload.reconstruction[section] : payload.reconstruction;
+      target[name] = invalid;
+      assert.deepEqual(projectAdminOverview(payload), legacy, `${section}.${name}: ${invalid}`);
+    }
+  }
+  for (const field of ["observedAt", "schemaVersion", "mode", "status"]) {
+    payload.reconstruction = { ...reconstructionPayload(), status: "unavailable" };
+    delete payload.reconstruction[field];
+    assert.deepEqual(projectAdminOverview(payload), legacy, field);
+  }
 });
 
 test("an unavailable ingress budget projects to null instead of failing the view", async () => {

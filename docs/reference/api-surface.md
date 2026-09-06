@@ -56,7 +56,7 @@ site.
 | `POST` | `/api/v1/identity/apple/result` | Initiating client | Handoff | Reads/delivers the state-and-verifier-bound result. | Hosted identity |
 | `GET` | `/api/v1/session` | Website or loopback relay | Session | Reads the current participant session and CSRF projection. | Participant account |
 | `POST` | `/api/v1/logout` | Website or loopback relay | Session | Revokes/clears the current web session. | Participant account |
-| `GET` | `/api/v1/admin/overview` | Admin application | Admin | Reads bounded operational, distribution, lifecycle, and sampled error evidence. | Operations |
+| `GET` | `/api/v1/admin/overview` | Admin application | Admin | Reads bounded operational, distribution, lifecycle, sampled error evidence, and optional failure-isolated reconstruction progress. Refresh never advances calculation. | Operations |
 | `GET` | `/api/v1/admin/metrics/history` | Admin application | Admin | Reads bounded operational history. | Operations |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin application | Admin | Reads unpublished allowance-fit previews; does not publish. | Operations |
 | `POST` | `/api/v1/admin/action` | Owner/admin application | Admin | Collection controls, maintenance, and distribution actions; explicit participant erasure uses the existing maintenance action with auditable D1/R2 effects. | Operations |

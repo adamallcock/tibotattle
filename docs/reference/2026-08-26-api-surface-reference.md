@@ -333,7 +333,7 @@ Authority vocabulary:
 | `POST` | `/api/v1/identity/apple/result` | Handoff | Deliver the bounded one-time Apple identity proof to its initiator |
 | `GET` | `/api/v1/session` | Session | Read the current web-session projection and CSRF material |
 | `POST` | `/api/v1/logout` | Session | Revoke the current web session |
-| `GET` | `/api/v1/admin/overview` | Admin | Read owner operations state plus bounded optional distribution integrations |
+| `GET` | `/api/v1/admin/overview` | Admin | Read owner operations state, bounded optional distribution integrations, and failure-isolated reconstruction progress; no calculation on refresh |
 | `GET` | `/api/v1/admin/metrics/history` | Admin | Read cached owner metrics history |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin | Preview the cached owner-only allowance merge without publishing it |
 | `POST` | `/api/v1/admin/action` | Admin | Run an allowlisted operations action; explicit owner participant erasure is a task of `run_maintenance`, not a new action or route |

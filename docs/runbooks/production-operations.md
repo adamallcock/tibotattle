@@ -52,7 +52,10 @@ to conceal a source mismatch.
 One physical-statement meter covers both D1 bindings and all scheduled phases
 (900 statements, with lease-release headroom). Required maintenance runs
 first. Optional calculation has a 40-second admission deadline, rotates
-participants, and yields durable progress when it cannot finish. A completed
+participants, and yields durable progress when it cannot finish. Already-current
+accounts are checked within the same budget but do not consume the four
+unfinished-analysis slots. This improves useful-work selection without adding
+parallel database or pricing work. A completed
 head is admitted before rehydration only if its entire read and the shared
 usage-finishing reserve fit. Sustained required-work saturation may defer
 large accounts; it is not permission to lower evidence caps.
@@ -68,6 +71,22 @@ review pass, through the normal guarded deploy wrapper. Verify natural
 scheduled progress, cache source identity, public/admin responses and the
 rendered graph independently. See the
 [recovery decision](../decisions/2026-09-06-hosted-calculator-recovery.md).
+
+The admin allowance section includes reconstruction progress from the existing
+owner-only overview. Its optional `reconstruction` block reads bounded derived
+metadata: lookup position, acquisition phases, invalidated sources, maintenance
+lease state, last cached-result time, and the daily publication/price backlog.
+The display survives an unavailable allowance preview; a failed overview refresh
+labels its last observation stale. Missing diagnostics do not take Operations
+down or become zero work. Refresh never starts a calculation.
+
+Acquisition completion is not a finished allowance estimate. The account census
+is capped at 10,000 tracked checkpoints and explicitly indicates truncation.
+Publication coverage uses 366 indexed day lookups; a day with known price data
+may still be partially priced. Neither account progress nor queued-day counts
+is an estimate of remaining time. Parallelizing days alone does not remove the
+complete-account-cache prerequisite; source fencing and shared resource budgets
+must remain intact in any later concurrency change.
 
 ## Read-only observation
 

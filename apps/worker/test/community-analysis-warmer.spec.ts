@@ -347,12 +347,58 @@ describe("scheduled analysis warmer and atomic cache promotion",()=>{
 
   it("rotates bounded work fairly and leaves a spent invocation unchanged",async()=>{
     for(let n=0;n<5;n++)await seed(`warmer-${n}`,1);
-    const first=await warm();expect(first.result.visited).toBeLessThanOrEqual(4);expect(first.result.published).toBeGreaterThan(0);
-    const second=await warm(900,NOW+60_000);expect(second.result.visited).toBeLessThanOrEqual(4);
+    const first=await warm();expect(first.result).toMatchObject({visited:4,resumed:4,published:4,status:"deferred"});
+    // The next rotation checks current entries without spending its work slots.
+    const second=await warm(900,NOW+60_000);expect(second.result).toMatchObject({visited:5,resumed:1,published:1,status:"complete"});
     expect((await cacheRows()).map(rows=>rows.length)).toEqual([5,5]);
     const prior=await cacheRows(),spent=await warm(12);
     expect(spent.result).toMatchObject({status:"deferred",visited:0,published:0});expect(spent.meter.queriesUsed).toBe(0);
     expect(await cacheRows()).toEqual(prior);
+  });
+
+  it("reaches both unfinished accounts beyond a thirteen-account current prefix",async()=>{
+    const ids=Array.from({length:15},(_,n)=>`current-prefix-${String(n).padStart(2,"0")}`);
+    for(const id of ids)await seed(id,1);
+    const start=Math.floor(NOW/60_000)%ids.length;
+    const order=ids.map((_,index)=>ids[(start+index)%ids.length]!);
+    for(const id of order.slice(0,13))expect(await publishCommunityAnalysisCaches(db(),await identity(id),
+      [{source:"v1",analysis:refusal}],refusal,LEASE)).toBe(true);
+    const currentBefore=(await cacheRows()).map(rows=>rows.filter(row=>order.slice(0,13).includes(String(row.participant_id))));
+    const run=await warm();
+    expect(run.result).toMatchObject({status:"complete",visited:15,resumed:2,published:2});
+    const after=await cacheRows();expect(after.map(rows=>rows.length)).toEqual([15,15]);
+    expect(after.map(rows=>rows.filter(row=>order.slice(0,13).includes(String(row.participant_id))))).toEqual(currentBefore);
+    const next=await warm(900,NOW+60_000);
+    expect(next.result).toMatchObject({status:"complete",visited:15,resumed:0,published:0});
+    expect(next.observation.raw()).toEqual([]);expect(await cacheRows()).toEqual(after);
+  });
+
+  it("keeps the four stale-analysis ceiling after skipping a current prefix and rotates remaining work",async()=>{
+    const ids=Array.from({length:12},(_,n)=>`useful-work-${String(n).padStart(2,"0")}`);
+    for(const id of ids)await seed(id,1);
+    const start=Math.floor(NOW/60_000)%ids.length;
+    const order=ids.map((_,index)=>ids[(start+index)%ids.length]!);
+    for(const id of order.slice(0,6))expect(await publishCommunityAnalysisCaches(db(),await identity(id),
+      [{source:"v1",analysis:refusal}],refusal,LEASE)).toBe(true);
+    const first=await warm();
+    expect(first.result).toMatchObject({status:"deferred",visited:10,resumed:4,published:4});
+    expect((await db().prepare("SELECT participant_id FROM community_analysis_work ORDER BY participant_id").all()).results)
+      .toEqual(order.slice(6,10).sort().map(participant_id=>({participant_id})));
+    const second=await warm(900,NOW+60_000);
+    expect(second.result).toMatchObject({status:"complete",visited:12,resumed:2,published:2});
+    expect((await cacheRows()).map(rows=>rows.length)).toEqual([12,12]);
+  });
+
+  it("stops metered current-prefix scans before a spent budget without creating work",async()=>{
+    for(let n=0;n<8;n++){
+      const id=`metered-current-${n}`;await seed(id,1);
+      expect(await publishCommunityAnalysisCaches(db(),await identity(id),[{source:"v1",analysis:refusal}],refusal,LEASE)).toBe(true);
+    }
+    const prior=await cacheRows(),run=await warm(40);
+    expect(run.result).toMatchObject({status:"deferred",resumed:0,published:0});
+    expect(run.result.visited).toBeGreaterThan(0);expect(run.result.visited).toBeLessThan(8);
+    expect(run.observation.raw()).toEqual([]);expect(await cacheRows()).toEqual(prior);
+    expect(await db().prepare("SELECT COUNT(*) AS n FROM community_analysis_work").first()).toEqual({n:0});
   });
 
   it("uses the current-chunk and time-range indexes while preserving legacy overlap parity",async()=>{

@@ -2882,6 +2882,88 @@ async function loadAdminCommunityAllowance(loadGeneration) {
   renderAdminCommunityAllowance(state.allowancePreview);
 }
 
+function renderReconstructionProgress(progress, { stale = false } = {}) {
+  if (!isAdminPage) return;
+  const panel = $("#admin-reconstruction-progress");
+  const badge = $("#admin-reconstruction-status");
+  const details = $("#admin-reconstruction-details");
+  if (!panel || !badge || !details) return;
+  panel.className = `admin-reconstruction${stale ? " admin-reconstruction-stale" : ""}`;
+  details.replaceChildren();
+  const paragraph = (parent, text, className = "") => {
+    const node = document.createElement("p");
+    node.className = className;
+    node.textContent = text;
+    parent.append(node);
+    return node;
+  };
+  const modeLabel = {
+    resumable: "Resumable calculation",
+    synchronous: "Synchronous calculation",
+    paused: "Paused",
+    unknown: "Mode unknown",
+  }[progress?.mode];
+  const available = progress?.status === "available";
+  badge.className = `admin-source-badge admin-source-${!available || stale || progress.mode === "paused" ? "partial" : "available"}`;
+  badge.textContent = stale && available
+    ? "Stale · last known progress"
+    : !available
+      ? `${progress?.mode === "paused" ? "Paused · " : ""}Progress unavailable`
+      : modeLabel;
+  if (!available) {
+    paragraph(details, "Reconstruction progress is unavailable. Missing progress does not mean there is no work remaining.");
+  } else {
+    const { lookup, calculations, maintenance, publication } = progress;
+    const explanation = paragraph(details,
+      "Daily publication waits for account calculations. Acquired checkpoints are saved calculation inputs, not ready allowance estimates.");
+    explanation.id = "admin-reconstruction-explanation";
+    const grid = document.createElement("dl");
+    grid.className = "admin-reconstruction-grid";
+    const metric = (label, value) => {
+      const group = document.createElement("div");
+      const term = document.createElement("dt");
+      term.textContent = label;
+      const description = document.createElement("dd");
+      description.textContent = value;
+      group.append(term, description);
+      grid.append(group);
+      return group;
+    };
+    const lookupGroup = metric("Record lookup", lookup.complete ? "Complete" : "In progress");
+    if (!lookup.complete) paragraph(lookupGroup,
+      `Lookup position: ${formatNumber(lookup.lastRecordId)} / ${formatNumber(lookup.throughRecordId)}. Positions may have gaps; not a processed-record count.`);
+    const accountCount = `${formatNumber(calculations.completedAccounts)} of ${formatNumber(calculations.trackedAccounts)} ${calculations.bounded ? "shown " : ""}tracked accounts`;
+    const accountGroup = metric("Account checkpoint acquisition",
+      accountCount);
+    if (calculations.trackedAccounts > 0) {
+      const meter = document.createElement("progress");
+      meter.setAttribute("max", calculations.trackedAccounts);
+      meter.setAttribute("value", calculations.completedAccounts);
+      meter.setAttribute("aria-label", "Account checkpoint acquisition");
+      meter.setAttribute("aria-valuetext", `${accountCount} have acquired checkpoints`);
+      meter.setAttribute("aria-describedby", "admin-reconstruction-explanation");
+      meter.textContent = accountCount;
+      accountGroup.append(meter);
+    }
+    paragraph(accountGroup, `Preparing ${formatNumber(calculations.preparingAccounts)} · scanning ${formatNumber(calculations.scanningAccounts)} · finalizing ${formatNumber(calculations.finalizingAccounts)} · source, window or method changed ${formatNumber(calculations.sourceChangedAccounts)}`);
+    paragraph(accountGroup, `${formatNumber(calculations.checkpointsWritten)} checkpoint steps saved in current runs`);
+    paragraph(accountGroup, `Latest cached result: ${calculations.newestResultAt === null ? "not recorded" : `${formatTime(calculations.newestResultAt)} (may be outdated)`}`);
+    if (calculations.bounded) paragraph(accountGroup, `At least ${formatNumber(calculations.trackedAccounts)} tracked accounts; the meter covers only those shown, not overall completion.`);
+    const publicationGroup = metric("Daily publication", {
+      updating: "Updating",
+      ready: "Ready",
+      unknown: "State unknown",
+    }[publication.state]);
+    paragraph(publicationGroup, `${publication.pendingDaysBounded ? "At least " : ""}${formatNumber(publication.pendingDays)} pending days across all history`);
+    paragraph(publicationGroup, `Last 366 days: ${formatNumber(publication.publishedDays)} published · ${formatNumber(publication.pricedDays)} with price data (may be partial)`);
+    details.append(grid);
+    paragraph(details, `${modeLabel} · maintenance ${maintenance.running ? "lock held" : "idle"} · last run ${maintenance.lastRunAt === null ? "not recorded" : formatTime(maintenance.lastRunAt)} · latest publication ${publication.latestPublishedAt === null ? "not recorded" : formatTime(publication.latestPublishedAt)}`);
+  }
+  paragraph(details,
+    `${stale ? "Refresh failed; showing the last available observation. " : ""}${progress ? `Observed ${formatTime(progress.observedAt)}. ` : ""}Updates with the dashboard refresh; no time estimate is available.`,
+    "admin-reconstruction-freshness");
+}
+
 function render(overview) {
   state.overview = overview;
   const attention = renderAttention(overview);
@@ -2893,6 +2975,7 @@ function render(overview) {
   renderIngress(overview.ingress);
   renderErrors(overview.errors);
   renderAudit(overview.audit);
+  renderReconstructionProgress(overview.reconstruction);
   $("#last-refresh").textContent = formatTime(overview.generatedAt);
   $("#service-state").textContent = `${overview.service.environment} · ${overview.collection.state}`;
   notifyAttention(attention);
@@ -2900,6 +2983,7 @@ function render(overview) {
 
 function renderOverviewUnavailable() {
   const hasPreviousData = state.overview !== null;
+  renderReconstructionProgress(state.overview?.reconstruction, { stale: hasPreviousData });
   const serviceState = $("#service-state");
   if (serviceState) {
     serviceState.textContent = hasPreviousData

@@ -341,6 +341,32 @@ describe("admin surface hostname gating", () => {
     }
   });
 
+  it("adds failure-isolated reconstruction progress only behind the owner overview gate", async () => {
+    const runtimeEnv = adminSurfaceBindings({ ALLOWANCE_RECONSTRUCTION_MODE: "resumable" });
+    const token = await signedAccessJwt();
+    const overview = () => handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/overview`, {
+      headers: { "cf-access-jwt-assertion": token },
+    }), runtimeEnv);
+    const available = await overview();
+    expect(available.status).toBe(200);
+    expect(available.headers.get("cache-control")).toBe("no-store");
+    await expect(available.json()).resolves.toMatchObject({
+      schemaVersion: "admin-overview-v0.3",
+      reconstruction: { schemaVersion: "admin-reconstruction-progress-v0.1", status: "available",
+        mode: "resumable", calculations: { trackedAccounts: 0, completedAccounts: 0 } },
+    });
+    await env.USAGE_MONITOR_DB.prepare("DROP TABLE community_analysis_work_stage").run();
+    await env.USAGE_MONITOR_DB.prepare("DROP TABLE community_analysis_work_parts").run();
+    await env.USAGE_MONITOR_DB.prepare("DROP TABLE community_analysis_work").run();
+    const unavailable = await overview();
+    expect(unavailable.status).toBe(200);
+    await expect(unavailable.json()).resolves.toMatchObject({
+      schemaVersion: "admin-overview-v0.3",
+      reconstruction: { status: "unavailable", mode: "resumable" },
+      dailyPublication: { pendingRebuilds: 0 },
+    });
+  });
+
   it("accepts a plain string audience claim from Access", async () => {
     const response = await handleRequest(
       new Request(`${ADMIN_ORIGIN}/admin.html`, {

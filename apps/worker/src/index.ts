@@ -55,6 +55,7 @@ import {
   type CollectionControlReason,
 } from "./admin-operations";
 import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
+import { readAdminReconstructionProgress } from "./admin-reconstruction-progress";
 import { readDistributionAnalytics } from "./distribution-analytics";
 import {
   githubUnavailable,
@@ -2895,7 +2896,7 @@ async function handleAdminOverview(
   }
   const nowEpoch = Date.now();
   const distributionEnabled = env.ENVIRONMENT === "production";
-  const [overview, ingress, githubSnapshot] = await Promise.all([
+  const [overview, ingress, githubSnapshot, reconstruction] = await Promise.all([
     readAdminOverview(env.USAGE_MONITOR_DB, env.DELETION_LEDGER, {
       environment: env.ENVIRONMENT,
       enrollmentMode: env.ENROLLMENT_MODE,
@@ -2908,6 +2909,8 @@ async function handleAdminOverview(
       ? readGithubDistributionSnapshot(env.USAGE_MONITOR_DB, nowEpoch)
         .catch(() => githubUnavailable("unavailable", "GITHUB_SNAPSHOT_UNAVAILABLE"))
       : Promise.resolve(undefined),
+    readAdminReconstructionProgress(env.USAGE_MONITOR_DB, nowEpoch,
+      allowanceReconstructionMode(env)),
   ]);
   const distribution = await readDistributionAnalytics({
     enabled: distributionEnabled,
@@ -2920,7 +2923,7 @@ async function handleAdminOverview(
     githubSnapshot,
   }, nowEpoch);
   return jsonResponse(
-    { ...overview, ingress, distribution },
+    { ...overview, ingress, distribution, reconstruction },
     200,
     { "cache-control": "no-store", vary: "Cookie" },
   );

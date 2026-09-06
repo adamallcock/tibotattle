@@ -92,8 +92,12 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
   // Rotate over a stable participant-ID census: a large or continuously changing
   // first account cannot monopolize every pass. No participant ID enters logs.
   const start=Math.floor(nowMs/60_000)%candidates.length;
-  let deferred=false;
-  for(let index=0;index<Math.min(candidates.length,MAX_PARTICIPANTS_PER_PASS);index++) {
+  let deferred=false, attempted=0;
+  // Current-cache probes remain metered, but do not consume useful-work slots.
+  // Scan at most the bounded census once in the same rotating order; a prefix
+  // of already-finished accounts must not hide unfinished work on an idle pass.
+  // This is still sequential and does not increase the shared time/query limits.
+  for(let index=0;index<candidates.length&&attempted<MAX_PARTICIPANTS_PER_PASS;index++) {
     if(options.meter.remainingQueries<FINAL_RESERVE+20 || Date.now()>=options.deadlineMs) {deferred=true;break;}
     const candidate=candidates[(start+index)%candidates.length]!;
     const source=candidate.has_v11?"v1.1":candidate.has_v1?candidate.has_legacy?"mixed":"v1":"v0.2";
@@ -102,6 +106,7 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
       fitFingerprint:fingerprint,fromDay,compositionSupported:source!=="v0.2"&&!candidate.legacy_overlap};
     result.visited++;
     if(await communityAnalysisCachesCurrent(db,identity)) continue;
+    attempted++;
     const allocation: CommunityModelCacheReadBudget = {remainingQueries:Math.max(0,options.meter.remainingQueries-FINAL_RESERVE),deadlineMs:options.deadlineMs};
     const analyses: {source:"v0.2"|"v1"|"v1.1";analysis:object}[]=[];
     let composition: V1ModelCompositionResult|null=null;

@@ -73,8 +73,8 @@ confirmed at 19:00 UTC on 2026-09-06. Approved migrations `0046`–`0047` are
 applied and verified; the normal guarded deployment passed with no health
 exception. The lookup backfill has completed, and natural scheduled runs are
 advancing restartable calculations without exceptions. The authenticated
-Operations view loads. The main allowance graph and spend total remain
-unavailable while fresh caches and historical publications rebuild: this is
+Operations view loads. The main allowance graph remains unavailable while fresh
+caches and historical publications rebuild: this is
 verified deployment and progress, not completed graph recovery. See the
 [deployment receipt](./receipts/2026-09-06-hosted-calculator-deployment.md).
 
@@ -85,9 +85,16 @@ local usage history nor rebuilds the published desktop app.
 
 The requested [all-token detail and API-equivalent spend](./decisions/2026-09-06-community-detail-totals.md)
 are deployed. Live Chrome rendering confirms the all-token activity chart and
-replacement spend card; the latter correctly reports unavailable while existing
-published days lack repriced totals. Recovery preserves pricing and analytical
+replacement spend card. At 20:34 UTC on 2026-09-06, one published day had partial
+price data (USD 114.9153), while 316 published days still lacked repriced totals;
+the displayed partial amount is not the complete historical spend. Recovery preserves pricing and analytical
 refusal rules, with no historical telemetry rewrite or statistical-policy change.
+
+The scoped [admin progress and useful-work scheduling change](./plans/2026-09-06-admin-reconstruction-progress.md)
+is implemented and in final hosted qualification, not yet deployed. It makes
+calculation phases and publication backlog visible even when the admin graph
+preview is unavailable, and prevents current accounts consuming unfinished-work
+slots without increasing concurrency, query limits or calculation budgets.
 
 The existing dated social preview was temporarily retained to prioritize the
 verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;

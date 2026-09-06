@@ -147,6 +147,15 @@ function tableTexts(documentRef, id) {
     row.children.map((cell) => cell.textContent));
 }
 
+function descendantNodes(node) {
+  return [node, ...node.children.flatMap(descendantNodes)];
+}
+
+function reconstructionText(documentRef) {
+  return descendantNodes(documentRef.byId.get("admin-reconstruction-details"))
+    .map((node) => node.textContent).filter(Boolean).join(" ");
+}
+
 function metricTexts(documentRef, id) {
   return documentRef.byId.get(id).children.map((card) => [
     card.children[0].children[0].textContent,
@@ -266,9 +275,14 @@ test("an initial overview failure marks operations unavailable without inventing
 
 test("overview success, failed refresh, and recovery preserve then replace the last successful data", async () => {
   const overview = await fixture("admin-overview-valid.json");
+  overview.reconstruction = await fixture("admin-reconstruction-valid.json");
   const recovered = structuredClone(overview);
   recovered.generatedAt = "2026-08-18T12:00:00.000Z";
   recovered.counts.contributions.acceptedLast24Hours += 1;
+  recovered.reconstruction.observedAt = "2026-09-06T12:05:00.000Z";
+  recovered.reconstruction.calculations.completedAccounts += 1;
+  recovered.reconstruction.calculations.scanningAccounts -= 1;
+  recovered.reconstruction.calculations.checkpointsWritten = 21;
   const overviewResponses = [response(overview), unavailableResponse(), response(recovered)];
   let overviewRequests = 0;
   await withAdminPage(async (path) => path === "/api/v1/admin/overview"
@@ -281,6 +295,7 @@ test("overview success, failed refresh, and recovery preserve then replace the l
     const preferences = [...storedPreferences];
     assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
     assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
+    assert.match(reconstructionText(documentRef), /3 of 8 tracked accounts/u);
 
     await documentRef.byId.get("refresh").listeners.get("click")();
     assert.equal(overviewRequests, 2);
@@ -294,6 +309,11 @@ test("overview success, failed refresh, and recovery preserve then replace the l
     assert.deepEqual(metricTexts(documentRef, "counts"), counts);
     assert.deepEqual([...storedPreferences], preferences);
     assert.equal(documentRef.byId.get("notice").hidden, false);
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Stale · last known progress");
+    assert.match(documentRef.byId.get("admin-reconstruction-progress").className, /admin-reconstruction-stale/u);
+    assert.match(reconstructionText(documentRef), /3 of 8 tracked accounts/u);
+    assert.match(reconstructionText(documentRef), /Refresh failed; showing the last available observation/u);
+    assert.ok(reconstructionText(documentRef).includes(formatReportingTime(overview.reconstruction.observedAt)));
 
     await documentRef.byId.get("refresh").listeners.get("click")();
     await new Promise((resolve) => setImmediate(resolve));
@@ -308,11 +328,19 @@ test("overview success, failed refresh, and recovery preserve then replace the l
       ["Accepted uploads last 24h", "6", "14 in the last 7 days"]);
     assert.equal(documentRef.byId.get("notice").hidden, true);
     assert.equal(documentRef.title, "TiboTattle operations");
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Resumable calculation");
+    assert.doesNotMatch(documentRef.byId.get("admin-reconstruction-progress").className, /stale/u);
+    assert.match(reconstructionText(documentRef), /4 of 8 tracked accounts/u);
+    assert.match(reconstructionText(documentRef), /21 checkpoint steps saved in current runs/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /42 checkpoint steps/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /Refresh failed/u);
+    assert.ok(reconstructionText(documentRef).includes(formatReportingTime(recovered.reconstruction.observedAt)));
   });
 });
 
 test("an independent allowance-preview failure does not mark a successful overview stale", async () => {
   const overview = await fixture("admin-overview-valid.json");
+  overview.reconstruction = await fixture("admin-reconstruction-valid.json");
   const requests = [];
   await withAdminPage(async (path) => {
     requests.push(path);
@@ -332,6 +360,121 @@ test("an independent allowance-preview failure does not mark a successful overvi
     assert.equal(documentRef.byId.get("notice").hidden, true);
     assert.equal(documentRef.byId.get("last-refresh").textContent, formatReportingTime(overview.generatedAt));
     assert.equal(documentRef.title, "TiboTattle operations");
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Resumable calculation");
+    assert.match(reconstructionText(documentRef), /3 of 8 tracked accounts/u);
+    assert.equal(documentRef.byId.get("admin-reconstruction-progress").hidden, false);
+  });
+});
+
+test("reconstruction shows checkpoint acquisition separately from daily publication without new requests", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.reconstruction = await fixture("admin-reconstruction-valid.json");
+  const requests = [];
+  await withAdminPage(async (path) => {
+    requests.push(path);
+    return path === "/api/v1/admin/overview" ? response(overview) : unavailableResponse();
+  }, async (documentRef) => {
+    await waitFor(() => documentRef.byId.get("growth-status").textContent === "History unavailable");
+    const text = reconstructionText(documentRef);
+    assert.match(text, /Daily publication waits for account calculations/u);
+    assert.match(text, /Acquired checkpoints are saved calculation inputs, not ready allowance estimates/u);
+    assert.match(text, /Record lookup Complete/u);
+    assert.match(text, /3 of 8 tracked accounts/u);
+    assert.match(text, /Preparing 1 · scanning 2 · finalizing 1 · source, window or method changed 1/u);
+    assert.match(text, /42 checkpoint steps saved in current runs/u);
+    assert.ok(text.includes(`Latest cached result: ${formatReportingTime(overview.reconstruction.calculations.newestResultAt)} (may be outdated)`));
+    assert.doesNotMatch(text, /Lookup position/u);
+    assert.match(text, /Daily publication Updating/u);
+    assert.match(text, /5 pending days across all history/u);
+    assert.match(text, /Last 366 days: 10 published · 7 with price data \(may be partial\)/u);
+    assert.match(text, /maintenance lock held/u);
+    assert.doesNotMatch(text, /maintenance running/u);
+    assert.match(text, /no time estimate is available/u);
+    assert.doesNotMatch(text, /\d+%|ETA/u);
+    const meters = descendantNodes(documentRef.byId.get("admin-reconstruction-details"))
+      .filter((node) => node.tag === "progress");
+    assert.equal(meters.length, 1);
+    assert.equal(meters[0].getAttribute("max"), "8");
+    assert.equal(meters[0].getAttribute("value"), "3");
+    assert.equal(meters[0].getAttribute("aria-label"), "Account checkpoint acquisition");
+    assert.equal(meters[0].getAttribute("aria-valuetext"), "3 of 8 tracked accounts have acquired checkpoints");
+    assert.equal(meters[0].getAttribute("aria-describedby"), "admin-reconstruction-explanation");
+    assert.deepEqual(requests, [
+      "/api/v1/admin/overview", "/api/v1/admin/community/allowance-preview", "/api/v1/admin/metrics/history",
+    ]);
+  });
+});
+
+test("unavailable, legacy missing and malformed reconstruction stay isolated from a valid overview", async () => {
+  for (const kind of ["unavailable", "missing", "malformed"]) {
+    const overview = await fixture("admin-overview-valid.json");
+    if (kind === "unavailable") overview.reconstruction = {
+      schemaVersion: "admin-reconstruction-progress-v0.1", status: "unavailable",
+      observedAt: "2026-09-06T12:00:00.000Z", mode: "unknown",
+    };
+    if (kind === "malformed") {
+      overview.reconstruction = await fixture("admin-reconstruction-valid.json");
+      overview.reconstruction.calculations.completedAccounts = 100;
+    }
+    await withAdminPage(async (path) => path === "/api/v1/admin/overview"
+      ? response(overview) : unavailableResponse(), async (documentRef) => {
+      await waitFor(() => documentRef.byId.get("growth-status").textContent === "History unavailable");
+      assert.equal(documentRef.byId.get("service-state").textContent, "production · operational", kind);
+      assert.equal(documentRef.byId.get("notice").hidden, true, kind);
+      assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Progress unavailable", kind);
+      assert.match(reconstructionText(documentRef), /Missing progress does not mean there is no work remaining/u, kind);
+      assert.doesNotMatch(reconstructionText(documentRef), /0 tracked|0 pending|0 published/u, kind);
+      assert.equal(descendantNodes(documentRef.byId.get("admin-reconstruction-details"))
+        .some((node) => node.tag === "progress"), false, kind);
+    });
+  }
+});
+
+test("paused and bounded reconstruction qualifies account and daily counts", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.reconstruction = await fixture("admin-reconstruction-valid.json");
+  overview.reconstruction.mode = "paused";
+  overview.reconstruction.lookup.complete = false;
+  overview.reconstruction.lookup.lastRecordId = 600;
+  overview.reconstruction.calculations.bounded = true;
+  overview.reconstruction.maintenance.running = false;
+  overview.reconstruction.publication.pendingDaysBounded = true;
+  await withAdminPage(async (path) => path === "/api/v1/admin/overview"
+    ? response(overview) : unavailableResponse(), async (documentRef) => {
+    await waitFor(() => documentRef.byId.get("growth-status").textContent === "History unavailable");
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Paused");
+    assert.match(reconstructionText(documentRef), /Record lookup In progress/u);
+    assert.match(reconstructionText(documentRef), /Lookup position: 600 \/ 1,200\. Positions may have gaps; not a processed-record count/u);
+    assert.match(reconstructionText(documentRef), /3 of 8 shown tracked accounts/u);
+    assert.match(reconstructionText(documentRef), /At least 8 tracked accounts; the meter covers only those shown, not overall completion/u);
+    assert.match(reconstructionText(documentRef), /At least 5 pending days/u);
+    assert.match(reconstructionText(documentRef), /Paused · maintenance idle/u);
+  });
+});
+
+test("zero tracked reconstruction accounts show recorded zeros without an indeterminate completion meter", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  overview.reconstruction = await fixture("admin-reconstruction-valid.json");
+  for (const key of ["trackedAccounts", "completedAccounts", "preparingAccounts", "scanningAccounts", "finalizingAccounts", "sourceChangedAccounts", "checkpointsWritten"]) {
+    overview.reconstruction.calculations[key] = 0;
+  }
+  overview.reconstruction.calculations.newestResultAt = null;
+  overview.reconstruction.maintenance = { running: false, lastRunAt: null, leaseExpiresAt: null };
+  overview.reconstruction.publication = {
+    state: "unknown", pendingDays: 0, pendingDaysBounded: false, publishedDays: 0,
+    pricedDays: 0, latestPublishedAt: null,
+  };
+  await withAdminPage(async (path) => path === "/api/v1/admin/overview"
+    ? response(overview) : unavailableResponse(), async (documentRef) => {
+    await waitFor(() => documentRef.byId.get("growth-status").textContent === "History unavailable");
+    assert.match(reconstructionText(documentRef), /0 of 0 tracked accounts/u);
+    assert.match(reconstructionText(documentRef), /0 pending days across all history/u);
+    assert.match(reconstructionText(documentRef), /Last 366 days: 0 published/u);
+    assert.match(reconstructionText(documentRef), /State unknown/u);
+    assert.match(reconstructionText(documentRef), /Latest cached result: not recorded/u);
+    assert.match(reconstructionText(documentRef), /last run not recorded · latest publication not recorded/u);
+    assert.equal(descendantNodes(documentRef.byId.get("admin-reconstruction-details"))
+      .some((node) => node.tag === "progress"), false);
   });
 });
 
@@ -752,5 +895,8 @@ test("the owner dashboard keeps the merge trial private and separate from the pu
   assert.match(html, /data-allowance-mode="combined"[^>]*>Combined</u);
   assert.match(html, /data-allowance-mode="plans"[^>]*>By plan</u);
   assert.match(html, /data-allowance-mode="models"[^>]*>By model</u);
+  assert.match(html, /class="community-allowance">[\s\S]*id="admin-reconstruction-progress"[\s\S]*id="admin-community-allowance-result"/u);
+  assert.match(html, /id="admin-reconstruction-progress" aria-labelledby="admin-reconstruction-title"/u);
+  assert.match(html, /id="admin-reconstruction-status" role="status"/u);
   assert.doesNotMatch(html, /same published community graph/u);
 });
