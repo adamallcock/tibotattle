@@ -33,8 +33,9 @@ Server pricing method v0.5 corrects inherited boundary errors: an unknown
 provider cannot inherit Anthropic pricing; incomplete input counts cannot
 establish a short-context band; explicitly zero aggregate cache writes need
 no inferred Anthropic TTL allocation. Context-independent known components
-remain priceable. Existing fit/cache keys include the method version, so
-corrected costs cannot reuse v0.4 evidence. This changes hosted derived
+remain priceable. Fit/cache keys and public allowance readiness include the
+method version, so corrected costs cannot reuse or advertise v0.4 evidence.
+This changes hosted derived
 pricing, not released desktop artifacts or persisted telemetry.
 
 Pricing reads at most eight admitted chunks at once and reserves a whole day
