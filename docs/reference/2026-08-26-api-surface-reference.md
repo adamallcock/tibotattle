@@ -709,13 +709,18 @@ undifferentiated names.
 - Speed accounting: `CODEX_SPEED_MODE_DECLARATION`, `CODEX_SPEED_MODE_OBSERVABILITY`, `DEFAULT_UNRESOLVED_SPEED_SCENARIO`, `FAST_MODE_ASSUMED_MULTIPLIER`, `FAST_MODE_ASSUMED_MULTIPLIER_SOURCE`, `FAST_MODE_MODEL_FAMILY_KEYS`, `FAST_MODE_MULTIPLIER_SOURCE`, `FAST_MODE_QUOTA_MULTIPLIERS`, `OBSERVED_SPEED_MODE_KEYS`, `QUOTA_WEIGHTED_API_PRICE_METRIC`, `SPEED_MODE_PROVENANCE_VALUES`, `deriveFastModePriorityRatiosFromRegistry`, `emptySpeedWeightingCrossing`, `fastModeModelFamilyKey`, `fastModeQuotaMultiplier`, `inferFastModeFromCalibrationWindows`, `quotaWeightedApiPriceEquivalent`, `resolveEffectiveSpeedMode`, `summarizeQuotaWeightedAccounting`.
 - Local pricing: `aggregateLocalApiPriceResults`, `apiPriceResolutionSummary`, `costWarningCodes`, `priceClaudeUsageRecord`, `priceCodexProviderToolUnits`, `priceCodexUsageEvent`.
 
-#### `@app-usagemonitor/quota-analysis` — 32 public symbols
+#### `@app-usagemonitor/quota-analysis` — 33 public symbols
 
 - Tracks: `buildResetEvidence`, `continuityKey`, `resetKey`.
 - Calibration: `QUOTA_CALIBRATION_POLICY`, `analyzeQuotaCalibration`, `fitResetCapacity`.
 - Rolling and pace: `buildRollingQuotaComparisons`, `analyzeQuotaPace`.
-- Composition: `MODEL_COMPOSITION_POLICY`, `blendedCompositionCapacityUsd`, `buildCompositionObservations`, `calibrateCompositionCapacities`, `compositionExpectedPp`.
+- Composition: `MODEL_COMPOSITION_POLICY`, `blendedCompositionCapacityUsd`, `buildCompositionObservations`, `buildCompositionObservationsFromOrderedUsage`, `calibrateCompositionCapacities`, `compositionExpectedPp`.
 - Windows and provider pools: `CODEX_PRIMARY_LIMIT_ID`, `CODEX_SPARK_LIMIT_ID`, `CODEX_SPARK_LIMIT_IDS`, `CODEX_SPARK_RESERVED_LIMIT_ID`, `FIVE_HOUR_WINDOW_MINUTES`, `formatQuotaWindowDuration`, `MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH`, `MAX_QUOTA_WINDOW_DURATION_MINUTES`, `QUOTA_LIMIT_DISPLAY_ALIASES`, `QUOTA_WINDOW_KINDS`, `classifyQuotaWindowKind`, `isSparkQuotaLimitId`, `isSupportedQuotaWindowDuration`, `isValidQuotaWindowDuration`, `quotaLimitDisplayAlias`, `quotaWindowLabel`, `sanitizeQuotaLimitDisplayName`, `sanitizeQuotaLimitId`, `SEVEN_DAY_WINDOW_MINUTES`.
+
+The ordered composition builder accepts a one-pass usage iterable with
+nondecreasing valid time bins, preserving within-bin addition and model order.
+The existing unordered-array builder remains compatible; both share quota
+topology and calibration policy.
 
 #### `@app-usagemonitor/telemetry-contract` — 63 public symbols
 

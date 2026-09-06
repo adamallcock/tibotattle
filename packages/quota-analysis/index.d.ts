@@ -599,6 +599,22 @@ export function buildCompositionObservations(
   },
 ): CompositionObservationCorpus;
 
+/** One-pass usage input in nondecreasing kernel-bin order. Within each bin,
+ * preserve the original row order for exact floating-point sums. Invalid rows
+ * are dropped as in the array API; descending valid bins throw TypeError. */
+export function buildCompositionObservationsFromOrderedUsage(
+  input?: {
+    usageRows?: Iterable<CompositionUsageRow>;
+    quotaRows?: readonly CompositionQuotaRow[];
+  },
+  policy?: {
+    grainMs?: number;
+    poolToleranceMs?: number;
+    resetDropPp?: number;
+    maxCrossingElapsedMs?: number;
+  },
+): CompositionObservationCorpus;
+
 export function calibrateCompositionCapacities(
   observations: readonly CompositionObservation[],
   policy?: {
