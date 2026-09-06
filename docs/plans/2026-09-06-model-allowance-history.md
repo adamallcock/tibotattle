@@ -2,10 +2,13 @@
 title: Historical per-model allowance reconstruction
 date: 2026-09-06
 type: plan
-status: validation
+status: locally-qualified
 ---
 
 # Scope and acceptance
+
+Local implementation is complete at `e35008d5`; production application and
+live backfill verification remain separate, unperformed gates.
 
 The owner requested historical per-model points alongside the existing plan
 history. Work starts from the completed hosted repair at `e9c56452` in an
@@ -60,7 +63,7 @@ window is a separate analytical choice and must not be silently introduced.
 - [x] Create an isolated branch and verify dependency copies against its source.
 - [x] Implement date-bounded input and isolated reconstruction.
 - [x] Validate preservation, numerical semantics, bounded resources and UI.
-- [ ] Present qualified source and any separate production gate.
+- [x] Present qualified source and the separate production gate.
 
 # Local evidence, 2026-09-06
 
@@ -88,9 +91,21 @@ window is a separate analytical choice and must not be silently introduced.
   records `7b441df76b2f045c4bf22506dd990e9aa182414f00dba518c99cfe17f257cc54`.
   No R7 receipt or desktop workload is changed or requalified here.
 - The initial dry-bundle step stopped at the clean, committed source guard.
-  Remaining local work is to record this isolated implementation and rerun
-  packaging/staging dry checks using the unchanged, manifest-verified public
-  assets. No production action has run.
+  After recording `e35008d5`, default, staging and production dry bundles all
+  pass (1,611.11 KiB, 335.81 KiB gzip). The 21 public assets were reused only
+  after their manifest and unchanged 15-file source closure were verified.
+  Their source-closure SHA-256 is
+  `37758ac4d9006f09ce53b1f98037dcd02642fb6f99b89825070cb03906f82ddd`.
+  This does not claim a new installer download/trust check or public deployment.
+- Staging configuration is safely unprovisioned, with collection unauthorized;
+  its successful static/dry checks are not a live staging qualification.
+  No production migration, deployment, push or desktop release ran. The
+  isolated browser and synthetic loopback preview were stopped after QA.
+
+Cloudflare/Worker guidance shaped the shared query budget and isolated state;
+the test-runner and browser-check guidance supplied the regression and rendered
+verification boundaries. Neither local tests nor dry bundles certify production
+corpus cost, progress or completion.
 
 # Deployment boundary
 
