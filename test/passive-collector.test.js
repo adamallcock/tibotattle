@@ -2304,6 +2304,9 @@ test("a duplicate unavailable notification still clears a newer account marker",
       appServerFactory: () => { activeClient = new AccountClient(); return activeClient; },
       loadAccountObservationSecret: async () => Buffer.alloc(32, 87), clock: () => nowMs,
     });
+    // Client construction follows state preparation, including owner-only
+    // permissions. Do not poll the database during its initial creation.
+    await until(async () => activeClient !== undefined, "collector state prepared");
     await until(async () => (await readLines(fixture.dataFile)).some((row) => row.source === "app_server_read"), "initial quota record");
     loggedIn = false;
     nowMs += 1_000;
