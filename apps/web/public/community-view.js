@@ -38,7 +38,7 @@ const COMMUNITY_DAILY_COLUMN_KEYS = Object.freeze([
   "community.metric.usageEvents",
   "community.daily.quotaObservations",
   "community.daily.contributingDevices",
-  "community.metric.combinedOutput",
+  "community.metric.allTokens",
 ]);
 // Header indexes that carry numbers; they right-align with tabular digits so
 // magnitudes line up down a column.
@@ -52,12 +52,33 @@ const COMMUNITY_DAILY_NUMERIC_COLUMNS = Object.freeze(new Set([1, 2, 3, 4]));
 export function communityDailyColumnFormatter(values) {
   const maximum = Math.max(0, ...values);
   if (maximum >= 1_000_000) {
-    return (value) => `${(value / 1_000_000).toFixed(1)}M`;
+    return (value) => value === null ? compact(null) : `${(value / 1_000_000).toFixed(1)}M`;
   }
   if (maximum >= 1_000) {
-    return (value) => `${(value / 1_000).toFixed(1)}K`;
+    return (value) => value === null ? compact(null) : `${(value / 1_000).toFixed(1)}K`;
   }
-  return (value) => String(value);
+  return (value) => value === null ? compact(null) : String(value);
+}
+
+function sumSafeCounts(values) {
+  let total = 0;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 0) return null;
+    total += value;
+    if (!Number.isSafeInteger(total)) return null;
+  }
+  return total;
+}
+
+// Input categories are disjoint; combined output already includes reasoning.
+// Never add text/reasoning again or count cache reads twice.
+function allTokens(totals) {
+  return sumSafeCounts([
+    totals.inputUncachedTokens,
+    totals.inputCacheReadTokens,
+    totals.inputCacheWriteTokens,
+    totals.outputCombinedTokens,
+  ]);
 }
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -106,12 +127,12 @@ function valueAxis(maximum, plotTop, plotBottom) {
 
 /**
  * Pure geometry for the public daily-series chart: usage events as bars on
- * the left axis and combined output tokens as a line on the right axis.
+ * the left axis and all input/output tokens as a line on the right axis.
  *
  * The mapping is honest about the series' shape:
  * - the x scale covers the published days only, positioned by real date, so a
  *   day that was never published is a gap, not a zero;
- * - the output line breaks at any gap wider than one day instead of bridging
+ * - the token line breaks at any gap wider than one day instead of bridging
  *   days that do not exist;
  * - one or two published days mark the series as `sparse`, which the renderer
  *   turns into visible dots plus a still-filling note;
@@ -137,7 +158,7 @@ export function buildCommunityDailyChartModel(series, {
     day: day.day,
     atMs: communityDayStartMs(day.day),
     usageEvents: day.totals.usageEvents,
-    outputCombinedTokens: day.totals.outputCombinedTokens,
+    allTokens: allTokens(day.totals),
   }));
   const startMs = days[0].atMs;
   const endMs = days[days.length - 1].atMs;
@@ -155,8 +176,8 @@ export function buildCommunityDailyChartModel(series, {
     plotTop,
     plotBottom,
   );
-  const output = valueAxis(
-    Math.max(...days.map((day) => day.outputCombinedTokens)),
+  const tokens = valueAxis(
+    Math.max(0, ...days.map((day) => day.allTokens ?? 0)),
     plotTop,
     plotBottom,
   );
@@ -174,27 +195,29 @@ export function buildCommunityDailyChartModel(series, {
     };
   });
 
-  const outputPoints = days.map((day) => ({
+  const tokenPoints = days.filter((day) => day.allTokens !== null).map((day) => ({
     day: day.day,
-    outputCombinedTokens: day.outputCombinedTokens,
+    allTokens: day.allTokens,
     x: x(day.atMs),
-    y: output.y(day.outputCombinedTokens),
+    y: tokens.y(day.allTokens),
   }));
   // Split the line at unpublished days: consecutive points stay connected only
   // when their days are adjacent on the calendar.
-  const outputSegments = [];
-  let segment = [outputPoints[0]];
-  for (let index = 1; index < days.length; index += 1) {
-    const gapDays = Math.round(
-      (days[index].atMs - days[index - 1].atMs) / MILLISECONDS_PER_DAY,
-    );
+  const tokenSegments = [];
+  let segment = [];
+  for (const point of tokenPoints) {
+    const previous = segment[segment.length - 1];
+    const gapDays = previous ? Math.round(
+      (communityDayStartMs(point.day) - communityDayStartMs(previous.day))
+        / MILLISECONDS_PER_DAY,
+    ) : 0;
     if (gapDays > 1) {
-      outputSegments.push(segment);
+      tokenSegments.push(segment);
       segment = [];
     }
-    segment.push(outputPoints[index]);
+    segment.push(point);
   }
-  outputSegments.push(segment);
+  if (segment.length > 0) tokenSegments.push(segment);
 
   // Date ticks: every published day while they fit, then evenly spaced
   // calendar positions across the span, labelled by month once the span makes
@@ -231,10 +254,10 @@ export function buildCommunityDailyChartModel(series, {
     barWidth,
     sparse: days.length <= 2,
     bars,
-    outputPoints,
-    outputSegments,
+    tokenPoints,
+    tokenSegments,
     eventsTicks: events.ticks,
-    outputTicks: output.ticks,
+    tokenTicks: tokens.ticks,
     dayTicks,
     tickLabelStyle,
   };
@@ -428,7 +451,7 @@ function tickLabelFormatter(style) {
 /**
  * Renders the inline SVG daily chart. The site is CSP-strict and
  * dependency-free, so this is plain SVG construction: bars for usage events
- * on the left axis, a line for combined output tokens on the right axis, and
+ * on the left axis, a line for all input/output tokens on the right axis, and
  * dots plus a note while the series is still one or two days long.
  */
 function appendCommunityDailyChart({ documentRef, container, series, t }) {
@@ -440,7 +463,7 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
   const legend = node("p", "community-daily-legend");
   for (const [swatchClass, labelKey] of [
     ["daily-legend-swatch events", "community.metric.usageEvents"],
-    ["daily-legend-swatch output", "community.metric.combinedOutput"],
+    ["daily-legend-swatch output", "community.metric.allTokens"],
   ]) {
     const item = node("span");
     const swatch = node("span", swatchClass);
@@ -473,7 +496,7 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
     label.textContent = compact(tick.value);
     svg.append(label);
   }
-  for (const tick of model.outputTicks) {
+  for (const tick of model.tokenTicks) {
     const label = svgNode(documentRef, "text", "chart-axis-label daily-axis-output", {
       x: model.plot.right + 8,
       y: tick.y + 3,
@@ -502,7 +525,7 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
     }));
   }
 
-  for (const segment of model.outputSegments) {
+  for (const segment of model.tokenSegments) {
     if (segment.length >= 2) {
       svg.append(svgNode(documentRef, "polyline", "daily-output-line", {
         points: segment
@@ -533,7 +556,7 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
 /**
  * Renders the day-partitioned community series. Publication revisions remain
  * part of the read contract, but the reader-facing summary describes the
- * activity itself: its latest day, current contributors, turns and output.
+ * activity itself: its latest day, current contributors, turns and all tokens.
  * Late contributions still replace a day's published aggregate behind the
  * scenes, which the concise disclosure below explains without exposing
  * operational revision metadata as a headline metric.
@@ -563,17 +586,8 @@ export function renderCommunityDailySeries({
   }
 
   const latest = series.days[series.days.length - 1];
-  const sumSafeTotal = (field) => {
-    let total = 0;
-    for (const day of series.days) {
-      const next = total + day.totals[field];
-      if (!Number.isSafeInteger(next)) return null;
-      total = next;
-    }
-    return total;
-  };
-  const usageEvents = sumSafeTotal("usageEvents");
-  const outputTokens = sumSafeTotal("outputCombinedTokens");
+  const usageEvents = sumSafeCounts(series.days.map((day) => day.totals.usageEvents));
+  const tokens = sumSafeCounts(series.days.map((day) => allTokens(day.totals)));
   const historyDays = compact(series.days.length);
   const quality = node("dl", "snapshot-quality-grid");
   for (const [term, value, detail] of [
@@ -593,9 +607,9 @@ export function renderCommunityDailySeries({
       t("community.daily.turnsCountedDetail", { days: historyDays }),
     ],
     [
-      t("community.daily.outputTokensCounted"),
-      compact(outputTokens),
-      t("community.daily.outputTokensCountedDetail", { days: historyDays }),
+      t("community.daily.allTokensCounted"),
+      compact(tokens),
+      t("community.daily.allTokensCountedDetail", { days: historyDays }),
     ],
   ]) {
     const item = node("div");
@@ -649,8 +663,8 @@ export function renderCommunityDailySeries({
   const formatContributingDevices = formatColumn(
     series.days.map((day) => day.totals.contributingDevices),
   );
-  const formatOutputTokens = formatColumn(
-    series.days.map((day) => day.totals.outputCombinedTokens),
+  const formatAllTokens = formatColumn(
+    series.days.map((day) => allTokens(day.totals)),
   );
   // Most recent day first: freshness is what a reader scans for.
   for (const day of [...series.days].reverse()) {
@@ -664,7 +678,7 @@ export function renderCommunityDailySeries({
       formatUsageEvents(day.totals.usageEvents),
       formatQuotaObservations(day.totals.quotaObservations),
       formatContributingDevices(day.totals.contributingDevices),
-      formatOutputTokens(day.totals.outputCombinedTokens),
+      formatAllTokens(allTokens(day.totals)),
     ];
     cells.forEach((value, index) => {
       const td = documentRef.createElement("td");

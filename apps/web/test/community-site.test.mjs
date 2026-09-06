@@ -1567,14 +1567,14 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     "Activity through",
     "Contributors that day",
     "Turns counted",
-    "Output tokens counted",
+    "All tokens counted",
   ]);
-  assert.deepEqual(values, ["Aug 7, 2026", "3", "240", "1K"]);
+  assert.deepEqual(values, ["Aug 7, 2026", "3", "240", "3K"]);
   assert.deepEqual(details, [
     "Most recent community day",
     "Accounts represented on that day",
     "Usage events across 2 shared days",
-    "Combined output across 2 shared days",
+    "Input and output across 2 shared days",
   ]);
   for (const retiredOperationalLabel of [
     "Latest published day",
@@ -1591,7 +1591,7 @@ test("a published daily series renders friendly cumulative activity, latest-firs
   );
 
   // The chart precedes the table: bars for usage events, a line series for
-  // combined output, and — while the series is one or two days long — dots
+  // all input/output tokens, and — while the series is one or two days long — dots
   // plus the still-filling note.
   const svg = container.descendants().find(({ tag }) => tag === "svg");
   assert.ok(svg, "a published daily series renders its inline SVG chart");
@@ -1607,10 +1607,10 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     .filter((element) => element.attributes.get("class") === "daily-events-bar");
   assert.equal(bars.length, 2);
   const dots = svg.descendants().filter(({ tag }) => tag === "circle");
-  assert.equal(dots.length, 2, "a sparse series marks every output point with a dot");
+  assert.equal(dots.length, 2, "a sparse series marks every token point with a dot");
   assert.match(container.text, /still filling/u);
   assert.match(container.text, /Usage events/u);
-  assert.match(container.text, /Output tokens/u);
+  assert.match(container.text, /All tokens/u);
 
   const table = container.descendants().find(({ tag }) => tag === "table");
   assert.ok(table, "a published daily series renders its table");
@@ -1623,7 +1623,7 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     "Usage events",
     "Quota observations",
     "Contributing devices",
-    "Output tokens",
+    "All tokens",
   ]) {
     assert.equal(columnLabels.includes(label), true, label);
   }
@@ -1723,13 +1723,13 @@ test("the daily chart model maps published days honestly", () => {
   );
   assert.equal(sparse.sparse, true);
   assert.deepEqual(sparse.bars.map(({ day }) => day), ["2026-08-06", "2026-08-07"]);
-  assert.equal(sparse.outputSegments.length, 1);
-  assert.equal(sparse.outputSegments[0].length, 2);
+  assert.equal(sparse.tokenSegments.length, 1);
+  assert.equal(sparse.tokenSegments[0].length, 2);
   assert.deepEqual(sparse.dayTicks.map(({ day }) => day), ["2026-08-06", "2026-08-07"]);
   assert.equal(sparse.tickLabelStyle, "day");
   assert.ok(sparse.bars[0].x < sparse.bars[1].x, "bars advance with the calendar");
 
-  // Events scale from zero on the left axis; output tokens scale on the right.
+  // Events scale from zero on the left axis; all tokens scale on the right.
   assert.equal(sparse.eventsTicks[0].value, 0);
   assert.equal(sparse.eventsTicks[0].y, sparse.plot.bottom);
   assert.ok(
@@ -1737,8 +1737,8 @@ test("the daily chart model maps published days honestly", () => {
     "the events axis covers the maximum usage-event total",
   );
   assert.ok(
-    sparse.outputTicks[sparse.outputTicks.length - 1].value >= 500,
-    "the output axis covers the maximum combined-output total",
+    sparse.tokenTicks[sparse.tokenTicks.length - 1].value >= 1500,
+    "the token axis covers the maximum all-token total",
   );
 });
 
@@ -1753,10 +1753,10 @@ test("the daily chart model renders unpublished days as gaps, not zeros", () => 
   const model = buildCommunityDailyChartModel(series);
   assert.equal(model.sparse, false);
   assert.equal(model.bars.length, 3, "only published days draw a bar");
-  // The output line breaks at the two-day publication gap: one connected
+  // The token line breaks at the two-day publication gap: one connected
   // segment for the adjacent days, then an isolated single-point segment.
   assert.deepEqual(
-    model.outputSegments.map((segment) => segment.map(({ day }) => day)),
+    model.tokenSegments.map((segment) => segment.map(({ day }) => day)),
     [["2026-08-01", "2026-08-02"], ["2026-08-05"]],
   );
   const positions = model.bars.map(({ x }) => x);
@@ -1796,15 +1796,75 @@ test("the daily chart model thins ticks and bars for a year of days", () => {
   }
 });
 
-test("the daily chart keeps an all-zero output series on the baseline", () => {
-  // Combined-output totals were zero before the server-side fix; a series of
-  // zeros must chart as a flat baseline, never as an invented scale.
+test("all-token totals count disjoint inputs and combined output exactly once", () => {
+  const day = publishedDailyDay("2026-08-06", 1);
+  Object.assign(day.payload.totals, {
+    inputUncachedTokens: 100,
+    inputCacheReadTokens: 200,
+    inputCacheWriteTokens: 300,
+    outputTextTokens: 40,
+    outputReasoningTokens: 60,
+    outputCombinedTokens: 100,
+  });
+  const payload = publishedDailySeries({ days: [day] });
+  const model = buildCommunityDailyChartModel(normalizeCommunityDailySeries(payload));
+  assert.equal(model.tokenPoints[0].allTokens, 700);
+  const documentRef = fakeDocument();
+  const container = documentRef.createElement("div");
+  renderCommunityDailySeries({ documentRef, container, payload });
+  const summaryValues = container.descendants()
+    .filter(({ tag }) => tag === "dd").map(({ textContent }) => textContent);
+  assert.equal(summaryValues[3], "700");
+  const tableRow = container.descendants().filter(({ tag }) => tag === "tr")[1];
+  assert.equal(tableRow.children[4].textContent, "700");
+  assert.doesNotMatch(container.text, /Output tokens/u);
+});
+
+test("unsafe all-token sums stay unavailable and break the token line", () => {
+  const invalidDay = publishedDailyDay("2026-08-07", 1);
+  invalidDay.payload.totals.inputUncachedTokens = Number.MAX_SAFE_INTEGER;
+  const payload = publishedDailySeries({ days: [
+    publishedDailyDay("2026-08-06", 1), invalidDay,
+    publishedDailyDay("2026-08-08", 1),
+  ] });
+  const model = buildCommunityDailyChartModel(normalizeCommunityDailySeries(payload));
+  assert.equal(model.bars.length, 3, "valid event totals still render");
+  assert.deepEqual(model.tokenSegments.map((segment) => segment.map(({ day }) => day)),
+    [["2026-08-06"], ["2026-08-08"]]);
+  const documentRef = fakeDocument();
+  const container = documentRef.createElement("div");
+  renderCommunityDailySeries({ documentRef, container, payload });
+  const summaryValues = container.descendants()
+    .filter(({ tag }) => tag === "dd").map(({ textContent }) => textContent);
+  assert.equal(summaryValues[3], "—");
+  const invalidRow = container.descendants().filter(({ tag }) => tag === "tr")[2];
+  assert.equal(invalidRow.children[4].textContent, "—");
+});
+
+test("all-token activity labels preserve their meaning in every shipped language", () => {
+  for (const [locale, label, detail] of [
+    ["en-US", "All tokens counted", "Input and output across 2 shared days"],
+    ["zh-Hans", "已计入的全部 token", "跨 2 个共享日期的输入与输出"],
+    ["es", "Todos los tokens contabilizados", "Entrada y salida en 2 días compartidos"],
+  ]) {
+    const documentRef = fakeDocument();
+    documentRef.documentElement.lang = locale;
+    const container = documentRef.createElement("div");
+    renderCommunityDailySeries({ documentRef, container, payload: publishedDailySeries() });
+    assert.ok(container.text.includes(label), locale);
+    assert.ok(container.text.includes(detail), locale);
+  }
+});
+
+test("the daily chart keeps an all-zero token series on the baseline", () => {
+  // A genuine series of zeros must stay on the baseline, not invent activity.
   const series = normalizeCommunityDailySeries(publishedDailySeries({
     days: [
       publishedDailyDay("2026-08-06", 1, {
         payload: {
           totals: {
             ...publishedDailyDay("2026-08-06", 1).payload.totals,
+            inputUncachedTokens: 0,
             outputCombinedTokens: 0,
           },
         },
@@ -1813,6 +1873,7 @@ test("the daily chart keeps an all-zero output series on the baseline", () => {
         payload: {
           totals: {
             ...publishedDailyDay("2026-08-07", 1).payload.totals,
+            inputUncachedTokens: 0,
             outputCombinedTokens: 0,
           },
         },
@@ -1820,7 +1881,7 @@ test("the daily chart keeps an all-zero output series on the baseline", () => {
     ],
   }));
   const model = buildCommunityDailyChartModel(series);
-  for (const point of model.outputPoints) {
+  for (const point of model.tokenPoints) {
     assert.equal(point.y, model.plot.bottom);
   }
 });
