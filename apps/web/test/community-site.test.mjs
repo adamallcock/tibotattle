@@ -1565,14 +1565,14 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     .map(({ textContent }) => textContent);
   assert.deepEqual(terms, [
     "Activity through",
-    "Contributors that day",
+    "Total API-equivalent spend",
     "Turns counted",
     "All tokens counted",
   ]);
-  assert.deepEqual(values, ["Aug 7, 2026", "3", "240", "3K"]);
+  assert.deepEqual(values, ["Aug 7, 2026", "—", "240", "3K"]);
   assert.deepEqual(details, [
     "Most recent community day",
-    "Accounts represented on that day",
+    "API-equivalent spend unavailable; not an actual bill",
     "Usage events across 2 shared days",
     "Input and output across 2 shared days",
   ]);
@@ -1582,6 +1582,7 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     "Revision age",
     "Released",
     "Published days in window",
+    "Contributors that day",
   ]) {
     assert.equal(quality.text.includes(retiredOperationalLabel), false, retiredOperationalLabel);
   }
@@ -1644,6 +1645,72 @@ test("a published daily series renders friendly cumulative activity, latest-firs
   const numericCells = bodyRows[0].children
     .filter((cell) => cell.className === "numeric");
   assert.equal(numericCells.length, 4);
+});
+
+test("community spend card sums only reported equivalents and qualifies incomplete history", () => {
+  function spendBlock(knownCostUsd, overrides = {}) {
+    return {
+      basis: "reported_usage_event_time_api_price_equivalent_v1",
+      currency: "USD", knownCostUsd, coverage: "complete", usageEvents: 120,
+      fullyPricedUsageEvents: 120, partiallyPricedUsageEvents: 0, unpricedUsageEvents: 0,
+      pricingMethodVersion: "server-api-price-equivalent-v1.0", registrySha256: "a".repeat(64),
+      ...overrides,
+    };
+  }
+  const completeDay = (day, value) => publishedDailyDay(day, 1, {
+    payload: { apiEquivalentSpend: spendBlock(value), allowance: allowanceBlock({ centralUsd: 9999 }) },
+  });
+  const partialDay = publishedDailyDay("2026-08-07", 1, {
+    payload: { apiEquivalentSpend: spendBlock(2.5, {
+      coverage: "partial", fullyPricedUsageEvents: 100, unpricedUsageEvents: 20,
+    }) },
+  });
+  const unpricedDay = publishedDailyDay("2026-08-07", 1, {
+    payload: { apiEquivalentSpend: spendBlock(null, {
+      coverage: "unavailable", fullyPricedUsageEvents: 0, unpricedUsageEvents: 120,
+    }) },
+  });
+  const zeroDay = publishedDailyDay("2026-08-07", 1);
+  zeroDay.payload.totals.usageEvents = 0;
+  zeroDay.payload.apiEquivalentSpend = spendBlock(0, { usageEvents: 0, fullyPricedUsageEvents: 0 });
+  for (const [label, days, value, detail] of [
+    ["complete", [completeDay("2026-08-06", 1.25), completeDay("2026-08-07", 2.5)], "$3.75",
+      "Across 2 shared days in USD; not an actual bill"],
+    ["partial pricing", [completeDay("2026-08-06", 1.25), partialDay], "$3.75",
+      "Priced portion across 2 of 2 shared days in USD; not an actual bill"],
+    ["old day missing spend", [completeDay("2026-08-06", 1.25), publishedDailyDay("2026-08-07", 1)], "$1.25",
+      "Priced portion across 1 of 2 shared days in USD; not an actual bill"],
+    ["unpriced day", [completeDay("2026-08-06", 1.25), unpricedDay], "$1.25",
+      "Priced portion across 1 of 2 shared days in USD; not an actual bill"],
+    ["all unpriced", [unpricedDay], "—", "API-equivalent spend unavailable; not an actual bill"],
+    ["genuine zero", [zeroDay], "$0", "Across 1 shared days in USD; not an actual bill"],
+    ["overflow", [completeDay("2026-08-06", Number.MAX_VALUE), completeDay("2026-08-07", Number.MAX_VALUE)], "—",
+      "API-equivalent spend unavailable; not an actual bill"],
+  ]) {
+    const documentRef = fakeDocument();
+    const container = documentRef.createElement("div");
+    renderCommunityDailySeries({ documentRef, container, payload: publishedDailySeries({ days }) });
+    const cards = container.descendants().find((element) => element.className === "snapshot-quality-grid").children;
+    assert.equal(cards[1].children[0].textContent, "Total API-equivalent spend", label);
+    assert.equal(cards[1].children[1].textContent, value, label);
+    assert.equal(cards[1].children[2].textContent, detail, label);
+    assert.doesNotMatch(container.text, /Contributors that day|9,999/u, label);
+  }
+});
+
+test("community spend coverage wording is translated in every shipped language", () => {
+  for (const [locale, label, detail] of [
+    ["en-US", "Total API-equivalent spend", "API-equivalent spend unavailable; not an actual bill"],
+    ["zh-Hans", "API 等值总支出", "API 等值支出不可用；非实际账单"],
+    ["es", "Gasto total equivalente de API", "Gasto equivalente de API no disponible; no es una factura real"],
+  ]) {
+    const documentRef = fakeDocument();
+    documentRef.documentElement.lang = locale;
+    const container = documentRef.createElement("div");
+    renderCommunityDailySeries({ documentRef, container, payload: publishedDailySeries() });
+    assert.ok(container.text.includes(label), locale);
+    assert.ok(container.text.includes(detail), locale);
+  }
 });
 
 test("daily table columns share one unit chosen from the column maximum", () => {

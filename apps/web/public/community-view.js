@@ -81,6 +81,27 @@ function allTokens(totals) {
   ]);
 }
 
+function communityDailySpendSummary(days) {
+  let knownCostUsd = 0;
+  let pricedDays = 0;
+  let complete = true;
+  for (const day of days) {
+    const spend = day.apiEquivalentSpend;
+    complete &&= spend?.coverage === "complete";
+    if (spend?.knownCostUsd === null || spend?.knownCostUsd === undefined) continue;
+    knownCostUsd += spend.knownCostUsd;
+    if (!Number.isFinite(knownCostUsd)) {
+      return { knownCostUsd: null, pricedDays: 0, coverage: "unavailable" };
+    }
+    pricedDays += 1;
+  }
+  return {
+    knownCostUsd: pricedDays > 0 ? knownCostUsd : null,
+    pricedDays,
+    coverage: pricedDays === 0 ? "unavailable" : complete ? "complete" : "partial",
+  };
+}
+
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 const SVG_NAMESPACE = "http://www.w3.org/2000/svg";
 
@@ -556,7 +577,7 @@ function appendCommunityDailyChart({ documentRef, container, series, t }) {
 /**
  * Renders the day-partitioned community series. Publication revisions remain
  * part of the read contract, but the reader-facing summary describes the
- * activity itself: its latest day, current contributors, turns and all tokens.
+ * activity itself: its latest day, API-equivalent spend, turns and all tokens.
  * Late contributions still replace a day's published aggregate behind the
  * scenes, which the concise disclosure below explains without exposing
  * operational revision metadata as a headline metric.
@@ -588,6 +609,7 @@ export function renderCommunityDailySeries({
   const latest = series.days[series.days.length - 1];
   const usageEvents = sumSafeCounts(series.days.map((day) => day.totals.usageEvents));
   const tokens = sumSafeCounts(series.days.map((day) => allTokens(day.totals)));
+  const spend = communityDailySpendSummary(series.days);
   const historyDays = compact(series.days.length);
   const quality = node("dl", "snapshot-quality-grid");
   for (const [term, value, detail] of [
@@ -597,9 +619,12 @@ export function renderCommunityDailySeries({
       t("community.daily.activityThroughDetail"),
     ],
     [
-      t("community.daily.contributorsThatDay"),
-      compact(latest.totals.contributingParticipants),
-      t("community.daily.contributorsThatDayDetail"),
+      t("community.daily.apiEquivalentSpend"),
+      spend.knownCostUsd === null ? compact(null) : usdFormatter(2).format(spend.knownCostUsd),
+      t(`community.daily.apiEquivalentSpendDetail.${spend.coverage}`, {
+        days: historyDays,
+        pricedDays: compact(spend.pricedDays),
+      }),
     ],
     [
       t("community.daily.turnsCounted"),
