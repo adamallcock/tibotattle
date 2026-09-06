@@ -38,7 +38,7 @@ import type { V1SourcePin } from "./telemetry-v1-source-selection";
 
 /** Bump fit/composition caches whenever this adapter attribution changes. */
 export const V1_PLAN_ATTRIBUTION_ADAPTER_VERSION =
-  `${V1_SOURCE_SELECTION_METHOD_VERSION}:${PLAN_ATTRIBUTION_POLICY.methodVersion}:v1-era-buckets-1`;
+  `${V1_SOURCE_SELECTION_METHOD_VERSION}:${PLAN_ATTRIBUTION_POLICY.methodVersion}:v1-era-buckets-2`;
 
 /**
  * Reset-fit analysis for the telemetry-contribution-v1.0 chunk corpus, computed
@@ -81,7 +81,8 @@ export const V1_PLAN_ATTRIBUTION_ADAPTER_VERSION =
  *     trailing horizon snapped to whole reset cycles, pre-filters to the only
  *     track the consumer keeps (limit_id='codex', window=10080), drops reset
  *     groups the shared calibration always refuses (the fitable HAVING), and
- *     collapses each flat used_percent run to its endpoints via LAG/LEAD. A
+ *     collapses each flat used_percent run to its endpoints via indexed
+ *     predecessor/successor seeks. A
  *     boundary is emitted only on a strict used_percent increase and anchors
  *     lowerCost on the LAST row of the preceding run and upperCost on the FIRST
  *     row of the new run, so keeping both run endpoints is byte-identical for
@@ -124,6 +125,9 @@ export const MAX_PLAN_ATTRIBUTION_ROWS = 120_000;
 export const MAX_WINDOWED_USAGE_ROWS = 1_000_000;
 const MAX_SESSION_INTERVAL_SCOPES = 100_000;
 const USAGE_PAGE_SIZE = 5_000;
+// Same synthetic-row bound enforced by the quota-tracks kernel and v1.1
+// adapter. Refuse explicitly here rather than throw on an invalid folded row.
+const MAX_SCALAR_BUCKET_COST_NANOUSD = 90_000_000_000_000;
 // Identical purpose to the v0.2 path: reject a high-cardinality corpus before
 // any per-track analysis rather than let distinct-seed count multiply the cost.
 const MAX_CONTINUITY_TRACKS = 256;
@@ -530,20 +534,51 @@ function attributeSnapshot(
  * window) includes a reset only when its ENTIRE first..last series is within the
  * window, so a cycle straddling the cutoff is excluded wholesale rather than
  * read partially and mis-fit. The fitable HAVING drops reset groups the shared
- * calibration always refuses; the LAG/LEAD collapse keeps every row that differs
+ * calibration always refuses; the neighbor collapse keeps every row that differs
  * from its predecessor OR successor — the first and last row of every flat
  * used_percent run — because a boundary anchors lowerCost on the last row of the
  * preceding run and upperCost on the first row of the new run. The partition
  * INCLUDES slot (an eligible multi-slot reset has time-disjoint slots); the
  * fitable GROUP BY EXCLUDES slot (= the shared resetKey).
  */
-// Binds (in order): era markers JSON, winnersJson, participantId, observedAt cutoff, resetsAt
-// cutoff, window minutes, minimum boundaries, minimum span, row limit. Anonymous
-// `?` because the leading json_each winner filter binds one parameter and fixed
-// numbering across the CTE chain buys nothing. `scoped` is MATERIALIZED so its
-// winner-filtered index scan runs once rather than being re-evaluated by both
-// `fitable` and `survivors`.
-const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
+const QUOTA_WINNER_FILTER_SQL = WINNER_FILTER_SQL.replace("?", "?2");
+
+// The tuple (time,id) predecessor/successor must use two explicit seeks, just
+// like the usage cursor below. Looking within the tied timestamp first preserves
+// rowid order; only an absent neighbor advances to the adjacent time. The other
+// partition fields and the exact winner/era bounds must also match. Every
+// accepted percentage is nonnegative, so -1 denotes an absent neighbor without
+// becoming a retained value or confusing a genuine zero-percent endpoint.
+function quotaNeighborSql(previous: boolean): string {
+  const comparison = previous ? "<" : ">";
+  const direction = previous ? "DESC" : "ASC";
+  const select = (sameTime: boolean) => `(SELECT n.used_percent FROM telemetry_v1_records n
+      INDEXED BY telemetry_v1_records_participant_stream_observed
+    WHERE n.participant_id = r.participant_id AND n.stream = 'quota'
+      AND ${sameTime ? `n.observed_at = r.observed_at AND n.id ${comparison} r.id` : `n.observed_at ${comparison} r.observed_at`}
+      AND n.observed_at >= MAX(?4, e.lower_bound)
+      AND n.observed_at <= COALESCE(e.upper_bound, '9999-12-31T23:59:59.999Z')
+      AND n.provider = r.provider AND n.limit_id = r.limit_id
+      AND n.plan_type = r.plan_type AND n.plan_variant = r.plan_variant
+      AND n.window_duration_minutes = r.window_duration_minutes
+      AND n.resets_at = r.resets_at AND n.slot = r.slot
+      AND n.used_percent IS NOT NULL AND ${QUOTA_WINNER_FILTER_SQL.replaceAll("r.", "n.")}
+    ORDER BY ${sameTime ? "" : `n.observed_at ${direction}, `}n.id ${direction} LIMIT 1)`;
+  return `COALESCE(${select(true)}, ${select(false)}, -1)`;
+}
+
+// Binds (in order): era markers JSON, winnersJson, participantId, observedAt
+// cutoff, resetsAt cutoff, window minutes, minimum boundaries, minimum span,
+// row limit. Numbered parameters reuse the same winner and cutoff bindings in
+// all four neighbor seeks. Plan-era bounds are disjoint within each
+// provider/limit context, including conflict gaps. Seek through deployed 0036;
+// no dense marker-stream table, partition sorter, or window spool is needed.
+// Materialize endpoints BEFORE reset eligibility: collapse preserves every
+// distinct percentage and extremum, so the same slot-independent gates commute
+// with this slot-partitioned reduction. Hydrate wide rows only after the cap.
+// NOT MATERIALIZED prevents retaining the dense per-record neighbor results;
+// the owning query-plan test forbids a sort/materialization before endpoints.
+export const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
     SELECT json_extract(e.value, '$[0]') AS provider,
       json_extract(e.value, '$[1]') AS limit_id,
       json_extract(e.value, '$[2]') AS plan_type,
@@ -552,118 +587,95 @@ const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
       json_extract(e.value, '$[5]') AS lower_bound,
       json_extract(e.value, '$[6]') AS upper_bound,
       json_extract(e.value, '$[7]') AS era_ordinal
-    FROM json_each(?) e
-  ), raw_scoped AS MATERIALIZED (
-    SELECT r.occurrence_id AS occurrence_id,
-           r.observed_at AS observed_at,
-           r.provider AS provider,
-           r.plan_type AS plan_type,
-           r.plan_variant AS plan_variant,
-           r.limit_id AS limit_id,
-           r.slot AS slot,
-           r.used_percent AS used_percent,
-           r.window_duration_minutes AS window_duration_minutes,
-           r.resets_at AS resets_at,
-           r.id AS id
-      FROM telemetry_v1_records r
+    FROM json_each(?1) e
+  ), marked AS NOT MATERIALIZED (
+    SELECT r.id, r.observed_at, r.resets_at, r.used_percent, e.era_ordinal,
+           ${quotaNeighborSql(true)} AS prev_up,
+           ${quotaNeighborSql(false)} AS next_up
+      FROM era_markers e
+      CROSS JOIN telemetry_v1_records r INDEXED BY telemetry_v1_records_participant_stream_observed
       JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-     WHERE ${WINNER_FILTER_SQL}
-       AND r.participant_id = ?
+     WHERE ${QUOTA_WINNER_FILTER_SQL}
+       AND r.participant_id = ?3
        AND r.stream = 'quota'
-       AND r.observed_at >= ?
-       AND r.resets_at >= ?
+       AND r.observed_at >= MAX(?4, e.lower_bound)
+       AND r.resets_at >= ?5
        AND r.limit_id = 'codex'
-       AND r.window_duration_minutes = ?
+       AND r.window_duration_minutes = ?6
        AND r.resets_at IS NOT NULL
        AND r.slot IS NOT NULL
        AND r.used_percent IS NOT NULL
        AND r.plan_type IS NOT NULL
        AND r.plan_variant IS NOT NULL
-  ),
-  marker_stream AS (
-    SELECT r.*, 0 AS is_marker, 0 AS era_ordinal FROM raw_scoped r
-    UNION ALL
-    SELECT NULL AS occurrence_id, e.lower_bound AS observed_at, e.provider,
-      e.plan_type, e.plan_variant, e.limit_id, NULL AS slot,
-      NULL AS used_percent, NULL AS window_duration_minutes, NULL AS resets_at,
-      0 AS id, 1 AS is_marker, e.era_ordinal
-      FROM era_markers e
-  ), assigned AS (
-    SELECT *, MAX(era_ordinal) OVER (
-      PARTITION BY provider, limit_id ORDER BY observed_at, is_marker DESC, id
-      ROWS UNBOUNDED PRECEDING
-    ) AS assigned_era FROM marker_stream
-  ), scoped AS MATERIALIZED (
-    SELECT a.*, e.plan_era_key
-    FROM assigned a JOIN era_markers e ON e.era_ordinal = a.assigned_era
-    WHERE a.is_marker = 0 AND a.plan_type = e.plan_type
-      AND a.plan_variant = e.plan_variant AND a.observed_at >= e.lower_bound
-      AND (e.upper_bound IS NULL OR a.observed_at <= e.upper_bound)
-  ), fragment_stats AS (
-    SELECT provider, plan_type, plan_variant, limit_id,
-           window_duration_minutes, resets_at, plan_era_key,
-           COUNT(DISTINCT used_percent) AS boundary_count,
-           MAX(used_percent) - MIN(used_percent) AS displayed_span,
-           MAX(observed_at) AS last_observed_at
-      FROM scoped
-     GROUP BY provider, plan_type, plan_variant, limit_id,
-              window_duration_minutes, resets_at, plan_era_key
+       AND r.provider = e.provider AND r.limit_id = e.limit_id
+       AND r.plan_type = e.plan_type AND r.plan_variant = e.plan_variant
+       -- Accepted v1 anchors have canonical four-digit-year chunk days. A
+       -- finite open-era bound preserves that domain and makes BOTH ends seekable.
+       AND r.observed_at <= COALESCE(e.upper_bound, '9999-12-31T23:59:59.999Z')
+  ), endpoints AS MATERIALIZED (
+    SELECT id, observed_at, resets_at, used_percent, era_ordinal
+      FROM marked
+     WHERE used_percent <> prev_up OR used_percent <> next_up
   ), fitable AS (
-    SELECT * FROM fragment_stats WHERE boundary_count >= ? AND displayed_span >= ?
-  ),
-  survivors AS (
-    SELECT s.*
-      FROM scoped s
-      JOIN fitable f
-        ON f.provider = s.provider
-       AND f.plan_type = s.plan_type
-       AND f.plan_variant = s.plan_variant
-       AND f.limit_id = s.limit_id
-       AND f.window_duration_minutes = s.window_duration_minutes
-       AND f.resets_at = s.resets_at
-       AND f.plan_era_key = s.plan_era_key
-  ),
-  marked AS (
-    SELECT survivors.*,
-           LAG(used_percent) OVER win AS prev_up,
-           LEAD(used_percent) OVER win AS next_up
-      FROM survivors
-    WINDOW win AS (
-      PARTITION BY provider, plan_type, plan_variant, limit_id,
-                   window_duration_minutes, resets_at, slot, plan_era_key
-      ORDER BY observed_at, id
-    )
+    SELECT era_ordinal, resets_at FROM endpoints
+     GROUP BY era_ordinal, resets_at
+    HAVING COUNT(DISTINCT used_percent) >= ?7
+       AND MAX(used_percent) - MIN(used_percent) >= ?8
+  ), selected AS (
+    SELECT s.id, s.observed_at, s.era_ordinal FROM endpoints s
+      JOIN fitable f ON f.era_ordinal = s.era_ordinal AND f.resets_at = s.resets_at
+     ORDER BY s.observed_at, s.id
+     LIMIT ?9
   )
-  SELECT occurrence_id, observed_at, provider, plan_type, plan_variant,
-         limit_id, slot, used_percent, window_duration_minutes, resets_at, plan_era_key
-    FROM marked
-   WHERE prev_up IS NULL
-      OR next_up IS NULL
-      OR used_percent <> prev_up
-      OR used_percent <> next_up
-   ORDER BY observed_at, id
-   LIMIT ?`;
+  SELECT r.occurrence_id, r.observed_at, r.provider, r.plan_type, r.plan_variant,
+         r.limit_id, r.slot, r.used_percent, r.window_duration_minutes, r.resets_at,
+         e.plan_era_key
+    FROM selected s JOIN telemetry_v1_records r ON r.id = s.id
+    JOIN era_markers e ON e.era_ordinal = s.era_ordinal
+   ORDER BY s.observed_at, s.id`;
 
-// Binds: winnersJson, participantId, cursor observed_at, cursor occurrence, size.
-// Initialize at (window cutoff, ""). The explicit NOT NULL occurrence field
-// lets D1 seek BOTH cursor keys, including within a large equal-time run; its
-// planner does not seek the implicit rowid suffix of the older time-only index.
-// Selected rows have unique (time, occurrence): admission binds the timestamp
-// to observed_day, we select one device/day, and occurrences are unique per
-// device/stream. The row-value predicate also avoids rescanning the original
-// window prefix, unlike a separate cutoff plus OR-shaped cursor predicate.
-export const V1_USAGE_PAGE_SQL = `
+// The already-deployed 0036 index has implicit rowid (= id) as its last key.
+// D1 does not seek that suffix through a row-value (time,id) predicate, but
+// DOES seek it after three explicit equalities. Drain the current timestamp
+// first, then advance time. Neither seek rescans the original window prefix
+// or sorts a potentially unbounded equal-time run. INDEXED BY makes the
+// required bounded access path explicit even where a newer index is present.
+const V1_USAGE_PAGE_SELECT_SQL = `
   SELECT r.id AS id, r.occurrence_id AS occurrence_id,
          r.observed_at AS observed_at, r.provider AS provider,
          r.session_uuid AS session_uuid, r.record_json AS record_json
-    FROM telemetry_v1_records r
+    FROM telemetry_v1_records r INDEXED BY telemetry_v1_records_participant_stream_observed
     JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
    WHERE ${WINNER_FILTER_SQL}
      AND r.participant_id = ?
-     AND r.stream = 'usage'
-     AND (r.observed_at, r.occurrence_id) > (?, ?)
-   ORDER BY r.observed_at, r.occurrence_id
+     AND r.stream = 'usage'`;
+
+// Binds: winnersJson, participantId, cursor time, cursor id, page size.
+export const V1_USAGE_PAGE_AT_TIME_SQL = `${V1_USAGE_PAGE_SELECT_SQL}
+     AND r.observed_at = ? AND r.id > ?
+   ORDER BY r.id
    LIMIT ?`;
+
+// Binds: winnersJson, participantId, cursor time, remaining page size.
+export const V1_USAGE_PAGE_AFTER_TIME_SQL = `${V1_USAGE_PAGE_SELECT_SQL}
+     AND r.observed_at > ?
+   ORDER BY r.observed_at, r.id
+   LIMIT ?`;
+
+/** Shared page/cursor contract for both scalar and model-composition readers. */
+export async function readV1UsagePage(
+  db: D1Database, winnersJson: string, participantId: string,
+  cursorObservedAt: string, cursorId: number, pageSize: number,
+): Promise<WindowedUsageRow[]> {
+  const sameTime = await db.prepare(V1_USAGE_PAGE_AT_TIME_SQL)
+    .bind(winnersJson, participantId, cursorObservedAt, cursorId, pageSize)
+    .all<WindowedUsageRow>();
+  if (sameTime.results.length === pageSize) return sameTime.results;
+  const later = await db.prepare(V1_USAGE_PAGE_AFTER_TIME_SQL)
+    .bind(winnersJson, participantId, cursorObservedAt, pageSize - sameTime.results.length)
+    .all<WindowedUsageRow>();
+  return sameTime.results.concat(later.results);
+}
 
 interface ProviderGrid {
   sortedMs: number[];
@@ -731,7 +743,7 @@ async function readAndBucketUsage(
   maxWindowedUsageRows: number,
   winnersJsonArg: string,
   attributionIndex: PlanAttributionIndex,
-): Promise<AttributedUsageEventPartial[] | "limit_exceeded" | "session_scope_limit_exceeded"> {
+): Promise<AttributedUsageEventPartial[] | "limit_exceeded" | "session_scope_limit_exceeded" | "cost_limit_exceeded"> {
   // Per provider: strictly-interior events keyed by their ceiling grid instant,
   // and grid-exact events kept as their own singleton at that instant (the
   // matchedUsage lower bound is inclusive, so a grid-exact event that equals a
@@ -742,20 +754,73 @@ async function readAndBucketUsage(
   const bucketScopes = new Map<string, { provider: string; planEraKey: string | null }>();
   const priorSessionTimes = new Map<string, number>();
 
+  // Physical reads now use id within a timestamp, while the attribution
+  // contract uses occurrence order. Only the minimum occurrence for a session
+  // can inherit its earlier interval; every other tie has interval [t,t].
+  // Retain that one compact candidate, not the raw JSON or the whole tie run.
+  // priorSessionTimes includes pending sessions, so its existing cap bounds
+  // the UNION of both maps rather than permitting a second set of 100k scopes.
+  interface UsagePoint {
+    provider: string;
+    observedAtMs: number;
+    priced: ReturnType<typeof priceChunkUsageRecord>;
+  }
+  const pendingFirst = new Map<string, {
+    occurrenceId: string;
+    intervalStartMs: number | undefined;
+    point: UsagePoint;
+  }>();
+  let pendingObservedAt: string | null = null;
+  let costLimitExceeded = false;
+
+  const foldPoint = (point: UsagePoint, intervalStartMs: number | undefined): void => {
+    const { provider, observedAtMs: eMs, priced } = point;
+    if (priced === null) return;
+    const grid = gridByProvider.get(provider);
+    if (!grid || grid.sortedMs.length === 0 || eMs > grid.sortedMs[grid.sortedMs.length - 1]!) return;
+    const match = planEraForInterval(attributionIndex, {
+      contextKey: planAttributionContextKey(provider, "codex"), observedAtMs: eMs, intervalStartMs,
+    });
+    const planEraKey = match.status === "matched" ? match.era.eraKey : null;
+    const bucketKey = JSON.stringify([provider, planEraKey]);
+    bucketScopes.set(bucketKey, { provider, planEraKey });
+    const fullyPriced = priced.pricingStatus === "fully_priced";
+    const gridExact = grid.set.has(eMs);
+    const placement = gridExact ? eMs : ceilingGrid(grid.sortedMs, eMs);
+    if (placement === null) return;
+    const target = gridExact ? singletons : buckets;
+    const providerBuckets = target.get(bucketKey) ?? new Map<number, BucketAccumulator>();
+    const existing = providerBuckets.get(placement);
+    const validCost = Number.isSafeInteger(priced.costNanousd) && priced.costNanousd >= 0;
+    if (!validCost || priced.costNanousd > MAX_SCALAR_BUCKET_COST_NANOUSD - (existing?.costNanousd ?? 0)) {
+      // Partial pricing is not a permission to omit/truncate an overflowing
+      // scalar bucket: the kernel validates cost before its pricing refusal.
+      costLimitExceeded = true;
+      return;
+    }
+    if (existing) {
+      existing.costNanousd += priced.costNanousd;
+      existing.allFullyPriced = existing.allFullyPriced && fullyPriced;
+      // Keep the latest constituent strictly below its ceiling grid point.
+      existing.placementMs = Math.max(existing.placementMs, eMs);
+    } else {
+      providerBuckets.set(placement, {
+        costNanousd: priced.costNanousd, allFullyPriced: fullyPriced, placementMs: eMs,
+      });
+    }
+    target.set(bucketKey, providerBuckets);
+  };
+
+  const flushFirst = (): void => {
+    for (const candidate of pendingFirst.values()) foldPoint(candidate.point, candidate.intervalStartMs);
+    pendingFirst.clear();
+  };
+
   let total = 0;
   let cursorObs = observedAtCutoff;
-  let cursorOccurrence = "";
+  let cursorId = 0;
   for (;;) {
-    const page = await db.prepare(V1_USAGE_PAGE_SQL)
-      .bind(
-        winnersJsonArg,
-        participantId,
-        cursorObs,
-        cursorOccurrence,
-        USAGE_PAGE_SIZE,
-      )
-      .all<WindowedUsageRow>();
-    const rows = page.results;
+    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) return "limit_exceeded";
@@ -763,75 +828,48 @@ async function readAndBucketUsage(
       if (!SAFE_TOKEN.test(row.provider)) continue;
       const eMs = Date.parse(row.observed_at);
       if (!Number.isFinite(eMs)) continue;
+      if (pendingObservedAt !== row.observed_at) {
+        flushFirst();
+        pendingObservedAt = row.observed_at;
+      }
       // v1 has no quantity-basis field. A prior usage record in the SAME
       // session gives a conservative interval bound, never account proof.
       const sessionKey = row.session_uuid === null ? null
         : JSON.stringify([row.provider, row.session_uuid]);
-      const intervalStartMs = sessionKey === null ? undefined : priorSessionTimes.get(sessionKey);
-      if (sessionKey !== null) {
-        if (!priorSessionTimes.has(sessionKey) && priorSessionTimes.size >= MAX_SESSION_INTERVAL_SCOPES) {
-          return "session_scope_limit_exceeded";
-        }
-        priorSessionTimes.set(sessionKey, eMs);
+      if (sessionKey !== null && !priorSessionTimes.has(sessionKey)
+          && priorSessionTimes.size >= MAX_SESSION_INTERVAL_SCOPES) {
+        return "session_scope_limit_exceeded";
       }
       const grid = gridByProvider.get(row.provider);
-      if (!grid || grid.sortedMs.length === 0) continue;
-      // Events after the last retained quota instant cannot enter any reset's
-      // matched window (matchedUsage requires observedAt <= lastObserved <=
-      // maxG), so they change no fit — drop them.
-      if (eMs > grid.sortedMs[grid.sortedMs.length - 1]!) continue;
-      const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
-      if (priced === null) continue;
-      const match = planEraForInterval(attributionIndex, {
-        contextKey: planAttributionContextKey(row.provider, "codex"),
-        observedAtMs: eMs, intervalStartMs,
-      });
-      const planEraKey = match.status === "matched" ? match.era.eraKey : null;
-      const bucketKey = JSON.stringify([row.provider, planEraKey]);
-      bucketScopes.set(bucketKey, { provider: row.provider, planEraKey });
-      const fullyPriced = priced.pricingStatus === "fully_priced";
-      if (grid.set.has(eMs)) {
-        const providerSingletons = singletons.get(bucketKey)
-          ?? new Map<number, BucketAccumulator>();
-        const existing = providerSingletons.get(eMs);
-        if (existing) {
-          existing.costNanousd += priced.costNanousd;
-          existing.allFullyPriced = existing.allFullyPriced && fullyPriced;
-        } else {
-          providerSingletons.set(eMs, {
-            costNanousd: priced.costNanousd,
-            allFullyPriced: fullyPriced,
-            placementMs: eMs,
-          });
-        }
-        singletons.set(bucketKey, providerSingletons);
-        continue;
-      }
-      const qc = ceilingGrid(grid.sortedMs, eMs);
-      if (qc === null) continue;
-      const providerBuckets = buckets.get(bucketKey)
-        ?? new Map<number, BucketAccumulator>();
-      const existing = providerBuckets.get(qc);
-      if (existing) {
-        existing.costNanousd += priced.costNanousd;
-        existing.allFullyPriced = existing.allFullyPriced && fullyPriced;
-        // Place the synthetic at the MAX constituent observed_at (< qc), so it
-        // sits strictly between the previous grid point and qc.
-        existing.placementMs = Math.max(existing.placementMs, eMs);
+      const point: UsagePoint = { provider: row.provider, observedAtMs: eMs,
+        priced: !grid || grid.sortedMs.length === 0 || eMs > grid.sortedMs[grid.sortedMs.length - 1]!
+          ? null : priceChunkUsageRecord(row.record_json, row.observed_at) };
+      if (sessionKey === null) {
+        foldPoint(point, undefined);
       } else {
-        providerBuckets.set(qc, {
-          costNanousd: priced.costNanousd,
-          allFullyPriced: fullyPriced,
-          placementMs: eMs,
-        });
+        const candidate = pendingFirst.get(sessionKey);
+        if (!candidate) {
+          pendingFirst.set(sessionKey, { occurrenceId: row.occurrence_id,
+            intervalStartMs: priorSessionTimes.get(sessionKey), point });
+          // Includes DROP/grid-ineligible candidates: the original clock
+          // advanced before those filters. Null sessions never share a clock.
+          priorSessionTimes.set(sessionKey, eMs);
+        } else if (row.occurrence_id < candidate.occurrenceId) {
+          foldPoint(candidate.point, eMs);
+          candidate.occurrenceId = row.occurrence_id;
+          candidate.point = point;
+        } else {
+          foldPoint(point, eMs);
+        }
       }
-      buckets.set(bucketKey, providerBuckets);
     }
     if (rows.length < USAGE_PAGE_SIZE) break;
     const last = rows[rows.length - 1]!;
     cursorObs = last.observed_at;
-    cursorOccurrence = last.occurrence_id;
+    cursorId = last.id;
   }
+  flushFirst();
+  if (costLimitExceeded) return "cost_limit_exceeded";
 
   const usageEvents: AttributedUsageEventPartial[] = [];
   for (const [bucketKey, { provider, planEraKey }] of bucketScopes) {
@@ -1135,6 +1173,7 @@ export async function accountScopedQuotaAnalysisV1(
     return notTestable("windowed_usage_limit_exceeded");
   }
   if (usageEvents === "session_scope_limit_exceeded") return notTestable("session_interval_scope_limit_exceeded");
+  if (usageEvents === "cost_limit_exceeded") return notTestable("usage_cost_limit_exceeded");
 
   const analysis = runV1SeedLoop(datasets, quotaSnapshots, usageEvents);
   await assertV1SourcePinCurrent(db, sourcePin);
@@ -1189,6 +1228,7 @@ export async function downsampleQuotaForTest(
 export async function accountScopedQuotaAnalysisV1FullReferenceForTest(
   db: D1Database,
   participantId: string,
+  options: { usageTieOrder?: "occurrence" | "rowid" } = {},
 ): Promise<object> {
   const sourcePin = await loadV1SourcePin(db, { participantId });
   await assertNoActiveV11Source(db, participantId);
@@ -1200,7 +1240,8 @@ export async function accountScopedQuotaAnalysisV1FullReferenceForTest(
       JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
      WHERE ${WINNER_FILTER_SQL} AND r.participant_id = ?
        AND r.stream IN ('usage', 'quota')
-     ORDER BY r.observed_at, r.id`,
+     ORDER BY r.observed_at, ${options.usageTieOrder === "rowid"
+      ? "r.id" : "CASE WHEN r.stream = 'usage' THEN r.occurrence_id END, r.id"}`,
   ).bind(sourcePin.winnersJson, participantId).all<ReferenceRecordRowV1>();
 
   const datasetId = await v1DatasetId(participantId);
@@ -1416,24 +1457,17 @@ export async function accountScopedModelCompositionV1(
   const grainMs = MODEL_COMPOSITION_POLICY.grainMs;
   const costByBinAndModel = new Map<string, {
     observedAtMs: number; model: string; costNanousd: number;
+    firstObservedAt: string; firstOccurrenceId: string;
+    overflowed: boolean;
   }>();
   let usageEventCount = 0;
   let unpricedUsageEventCount = 0;
   const poisonedBins = new Set<number>();
   let total = 0;
   let cursorObs = observedAtCutoff;
-  let cursorOccurrence = "";
+  let cursorId = 0;
   for (;;) {
-    const page = await db.prepare(V1_USAGE_PAGE_SQL)
-      .bind(
-        winnersJsonArg,
-        participantId,
-        cursorObs,
-        cursorOccurrence,
-        USAGE_PAGE_SIZE,
-      )
-      .all<WindowedUsageRow>();
-    const rows = page.results;
+    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) {
@@ -1461,19 +1495,51 @@ export async function accountScopedModelCompositionV1(
       const binStartMs = eventBinStartMs;
       const key = `${binStartMs}\u0000${model}`;
       const existing = costByBinAndModel.get(key);
-      if (existing) existing.costNanousd += priced.costNanousd;
-      else costByBinAndModel.set(key, { observedAtMs: binStartMs, model, costNanousd: priced.costNanousd });
+      if (existing) {
+        if (!Number.isSafeInteger(priced.costNanousd) || priced.costNanousd < 0
+            || priced.costNanousd > Number.MAX_SAFE_INTEGER - existing.costNanousd) {
+          existing.overflowed = true;
+        } else if (!existing.overflowed) {
+          existing.costNanousd += priced.costNanousd;
+        }
+        if (row.observed_at < existing.firstObservedAt
+            || (row.observed_at === existing.firstObservedAt && row.occurrence_id < existing.firstOccurrenceId)) {
+          existing.firstObservedAt = row.observed_at;
+          existing.firstOccurrenceId = row.occurrence_id;
+        }
+      } else {
+        const validCost = Number.isSafeInteger(priced.costNanousd) && priced.costNanousd >= 0;
+        costByBinAndModel.set(key, { observedAtMs: binStartMs, model,
+          costNanousd: validCost ? priced.costNanousd : 0, overflowed: !validCost,
+          firstObservedAt: row.observed_at, firstOccurrenceId: row.occurrence_id });
+      }
     }
     if (rows.length < USAGE_PAGE_SIZE) break;
     const last = rows[rows.length - 1]!;
     cursorObs = last.observed_at;
-    cursorOccurrence = last.occurrence_id;
+    cursorId = last.id;
   }
 
   const usageRows: CompositionUsageRow[] = [];
+  // Reconstruct the former (time,occurrence) stream's first-model insertion
+  // order before the kernel converts costs to floating USD. Sorting by model
+  // instead would be deterministic but could change its reduction order.
+  // Fully priced zero-cost rows participate in this first-seen key just as
+  // before; poisoned/zero-total bins are still omitted below.
+  const orderedCosts = [];
   for (const entry of costByBinAndModel.values()) {
-    if (entry.costNanousd <= 0) continue;
     if (poisonedBins.has(entry.observedAtMs)) continue;
+    // Keep scanning after overflow: later unpriced evidence may legitimately
+    // poison this whole bin. Only a contributing, otherwise retained entry
+    // refuses the fit; never emit its partial sum or silently drop its cost.
+    if (entry.overflowed) return { status: "not_testable", reason: "usage_cost_limit_exceeded" };
+    if (entry.costNanousd > 0) orderedCosts.push(entry);
+  }
+  orderedCosts.sort((left, right) => (
+    left.firstObservedAt < right.firstObservedAt ? -1 : left.firstObservedAt > right.firstObservedAt ? 1
+      : left.firstOccurrenceId < right.firstOccurrenceId ? -1 : left.firstOccurrenceId > right.firstOccurrenceId ? 1 : 0
+  ));
+  for (const entry of orderedCosts) {
     usageRows.push({
       observedAtMs: entry.observedAtMs,
       model: entry.model,

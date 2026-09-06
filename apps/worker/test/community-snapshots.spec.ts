@@ -2,7 +2,10 @@ import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { buildCommunityWeeklySnapshot } from "../src/community-snapshots";
+import {
+  buildCommunityWeeklySnapshot,
+  rebuildPendingCommunityWeeklySnapshots,
+} from "../src/community-snapshots";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -16,6 +19,28 @@ const FAR_FUTURE = "2099-01-01T00:00:00.000Z";
 
 function db(): D1Database {
   return (env as TestBindings).USAGE_MONITOR_DB;
+}
+
+// The builder's only batch is finalization; interleave a real D1 mutation
+// immediately before it so each SQL fence is exercised, not mocked away.
+function beforeFinalization(callback: () => Promise<void>): D1Database {
+  return new Proxy(db(), {
+    get(target, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        await callback();
+        return target.batch(statements);
+      };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+async function advanceEpoch(): Promise<void> {
+  await db().prepare(
+    `UPDATE community_snapshot_mutation_control SET mutation_epoch = mutation_epoch + 1
+      WHERE singleton_id = 1`,
+  ).run();
 }
 
 async function insertParticipant(
@@ -181,6 +206,170 @@ beforeEach(async () => {
 });
 
 describe("community aggregate safety", () => {
+  it.each(["suppressed", "published"] as const)(
+    "replaces an older %s epoch after ingest without deleting or rewriting sealed data",
+    async (releaseState) => {
+      const participant = releaseState === "published"
+        ? (await seedMatureOpenCohort(["gpt-5.6-sol", "gpt-5.6-terra"]))[0]
+        : await insertParticipant(0);
+      if (!participant) throw new Error("synthetic cohort participant missing");
+      const first = await buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF));
+      const before = await db().prepare(
+        "SELECT * FROM community_weekly_snapshots WHERE snapshot_id = ?",
+      ).bind(first.snapshotId).first();
+      expect(before!.release_state).toBe(releaseState);
+      // Exercise the real 0043 ingest trigger, not only a direct epoch update.
+      await insertAcceptedContribution(participant, 900, "2026-07-25T12:00:00.000Z", "gpt-5.6-sol");
+      const records = await db().prepare("SELECT * FROM telemetry_records ORDER BY id").all();
+      const contributions = await db().prepare("SELECT * FROM telemetry_contributions ORDER BY id").all();
+      const second = await buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF));
+      expect(second.state).toBe("built");
+      expect(second.snapshotId).not.toBe(first.snapshotId);
+      const after = await db().prepare(
+        "SELECT * FROM community_weekly_snapshots WHERE snapshot_id = ?",
+      ).bind(first.snapshotId).first();
+      expect(after).toEqual({
+        ...before,
+        release_state: "withdrawn",
+        withdrawn_at: CUTOFF,
+        withdrawal_epoch: Number(before!.source_mutation_epoch) + 1,
+      });
+      expect(await buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF))).toEqual({
+        state: "existing", snapshotId: second.snapshotId,
+      });
+      expect(await db().prepare(
+        "SELECT COUNT(*) AS count FROM community_weekly_snapshots",
+      ).first()).toEqual({ count: 2 });
+      expect(await db().prepare(
+        "SELECT COUNT(*) AS count FROM community_weekly_snapshot_rebuilds",
+      ).first()).toEqual({ count: 0 });
+      expect((await db().prepare("SELECT * FROM telemetry_records ORDER BY id").all()).results)
+        .toEqual(records.results);
+      expect((await db().prepare("SELECT * FROM telemetry_contributions ORDER BY id").all()).results)
+        .toEqual(contributions.results);
+    },
+  );
+
+  it.each(["epoch", "owner", "lease_epoch", "lease_expiry"] as const)(
+    "does not withdraw or drain a queued rebuild after a %s race",
+    async (race) => {
+      const first = await buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF));
+      const before = await db().prepare(
+        "SELECT * FROM community_weekly_snapshots WHERE snapshot_id = ?",
+      ).bind(first.snapshotId).first();
+      await advanceEpoch();
+      const epoch = Number(before!.source_mutation_epoch) + 1;
+      // An older queue entry makes an unfenced journal UPSERT observable.
+      await db().prepare(
+        `INSERT INTO community_weekly_snapshot_rebuilds
+          (week_start, week_end, ingestion_cutoff_at, requested_epoch, requested_at)
+          VALUES (?, ?, ?, ?, ?)`,
+      ).bind(PERIOD_START, PERIOD_END, CUTOFF, epoch - 1, PERIOD_END).run();
+      const queued = await db().prepare("SELECT * FROM community_weekly_snapshot_rebuilds").first();
+      let interleaved = false;
+      const guarded = beforeFinalization(async () => {
+        interleaved = true;
+        if (race === "epoch") await advanceEpoch();
+        else if (race === "owner") await db().prepare(
+          "UPDATE community_snapshot_builders SET owner_nonce = 'replacement-owner'",
+        ).run();
+        else if (race === "lease_epoch") await db().prepare(
+          "UPDATE community_snapshot_builders SET mutation_epoch = mutation_epoch + 1",
+        ).run();
+        else await db().prepare(
+          "UPDATE community_snapshot_builders SET lease_expires_at = ?",
+        ).bind(CUTOFF).run();
+      });
+      await expect(buildCommunityWeeklySnapshot(guarded, Date.parse(CUTOFF)))
+        .rejects.toThrow("community snapshot finalization cancelled or conflicted");
+      expect(interleaved).toBe(true);
+      expect(await db().prepare("SELECT * FROM community_weekly_snapshots").first()).toEqual(before);
+      expect(await db().prepare("SELECT * FROM community_weekly_snapshot_rebuilds").first()).toEqual(queued);
+      expect(await db().prepare("SELECT COUNT(*) AS count FROM community_weekly_snapshots").first())
+        .toEqual({ count: 1 });
+      if (race === "owner") expect(await db().prepare(
+        "SELECT owner_nonce FROM community_snapshot_builders",
+      ).first()).toEqual({ owner_nonce: "replacement-owner" });
+    },
+  );
+
+  it("rolls back journal and withdrawal if the replacement INSERT aborts, then retries", async () => {
+    const first = await buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF));
+    const before = await db().prepare("SELECT * FROM community_weekly_snapshots").first();
+    await advanceEpoch();
+    const epoch = Number(before!.source_mutation_epoch) + 1;
+    await db().prepare(
+      `INSERT INTO community_weekly_snapshot_rebuilds
+        (week_start, week_end, ingestion_cutoff_at, requested_epoch, requested_at)
+        VALUES (?, ?, ?, ?, ?)`,
+    ).bind(PERIOD_START, PERIOD_END, CUTOFF, epoch - 1, PERIOD_END).run();
+    const queued = await db().prepare("SELECT * FROM community_weekly_snapshot_rebuilds").first();
+    await db().prepare(
+      `CREATE TRIGGER test_replacement_abort BEFORE INSERT ON community_weekly_snapshots
+        WHEN NEW.revision = 2 BEGIN SELECT RAISE(ABORT, 'synthetic replacement failure'); END`,
+    ).run();
+    await expect(buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF)))
+      .rejects.toThrow("synthetic replacement failure");
+    expect(await db().prepare("SELECT * FROM community_weekly_snapshots").first()).toEqual(before);
+    expect(await db().prepare("SELECT * FROM community_weekly_snapshot_rebuilds").first()).toEqual(queued);
+    await db().prepare("DROP TRIGGER test_replacement_abort").run();
+    const replacement = await buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF) + 6 * 60_000);
+    expect(replacement).toEqual({ state: "built", snapshotId: `${first.snapshotId}:r2` });
+    expect(await db().prepare("SELECT COUNT(*) AS count FROM community_weekly_snapshot_rebuilds").first())
+      .toEqual({ count: 0 });
+  });
+
+  it("retains a newer queued epoch and unrelated sealed weeks during replacement", async () => {
+    const previous = await buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF) - 7 * 86_400_000);
+    const previousRow = await db().prepare(
+      "SELECT * FROM community_weekly_snapshots WHERE snapshot_id = ?",
+    ).bind(previous.snapshotId).first();
+    const first = await buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF));
+    await advanceEpoch();
+    const epoch = await db().prepare(
+      "SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1",
+    ).first<{ mutation_epoch: number }>();
+    await db().prepare(
+      `INSERT INTO community_weekly_snapshot_rebuilds
+        (week_start, week_end, ingestion_cutoff_at, requested_epoch, requested_at)
+        VALUES (?, ?, ?, ?, ?)`,
+    ).bind(PERIOD_START, PERIOD_END, CUTOFF, epoch!.mutation_epoch + 1, CUTOFF).run();
+    const queued = await db().prepare("SELECT * FROM community_weekly_snapshot_rebuilds").first();
+    expect(await buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF)))
+      .toEqual({ state: "built", snapshotId: `${first.snapshotId}:r2` });
+    expect(await db().prepare("SELECT * FROM community_weekly_snapshot_rebuilds").first()).toEqual(queued);
+    expect(await db().prepare(
+      "SELECT * FROM community_weekly_snapshots WHERE snapshot_id = ?",
+    ).bind(previous.snapshotId).first()).toEqual(previousRow);
+  });
+
+  it("preserves a racing policy withdrawal and its newer journal until a fresh rebuild", async () => {
+    const first = await buildCommunityWeeklySnapshot(db(), Date.parse(CUTOFF));
+    await advanceEpoch();
+    let withdrawn: Record<string, unknown> | null = null;
+    let queued: Record<string, unknown> | null = null;
+    const guarded = beforeFinalization(async () => {
+      await db().prepare(
+        `UPDATE community_snapshot_policy
+          SET maturity_days = maturity_days + 1, policy_revision = policy_revision + 1,
+              updated_at = ?, updated_by_digest = ? WHERE singleton_id = 1`,
+      ).bind(CUTOFF, "c".repeat(64)).run();
+      withdrawn = await db().prepare("SELECT * FROM community_weekly_snapshots").first();
+      queued = await db().prepare("SELECT * FROM community_weekly_snapshot_rebuilds").first();
+    });
+    await expect(buildCommunityWeeklySnapshot(guarded, Date.parse(CUTOFF)))
+      .rejects.toThrow("community snapshot finalization cancelled or conflicted");
+    const persistedWithdrawal = await db().prepare("SELECT * FROM community_weekly_snapshots").first();
+    expect(persistedWithdrawal?.release_state).toBe("withdrawn");
+    expect(persistedWithdrawal).toEqual(withdrawn);
+    expect(await db().prepare("SELECT * FROM community_weekly_snapshot_rebuilds").first()).toEqual(queued);
+    const rebuilt = await rebuildPendingCommunityWeeklySnapshots(db(), Date.parse(CUTOFF) + 1000);
+    expect(rebuilt).toEqual({ processed: 1, remaining: false, snapshotIds: [`${first.snapshotId}:r2`] });
+    expect(await db().prepare(
+      "SELECT * FROM community_weekly_snapshots WHERE snapshot_id = ?",
+    ).bind(first.snapshotId).first()).toEqual(withdrawn);
+  });
+
   it("applies maturity and account-level clipping deterministically", async () => {
     await seedMatureOpenCohort(["gpt-5.6-sol", "gpt-5.6-terra"]);
     await db().prepare(

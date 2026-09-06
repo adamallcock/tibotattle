@@ -17,6 +17,7 @@ import {
   STAGING_PROOF_TYPES,
   stagingOperationReceipt,
   validateStagingMigrationInventory,
+  V1_USAGE_CURSOR_INDEX_PROBE_SQL,
 } from "./staging-readiness-lib.mjs";
 import {
   checkedInConfig,
@@ -51,7 +52,8 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-3), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-4), [
+    "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
     "0046_accountless_enrollment_ledger.sql",
@@ -87,17 +89,19 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
   );
 });
 
-test("reconciled migration lineage preserves historical and renumbered SQL bytes", () => {
+test("reconciled migration lineage pins historical SQL and reviewed unapplied repairs", () => {
   // Historical 0041 is the deployed 4519b349 migration. The other digests pin
-  // the unchanged SQL from the pre-reconciliation release source a9220795.
-  // The unpublished accountless ledger follows that lineage with its original
-  // integration bytes, renumbered from 0045 to 0046 to avoid a collision.
+  // the unchanged SQL from the pre-reconciliation release source a9220795,
+  // except the owner-approved 0043 repair and expression-parentheses-only
+  // remote-parser compatibility repair of unapplied 0044/0045. The
+  // unpublished accountless ledger is appended at 0046. Never change
+  // already-applied SQL or silently update these historical pins.
   const expectedDigests = {
     "0041_community_model_composition_cache.sql": "52ff5ff182023bd504c5d584e4c96494c04db7f29a70661dd5713c4a8770d12d",
     "0042_community_model_composition.sql": "c61629ef87facfc8f8d8e16fc5cdc1d4adaf788df7bcc9ee760b60f86e577330",
-    "0043_analytical_input_fencing.sql": "4c36ed9342365adceb0dc5c4d576a93ffd557b9bc39dfd2a7c9239c5c9b0ca9a",
-    "0044_attribution_transport_staging.sql": "6d79465243432097aebc20f50718f891e01de234a3b264a984816c54b338e713",
-    "0045_attribution_domain_activation.sql": "0e4bd66cc391f64b8b1a3d1533751cec461882282160cc283330bfba22ff9690",
+    "0043_analytical_input_fencing.sql": "acc7c319478487eec408c5bbcebd90e60f029fb02a608c901b7c6f71706c2f49",
+    "0044_attribution_transport_staging.sql": "9b2661a5052ca8a08e18098e960891a49e7f1c7516b2c1b8cacf32c6f294f5e4",
+    "0045_attribution_domain_activation.sql": "89f0df9e95eb98fa7ae8cb00dc82fe19f8933689a8002e647e638fdc870990fe",
     "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
@@ -111,6 +115,28 @@ test("reconciled migration lineage preserves historical and renumbered SQL bytes
   for (const [name, expected] of Object.entries(expectedDigests)) {
     const bytes = readFileSync(join(workerDirectory, "migrations", name));
     assert.equal(createHash("sha256").update(bytes).digest("hex"), expected, name);
+  }
+});
+
+test("remote trigger parser repair changes only complete CASE expression parentheses", () => {
+  // D1's remote query parser misidentifies an unparenthesized CASE END inside
+  // a trigger as its terminator (workers-sdk#4727, reproduced read-only with
+  // EXPLAIN on 2026-09-05). Local SQLite/Miniflare alone does not expose this.
+  // Undo exactly the new wrappers and require the original reviewed bytes;
+  // no guard, literal, NULL branch or data operation may change incidentally.
+  for (const [name, selectCount, originalDigest] of [
+    ["0044_attribution_transport_staging.sql", 11, "6d79465243432097aebc20f50718f891e01de234a3b264a984816c54b338e713"],
+    ["0045_attribution_domain_activation.sql", 7, "0e4bd66cc391f64b8b1a3d1533751cec461882282160cc283330bfba22ff9690"],
+  ]) {
+    const sql = readFileSync(join(workerDirectory, "migrations", name), "utf8");
+    assert.equal((sql.match(/SELECT \(CASE\b/gu) ?? []).length, selectCount);
+    assert.equal((sql.match(/\bCASE\b/gu) ?? []).length, name.startsWith("0044") ? 12 : 7);
+    assert.equal(/SELECT CASE\b/u.test(sql), false);
+    const original = sql.replaceAll("SELECT (CASE", "SELECT CASE")
+      .replaceAll(" END);", " END;")
+      .replaceAll(">= (CASE WHEN (", ">= CASE WHEN (")
+      .replaceAll("THEN 20000 ELSE 2000 END)", "THEN 20000 ELSE 2000 END");
+    assert.equal(createHash("sha256").update(original).digest("hex"), originalDigest, name);
   }
 });
 
@@ -245,6 +271,29 @@ test("fresh reconciled schema and attribution metadata probe cover every new gua
       assert.equal(attributionSchemaComplete(row), false, name);
       database.exec("ROLLBACK TO missing_schema; RELEASE missing_schema;");
     }
+    // An object with the prerequisite's name but a different seek contract is
+    // insufficient. Exercise absent, reordered, partial and descending keys.
+    const cursorIndex = "telemetry_v1_records_participant_stream_observed";
+    for (const replacement of [
+      "",
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, observed_at, stream)`,
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, stream, observed_at) WHERE stream = 'usage'`,
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, stream, observed_at DESC)`,
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, stream, observed_at COLLATE NOCASE)`,
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, stream, substr(observed_at, 1))`,
+      `CREATE INDEX ${cursorIndex} ON telemetry_v1_records(participant_id, stream, observed_at, occurrence_id)`,
+    ]) {
+      database.exec(`SAVEPOINT wrong_cursor; DROP INDEX ${cursorIndex}; ${replacement};`);
+      const row = database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get();
+      assert.equal(row.attribution_objects, 0, replacement || "missing 0036 cursor index");
+      assert.equal(attributionSchemaComplete(row), false);
+      database.exec("ROLLBACK TO wrong_cursor; RELEASE wrong_cursor;");
+    }
+    // The physical suffix is rowid; the SQL cursor specifically uses r.id.
+    // A renamed column keeps index metadata intact but breaks that contract.
+    database.exec("SAVEPOINT wrong_cursor_id; ALTER TABLE telemetry_v1_records RENAME COLUMN id TO non_cursor_id;");
+    assert.equal(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get().attribution_objects, 0);
+    database.exec("ROLLBACK TO wrong_cursor_id; RELEASE wrong_cursor_id;");
     for (const [table, column] of [
       ["device_credential_rotations", "recovery_proof_hash"],
       ["community_allowance_fit_cache", "input_fingerprint"],
@@ -275,6 +324,29 @@ test("fresh reconciled schema and attribution metadata probe cover every new gua
   }
 });
 
+test("v1 cursor prerequisite requires id to be the rowid alias, not merely an indexed column", () => {
+  for (const [idDefinition, suffix, expected] of [
+    ["id INTEGER PRIMARY KEY", "", 1],
+    ["id INTEGER PRIMARY KEY AUTOINCREMENT", "", 1],
+    ["id INTEGER PRIMARY KEY DESC", "", 0],
+    ["id INT PRIMARY KEY", "", 0],
+    ["id INTEGER", "", 0],
+    ["id INTEGER", ", PRIMARY KEY (id, participant_id)", 0],
+  ]) {
+    const database = new DatabaseSync(":memory:");
+    try {
+      database.exec(`CREATE TABLE telemetry_v1_records (${idDefinition}, participant_id TEXT,
+        stream TEXT, observed_at TEXT ${suffix});
+        CREATE INDEX telemetry_v1_records_participant_stream_observed
+          ON telemetry_v1_records(participant_id, stream, observed_at);`);
+      assert.equal(database.prepare(V1_USAGE_CURSOR_INDEX_PROBE_SQL).get().v1_usage_cursor_index,
+        expected, `${idDefinition}${suffix}`);
+    } finally {
+      database.close();
+    }
+  }
+});
+
 test("current migration labels do not hide missing attribution metadata in staging readiness", () => {
   const config = provisionedConfig();
   const result = probeStagingLive({
@@ -298,7 +370,7 @@ test("staging requires pending attribution migrations before its schema probe", 
       if (args[2] === "USAGE_MONITOR_DB" && args.some((arg) => arg.includes("FROM d1_migrations"))) {
         calls.push(args);
         return { status: 0, stdout: JSON.stringify([{ results:
-          EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, -3).map((name) => ({ name })),
+          EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, -4).map((name) => ({ name })),
         }]), stderr: "" };
       }
       return baseSpawn(command, args, options);
