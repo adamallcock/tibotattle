@@ -91,10 +91,15 @@ the displayed partial amount is not the complete historical spend. Recovery pres
 refusal rules, with no historical telemetry rewrite or statistical-policy change.
 
 The scoped [admin progress and useful-work scheduling change](./plans/2026-09-06-admin-reconstruction-progress.md)
-is implemented and in final hosted qualification, not yet deployed. It makes
-calculation phases and publication backlog visible even when the admin graph
-preview is unavailable, and prevents current accounts consuming unfinished-work
-slots without increasing concurrency, query limits or calculation budgets.
+deployed as `daa82a939020cb74ad5054c4ee7e6091019502be`, independently confirmed
+healthy at 21:11 UTC on 2026-09-06. The normal guarded deployment required no
+migrations or health exception. Live authenticated Chrome shows calculation
+phases and publication backlog even while the admin graph preview is unavailable:
+13 of 15 tracked account checkpoints acquired, one account preparing, one
+scanning, and 266 pending daily rebuilds. Current accounts no longer consume
+unfinished-work slots; concurrency, query limits and calculation budgets are
+unchanged. This closes progress visibility and useful-work scheduling, not the
+separate graph-recovery gate.
 
 The existing dated social preview was temporarily retained to prioritize the
 verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;

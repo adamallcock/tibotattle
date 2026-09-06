@@ -2,7 +2,7 @@
 title: Admin reconstruction visibility and useful-work scheduling
 date: 2026-09-06
 type: plan
-status: in-progress
+status: completed
 ---
 
 # Outcome and scope
@@ -60,8 +60,34 @@ despite the unavailable allowance preview. Independent SQL query-plan review
 confirmed bounded pages before joins and indexed, capped daily probes. The
 architecture gate caught a dependency cycle when composing diagnostics inside
 the generic operations reader; composition now belongs to the existing route
-entrypoint, and architecture/type checks pass without policy exceptions. The full
-Worker and production deployment gates remain to run; this is not live proof.
+entrypoint, and architecture/type checks pass without policy exceptions.
+
+The complete hosted gate passes: 759 Worker tests in 58 files, 198 Worker script
+tests, package-copy and endpoint guards, generated types/assets, TypeScript,
+default/staging dry deployments and production dry bundle. Documentation,
+20 preflight tests and architecture checks pass. No skipped browser/Worker tests.
+
+# Live verification
+
+At 21:11 UTC on 2026-09-06 the normal guarded production deployment returned
+`PRODUCTION_DEPLOYED` for exact source
+`daa82a939020cb74ad5054c4ee7e6091019502be`. It found no unapplied migrations;
+pre/post health checks and the public-only surface check passed. Independent
+cache-busted health returned `ok` with the exact source commit. No migration,
+consent, activation, resource-limit or desktop-artifact changes were made.
+
+Authenticated Chrome rendering shows the new panel alongside an unavailable
+allowance preview: record lookup complete; 13 of 15 tracked account checkpoints
+acquired; one preparing and one scanning; 2,345 current-run checkpoint steps;
+266 queued days; 317 published days in the displayed year, of which one has
+possibly partial price data. The latest cache timestamp is explicitly qualified
+as potentially outdated. The panel is readable at the real desktop viewport.
+These are observations at 21:11 UTC, not a completion forecast or a claim that
+the allowance graph has recovered.
+
+A subsequent content-free database read showed both unfinished jobs in scanning
+and a natural maintenance run recorded at `2026-09-06T21:11:18.000Z`. No manual
+maintenance, lease override or checkpoint reset was used for verification.
 
 The useful-work scheduler remains sequential: current cache checks consume the
 same statement budget but not the four unfinished-analysis slots. Tests prove
