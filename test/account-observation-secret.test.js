@@ -516,6 +516,47 @@ test("Windows x64 account-observation production selection remains fail closed",
   assert.equal(constructions, 0);
 });
 
+test("Linux account selection preserves its separate brokered identity and read-only absence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "linux-account-broker-selection-"));
+  const backend = { ...memoryBackend(Buffer.alloc(32, 81)),
+    replaceExact: async () => "replaced", deleteExact: async () => "deleted",
+    describe: () => ({ backend: "linux_secret_service_broker", status: "available" }) };
+  try {
+    const selection = selectProductionAccountObservationSecret({
+      platform: "linux", architecture: "x64", operationLockFile: join(root, "account.lock"),
+      createLinuxBackend: () => backend, createIfMissing: false,
+      createKeychainBackend: () => { throw new Error("Mac fallback must not run"); },
+    });
+    assert.equal(selection.mode, "linux_secret_service_broker_account_observation");
+    const observed = await selection.loadAccountObservationSecret();
+    assert.deepEqual(observed, Buffer.alloc(32, 81)); observed.fill(0);
+    assert.equal(backend.calls.every(([, capability]) => capability === ACCOUNT_CAPABILITY), true);
+    assert.equal(backend.calls.some(([operation]) => operation === "createIfMissing"), false);
+    const absent = { ...backend, read: async () => null,
+      createIfMissing: () => { throw new Error("Read-only selection cannot create"); } };
+    const readOnly = selectProductionAccountObservationSecret({
+      platform: "linux", architecture: "x64", operationLockFile: join(root, "absent.lock"),
+      createLinuxBackend: () => absent, createIfMissing: false,
+    });
+    assert.equal(await readOnly.loadAccountObservationSecret(), null);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("Linux account selection refuses missing, malformed and cross-capability backends without fallback", () => {
+  for (const createLinuxBackend of [null, () => null, () => ({ get() {}, set() {}, delete() {} }), () => { throw new Error("private-native-detail"); }]) {
+    assert.throws(() => selectProductionAccountObservationSecret({
+      platform: "linux", architecture: "x64", createLinuxBackend,
+    }), (error) => error.code === "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE"
+      && !error.stack.includes("private-native-detail"));
+  }
+  for (const keychainCapability of [EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.exportIdentity, {}]) {
+    assert.throws(() => selectProductionAccountObservationSecret({
+      platform: "linux", architecture: "x64", keychainCapability,
+      createLinuxBackend: () => { throw new Error("Must refuse before construction"); },
+    }), { code: "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_INVALID" });
+  }
+});
+
 test("development account secret injection is explicit and returns disposable copies", async () => {
   const original = Buffer.alloc(32, 75);
   const load = createDevelopmentAccountObservationSecretLoader(original);

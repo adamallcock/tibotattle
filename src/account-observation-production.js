@@ -23,6 +23,7 @@ export function selectProductionAccountObservationSecret({
   architecture = process.arch,
   operationLockFile = defaultAccountObservationOperationLockFile(),
   createKeychainBackend = createExportIdentityKeychainBackend,
+  createLinuxBackend = null,
   keychainCapability = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
   createIfMissing = true,
   developmentSecret = null,
@@ -34,6 +35,34 @@ export function selectProductionAccountObservationSecret({
     return Object.freeze({
       mode: "injected_development_secret",
       loadAccountObservationSecret: createDevelopmentAccountObservationSecretLoader(developmentSecret),
+    });
+  }
+  if (platform === "linux") {
+    if (architecture !== "x64" || typeof createLinuxBackend !== "function") {
+      fail("ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE");
+    }
+    if (keychainCapability !== EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation) {
+      fail("ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_INVALID");
+    }
+    let backend;
+    try {
+      backend = createLinuxBackend();
+      if (backend === null || typeof backend !== "object"
+          || ["read", "createIfMissing", "replaceExact", "deleteExact", "describe"].some(
+            (method) => typeof backend[method] !== "function")) {
+        throw new Error("Unavailable broker");
+      }
+    } catch {
+      fail("ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE");
+    }
+    return Object.freeze({
+      mode: "linux_secret_service_broker_account_observation",
+      loadAccountObservationSecret: createAccountObservationSecretLoader({
+        backend,
+        capability: keychainCapability,
+        operationLockFile,
+        createIfMissing,
+      }),
     });
   }
   if (platform === "win32") {

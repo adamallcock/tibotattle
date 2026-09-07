@@ -140,6 +140,9 @@ import {
   selectProductionAccountObservationSecret,
 } from "../../src/account-observation-production.js";
 import {
+  createLinuxSecretServiceBrokerBackendFromEnvironment,
+} from "../../src/platform/linux-secret-service-broker.js";
+import {
   PREVIEW_PRODUCT_BRAND,
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
@@ -2957,6 +2960,8 @@ function createPreparedLocalCompanionServer({
         ...options,
         createKeychainBackend: () =>
           createAppAwareKeychainBackend(environment),
+        createLinuxBackend: () =>
+          createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
       }),
     refreshAccounting: refreshReplaySafeAccountingCache,
     refreshClaudeUsageShadow: claudeShadowEnabled
@@ -3079,6 +3084,7 @@ function createPreparedLocalCompanionServer({
   loadExistingAccountObservationSecret = async () => selectProductionAccountObservationSecret({
     operationLockFile: statePaths.accountObservationLockFile,
     createKeychainBackend: () => createAppAwareKeychainBackend(environment),
+    createLinuxBackend: () => createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
     createIfMissing: false,
   }).loadAccountObservationSecret(),
   readContributionAccountMarkers = async () => {
@@ -3398,6 +3404,8 @@ function createPreparedLocalCompanionServer({
           explicitSecretFile,
           environmentSecret: environment[EXPORT_IDENTITY_ENV],
           appStateSecretFile: statePaths.exportParticipantSecretFile,
+          createLinuxBackend: () =>
+            createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
           ...(contributionPreparationCreateKeychainBackend === undefined
             ? {}
             : {
