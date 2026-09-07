@@ -2144,12 +2144,12 @@ async function assertTrayProcessRelaunch({ executable, appPath, environment, fix
     const settingsTarget = await waitFor(() => findSettingsTarget(port, origin), MAX_STARTUP_MS, "relaunch tray settings target");
     settings = await connectCdp(settingsTarget);
     await assertTraySettingsChoice(settings, expected);
-    const rendered = await settings.evaluate(`(() => {
+    const rendered = await waitFor(() => settings.evaluate(`(() => {
       const panel = document.querySelector('[data-settings-panel="tray"]');
       return panel?.hidden === false && document.querySelector("#tray-preset")?.value === ${JSON.stringify(expected.preset)}
         && document.querySelector("#tray-historyRange")?.value === ${JSON.stringify(expected.historyRange)}
         && document.querySelector("#tray-density")?.value === ${JSON.stringify(expected.density)};
-    })()`);
+    })()`), MAX_OPERATION_MS, "relaunch tray panel rendered");
     if (rendered !== true || JSON.stringify(await readMacSyntheticFixtureTray(fixture.settingsPath)) !== JSON.stringify(expected)) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
     }
