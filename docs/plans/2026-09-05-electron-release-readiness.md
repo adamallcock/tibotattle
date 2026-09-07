@@ -294,6 +294,19 @@ The user approved private signing and Apple notarization of these exact
 `d5dc8025` candidates on 2026-09-07. Installation, update-feed publication and
 public release remain separate operations; no feed was published.
 
+The first Apple Silicon `.1` candidate is signed, notarized and stapled, with
+strict app/DMG Gatekeeper checks, the final app verified inside both ZIP and
+read-only mounted DMG, and all 18 Mach-O files verified as ARM64. Its final DMG
+SHA-256 is `d807fd92092153b4fbe2ae5c72487b3f8e6bd021f00ce721146aedaaa8f24f65`;
+the ZIP is `23b11db5f65d74ecfb666f84a4fd47f1ef7d12ef5b7062be2f52186ee99229d9`.
+Finalization signs/notarizes/staples the outer DMG before regenerating its
+blockmap and rebinding updater digests to the final bytes. The updater's
+transport channel is `native-to-electron-handover`, distinct from the logical
+product rehearsal channel. Read-only comparison with installed native 0.1.18
+build 1026 confirms matching designated requirements, signing team and bundle
+identity; candidate build 2026090701 is higher. Installed handover approval is
+pending. The other three approved signed candidates are still in progress.
+
 Accountless synthetic enrollment/upload/deduplication/disconnect tests have
 run against disposable Worker databases. Independent review identified two
 additional release blockers: accountless chunks consumed the public source
