@@ -46,6 +46,11 @@ const REQUIRED_METHODS = Object.freeze([
   "releaseAccountlessInstallationCredentialMutex",
 ]);
 const WINDOWS_FILESYSTEM_ADAPTERS = new WeakSet();
+const BINDING_PROVENANCE = Object.freeze({
+  contractVersion: "windows-binding-provenance-v1",
+  status: "unqualified",
+  source: "unsigned-development-binding",
+});
 const MANIFEST_KEYS = Object.freeze([
   "schemaVersion",
   "bindingFile",
@@ -57,6 +62,7 @@ const MANIFEST_KEYS = Object.freeze([
   "securityContractVersion",
   "credentialAuditFileGuardContractVersion",
   "credentialMutexContractVersion",
+  "bindingProvenance",
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
@@ -125,6 +131,7 @@ function parseBindingManifest(value) {
 function assertBindingManifest(manifest) {
   const nativeClaims = manifest.nativeClaims;
   const approvedPolicy = manifest.approvedPolicy;
+  const bindingProvenance = manifest.bindingProvenance;
   const requiredMethods = manifest.requiredMethods;
   const manifestKeys = Object.keys(manifest);
   const valid = manifestKeys.length === MANIFEST_KEYS.length
@@ -143,6 +150,13 @@ function assertBindingManifest(manifest) {
     && manifest.credentialAuditFileGuardContractVersion
       === "windows-credential-audit-file-guard-v1"
     && manifest.credentialMutexContractVersion === "windows-credential-mutex-v1"
+    && bindingProvenance !== null
+    && typeof bindingProvenance === "object"
+    && !Array.isArray(bindingProvenance)
+    && Object.keys(bindingProvenance).length === Object.keys(BINDING_PROVENANCE).length
+    && Object.keys(BINDING_PROVENANCE).every((key) =>
+      Object.hasOwn(bindingProvenance, key)
+        && bindingProvenance[key] === BINDING_PROVENANCE[key])
     && Array.isArray(requiredMethods)
     && requiredMethods.length === REQUIRED_METHODS.length
     && requiredMethods.every((method, index) => method === REQUIRED_METHODS[index])
@@ -173,6 +187,7 @@ function assertBindingManifest(manifest) {
   if (!valid) throw failure("INVALID_MANIFEST");
   return Object.freeze({
     ...manifest,
+    bindingProvenance: Object.freeze({ ...bindingProvenance }),
     nativeClaims: Object.freeze({ ...nativeClaims }),
     approvedPolicy: Object.freeze({ ...approvedPolicy }),
     requiredMethods: Object.freeze([...requiredMethods]),

@@ -66,6 +66,12 @@ import {
 import {
   WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS,
 } from "../../../src/platform/windows-qualification-mode.js";
+import {
+  WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
+} from "../../../src/platform/windows-filesystem.js";
+import {
+  createWindowsFilesystemBindingManifest,
+} from "../../../scripts/build-windows-filesystem-manifest.mjs";
 
 const REPOSITORY_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
 const require = createRequire(import.meta.url);
@@ -75,6 +81,22 @@ const WINDOWS_KEYTAR_PATH = require.resolve(
 
 function sha256(value) {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function syntheticWindowsFilesystemBinding() {
+  return {
+    contractVersion: "windows-filesystem-v1",
+    securityContractVersion: "windows-filesystem-security-v1",
+    credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+    credentialMutexContractVersion: "windows-credential-mutex-v1",
+    productionSafe: false,
+    pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
+    credentialAuditFileGuardSafe: true,
+    ...Object.fromEntries(
+      WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS.map((method) => [method, () => undefined]),
+    ),
+  };
 }
 
 function nextTick() {
@@ -103,21 +125,11 @@ async function withWindowsQualificationFixture(run) {
   const keytarPath = join(appPath, "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node");
   const binding = Buffer.from("synthetic Windows qualification binding\n");
   const keytar = await readFile(WINDOWS_KEYTAR_PATH);
-  const bindingManifest = Buffer.from(`${JSON.stringify({
-    schemaVersion: "windows-filesystem-binding-manifest-v1",
-    bindingFile: "windows_filesystem.node",
-    platform: "win32",
-    architecture: "x64",
-    bytes: binding.byteLength,
-    sha256: sha256(binding),
-    contractVersion: "windows-filesystem-v1",
-    securityContractVersion: "windows-filesystem-security-v1",
-    bindingProvenance: {
-      contractVersion: "windows-binding-provenance-v1",
-      status: "unqualified",
-      source: "unsigned-development-binding",
-    },
-  })}\n`);
+  const bindingManifestValue = createWindowsFilesystemBindingManifest({
+    bytes: binding,
+    binding: syntheticWindowsFilesystemBinding(),
+  });
+  const bindingManifest = Buffer.from(`${JSON.stringify(bindingManifestValue)}\n`);
   const runtimeSourcePaths = [...WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS];
   const runtimeFiles = [
     ...runtimeSourcePaths.map((path) => {
@@ -219,7 +231,14 @@ async function withWindowsQualificationFixture(run) {
       platform: "win32",
       architecture: "x64",
     });
-    return await run({ root, appPath, context, environment, runtimeManifest });
+    return await run({
+      root,
+      appPath,
+      context,
+      environment,
+      runtimeManifest,
+      bindingManifest: bindingManifestValue,
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1071,8 +1090,13 @@ test("platform gate leaves macOS/Linux available and refuses unqualified Windows
   );
 });
 
-test("Windows qualification context is branded, content-free, and accepted only for the smoke lane", async () => {
-  await withWindowsQualificationFixture(async ({ context }) => {
+test("Windows qualification context accepts the generated unqualified binding manifest", async () => {
+  await withWindowsQualificationFixture(async ({ context, bindingManifest }) => {
+    assert.deepEqual(bindingManifest.bindingProvenance, {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
+    });
     assert.equal(context.windowsProductionReady, false);
     assert.equal(context.windowsQualificationOnly, true);
     assert.deepEqual(

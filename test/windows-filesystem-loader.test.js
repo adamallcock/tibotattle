@@ -41,6 +41,11 @@ function manifest(overrides = {}) {
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
+    },
     requiredMethods: [...WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS],
     nativeClaims: {
       productionSafe: false,
@@ -221,6 +226,24 @@ test("manifest policy and native claims are cross-checked before loading", () =>
           credentialAuditFileGuardSafe: true,
         },
       }),
+      readBindingBytes: () => BINDING_BYTES,
+      requireBinding: () => binding(),
+    }),
+    (error) => error.code === "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  );
+  assert.throws(
+    () => loadWindowsFilesystemBinding({
+      platform: "win32",
+      architecture: "x64",
+      bindingPath,
+      resolveBinding: (path) => path,
+      readManifest: () => JSON.stringify(manifest({
+        bindingProvenance: {
+          contractVersion: "windows-binding-provenance-v1",
+          status: "qualified",
+          source: "unsigned-development-binding",
+        },
+      })),
       readBindingBytes: () => BINDING_BYTES,
       requireBinding: () => binding(),
     }),
