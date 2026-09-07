@@ -189,16 +189,19 @@ const COMMUNITY_ALLOWANCE_PARTICIPANT_SOURCES_CTE = `participant_sources AS (
       SELECT c.participant_id AS participant_id, 'v0.2' AS source
         FROM telemetry_contributions c
         JOIN participants p ON p.id = c.participant_id AND p.state = 'active'
+          AND p.owner_kind = 'social'
        WHERE c.status = 'accepted'
          AND c.transport_schema_version = 'telemetry-contribution-v0.2'
       UNION ALL
       SELECT c2.participant_id, 'v1' AS source
         FROM telemetry_v1_chunks c2
         JOIN participants p2 ON p2.id = c2.participant_id AND p2.state = 'active'
+          AND p2.owner_kind = 'social'
        WHERE c2.superseded_at IS NULL
       UNION ALL
       SELECT h.participant_id, 'v1.1' AS source FROM telemetry_v11_domain_heads h
         JOIN participants p3 ON p3.id = h.participant_id AND p3.state = 'active'
+          AND p3.owner_kind = 'social'
     )
    GROUP BY participant_id
 )`;
@@ -440,6 +443,7 @@ export async function collectCommunityAllowanceFits(
            WHERE EXISTS (
              SELECT 1 FROM community_analytical_input_versions v
              JOIN participants p ON p.id = v.participant_id AND p.state = 'active'
+               AND p.owner_kind = 'social'
              WHERE v.participant_id = ?1 AND v.revision = ?6
            )
          ON CONFLICT(participant_id) DO UPDATE SET cache_key = excluded.cache_key,
@@ -837,6 +841,7 @@ export async function collectCommunityModelCompositions(
                WHERE EXISTS (
                  SELECT 1 FROM community_analytical_input_versions v
                  JOIN participants p ON p.id = v.participant_id AND p.state = 'active'
+                   AND p.owner_kind = 'social'
                  WHERE v.participant_id = ?1 AND v.revision = ?6
                )
              ON CONFLICT(participant_id) DO UPDATE SET

@@ -5,6 +5,7 @@ export type WorkerRouteAuthority =
   | "public"
   | "enrollment"
   | "accountless_enrollment"
+  | "accountless_ownership"
   | "handoff"
   | "session"
   | "device"
@@ -53,6 +54,12 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     id: "accountless_enrollment",
     methods: ["POST"],
     authority: "accountless_enrollment",
+  },
+  {
+    pathname: "/api/v1/accountless/ownership",
+    id: "accountless_ownership",
+    methods: ["POST"],
+    authority: "accountless_ownership",
   },
   {
     pathname: "/api/v1/internal/release/appcast",

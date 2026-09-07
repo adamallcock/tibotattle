@@ -76,6 +76,34 @@ test("the normal local dispatcher cannot turn policy authorization into a hosted
   assert.deepEqual(service.calls, []);
 });
 
+test("accountless dispatcher validates closed policy authority on an allowed local origin before reading state", async (t) => {
+  const { options, service } = await fixture(t);
+  const { consent: ignoredConsent, ...withoutConsent } = options;
+  void ignoredConsent;
+  const authority = {
+    schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+  };
+  for (const authorization of [
+    null,
+    [],
+    Object.create(authority),
+    { ...authority, policyVersion: "stale-policy" },
+    { ...authority, extra: true },
+    { ...authority, [Symbol("extra")]: true },
+  ]) {
+    await assert.rejects(runIncrementalContributionSyncOnce({
+      ...withoutConsent,
+      origin: "http://127.0.0.1:4179",
+      laboratory: true,
+      authorization,
+    }), { code: "contribution_incremental_sync_authorization_invalid" });
+  }
+  assert.deepEqual(service.calls, []);
+});
+
 test("real local hydration and public runner activate mixed-plan history without inventing accounts or changing usage IDs", async (t) => {
   const { options, service, records } = await fixture(t);
   const result = await runIncrementalContributionSyncOnce(options);

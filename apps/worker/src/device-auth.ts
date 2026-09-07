@@ -11,6 +11,7 @@ import {
   UPLOAD_AUTHORIZATION_TTL_MILLISECONDS,
   UPLOAD_CONSUME_LEASE_MILLISECONDS,
 } from "./constants";
+import { revokeAccountlessEnrollment } from "./accountless-enrollment";
 import {
   encodeBase64Url,
   randomSecret,
@@ -38,7 +39,9 @@ interface PairingRow {
 interface DeviceRow {
   id: string;
   participant_id: string;
-  paired_via_pairing_id: string;
+  paired_via_pairing_id: string | null;
+  accountless_enrollment_device_id: string | null;
+  authority_kind: "social" | "accountless";
   secret_hash: ArrayBuffer;
   state: "active" | "revoked";
   issued_at: string;
@@ -48,7 +51,14 @@ interface DeviceRow {
   credential_generation: number;
   revoked_at: string | null;
   participant_state: "active" | "deleting";
-  participant_consent_version: string;
+  participant_consent_version: string | null;
+  participant_owner_kind: "social" | "accountless";
+  accountless_ledger_state: "active" | "revoked" | null;
+  accountless_ledger_expires_at: string | null;
+  accountless_owner_state: "active" | "revoked" | null;
+  accountless_owner_expires_at: string | null;
+  accountless_authorization_state: "active" | "revoked" | null;
+  accountless_authorization_expires_at: string | null;
 }
 
 interface DeviceRotationRow {
@@ -80,10 +90,11 @@ interface DeviceUploadRow {
 export interface DevicePrincipal {
   deviceId: string;
   participantId: string;
-  participantConsentVersion: string;
+  participantConsentVersion: string | null;
   expiresAt: string;
   credentialGeneration: number;
-  socialVerifiedAt: string;
+  socialVerifiedAt: string | null;
+  authorityKind: "social" | "accountless";
 }
 
 export interface DeviceUploadClaim {
@@ -268,7 +279,7 @@ function pairingHash(id: string, secret: string): Promise<Uint8Array> {
   return sha256(`app-usagemonitor/device-pairing/v1\0${id}\0${secret}`);
 }
 
-async function deviceHash(id: string, secret: string): Promise<Uint8Array> {
+export async function deviceHash(id: string, secret: string): Promise<Uint8Array> {
   let decoded: Uint8Array | null = null;
   let input: Uint8Array | null = null;
   try {
@@ -411,7 +422,7 @@ function parsePairingAuthorization(header: string | null): {
   return { id: match[1], secret: match[2] };
 }
 
-function parseDeviceAuthorization(header: string | null): {
+export function parseDeviceAuthorization(header: string | null): {
   id: string;
   secret: string;
 } {
@@ -1076,9 +1087,26 @@ export async function authenticateDevice(
   const parsed = parseDeviceAuthorization(authorizationHeader);
   const row = await db.prepare(
     `SELECT device.*, participant.state AS participant_state,
-            participant.consent_version AS participant_consent_version
+            participant.consent_version AS participant_consent_version,
+            participant.owner_kind AS participant_owner_kind,
+            ledger.state AS accountless_ledger_state,
+            ledger.expires_at AS accountless_ledger_expires_at,
+            owner.state AS accountless_owner_state,
+            owner.expires_at AS accountless_owner_expires_at,
+            grant_row.state AS accountless_authorization_state,
+            grant_row.expires_at AS accountless_authorization_expires_at
        FROM device_credentials device
        JOIN participants participant ON participant.id = device.participant_id
+       LEFT JOIN accountless_enrollment_ledger ledger
+         ON ledger.device_id = device.accountless_enrollment_device_id
+       LEFT JOIN accountless_upload_owners owner
+         ON owner.enrollment_device_id = ledger.device_id
+        AND owner.participant_id = device.participant_id
+        AND owner.device_credential_id = device.id
+       LEFT JOIN accountless_v11_device_authorizations grant_row
+         ON grant_row.enrollment_device_id = ledger.device_id
+        AND grant_row.participant_id = device.participant_id
+        AND grant_row.device_credential_id = device.id
       WHERE device.id = ?`,
   ).bind(parsed.id).first<DeviceRow>();
   const presentedHash = await deviceHash(parsed.id, parsed.secret);
@@ -1086,17 +1114,73 @@ export async function authenticateDevice(
     presentedHash,
     row ? bytes(row.secret_hash) : new Uint8Array(32),
   );
-  if (!currentSecretMatches && row) {
+  if (!currentSecretMatches && row && row.authority_kind === "social") {
     // A previous secret is a signal that a rotated credential was reused.
     // Revoke the current device lineage before returning the same neutral
     // auth failure used for every other invalid bearer.
     await credentialReuseDetected(db, row.id, presentedHash);
   }
+  if (row?.authority_kind === "accountless") {
+    if (!currentSecretMatches
+        || row.state !== "active"
+        || row.participant_state !== "active"
+        || row.participant_owner_kind !== "accountless"
+        || row.accountless_enrollment_device_id !== row.id
+        || row.social_verified_at !== null
+        || row.accountless_ledger_state !== "active"
+        || row.accountless_owner_state !== "active"
+        || row.accountless_authorization_state !== "active"
+        || row.accountless_ledger_expires_at !== row.expires_at
+        || row.accountless_owner_expires_at !== row.expires_at
+        || row.accountless_authorization_expires_at !== row.expires_at
+        || !futureInstant(row.expires_at, nowEpoch)) {
+      throw new ApiError(401, "DEVICE_AUTH_INVALID");
+    }
+    const used = await db.prepare(
+      `UPDATE device_credentials
+          SET last_used_at = ?
+        WHERE id = ? AND state = 'active' AND authority_kind = 'accountless'
+          AND expires_at > ? AND secret_hash = ?
+          AND EXISTS (
+            SELECT 1 FROM participants participant
+              JOIN accountless_enrollment_ledger ledger
+                ON ledger.device_id = device_credentials.accountless_enrollment_device_id
+              JOIN accountless_upload_owners owner
+                ON owner.enrollment_device_id = ledger.device_id
+              JOIN accountless_v11_device_authorizations grant_row
+                ON grant_row.enrollment_device_id = ledger.device_id
+             WHERE participant.id = device_credentials.participant_id
+               AND participant.state = 'active' AND participant.owner_kind = 'accountless'
+               AND ledger.state = 'active' AND ledger.expires_at = device_credentials.expires_at
+               AND ledger.expires_at > ?
+               AND owner.participant_id = participant.id
+               AND owner.device_credential_id = device_credentials.id
+               AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+               AND grant_row.participant_id = participant.id
+               AND grant_row.device_credential_id = device_credentials.id
+               AND grant_row.state = 'active' AND grant_row.expires_at = ledger.expires_at
+          )`,
+    ).bind(now, row.id, now, presentedHash, now).run();
+    if (used.meta.changes !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+    return {
+      deviceId: row.id,
+      participantId: row.participant_id,
+      participantConsentVersion: null,
+      expiresAt: row.expires_at,
+      credentialGeneration: row.credential_generation,
+      socialVerifiedAt: null,
+      authorityKind: "accountless",
+    };
+  }
+
   const socialVerifiedAt = row?.social_verified_at ?? row?.issued_at ?? null;
   if (!currentSecretMatches
       || !row
+      || row.authority_kind !== "social"
       || row.state !== "active"
       || row.participant_state !== "active"
+      || row.participant_owner_kind !== "social"
+      || row.participant_consent_version === null
       || ongoingConsentForParticipant(row.participant_consent_version) === null
       || !futureInstant(row.expires_at, nowEpoch)
       || !recentInstant(row.last_used_at, nowEpoch, policy.idleMilliseconds)
@@ -1150,6 +1234,7 @@ export async function authenticateDevice(
     expiresAt: renewedExpiry,
     credentialGeneration: row.credential_generation,
     socialVerifiedAt: socialVerifiedAt!,
+    authorityKind: "social",
   };
 }
 
@@ -1231,6 +1316,9 @@ export async function rotateDeviceCredential(
     nowEpoch,
     policy,
   });
+  if (principal.authorityKind !== "social" || !principal.socialVerifiedAt) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
   const row = await db.prepare(
     `SELECT device.*, participant.state AS participant_state,
             participant.consent_version AS participant_consent_version
@@ -1380,7 +1468,15 @@ export async function createDeviceUploadAuthorization(
   const id = crypto.randomUUID();
   const secret = randomSecret(32);
   const issuedAt = new Date(nowEpoch).toISOString();
-  const expiresAt = new Date(nowEpoch + UPLOAD_AUTHORIZATION_TTL_MILLISECONDS).toISOString();
+  const expiresAt = new Date(device.authorityKind === "accountless"
+    ? Math.min(
+      nowEpoch + UPLOAD_AUTHORIZATION_TTL_MILLISECONDS,
+      Date.parse(device.expiresAt),
+    )
+    : nowEpoch + UPLOAD_AUTHORIZATION_TTL_MILLISECONDS).toISOString();
+  if (!futureInstant(expiresAt, nowEpoch)) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
   const secretHash = await deviceUploadHash(id, secret);
   const result = await db.prepare(
     `INSERT INTO device_upload_authorizations (
@@ -1396,7 +1492,32 @@ export async function createDeviceUploadAuthorization(
        AND device.state = 'active'
        AND device.expires_at > ?
        AND participant.state = 'active'
-       AND participant.consent_version = ?`,
+       AND device.authority_kind = ?
+       AND (
+         (device.authority_kind = 'social'
+          AND participant.owner_kind = 'social'
+          AND participant.consent_version = ?)
+         OR
+         (device.authority_kind = 'accountless'
+          AND participant.owner_kind = 'accountless'
+          AND participant.consent_version IS NULL
+          AND EXISTS (
+            SELECT 1 FROM accountless_enrollment_ledger ledger
+              JOIN accountless_upload_owners owner
+                ON owner.enrollment_device_id = ledger.device_id
+              JOIN accountless_v11_device_authorizations grant_row
+                ON grant_row.enrollment_device_id = ledger.device_id
+             WHERE ledger.device_id = device.accountless_enrollment_device_id
+               AND ledger.state = 'active' AND ledger.expires_at = device.expires_at
+               AND ledger.expires_at > ?
+               AND owner.participant_id = participant.id
+               AND owner.device_credential_id = device.id
+               AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+               AND grant_row.participant_id = participant.id
+               AND grant_row.device_credential_id = device.id
+               AND grant_row.state = 'active' AND grant_row.expires_at = ledger.expires_at
+          ))
+       )`,
   ).bind(
     id,
     secretHash,
@@ -1407,7 +1528,9 @@ export async function createDeviceUploadAuthorization(
     device.deviceId,
     device.participantId,
     issuedAt,
+    device.authorityKind,
     device.participantConsentVersion,
+    issuedAt,
   ).run();
   if (result.meta.changes !== 1) throw new ApiError(401, "DEVICE_AUTH_INVALID");
   return {
@@ -1470,8 +1593,30 @@ export async function claimDeviceUploadAuthorization(
              AND device.state = 'active'
              AND device.expires_at > ?
              AND participant.state = 'active'
+             AND (
+               (device.authority_kind = 'social' AND participant.owner_kind = 'social')
+               OR
+               (device.authority_kind = 'accountless'
+                AND participant.owner_kind = 'accountless'
+                AND EXISTS (
+                  SELECT 1 FROM accountless_enrollment_ledger ledger
+                    JOIN accountless_upload_owners owner
+                      ON owner.enrollment_device_id = ledger.device_id
+                    JOIN accountless_v11_device_authorizations grant_row
+                      ON grant_row.enrollment_device_id = ledger.device_id
+                   WHERE ledger.device_id = device.accountless_enrollment_device_id
+                     AND ledger.state = 'active' AND ledger.expires_at = device.expires_at
+                     AND ledger.expires_at > ?
+                     AND owner.participant_id = participant.id
+                     AND owner.device_credential_id = device.id
+                     AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+                     AND grant_row.participant_id = participant.id
+                     AND grant_row.device_credential_id = device.id
+                     AND grant_row.state = 'active' AND grant_row.expires_at = ledger.expires_at
+                ))
+             )
         )`,
-  ).bind(leaseExpiresAt, parsed.id, now, now).run();
+  ).bind(leaseExpiresAt, parsed.id, now, now, now).run();
   if (result.meta.changes !== 1) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
   return {
     authorizationId: parsed.id,
@@ -1492,8 +1637,37 @@ export async function recordDeviceUploadReceipt(
             consumed_contribution_id = ?, consume_lease_expires_at = NULL
       WHERE id = ? AND state = 'consuming'
         AND consume_lease_expires_at > ?
-        AND expires_at > ?`,
-  ).bind(now, contributionId, authorizationId, now, now).run();
+        AND expires_at > ?
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM device_credentials device
+             WHERE device.id = device_upload_authorizations.issued_by_device_id
+               AND device.authority_kind = 'accountless'
+          )
+          OR EXISTS (
+            SELECT 1 FROM device_credentials device
+              JOIN participants participant ON participant.id = device.participant_id
+              JOIN accountless_enrollment_ledger ledger
+                ON ledger.device_id = device.accountless_enrollment_device_id
+              JOIN accountless_upload_owners owner
+                ON owner.enrollment_device_id = ledger.device_id
+              JOIN accountless_v11_device_authorizations grant_row
+                ON grant_row.enrollment_device_id = ledger.device_id
+             WHERE device.id = device_upload_authorizations.issued_by_device_id
+               AND device.participant_id = device_upload_authorizations.participant_id
+               AND device.authority_kind = 'accountless' AND device.state = 'active'
+               AND participant.owner_kind = 'accountless' AND participant.state = 'active'
+               AND ledger.state = 'active' AND ledger.expires_at = device.expires_at
+               AND ledger.expires_at > ?
+               AND owner.participant_id = participant.id
+               AND owner.device_credential_id = device.id
+               AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+               AND grant_row.participant_id = participant.id
+               AND grant_row.device_credential_id = device.id
+               AND grant_row.state = 'active' AND grant_row.expires_at = ledger.expires_at
+          )
+        )`,
+  ).bind(now, contributionId, authorizationId, now, now, now).run();
   if (result.meta.changes === 1) return;
   const existing = await db.prepare(
     `SELECT state, consumed_contribution_id
@@ -1596,19 +1770,33 @@ export async function disconnectAuthenticatedDevice(
   const parsed = parseDeviceAuthorization(authorizationHeader);
   const presentedHash = await deviceHash(parsed.id, parsed.secret);
   const row = await db.prepare(
-    `SELECT id, secret_hash, state
+    `SELECT id, secret_hash, state, authority_kind,
+            accountless_enrollment_device_id
        FROM device_credentials
       WHERE id = ?`,
   ).bind(parsed.id).first<{
     id: string;
     secret_hash: ArrayBuffer;
     state: "active" | "revoked";
+    authority_kind: "social" | "accountless";
+    accountless_enrollment_device_id: string | null;
   }>();
   if (!row || !timingSafeEqual(presentedHash, bytes(row.secret_hash))) {
     if (row) await credentialReuseDetected(db, row.id, presentedHash);
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
-  await revokeDeviceRows(db, row.id, new Date().toISOString());
+  if (row.authority_kind === "accountless") {
+    if (row.accountless_enrollment_device_id !== row.id) {
+      throw new ApiError(401, "DEVICE_AUTH_INVALID");
+    }
+    await revokeAccountlessEnrollment(
+      db,
+      row.accountless_enrollment_device_id,
+      "user_opt_out",
+    );
+  } else {
+    await revokeDeviceRows(db, row.id, new Date().toISOString());
+  }
   return { deviceId: row.id, revoked: true };
 }
 

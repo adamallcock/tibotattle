@@ -7,7 +7,7 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
   accountlessOwnershipResponse,
-  assertAccountlessOwnershipLaboratory,
+  assertAccountlessOwnershipEnabled,
   configuredAccountlessOwnershipMode,
   parseAccountlessOwnershipJson,
   parseAccountlessOwnershipRequest,
@@ -70,26 +70,16 @@ describe("accountless ownership wire boundary", () => {
     expect(JSON.stringify(receipt)).not.toMatch(/participant|secret|session|pairing|consent/iu);
   });
 
-  it("fails closed unless an explicit synthetic loopback mode is present", () => {
+  it("fails closed unless the accountless ownership mode is explicitly enabled", () => {
     expect(configuredAccountlessOwnershipMode({} as Env)).toBe("disabled");
     expect(errorCode(() => configuredAccountlessOwnershipMode({
-      ACCOUNTLESS_OWNERSHIP_MODE: "enabled",
+      ACCOUNTLESS_OWNERSHIP_MODE: "unexpected",
     } as unknown as Env))).toBe("ACCOUNTLESS_OWNERSHIP_CONFIGURATION_INVALID");
-    expect(errorCode(() => assertAccountlessOwnershipLaboratory(
+    expect(errorCode(() => assertAccountlessOwnershipEnabled(
       {} as Env,
-      new URL("http://127.0.0.1:8787/api/v1/accountless/ownership"),
     ))).toBe("ACCOUNTLESS_OWNERSHIP_DISABLED");
-    expect(() => assertAccountlessOwnershipLaboratory({
-      ENVIRONMENT: "synthetic-development",
-      ACCOUNTLESS_OWNERSHIP_MODE: "synthetic-local",
-    } as unknown as Env,
-    new URL("http://127.0.0.1:8787/api/v1/accountless/ownership"),
-    )).not.toThrow();
-    expect(errorCode(() => assertAccountlessOwnershipLaboratory({
-      ENVIRONMENT: "synthetic-development",
-      ACCOUNTLESS_OWNERSHIP_MODE: "synthetic-local",
-    } as unknown as Env,
-    new URL("https://tibotattle.com/api/v1/accountless/ownership"),
-    ))).toBe("ACCOUNTLESS_OWNERSHIP_DISABLED");
+    expect(() => assertAccountlessOwnershipEnabled({
+      ACCOUNTLESS_OWNERSHIP_MODE: "enabled",
+    } as unknown as Env)).not.toThrow();
   });
 });

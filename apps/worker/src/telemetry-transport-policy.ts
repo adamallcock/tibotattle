@@ -46,6 +46,9 @@ export async function assertTelemetryTransportWriteAllowed(
   const row = await db.prepare(
     `SELECT formats.lifecycle, formats.format_rank, floors.minimum_rank,
             CASE WHEN grant_v11.device_id IS NULL THEN 0 ELSE 1 END AS consent_v11,
+            p.owner_kind, d.authority_kind,
+            CASE WHEN accountless_grant.enrollment_device_id IS NULL THEN 0 ELSE 1 END
+              AS accountless_v11,
             EXISTS (SELECT 1 FROM telemetry_contributions legacy
               WHERE legacy.participant_id = p.id AND legacy.status = 'accepted'
                 AND legacy.transport_schema_version = 'telemetry-contribution-v0.2') AS incompatible_history
@@ -55,16 +58,46 @@ export async function assertTelemetryTransportWriteAllowed(
        JOIN telemetry_transport_formats formats ON formats.schema_version = ?
        LEFT JOIN telemetry_v11_device_consents grant_v11
          ON grant_v11.participant_id = p.id AND grant_v11.device_id = d.id
-      WHERE p.id = ? AND d.id = ? AND p.state = 'active' AND d.state = 'active'`,
+       LEFT JOIN accountless_enrollment_ledger ledger
+         ON ledger.device_id = d.accountless_enrollment_device_id
+        AND ledger.state = 'active' AND ledger.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        AND ledger.expires_at = d.expires_at
+       LEFT JOIN accountless_upload_owners owner
+         ON owner.enrollment_device_id = ledger.device_id
+        AND owner.participant_id = p.id AND owner.device_credential_id = d.id
+        AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+       LEFT JOIN accountless_v11_device_authorizations accountless_grant
+         ON accountless_grant.enrollment_device_id = ledger.device_id
+        AND owner.enrollment_device_id = ledger.device_id
+        AND accountless_grant.participant_id = p.id
+        AND accountless_grant.device_credential_id = d.id
+        AND accountless_grant.state = 'active'
+        AND accountless_grant.expires_at = ledger.expires_at
+      WHERE p.id = ? AND d.id = ? AND p.state = 'active' AND d.state = 'active'
+        AND d.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
   ).bind(schema, principal.participantId, principal.deviceId).first<{
-    lifecycle: string; format_rank: number; minimum_rank: number; consent_v11: number; incompatible_history: number;
+    lifecycle: string; format_rank: number; minimum_rank: number; consent_v11: number;
+    owner_kind: "social" | "accountless";
+    authority_kind: "social" | "accountless";
+    accountless_v11: number;
+    incompatible_history: number;
   }>();
   if (!row) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  const accountless = row.owner_kind === "accountless";
+  if ((accountless && row.authority_kind !== "accountless")
+      || (!accountless && row.owner_kind !== "social")
+      || (!accountless && row.authority_kind !== "social")) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
   if (row.lifecycle !== "accepted" || row.format_rank < row.minimum_rank
       || (schema === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION && row.incompatible_history === 1)) {
     throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
   }
-  if (schema === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION && row.consent_v11 !== 1) {
+  if (accountless && schema !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
+    throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  }
+  if (schema === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      && (accountless ? row.accountless_v11 !== 1 : row.consent_v11 !== 1)) {
     throw new ApiError(403, "TELEMETRY_CONSENT_INVALID");
   }
 }
@@ -82,7 +115,8 @@ export async function grantTelemetryV11Consent(
        JOIN device_credentials d ON d.participant_id = p.id
        JOIN web_sessions s ON s.participant_id = p.id
        JOIN telemetry_transport_formats f ON f.schema_version = ?
-      WHERE p.id = ? AND p.state = 'active' AND d.id = ? AND d.state = 'active'
+      WHERE p.id = ? AND p.state = 'active' AND p.owner_kind = 'social'
+        AND d.id = ? AND d.state = 'active' AND d.authority_kind = 'social'
         AND s.id = ? AND s.scope = 'personal' AND s.state = 'active' AND s.expires_at > ?
         AND f.lifecycle = 'accepted'
         AND NOT EXISTS (SELECT 1 FROM telemetry_contributions legacy
@@ -98,12 +132,17 @@ export async function grantTelemetryV11Consent(
           participant_id, device_id, telemetry_schema_version, field_dictionary_version,
           privacy_contract_version, consented_at
         ) SELECT ?, ?, ?, ?, ?, ?
-            WHERE EXISTS (SELECT 1 FROM web_sessions s WHERE s.id = ? AND s.participant_id = ?
+          WHERE EXISTS (SELECT 1 FROM web_sessions s WHERE s.id = ? AND s.participant_id = ?
               AND s.state = 'active' AND s.scope = 'personal' AND s.expires_at > ?)
+            AND EXISTS (SELECT 1 FROM participants p
+              JOIN device_credentials d ON d.participant_id = p.id
+             WHERE p.id = ? AND p.owner_kind = 'social' AND p.state = 'active'
+               AND d.id = ? AND d.authority_kind = 'social' AND d.state = 'active')
           ON CONFLICT(participant_id, device_id) DO NOTHING`,
       ).bind(principal.participantId, principal.deviceId, consent.telemetrySchemaVersion,
         consent.fieldDictionaryVersion, consent.privacyContractVersion, now,
-        principal.sessionId, principal.participantId, now),
+        principal.sessionId, principal.participantId, now,
+        principal.participantId, principal.deviceId),
       // An explicit re-grant after an audited rollback raises the same floor;
       // an idempotent retry while already upgraded does not invent a revision.
       db.prepare(
@@ -162,6 +201,9 @@ export async function telemetryTransportCapabilities(
   const row = await db.prepare(
     `SELECT e.namespace, f.minimum_rank, f.revision,
             CASE WHEN c.device_id IS NULL THEN 0 ELSE 1 END AS consent_v11,
+            p.owner_kind, d.authority_kind,
+            CASE WHEN accountless_grant.enrollment_device_id IS NULL THEN 0 ELSE 1 END
+              AS accountless_v11,
             EXISTS (SELECT 1 FROM telemetry_contributions legacy
               WHERE legacy.participant_id = p.id AND legacy.status = 'accepted'
                 AND legacy.transport_schema_version = 'telemetry-contribution-v0.2') AS incompatible_history
@@ -169,16 +211,41 @@ export async function telemetryTransportCapabilities(
        JOIN telemetry_transport_participant_floors f ON f.participant_id = p.id
        JOIN device_credentials d ON d.participant_id = p.id
        LEFT JOIN telemetry_v11_device_consents c ON c.participant_id = p.id AND c.device_id = d.id
-      WHERE p.id = ? AND p.state = 'active' AND d.id = ? AND d.state = 'active'`,
+       LEFT JOIN accountless_enrollment_ledger ledger
+         ON ledger.device_id = d.accountless_enrollment_device_id
+        AND ledger.state = 'active' AND ledger.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        AND ledger.expires_at = d.expires_at
+       LEFT JOIN accountless_upload_owners owner
+         ON owner.enrollment_device_id = ledger.device_id
+        AND owner.participant_id = p.id AND owner.device_credential_id = d.id
+        AND owner.state = 'active' AND owner.expires_at = ledger.expires_at
+       LEFT JOIN accountless_v11_device_authorizations accountless_grant
+         ON accountless_grant.enrollment_device_id = ledger.device_id
+        AND owner.enrollment_device_id = ledger.device_id
+        AND accountless_grant.participant_id = p.id
+        AND accountless_grant.device_credential_id = d.id
+        AND accountless_grant.state = 'active'
+        AND accountless_grant.expires_at = ledger.expires_at
+      WHERE p.id = ? AND p.state = 'active' AND d.id = ? AND d.state = 'active'
+        AND d.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
   ).bind(principal.participantId, principal.deviceId).first<{
-    namespace: string; minimum_rank: number; revision: number; consent_v11: number; incompatible_history: number;
+    namespace: string; minimum_rank: number; revision: number; consent_v11: number;
+    owner_kind: "social" | "accountless";
+    authority_kind: "social" | "accountless";
+    accountless_v11: number;
+    incompatible_history: number;
   }>();
   if (!row) throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  const accountless = row.owner_kind === "accountless";
+  if ((accountless && (row.authority_kind !== "accountless" || row.accountless_v11 !== 1))
+      || (!accountless && (row.owner_kind !== "social" || row.authority_kind !== "social"))) {
+    throw new ApiError(401, "DEVICE_AUTH_INVALID");
+  }
   const formats = await db.prepare(
     "SELECT schema_version, format_rank, lifecycle FROM telemetry_transport_formats ORDER BY format_rank LIMIT 5",
   ).all<{ schema_version: string; format_rank: number; lifecycle: "accepted" | "staged" | "blocked" }>();
   if (formats.results.length !== 4) throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
-  return {
+  const base = {
     schemaVersion: "device-sync-capabilities-v1.1" as const,
     destinationOrigin,
     enrollmentNamespace: row.namespace,
@@ -186,14 +253,21 @@ export async function telemetryTransportCapabilities(
     minimumWriteRank: row.minimum_rank,
     policyRevision: row.revision,
     requiredConsent: telemetryV11RequiredConsent(),
-    consentCurrent: row.consent_v11 === 1,
     formats: formats.results.map((format) => ({
       schemaVersion: format.schema_version,
       rank: format.format_rank,
-      lifecycle: row.incompatible_history === 1 && format.schema_version === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      lifecycle: (row.incompatible_history === 1 && format.schema_version === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION)
+        || (accountless && format.schema_version !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION)
         ? "blocked" as const : format.lifecycle,
     })),
   };
+  // Social clients keep their historical closed response shape. Accountless
+  // replies retain the exact v1.1 dictionary but identify policy authority
+  // separately from consent, so no policy event is relabelled as consent.
+  return accountless
+    ? { ...base, consentCurrent: false, authorityKind: "accountless" as const,
+      authorizationCurrent: true }
+    : { ...base, consentCurrent: row.consent_v11 === 1 };
 }
 
 /**

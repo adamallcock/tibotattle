@@ -462,7 +462,7 @@ async function buildCommunityWeeklySnapshotForPeriod(
         FROM participants p
         JOIN participant_community_eligibility e
           ON e.participant_id = p.id
-       WHERE p.state = 'active'
+       WHERE p.state = 'active' AND p.owner_kind = 'social'
          AND NOT EXISTS (
            SELECT 1
              FROM community_aggregate_exclusions x
@@ -1045,6 +1045,7 @@ export async function readParticipantCommunityComparison(
     FROM telemetry_records r
     JOIN participants p
       ON p.id = r.participant_id AND p.state = 'active'
+     AND p.owner_kind = 'social'
     WHERE r.participant_id = ?
       AND r.record_kind = 'usage'
       AND r.observed_at >= ? AND r.observed_at < ?

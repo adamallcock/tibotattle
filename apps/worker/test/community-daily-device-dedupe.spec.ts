@@ -2,6 +2,17 @@ import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { telemetryV11RequiredConsent } from "@app-usagemonitor/telemetry-contract";
+
+import {
+  ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+  ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
+} from "../src/accountless-enrollment";
+import {
+  ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+  ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+} from "../src/accountless-ownership";
 
 import {
   readLatestCommunityDailyAggregate,
@@ -10,6 +21,7 @@ import {
 import {
   assertV1SourcePinCurrent,
   loadV1SourcePin,
+  MAX_V1_SOURCE_CHUNKS,
 } from "../src/telemetry-v1-source-selection";
 
 /**
@@ -102,6 +114,124 @@ async function seedDevice(
     ).bind(deviceId, participantId, `pairing-${deviceId}`, hash(6), SEED_AT,
       FUTURE, SEED_AT),
   ]);
+}
+
+/**
+ * Establish a real direct-owner graph, then materialize a deliberately
+ * oversized legacy source journal. Accountless owners cannot submit v1.0 in
+ * production; the raw journal below models stale/corrupt/future source rows
+ * so the public selector's bound is tested independently of that admission
+ * fence. The direct owner itself remains fully authority-shaped.
+ */
+async function seedOversizedAccountlessSourceJournal(): Promise<string> {
+  const participantId = "participant-accountless-public-cap";
+  const deviceId = "11111111-1111-4111-8111-111111111111";
+  const required = telemetryV11RequiredConsent();
+  await db().batch([
+    db().prepare(`INSERT INTO accountless_enrollment_ledger (
+      device_id, device_secret_hash, installation_principal_id,
+      schema_version, policy_version, authorization_basis, state, issued_at,
+      expires_at
+    ) VALUES (?, ?, 'accountless:public-cap', ?, ?, ?, 'active', ?, ?)`)
+      .bind(
+        deviceId,
+        hash(8),
+        ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
+        ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
+        ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
+        SEED_AT,
+        FUTURE,
+      ),
+    db().prepare(`INSERT INTO participants (
+      id, owner_kind, access_token_id, access_token_hash, recovery_token_id,
+      recovery_token_hash, state, consent_version, consented_at, created_at,
+      deletion_session_id, identity_link_key, identity_cooldown_digest
+    ) VALUES (?, 'accountless', NULL, NULL, NULL, NULL, 'active', NULL,
+      NULL, ?, NULL, NULL, NULL)`).bind(participantId, SEED_AT),
+    db().prepare(`INSERT INTO device_credentials (
+      id, participant_id, authority_kind, paired_via_pairing_id,
+      accountless_enrollment_device_id, secret_hash, state, issued_at,
+      expires_at, last_used_at, revoked_at, social_verified_at,
+      credential_generation
+    ) VALUES (?, ?, 'accountless', NULL, ?, ?, 'active', ?, ?, ?, NULL,
+      NULL, 1)`).bind(deviceId, participantId, deviceId, hash(8), SEED_AT,
+      FUTURE, SEED_AT),
+    db().prepare(`INSERT INTO accountless_upload_owners (
+      enrollment_device_id, participant_id, device_credential_id,
+      policy_version, authorization_basis, authorized_at, expires_at, state
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`).bind(
+      deviceId,
+      participantId,
+      deviceId,
+      ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+      ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+      SEED_AT,
+      FUTURE,
+    ),
+    db().prepare(`INSERT INTO accountless_v11_device_authorizations (
+      enrollment_device_id, participant_id, device_credential_id,
+      telemetry_schema_version, field_dictionary_version,
+      privacy_contract_version, authorized_at, expires_at, state
+    ) VALUES (?, ?, ?, 'telemetry-contribution-v1.1', ?, ?, ?, ?, 'active')`)
+      .bind(deviceId, participantId, deviceId, required.fieldDictionaryVersion,
+        required.privacyContractVersion, SEED_AT, FUTURE),
+  ]);
+
+  // The social-owner and v1 transport guards correctly reject this synthetic
+  // malformed lane. Disable only those per-test guards so the source selector
+  // sees MAX+1 rows; reset restores the production schema for every test.
+  await db().batch([
+    db().prepare("DROP TRIGGER telemetry_transport_v1_insert"),
+    db().prepare("DROP TRIGGER telemetry_v1_chunks_enforce_admission"),
+    db().prepare("DROP TRIGGER telemetry_v1_chunks_require_social_owner"),
+    db().prepare("DROP TRIGGER telemetry_v1_chunks_require_consuming_upload"),
+    db().prepare("DROP TRIGGER telemetry_v1_chunks_consume_device_upload"),
+    db().prepare("DROP TRIGGER telemetry_v1_chunks_record_admission"),
+    db().prepare("DROP TRIGGER community_analytical_input_v1_insert"),
+    db().prepare("DROP TRIGGER accountless_device_upload_authorization_admission"),
+  ]);
+  await db().prepare(`WITH RECURSIVE source_rows(value) AS (
+    VALUES(0)
+    UNION ALL SELECT value + 1 FROM source_rows
+      WHERE value < ?
+  ) INSERT INTO device_upload_authorizations (
+    id, participant_id, issued_by_device_id, secret_hash, envelope_digest,
+    body_bytes, content_type, state, issued_at, expires_at,
+    consume_lease_expires_at
+  ) SELECT
+    'accountless-cap-upload-' || printf('%05d', value), ?, ?, zeroblob(32),
+    printf('%064x', value + 100000), 1, 'application/json', 'consuming', ?,
+    ?, ?
+  FROM source_rows`).bind(
+    MAX_V1_SOURCE_CHUNKS,
+    participantId,
+    deviceId,
+    SEED_AT,
+    FUTURE,
+    FUTURE,
+  ).run();
+  await db().prepare(`WITH RECURSIVE source_rows(value) AS (
+    VALUES(0)
+    UNION ALL SELECT value + 1 FROM source_rows
+      WHERE value < ?
+  ) INSERT INTO telemetry_v1_chunks (
+    id, participant_id, device_id, stream, chunk_day, chunk_seq, revision,
+    chunk_digest, envelope_digest, parser_version, record_count,
+    accepted_record_count, r2_key, device_upload_authorization_id, created_at
+  ) SELECT
+    'accountless-cap-chunk-' || printf('%05d', value), ?, ?, 'usage', ?,
+    value, 1, printf('%064x', value), printf('%064x', value + 100000),
+    'synthetic-public-cap', 1, 1,
+    'telemetry/accountless-public-cap/' || value,
+    'accountless-cap-upload-' || printf('%05d', value), ?
+  FROM source_rows`).bind(
+    MAX_V1_SOURCE_CHUNKS,
+    participantId,
+    deviceId,
+    DAY,
+    SEED_AT,
+  ).run();
+  return participantId;
 }
 
 interface SeedRecord {
@@ -291,6 +421,54 @@ describe("community daily aggregate cross-device dedupe", () => {
       createdAt: "2026-08-02T01:00:00.000Z", records: [{ occurrenceId: "owner-usage-two", inputUncachedTokens: 1 }] });
     await expect(assertV1SourcePinCurrent(db(), pin)).rejects.toThrow("v1 source changed during analysis");
     await expect(loadV1SourcePin(db(), scope, { maxChunks: 1 })).rejects.toThrow("v1 source chunk limit exceeded");
+  });
+
+  it("bounds the public source after social ownership filtering", async () => {
+    const socialParticipant = await seedParticipant("public-source-cap-social");
+    await seedDevice(socialParticipant, "device-public-source-cap-social");
+    await seedChunk({
+      participantId: socialParticipant,
+      deviceId: "device-public-source-cap-social",
+      createdAt: "2026-08-02T01:00:00.000Z",
+      records: [{ occurrenceId: "public-source-cap-usage", inputUncachedTokens: 42 }],
+    });
+    const accountlessParticipant = await seedOversizedAccountlessSourceJournal();
+    expect(await db().prepare(`SELECT COUNT(*) AS count
+      FROM telemetry_v1_chunks WHERE participant_id = ?`).bind(accountlessParticipant)
+      .first<{ count: number }>()).toEqual({ count: MAX_V1_SOURCE_CHUNKS + 1 });
+
+    // The unscoped private/debug source reaches its exact cap, while the
+    // public selector admits the social record before applying that bound.
+    await expect(loadV1SourcePin(db(), { day: DAY }))
+      .rejects.toThrow("v1 source chunk limit exceeded");
+    const unscoped = await loadV1SourcePin(db(), { day: DAY }, {
+      // The oversized private journal plus the single social chunk.
+      maxChunks: MAX_V1_SOURCE_CHUNKS + 2,
+    });
+    const publicPin = await loadV1SourcePin(db(), {
+      day: DAY,
+      ownerKind: "social",
+    });
+    expect(unscoped.winners).toEqual(expect.arrayContaining([
+      expect.objectContaining({ participant_id: accountlessParticipant }),
+      expect.objectContaining({ participant_id: socialParticipant }),
+    ]));
+    expect(publicPin.scope).toEqual({ day: DAY, ownerKind: "social" });
+    expect(publicPin.fingerprint).not.toBe(unscoped.fingerprint);
+    expect(publicPin.winners).toEqual([{
+      participant_id: socialParticipant,
+      observed_day: DAY,
+      device_id: "device-public-source-cap-social",
+      evidence: "analytical",
+    }]);
+
+    const payload = await rebuildAndReadDay("2026-08-03T12:00:00.000Z");
+    expect(payload.totals).toMatchObject({
+      contributingParticipants: 1,
+      contributingDevices: 1,
+      usageEvents: 1,
+      inputUncachedTokens: 42,
+    });
   });
 
   it("counts an overlapping participant-day once, the newest device winning across streams", async () => {

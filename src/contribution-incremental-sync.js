@@ -383,6 +383,18 @@ function explicitV11Consent(consent, origin) {
   return required;
 }
 
+function exactKeys(record, keys) {
+  if (record === null || typeof record !== "object" || Array.isArray(record)) return false;
+  try {
+    const prototype = Object.getPrototypeOf(record);
+    return (prototype === Object.prototype || prototype === null)
+      && Reflect.ownKeys(record).length === keys.length
+      && keys.every((key) => Object.hasOwn(record, key));
+  } catch {
+    return false;
+  }
+}
+
 function accountlessV11Authorization(authorization, origin, laboratory, production) {
   if (accountlessTransportOrigin({ laboratory, production, origin }) === null
       || !exactKeys(authorization, [
