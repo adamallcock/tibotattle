@@ -89,8 +89,17 @@ test("the development workflow builds each target on a static native runner with
   assert.match(workflow, /WINDOWS_BINDING_BUILD_FAILED/u);
   assert.match(workflow, /LINUX_CREDENTIAL_MUTEX_NODE_GYP_UNAVAILABLE/u);
   assert.match(workflow, /rebuild --directory native\/linux-credential-mutex/u);
+  assert.match(workflow, /stage-linux-credential-mutex-binding\.mjs/u);
   assert.match(workflow, /build-linux-credential-mutex-manifest\.mjs/u);
   assert.match(workflow, /qualify-linux-credential-mutex\.mjs/u);
+  assert.ok(
+    workflow.indexOf("stage-linux-credential-mutex-binding.mjs")
+      < workflow.indexOf("build-linux-credential-mutex-manifest.mjs"),
+  );
+  assert.ok(
+    workflow.indexOf("build-linux-credential-mutex-manifest.mjs")
+      < workflow.indexOf("qualify-linux-credential-mutex.mjs"),
+  );
 });
 
 test("common packaging assembles usable, hashed handoffs without a source checkout", async () => {
@@ -134,14 +143,18 @@ test("Linux native qualification outputs leave the source inventory unchanged", 
     const before = git("status", "--porcelain", "--untracked-files=all");
     assert.ok(before.includes(source), "native source changes must remain visible to the clean-source gate");
 
-    const build = "native/linux-credential-mutex/build/Release";
-    await mkdir(join(directory, build), { recursive: true });
-    for (const name of ["linux_credential_mutex.node", "linux_credential_mutex.node.manifest.json"]) {
-      await writeFile(join(directory, build, name), "synthetic build output\n");
-      assert.equal(git("check-ignore", "--", `${build}/${name}`).trim(), `${build}/${name}`);
+    for (const build of [
+      "native/linux-credential-mutex/build/Release",
+      "native/linux-credential-mutex/build/qualification",
+    ]) {
+      await mkdir(join(directory, build), { recursive: true });
+      for (const name of ["linux_credential_mutex.node", "linux_credential_mutex.node.manifest.json"]) {
+        await writeFile(join(directory, build, name), "synthetic build output\n");
+        assert.equal(git("check-ignore", "--", `${build}/${name}`).trim(), `${build}/${name}`);
+      }
     }
     assert.equal(git("status", "--porcelain", "--untracked-files=all"), before,
-      "building the native binding and manifest must not dirty the packager's source inventory");
+      "building, staging, and manifesting the native binding must not dirty the packager's source inventory");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

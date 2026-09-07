@@ -15,11 +15,18 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 
-export const LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH = Object.freeze([
+export const LINUX_CREDENTIAL_MUTEX_GENERATED_BINDING_RELATIVE_PATH = Object.freeze([
   "native",
   "linux-credential-mutex",
   "build",
   "Release",
+  "linux_credential_mutex.node",
+].join("/"));
+export const LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH = Object.freeze([
+  "native",
+  "linux-credential-mutex",
+  "build",
+  "qualification",
   "linux_credential_mutex.node",
 ].join("/"));
 export const LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_RELATIVE_PATH = Object.freeze(
@@ -37,11 +44,7 @@ const NATIVE_BINDING_PATH = resolve(
   dirname(fileURLToPath(import.meta.url)),
   "..",
   "..",
-  "native",
-  "linux-credential-mutex",
-  "build",
-  "Release",
-  "linux_credential_mutex.node",
+  LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH,
 );
 const BINDING_FILE_NAME = "linux_credential_mutex.node";
 const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;

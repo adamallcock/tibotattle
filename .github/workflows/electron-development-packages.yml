@@ -206,6 +206,7 @@ jobs:
             exit 1
           fi
           node "$node_gyp_script" rebuild --directory native/linux-credential-mutex
+          node scripts/stage-linux-credential-mutex-binding.mjs
           node scripts/build-linux-credential-mutex-manifest.mjs
           node scripts/qualify-linux-credential-mutex.mjs
       - name: Validate packaging contracts
