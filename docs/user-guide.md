@@ -59,8 +59,11 @@ These historical estimates are conditional on the locally observed plan, not
 proof of which provider account generated every token. Known plan switches and
 ambiguous boundary quantities are excluded narrowly; coherent older history is
 still useful. **Usage and costs** continues to retain all-plan accounting totals.
-Community figures intentionally retain their common Pro-equivalent scale; this
-does not authorize mixing personal Plus and Pro allowance histories.
+Community chart lines and headline values retain their common Pro 20x-equivalent
+scale. In By plan, the smaller card value shows that plan's own weekly allowance
+at API prices: divide the headline by 1 for Pro 20x, 4 for Pro 5x, or 20 for Plus.
+This is an estimated API value, not the subscription price, and does not authorize
+mixing personal Plus and Pro allowance histories.
 
 Switching and cache-drop overheads estimate the API-equivalent premium in
 observed comparisons, not a proven cause or a bill. A labelled covered subtotal

@@ -50,6 +50,7 @@ async function fixture() {
     "index.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
     "install-cta.js": "export const installCta = true;\n",
     "localization.js": "export const localization = true;\n",
+    "model-catalog.generated.js": "export const REVIEWED_MODEL_CATALOG = [];\n",
     "privacy.html": "<!doctype html><title>public privacy</title>\n",
     "robots.txt": "User-agent: *\nAllow: /\nSitemap: https://usagemonitor.app/sitemap.xml\n",
     "sitemap.xml": [
@@ -270,7 +271,7 @@ test("staging refuses a missing shared admin dependency and never publishes the 
   });
   for (const path of [
     "styles.css", "ui-format.js", "localization.js", "i18n.generated.js",
-    "community-data.js", "community-view.js",
+    "community-data.js", "community-view.js", "model-catalog.generated.js",
   ]) {
     const manifest = JSON.parse(originalManifest);
     manifest.files = manifest.files.filter((entry) => entry.path !== path);

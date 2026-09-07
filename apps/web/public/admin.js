@@ -7,6 +7,8 @@ import {
   projectAdminOverview,
 } from "./admin-client.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
+import { planWeeklyApiEquivalentUsd } from "./community-data.js";
+import { allowanceModelPresentation, modelThemeIcon } from "./community-view.js";
 
 const state = {
   csrfToken: "",
@@ -21,7 +23,9 @@ const state = {
   allowanceMode: "combined",
   allowancePlanFilter: null,
   allowanceModelFilter: "observed",
+  allowanceModelFocus: null,
   allowanceRangeDays: 30,
+  allowanceChartWidth: null,
   notificationPreferences: null,
   metricsHistory: undefined,
   auditRows: [],
@@ -2191,16 +2195,10 @@ function scheduleRefresh({ retry = false } = {}) {
 const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
 const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
-const ADMIN_ALLOWANCE_MODEL_STYLES = Object.freeze({
-  "gpt-5.6-sol": Object.freeze({ className: "model-sol" }),
-  "gpt-5.6-terra": Object.freeze({ className: "model-terra" }),
-  "gpt-5.6-luna": Object.freeze({ className: "model-luna" }),
-  "gpt-5.5": Object.freeze({ className: "model-gpt55" }),
-});
 const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
-  pro: Object.freeze({ label: "Pro 20x", className: "pro" }),
-  prolite: Object.freeze({ label: "Pro 5x → 20x", className: "prolite" }),
-  plus: Object.freeze({ label: "Plus → 20x", className: "plus" }),
+  pro: Object.freeze({ label: "Pro 20×", className: "allowance-series-0" }),
+  prolite: Object.freeze({ label: "Pro 5×", className: "allowance-series-1" }),
+  plus: Object.freeze({ label: "Plus", className: "allowance-series-2" }),
 });
 
 function adminAllowanceTickStep(span, target = 4) {
@@ -2244,6 +2242,7 @@ export function adminAllowanceChartModel(preview, {
   mode = "combined",
   planFilter = null,
   modelFilter = "all",
+  modelFocus = null,
   rangeDays = 30,
   width = ADMIN_ALLOWANCE_CHART_WIDTH,
   height = ADMIN_ALLOWANCE_CHART_HEIGHT,
@@ -2257,10 +2256,10 @@ export function adminAllowanceChartModel(preview, {
     ? Number.NEGATIVE_INFINITY
     : Date.parse(`${anchor}T00:00:00.000Z`)
       - (rangeDays - 1) * ADMIN_ALLOWANCE_DAY_MILLISECONDS;
-  const days = preview.days.filter((day) => (
+  const rangeDaysWithEvidence = preview.days.filter((day) => (
     Date.parse(`${day.day}T00:00:00.000Z`) >= cutoffMs
   ));
-  if (days.length === 0) return null;
+  if (rangeDaysWithEvidence.length === 0) return null;
   const planSeries = preview.plans.map((plan) => ({
     key: plan.planType,
     ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
@@ -2271,9 +2270,9 @@ export function adminAllowanceChartModel(preview, {
   const modelSeries = (preview.models?.modelConfig ?? []).map((model, index) => ({
     key: model.modelId,
     label: model.label,
-    className: ADMIN_ALLOWANCE_MODEL_STYLES[model.modelId]?.className
-      ?? `model-catalog-${index % 8}`,
-  }));
+    hasEvidence: rangeDaysWithEvidence.some(day => modelDayByDay.get(day.day)?.byModel?.[model.modelId]?.capacityUsd != null),
+    ...allowanceModelPresentation(model.modelId, index),
+  })).sort((left, right) => left.order - right.order);
   const activePlanFilter = mode === "plans"
     && planSeries.some((plan) => plan.key === planFilter)
     ? planFilter
@@ -2282,13 +2281,14 @@ export function adminAllowanceChartModel(preview, {
     ? [{ key: "combined", label: "Combined", className: "combined" }]
     : mode === "models"
       ? modelSeries.filter((model) => modelFilter === "all"
-        || (modelFilter === "observed" ? days.some((day) => (
-          modelDayByDay.get(day.day)?.byModel?.[model.key]?.capacityUsd != null
-        )) : model.key === modelFilter))
+        || (modelFilter === "observed" ? model.hasEvidence : model.key === modelFilter))
       : planSeries;
-  const series = mode !== "plans" || activePlanFilter === null
-    ? legendSeries
-    : planSeries.filter((plan) => plan.key === activePlanFilter);
+  const activeModelFocus = mode === "models"
+    && legendSeries.some((model) => model.key === modelFocus && model.hasEvidence)
+    ? modelFocus : null;
+  const activeSeriesKey = activePlanFilter ?? activeModelFocus;
+  const series = activeSeriesKey === null ? legendSeries
+    : legendSeries.filter((definition) => definition.key === activeSeriesKey);
   const summaryFor = (day, key) => {
     if (mode === "models") {
       const modelDay = modelDayByDay.get(day.day);
@@ -2309,9 +2309,18 @@ export function adminAllowanceChartModel(preview, {
     }
     return key === "combined" ? day.combined : day.byPlanType[key];
   };
+  // Trim empty edges in All, but not interior gaps. Focusing a legend never
+  // moves the date axis; all series in the selected view share its bounds.
+  let days = rangeDaysWithEvidence;
+  if (rangeDays === null) {
+    const hasEstimate = day => legendSeries.some(definition => summaryFor(day, definition.key)?.centralUsd != null);
+    const first = days.findIndex(hasEstimate);
+    if (first < 0) return null;
+    days = days.slice(first, days.findLastIndex(hasEstimate) + 1);
+  }
   let visibleValueCount = 0;
   const valueCandidates = [];
-  for (const day of days) {
+  for (const day of rangeDaysWithEvidence) {
     for (const definition of series) {
       const summary = summaryFor(day, definition.key);
       if (summary?.centralUsd !== null && summary?.centralUsd !== undefined) {
@@ -2370,13 +2379,14 @@ export function adminAllowanceChartModel(preview, {
         * (plot.right - plot.left);
   };
   const step = adminAllowanceTickStep(Math.max(...valueCandidates));
-  const axisTop = Math.ceil(Math.max(...valueCandidates) / step) * step;
+  const axisTop = Math.max(step, Math.ceil(Math.max(...valueCandidates) / step) * step);
   const y = (value) => plot.bottom
     - (value / axisTop) * (plot.bottom - plot.top);
   const dollarTicks = [];
   for (let value = 0; value <= axisTop + step / 100; value += step) {
     dollarTicks.push({ value, y: y(value) });
   }
+  const daySpacing = (plot.right - plot.left) / Math.max(1, (endMs - startMs) / ADMIN_ALLOWANCE_DAY_MILLISECONDS);
   const modeledSeries = series.map((definition) => {
     const points = days.flatMap((day) => {
       const summary = summaryFor(day, definition.key);
@@ -2386,14 +2396,18 @@ export function adminAllowanceChartModel(preview, {
         value: summary.centralUsd,
         fitCount: summary.fitCount,
         participantCount: summary.participantCount,
+        radius: Math.min(5, Math.max(1.6, daySpacing * .3), 2.6 + Math.sqrt(summary.fitCount)),
         x: x(day.day),
         y: y(summary.centralUsd),
       }];
     });
+    const segments = adminAllowanceSegments(points);
     return {
       ...definition,
       points,
-      segments: adminAllowanceSegments(points),
+      segments,
+      markerPoints: daySpacing < 14
+        ? segments.flatMap(segment => segment.length === 1 ? segment : [segment[0], segment.at(-1)]) : points,
       latest: points.at(-1) ?? null,
     };
   });
@@ -2410,7 +2424,7 @@ export function adminAllowanceChartModel(preview, {
     const segments = adminAllowanceSegments(points);
     return segments.length === 0 ? [] : [{ ...definition, segments }];
   });
-  const maximumTicks = 6;
+  const maximumTicks = width < 480 ? 4 : 6;
   const dayTicks = Array.from({ length: maximumTicks }, (_, index) => {
     const atMs = startMs + Math.round(
       ((endMs - startMs) * index) / (maximumTicks - 1)
@@ -2425,9 +2439,11 @@ export function adminAllowanceChartModel(preview, {
     plot,
     dollarTicks,
     dayTicks,
-    tickLabelStyle: days.length > 45 ? "month" : "day",
+    tickLabelStyle: endMs - startMs > 150 * ADMIN_ALLOWANCE_DAY_MILLISECONDS ? "month" : "day",
     mode,
     activePlanFilter,
+    activeModelFocus,
+    activeSeriesKey,
     legendSeries,
     series: modeledSeries,
     bandSeries,
@@ -2475,34 +2491,40 @@ function allowanceCountLabel(value, singular) {
 function appendAdminAllowanceLegend(figure, model) {
   const legend = document.createElement("div");
   legend.className = "admin-allowance-legend";
-  if (model.mode === "plans") {
+  const interactive = model.mode !== "combined";
+  if (interactive) {
     legend.classList.add("admin-allowance-legend-interactive");
-    if (model.activePlanFilter !== null) {
+    if (model.activeSeriesKey !== null) {
       legend.classList.add("admin-allowance-legend-filtered");
     }
     legend.setAttribute("role", "group");
-    legend.setAttribute("aria-label", "Filter allowance chart by plan");
+    legend.setAttribute("aria-label", `Focus allowance chart by ${model.mode === "plans" ? "plan" : "model"}`);
   }
   for (const series of model.legendSeries) {
-    const item = document.createElement(model.mode === "plans" ? "button" : "span");
-    if (model.mode === "plans") {
-      const selected = model.activePlanFilter === series.key;
+    const item = document.createElement(interactive ? "button" : "span");
+    if (interactive) {
+      const selected = model.activeSeriesKey === series.key;
       item.type = "button";
       item.className = "admin-allowance-legend-button";
-      item.dataset.allowancePlan = series.key;
+      if (model.mode === "plans") item.dataset.allowancePlan = series.key;
+      else item.dataset.allowanceModelFocus = series.key;
       item.setAttribute("aria-pressed", String(selected));
       item.setAttribute(
         "aria-label",
-        selected ? `Show all plans` : `Show only ${series.label}`,
+        selected ? `Show all ${model.mode}` : `Show only ${series.label}`,
       );
       item.title = selected
-        ? "Show all plans"
-        : `Filter chart to ${series.label}`;
+        ? `Show all ${model.mode}`
+        : `Focus chart on ${series.label}`;
+      if (series.hasEvidence === false) {
+        item.disabled = true;
+        item.title = "No qualifying fits in this range";
+      }
     }
     const swatch = document.createElement("span");
     swatch.className = model.mode === "plans"
-      ? `admin-allowance-plan-key admin-allowance-plan-key-${series.className}`
-      : `admin-allowance-swatch admin-allowance-swatch-${series.className}`;
+      ? `admin-allowance-plan-key ${series.className}`
+      : `admin-allowance-swatch ${series.className}`;
     swatch.setAttribute("aria-hidden", "true");
     const label = document.createElement("span");
     label.textContent = series.label;
@@ -2520,14 +2542,29 @@ function appendAdminAllowanceLegend(figure, model) {
     legend.append(item);
   }
   figure.append(legend);
+  if (interactive) {
+    const hint = document.createElement("p");
+    hint.className = "allowance-legend-hint";
+    hint.textContent = "Select a legend to focus; select it again to show all.";
+    figure.append(hint);
+  }
 }
 
 function appendAdminAllowanceChart(container, preview) {
+  const availableWidth = container.getBoundingClientRect?.().width;
+  // Size the coordinate system to the actual chart surface so phone layouts
+  // retain readable axes instead of shrinking a desktop-wide SVG to a strip.
+  const width = Number.isFinite(availableWidth) && availableWidth > 0
+    ? Math.max(280, Math.min(ADMIN_ALLOWANCE_CHART_WIDTH, availableWidth - 30))
+    : ADMIN_ALLOWANCE_CHART_WIDTH;
+  state.allowanceChartWidth = availableWidth;
   const model = adminAllowanceChartModel(preview, {
     mode: state.allowanceMode,
     planFilter: state.allowancePlanFilter,
     modelFilter: state.allowanceModelFilter,
+    modelFocus: state.allowanceModelFocus,
     rangeDays: state.allowanceRangeDays,
+    width,
   });
   if (model === null) {
     const empty = document.createElement("p");
@@ -2538,13 +2575,15 @@ function appendAdminAllowanceChart(container, preview) {
   }
   const figure = document.createElement("div");
   figure.className = "community-daily-chart community-allowance-chart";
-  if (model.activePlanFilter !== null) {
+  if (model.activeSeriesKey !== null) {
     figure.classList.add("community-allowance-chart-filtered");
   }
   appendAdminAllowanceLegend(figure, model);
   const svg = adminAllowanceSvg("svg", "", {
     viewBox: `0 0 ${model.width} ${model.height}`,
     role: "img",
+    tabindex: 0,
+    "aria-description": "Weekly API-equivalent USD on a Pro 20× basis. Hover, tap or use arrow keys to inspect each day's estimate. Missing days stay gaps.",
     "aria-label": state.allowanceMode === "combined"
       ? "Combined Pro 20x-equivalent community allowance by day"
       : state.allowanceMode === "models"
@@ -2591,13 +2630,13 @@ function appendAdminAllowanceChart(container, preview) {
         ));
         svg.append(adminAllowanceSvg(
           "path",
-          `admin-allowance-band-area admin-allowance-band-area-${bandSeries.className}`,
+          `admin-allowance-band-area ${bandSeries.className}`,
           { d: `M${[...forward, ...backward].join(" L")} Z` },
         ));
       } else {
         svg.append(adminAllowanceSvg(
           "line",
-          `admin-allowance-band-mark admin-allowance-band-mark-${bandSeries.className}`,
+          `admin-allowance-band-mark ${bandSeries.className}`,
           {
             x1: band[0].x,
             x2: band[0].x,
@@ -2608,38 +2647,76 @@ function appendAdminAllowanceChart(container, preview) {
       }
     }
   }
+  const inspection = document.createElement("p");
+  inspection.className = "admin-allowance-inspection";
+  inspection.setAttribute("aria-live", "polite");
+  inspection.textContent = "Hover, tap or use arrow keys to inspect a day.";
+  const inspectionPoints = [];
   for (const series of model.series) {
     for (const segment of series.segments) {
       if (segment.length >= 2) {
         svg.append(adminAllowanceSvg(
           "polyline",
-          `admin-allowance-line admin-allowance-line-${series.className}`,
+          `admin-allowance-line ${series.className}`,
           { points: segment.map((point) => (
             `${point.x.toFixed(1)},${point.y.toFixed(1)}`
           )).join(" ") },
         ));
       }
     }
+    const markers = new Set(series.markerPoints);
     for (const point of series.points) {
+      const detail = `${series.label} · ${point.day} · ${allowanceUsd(point.value)}/Pro 20× week at API prices`
+        + ` · ${allowanceCountLabel(point.participantCount, "account")}`
+        + (model.mode === "models" ? "" : ` · ${allowanceCountLabel(point.fitCount, "fit")}`);
       const dot = adminAllowanceSvg(
         "circle",
-        `admin-allowance-dot admin-allowance-dot-${series.className}`,
+        `admin-allowance-dot ${series.className}`,
         {
           cx: point.x,
           cy: point.y,
-          r: Math.min(6, 2.4 + Math.sqrt(point.fitCount)),
-          tabindex: 0,
-          "aria-label": `${series.label}, ${point.day}: ${allowanceUsd(point.value)}, ${allowanceCountLabel(point.participantCount, "account")}, ${allowanceCountLabel(point.fitCount, "fit")}`,
+          r: point.radius,
+          tabindex: -1,
+          "data-permanent-marker": String(markers.has(point)),
+          "aria-label": detail,
         },
       );
       const title = adminAllowanceSvg("title");
-      title.textContent = `${series.label} · ${point.day} · ${allowanceUsd(point.value)} · ${allowanceCountLabel(point.participantCount, "account")} · ${allowanceCountLabel(point.fitCount, "fit")}`;
+      title.textContent = detail;
       dot.append(title);
+      const inspect = () => { inspection.textContent = detail; };
+      dot.addEventListener("pointerenter", inspect);
+      dot.addEventListener("click", inspect);
+      dot.addEventListener("focus", inspect);
+      inspectionPoints.push({ day: point.day, dot });
       svg.append(dot);
     }
   }
-  figure.append(svg);
+  // One tab stop for the chart, chronological arrow-key access to every point
+  // (including markers hidden to keep dense lines legible).
+  inspectionPoints.sort((left, right) => left.day.localeCompare(right.day));
+  let inspectionIndex = -1;
+  svg.addEventListener("keydown", event => {
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const focused = inspectionPoints.findIndex(point => point.dot === event.target);
+    if (focused >= 0) inspectionIndex = focused;
+    if (event.key === "Home") inspectionIndex = 0;
+    else if (event.key === "End") inspectionIndex = inspectionPoints.length - 1;
+    else inspectionIndex = Math.max(0, Math.min(inspectionPoints.length - 1,
+      inspectionIndex + (["ArrowLeft", "ArrowUp"].includes(event.key) ? -1 : 1)));
+    inspectionPoints[inspectionIndex]?.dot.focus();
+  });
+  figure.append(svg, inspection);
   container.append(figure);
+  if (model.mode === "plans") {
+    const method = document.createElement("p");
+    method.className = "admin-allowance-meta";
+    method.textContent = "Chart scaled to Pro 20×: Pro 20× ×1, Pro 5× ×4, Plus ×20."
+      + " Smaller card values show each plan’s own week at API prices."
+      + " Shading: middle 80% of qualifying reset fits. Missing days stay gaps.";
+    container.append(method);
+  }
 }
 
 function appendCombinedAllowanceSummary(container, preview) {
@@ -2652,7 +2729,7 @@ function appendCombinedAllowanceSummary(container, preview) {
   value.textContent = allowanceUsd(latest.summary.centralUsd);
   const unit = document.createElement("span");
   unit.className = "admin-allowance-unit";
-  unit.textContent = "per 7 days, Pro 20x equivalent";
+  unit.textContent = "API-equivalent USD / Pro 20× week";
   const meta = document.createElement("p");
   meta.className = "admin-allowance-meta";
   const evidence = document.createElement("span");
@@ -2679,33 +2756,50 @@ function appendCombinedAllowanceSummary(container, preview) {
 }
 
 function appendPlanAllowanceSummaries(container, preview) {
+  appendAllowanceCardsCaption(container);
   const list = document.createElement("div");
-  list.className = "admin-allowance-plan-summaries";
+  list.className = "admin-allowance-plan-summaries allowance-summary-cards";
   for (const plan of preview.plans) {
     const latest = latestAllowanceSummary(preview, plan.planType);
     const style = ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType];
     const item = document.createElement("div");
-    item.className = "admin-allowance-plan-summary";
+    item.className = `admin-allowance-plan-summary allowance-summary-card ${style.className}`;
     if (state.allowancePlanFilter === plan.planType) {
       item.classList.add("admin-allowance-plan-summary-selected");
     }
-    const label = document.createElement("span");
+    const label = document.createElement("h3");
     label.textContent = style.label;
     const value = document.createElement("strong");
+    value.className = "allowance-summary-value";
     value.textContent = latest === null ? "—" : allowanceUsd(latest.summary.centralUsd);
-    const meta = document.createElement("small");
+    const meta = document.createElement("p");
     meta.textContent = latest === null
       ? "No qualifying fits"
-      : `${allowanceCountLabel(latest.summary.participantCount, "account")} · ${allowanceCountLabel(latest.summary.fitCount, "fit")}`;
-    const range = document.createElement("small");
+      : `${latest.day} · ${allowanceCountLabel(latest.summary.participantCount, "account")} · ${allowanceCountLabel(latest.summary.fitCount, "fit")}`;
+    const range = document.createElement("p");
     range.className = "admin-allowance-plan-range";
     range.textContent = latest?.summary.band80Usd
       ? `Middle 80% ${allowanceUsd(latest.summary.band80Usd.lowerUsd)}–${allowanceUsd(latest.summary.band80Usd.upperUsd)}`
       : "Middle 80% unavailable";
-    item.append(label, value, meta, range);
+    item.append(label, value);
+    const planUsd = planWeeklyApiEquivalentUsd(latest?.summary.centralUsd, plan.planType);
+    if (planUsd !== null) {
+      const actual = document.createElement("p");
+      actual.className = "allowance-plan-value";
+      actual.textContent = `This plan: ${allowanceUsd(planUsd)}/week at API prices`;
+      item.append(actual);
+    }
+    item.append(meta, range);
     list.append(item);
   }
   container.append(list);
+}
+
+function appendAllowanceCardsCaption(container) {
+  const caption = document.createElement("p");
+  caption.className = "allowance-summary-caption";
+  caption.textContent = "API-equivalent USD / Pro 20× week";
+  container.append(caption);
 }
 
 function appendAllowanceCoverage(container, coverage) {
@@ -2751,6 +2845,9 @@ function renderAdminAllowanceControls() {
 
 function appendModelAllowanceSummaries(container, preview) {
   const models = preview.models;
+  const modelConfig = models.modelConfig.map((model, index) => ({
+    ...model, ...allowanceModelPresentation(model.modelId, index),
+  })).sort((left, right) => left.order - right.order);
   const filterLabel = document.createElement("label");
   filterLabel.className = "admin-allowance-model-filter";
   filterLabel.textContent = "Model view ";
@@ -2759,7 +2856,7 @@ function appendModelAllowanceSummaries(container, preview) {
   for (const [value, text] of [
     ["observed", "Models with identified fits"],
     ["all", "All reviewed models"],
-    ...models.modelConfig.map((model) => [model.modelId, model.label]),
+    ...modelConfig.map((model) => [model.modelId, model.label]),
   ]) {
     const option = document.createElement("option");
     option.value = value;
@@ -2769,6 +2866,7 @@ function appendModelAllowanceSummaries(container, preview) {
   filter.value = state.allowanceModelFilter;
   filter.addEventListener("change", () => {
     state.allowanceModelFilter = filter.value;
+    state.allowanceModelFocus = null;
     renderAdminCommunityAllowance(preview);
     $(".admin-allowance-model-filter select")?.focus();
   });
@@ -2782,43 +2880,42 @@ function appendModelAllowanceSummaries(container, preview) {
       + " Qualified historical points fill in as background calculations complete.";
     container.append(empty);
   }
+  appendAllowanceCardsCaption(container);
   const grid = document.createElement("div");
-  grid.className = "admin-allowance-plan-summaries";
-  for (const model of models.modelConfig) {
+  grid.className = "admin-allowance-plan-summaries allowance-summary-cards";
+  for (const model of modelConfig) {
     const summary = latest?.byModel[model.modelId];
     if (state.allowanceModelFilter === "observed"
         ? summary?.capacityUsd == null
         : state.allowanceModelFilter !== "all"
           && state.allowanceModelFilter !== model.modelId) continue;
     const tile = document.createElement("div");
-    tile.className = "admin-allowance-plan-summary";
-    const label = document.createElement("p");
-    label.className = "admin-allowance-plan-label";
+    tile.className = `admin-allowance-plan-summary allowance-summary-card ${model.className}`;
+    const heading = document.createElement("div");
+    heading.className = "allowance-summary-heading";
+    const label = document.createElement("h3");
     label.textContent = model.label;
-    const value = document.createElement("p");
-    value.className = "admin-allowance-value";
+    heading.append(label);
+    const icon = modelThemeIcon(document, model.theme);
+    if (icon) heading.append(icon);
+    const value = document.createElement("strong");
+    value.className = "allowance-summary-value";
     value.textContent = summary?.capacityUsd == null
       ? "—"
       : allowanceUsd(summary.capacityUsd);
-    const unit = document.createElement("p");
-    unit.className = "admin-allowance-unit";
-    unit.textContent = model.allowanceTrack === "spark"
-      ? "Separate Spark allowance track"
-      : "per 100pp weekly, Pro 20x equivalent";
     const meta = document.createElement("p");
-    meta.className = "admin-allowance-meta";
+    meta.className = "allowance-headline-caveat";
     meta.textContent = model.allowanceTrack === "spark"
-      ? "Not comparable with the primary allowance; API pricing unavailable"
+      ? "Separate Spark allowance; no comparable API value"
       : summary?.participantCount == null
         ? "Not covered by this retained day’s model roster"
         : summary.capacityUsd === null
           ? "No identification-passing fit carries this model"
-      : `${allowanceCountLabel(summary.participantCount, "account")}`
-        + ` · ${latest.day}`;
+      : `${latest.day} · ${allowanceCountLabel(summary.participantCount, "account")}`;
     if (model.pricingStatus === "assumed_alias") {
       meta.textContent += " · Price alias assumption; identity kept separate";
     }
-    tile.append(label, value, unit, meta);
+    tile.append(heading, value, meta);
     grid.append(tile);
   }
   container.append(grid);
@@ -3185,6 +3282,16 @@ if (isAdminPage) {
     }
   });
   window.addEventListener("focus", updateNotificationControls);
+  let allowanceResizePending = false;
+  window.addEventListener("resize", () => {
+    if (allowanceResizePending || state.allowancePreview === null) return;
+    allowanceResizePending = true;
+    window.requestAnimationFrame(() => {
+      allowanceResizePending = false;
+      const width = $("#admin-community-allowance-result")?.getBoundingClientRect().width;
+      if (width !== state.allowanceChartWidth) renderAdminCommunityAllowance(state.allowancePreview);
+    });
+  });
   $("#admin-community-mode-controls").addEventListener("click", (event) => {
     const button = event.target.closest("button[data-allowance-mode]");
     if (!button) return;
@@ -3200,14 +3307,24 @@ if (isAdminPage) {
     renderAdminCommunityAllowance(state.allowancePreview);
   });
   $("#admin-community-allowance-result").addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-allowance-plan]");
+    const button = event.target.closest("button[data-allowance-plan], button[data-allowance-model-focus]");
     if (!button || state.allowancePreview === null) return;
-    state.allowancePlanFilter = toggleAdminAllowancePlanFilter(
-      state.allowancePlanFilter,
-      button.dataset.allowancePlan,
-      state.allowancePreview.plans,
-    );
+    const modelId = button.dataset.allowanceModelFocus;
+    if (modelId !== undefined) {
+      if (!state.allowancePreview.models.modelConfig.some(model => model.modelId === modelId)) return;
+      state.allowanceModelFocus = state.allowanceModelFocus === modelId ? null : modelId;
+    } else {
+      state.allowancePlanFilter = toggleAdminAllowancePlanFilter(
+        state.allowancePlanFilter,
+        button.dataset.allowancePlan,
+        state.allowancePreview.plans,
+      );
+    }
     renderAdminCommunityAllowance(state.allowancePreview);
+    const selector = modelId !== undefined
+      ? `button[data-allowance-model-focus="${modelId}"]`
+      : `button[data-allowance-plan="${button.dataset.allowancePlan}"]`;
+    $(selector)?.focus();
   });
   $("#sync-distribution").addEventListener("click", async () => {
     const button = $("#sync-distribution");

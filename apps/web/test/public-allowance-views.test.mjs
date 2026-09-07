@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildCommunityAllowanceChartModel, renderCommunityAllowanceSection } from "../public/community-view.js";
-import { normalizeCommunityDailySeries, normalizePublicAllowanceBreakdowns } from "../public/community-data.js";
+import { normalizeCommunityDailySeries, normalizePublicAllowanceBreakdowns, planWeeklyApiEquivalentUsd } from "../public/community-data.js";
 import { translate, translatePlural } from "../public/localization.js";
 import { publicAllowanceFixture } from "./fixtures/public-allowance.js";
 
@@ -136,6 +136,23 @@ test("public view controls and method caveats are translated in every shipped la
 });
 
 const NOW = Date.parse("2026-09-07T12:00:00.000Z");
+test("actual plan values invert only the supported reference scaling without rounding or inventing missing values", () => {
+  assert.equal(planWeeklyApiEquivalentUsd(2011, "pro"), 2011);
+  assert.equal(planWeeklyApiEquivalentUsd(1916, "prolite"), 479);
+  assert.equal(planWeeklyApiEquivalentUsd(2257, "plus"), 112.85);
+  assert.equal(planWeeklyApiEquivalentUsd(0, "plus"), 0);
+  for (const value of [null, undefined, NaN, Infinity, -1, "2257"]) {
+    assert.equal(planWeeklyApiEquivalentUsd(value, "plus"), null);
+  }
+  for (const plan of ["free", "team", "constructor", "toString", "__proto__", null, undefined, ["plus"], {}]) {
+    assert.equal(planWeeklyApiEquivalentUsd(2257, plan), null);
+  }
+  for (const locale of ["en-US", "zh-Hans", "es"]) {
+    const copy = translate("community.allowance.actualPlanValue", { value: "$479" }, locale);
+    assert.ok(copy.includes("$479"));
+    assert.ok(!copy.includes("{value}"));
+  }
+});
 test("the closed public wire survives normalization into all three chart views", () => {
   const payload = publicAllowanceFixture(NOW);
   const normalized = normalizeCommunityDailySeries(payload, { nowMs: NOW });
@@ -227,6 +244,7 @@ test("real public render shows model sample semantics, per-view labels and discl
     const svg = container.descendants().find(element => element.tag === "svg" && element.attributes.has("aria-label"));
     assert.ok(svg);
     if (view === "models") {
+      assert.doesNotMatch(container.text, /This plan:/u);
       assert.match(container.text, /GPT-6 Astra/u);
       assert.match(container.text, /1 account/u);
       const cards = container.descendants().filter(element => element.tag === "article");
@@ -240,6 +258,17 @@ test("real public render shows model sample semantics, per-view labels and discl
     } else if (view === "plans") {
       assert.match(container.text, /Pro 5× ×4, Plus ×20/u);
       assert.equal(svg.attributes.get("aria-label"), "Community allowance by plan");
+      const normalized = normalizeCommunityDailySeries(publicAllowanceFixture());
+      const summaries = buildCommunityAllowanceChartModel(normalized, { view: "plans" }).latestSummaries;
+      const cards = container.descendants().filter(element => element.tag === "article");
+      assert.equal(cards.length, 3);
+      cards.forEach((card, index) => {
+        const planValue = planWeeklyApiEquivalentUsd(summaries[index].centralUsd, summaries[index].seriesKey);
+        const formatted = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 }).format(planValue);
+        assert.ok(card.text.includes(`This plan: ${formatted}/week at API prices`));
+      });
+    } else {
+      assert.doesNotMatch(container.text, /This plan:/u);
     }
   }
   const emptyModels = publicAllowanceFixture();

@@ -4,7 +4,7 @@
 // retired in favour of daily revisions, so no snapshot render path lives here
 // any more.
 
-import { normalizeCommunityDailySeries } from "./community-data.js";
+import { normalizeCommunityDailySeries, planWeeklyApiEquivalentUsd } from "./community-data.js";
 import {
   compact,
   createDomHelpers,
@@ -456,6 +456,18 @@ const MODEL_PRESENTATION_THEMES = Object.freeze([
   "astra", "sol", "terra", "luna", "classic",
 ]);
 
+// Shared visual identity only. Admin retains its private preview contract and
+// renderer; both surfaces use the same ordering, colours and decorative icons.
+export function allowanceModelPresentation(modelId, catalogIndex = 0) {
+  const preferred = MODEL_PRESENTATION_ORDER.indexOf(modelId);
+  return {
+    order: preferred < 0 ? MODEL_PRESENTATION_ORDER.length + catalogIndex : preferred,
+    theme: preferred < 0 ? null : MODEL_PRESENTATION_THEMES[preferred],
+    className: preferred < 0 ? `allowance-series-${catalogIndex % 8}`
+      : `allowance-model-${MODEL_PRESENTATION_THEMES[preferred]}`,
+  };
+}
+
 /** Presentation only: validated public series in, shared dollar axes and gap-aware
  * geometry out. No owner data access, pricing, fitting, or inferred history. */
 export function buildCommunityAllowanceChartModel(series, options = {}) {
@@ -478,14 +490,9 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
       key, label, view: "plans", className: `allowance-series-${index}`,
     })),
-    ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => {
-      const preferred = MODEL_PRESENTATION_ORDER.indexOf(modelId);
-      return { key: modelId, label, view: "models",
-        order: preferred < 0 ? MODEL_PRESENTATION_ORDER.length + index : preferred,
-        theme: preferred < 0 ? null : MODEL_PRESENTATION_THEMES[preferred],
-        className: preferred < 0 ? `allowance-series-${index % 8}`
-          : `allowance-model-${MODEL_PRESENTATION_THEMES[preferred]}` };
-    }).sort((left, right) => left.order - right.order),
+    ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => ({
+      key: modelId, label, view: "models", ...allowanceModelPresentation(modelId, index),
+    })).sort((left, right) => left.order - right.order),
   ];
   const summaryFor = (day, definition) => {
     if (definition.view === "aggregate") return day.allowance;
@@ -583,7 +590,7 @@ function svgNode(documentRef, tag, className = "", attributes = {}) {
   return element;
 }
 
-function modelThemeIcon(documentRef, theme) {
+export function modelThemeIcon(documentRef, theme) {
   const paths = {
     astra: "M12 3 14.5 9.5 21 12 14.5 14.5 12 21 9.5 14.5 3 12 9.5 9.5Z",
     sol: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M12 2v2 M12 20v2 M2 12h2 M20 12h2 M5 5l1.5 1.5 M17.5 17.5 19 19 M5 19l1.5-1.5 M17.5 6.5 19 5",
@@ -1309,8 +1316,10 @@ export function renderCommunityAllowanceSection({
       const icon = modelThemeIcon(documentRef, latest.seriesTheme);
       if (icon) heading.append(icon);
       card.append(heading,
-        node("strong", "allowance-summary-value", dollars.format(latest.centralUsd)),
-        node("p", "allowance-headline-caveat", `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.shortAccountCount", latest.participantCount)}`));
+        node("strong", "allowance-summary-value", dollars.format(latest.centralUsd)));
+      const planUsd = view === "plans" ? planWeeklyApiEquivalentUsd(latest.centralUsd, latest.seriesKey) : null;
+      if (planUsd !== null) card.append(node("p", "allowance-plan-value", t("community.allowance.actualPlanValue", { value: dollars.format(planUsd) })));
+      card.append(node("p", "allowance-headline-caveat", `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.shortAccountCount", latest.participantCount)}`));
       cards.append(card);
     }
     container.append(cards);

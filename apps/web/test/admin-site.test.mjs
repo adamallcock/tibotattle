@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 
 import { formatReportingTime } from "../public/ui-format.js";
+import { createAdminAllowancePreviewPayload } from "./fixtures/admin-allowance.js";
 
 const fixture = async (name) => JSON.parse(await readFile(
   new URL(`./fixtures/${name}`, import.meta.url),
@@ -28,14 +29,30 @@ class FakeNode {
     this.value = "";
     this.checked = false;
     this.attributes = new Map();
+    this.dataset = {};
+    this.parentNode = null;
+    this.ownerDocument = null;
+    this.classList = {
+      contains: (name) => this.className.split(/\s+/u).includes(name),
+      add: (...names) => { this.className = [...new Set([...this.className.split(/\s+/u).filter(Boolean), ...names])].join(" "); },
+      remove: (...names) => { this.className = this.className.split(/\s+/u).filter((name) => !names.includes(name)).join(" "); },
+      toggle: (name, force) => {
+        const active = force ?? !this.classList.contains(name);
+        this.classList[active ? "add" : "remove"](name);
+        return active;
+      },
+    };
   }
 
   append(...nodes) {
+    for (const node of nodes) node.parentNode = this;
     this.children.push(...nodes);
   }
 
   replaceChildren(...nodes) {
-    this.children = nodes;
+    for (const node of this.children) node.parentNode = null;
+    this.children = [];
+    this.append(...nodes);
   }
 
   addEventListener(type, listener) {
@@ -46,9 +63,13 @@ class FakeNode {
     const copy = String(value);
     this.attributes.set(name, copy);
     if (name === "id") this.id = copy;
+    if (name === "class") this.className = copy;
+    if (name.startsWith("data-")) this.dataset[dataKey(name)] = copy;
   }
 
   getAttribute(name) {
+    if (name === "class") return this.className;
+    if (name.startsWith("data-")) return this.dataset[dataKey(name)] ?? null;
     return this.attributes.get(name) ?? null;
   }
 
@@ -56,9 +77,62 @@ class FakeNode {
     return this.rect;
   }
 
-  querySelectorAll() {
-    return [];
+  querySelectorAll(selector) {
+    return this.children.flatMap(descendantNodes).filter((node) => matchesSelector(node, selector));
   }
+
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] ?? null;
+  }
+
+  closest(selector) {
+    for (let node = this; node; node = node.parentNode) {
+      if (matchesSelector(node, selector)) return node;
+    }
+    return null;
+  }
+
+  focus() {
+    if (this.disabled) return;
+    this.ownerDocument.activeElement = this;
+    this.listeners.get("focus")?.({ target: this });
+  }
+}
+
+function dataKey(name) {
+  return name.slice(5).replace(/-([a-z])/gu, (_, letter) => letter.toUpperCase());
+}
+
+// Only the tag/class/data selectors used by the real admin allowance renderer
+// and these interaction checks; this is not a general browser replacement.
+function matchesSimpleSelector(node, selector) {
+  const attributes = [...selector.matchAll(/\[([\w-]+)(?:="([^"]*)")?\]/gu)];
+  const bare = selector.replace(/\[[^\]]*\]/gu, "");
+  const tag = bare.match(/^[\w-]+/u)?.[0];
+  if (tag && node.tag !== tag) return false;
+  for (const [, className] of bare.matchAll(/\.([\w-]+)/gu)) {
+    if (!node.classList.contains(className)) return false;
+  }
+  for (const [, name, value] of attributes) {
+    const actual = node.getAttribute(name);
+    if (actual === null || (value !== undefined && value !== actual)) return false;
+  }
+  return true;
+}
+
+function matchesSelector(node, selector) {
+  return selector.split(",").some((choice) => {
+    const parts = choice.trim().split(/\s+(?![^\[]*\])/u);
+    if (!matchesSimpleSelector(node, parts.pop())) return false;
+    let ancestor = node.parentNode;
+    while (parts.length > 0) {
+      const part = parts.pop();
+      while (ancestor && !matchesSimpleSelector(ancestor, part)) ancestor = ancestor.parentNode;
+      if (!ancestor) return false;
+      ancestor = ancestor.parentNode;
+    }
+    return true;
+  });
 }
 
 function fakeDocument() {
@@ -111,25 +185,37 @@ function fakeDocument() {
     "publication",
   ].map((name) => [name, new FakeNode("input")]));
 
-  return {
+  const documentRef = {
     byId,
+    activeElement: null,
     createElement(tag) {
-      return new FakeNode(tag);
+      const node = new FakeNode(tag);
+      node.ownerDocument = documentRef;
+      return node;
+    },
+    createElementNS(_namespace, tag) {
+      return this.createElement(tag);
     },
     createTextNode(value) {
-      const node = new FakeNode("#text");
+      const node = this.createElement("#text");
       node.textContent = value;
       return node;
     },
     querySelector(selector) {
       const control = selector.match(/^input\[name="([^"]+)"\]$/u);
       if (control) return controls.get(control[1]);
+      if (!selector.startsWith("#")) {
+        return [...byId.values()].flatMap(descendantNodes)
+          .find((node) => matchesSelector(node, selector)) ?? null;
+      }
       assert.match(selector, /^#[\w-]+$/u);
       const node = byId.get(selector.slice(1));
       assert.ok(node, `unexpected selector: ${selector}`);
       return node;
     },
   };
+  for (const node of [...byId.values(), ...controls.values()]) node.ownerDocument = documentRef;
+  return documentRef;
 }
 
 function response(body) {
@@ -199,7 +285,13 @@ async function withAdminPage(fetchResponse, check) {
   const documentRef = fakeDocument();
   const html = await readFile(new URL("../public/admin.html", import.meta.url), "utf8");
   for (const [, id] of html.matchAll(/\bid="([\w-]+)"/gu)) {
-    if (!documentRef.byId.has(id)) documentRef.byId.set(id, new FakeNode("div"));
+    if (!documentRef.byId.has(id)) documentRef.byId.set(id, documentRef.createElement("div"));
+  }
+  for (const [, attributes, kind, label] of html.matchAll(/<button\b([^>]*data-(allowance-mode|range-days)[^>]*)>([^<]*)<\/button>/gu)) {
+    const button = documentRef.createElement("button");
+    for (const [, name, value] of attributes.matchAll(/([\w-]+)="([^"]*)"/gu)) button.setAttribute(name, value);
+    button.textContent = label;
+    documentRef.byId.get(kind === "allowance-mode" ? "admin-community-mode-controls" : "admin-community-range-controls").append(button);
   }
   documentRef.body = { classList: { contains: (name) => name === "admin-operator-page" } };
   documentRef.addEventListener = () => {};
@@ -899,4 +991,192 @@ test("the owner dashboard keeps the merge trial private and separate from the pu
   assert.match(html, /id="admin-reconstruction-progress" aria-labelledby="admin-reconstruction-title"/u);
   assert.match(html, /id="admin-reconstruction-status" role="status"/u);
   assert.doesNotMatch(html, /same published community graph/u);
+});
+
+async function withAllowancePage(preview, check) {
+  const overview = await fixture("admin-overview-valid.json");
+  const requests = [];
+  await withAdminPage(async (path, options) => {
+    assert.equal(options?.method ?? "GET", "GET", "allowance UI interactions must remain read-only");
+    requests.push(path);
+    if (path === "/api/v1/admin/overview") return response(overview);
+    if (path === "/api/v1/admin/community/allowance-preview") return response(preview);
+    assert.equal(path, "/api/v1/admin/metrics/history", "never call a public or unapproved endpoint");
+    return unavailableResponse();
+  }, async (documentRef) => {
+    await waitFor(() => documentRef.byId.get("admin-community-status").textContent === "Admin preview available"
+      && documentRef.byId.get("growth-status").textContent === "History unavailable");
+    await check(documentRef);
+    assert.deepEqual(requests, [
+      "/api/v1/admin/overview",
+      "/api/v1/admin/community/allowance-preview",
+      "/api/v1/admin/metrics/history",
+    ]);
+  });
+}
+
+function selectAllowanceControl(documentRef, id, selector) {
+  const group = documentRef.byId.get(id);
+  const button = group.querySelector(selector);
+  assert.ok(button, `control exists: ${selector}`);
+  group.listeners.get("click")({ target: button });
+  return button;
+}
+
+function allowanceNodes(documentRef, selector) {
+  return documentRef.byId.get("admin-community-allowance-result").querySelectorAll(selector);
+}
+
+test("rendered plan cards keep normalized headlines and show correctly rounded actual-plan weeks", async () => {
+  await withAllowancePage(createAdminAllowancePreviewPayload(), async (documentRef) => {
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
+    const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+    assert.equal(cards.length, 3);
+    assert.deepEqual(cards.map((card) => card.querySelector("h3").textContent), ["Pro 20×", "Pro 5×", "Plus"]);
+    assert.deepEqual(cards.map((card) => card.querySelector(".allowance-summary-value").textContent), ["$2,119", "$1,918", "$1,900"]);
+    assert.deepEqual(cards.map((card) => card.querySelector(".allowance-plan-value").textContent), [
+      "This plan: $2,119/week at API prices",
+      "This plan: $479/week at API prices",
+      "This plan: $95/week at API prices",
+    ]);
+    assert.equal(allowanceNodes(documentRef, ".allowance-summary-caption")[0].textContent,
+      "API-equivalent USD / Pro 20× week");
+    assert.match(descendantNodes(cards[1]).map((node) => node.textContent).join(" "), /1 account · 2 fits/u);
+
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const legend = container.querySelector('button[data-allowance-plan="prolite"]');
+    container.listeners.get("click")({ target: legend.children[1] });
+    const focused = container.querySelector('button[data-allowance-plan="prolite"]');
+    assert.equal(focused.getAttribute("aria-pressed"), "true");
+    assert.equal(documentRef.activeElement, focused);
+    assert.equal(allowanceNodes(documentRef, ".allowance-plan-value").length, 3);
+  });
+});
+
+test("a plan without qualifying evidence retains its unavailable card and has no fabricated actual value", async () => {
+  const preview = createAdminAllowancePreviewPayload();
+  for (const day of preview.days) {
+    day.byPlanType.plus = { fitCount: 0, participantCount: 0, centralUsd: null, band80Usd: null };
+  }
+  await withAllowancePage(preview, async (documentRef) => {
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
+    const plus = allowanceNodes(documentRef, ".admin-allowance-plan-summary").at(-1);
+    assert.equal(plus.querySelector("h3").textContent, "Plus");
+    assert.equal(plus.querySelector(".allowance-summary-value").textContent, "—");
+    assert.equal(plus.querySelector(".allowance-plan-value"), null);
+    const text = descendantNodes(plus).map((node) => node.textContent).join(" ");
+    assert.match(text, /No qualifying fits/u);
+    assert.doesNotMatch(text, /This plan:|\$0/u);
+  });
+});
+
+test("rendered model cards, icons and native legend buttons share order and preserve focus and dropdown state", async () => {
+  await withAllowancePage(createAdminAllowancePreviewPayload(), async (documentRef) => {
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="models"]');
+    selectAllowanceControl(documentRef, "admin-community-range-controls", 'button[data-range-days="all"]');
+    const ids = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"];
+    const themes = ["astra", "sol", "terra", "luna", "classic"];
+    const cards = allowanceNodes(documentRef, ".admin-allowance-plan-summary");
+    assert.deepEqual(cards.map((card) => card.querySelector("h3").textContent), [
+      "GPT-6 Astra", "GPT-5.6 Sol", "GPT-5.6 Terra", "GPT-5.6 Luna", "GPT-5.5",
+    ]);
+    cards.forEach((card, index) => {
+      assert.equal(card.classList.contains(`allowance-model-${themes[index]}`), true);
+      assert.equal(card.querySelector(".allowance-model-icon").getAttribute("aria-hidden"), "true");
+      assert.equal(card.querySelector(".admin-allowance-value"), null, "cards do not inherit the large combined headline");
+    });
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const buttons = container.querySelectorAll("button[data-allowance-model-focus]");
+    assert.deepEqual(buttons.map((button) => button.dataset.allowanceModelFocus), ids);
+    assert.ok(buttons.every((button) => button.type === "button" && button.getAttribute("aria-pressed") === "false" && !button.disabled));
+    buttons.forEach((button, index) => {
+      assert.equal(button.children[0].classList.contains(`allowance-model-${themes[index]}`), true);
+    });
+    const axes = container.querySelectorAll(".chart-axis-label").map((node) => [node.textContent, node.getAttribute("x"), node.getAttribute("y")]);
+    container.listeners.get("click")({ target: buttons[0].children[1] });
+    let focused = container.querySelector('button[data-allowance-model-focus="gpt-6-astra"]');
+    assert.equal(focused.getAttribute("aria-pressed"), "true");
+    assert.equal(documentRef.activeElement, focused);
+    assert.equal(container.querySelector(".admin-allowance-model-filter select").value, "observed");
+    assert.deepEqual(container.querySelectorAll(".chart-axis-label").map((node) => [node.textContent, node.getAttribute("x"), node.getAttribute("y")]), axes);
+    assert.equal(container.querySelectorAll(".admin-allowance-dot").length, 10);
+    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, 5);
+    container.listeners.get("click")({ target: focused });
+    focused = container.querySelector('button[data-allowance-model-focus="gpt-6-astra"]');
+    assert.equal(focused.getAttribute("aria-pressed"), "false");
+    assert.equal(documentRef.activeElement, focused);
+    assert.equal(container.querySelectorAll(".admin-allowance-dot").length, 290);
+
+    const dropdown = container.querySelector(".admin-allowance-model-filter select");
+    dropdown.value = "all";
+    dropdown.listeners.get("change")();
+    assert.equal(container.querySelector(".admin-allowance-model-filter select").value, "all");
+    assert.equal(documentRef.activeElement, container.querySelector(".admin-allowance-model-filter select"));
+    const unavailable = container.querySelector('button[data-allowance-model-focus="gpt-5.4-mini"]');
+    assert.equal(unavailable.disabled, true);
+    assert.equal(unavailable.getAttribute("aria-pressed"), "false");
+    assert.equal(unavailable.title, "No qualifying fits in this range");
+    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, 39);
+    const specific = container.querySelector(".admin-allowance-model-filter select");
+    specific.value = "gpt-5.4-mini";
+    specific.listeners.get("change")();
+    assert.equal(container.querySelectorAll(".admin-allowance-dot").length, 0);
+    assert.equal(container.querySelectorAll(".admin-allowance-plan-summary").length, 1);
+    assert.match(descendantNodes(container).map((node) => node.textContent).join(" "), /No qualifying fits in this range/u);
+  });
+});
+
+test("the chart has one tab stop and keyboard inspection reaches every point hidden by dense marker thinning", async () => {
+  const preview = createAdminAllowancePreviewPayload();
+  await withAllowancePage(preview, async (documentRef) => {
+    selectAllowanceControl(documentRef, "admin-community-range-controls", 'button[data-range-days="all"]');
+    const svg = allowanceNodes(documentRef, 'svg[role="img"]')[0];
+    const dots = svg.querySelectorAll(".admin-allowance-dot");
+    const inspection = allowanceNodes(documentRef, ".admin-allowance-inspection")[0];
+    assert.equal(svg.getAttribute("tabindex"), "0");
+    assert.equal(dots.length, 70);
+    assert.ok(dots.every((dot) => dot.getAttribute("tabindex") === "-1"));
+    assert.equal(dots.filter((dot) => dot.getAttribute("data-permanent-marker") === "true").length, 2);
+    assert.equal(inspection.getAttribute("aria-live"), "polite");
+    let prevented = 0;
+    const key = (value) => svg.listeners.get("keydown")({
+      key: value, target: documentRef.activeElement ?? svg, preventDefault: () => { prevented += 1; },
+    });
+    key("Home");
+    for (const [index, dot] of dots.entries()) {
+      if (index > 0) key("ArrowRight");
+      assert.equal(documentRef.activeElement, dot, `day ${index + 1} remains inspectable`);
+      assert.equal(inspection.textContent, dot.getAttribute("aria-label"));
+      assert.ok(inspection.textContent.includes(preview.days[index].day));
+    }
+    assert.equal(prevented, 70);
+    key("ArrowDown");
+    assert.equal(documentRef.activeElement, dots.at(-1), "inspection clamps at the last fitted point");
+    key("Home");
+    key("ArrowUp");
+    assert.equal(documentRef.activeElement, dots[0], "inspection clamps at the first fitted point");
+    key("End");
+    key("ArrowLeft");
+    assert.equal(documentRef.activeElement, dots.at(-2));
+    assert.equal(dots.at(-2).getAttribute("data-permanent-marker"), "false");
+    const priorPrevented = prevented;
+    key("PageDown");
+    assert.equal(prevented, priorPrevented, "unrelated keyboard controls keep their default behavior");
+    dots[1].listeners.get("pointerenter")();
+    assert.equal(inspection.textContent, dots[1].getAttribute("aria-label"));
+    dots[2].listeners.get("click")();
+    assert.equal(inspection.textContent, dots[2].getAttribute("aria-label"));
+  });
+});
+
+test("rendered admin charts size their coordinate system to the container instead of shrinking desktop labels", async () => {
+  await withAllowancePage(createAdminAllowancePreviewPayload(), async (documentRef) => {
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    for (const [availableWidth, expectedWidth, mode] of [[350, 320, "plans"], [250, 280, "models"], [1_400, 960, "combined"]]) {
+      container.rect.width = availableWidth;
+      selectAllowanceControl(documentRef, "admin-community-mode-controls", `button[data-allowance-mode="${mode}"]`);
+      assert.equal(container.querySelector('svg[role="img"]').getAttribute("viewBox"), `0 0 ${expectedWidth} 300`);
+      assert.ok(container.querySelectorAll(".chart-axis-label").length > 0);
+    }
+  });
 });

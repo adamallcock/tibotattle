@@ -288,6 +288,16 @@ export const COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE = "pro";
 export const COMMUNITY_ALLOWANCE_NORMALIZATION =
   "pro_x1_prolite_x4_plus_x20";
 
+// Inverse of the validated reference-plan display basis, not a pricing model
+// or a new allowance fit. Convert the unrounded estimate before formatting.
+const PLAN_REFERENCE_MULTIPLIERS = Object.freeze({ pro: 1, prolite: 4, plus: 20 });
+export function planWeeklyApiEquivalentUsd(referenceUsd, planType) {
+  if (typeof referenceUsd !== "number" || !Number.isFinite(referenceUsd) || referenceUsd < 0
+      || typeof planType !== "string"
+      || !Object.prototype.hasOwnProperty.call(PLAN_REFERENCE_MULTIPLIERS, planType)) return null;
+  return referenceUsd / PLAN_REFERENCE_MULTIPLIERS[planType];
+}
+
 export const PUBLIC_ALLOWANCE_MODEL_CONFIG = Object.freeze(REVIEWED_MODEL_CATALOG
   .filter(model => model.provider === "openai_codex" && model.allowanceTrack === "primary")
   .map(model => Object.freeze({ modelId: model.id, label: model.label })));
