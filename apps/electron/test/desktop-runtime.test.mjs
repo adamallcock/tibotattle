@@ -402,6 +402,7 @@ test("macOS production runtime connects updater controls to protected preference
   let installs = 0;
   let rejectInstall = true;
   let handoverCompleted = false;
+  const firstRunDisclosures = [];
   let fixture;
   autoUpdater.checkForUpdates = async () => {
     checks += 1;
@@ -428,18 +429,21 @@ test("macOS production runtime connects updater controls to protected preference
   },
     environment: { HOME: profile },
     runtimeOverrides: { autoUpdater, dialog: {
-      showMessageBox: async () => ({ response: 0 }),
+      showMessageBox: async (options) => { firstRunDisclosures.push(options); return { response: 0 }; },
       showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
     } },
     productionDistribution: createProductionDistributionMetadata({
       target: `darwin-${process.arch}`, sourceRevision: "a".repeat(40), buildNumber: "20260906",
     }),
+    firstRunReceiptBackend: { load: async () => null, save: async () => {} },
     prepareNativeHandover: async () => {
       assert.equal(app.ready, true);
       handoverCompleted = true;
       return { status: "already_migrated" };
     },
   });
+  assert.equal(firstRunDisclosures[0].title, "Welcome to TiboTattle");
+  assert.doesNotMatch(firstRunDisclosures[0].detail, /Uploads are not available|development build/u);
   assert.equal(autoUpdater.autoInstallOnAppQuit, false);
   assert.equal(autoUpdater.autoDownload, true);
   await fixture.desktop.controller.handlers.setAutomaticDownload({ enabled: false });

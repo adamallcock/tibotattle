@@ -11,6 +11,21 @@ const DEFAULT_LOCALE = "en-US";
 const SUPPORTED_LOCALES = Object.freeze([DEFAULT_LOCALE, "zh-Hans", "es"]);
 
 const DESKTOP_MESSAGES = Object.freeze({
+  "electron.firstRun.production.title": Object.freeze({
+    "en-US": "Welcome to TiboTattle",
+    "zh-Hans": "欢迎使用 TiboTattle",
+    es: "Te damos la bienvenida a TiboTattle",
+  }),
+  "electron.firstRun.production.message": Object.freeze({
+    "en-US": "See your Codex usage and allowance in one place.",
+    "zh-Hans": "在一个地方查看你的 Codex 用量和额度。",
+    es: "Consulta tu uso y tu cuota de Codex en un solo lugar.",
+  }),
+  "electron.firstRun.production.detail": Object.freeze({
+    "en-US": "TiboTattle reads local usage metadata: timestamps, models, token counts, tool categories and quota snapshots. Analysis and your saved history stay on this computer and work offline.\n\nCommunity sharing sends content-free usage and quota records without sign-in. Fresh installations share automatically. Existing installations without a saved choice receive three notices before sharing begins. Turn sharing off at any time in Settings or Community; an earlier explicit opt-out stays off.\n\nPrompts, responses, file paths, repositories, commands, credentials, emails and account names are never contributed.\n\nUpdate checks are available in About. Manage automatic downloads, optional local notifications and startup in Settings.\n\nKeep TiboTattle open while analysis runs. Quitting stops the current pass and preserves completed checkpoints. The startup checkbox below adds a login item only after you click Continue.",
+    "zh-Hans": "TiboTattle 读取本地用量元数据：时间戳、模型、令牌计数、工具类别和配额快照。分析和已保存的历史记录保留在此电脑上，离线也可使用。\n\n社区共享无需登录，会发送不含会话内容的用量和配额记录。新安装会自动共享。没有保存选择的现有安装会在开始共享前收到三次提示。你可以随时在“设置”或“社区”中关闭共享；以前明确关闭的选择会保留。\n\n提示、回复、文件路径、代码仓库、命令、凭据、电子邮件和账户名称绝不会被贡献。\n\n你可以在“关于”中检查更新，在“设置”中管理自动下载、可选的本地提醒和启动选项。\n\n分析期间请保持 TiboTattle 打开。退出会停止当前分析，并保留已完成的检查点。只有在你点击“继续”后，下方的启动复选框才会添加登录项。",
+    es: "TiboTattle lee metadatos de uso locales: marcas de tiempo, modelos, contadores de tokens, categorías de herramientas y capturas de cuotas. El análisis y tu historial guardado permanecen en este equipo y funcionan sin conexión.\n\nLa compartición comunitaria envía registros de uso y cuotas sin contenido y sin iniciar sesión. Las instalaciones nuevas comparten automáticamente. Las instalaciones existentes sin una elección guardada reciben tres avisos antes de empezar a compartir. Puedes desactivar la compartición en cualquier momento en Configuración o Comunidad; una desactivación explícita anterior se conserva.\n\nNunca se contribuyen instrucciones, respuestas, rutas de archivos, repositorios, comandos, credenciales, correos electrónicos ni nombres de cuenta.\n\nPuedes buscar actualizaciones en Acerca de. Gestiona las descargas automáticas, las notificaciones locales opcionales y el inicio en Configuración.\n\nMantén TiboTattle abierto durante el análisis. Salir detiene el análisis actual y conserva los puntos de control completados. La casilla de inicio que aparece abajo añade un elemento de inicio de sesión solo después de pulsar Continuar.",
+  }),
   "electron.firstRun.title": Object.freeze({
     "en-US": "TiboTattle local data",
     "zh-Hans": "TiboTattle 本地数据",

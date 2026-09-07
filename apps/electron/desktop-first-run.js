@@ -169,12 +169,13 @@ function firstRunTextOptions({ locale = "system", systemLocales = [] } = {}) {
   return { locale, systemLocales };
 }
 
-export function desktopFirstRunDialogCopy(options = {}) {
+export function desktopFirstRunDialogCopy({ production = false, ...options } = {}) {
   const textOptions = firstRunTextOptions(options);
+  const disclosure = production === true ? "electron.firstRun.production" : "electron.firstRun";
   return Object.freeze({
-    title: desktopText("electron.firstRun.title", {}, textOptions),
-    message: desktopText("electron.firstRun.message", {}, textOptions),
-    detail: desktopText("electron.firstRun.detail", {}, textOptions),
+    title: desktopText(`${disclosure}.title`, {}, textOptions),
+    message: desktopText(`${disclosure}.message`, {}, textOptions),
+    detail: desktopText(`${disclosure}.detail`, {}, textOptions),
     checkboxLabel: desktopText(
       "electron.firstRun.checkbox.startAtLogin",
       {},
@@ -219,10 +220,11 @@ export async function ensureDesktopFirstRunAcknowledged({
   quit = () => {},
   locale = "system",
   systemLocales = [],
+  production = false,
 } = {}) {
   const nativeDialog = assertDialog(dialog);
   const backend = assertReceiptBackend(receiptBackend);
-  const copy = desktopFirstRunDialogCopy({ locale, systemLocales });
+  const copy = desktopFirstRunDialogCopy({ locale, systemLocales, production });
 
   let receipt;
   try {

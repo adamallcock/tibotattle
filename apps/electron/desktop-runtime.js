@@ -683,6 +683,7 @@ export async function launchDesktopRuntime({
     quit: () => app.quit?.(),
     locale: firstRunLocale,
     systemLocales: desktopSystemLocales,
+    production: productionDistribution !== undefined,
   });
   if (firstRun.status !== "acknowledged") {
     deepLinkIntakeCleanup();
