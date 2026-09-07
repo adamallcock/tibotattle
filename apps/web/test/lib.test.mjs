@@ -426,6 +426,8 @@ async function renderWeeklyHero(data, { span, rangeDays, locale = "en-US", planT
     range: element("#weekly-range").textContent,
     explanation: element("#weekly-explanation").textContent,
     timeZone: element("#weekly-chart-timezone").textContent,
+    spanLabel: element("#weekly-span-label").textContent,
+    spanNote: element("#weekly-span-note"),
     empty: element("#weekly-empty"),
     shared,
     paceData,
@@ -6047,6 +6049,12 @@ test("the weekly headline is a stable all-data median and says so on screen", as
   // sentence names the relaxed floor.
   assert.match(views[0].explanation, /drawing 2 of 52/u);
   assert.match(views[0].explanation, /any length/u);
+  assert.equal(views[0].spanLabel, "Well-observed quota span");
+  assert.equal(views[0].spanNote.hidden, false);
+  assert.match(views[0].spanNote.textContent, /includes all spans/u);
+  assert.equal(views[1].spanLabel, "Minimum observed quota span");
+  assert.equal(views[1].spanNote.hidden, true);
+
   assert.match(views[2].explanation, /drawing 34 of 52/u);
   assert.match(views[3].explanation, /drawing 52 of 52/u);
   // An empty chart names its reason with numbers instead of the generic

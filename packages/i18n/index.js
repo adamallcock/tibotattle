@@ -20,6 +20,9 @@ export const LANGUAGE_OPTIONS = Object.freeze([
 ]);
 
 export const EN_US_CATALOG = Object.freeze({
+  "weekly.controls.minimumSpan": "Minimum observed quota span",
+  "weekly.controls.observedSpan": "Well-observed quota span",
+  "weekly.controls.shortRangeNote": "The 7-day view includes all spans. This control marks longer observations.",
   "app.name": "TiboTattle",
   "common.loading": "Loading…",
   "common.refresh": "Refresh",
@@ -288,6 +291,9 @@ export const EN_US_CATALOG = Object.freeze({
 });
 
 export const ZH_HANS_CATALOG = Object.freeze({
+  "weekly.controls.minimumSpan": "最低观测额度跨度",
+  "weekly.controls.observedSpan": "充分观测的额度跨度",
+  "weekly.controls.shortRangeNote": "7 天视图包含所有跨度。此控件用于标记较长的观测。",
   "app.name": "TiboTattle",
   "common.loading": "正在加载…",
   "common.refresh": "刷新",
@@ -556,6 +562,9 @@ export const ZH_HANS_CATALOG = Object.freeze({
 });
 
 export const ES_CATALOG = Object.freeze({
+  "weekly.controls.minimumSpan": "Intervalo mínimo de cuota observado",
+  "weekly.controls.observedSpan": "Intervalo de cuota bien observado",
+  "weekly.controls.shortRangeNote": "La vista de 7 días incluye todos los intervalos. Este control marca las observaciones más largas.",
   "app.name": "TiboTattle",
   "common.loading": "Cargando…",
   "common.refresh": "Actualizar",

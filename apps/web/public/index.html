@@ -470,12 +470,13 @@
                 <button type="button" data-days="36500">All</button>
               </div>
               <label class="weekly-span-control" for="weekly-span-control">
-                <span>Minimum observed quota span</span>
+                <span id="weekly-span-label">Minimum observed quota span</span>
                 <input id="weekly-span-control" type="range" min="0" max="99" step="1" value="50">
                 <output id="weekly-span-value" for="weekly-span-control">50+ pp</output>
               </label>
             </div>
           </div>
+          <p id="weekly-span-note" class="small muted" hidden></p>
           <div class="legend weekly-legend" aria-label="Weekly estimate chart legend" data-i18n-aria-label="aria.weeklyEstimateLegend">
             <span><i class="legend-dot weekly-center"></i>All-data median</span>
             <span><i class="legend-dot weekly-mature"></i><span id="weekly-span-legend">Observed across 50+ points</span></span>

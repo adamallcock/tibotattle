@@ -7994,6 +7994,14 @@ function renderWeekly(data) {
   setLocalizedText($("#weekly-chart-timezone"), "chart.timeZoneNote", {
     timeZone: formatTimeZoneLabel(),
   });
+  // Short ranges include every fit; here the slider only classifies markers.
+  // Name that role explicitly instead of presenting an inactive minimum filter.
+  const shortRange = history.rangeDays !== null && history.rangeDays <= 7;
+  setLocalizedText($("#weekly-span-label"), shortRange
+    ? "weekly.controls.observedSpan" : "weekly.controls.minimumSpan");
+  const spanNote = $("#weekly-span-note");
+  spanNote.hidden = !shortRange;
+  setLocalizedText(spanNote, "weekly.controls.shortRangeNote");
   $("#weekly-span-value").textContent = weeklySpanLabel();
   $("#weekly-span-legend").textContent = chartText(weeklyObservedSeriesLabel());
   $("#weekly-partial-legend").hidden = !chartValues.some((row) => !row.wellObserved);
