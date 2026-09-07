@@ -303,6 +303,8 @@ export const CLIENT_WEB_FILES = Object.freeze([
   "apps/web/public/electron-settings.css",
   "apps/web/public/electron-settings.html",
   "apps/web/public/electron-settings.js",
+  "apps/web/public/electron-tray-settings.js",
+  "apps/web/public/electron-tray-preferences.js",
   "apps/web/public/icon-panel-left.svg",
   "apps/web/public/icon-refresh-cw.svg",
   "apps/web/public/icon-settings.svg",

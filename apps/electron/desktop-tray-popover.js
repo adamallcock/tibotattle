@@ -1,3 +1,4 @@
+import { DESKTOP_TRAY_UPGRADE_DEFAULTS, validateDesktopTrayPreferences } from "./desktop-tray-preferences.js";
 /**
  * The visual status surface opened by the Electron tray item.
  *
@@ -35,6 +36,10 @@ export const TRAY_POPOVER_ACTIONS = Object.freeze([
   "accounting",
   "refresh",
   "settings",
+  "customize",
+  "usage",
+  "history-7d",
+  "history-30d",
   "more",
   "quit",
 ]);
@@ -108,7 +113,9 @@ function freezeModel(value) {
     "windows",
     "refreshEnabled",
     "hint",
+    "trayPreferences",
   ];
+  value = { ...value, trayPreferences: value.trayPreferences ?? DESKTOP_TRAY_UPGRADE_DEFAULTS };
   const actual = Reflect.ownKeys(value);
   if (actual.length !== expected.length || expected.some((key) => !Object.hasOwn(value, key))) {
     throw new TypeError("tray popover model has unexpected fields");
@@ -164,6 +171,7 @@ function freezeModel(value) {
     windows: Object.freeze(windows),
     refreshEnabled: value.refreshEnabled,
     hint: value.hint,
+    trayPreferences: validateDesktopTrayPreferences(value.trayPreferences),
   });
 }
 
@@ -175,6 +183,7 @@ function freezeModel(value) {
 export function createDesktopTrayPopoverModel({
   appName = "TiboTattle",
   trayStatus,
+  trayPreferences = DESKTOP_TRAY_UPGRADE_DEFAULTS,
   locale = "system",
   systemLocales = [],
   now = Date.now(),
@@ -188,6 +197,7 @@ export function createDesktopTrayPopoverModel({
     {
       localize: (key, values) => desktopText(key, values, { locale, systemLocales }),
       now,
+      preferences: trayPreferences,
     },
   );
   const windows = projected.windows.slice(0, MAX_WINDOWS).map((item) => Object.freeze({
@@ -201,7 +211,8 @@ export function createDesktopTrayPopoverModel({
     status: projected.status,
     statusLabel: projected.label,
     evidenceLabel: projected.evidenceLabel,
-    compactTitle: projected.compactTitle,
+    compactTitle: projected.compactTitle || "TiboTattle",
+    trayPreferences,
     windows,
     refreshEnabled: !["starting", "analyzing"].includes(projected.status),
     hint: desktopText("electron.trayPopover.dashboardHint", {}, { locale, systemLocales }),
@@ -262,7 +273,13 @@ export function installDesktopTrayPopoverPolicy({
         if (Number.isSafeInteger(values[0]) && values[0] >= 1
             && values[0] <= MAX_REPORTED_CONTENT_HEIGHT) onContentHeight?.(values[0]);
       } else if (channel === TRAY_POPOVER_ACTION_CHANNEL && validAction(values[0])) {
-        onAction(values[0]);
+        if (values[0].startsWith("history-")) {
+          Promise.resolve().then(() => onAction(values[0])).then(() => {
+            if (!removed && isCommittedMainFrame(event)) webContents.send?.(`${TRAY_POPOVER_ACTION_CHANNEL}:saved`, true);
+          }, () => {
+            if (!removed && isCommittedMainFrame(event)) webContents.send?.(`${TRAY_POPOVER_ACTION_CHANNEL}:saved`, false);
+          });
+        } else onAction(values[0]);
       }
     } catch {
       // The lifecycle owns each bounded action. Renderer failure must not
@@ -509,8 +526,9 @@ export function createDesktopTrayPopover({
           if (window === candidate && candidate.isVisible?.()) position();
         },
         onAction: (action) => {
+          if (action.startsWith("history-")) return onAction(action);
           try {
-            onAction(action);
+            return onAction(action);
           } finally {
             hide();
           }

@@ -13,6 +13,8 @@ import {
   translate,
 } from "./localization.js";
 
+import { createTraySettingsController } from "./electron-tray-settings.js";
+
 export const DESKTOP_SETTINGS_API_VERSION = "v1";
 
 export const SETTINGS_LANGUAGE_VALUES = Object.freeze([
@@ -430,6 +432,9 @@ export function normalizeSettingsState(raw, settingsRoots = null) {
   return Object.freeze({
     language,
     appearance,
+    tray: settings.tray,
+    traySettingsStatus: settings.traySettingsStatus,
+    trayCapabilities: settings.trayCapabilities,
     codexHomes,
     codexHomesForSettings,
     codexFolder: Object.freeze({
@@ -1022,7 +1027,7 @@ function initialTab(windowRef) {
   const candidate = typeof windowRef?.location?.hash === "string"
     ? windowRef.location.hash.slice(1)
     : "";
-  return ["general", "data", "notifications", "about"].includes(candidate)
+  return ["general", "tray", "data", "notifications", "about"].includes(candidate)
     ? candidate
     : "general";
 }
@@ -1068,6 +1073,7 @@ export async function mountSettingsPage({
       && typeof documentRef.createElement === "function"
       ? createBrowserLocalization({ windowRef, documentRef })
       : null);
+  const trayController = createTraySettingsController({ documentRef, bridge: settingsBridge, localizer: pageLocalizer });
   let currentState = normalizeSettingsState(null);
   applyElectronAppearancePreference(currentState.appearance, { documentRef, windowRef });
   let busy = false;
@@ -1144,10 +1150,12 @@ export async function mountSettingsPage({
         currentSharingPreference,
         settingsSharingBridge !== null,
       );
+      trayController.update(currentState, true);
       setBridgeStatus(documentRef, "electron.settings.bridge.connected", true, pageLocalizer);
       return currentState;
     } catch {
       currentSharingPreference = null;
+      trayController.update(currentState, false);
       setBridgeStatus(
         documentRef,
         "electron.settings.bridge.readFailed",
@@ -1219,6 +1227,7 @@ export async function mountSettingsPage({
       } else {
         setOperationStatus(documentRef, "");
       }
+      trayController.update(currentState, true);
       setBridgeStatus(documentRef, "electron.settings.bridge.connected", true, pageLocalizer);
     } catch {
       operationError(documentRef, pageLocalizer);
@@ -1243,6 +1252,7 @@ export async function mountSettingsPage({
   if (settingsBridge && typeof settingsBridge.onCommand === "function") {
     try {
       const unsubscribe = settingsBridge.onCommand((command) => {
+        if (command?.command === "tray") { void refresh(); return; }
         if (command?.command === "appearance"
             && SETTINGS_APPEARANCE_VALUES.includes(command.preference)
             && ["light", "dark"].includes(command.resolvedTheme)) {
@@ -1389,6 +1399,7 @@ export async function mountSettingsPage({
   return Object.freeze({
     refresh,
     teardown() {
+      trayController.teardown();
       unsubscribeDesktopCommands();
       for (const remove of listeners.splice(0)) remove();
     },

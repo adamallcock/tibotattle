@@ -11,6 +11,12 @@ const DEFAULT_LOCALE = "en-US";
 const SUPPORTED_LOCALES = Object.freeze([DEFAULT_LOCALE, "zh-Hans", "es"]);
 
 const DESKTOP_MESSAGES = Object.freeze({
+  "electron.tray.selectedUnavailable": Object.freeze({"en-US":"{window} unavailable","zh-Hans":"{window}不可用","es":"{window} no disponible"}),
+  "electron.tray.resetCountdown": Object.freeze({"en-US":"{window} resets in {reset}","zh-Hans":"{window}在 {reset} 后重置","es":"{window} reinicia en {reset}"}),
+  "electron.tray.resetClock": Object.freeze({"en-US":"{window} resets at {reset}","zh-Hans":"{window}于 {reset} 重置","es":"{window} reinicia a las {reset}"}),
+  "electron.tray.low": Object.freeze({"en-US":"{window}: 10% remaining or less","zh-Hans":"{window}：剩余量不超过 10%","es":"{window}: queda un 10% o menos"}),
+  "electron.tray.customize": Object.freeze({"en-US":"Customize tray…","zh-Hans":"自定义托盘…","es":"Personalizar bandeja…"}),
+  "electron.tray.dualMeterHint": Object.freeze({"en-US":"Top: 5-hour allowance. Bottom: 7-day allowance.","zh-Hans":"上方：5 小时额度。下方：7 天额度。","es":"Arriba: límite de 5 horas. Abajo: límite de 7 días."}),
   "electron.firstRun.production.title": Object.freeze({
     "en-US": "Welcome to TiboTattle",
     "zh-Hans": "欢迎使用 TiboTattle",

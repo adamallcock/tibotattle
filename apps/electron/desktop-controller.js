@@ -1,3 +1,4 @@
+import { DESKTOP_TRAY_DEFAULTS, DESKTOP_TRAY_UPGRADE_DEFAULTS } from "./desktop-tray-preferences.js";
 import { DESKTOP_ACTIONS, DESKTOP_APPEARANCES } from "./desktop-contract.js";
 import {
   createDesktopAutomaticRefreshCadence,
@@ -319,6 +320,7 @@ export function createDesktopController({
   sharingCoordinator,
   settingsStore,
   platformServices,
+  desktopPlatform = process.platform,
   notificationCoordinator,
   getLifecycle = () => null,
   applyCodexHome = async () => {},
@@ -728,6 +730,9 @@ export function createDesktopController({
         startAtLogin: login,
         sidebarCollapsed: settings.sidebarCollapsed,
         notifications: notificationSnapshot(settings),
+        tray: settings.tray ?? DESKTOP_TRAY_UPGRADE_DEFAULTS,
+        traySettingsStatus: store.traySettingsStatus ?? "current",
+        trayCapabilities: Object.freeze({ title: desktopPlatform === "darwin" }),
       }),
       about: platform.about(),
     });
@@ -1078,6 +1083,20 @@ export function createDesktopController({
     async openSettings() {
       lifecycle().showSettingsWindow?.("general");
       return snapshot();
+    },
+    async openTraySettings() {
+      lifecycle().showSettingsWindow?.("tray");
+      return snapshot();
+    },
+    async setTrayPreferences({ value }) {
+      return enqueue(async () => {
+        await store.update({ tray: value });
+        lifecycle().setDesktopTrayPreferences?.((await store.getSettings()).tray);
+        return snapshot();
+      });
+    },
+    async restoreTrayDefaults() {
+      return handlers.setTrayPreferences({ value: DESKTOP_TRAY_DEFAULTS });
     },
     async openCommunity() {
       const selected = lifecycle();

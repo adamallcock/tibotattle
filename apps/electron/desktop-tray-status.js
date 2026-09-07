@@ -1,3 +1,4 @@
+import { validateDesktopTrayPreferences } from "./desktop-tray-preferences.js";
 /**
  * Pure, content-free status projection for the Electron tray.
  *
@@ -14,7 +15,7 @@
  * inspect a renderer, preserve raw errors, or infer a value from stale data.
  */
 
-import { projectDesktopShellNotificationEvidence } from "../../src/desktop-shell-status.js";
+import { projectDesktopShellDisplayEvidence, projectDesktopShellNotificationEvidence } from "../../src/desktop-shell-status.js";
 
 export const DESKTOP_TRAY_STATUS_STATES = Object.freeze([
   "starting",
@@ -148,14 +149,17 @@ function cloneNotificationEvidence(value, { allowNull = true } = {}) {
   return projected;
 }
 
-function statusSnapshot(status, allowance = null, notificationEvidence = null) {
+function statusSnapshot(status, allowance = null, notificationEvidence = null, displayEvidence = null) {
   assertStatus(status);
   if (!["fresh", "analyzing"].includes(status)
       && (allowance !== null || notificationEvidence !== null)) {
     throw new TypeError("only fresh or analyzing status may carry evidence");
   }
+  const display = displayEvidence === null ? null : projectDesktopShellDisplayEvidence(displayEvidence, { now: null });
+  if (displayEvidence !== null && (display === null || !["fresh", "analyzing"].includes(status))) throw new TypeError("tray display evidence is invalid");
   return Object.freeze({
     status,
+    ...(display === null ? {} : { displayEvidence: display }),
     allowance: cloneAllowance(allowance),
     notificationEvidence: cloneNotificationEvidence(notificationEvidence),
   });
@@ -168,10 +172,10 @@ function statusSnapshot(status, allowance = null, notificationEvidence = null) {
  */
 export function validateDesktopTrayStatus(value) {
   assertPlainRecord(value, "tray status");
-  if (!hasExactKeys(value, ["status", "allowance", "notificationEvidence"])) {
+  if (!hasExactKeys(value, ["status", "allowance", "notificationEvidence", ...(Object.hasOwn(value, "displayEvidence") ? ["displayEvidence"] : [])])) {
     throw new TypeError("tray status has unexpected fields");
   }
-  return statusSnapshot(value.status, value.allowance, value.notificationEvidence);
+  return statusSnapshot(value.status, value.allowance, value.notificationEvidence, value.displayEvidence);
 }
 
 /**
@@ -215,6 +219,7 @@ export function reduceDesktopTrayStatus(current, event) {
         "type",
         "allowance",
         "notificationEvidence",
+        ...(Object.hasOwn(event, "displayEvidence") ? ["displayEvidence"] : []),
       ]);
       if (!isPayloadFreeTransition && !isExplicitSnapshot) {
         throw new TypeError("tray event has unexpected fields");
@@ -224,6 +229,7 @@ export function reduceDesktopTrayStatus(current, event) {
           "analyzing",
           event.allowance,
           event.notificationEvidence,
+          event.displayEvidence,
         );
       }
       // The status endpoint intentionally reports only the lifecycle phase.
@@ -232,18 +238,19 @@ export function reduceDesktopTrayStatus(current, event) {
       // newer pass is being calculated. The projector still expires it using
       // the current clock.
       const retainingEvidence = ["fresh", "analyzing"].includes(previous.status)
-        && previous.notificationEvidence !== null;
+        && (previous.notificationEvidence !== null || previous.displayEvidence != null);
       return statusSnapshot(
         "analyzing",
         retainingEvidence ? previous.allowance : null,
         retainingEvidence ? previous.notificationEvidence : null,
+        retainingEvidence ? previous.displayEvidence : null,
       );
     }
     case "fresh":
-      if (!hasExactKeys(event, ["type", "allowance", "notificationEvidence"])) {
+      if (!hasExactKeys(event, ["type", "allowance", "notificationEvidence", ...(Object.hasOwn(event, "displayEvidence") ? ["displayEvidence"] : [])])) {
         throw new TypeError("fresh tray event has unexpected fields");
       }
-      return statusSnapshot("fresh", event.allowance, event.notificationEvidence);
+      return statusSnapshot("fresh", event.allowance, event.notificationEvidence, event.displayEvidence);
     default:
       // Keep `previous` referenced so a debugger can inspect the validated
       // boundary without changing the fail-closed behavior.
@@ -273,6 +280,11 @@ function defaultLocalize(key, values = {}) {
   if (key === "electron.tray.windowSevenDay") {
     return `Seven-day allowance: ${values.elapsedPercent}% elapsed · ${values.usedPercent}% used · resets in ${values.reset}`;
   }
+  if (key === "electron.tray.selectedUnavailable") return `${values.window} remaining: unavailable`;
+  if (key === "electron.tray.resetCountdown") return `${values.window} resets in ${values.reset}`;
+  if (key === "electron.tray.resetClock") return `${values.window} resets at ${values.reset}`;
+  if (key === "electron.tray.low") return `${values.window}: low allowance`;
+  if (key === "electron.tray.dualMeterHint") return "Top meter: 5-hour remaining; bottom meter: 7-day remaining";
   throw new TypeError("tray localization key is invalid");
 }
 
@@ -294,10 +306,14 @@ function localizeText(localize, key, values, label) {
  */
 export function projectDesktopTrayStatus(value, options = {}) {
   assertPlainRecord(options, "projector options");
-  if (Reflect.ownKeys(options).some((key) => !["localize", "now"].includes(key))) {
+  if (Reflect.ownKeys(options).some((key) => !["localize", "now", "preferences", "lowState", "locale"].includes(key))) {
     throw new TypeError("projector options have unexpected fields");
   }
-  const { localize = defaultLocalize, now = Date.now() } = options;
+  const { localize = defaultLocalize, now = Date.now(), preferences, lowState = {}, locale } = options;
+  if (locale !== undefined && locale !== "system") {
+    try { new Intl.DateTimeFormat(locale); } catch { throw new TypeError("tray locale is invalid"); }
+  }
+  const configured = preferences === undefined ? null : validateDesktopTrayPreferences(preferences);
   const status = validateDesktopTrayStatus(value);
   if (typeof localize !== "function") {
     throw new TypeError("localize must be a function");
@@ -310,16 +326,17 @@ export function projectDesktopTrayStatus(value, options = {}) {
   // rechecks on every poll.
   const evidence = status.notificationEvidence === null
     ? null
-    : status.status === "analyzing"
+    : (configured !== null || status.status === "analyzing")
       ? projectDesktopShellNotificationEvidence(
         status.notificationEvidence,
         { now },
       )
       : status.notificationEvidence;
-  const evidenceExpired = status.status === "analyzing"
+  const display = status.displayEvidence == null ? null : projectDesktopShellDisplayEvidence(status.displayEvidence, { now });
+  const evidenceExpired = (configured !== null || status.status === "analyzing")
     && status.notificationEvidence !== null
-    && evidence === null;
-  const displayStatus = status.status === "fresh" && evidenceExpired
+    && (evidence === null || (configured !== null && evidence.windows.every((window) => Date.parse(window.resetAt) <= now)));
+  const displayStatus = status.status === "fresh" && ((evidenceExpired && display === null) || (status.displayEvidence != null && display === null && evidence === null))
     ? "stale"
     : status.status;
 
@@ -348,7 +365,9 @@ export function projectDesktopTrayStatus(value, options = {}) {
       ),
     });
   }
-  const windows = evidence === null ? [] : evidence.windows.map((window) => {
+  const notificationWindows = evidence === null ? [] : evidence.windows.filter((window) => configured === null || (Date.parse(window.resetAt) > now && evidence.windows.filter((candidate) => candidate.durationMinutes === window.durationMinutes).length === 1));
+  const currentWindows = [...notificationWindows, ...(display?.windows ?? []).filter((item) => !notificationWindows.some((window) => window.durationMinutes === item.durationMinutes)).map((item) => ({ ...item, usedPercent: 100 - item.remainingPercent }))];
+  const windows = currentWindows.map((window) => {
     const remainingPercent = Math.round(100 - window.usedPercent);
     const resetMs = Math.max(0, Date.parse(window.resetAt) - now);
     const resetMinutes = Math.ceil(resetMs / 60_000);
@@ -372,21 +391,82 @@ export function projectDesktopTrayStatus(value, options = {}) {
     );
     return Object.freeze({ ...window, remainingPercent, label });
   });
-  const observedMinutes = evidence === null
-    ? null
-    : Math.max(0, Math.floor((now - Date.parse(evidence.observedAt)) / 60_000));
+  const observation = evidence?.observedAt ?? display?.windows.map((item) => item.observedAt).sort()[0] ?? null;
+  const observedMinutes = observation === null ? null : Math.max(0, Math.floor((now - Date.parse(observation)) / 60_000));
   // The compact status-item title may make only the already-validated direct
   // allowance claim.  Do not promote a secondary lane (or a renderer-shaped
   // value) into the title when the primary summary is unavailable.
-  const compactTitle = allowance === null
+  let compactTitle = allowance === null
     ? (displayStatus === "analyzing" ? "…" : "–")
     : `${allowance.remainingPercent}%`;
+  let configuredFields = {};
+  if (configured !== null) {
+    const lane = (kind) => {
+      const matching = windows.find((window) => window.durationMinutes === (kind === "five_hour" ? 300 : 10_080));
+      if (matching !== undefined) return { window: kind, remainingPercent: matching.remainingPercent, actualRemainingPercent: 100 - matching.usedPercent, resetAt: matching.resetAt };
+      // A closed overview summary is a display authority only for its own lane.
+      // Never use it to replace an expired/conflicting detailed observation.
+      return status.notificationEvidence === null && status.displayEvidence == null && allowance?.window === kind
+        ? { ...allowance, actualRemainingPercent: status.allowance.remainingPercent, resetAt: null } : null;
+    };
+    const selectedKinds = configured.preset === "both" ? ["five_hour", "seven_day"]
+      : configured.preset === "automatic" ? [allowance?.window ?? (currentWindows.some((window) => window.durationMinutes === 10_080) ? "seven_day" : currentWindows.some((window) => window.durationMinutes === 300) ? "five_hour" : "seven_day")]
+        : [configured.preset === "five-hour" ? "five_hour" : configured.preset === "weekly" ? "seven_day"
+          : configured.meterWindow === "five-hour" ? "five_hour" : "seven_day"];
+    const short = (kind) => kind === "five_hour" ? "5h" : "7d";
+    const scope = evidence?.continuityKey ?? null;
+    const selected = selectedKinds.map((kind) => {
+      const item = lane(kind);
+      const displayLane = display?.windows.find((window) => window.durationMinutes === (kind === "five_hour" ? 300 : 10_080));
+      const identity = item === null ? null : scope !== null && notificationWindows.some((window) => window.durationMinutes === (kind === "five_hour" ? 300 : 10_080)) ? `${scope}:${item.resetAt}`
+        : displayLane ? `display:${display.scopeKey ?? displayLane.observedAt}:${displayLane.resetAt}` : null;
+      const previous = lowState[kind];
+      const low = configured.emphasizeLow && identity !== null && item !== null
+        && (item.actualRemainingPercent <= 10 || (previous?.identity === identity && previous.low && item.actualRemainingPercent < 12));
+      lowState[kind] = { identity, low };
+      return Object.freeze({ window: kind, remainingPercent: item?.remainingPercent ?? null, resetAt: item?.resetAt ?? null, low });
+    });
+    for (const kind of ["five_hour", "seven_day"]) {
+      if (!selectedKinds.includes(kind)) delete lowState[kind];
+    }
+    const resetText = (item) => {
+      if (item.resetAt === null || Date.parse(item.resetAt) <= now) return "—";
+      if (configured.resetFormat === "clock") {
+        const date = new Date(item.resetAt);
+        const sameDay = date.toDateString() === new Date(now).toDateString();
+        return new Intl.DateTimeFormat(locale === "system" ? undefined : locale, {
+          hour: "numeric", minute: "2-digit", ...(sameDay ? {} : { weekday: "short", month: "short", day: "numeric" }),
+        }).format(date);
+      }
+      const minutes = Math.ceil((Date.parse(item.resetAt) - now) / 60_000);
+      return minutes >= 1440 ? `${Math.floor(minutes / 1440)}d ${Math.floor(minutes % 1440 / 60)}h`
+        : minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`;
+    };
+    compactTitle = configured.preset === "icon-only" ? "" : selected.map((item) => {
+      const remaining = `${short(item.window)} ${item.remainingPercent === null ? "—" : `${item.remainingPercent}%`}`;
+      const reset = localizeText(localize, configured.resetFormat === "clock" ? "electron.tray.resetClock" : "electron.tray.resetCountdown", { window: short(item.window), reset: resetText(item) }, "reset label");
+      return configured.barMetric === "remaining" ? remaining : configured.barMetric === "reset" ? reset : `${remaining} · ${reset}`;
+    }).join(" · ");
+    const meterKind = ["five-hour", "weekly"].includes(configured.preset) ? selectedKinds[0]
+      : configured.preset === "automatic" ? selectedKinds[0]
+        : configured.meterWindow === "five-hour" ? "five_hour" : "seven_day";
+    const meterKinds = configured.iconMode === "dual-meter" ? ["five_hour", "seven_day"] : [meterKind];
+    const meters = meterKinds.map((kind) => ({ window: kind, remainingPercent: lane(kind)?.remainingPercent ?? null,
+      low: selected.find((item) => item.window === kind)?.low === true }));
+    const selectionLabel = selected.map((item) => item.remainingPercent === null
+      ? localizeText(localize, "electron.tray.selectedUnavailable", { window: short(item.window) }, "selection label")
+      : localizeText(localize, DESKTOP_TRAY_ALLOWANCE_LOCALIZATION_KEYS[item.window], { remainingPercent: item.remainingPercent }, "selection label")
+    ).concat(selected.filter((item) => item.low).map((item) => localizeText(localize, "electron.tray.low", { window: short(item.window) }, "low label")))
+      .concat(configured.iconMode === "dual-meter" ? [localizeText(localize, "electron.tray.dualMeterHint", {}, "meter label")] : []).join(" · ");
+    configuredFields = { selectionLabel, selected: Object.freeze(selected), meters: Object.freeze(meters.map(Object.freeze)), iconMode: configured.iconMode };
+  }
   return Object.freeze({
+    ...configuredFields,
     status: displayStatus,
     label: statusLabel,
     allowance,
     compactTitle,
-    evidenceLabel: evidence === null ? statusLabel : localizeText(
+    evidenceLabel: observation === null ? statusLabel : localizeText(
       localize,
       "electron.tray.evidenceCurrent",
       { age: observedMinutes === 0 ? "just now" : `${observedMinutes} minute${observedMinutes === 1 ? "" : "s"} ago` },

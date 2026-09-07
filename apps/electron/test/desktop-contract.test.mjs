@@ -28,6 +28,9 @@ test("desktop contract freezes the exact bridge action and enum vocabulary", () 
     "sharingNoticePresented",
     "getCodexHomesForSettings",
     "openSettings",
+    "openTraySettings",
+    "setTrayPreferences",
+    "restoreTrayDefaults",
     "openCommunity",
     "toggleSidebar",
     "chooseCodexHome",
@@ -246,6 +249,7 @@ test("settings snapshot validator enforces the exact schema and defaults", () =>
     startAtLogin: false,
     notifications: { enabled: false, threshold: "off" },
     sidebarCollapsed: false,
+    tray: DESKTOP_DEFAULT_SETTINGS.tray,
   });
 
   const valid = validateDesktopSettingsSnapshot({
@@ -268,18 +272,16 @@ test("settings snapshot validator enforces the exact schema and defaults", () =>
   assert.equal(valid.codexHomes.activityRoots[0].kind, "custom");
   assert.equal(Object.isFrozen(valid.notifications), true);
 
-  assert.equal(
-    validateDesktopSettingsSnapshot({
-      schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION,
-      codexHomes: DESKTOP_DEFAULT_SETTINGS.codexHomes,
-      language: "system",
-      appearance: "system",
-      refreshIntervalSeconds: 300,
-      startAtLogin: false,
-      notifications: { enabled: false, threshold: "off" },
-    }).sidebarCollapsed,
-    false,
-  );
+  const prior = {
+    schemaVersion: "tibotattle-desktop-settings-v2",
+    codexHomes: DESKTOP_DEFAULT_SETTINGS.codexHomes,
+    language: "system", appearance: "system", refreshIntervalSeconds: 300,
+    startAtLogin: false, notifications: { enabled: false, threshold: "off" },
+  };
+  assert.equal(migrateDesktopSettingsSnapshot(prior).sidebarCollapsed, false);
+  assert.equal(migrateDesktopSettingsSnapshot(prior).tray.preset, "automatic");
+  assert.throws(() => validateDesktopSettingsSnapshot({ ...prior, schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION }), TypeError);
+
 
   for (const invalid of [
     { ...DESKTOP_DEFAULT_SETTINGS, schemaVersion: "v2" },

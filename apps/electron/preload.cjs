@@ -291,6 +291,12 @@ function installDesktopBridge() {
       values,
     ),
     openSettings: (...values) => noArguments("openSettings", values),
+    openTraySettings: (...values) => noArguments("openTraySettings", values),
+    restoreTrayDefaults: (...values) => noArguments("restoreTrayDefaults", values),
+    setTrayPreferences: (...values) => oneArgument("setTrayPreferences", values, (value) => {
+      if (!exactObject(value, ["schemaVersion", "preset", "iconMode", "meterWindow", "barMetric", "resetFormat", "sections", "historyRange", "showChart", "metrics", "density", "emphasizeLow"], "tray")) return rejected("tray preferences are invalid");
+      return invoke("setTrayPreferences", { value });
+    }),
     openCommunity: (...values) => noArguments("openCommunity", values),
     toggleSidebar: (...values) => noArguments("toggleSidebar", values),
     chooseCodexHome: (...values) => noArguments("chooseCodexHome", values),

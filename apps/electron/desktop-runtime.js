@@ -1048,6 +1048,7 @@ export async function launchDesktopRuntime({
     sharingCoordinator,
     settingsStore: store,
     platformServices: services,
+    desktopPlatform: platform,
     notificationCoordinator,
     getLifecycle: () => facade ?? lifecycle,
     applyCodexHome,
@@ -1115,6 +1116,11 @@ export async function launchDesktopRuntime({
     ...lifecycleOptions,
     desktopActions,
     desktopLocale: initialDesktopSnapshot.settings.language,
+    initialTrayPreferences: initialDesktopSnapshot.settings.tray,
+    onTrayHistoryRange: async (historyRange) => {
+      const current = await store.getSettings();
+      return controller.handlers.setTrayPreferences({ value: { ...current.tray, historyRange } });
+    },
     desktopSystemLocales,
     singleInstanceLockAcquired,
     openDashboardExternal: lifecycleOptions.openDashboardExternal
@@ -1296,6 +1302,7 @@ export async function launchDesktopRuntime({
     sendDashboardCommand: lifecycle.sendDashboardCommand,
     navigateDashboardSection: lifecycle.navigateDashboardSection,
     setDesktopLanguage: lifecycle.setDesktopLanguage,
+    setDesktopTrayPreferences: lifecycle.setDesktopTrayPreferences,
     invokeTrayCommand: lifecycle.invokeTrayCommand,
     requestQuit,
     openDashboardInBrowser: lifecycle.openDashboardInBrowser,

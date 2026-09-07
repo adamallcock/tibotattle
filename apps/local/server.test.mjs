@@ -2453,6 +2453,11 @@ test("desktop status route serves cached current overview evidence without a com
         remainingPercent: 0,
       },
       notificationEvidence: null,
+      displayEvidence: {
+        schemaVersion: "tibotattle-display-evidence-v1", scopeKey: null, staleAfterSeconds: 1800,
+        windows: [{ durationMinutes: 10080, remainingPercent: 0,
+          observedAt: "2026-09-05T11:59:00.000Z", resetAt: "2026-09-05T15:00:00.000Z" }],
+      },
     });
     assert.equal(displayReads, 1);
     assert.equal(overviewReads, 0);

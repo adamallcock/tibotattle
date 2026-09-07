@@ -10,7 +10,7 @@ import { MACOS_WEB_MODULE_ENTRYPOINTS, MACOS_RUNTIME_STATIC_ASSETS } from "../..
 
 const ASSETS = ["desktop-shell.js", "electron-tray-popup.html", "electron-tray-popup.js",
   "electron-tray-popup.css", "electron-settings.html", "electron-settings.js",
-  "electron-settings.css", "icon-panel-left.svg", "icon-refresh-cw.svg", "icon-settings.svg"];
+  "electron-tray-settings.js", "electron-tray-preferences.js", "electron-settings.css", "icon-panel-left.svg", "icon-refresh-cw.svg", "icon-settings.svg"];
 
 test("Electron settings and bridge have a real loopback route and retained client/native asset closure", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-assets-"));

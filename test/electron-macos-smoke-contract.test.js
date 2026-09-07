@@ -10,6 +10,9 @@ import { DESKTOP_DEFAULT_CODEX_ROOT_ID } from "../apps/electron/desktop-codex-ro
 import {
   assertMacAppContract,
   assertMacSyntheticFixtureSettings,
+  classifyMacTraySettingsEvidence,
+  MACOS_SMOKE_TRAY_EVIDENCE_KEYS,
+  readMacSyntheticFixtureTray,
   buildClosedReceipt,
   classifyMacDashboardParityEvidence,
   classifyAutomaticStartupRefreshReceipt,
@@ -201,8 +204,8 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.match(source, /retainedNotAnalyzedCount/u);
   assert.doesNotMatch(source, /primaryRadioCount === normalizedRootCount/u);
   assert.match(source, /settings-add-codex-root/u);
-  assert.match(source, /tabCount === 4/u);
-  assert.match(source, /\["general", "data", "notifications", "about"\]/u);
+  assert.match(source, /tabCount === 5/u);
+  assert.match(source, /\["general", "data", "notifications", "about", "tray"\]/u);
   assert.match(source, /KeyboardEvent\("keydown", \{ key: "ArrowRight"/u);
   assert.match(source, /KeyboardEvent\("keydown", \{ key: "End"/u);
   assert.match(source, /data-settings-tab.*data/u);
@@ -345,7 +348,7 @@ test("macOS synthetic fixture exposes only a bounded refresh interval read", asy
     await writeFile(
       fixture.settingsPath,
       `${JSON.stringify({
-        schemaVersion: "tibotattle-desktop-settings-v2",
+        schemaVersion: "tibotattle-desktop-settings-v3",
         refreshIntervalSeconds: 900,
       })}\n`,
       { mode: 0o600 },
@@ -357,7 +360,7 @@ test("macOS synthetic fixture exposes only a bounded refresh interval read", asy
     await writeFile(
       fixture.settingsPath,
       `${JSON.stringify({
-        schemaVersion: "tibotattle-desktop-settings-v2",
+        schemaVersion: "tibotattle-desktop-settings-v3",
         refreshIntervalSeconds: 42,
       })}\n`,
       { mode: 0o600 },
@@ -1477,4 +1480,31 @@ test("failed renderer readiness receipt retains completed chrome and refresh pro
   assert.equal(receipt.settings.refreshIntervalPersisted, false);
   assert.equal(receipt.settings.sharingPreferencePersisted, false);
   assert.equal(receipt.share.panelVisible, false);
+});
+
+test("tray smoke proof requires rendered changes, save, undo, restore, reopen and process restart", () => {
+  const complete = Object.fromEntries(MACOS_SMOKE_TRAY_EVIDENCE_KEYS.map((key) => [key, true]));
+  assert.equal(classifyMacTraySettingsEvidence(complete).status, "passed");
+  for (const key of MACOS_SMOKE_TRAY_EVIDENCE_KEYS) {
+    assert.equal(classifyMacTraySettingsEvidence({ ...complete, [key]: false }).status, "failed", key);
+    assert.equal(classifyMacTraySettingsEvidence({ ...complete, [key]: "true" }).status, "failed", key);
+    const missing = { ...complete }; delete missing[key];
+    assert.equal(classifyMacTraySettingsEvidence(missing).status, "failed", key);
+  }
+  assert.equal(JSON.stringify(classifyMacTraySettingsEvidence({ ...complete, path: "/private/synthetic" })).includes("/private"), false);
+  const receipt = buildClosedReceipt({ settings: { trayCustomization: complete } });
+  assert.deepEqual(receipt.settings.trayCustomization, { status: "passed", ...complete });
+});
+
+test("tray smoke fixture reader returns only the validated preference and rejects future fields", async () => {
+  const fixture = await createSyntheticFixture();
+  try {
+    const tray = await readMacSyntheticFixtureTray(fixture.settingsPath);
+    assert.equal(tray.preset, "weekly"); assert.equal(tray.historyRange, "7d");
+    assert.equal(JSON.stringify(tray).includes(fixture.root), false);
+    const stored = JSON.parse(await readFile(fixture.settingsPath, "utf8"));
+    stored.tray = { ...tray, schemaVersion: 2 };
+    await writeFile(fixture.settingsPath, JSON.stringify(stored));
+    await assert.rejects(readMacSyntheticFixtureTray(fixture.settingsPath), TypeError);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });

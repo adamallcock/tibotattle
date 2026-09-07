@@ -151,7 +151,7 @@ async function assertMigratedState(state) {
     join(state.userDataRoot, "desktop-settings", "desktop-settings-v1.json"),
     "utf8",
   ));
-  assert.equal(settings.schemaVersion, "tibotattle-desktop-settings-v2");
+  assert.equal(settings.schemaVersion, "tibotattle-desktop-settings-v3");
   assert.equal(settings.codexHomes.activityRoots[0].path, "/private/tmp/synthetic-codex-home");
   assert.equal(settings.language, "en");
   assert.equal(settings.appearance, "dark");
@@ -342,4 +342,26 @@ test("group-writable legacy files remain a migration blocker", async (t) => {
     code: "native_electron_handover_unsafe_state",
   });
   assert.deepEqual(calls, []);
+});
+
+test("journaled native handover carries validated tray preferences and preserves the source", async (t) => {
+  const { DESKTOP_TRAY_DEFAULTS } = await import("../desktop-tray-preferences.js");
+  const state = await fixture(); t.after(state.dispose);
+  const tray = { ...DESKTOP_TRAY_DEFAULTS, preset: "both", sections: ["cache", "allowances"], historyRange: "30d" };
+  const source = join(state.nativeStateRoot, "tray-preferences-v1.json");
+  await privateFile(source, JSON.stringify(tray));
+  await runNativeElectronHandover(migrationOptions(state, []));
+  const migrated = JSON.parse(await readFile(join(state.userDataRoot, "desktop-settings", "desktop-settings-v1.json"), "utf8"));
+  assert.deepEqual(migrated.tray, tray);
+  assert.deepEqual(JSON.parse(await readFile(source, "utf8")), tray);
+});
+
+test("future native tray preferences block migration without replacing their source", async (t) => {
+  const { DESKTOP_TRAY_DEFAULTS } = await import("../desktop-tray-preferences.js");
+  const state = await fixture(); t.after(state.dispose);
+  const future = { ...DESKTOP_TRAY_DEFAULTS, schemaVersion: 2 };
+  const source = join(state.nativeStateRoot, "tray-preferences-v1.json");
+  await privateFile(source, JSON.stringify(future));
+  await assert.rejects(runNativeElectronHandover(migrationOptions(state, [])), { code: "native_electron_handover_native_settings_invalid" });
+  assert.deepEqual(JSON.parse(await readFile(source, "utf8")), future);
 });

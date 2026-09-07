@@ -3228,6 +3228,45 @@ function unavailableCacheContinuityImpact(errorCode = null) {
   };
 }
 
+// This summary uses the companion's existing follow-up denominator. It does
+// not infer token cache-hit rate or assign freshness independently of accounting.
+export function normalizeTrayCacheSummary(value) {
+  const exact = (row, keys) => row !== null && typeof row === "object"
+    && !Array.isArray(row) && Object.keys(row).length === keys.length
+    && keys.every((key) => Object.hasOwn(row, key));
+  const validRoot = exact(value, ["schemaVersion", "periods"])
+    && value.schemaVersion === 1 && Array.isArray(value.periods)
+    && value.periods.length === 2;
+  const keys = ["periodId", "status", "comparableReturns", "reusedMoreThanHalfReturns",
+    "reusePercent", "coverageStatus"];
+  return {
+    schemaVersion: 1,
+    periods: ["7d", "30d"].map((periodId) => {
+      const unavailable = {
+        periodId, status: "unavailable", comparableReturns: null,
+        reusedMoreThanHalfReturns: null, reusePercent: null, coverageStatus: "unavailable"
+      };
+      if (!validRoot) return unavailable;
+      const matches = value.periods.filter((row) => row?.periodId === periodId);
+      if (matches.length !== 1 || !exact(matches[0], keys)) return unavailable;
+      const row = matches[0];
+      if (row.status !== "available"
+          || !["complete", "incomplete"].includes(row.coverageStatus)
+          || ![row.comparableReturns, row.reusedMoreThanHalfReturns]
+            .every((n) => Number.isSafeInteger(n) && n >= 0)
+          || row.reusedMoreThanHalfReturns > row.comparableReturns) return unavailable;
+      const expected = row.comparableReturns === 0 ? null
+        : row.reusedMoreThanHalfReturns / row.comparableReturns * 100;
+      if (expected === null ? row.reusePercent !== null
+        : typeof row.reusePercent !== "number" || !Number.isFinite(row.reusePercent)
+          || Math.abs(row.reusePercent - expected) > 1e-9) return unavailable;
+      return { periodId, status: "available", comparableReturns: row.comparableReturns,
+        reusedMoreThanHalfReturns: row.reusedMoreThanHalfReturns,
+        reusePercent: expected, coverageStatus: row.coverageStatus };
+    })
+  };
+}
+
 function normalizeCacheContinuityImpact(value) {
   if (value?.status !== "available") {
     return unavailableCacheContinuityImpact(value?.errorCode);
@@ -5186,6 +5225,7 @@ function normalizeLocalAccounting(value = {}, {
     cacheContinuityImpact: normalizeCacheContinuityImpact(
       value.cacheContinuityImpact
     ),
+    trayCacheSummary: normalizeTrayCacheSummary(value.trayCacheSummary),
     sideChatEstimates: normalizeSideChatEstimates(value.sideChatEstimates),
     byModel: models,
     modelUsage,

@@ -129,8 +129,9 @@ test("popover model is a content-free projection of direct tray evidence", () =>
     "windows",
     "refreshEnabled",
     "hint",
+    "trayPreferences",
   ]);
-  assert.equal(model.compactTitle, "74%");
+  assert.equal(model.compactTitle, "5h 74%");
   assert.equal(model.windows.length, 2);
   assert.equal(model.windows[0].remainingPercent, 74);
   assert.equal(model.windows[1].remainingPercent, 56);
@@ -270,10 +271,10 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   assert.deepEqual(window.positions, [[212, 52]]);
   assert.equal(popover.visible, true);
 
-  const nextModel = createDesktopTrayPopoverModel({ trayStatus: status() });
+  const nextModel = createDesktopTrayPopoverModel({ trayStatus: status(), now: Date.parse("2026-08-22T12:04:00.000Z") });
   assert.equal(popover.setModel(nextModel), true);
   assert.equal(window.webContents.sent.at(-1).channel, TRAY_POPOVER_MODEL_CHANNEL);
-  assert.equal(window.webContents.sent.at(-1).value.compactTitle, "74%");
+  assert.equal(window.webContents.sent.at(-1).value.compactTitle, "5h 74%");
   window.webContents.emit("ipc-message", {
     sender: window.webContents,
     senderFrame: window.webContents.mainFrame,
@@ -288,7 +289,7 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   assert.equal(window.webContents.sent.at(-1).channel, TRAY_POPOVER_VISIBILITY_CHANNEL);
   assert.equal(window.webContents.sent.at(-1).value, true);
   assert.equal(window.webContents.sent.at(-2).channel, TRAY_POPOVER_MODEL_CHANNEL);
-  assert.equal(window.webContents.sent.at(-2).value.compactTitle, "74%",
+  assert.equal(window.webContents.sent.at(-2).value.compactTitle, "5h 74%",
     "reopening republishes the latest model without waiting for a quota change");
   popover.destroy();
   assert.equal(popover.visible, false);
@@ -435,4 +436,18 @@ test("popover accepts negative display origins, caps to work area, and dismisses
   assert.equal(popover.visible, true);
   window.webContents.emit("before-input-event", {}, { type: "keyDown", key: "Escape" });
   assert.equal(popover.visible, false);
+});
+
+test("history preference replies reflect authenticated persistence success and failure", async () => {
+  const webContents = new FakeWebContents(); const initialURL = "http://127.0.0.1:4800/electron-tray-popup.html";
+  webContents.currentURL = initialURL; const calls = [];
+  const policy = installDesktopTrayPopoverPolicy({ webContents, initialURL, onAction: async (action) => { calls.push(action); if (action === "history-30d") throw new Error("synthetic failure"); } });
+  const emit = (action, senderFrame = webContents.mainFrame) => webContents.emit("ipc-message", { sender: webContents, senderFrame }, TRAY_POPOVER_ACTION_CHANNEL, action);
+  emit("history-7d", { isMainFrame: false }); emit("history-all");
+  emit("history-7d"); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(webContents.sent.at(-1).value, true);
+  emit("history-30d"); await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(webContents.sent.at(-1).value, false);
+  assert.deepEqual(calls, ["history-7d", "history-30d"]);
+  policy.remove();
 });

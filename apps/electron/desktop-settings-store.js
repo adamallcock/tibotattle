@@ -38,6 +38,7 @@ const UPDATE_KEYS = Object.freeze([
   "startAtLogin",
   "notifications",
   "sidebarCollapsed",
+  "tray",
 ]);
 
 function assertBackend(backend) {
@@ -60,11 +61,12 @@ function defaultSettings() {
     startAtLogin: DESKTOP_DEFAULT_SETTINGS.startAtLogin,
     notifications: { ...DESKTOP_DEFAULT_SETTINGS.notifications },
     sidebarCollapsed: DESKTOP_DEFAULT_SETTINGS.sidebarCollapsed,
+    tray: DESKTOP_DEFAULT_SETTINGS.tray,
   });
 }
 
 function cloneSettings(settings, idFactory) {
-  const migrated = migrateDesktopSettingsSnapshot(settings, { idFactory });
+  const migrated = validateDesktopSettingsSnapshot({ ...migrateDesktopSettingsSnapshot(settings, { idFactory }) });
   return validateDesktopSettingsSnapshot({
     schemaVersion: migrated.schemaVersion,
     codexHomes: migrated.codexHomes,
@@ -74,6 +76,7 @@ function cloneSettings(settings, idFactory) {
     startAtLogin: migrated.startAtLogin,
     notifications: { ...migrated.notifications },
     sidebarCollapsed: migrated.sidebarCollapsed,
+    tray: migrated.tray,
   });
 }
 
@@ -118,6 +121,7 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND, idFactor
   let loadPromise = null;
   let operation = Promise.resolve();
   let lastLoadError = null;
+  let writeBlocked = false;
 
   async function ensureLoaded() {
     if (loaded) return state;
@@ -149,6 +153,7 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND, idFactor
         // shell unusable. Keep the exact defaults and expose only a fixed
         // diagnostic through the store state, never the backend error.
         state = defaultSettings();
+        writeBlocked = true;
         lastLoadError = loadError();
         void error;
       }
@@ -170,7 +175,17 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND, idFactor
   }
 
   async function save(next) {
+    if (writeBlocked) throw persistenceError();
     const candidate = cloneSettings(next, idFactory);
+    try {
+      // Another app version may have replaced the file after this process loaded it.
+      // Revalidate its version before allowing this older reader to publish.
+      const latest = await persistence.load();
+      if (latest !== null && latest !== undefined) validateDesktopSettingsSnapshot({ ...migrateDesktopSettingsSnapshot(latest, { idFactory }) });
+    } catch {
+      writeBlocked = true;
+      throw persistenceError();
+    }
     try {
       await persistence.save(candidate);
     } catch (error) {
@@ -214,6 +229,7 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND, idFactor
       return {
         ...current,
         codexHomes,
+        tray: patch.tray === undefined ? current.tray : patch.tray,
         language: patch.language === undefined ? current.language : patch.language,
         appearance: patch.appearance === undefined ? current.appearance : patch.appearance,
         refreshIntervalSeconds: patch.refreshIntervalSeconds === undefined
@@ -368,6 +384,7 @@ export function createDesktopSettingsStore({ backend = DEFAULT_BACKEND, idFactor
     get lastLoadFailed() {
       return lastLoadError !== null;
     },
+    get traySettingsStatus() { return writeBlocked ? "invalid" : "current"; },
     schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION,
   });
 }
