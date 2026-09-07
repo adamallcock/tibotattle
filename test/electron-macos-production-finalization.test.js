@@ -17,6 +17,8 @@ import test from "node:test";
 import {
   finalizeElectronMacOSUpdateMetadata,
   parseElectronMacOSMetadataFinalizationArguments,
+  parseElectronMacOSMetadataRecoveryArguments,
+  recoverElectronMacOSPreFinalization,
 } from "../scripts/finalize-electron-macos-update-metadata.mjs";
 import { productionElectronCandidatePlan } from "../scripts/package-electron-production.mjs";
 
@@ -30,9 +32,20 @@ const CURRENT_VERSION = "0.1.19-native-to-electron-handover.1";
 const NEXT_VERSION = "0.1.19-native-to-electron-handover.2";
 const TRANSPORT_MANIFEST = "native-to-electron-handover-mac.yml";
 const FINALIZATION_RECEIPT = "electron-update-metadata-finalization-receipt.json";
+const FINALIZATION_OPERATION = "electron-update-metadata-finalization-operation.json";
+const FINALIZATION_LOCK = ".electron-update-metadata-finalization.lock";
+const FINALIZATION_LOCK_SCHEMA = "tibotattle-electron-update-metadata-finalization-lock-v1";
 
 function sha512(bytes) {
   return createHash("sha512").update(bytes).digest("base64");
+}
+
+function deferred() {
+  let resolveDeferred;
+  const promise = new Promise((resolvePromise) => {
+    resolveDeferred = resolvePromise;
+  });
+  return { promise, resolve: resolveDeferred };
 }
 
 function updaterManifest({ dmgFile, dmgBytes, releaseDate, version, zipFile, zipBytes }) {
@@ -134,6 +147,7 @@ async function createFixture(root, {
   const manifestPath = join(artifactDirectory, TRANSPORT_MANIFEST);
   const preManifestPath = join(evidenceDirectory, TRANSPORT_MANIFEST);
   const preDmgBlockmapPath = join(evidenceDirectory, `${dmgFile}.blockmap`);
+  const operationJournalPath = join(evidenceDirectory, FINALIZATION_OPERATION);
   const dmgBlockmapPath = `${dmgPath}.blockmap`;
   const zipBlockmapPath = `${zipPath}.blockmap`;
   const candidateReceiptPath = join(candidateDirectory, "production-source-candidate.json");
@@ -188,6 +202,7 @@ async function createFixture(root, {
     dmgPath,
     finalDmgBytes,
     manifestPath,
+    operationJournalPath,
     preDmgBlockmapBytes,
     preManifest,
     preDmgBlockmapPath,
@@ -207,6 +222,7 @@ async function outputSnapshot(fixture) {
     manifest: await readFile(fixture.manifestPath),
     preDmgBlockmap: await readOrAbsent(fixture.preDmgBlockmapPath),
     preManifest: await readOrAbsent(fixture.preManifestPath),
+    operationJournal: await readOrAbsent(fixture.operationJournalPath),
     sentinel: await readFile(fixture.sentinelPath),
     zipBlockmap: await readFile(fixture.zipBlockmapPath),
   });
@@ -217,8 +233,20 @@ async function assertOutputsUnchanged(fixture, snapshot) {
   assert.deepEqual(await readFile(fixture.manifestPath), snapshot.manifest);
   assert.deepEqual(await readOrAbsent(fixture.preDmgBlockmapPath), snapshot.preDmgBlockmap);
   assert.deepEqual(await readOrAbsent(fixture.preManifestPath), snapshot.preManifest);
+  assert.deepEqual(await readOrAbsent(fixture.operationJournalPath), snapshot.operationJournal);
   assert.deepEqual(await readFile(fixture.sentinelPath), snapshot.sentinel);
   assert.deepEqual(await readFile(fixture.zipBlockmapPath), snapshot.zipBlockmap);
+  assert.equal(await fileAbsent(join(fixture.artifactDirectory, FINALIZATION_RECEIPT)), true);
+}
+
+async function assertRecoveredPreFinalization(fixture, before) {
+  assert.deepEqual(await readFile(fixture.dmgBlockmapPath), before.dmgBlockmap);
+  assert.deepEqual(await readFile(fixture.manifestPath), before.manifest);
+  assert.deepEqual(await readFile(fixture.zipBlockmapPath), before.zipBlockmap);
+  assert.deepEqual(await readFile(fixture.preDmgBlockmapPath), before.dmgBlockmap);
+  assert.deepEqual(await readFile(fixture.preManifestPath), before.manifest);
+  assert.deepEqual(await readFile(fixture.sentinelPath), before.sentinel);
+  assert.equal(await fileAbsent(fixture.operationJournalPath), true);
   assert.equal(await fileAbsent(join(fixture.artifactDirectory, FINALIZATION_RECEIPT)), true);
 }
 
@@ -423,6 +451,234 @@ test("refuses post-commit blockmap corruption before it can emit a finalization 
   });
 });
 
+test("restores a pre-finalization state after interruption between metadata replacements", async () => {
+  await withFixture(async (fixture) => {
+    const before = await outputSnapshot(fixture);
+    const interrupted = new Error("synthetic interruption between metadata replacements");
+    await assert.rejects(
+      finalizeElectronMacOSUpdateMetadata({
+        candidateReceiptPath: fixture.candidateReceiptPath,
+      }, {
+        afterDmgBlockmapCommit: async () => {
+          throw interrupted;
+        },
+      }),
+      (error) => error === interrupted,
+    );
+    assert.notDeepEqual(await readFile(fixture.dmgBlockmapPath), before.dmgBlockmap);
+    assert.deepEqual(await readFile(fixture.manifestPath), before.manifest);
+    const journal = JSON.parse(await readFile(fixture.operationJournalPath, "utf8"));
+    assert.equal(journal.scope, "exact_pre_finalization_recovery_only");
+    assert.equal(journal.candidate.target, fixture.target);
+    assert.equal(journal.artifacts.dmg.sha256.length, 64);
+
+    const recovery = await recoverElectronMacOSPreFinalization({
+      candidateReceiptPath: fixture.candidateReceiptPath,
+    });
+    assert.equal(recovery.status, "pre_finalization_restored");
+    assert.equal(recovery.scope, "exact_pre_finalization_recovery_only");
+    await assertRecoveredPreFinalization(fixture, before);
+
+    const receipt = await finalizeElectronMacOSUpdateMetadata({
+      candidateReceiptPath: fixture.candidateReceiptPath,
+    });
+    assert.equal(receipt.candidate.target, fixture.target);
+  });
+});
+
+test("survives an interrupted partial recovery after both metadata replacements", async () => {
+  await withFixture(async (fixture) => {
+    const before = await outputSnapshot(fixture);
+    const interrupted = new Error("synthetic interruption after both metadata replacements");
+    await assert.rejects(
+      finalizeElectronMacOSUpdateMetadata({
+        candidateReceiptPath: fixture.candidateReceiptPath,
+      }, {
+        afterManifestCommit: async () => {
+          throw interrupted;
+        },
+      }),
+      (error) => error === interrupted,
+    );
+    assert.notDeepEqual(await readFile(fixture.dmgBlockmapPath), before.dmgBlockmap);
+    assert.notDeepEqual(await readFile(fixture.manifestPath), before.manifest);
+
+    const interruptedRecovery = new Error("synthetic interruption during pre-state restore");
+    await assert.rejects(
+      recoverElectronMacOSPreFinalization({
+        candidateReceiptPath: fixture.candidateReceiptPath,
+      }, {
+        afterDmgBlockmapRestore: async () => {
+          throw interruptedRecovery;
+        },
+      }),
+      (error) => error === interruptedRecovery,
+    );
+    assert.deepEqual(await readFile(fixture.dmgBlockmapPath), before.dmgBlockmap);
+    assert.notDeepEqual(await readFile(fixture.manifestPath), before.manifest);
+    assert.equal(await fileAbsent(fixture.operationJournalPath), false);
+
+    await recoverElectronMacOSPreFinalization({
+      candidateReceiptPath: fixture.candidateReceiptPath,
+    });
+    await assertRecoveredPreFinalization(fixture, before);
+    const receipt = await finalizeElectronMacOSUpdateMetadata({
+      candidateReceiptPath: fixture.candidateReceiptPath,
+    });
+    assert.equal(receipt.candidate.version, fixture.version);
+  });
+});
+
+test("refuses guessed recovery without a durable interrupted-operation journal", async () => {
+  await withFixture(async (fixture) => {
+    const snapshot = await outputSnapshot(fixture);
+    await assert.rejects(
+      recoverElectronMacOSPreFinalization({
+        candidateReceiptPath: fixture.candidateReceiptPath,
+      }),
+      (error) => error?.code === "ELECTRON_MACOS_METADATA_FINALIZATION_RECOVERY_JOURNAL_INVALID",
+    );
+    await assertOutputsUnchanged(fixture, snapshot);
+  });
+});
+
+test("refuses recovery once a finalization receipt exists", async () => {
+  await withFixture(async (fixture) => {
+    await finalizeElectronMacOSUpdateMetadata({
+      candidateReceiptPath: fixture.candidateReceiptPath,
+    });
+    const snapshot = await outputSnapshot(fixture);
+    const receipt = await readFile(join(fixture.artifactDirectory, FINALIZATION_RECEIPT));
+
+    await assert.rejects(
+      recoverElectronMacOSPreFinalization({
+        candidateReceiptPath: fixture.candidateReceiptPath,
+      }),
+      (error) => error?.code === "ELECTRON_MACOS_METADATA_FINALIZATION_FINALIZATION_RECEIPT_EXISTS",
+    );
+
+    assert.deepEqual(await outputSnapshot(fixture), snapshot);
+    assert.deepEqual(await readFile(join(fixture.artifactDirectory, FINALIZATION_RECEIPT)), receipt);
+    assert.equal(await fileAbsent(fixture.operationJournalPath), false);
+  });
+});
+
+test("does not let a second recovery remove a live replacement lock", async () => {
+  await withFixture(async (fixture) => {
+    const interrupted = new Error("synthetic interruption before manifest replacement");
+    await assert.rejects(
+      finalizeElectronMacOSUpdateMetadata({
+        candidateReceiptPath: fixture.candidateReceiptPath,
+      }, {
+        afterDmgBlockmapCommit: async () => {
+          throw interrupted;
+        },
+      }),
+      (error) => error === interrupted,
+    );
+    const journal = JSON.parse(await readFile(fixture.operationJournalPath, "utf8"));
+    const lockPath = join(fixture.artifactDirectory, FINALIZATION_LOCK);
+    await writeFile(lockPath, `${JSON.stringify({
+      schemaVersion: FINALIZATION_LOCK_SCHEMA,
+      pid: 2_000_000_000,
+      candidate: journal.candidate,
+    })}\n`, { flag: "wx", mode: 0o600 });
+
+    const firstEntered = deferred();
+    const releaseFirst = deferred();
+    const first = recoverElectronMacOSPreFinalization({
+      candidateReceiptPath: fixture.candidateReceiptPath,
+    }, {
+      afterDmgBlockmapRestore: async () => {
+        firstEntered.resolve();
+        await releaseFirst.promise;
+      },
+    });
+    await firstEntered.promise;
+    await assert.rejects(
+      recoverElectronMacOSPreFinalization({
+        candidateReceiptPath: fixture.candidateReceiptPath,
+      }),
+      (error) => error?.code === "ELECTRON_MACOS_METADATA_FINALIZATION_FINALIZATION_BUSY",
+    );
+    assert.equal(await fileAbsent(lockPath), false);
+
+    releaseFirst.resolve();
+    await first;
+    assert.equal(await fileAbsent(lockPath), true);
+    assert.equal(await fileAbsent(fixture.operationJournalPath), true);
+  });
+});
+
+test("retains the journal if a preserved backup or ZIP blockmap changes during recovery", async () => {
+  for (const [label, selectedPath] of [
+    ["preserved backup", "preManifestPath"],
+    ["ZIP blockmap", "zipBlockmapPath"],
+  ]) {
+    await withFixture(async (fixture) => {
+      const interrupted = new Error(`synthetic interruption before recovery ${label} check`);
+      await assert.rejects(
+        finalizeElectronMacOSUpdateMetadata({
+          candidateReceiptPath: fixture.candidateReceiptPath,
+        }, {
+          afterDmgBlockmapCommit: async () => {
+            throw interrupted;
+          },
+        }),
+        (error) => error === interrupted,
+      );
+      await assert.rejects(
+        recoverElectronMacOSPreFinalization({
+          candidateReceiptPath: fixture.candidateReceiptPath,
+        }, {
+          afterDmgBlockmapRestore: async () => {
+            await writeFile(fixture[selectedPath], `tampered ${label}\n`, { flag: "w" });
+          },
+        }),
+        (error) => error?.code === "ELECTRON_MACOS_METADATA_FINALIZATION_RECOVERY_RESTORE_FAILED",
+      );
+      assert.equal(await fileAbsent(fixture.operationJournalPath), false);
+      assert.equal(await fileAbsent(join(fixture.artifactDirectory, FINALIZATION_RECEIPT)), true);
+    });
+  }
+});
+
+test("refuses recovery when an interrupted operation has unrecorded sidecar or journal bytes", async () => {
+  await withFixture(async (fixture) => {
+    const interrupted = new Error("synthetic interruption before manifest replacement");
+    await assert.rejects(
+      finalizeElectronMacOSUpdateMetadata({
+        candidateReceiptPath: fixture.candidateReceiptPath,
+      }, {
+        afterDmgBlockmapCommit: async () => {
+          throw interrupted;
+        },
+      }),
+      (error) => error === interrupted,
+    );
+    const journal = await readFile(fixture.operationJournalPath);
+    const unknownSidecar = Buffer.from("unrecorded-sidecar-bytes\n", "utf8");
+    await writeFile(fixture.dmgBlockmapPath, unknownSidecar, { flag: "w" });
+    await assert.rejects(
+      recoverElectronMacOSPreFinalization({
+        candidateReceiptPath: fixture.candidateReceiptPath,
+      }),
+      (error) => error?.code === "ELECTRON_MACOS_METADATA_FINALIZATION_RECOVERY_STATE_INVALID",
+    );
+    assert.deepEqual(await readFile(fixture.dmgBlockmapPath), unknownSidecar);
+    assert.deepEqual(await readFile(fixture.operationJournalPath), journal);
+
+    await writeFile(fixture.operationJournalPath, "{}\n", { flag: "w" });
+    await assert.rejects(
+      recoverElectronMacOSPreFinalization({
+        candidateReceiptPath: fixture.candidateReceiptPath,
+      }),
+      (error) => error?.code === "ELECTRON_MACOS_METADATA_FINALIZATION_RECOVERY_JOURNAL_INVALID",
+    );
+    assert.deepEqual(await readFile(fixture.dmgBlockmapPath), unknownSidecar);
+  });
+});
+
 test("accepts only the closed candidate receipt CLI shape", () => {
   assert.deepEqual(parseElectronMacOSMetadataFinalizationArguments([
     "--candidate-receipt",
@@ -438,6 +694,26 @@ test("accepts only the closed candidate receipt CLI shape", () => {
   ]) {
     assert.throws(
       () => parseElectronMacOSMetadataFinalizationArguments(argv),
+      (error) => error?.code === "ELECTRON_MACOS_METADATA_FINALIZATION_ARGUMENT_INVALID",
+    );
+  }
+
+  assert.deepEqual(parseElectronMacOSMetadataRecoveryArguments([
+    "--recover-pre-finalization",
+    "--candidate-receipt",
+    "mirror/production-source-candidate.json",
+  ]), {
+    candidateReceiptPath: "mirror/production-source-candidate.json",
+  });
+  for (const argv of [
+    [],
+    ["--recover-pre-finalization"],
+    ["--recover-pre-finalization", "--candidate-receipt"],
+    ["--recover-pre-finalization", "--candidate-receipt", "candidate.json", "--feed", "https://example.invalid"],
+    ["--candidate-receipt", "candidate.json", "--recover-pre-finalization"],
+  ]) {
+    assert.throws(
+      () => parseElectronMacOSMetadataRecoveryArguments(argv),
       (error) => error?.code === "ELECTRON_MACOS_METADATA_FINALIZATION_ARGUMENT_INVALID",
     );
   }
