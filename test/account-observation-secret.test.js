@@ -539,6 +539,14 @@ test("Linux account selection preserves its separate brokered identity and read-
       createLinuxBackend: () => absent, createIfMissing: false,
     });
     assert.equal(await readOnly.loadAccountObservationSecret(), null);
+    const locked = selectProductionAccountObservationSecret({
+      platform: "linux", architecture: "x64", operationLockFile: join(root, "locked.lock"),
+      createLinuxBackend: () => ({ ...backend,
+        read: async () => { throw Object.assign(new Error("private native message"), { code: "linux_secret_service_broker_locked" }); },
+      }),
+    });
+    await assert.rejects(locked.loadAccountObservationSecret(), (error) =>
+      error.code === "account_observation_credential_locked" && !error.stack.includes("private native message"));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

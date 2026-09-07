@@ -57,7 +57,8 @@ async function invokeBackend(backend, method, ...args) {
       // Hostile backend errors are collapsed below.
     }
     if (code === "export_identity_keychain_locked"
-        || code === "windows_credential_manager_locked") {
+        || code === "windows_credential_manager_locked"
+        || code === "linux_secret_service_broker_locked") {
       fail("account_observation_credential_locked");
     }
     if (code === "export_identity_keychain_migration_required") {
