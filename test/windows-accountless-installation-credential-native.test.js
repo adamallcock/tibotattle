@@ -38,6 +38,15 @@ const ACTIVE_JOURNAL = Buffer.from(
 );
 const SECRET = Buffer.alloc(32, 73);
 
+function childOutputHasLine(output, expected) {
+  return typeof output === "string"
+    && output.split(/\r?\n/u).some((line) => line === expected);
+}
+
+function normalizeChildOutput(output) {
+  return output.replaceAll("\r\n", "\n");
+}
+
 function accountlessError(code) {
   return (error) => {
     assert.equal(error instanceof WindowsAccountlessInstallationCredentialError, true);
@@ -90,29 +99,44 @@ function startChild(mode, rootPath) {
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
-  const closed = once(child, "close").then(([code, signal]) => ({
-    code,
-    signal,
-    stderr,
-    stdout,
-  }));
+  // On Windows the child process can report close before Node has dispatched
+  // the final pipe data callback.  Wait for stdout's terminal event before
+  // snapshotting its fixed marker.
+  const stdoutEnded = once(child.stdout, "end").catch(() => undefined);
+  const closed = once(child, "close").then(async ([code, signal]) => {
+    await stdoutEnded;
+    return {
+      code,
+      signal,
+      stderr,
+      stdout,
+    };
+  });
   return Object.freeze({ child, closed, output: () => stdout });
 }
 
 async function waitForChildLine(child, expected) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
-    if (child.output().includes(`${expected}\n`)) return;
+    if (childOutputHasLine(child.output(), expected)) return;
     const result = await Promise.race([
       child.closed.then((value) => ({ closed: value })),
       new Promise((resolve) => setTimeout(resolve, 25, null)),
     ]);
     if (result?.closed) {
+      if (childOutputHasLine(child.output(), expected)) return;
       assert.fail(`WINDOWS_ACCOUNTLESS_CREDENTIAL_CHILD_UNEXPECTED_EXIT_${result.closed.code}`);
     }
   }
   assert.fail("WINDOWS_ACCOUNTLESS_CREDENTIAL_CHILD_TIMEOUT");
 }
+
+test("fixed child markers tolerate Windows and POSIX pipe line endings", () => {
+  const marker = "WINDOWS_ACCOUNTLESS_CREDENTIAL_CHILD_RECORD_PUBLISHED";
+  assert.equal(childOutputHasLine(`${marker}\n`, marker), true);
+  assert.equal(childOutputHasLine(`${marker}\r\n`, marker), true);
+  assert.equal(childOutputHasLine(`${marker}_FORGED\n`, marker), false);
+});
 
 async function releaseChild(child) {
   child.child.stdin.end("release\n");
@@ -266,7 +290,7 @@ test("native private mutex serializes a peer and interrupted mutation durably la
   assert.equal(interruptedResult.code, 17);
   assert.equal(interruptedResult.signal, null);
   assert.equal(
-    interruptedResult.stdout,
+    normalizeChildOutput(interruptedResult.stdout),
     "WINDOWS_ACCOUNTLESS_CREDENTIAL_CHILD_RECORD_PUBLISHED\n",
   );
   assert.equal(interruptedResult.stderr, "");
