@@ -303,6 +303,11 @@ test("Linux AMD64 package scripts preserve native image and network boundaries",
   for (const required of [
     "test/electron-linux-smoke-contract.test.js",
     "test/linux-credential-mutation-lease.test.js",
+    "test/linux-credential-mutex-loader.test.js",
+    "test/linux-credential-mutex-manifest.test.js",
+    "test/linux-credential-mutex-native-contract.test.js",
+    "test/linux-credential-mutex-native.test.js",
+    "test/linux-credential-mutex-qualification.test.js",
     "test/linux-portability-workflow.test.js",
     "test/linux-secret-service-binding.test.js",
     "test/linux-secret-service-qualification.test.js",
@@ -420,12 +425,13 @@ test("Linux foundation modules remain unreachable from production composition", 
     "apps/electron/linux-qualification.js",
     "apps/electron/linux-tray-assets.js",
     "src/platform/linux-credential-mutation-lease.js",
+    "src/platform/linux-credential-mutex.js",
     "src/platform/linux-secret-service-binding.js",
     "src/platform/linux-secret-service.js",
     "src/platform/linux-state-composition.js",
     "src/platform/linux-xdg-paths.js",
   ]);
-  const forbiddenSpecifier = /(?:linux-(?:autostart|desktop-capabilities|qualification|tray-assets)|platform\/linux-(?:credential-mutation-lease|secret-service(?:-binding)?|state-composition|xdg-paths))/u;
+  const forbiddenSpecifier = /(?:linux-(?:autostart|desktop-capabilities|qualification|tray-assets)|platform\/linux-(?:credential-mutation-lease|credential-mutex|secret-service(?:-binding)?|state-composition|xdg-paths))/u;
   const graph = await collectProductionDependencyGraph(productionCompositionRoots);
   const relativeGraph = new Set([...graph].map((path) => relative(REPOSITORY_ROOT, path)));
   assert.ok(
