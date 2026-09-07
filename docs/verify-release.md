@@ -1,6 +1,6 @@
 ---
 title: Verify a TiboTattle release
-date: 2026-08-28
+date: 2026-09-07
 type: guide
 status: current
 ---
@@ -24,13 +24,17 @@ software is vulnerability-free or universally “safe.”
 
 ## Current availability boundary
 
-The latest source-backed availability snapshot records public stable release
-`v0.1.16`, published 2026-08-21 for macOS 14 or later on Apple silicon. Its
-GitHub release includes the DMG, appcast, release manifest, checksums, and this
-guide; the public appcast advertised the same `0.1.16` DMG. Recheck the
-[current status](./current-status.md) and release endpoints before relying on
-that snapshot. Endpoint availability is not fresh proof of the downloaded
-artifact's Apple signature or notarization, so perform the checks in Section 3.
+As checked on 2026-09-07, the public stable release is
+[`v0.1.18`](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18), for
+macOS 14 or later on Apple silicon and Intel. It has separate `macOS-arm64.dmg`
+and `macOS-x64.dmg` artifacts with independent checksums and update feeds.
+Homebrew selects the matching artifact automatically; for a direct download,
+choose the one matching **Apple menu → About This Mac**. Always verify that
+artifact's own entry in `release-manifest.json`, not the other architecture's
+digest. Recheck [current status](./current-status.md) and the release endpoints
+before relying on this dated snapshot. Endpoint availability is not fresh proof
+of the downloaded artifact's Apple signature or notarization, so perform the
+checks in Section 3.
 
 Windows and Linux remain unsupported. Source, plans, contract tests, or
 simulated qualification do not make a build an official supported release.

@@ -45,36 +45,50 @@ the preference and notices; its accountless upload transport is not yet active.
 - **A menu bar item** — where the allowance stands without opening the app,
   including a Check for Updates entry in builds that ship the updater.
 
-## Install
+## Install (macOS, Apple silicon or Intel)
 
-For a published macOS release, install the signed, notarized app with Homebrew:
+Requires **macOS 14 or later**, on either Apple silicon or Intel. With
+[Homebrew](https://brew.sh/) installed, one command selects the correct signed,
+notarized app for your Mac:
 
 ```bash
 brew install --cask adamallcock/tap/tibotattle
 ```
 
-Or, when the website exposes a current download, download the DMG from
+The app includes its runtime. You do **not** need Node.js, pnpm, or Xcode to
+install or use the published app.
+
+Alternatively, choose the **macOS Apple silicon** or **macOS Intel** DMG from
 [tibotattle.com](https://tibotattle.com) or the
 [TiboTattle releases page](https://github.com/adamallcock/tibotattle/releases).
+If you are unsure, **Apple menu → About This Mac** shows either an Apple chip or
+an Intel processor. Open the DMG, drag TiboTattle to Applications, and launch it.
 When both refer to the same published version, those channels point to the same
-Developer ID artifact; the app continues to use its signed Sparkle feed for
+architecture-specific Developer ID artifact; the app continues to use its signed Sparkle feed for
 updates. A missing website slot is not a release claim—use the GitHub release
 page for the exact version and digest. A v1 release manifest may explicitly
 leave SBOM or provenance fields `null`; source-to-binary provenance is claimed
 only when a trusted hosted workflow generated/finalized and cryptographically
 verified the exact final bytes for that specific release. This repository is
-the source of truth for the public app and its releases. To build from source
-instead, follow the quick start below.
+the source of truth for the public app and its releases. See the
+[user guide](docs/user-guide.md#install-and-first-launch) for first launch,
+or the developer section below to build from source.
 See [Verify a TiboTattle release](docs/verify-release.md) to check the downloaded
 bytes, Apple signature and notarization, and any non-null release-specific
 GitHub provenance evidence yourself.
 
-## Quick start (macOS, Apple Silicon)
+## Build from source (developers)
 
-Requirements: macOS 14 or later on arm64, Node.js ≥ 22.13 for the repository tooling,
+These requirements are for development, not installation of the released app.
+The native app builder runs on macOS 14 or later on Apple silicon. Repository
+tooling requires Node.js ≥ 22.13,
 [pnpm](https://pnpm.io) 11, and the Xcode command-line tools. The app-bundle
 build itself requires exactly Node v26.2.0 on macOS arm64: it fails on any
 other runtime rather than producing an unverifiable bundle.
+The default target is Apple silicon. To build an Intel target on that same
+builder, follow the explicit target and verified-runtime instructions in
+[the native developer guide](apps/macos/README.md#developer-build). A native
+Intel build host is not currently supported by this builder.
 
 The root workspace uses pnpm; the Worker keeps its own npm lockfile, which is
 needed only for hosted-service checks and the full gates:

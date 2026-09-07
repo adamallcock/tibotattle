@@ -4086,6 +4086,15 @@ html.community-chart-modal-open body {
   margin: 0;
   padding-inline-start: 1.2rem;
 }
+.community-site .resource-card pre {
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: .75rem;
+  line-height: 1.6;
+}
 .community-site .download-security-card {
   padding: clamp(26px, 4vw, 40px);
 }

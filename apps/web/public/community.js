@@ -282,6 +282,8 @@ export function renderPublicInstallerJourney(documentRef = document) {
       checksumFallback.hidden = true;
     }
     renderInstallerAssurance(documentRef, release, { architecture });
+    const homebrewInstall = select(`#${prefix}homebrew-install`);
+    if (homebrewInstall) homebrewInstall.hidden = release === null;
     return release;
   };
   const release = renderArchitecture("arm64");
@@ -293,8 +295,6 @@ export function renderPublicInstallerJourney(documentRef = document) {
     headerDownloadLabel.dataset.i18n = "installer.headerDownload";
     headerDownloadLabel.textContent = t("installer.headerDownload");
   }
-  const homebrewInstall = select("#homebrew-install");
-  if (homebrewInstall) homebrewInstall.hidden = release === null;
   return release;
 }
 
@@ -324,8 +324,8 @@ export async function copyInstallerChecksum(checksum, clipboard) {
   }
 }
 
-function selectHomebrewInstallCommand() {
-  const command = $("#homebrew-install-command");
+function selectHomebrewInstallCommand(prefix = "") {
+  const command = $(`#${prefix}homebrew-install-command`);
   const selection = window.getSelection?.();
   const range = document.createRange?.();
   if (!command || !selection || !range) return;
@@ -334,10 +334,10 @@ function selectHomebrewInstallCommand() {
   selection.addRange(range);
 }
 
-function renderHomebrewCopyState(state = "idle") {
-  const button = $("#homebrew-copy-button");
-  const label = $("#homebrew-copy-label");
-  const status = $("#homebrew-copy-status");
+function renderHomebrewCopyState(state = "idle", prefix = "") {
+  const button = $(`#${prefix}homebrew-copy-button`);
+  const label = $(`#${prefix}homebrew-copy-label`);
+  const status = $(`#${prefix}homebrew-copy-status`);
   if (!button || !label || !status) return;
   const presentation = {
     copied: ["installer.homebrew.copied", "installer.homebrew.copySuccess"],
@@ -350,17 +350,17 @@ function renderHomebrewCopyState(state = "idle") {
   status.textContent = presentation[1] ? t(presentation[1]) : "";
 }
 
-function wireHomebrewInstallCommand() {
-  const button = $("#homebrew-copy-button");
+function wireHomebrewInstallCommand(prefix = "") {
+  const button = $(`#${prefix}homebrew-copy-button`);
   if (!button || button.dataset.copyBound === "true") return;
   button.dataset.copyBound = "true";
-  renderHomebrewCopyState();
+  renderHomebrewCopyState("idle", prefix);
   button.addEventListener("click", async () => {
     button.disabled = true;
     const copied = await copyHomebrewInstallCommand(navigator.clipboard);
     button.disabled = false;
-    if (!copied) selectHomebrewInstallCommand();
-    renderHomebrewCopyState(copied ? "copied" : "failed");
+    if (!copied) selectHomebrewInstallCommand(prefix);
+    renderHomebrewCopyState(copied ? "copied" : "failed", prefix);
   });
 }
 
@@ -574,6 +574,7 @@ if (typeof document !== "undefined") {
   renderPublicInstallerJourney();
   wirePublicPlatformSelector();
   wireHomebrewInstallCommand();
+  wireHomebrewInstallCommand("intel-");
   wireInstallerChecksumCopy();
   wireInstallerChecksumCopy("intel-");
   wireAllowanceRangeControls();
@@ -585,6 +586,9 @@ if (typeof document !== "undefined") {
     renderPublicInstallerJourney();
     renderHomebrewCopyState(
       $("#homebrew-copy-button")?.dataset.copyState ?? "idle",
+    );
+    renderHomebrewCopyState(
+      $("#intel-homebrew-copy-button")?.dataset.copyState ?? "idle", "intel-",
     );
     renderInstallerChecksumCopyState(
       $("#installer-sha256-copy")?.dataset.copyState ?? "idle",

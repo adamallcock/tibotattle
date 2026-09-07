@@ -127,8 +127,20 @@
         <article class="resource-card" id="start">
           <h2>Start on your Mac</h2>
           <p>
-            Install the current signed release from the public home page,
-            Homebrew, or GitHub Releases. On first launch, read the complete
+            TiboTattle supports macOS 14 or later on Apple silicon and Intel.
+            If you use <a href="https://brew.sh/" target="_blank" rel="noreferrer">Homebrew</a>,
+            the same command installs the signed release for your Mac:
+          </p>
+          <pre><code data-i18n-skip>brew install --cask adamallcock/tap/tibotattle</code></pre>
+          <p>
+            Or choose the matching Apple silicon or Intel download on the
+            <a href="./community.html#download">public home page</a> or
+            <a href="https://github.com/adamallcock/tibotattle/releases/latest" target="_blank" rel="noreferrer">GitHub Releases</a>,
+            open the DMG, and drag TiboTattle to Applications. The app includes
+            its runtime; installing it does not require Node.js, pnpm, or Xcode.
+          </p>
+          <p>
+            On first launch, read the complete
             local-source disclosure, choose whether TiboTattle starts at login,
             and select <strong>Get Started</strong>. The app hosts its private
             dashboard in its own window; this public website never scans local
@@ -234,7 +246,7 @@
           <h2>Platform support</h2>
           <p>
             The published product currently supports macOS 14 or later on Apple
-            silicon. Windows and Linux source, contract, container, or native
+            silicon and Intel. Windows and Linux source, contract, container, or native
             experiments are preparation evidence only; neither platform is a
             supported install until a release lists and qualifies its own final
             artifact.
