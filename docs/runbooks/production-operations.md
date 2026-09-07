@@ -64,6 +64,15 @@ the cache after each reconstructed day. See the
 [allowance diagnosis runbook](2026-08-13-community-allowance-band-diagnosis.md)
 for historical interpretation and gap semantics.
 
+`MAINTENANCE_IN_PROGRESS` acknowledges an existing maintenance lease; it is not
+proof that the skipped invocation performed lifecycle or reconstruction work.
+An abruptly canceled invocation may leave the existing 20-minute lease until
+expiry. Inspect only the last-run and lease-expiry metadata, preserve saved
+checkpoints, and verify that a natural scheduled run resumes after expiry.
+Do not clear the lease, force maintenance, or delete caches to manufacture a
+successful recovery observation. A `canceled` outcome without an exception does
+not establish a database, memory or application-level cause.
+
 One physical-statement meter covers both D1 bindings and all scheduled phases
 (900 statements, with lease-release headroom). Required maintenance runs
 first. Optional calculation has a 40-second admission deadline, rotates

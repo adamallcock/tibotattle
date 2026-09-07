@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-06
+date: 2026-09-07
 type: status
 status: current
-source_commit: 55c813a1bf7e67c00e47410b760104c0d9fbc0ea
-observation_date: 2026-09-06
+source_commit: 0207a3c1f728ae6682d4423cf31540f72cc4d19c
+observation_date: 2026-09-07
 ---
 
 # Current product and release status
@@ -101,13 +101,35 @@ unfinished-work slots; concurrency, query limits and calculation budgets are
 unchanged. This closes progress visibility and useful-work scheduling, not the
 separate graph-recovery gate.
 
+The owner-approved [historical model reconstruction](./receipts/2026-09-07-model-allowance-history-deployment.md)
+deployed as `0207a3c1f728ae6682d4423cf31540f72cc4d19c` at 00:08:54 UTC on
+2026-09-07. Migration `0048` and the complete stored schema passed read-back;
+both migration ledgers have no pending source migrations. The normal guarded
+deployment and independent exact-source health checks passed, preserving source
+telemetry, consent and transport activation. This supersedes the older source
+observations above, not their point-in-time qualification boundaries.
+
+Live authenticated Chrome renders the per-model chart and its retrospective
+history explanation, including Astra's existing September 6 point. At the first
+observation, no earlier historical points had been produced: low-priority
+history selected September 5 but deferred behind current-day calculation. A
+later scheduled run was canceled without a recorded exception. Its ordinary
+maintenance lease expired and natural schedules resumed successfully; the
+00:38 UTC read confirmed no held lease and 11 complete current-account heads,
+with four still acquiring. No lease override was used. Historical checkpoint,
+day-publication and rendered-series verification remain open.
+The public all-token activity chart renders 317 days and labels USD 101,954.04
+as the priced portion across 262 of them; the separate public allowance graph
+still reports that merged history is updating.
+
 The existing dated social preview was temporarily retained to prioritize the
 verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;
 do not describe that retained image as a new release preview.
 
 The admin per-model view supports the reviewed model catalog, including Astra
-and older model families. Source support does not establish that its live
-preview has recovered. Contribution consent and staged v1.1 activation remain
+and older model families. Its live preview is available at the observation
+above; that does not establish completed historical backfill. Contribution
+consent and staged v1.1 activation remain
 unchanged. The source health contract retains `participantDeletion: false`
 and `deletionSafeRestoreReplay: true`; these flags do not prove every route.
 

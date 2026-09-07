@@ -2,14 +2,17 @@
 title: Historical per-model allowance reconstruction
 date: 2026-09-06
 type: plan
-status: deployment-authorized
+status: deployed-awaiting-backfill-verification
 ---
 
 # Scope and acceptance
 
 Local implementation is complete at `e35008d5`. On 2026-09-06 the owner
 authorized applying migration 0048 and deploying the updated Worker, followed
-by live backfill verification. Those operational gates remain unperformed.
+by live backfill verification. Migration and protected deployment succeeded at
+source `0207a3c1` on 2026-09-07; historical checkpoint/publication verification
+remains open. The [deployment receipt](../receipts/2026-09-07-model-allowance-history-deployment.md)
+records exact production identity, preservation and observed behavior.
 
 The owner requested historical per-model points alongside the existing plan
 history. Work starts from the completed hosted repair at `e9c56452` in an
@@ -66,6 +69,9 @@ window is a separate analytical choice and must not be silently introduced.
 - [x] Implement date-bounded input and isolated reconstruction.
 - [x] Validate preservation, numerical semantics, bounded resources and UI.
 - [x] Present qualified source and the separate production gate.
+- [x] Apply owner-approved migration 0048 and deploy through the protected lane.
+- [x] Verify exact live source, preservation, controls and rendered model UI.
+- [ ] Verify natural historical checkpoint and day-publication progress.
 
 # Local evidence, 2026-09-06
 
