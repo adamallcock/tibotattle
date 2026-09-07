@@ -8,6 +8,7 @@ import {
   createWindowsAccountlessSmokeProtocol,
   exerciseWindowsAccountlessSmoke,
   observeWindowsSmokeStderr,
+  prepareWindowsAccountlessSmokeFirstRunAcknowledgementForTest,
 } from "../scripts/smoke-electron-windows-accountless.mjs";
 
 const type = "windows-electron-smoke-v1";
@@ -24,6 +25,32 @@ function fakeChild(reply) {
     queueMicrotask(() => reply(child, message));
   };
   return child;
+}
+
+function disposableWindowsProfile() {
+  return Object.freeze({
+    root: "C:\\smoke",
+    userData: "C:\\smoke\\user-data",
+    home: "C:\\smoke\\home",
+    codex: "C:\\smoke\\codex",
+    claude: "C:\\smoke\\claude",
+    state: "C:\\smoke\\state",
+    tmp: "C:\\smoke\\tmp",
+  });
+}
+
+function qualificationEnvironment(profile) {
+  return Object.freeze({
+    USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
+    USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
+    USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
+    USAGE_MONITOR_STATE_ROOT: profile.state,
+    USERPROFILE: profile.home,
+    HOME: profile.home,
+    CODEX_HOME: profile.codex,
+    CLAUDE_CONFIG_DIR: profile.claude,
+    TEMP: profile.tmp,
+  });
 }
 
 test("Windows accountless runner requires exact absolute inputs and refuses endpoint/credential options", () => {
@@ -43,6 +70,100 @@ test("identity requires matching source, executable and ASAR instead of acceptin
   for (const changed of [{ sourceRevision: "d".repeat(40) }, { target: "darwin-arm64" }, { runtimeExecuted: true }, { asar: { ...asar, bytes: 1 } }, { executable: { ...executable, sha256: "e".repeat(64) } }]) {
     assert.throws(() => assertWindowsAccountlessPackageIdentity({ receipt: { ...receipt, ...changed }, sourceRevision, executable, asar }), /PACKAGE_IDENTITY_INVALID/u);
   }
+});
+
+test("Windows smoke prepares and readbacks only the fixed first-run receipt in its authenticated disposable profile", async () => {
+  const profile = disposableWindowsProfile();
+  const environment = qualificationEnvironment(profile);
+  const resourceRoot = "C:\\staged-app";
+  const adapter = Object.freeze({ productionSafe: false });
+  const context = Object.freeze({
+    qualificationOnly: true,
+    productionSafe: false,
+    resourceRoot,
+    stateRoot: profile.userData,
+  });
+  const store = Object.freeze({ kind: "protected-store" });
+  const calls = [];
+  const result = await prepareWindowsAccountlessSmokeFirstRunAcknowledgementForTest({
+    profile,
+    environment,
+    stagedAppPath: resourceRoot,
+    createAdapter(options) {
+      calls.push(["adapter", options]);
+      return adapter;
+    },
+    createQualificationContext(options) {
+      calls.push(["context", options]);
+      return context;
+    },
+    createProtectedStore(options) {
+      calls.push(["store", options]);
+      return store;
+    },
+    createReceiptBackend(options) {
+      calls.push(["backend", options]);
+      return Object.freeze({
+        async save(value) {
+          calls.push(["save", value]);
+        },
+        async load() {
+          calls.push(["load"]);
+          return {
+            schemaVersion: "tibotattle-desktop-first-run-v1",
+            acknowledged: true,
+          };
+        },
+      });
+    },
+  });
+
+  assert.deepEqual(result, { status: "prepared-v1" });
+  assert.deepEqual(calls[0][1].bindingPath,
+    "C:\\staged-app\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node");
+  assert.equal(calls[0][1].platform, "win32");
+  assert.equal(calls[0][1].architecture, "x64");
+  assert.equal(calls[1][1].resourceRoot, resourceRoot);
+  assert.equal(calls[1][1].environment.USAGE_MONITOR_STATE_ROOT, profile.userData);
+  assert.equal(environment.USAGE_MONITOR_STATE_ROOT, profile.state);
+  assert.equal(calls[2][1].rootPath, "C:\\smoke\\user-data\\desktop-settings");
+  assert.equal(calls[2][1].windowsQualificationModeContext, context);
+  assert.equal(calls[2][1].resourceRoot, resourceRoot);
+  assert.deepEqual(calls[3][1], {
+    platform: "win32",
+    windowsProtectedStateStore: store,
+  });
+  assert.deepEqual(calls[4][1], {
+    schemaVersion: "tibotattle-desktop-first-run-v1",
+    acknowledged: true,
+  });
+  assert.deepEqual(calls[5], ["load"]);
+});
+
+test("Windows smoke refuses an unauthenticated first-run context before it writes a receipt", async () => {
+  const profile = disposableWindowsProfile();
+  let receiptWrites = 0;
+  await assert.rejects(
+    prepareWindowsAccountlessSmokeFirstRunAcknowledgementForTest({
+      profile,
+      environment: qualificationEnvironment(profile),
+      stagedAppPath: "C:\\staged-app",
+      createAdapter: () => ({ productionSafe: false }),
+      createQualificationContext: () => ({
+        qualificationOnly: true,
+        productionSafe: true,
+        resourceRoot: "C:\\staged-app",
+        stateRoot: profile.userData,
+      }),
+      createProtectedStore: () => ({ kind: "unreachable" }),
+      createReceiptBackend: () => ({
+        save: async () => { receiptWrites += 1; },
+        load: async () => null,
+      }),
+    }),
+    /FIRST_RUN_CONTEXT_INVALID/u,
+  );
+  assert.equal(receiptWrites, 0);
 });
 
 test("runner waits for ready then completes only the fixed storage and clean quit sequence", async () => {

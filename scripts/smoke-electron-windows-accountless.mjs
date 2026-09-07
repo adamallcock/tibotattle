@@ -4,10 +4,22 @@
 // The ordinary development launcher never enables this mutation-only test seam.
 import { spawn, execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { lstat, open, readFile, mkdtemp, rm } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  createWindowsFilesystemAdapter,
+  createWindowsProtectedStateStore,
+  createWindowsQualificationModeContext,
+} from "../src/platform/index.js";
+import {
+  createDesktopFirstRunReceiptBackend,
+  DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+  validateDesktopFirstRunReceipt,
+} from "../apps/electron/desktop-first-run.js";
 import {
   assertWindowsDevelopmentPackageLayout,
   prepareWindowsDevelopmentProfile,
@@ -15,12 +27,24 @@ import {
 } from "./launch-electron-windows-development.mjs";
 import { verifyElectronDevelopmentArtifact } from "./verify-electron-development-artifact.mjs";
 
+const require = createRequire(import.meta.url);
 const TYPE = "windows-electron-smoke-v1";
 const PREFIX = "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_";
 const SHA = /^[0-9a-f]{64}$/u;
 const REVISION = /^[0-9a-f]{40}$/u;
 const COMMANDS = new Set(["status-v1", "accountless-storage-v1", "quit-v1"]);
 const SEND_ERROR_CODES = new Set(["EPIPE", "ECONNRESET", "ERR_IPC_CHANNEL_CLOSED", "ERR_IPC_DISCONNECTED"]);
+const WINDOWS_STAGED_BINDING_PATH = Object.freeze([
+  "native",
+  "windows-filesystem",
+  "build",
+  "Release",
+  "windows_filesystem.node",
+]);
+const FIRST_RUN_ACKNOWLEDGEMENT = validateDesktopFirstRunReceipt({
+  schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+  acknowledged: true,
+});
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
 function fail(code) { throw Object.assign(new Error(`${PREFIX}${code}`), { code: `${PREFIX}${code}` }); }
 function fixedCode(error) { return new RegExp(`^${PREFIX}[A-Z_]+$`, "u").test(error?.code ?? "") ? error.code : `${PREFIX}FAILED`; }
@@ -82,6 +106,154 @@ export async function verifyWindowsAccountlessSmokePackage(options) {
   assertWindowsAccountlessPackageIdentity({ receipt, sourceRevision: options.sourceRevision, executable, asar });
   await verifyElectronDevelopmentArtifact({ target: "win32-x64", appPath: options.stagedAppPath, asarPath, unpackedPath: `${asarPath}.unpacked` });
   return Object.freeze({ sourceRevision: options.sourceRevision, artifactSha256: asar.sha256, executableSha256: executable.sha256 });
+}
+
+function sameWindowsPath(left, right) {
+  try {
+    return win32.resolve(left).toLowerCase() === win32.resolve(right).toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+function pathUnderWindowsRoot(value, root) {
+  try {
+    const selected = win32.resolve(value);
+    const selectedRoot = win32.resolve(root);
+    const relative = win32.relative(selectedRoot, selected);
+    return relative !== ""
+      && !relative.startsWith("..\\")
+      && relative !== ".."
+      && !win32.isAbsolute(relative);
+  } catch {
+    return false;
+  }
+}
+
+function assertDisposableFirstRunProfile(profile) {
+  if (profile === null || typeof profile !== "object" || Array.isArray(profile)) {
+    fail("FIRST_RUN_PROFILE_INVALID");
+  }
+  const expected = ["root", "userData", "home", "codex", "claude", "tmp"];
+  if (!expected.every((key) => typeof profile[key] === "string"
+      && profile[key].length > 0
+      && !profile[key].includes("\0")
+      && win32.isAbsolute(profile[key]))) {
+    fail("FIRST_RUN_PROFILE_INVALID");
+  }
+  if (!["userData", "home", "codex", "claude", "tmp"].every(
+    (key) => pathUnderWindowsRoot(profile[key], profile.root),
+  )) {
+    fail("FIRST_RUN_PROFILE_INVALID");
+  }
+  return profile;
+}
+
+function firstRunQualificationEnvironment(environment, profile) {
+  if (environment === null || typeof environment !== "object" || Array.isArray(environment)) {
+    fail("FIRST_RUN_ENVIRONMENT_INVALID");
+  }
+  // The app keeps companion state separate from Electron user data. The
+  // acknowledgement lives below user-data, so construct a second, private
+  // qualification context bound to that exact disposable tree before using
+  // the protected writer. The launched app still receives its ordinary
+  // profile environment and follows the returning-user path unchanged.
+  return Object.freeze({
+    ...environment,
+    USAGE_MONITOR_STATE_ROOT: profile.userData,
+  });
+}
+
+function assertFirstRunQualificationContext(context, {
+  resourceRoot,
+  stateRoot,
+} = {}) {
+  if (context?.qualificationOnly !== true
+      || context?.productionSafe !== false
+      || !sameWindowsPath(context.resourceRoot, resourceRoot)
+      || !sameWindowsPath(context.stateRoot, stateRoot)) {
+    fail("FIRST_RUN_CONTEXT_INVALID");
+  }
+  return context;
+}
+
+async function prepareWindowsAccountlessSmokeFirstRunAcknowledgement({
+  profile,
+  environment,
+  stagedAppPath,
+  createAdapter = createWindowsFilesystemAdapter,
+  createQualificationContext = createWindowsQualificationModeContext,
+  createProtectedStore = createWindowsProtectedStateStore,
+  createReceiptBackend = createDesktopFirstRunReceiptBackend,
+} = {}) {
+  const selectedProfile = assertDisposableFirstRunProfile(profile);
+  if (typeof stagedAppPath !== "string" || stagedAppPath.length === 0
+      || stagedAppPath.includes("\0") || !win32.isAbsolute(stagedAppPath)) {
+    fail("FIRST_RUN_RESOURCE_INVALID");
+  }
+  if ([createAdapter, createQualificationContext, createProtectedStore, createReceiptBackend]
+    .some((value) => typeof value !== "function")) {
+    fail("FIRST_RUN_CONFIGURATION_INVALID");
+  }
+  const resourceRoot = win32.resolve(stagedAppPath);
+  // The package verifier has already bound this staged tree to the selected
+  // packaged candidate. Load this exact staged binding, never a repository
+  // default binary that could be unrelated to the candidate under test.
+  const adapter = createAdapter({
+    platform: "win32",
+    architecture: "x64",
+    bindingPath: win32.join(resourceRoot, ...WINDOWS_STAGED_BINDING_PATH),
+    resolveBinding: (path) => path,
+    requireBinding: (path) => require(path),
+    readManifest: (path) => readFileSync(path, "utf8"),
+    readBindingBytes: (path) => readFileSync(path),
+  });
+  if (adapter === null || typeof adapter !== "object"
+      || adapter.productionSafe !== false) {
+    fail("FIRST_RUN_ADAPTER_INVALID");
+  }
+  const qualificationContext = assertFirstRunQualificationContext(
+    createQualificationContext({
+      platform: "win32",
+      architecture: "x64",
+      adapter,
+      environment: firstRunQualificationEnvironment(environment, selectedProfile),
+      resourceRoot,
+    }),
+    { resourceRoot, stateRoot: selectedProfile.userData },
+  );
+  const settingsRoot = win32.join(selectedProfile.userData, "desktop-settings");
+  const store = createProtectedStore({
+    adapter,
+    rootPath: settingsRoot,
+    windowsQualificationModeContext: qualificationContext,
+    resourceRoot,
+  });
+  const backend = createReceiptBackend({
+    platform: "win32",
+    windowsProtectedStateStore: store,
+  });
+  if (backend === null || typeof backend !== "object"
+      || typeof backend.save !== "function" || typeof backend.load !== "function") {
+    fail("FIRST_RUN_BACKEND_INVALID");
+  }
+  try {
+    await backend.save(FIRST_RUN_ACKNOWLEDGEMENT);
+    const observed = validateDesktopFirstRunReceipt(await backend.load());
+    if (observed.schemaVersion !== FIRST_RUN_ACKNOWLEDGEMENT.schemaVersion
+        || observed.acknowledged !== true) {
+      fail("FIRST_RUN_RECEIPT_INVALID");
+    }
+  } catch (error) {
+    if (error?.code === `${PREFIX}FIRST_RUN_RECEIPT_INVALID`) throw error;
+    fail("FIRST_RUN_RECEIPT_UNAVAILABLE");
+  }
+  return Object.freeze({ status: "prepared-v1" });
+}
+
+/** Dependency-injected seam for the source-only Windows smoke contract. */
+export async function prepareWindowsAccountlessSmokeFirstRunAcknowledgementForTest(options = {}) {
+  return prepareWindowsAccountlessSmokeFirstRunAcknowledgement(options);
 }
 
 // Install listeners before sending. No credential bytes or caller-selected
@@ -223,12 +395,19 @@ export async function runWindowsAccountlessSmoke(options) {
   let errorCode = null;
   let stopped = true;
   const observations = { entryFailureObserved: false, statusResponseObserved: false,
-    storageRequested: false, storagePassed: false, quitAcknowledged: false, sendFailureCode: null };
+    firstRunAcknowledgementPrepared: false, storageRequested: false,
+    storagePassed: false, quitAcknowledged: false, sendFailureCode: null };
   try {
     identity = await verifyWindowsAccountlessSmokePackage(options);
     profileRoot = await mkdtemp(join(tmpdir(), "tibotattle-windows-accountless-smoke-"));
     const profile = await prepareWindowsDevelopmentProfile({ appPath: options.appPath, profilePath: profileRoot });
     const spec = buildWindowsDevelopmentLaunchSpec({ appPath: options.appPath, profile });
+    await prepareWindowsAccountlessSmokeFirstRunAcknowledgement({
+      profile,
+      environment: spec.options.env,
+      stagedAppPath: options.stagedAppPath,
+    });
+    observations.firstRunAcknowledgementPrepared = true;
     child = spawn(spec.command, spec.args, { ...spec.options,
       env: { ...spec.options.env, USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
         USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: randomUUID() },
