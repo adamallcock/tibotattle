@@ -30,6 +30,8 @@ import {
 const require = createRequire(import.meta.url);
 const asar = createRequire(require.resolve("electron-builder"))("@electron/asar");
 const SHELL_FILES = [
+  "config/electron-production-distribution.cjs",
+  "native/macos-keychain/contract.js",
   "apps/electron/companion-supervisor.js",
   "apps/electron/desktop-automatic-refresh-cadence.js",
   "apps/electron/desktop-command.js",
@@ -45,9 +47,13 @@ const SHELL_FILES = [
   "apps/electron/desktop-hosted-signin.js",
   "apps/electron/desktop-recovery-settings.js",
   "apps/electron/desktop-ipc.js",
+  "apps/electron/desktop-keychain-broker.js",
   "apps/electron/desktop-owned-downloads.js",
   "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
+  "apps/electron/desktop-macos-keychain.js",
+  "apps/electron/desktop-native-migration.js",
+  "apps/electron/desktop-native-migration-macos.js",
   "apps/electron/desktop-notification-coordinator.js",
   "apps/electron/desktop-notification-delivery.js",
   "apps/electron/desktop-notification-policy.js",
@@ -61,6 +67,8 @@ const SHELL_FILES = [
   "apps/electron/desktop-tray-popover.js",
   "apps/electron/desktop-status-monitor.js",
   "apps/electron/desktop-tray-status.js",
+  "apps/electron/desktop-update-preferences.js",
+  "apps/electron/desktop-updater.js",
   "apps/electron/errors.js",
   "apps/electron/loopback-policy.js",
   "apps/electron/main.js",

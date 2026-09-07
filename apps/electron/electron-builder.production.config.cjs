@@ -101,6 +101,7 @@ function stagingClosure() {
         "apps/web/public/**",
         "config/**",
         "contracts/**",
+        "native/macos-keychain/contract.js",
         "native/windows-filesystem/build/Release/windows_filesystem.node",
         "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
         "schemas/**",
@@ -148,6 +149,12 @@ const nativeHandoverHelperContentsPath = [
   "MacOS",
   distribution.PRODUCTION_ELECTRON_NATIVE_HANDOVER_HELPER_RESOURCE_RELATIVE_PATH.at(-1),
 ].join("/");
+const nativeMacOSKeychainAdapterPath = path.join(
+  targetDirectory,
+  ...distribution.PRODUCTION_ELECTRON_MACOS_KEYCHAIN_ADAPTER_RESOURCE_RELATIVE_PATH,
+);
+const nativeMacOSKeychainAdapterResourcesPath =
+  distribution.PRODUCTION_ELECTRON_MACOS_KEYCHAIN_ADAPTER_RESOURCE_RELATIVE_PATH.join("/");
 
 const configuration = {
   appId: distribution.PRODUCTION_ELECTRON_APP_ID,
@@ -208,6 +215,13 @@ if (INPUTS.targetSpec.platform === "darwin") {
   configuration.extraFiles = [{
     from: nativeHandoverHelperPath,
     to: nativeHandoverHelperContentsPath,
+  }];
+  // The adapter stays outside app.asar at this exact Resources path. Its
+  // loader independently verifies the enclosing signed app and this fixed
+  // resource before Node can load native code.
+  configuration.extraResources = [{
+    from: nativeMacOSKeychainAdapterPath,
+    to: nativeMacOSKeychainAdapterResourcesPath,
   }];
   configuration.mac = {
     target: [

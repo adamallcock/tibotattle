@@ -30,7 +30,8 @@ Applications directory or infer the old state from Electron `userData`.
 | Preserved native bundle | `~/Library/Application Support/TiboTattle Native Handover/native-app/TiboTattle.app` |
 | Native source candidates | preserved bundle, `/Applications/TiboTattle.app`, then `~/Applications/TiboTattle.app` |
 | Final same-identity Electron location | the native source's `TiboTattle.app` location |
-| Future bridge resource | `TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover` |
+| Handover bridge resource | `TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover` |
+| Main-process credential adapter | `TiboTattle.app/Contents/Resources/native/macos-keychain.node` |
 
 [`scripts/plan-macos-native-electron-guided-handover.mjs`](../../scripts/plan-macos-native-electron-guided-handover.mjs)
 returns this concrete route for an exact old bundle and home directory. It is a
@@ -38,6 +39,16 @@ planning interface only: it does not move an app, replace a bundle, modify a
 profile, sign code, or invoke the handover bridge.
 
 # Runtime decision contract
+
+Production startup first validates the signed enclosing app and loads its
+fixed credential adapter. It reads and discards the four permitted credentials
+before invoking any handover operation. Missing modern credentials are accepted
+only after a fixed, attribute-only legacy lookup also proves absence. Locked,
+denied, indeterminate or legacy-only credentials stop startup without modifying
+the predecessor, credentials or data. This preflight also runs after a completed
+handover and on fresh installations; an absent migration helper is distinct
+from missing credential authority. No legacy ACL is broadened and no identity
+is replaced to avoid a security prompt.
 
 [`runProductionNativeMacHandover`](../../apps/electron/desktop-native-migration-macos.js)
 runs before Electron opens companion or settings state. It has three normal
@@ -139,5 +150,22 @@ The required installed rehearsal remains native `0.1.17` and released
 to a newer signed Electron candidate. It must verify retained history, identity
 salt, settings, sharing choice, one writer/login owner, Keychain continuity,
 restart, interrupted recovery, signing/notarization, and updater behavior.
+
+The updater part has two independent ordering requirements. Pinned
+`electron-updater` compares the installed app's semantic version with the
+candidate feed's `latest*.yml` semantic version; it does not compare
+`buildNumber`, `CFBundleVersion`, or PE file-version metadata. The later signed,
+feed-isolated rehearsal candidate must therefore have both a semantic version
+greater than the installed candidate and a strictly greater `buildNumber` for
+the native handover check. A higher `buildNumber` while both package and feed
+versions remain `0.1.18` is not an Electron update rehearsal. This source
+version remains unchanged until a concrete candidate version is allocated.
+
+The current production configuration accepts only the four fixed stable feed
+URLs. It has no isolated rehearsal feed selector yet. A reviewed private feed
+policy and executable rehearsal path must be added before this update exercise;
+changing the version alone does not make it runnable. No stable feed is changed
+by source preparation.
+
 Keep the native Sparkle routes for users who do not take the guided handover
 until that rehearsal and rollout are complete.

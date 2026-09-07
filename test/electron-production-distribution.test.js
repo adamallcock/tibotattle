@@ -25,6 +25,7 @@ const POLICY = require("../config/electron-production-distribution.cjs");
 const ELECTRON_BUILDER_REQUIRE = createRequire(require.resolve("electron-builder/package.json"));
 const { AppInfo } = ELECTRON_BUILDER_REQUIRE("app-builder-lib/out/appInfo");
 const BUILDER_CONFIG_PATH = resolve("apps/electron/electron-builder.production.config.cjs");
+const DEVELOPMENT_BUILDER_CONFIG_PATH = resolve("apps/electron/electron-builder.config.cjs");
 const PRODUCTION_SOURCE_WORKFLOW_PATH = resolve(
   ".github/workflows/electron-production-source-preparation.yml",
 );
@@ -58,6 +59,21 @@ function loadProductionBuilderConfig(target) {
   }));
 }
 
+function loadDevelopmentBuilderConfig(target) {
+  const source = [
+    `const config = require(${JSON.stringify(DEVELOPMENT_BUILDER_CONFIG_PATH)});`,
+    "process.stdout.write(JSON.stringify(config));",
+  ].join("\n");
+  return JSON.parse(execFileSync(process.execPath, ["-e", source], {
+    cwd: resolve("."),
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      TIBOTATTLE_ELECTRON_TARGET: target,
+    },
+  }));
+}
+
 function assertWindowsResourceVersion(version) {
   const components = version.split(".");
   assert.equal(components.length, 4);
@@ -71,6 +87,8 @@ test("closed production policy declares exactly four final targets with fixed HT
   assert.equal(POLICY.PRODUCTION_ELECTRON_APP_ID, "com.usagemonitor.local");
   assert.equal(POLICY.PRODUCTION_ELECTRON_CHANNEL, "stable");
   assert.equal(POLICY.PRODUCTION_ELECTRON_CONTRIBUTION_POLICY, "accountless-opt-out-v1");
+  assert.deepEqual(POLICY.PRODUCTION_ELECTRON_MACOS_KEYCHAIN_ADAPTER_RESOURCE_RELATIVE_PATH,
+    ["native", "macos-keychain.node"]);
   assert.deepEqual(Object.keys(POLICY.PRODUCTION_ELECTRON_TARGETS).sort(), [
     "darwin-arm64",
     "darwin-x64",
@@ -115,7 +133,12 @@ test("production builder source config binds app identity, target-specific build
       }], target);
       assert.match(config.extraFiles[0].from,
         new RegExp(`electron-production[\\\\/]${target}[\\\\/]native[\\\\/]TiboTattleNativeHandover$`, "u"), target);
-      assert.equal(Object.hasOwn(config, "extraResources"), false, target);
+      assert.deepEqual(config.extraResources, [{
+        from: config.extraResources[0].from,
+        to: "native/macos-keychain.node",
+      }], target);
+      assert.match(config.extraResources[0].from,
+        new RegExp(`electron-production[\\\\/]${target}[\\\\/]native[\\\\/]macos-keychain\\.node$`, "u"), target);
     } else if (target === "win32-x64") {
       assert.deepEqual(config.win.target, [{ target: "nsis", arch: ["x64"] }]);
       assert.equal(config.win.verifyUpdateCodeSignature, true);
@@ -127,6 +150,16 @@ test("production builder source config binds app identity, target-specific build
       assert.deepEqual(config.linux.executableArgs, []);
       assert.equal(Object.hasOwn(config.extraMetadata, "shortVersion"), false);
     }
+  }
+});
+
+test("development builder retains the adapter contract but excludes the production native resource", () => {
+  for (const target of ["darwin-arm64", "darwin-x64"]) {
+    const config = loadDevelopmentBuilderConfig(target);
+    const filter = config.files[0].filter;
+    assert.ok(filter.includes("native/macos-keychain/contract.js"), target);
+    assert.equal(filter.includes("native/macos-keychain.node"), false, target);
+    assert.equal(Object.hasOwn(config, "extraResources"), false, target);
   }
 });
 
@@ -183,6 +216,12 @@ test("production source candidate requires an explicit numeric build number and 
     signed: false,
     sourcePath: ".release-build/electron-production/darwin-arm64/native/TiboTattleNativeHandover",
   });
+  assert.deepEqual(plan.nativeMacOSKeychainAdapter, {
+    architecture: "arm64",
+    packagedPath: "Contents/Resources/native/macos-keychain.node",
+    signed: false,
+    sourcePath: ".release-build/electron-production/darwin-arm64/native/macos-keychain.node",
+  });
   assert.equal(plan.signingPerformed, false);
   assert.equal(plan.publishingPerformed, false);
   assert.throws(() => parseProductionCandidateArguments([
@@ -197,6 +236,26 @@ test("production source candidate requires an explicit numeric build number and 
   ]), (error) => error?.code === "ELECTRON_PRODUCTION_ARGUMENT_INVALID");
 });
 
+test("production source plans reserve a thin adapter for both macOS architectures only", () => {
+  for (const [target, spec] of Object.entries(POLICY.PRODUCTION_ELECTRON_TARGETS)) {
+    const plan = productionElectronCandidatePlan({
+      target,
+      sourceRevision: SOURCE_REVISION,
+      buildNumber: BUILD_NUMBER,
+    });
+    if (spec.platform === "darwin") {
+      assert.deepEqual(plan.nativeMacOSKeychainAdapter, {
+        architecture: spec.architecture,
+        packagedPath: "Contents/Resources/native/macos-keychain.node",
+        signed: false,
+        sourcePath: `.release-build/electron-production/${target}/native/macos-keychain.node`,
+      }, target);
+    } else {
+      assert.equal(plan.nativeMacOSKeychainAdapter, null, target);
+    }
+  }
+});
+
 test("manual production source workflow has no default candidate or finalization command", async () => {
   const workflow = await readFile(PRODUCTION_SOURCE_WORKFLOW_PATH, "utf8");
   assert.match(workflow, /^on:\n  workflow_dispatch:\n    inputs:\n      build_number:/mu);
@@ -205,6 +264,7 @@ test("manual production source workflow has no default candidate or finalization
   assert.doesNotMatch(workflow, /^\s+default:/mu);
   assert.doesNotMatch(workflow, /\belectron-builder\b/u);
   assert.doesNotMatch(workflow, /--publish\b/u);
+  assert.equal((workflow.match(/test\/electron-macos-keychain-adapter\.test\.js/gu) ?? []).length, 2);
   for (const target of Object.keys(POLICY.PRODUCTION_ELECTRON_TARGETS)) {
     assert.match(workflow, new RegExp(`--target ${target}`, "u"), target);
     assert.match(workflow,
@@ -241,8 +301,11 @@ test("production staging carries the exact app metadata and updater closure whil
     }
     for (const file of ELECTRON_SHELL_RUNTIME_FILES) {
       assert.ok(production.manifest.files.some(({ path }) => path === file), file);
+      assert.ok(development.manifest.files.some(({ path }) => path === file), file);
     }
     const closure = await assertStagedElectronShellModuleLinkage(production.output);
     assert.ok(closure.includes("apps/electron/desktop-updater.js"));
+    const developmentClosure = await assertStagedElectronShellModuleLinkage(development.output);
+    assert.ok(developmentClosure.includes("apps/electron/desktop-macos-keychain.js"));
   });
 });

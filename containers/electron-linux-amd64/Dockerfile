@@ -88,6 +88,7 @@ RUN curl --fail --silent --show-error --location --retry 3 \
   && rm -f /tmp/electron-v43.2.0-linux-x64.zip
 
 COPY apps/electron ./apps/electron
+COPY native/macos-keychain/contract.js ./native/macos-keychain/contract.js
 COPY apps/local ./apps/local
 COPY apps/web/public ./apps/web/public
 COPY config ./config

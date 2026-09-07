@@ -25,9 +25,10 @@ Scope: all files under `apps/electron/`. Apply the repository root guidance firs
 
 - Use the reviewed Electron staging and builder configuration. Keep the exact
   source/dependency closure and target-specific native bytes verifiable.
-- Electron's pinned Keytar dependency is independent of the native Mac app's
-  Swift Keychain broker. Do not restore retired native dependencies or route
-  Electron through a native-only broker without an explicit design change.
+- Production macOS credentials use the fixed main-process native adapter and
+  the Electron-owned companion pipe. Never reuse the retired native app's
+  broker process or fall back to Keytar after an announced broker fails.
+  Keytar remains a separate pinned dependency for other reviewed paths.
 - Keep unsigned development packaging separate from signing, notarization,
   installer/updater qualification, and public release. Never promote a prior
   receipt to proof for different source or artifact bytes.

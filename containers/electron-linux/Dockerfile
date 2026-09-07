@@ -84,6 +84,7 @@ RUN curl --fail --silent --show-error --location --retry 3 \
   && rm -f /tmp/electron-v43.2.0-linux-arm64.zip
 
 COPY --chown=node:node apps/electron ./apps/electron
+COPY --chown=node:node native/macos-keychain/contract.js ./native/macos-keychain/contract.js
 COPY --chown=node:node apps/local ./apps/local
 COPY --chown=node:node apps/web/public ./apps/web/public
 COPY --chown=node:node config ./config

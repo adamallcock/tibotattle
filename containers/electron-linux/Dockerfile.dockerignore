@@ -7,6 +7,9 @@
 !apps/
 !apps/electron/
 !apps/electron/**
+!native/
+!native/macos-keychain/
+!native/macos-keychain/contract.js
 !apps/local/
 !apps/local/**
 !apps/web/

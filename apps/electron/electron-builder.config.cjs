@@ -79,6 +79,10 @@ module.exports = {
         "apps/web/public/**",
         "config/**",
         "contracts/**",
+        // The source facade is needed because the platform module is part of
+        // the fixed Electron shell closure. Development does not receive the
+        // native resource or production loader path.
+        "native/macos-keychain/contract.js",
         "native/windows-filesystem/build/Release/windows_filesystem.node",
         "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
         "schemas/**",

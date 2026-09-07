@@ -68,7 +68,11 @@ function killChild(child, signal) {
   }
 }
 
-function companionEnvironment(environment, parentPid) {
+function disposeCredentialBroker(broker) {
+  try { broker?.dispose?.(); } catch { /* Child teardown must still complete. */ }
+}
+
+function companionEnvironment(environment, parentPid, hasCredentialBroker = false) {
   const selected = {};
   for (const key of COMPANION_ENVIRONMENT_KEYS) {
     if (Object.hasOwn(environment, key) && typeof environment[key] === "string") {
@@ -94,6 +98,9 @@ function companionEnvironment(environment, parentPid) {
   selected.ELECTRON_RUN_AS_NODE = "1";
   selected.USAGE_MONITOR_PORT = "0";
   selected.USAGE_MONITOR_PARENT_PID = String(parentPid);
+  // Only an explicitly composed parent broker can announce this descriptor.
+  // An inherited native-app FD is never accepted from the launch environment.
+  if (hasCredentialBroker) selected.USAGE_MONITOR_KEYCHAIN_BROKER_FD = "4";
   return selected;
 }
 
@@ -114,6 +121,7 @@ export function createCompanionSupervisor({
   setTimer = setTimeout,
   clearTimer = clearTimeout,
   attachPrivateChannel,
+  attachCredentialBroker,
 } = {}) {
   if (typeof spawnChild !== "function") throw new TypeError("spawnChild is required");
   if (typeof command !== "string" || command.length === 0) {
@@ -127,6 +135,9 @@ export function createCompanionSupervisor({
   }
   if (attachPrivateChannel !== undefined && typeof attachPrivateChannel !== "function") {
     throw new TypeError("private channel factory is invalid");
+  }
+  if (attachCredentialBroker !== undefined && typeof attachCredentialBroker !== "function") {
+    throw new TypeError("credential broker factory is invalid");
   }
   assertTimeout(startupTimeoutMs, "startupTimeoutMs");
   assertTimeout(shutdownTimeoutMs, "shutdownTimeoutMs");
@@ -145,6 +156,7 @@ export function createCompanionSupervisor({
   let generation = 0;
   let unexpectedExitHandler = onUnexpectedExit;
   let privateChannel = null;
+  let credentialBroker = null;
 
   function stateSnapshot() {
     return Object.freeze({
@@ -166,6 +178,7 @@ export function createCompanionSupervisor({
       let startupTimer = null;
       let currentChild = null;
       let currentPrivateChannel = null;
+      let currentCredentialBroker = null;
       let parser;
 
       const cleanupStartup = () => {
@@ -198,6 +211,8 @@ export function createCompanionSupervisor({
         if (settled) return;
         settled = true;
         cleanupStartup();
+        disposeCredentialBroker(currentCredentialBroker);
+        if (credentialBroker === currentCredentialBroker) credentialBroker = null;
         if (currentGeneration === generation) {
           state = "stopped";
           child = null;
@@ -238,6 +253,8 @@ export function createCompanionSupervisor({
       };
 
       const onExit = () => {
+        disposeCredentialBroker(currentCredentialBroker);
+        if (credentialBroker === currentCredentialBroker) credentialBroker = null;
         currentPrivateChannel?.dispose();
         if (privateChannel === currentPrivateChannel) privateChannel = null;
         if (!settled) {
@@ -262,8 +279,10 @@ export function createCompanionSupervisor({
       try {
         currentChild = spawnChild(command, [...args], {
           cwd,
-          env: companionEnvironment(environment, parentPid),
-          stdio: attachPrivateChannel ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
+          env: companionEnvironment(environment, parentPid, Boolean(attachCredentialBroker)),
+          stdio: attachCredentialBroker
+            ? ["ignore", "pipe", "pipe", attachPrivateChannel ? "ipc" : "ignore", "pipe"]
+            : attachPrivateChannel ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
       } catch {
@@ -275,6 +294,13 @@ export function createCompanionSupervisor({
         return;
       }
       try {
+        if (attachCredentialBroker) {
+          currentCredentialBroker = attachCredentialBroker(currentChild.stdio?.[4]);
+          if (typeof currentCredentialBroker?.dispose !== "function") {
+            throw new TypeError("credential broker is invalid");
+          }
+          credentialBroker = currentCredentialBroker;
+        }
         if (attachPrivateChannel) {
           currentPrivateChannel = attachPrivateChannel(currentChild);
           privateChannel = currentPrivateChannel;
@@ -309,6 +335,8 @@ export function createCompanionSupervisor({
     const currentChild = child;
     const currentGeneration = generation;
     state = "stopping";
+    disposeCredentialBroker(credentialBroker);
+    credentialBroker = null;
     privateChannel?.invalidate();
     ++generation;
     stopPromise = new Promise((resolveStop, rejectStop) => {

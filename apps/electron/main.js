@@ -7,6 +7,8 @@ import { launchDesktopRuntime } from "./desktop-runtime.js";
 import { createDesktopTrayIconFactory } from "./desktop-tray.js";
 import { validateProductionDistributionMetadata } from "./desktop-updater.js";
 import { runProductionNativeMacHandover } from "./desktop-native-migration-macos.js";
+import { attachDesktopKeychainBroker } from "./desktop-keychain-broker.js";
+import { loadDesktopMacOSCredentialBackend } from "./desktop-macos-keychain.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
 import { assertElectronPlatformGate } from "./platform-gate.js";
 import {
@@ -467,6 +469,31 @@ export function installWindowsSmokeControlForTest(lifecycle, {
   });
 }
 
+/** Resolve credential continuity before any predecessor or state mutation. */
+export function createProductionMacCredentialHandover({
+  app,
+  resourcesPath,
+  loadBackend = loadDesktopMacOSCredentialBackend,
+  runHandover = runProductionNativeMacHandover,
+} = {}) {
+  let backend = null;
+  return Object.freeze({
+    async prepareNativeHandover({ homeDirectory }) {
+      backend = null;
+      const selected = await loadBackend({ app, resourcesPath });
+      const handover = await runHandover({ electronApp: app, resourcesPath, homeDirectory });
+      if (["no_legacy_state", "migrated", "already_migrated"].includes(handover?.status)) {
+        backend = selected;
+      }
+      return handover;
+    },
+    attachCredentialBroker(stream) {
+      if (backend === null) throw shellError("electron_configuration_invalid");
+      return attachDesktopKeychainBroker({ stream, backend });
+    },
+  });
+}
+
 /**
  * Compose the real Electron runtime. The function is intentionally separate
  * from module evaluation so all policy/lifecycle code remains plain-Node
@@ -522,6 +549,11 @@ export async function launchElectronShell({
     // A local-QA launch must never inherit production sending or updating.
     const productionEnabled = productionDistribution !== null
       && environment.USAGE_MONITOR_TEST_LANE === undefined;
+    const macCredentialHandover = productionEnabled && process.platform === "darwin"
+      ? createProductionMacCredentialHandover({
+        app,
+        resourcesPath: packagedResourcesPath(app, packagedAppPath(app), resourcesPath),
+      }) : null;
     const trayIconFactory = createDesktopTrayIconFactory({
       nativeImage: runtime.nativeImage,
       resourceRoot: paths.resourceRoot,
@@ -542,7 +574,12 @@ export async function launchElectronShell({
         ...companionEnvironment({ app, environment, qualificationContext }),
         USAGE_MONITOR_RESOURCE_ROOT: paths.resourceRoot,
       },
-      supervisorOptions,
+      supervisorOptions: {
+        ...supervisorOptions,
+        ...(macCredentialHandover === null ? {} : {
+          attachCredentialBroker: macCredentialHandover.attachCredentialBroker,
+        }),
+      },
       lifecycleOptions: {
         appName: productionDistribution !== null || !isPackagedElectronApp(app)
           ? "TiboTattle" : "TiboTattle Dev",
@@ -555,12 +592,7 @@ export async function launchElectronShell({
       platform: process.platform,
       architecture: process.arch,
       productionDistribution: productionEnabled ? productionDistribution : undefined,
-      prepareNativeHandover: productionEnabled && process.platform === "darwin"
-        ? ({ homeDirectory }) => runProductionNativeMacHandover({
-          electronApp: app,
-          resourcesPath: packagedResourcesPath(app, packagedAppPath(app), resourcesPath),
-          homeDirectory,
-        }) : undefined,
+      prepareNativeHandover: macCredentialHandover?.prepareNativeHandover,
       accountlessProduction: productionEnabled ? {
         origin: DEPLOYMENT_ENDPOINTS.public.origin,
         policyVersion: productionDistribution.contributionPolicy,

@@ -26,6 +26,13 @@ const PRODUCTION_ELECTRON_NATIVE_HANDOVER_HELPER_RESOURCE_RELATIVE_PATH = Object
   "native",
   "TiboTattleNativeHandover",
 ]);
+// This unsigned source-candidate resource is compiled separately for each
+// reviewed macOS target. The signed enclosing Electron app is the later
+// authority that may load it; no development package receives this binary.
+const PRODUCTION_ELECTRON_MACOS_KEYCHAIN_ADAPTER_RESOURCE_RELATIVE_PATH = Object.freeze([
+  "native",
+  "macos-keychain.node",
+]);
 
 const PRODUCTION_ELECTRON_TARGETS = Object.freeze({
   "darwin-arm64": Object.freeze({
@@ -110,6 +117,7 @@ module.exports = Object.freeze({
   PRODUCTION_ELECTRON_CHANNEL,
   PRODUCTION_ELECTRON_CONTRIBUTION_POLICY,
   PRODUCTION_ELECTRON_DISTRIBUTION_SCHEMA_VERSION,
+  PRODUCTION_ELECTRON_MACOS_KEYCHAIN_ADAPTER_RESOURCE_RELATIVE_PATH,
   PRODUCTION_ELECTRON_NATIVE_HANDOVER_HELPER_RESOURCE_RELATIVE_PATH,
   PRODUCTION_ELECTRON_RELEASE_VERSION_PATTERN,
   PRODUCTION_ELECTRON_TARGETS,
