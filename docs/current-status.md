@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-07
 type: status
 status: current
-source_commit: 7f541517a79b2746596d4a2e70754eec8716aa8f
+source_commit: a4b6cbb4a236654ccc3f1c06c674481936057a2e
 observation_date: 2026-09-07
 ---
 
@@ -43,6 +43,17 @@ substitutes for SLSA build provenance. Follow
 
 ### Current presentation and live-data availability
 
+At 22:24 UTC on 2026-09-07, the guarded deployment published historical-model
+progress repair `a4b6cbb4a236654ccc3f1c06c674481936057a2e`. History now receives
+first use of the optional budget once per three-minute cycle; current work and
+publication keep their own priority slots. Account attempts rotate fairly, and
+new complete historical dates bypass the preview's ordinary refresh throttle.
+Existing valid graphs remain published. No migration or desktop change occurred.
+Natural scheduled runs advanced August 31 from 10 completed account results
+before deployment to 14 of 15 at 22:32 UTC. This proves resumed durable progress,
+not yet an expanded public date range or completed backfill. See the
+[repair receipt](./receipts/2026-09-07-historical-model-progress.md).
+
 On 2026-09-07 the owner-authorized migration 0049 and guarded deployment
 published source `7f541517a79b2746596d4a2e70754eec8716aa8f`, independently
 verified at 20:31 UTC. Public and admin aggregate/plan/model graphs, including
@@ -54,7 +65,7 @@ now use one complete snapshot, separate from daily activity publication.
 Unchanged pure-v1 accounts reuse a strictly validated joined cache read before
 loading source vectors. Only changed accounts re-enter acquisition/calculation;
 compact cohort fits must still be recombined for medians. Existing bounded
-scheduler priorities remain. Open public pages refresh automatically and retain
+scheduler resource limits remain. Open public pages refresh automatically and retain
 the graph across transient request failure. The 839 Worker, 562 web and 207
 operations tests, real-D1 migration rehearsal and live source/assets/browser
 checks are recorded in the
@@ -88,8 +99,9 @@ GPT-5.5 and GPT-5.6 history covered September 2–6; Astra covered September 5�
 Read-only metadata confirms September 1 completed at 13:21:16 UTC, after the
 13:05:41 public snapshot; August 31 is next. Automatic backfill targets the
 rolling 70-day preview, not unlimited history; on September 7 the closed target
-is June 30–September 6. It runs behind current work, and refresh throttling and
-public caching can delay visibility. Missing/unstable model estimates remain
+is June 30–September 6. The historical observation above predates the dedicated
+history priority slot and prompt new-day refresh repair. Public response caching
+can still briefly delay visibility. Missing/unstable model estimates remain
 gaps. This establishes real
 public history and working views, not unlimited retrospective coverage or a
 provider-authoritative allowance. The owner explicitly approved small-sample
