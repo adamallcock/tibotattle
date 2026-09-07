@@ -98,6 +98,8 @@ export async function buildElectronApp({
   replace = false,
   windowsBindingPath,
   windowsManifestPath,
+  linuxBindingPath,
+  linuxManifestPath,
   packagingProfile,
   packageVersion,
   distributionMetadata,
@@ -120,6 +122,8 @@ export async function buildElectronApp({
     packagingProfile: selectedPackagingProfile,
     packageVersion,
     distributionMetadata,
+    linuxBindingPath,
+    linuxManifestPath,
     ...(windowsInputs ?? {}),
   });
 }

@@ -139,6 +139,8 @@ function stagingClosure() {
         "native/macos-keychain/contract.js",
         "native/windows-filesystem/build/Release/windows_filesystem.node",
         "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+        "native/linux-credential-mutex/build/qualification/linux_credential_mutex.node",
+        "native/linux-credential-mutex/build/qualification/linux_credential_mutex.node.manifest.json",
         "schemas/**",
         "src/**",
         "generated/**",
@@ -160,7 +162,13 @@ function asarUnpackFor(target) {
     ];
   }
   const keytarTarget = target.startsWith("darwin-") ? target : "linux-x64";
-  return [`node_modules/@github/keytar/prebuilds/${keytarTarget}/keytar.node`];
+  return [
+    `node_modules/@github/keytar/prebuilds/${keytarTarget}/keytar.node`,
+    ...(target === "linux-x64" ? [
+      "native/linux-credential-mutex/build/qualification/linux_credential_mutex.node",
+      "native/linux-credential-mutex/build/qualification/linux_credential_mutex.node.manifest.json",
+    ] : []),
+  ];
 }
 
 const INPUTS = readInputs();

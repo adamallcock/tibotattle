@@ -648,6 +648,20 @@ assertion was changed. Main-process native composition and actual Linux runtime
 smoke remain the next gate; no production capability is enabled by these source
 tests.
 
+The Linux archive check exposed a concrete packaging omission: CI compiled the
+credential mutex, but the app did not contain its binary or manifest. Linux
+shell staging now requires that exact pair, validates the actual manifest
+producer's closed claims against captured binary bytes, and records both files
+in the ordinary runtime inventory. Both development and production packaging
+place the pair physically beside Keytar outside ASAR. The loader resolves only
+those fixed packaged paths. Independent archive checks reject missing, altered,
+extra or falsely qualified inputs; other platforms cannot receive the Linux
+pair. Focused packaging checks pass (53 passes, two optional artifact exclusions),
+production configuration checks pass 14/14, and the subsequent verifier check
+passes 20 with the same two exclusions. Documentation, architecture, 78 release
+trust checks and 20 documentation preflight checks pass. These are package
+contract checks; native ABI and isolated Secret Service execution remain separate.
+
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
 retain the detailed design history. This document coordinates the remaining

@@ -42,6 +42,11 @@ import {
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../src/platform/windows-filesystem.js";
+import {
+  LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH as LINUX_BINDING_PATH,
+  LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_RELATIVE_PATH as LINUX_MANIFEST_PATH,
+  validateLinuxCredentialMutexBindingManifest,
+} from "../src/platform/linux-credential-mutex.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const require = createRequire(import.meta.url);
@@ -132,6 +137,7 @@ const INVENTORY_KINDS = new Set([
   "workspace_dependency",
   "third_party_dependency",
   "windows_native_binding",
+  "linux_native_binding",
   "runtime_metadata",
 ]);
 const READ_ONLY_FLAG = fileSystemConstants.O_RDONLY ?? 0;
@@ -190,6 +196,7 @@ export const FIXED_STATUS = Object.freeze({
   inventoryMismatch: "ELECTRON_DEVELOPMENT_ARTIFACT_INVENTORY_MISMATCH",
   nativeInventoryInvalid: "ELECTRON_DEVELOPMENT_ARTIFACT_NATIVE_INVENTORY_INVALID",
   bindingInvalid: "ELECTRON_DEVELOPMENT_ARTIFACT_WINDOWS_BINDING_INVALID",
+  linuxBindingInvalid: "ELECTRON_DEVELOPMENT_ARTIFACT_LINUX_BINDING_INVALID",
 });
 
 const KNOWN_STATUSES = new Set(Object.values(FIXED_STATUS));
@@ -892,6 +899,7 @@ function expectedNativePaths(target) {
   return new Set([
     targetSpec.keytar,
     ...(target === "win32-x64" ? [WINDOWS_BINDING_PATH] : []),
+    ...(target === "linux-x64" ? [LINUX_BINDING_PATH] : []),
   ]);
 }
 
@@ -911,11 +919,9 @@ function validateTargetKeytar({ target, staged }) {
   }
 }
 
-// Electron's virtual-ASAR contract intentionally separates the executable
-// native module from its content-free sidecar: the .node is unpacked so the
-// loader can execute it, while the adjacent JSON manifest remains readable
-// through the virtual app.asar path. Keep this arrangement unless the actual
-// runtime/package contract changes and is reviewed with it.
+// Windows reads its sidecar through virtual ASAR. Linux requires both the
+// native module and adjacent sidecar as physical files for its pinned-descriptor
+// manifest checks. No other unpacked resources are admitted.
 function validateNativeBoundary({
   target,
   staged,
@@ -925,6 +931,16 @@ function validateNativeBoundary({
   manifest,
 }) {
   const expected = expectedNativePaths(target);
+  const expectedUnpacked = new Set([
+    ...expected,
+    ...(target === "linux-x64" ? [LINUX_MANIFEST_PATH] : []),
+  ]);
+  const linuxPair = new Set([LINUX_BINDING_PATH, LINUX_MANIFEST_PATH]);
+  if (staged.runtimeRows.some(({ path, kind }) =>
+    (kind === "linux_native_binding" && (target !== "linux-x64" || !linuxPair.has(path)))
+      || (target !== "linux-x64" && linuxPair.has(path)))) {
+    fail(FIXED_STATUS.nativeInventoryInvalid);
+  }
   const stagedNative = staged.runtimeRows
     .filter(({ path }) => path.toLowerCase().endsWith(".node"))
     .map(({ path }) => path);
@@ -937,8 +953,8 @@ function validateNativeBoundary({
     .filter(({ path }) => path.toLowerCase().endsWith(".node"));
   const unpackedNative = unpacked
     .filter(({ path }) => path.toLowerCase().endsWith(".node"));
-  if (unpacked.length !== expected.size
-      || unpacked.some(({ path }) => !expected.has(path))) {
+  if (unpacked.length !== expectedUnpacked.size
+      || unpacked.some(({ path }) => !expectedUnpacked.has(path))) {
     fail(FIXED_STATUS.nativeInventoryInvalid);
   }
   const physicalUnpackedPaths = new Set(unpacked.map(({ path }) => path));
@@ -946,7 +962,7 @@ function validateNativeBoundary({
       || [...archiveMarkedUnpacked].some((path) => !physicalUnpackedPaths.has(path))) {
     fail(FIXED_STATUS.nativeInventoryInvalid);
   }
-  for (const path of expected) {
+  for (const path of expectedUnpacked) {
     if (!archiveMarkedUnpacked.has(path)) {
       fail(FIXED_STATUS.nativeInventoryInvalid);
     }
@@ -958,7 +974,7 @@ function validateNativeBoundary({
   }
   const archiveMap = rowsByPath(archive);
   const unpackedMap = rowsByPath(unpacked);
-  for (const path of expected) {
+  for (const path of expectedUnpacked) {
     if (archiveMap.has(path) || !unpackedMap.has(path)) {
       fail(FIXED_STATUS.nativeInventoryInvalid);
     }
@@ -980,6 +996,33 @@ function validateNativeBoundary({
       fail(FIXED_STATUS.bindingInvalid);
     }
   }
+}
+
+async function validateLinuxBinding({ appPath, staged }) {
+  const paths = [LINUX_BINDING_PATH, LINUX_MANIFEST_PATH];
+  const captured = [];
+  for (const path of paths) {
+    const row = staged.rowMap.get(path);
+    const declared = staged.runtimeRows.find((entry) => entry.path === path);
+    if (!row || declared?.kind !== "linux_native_binding") fail(FIXED_STATUS.linuxBindingInvalid);
+    const bytes = await readRegularFile(
+      join(appPath, ...path.split("/")), FIXED_STATUS.linuxBindingInvalid, appPath,
+    );
+    if (bytes.byteLength !== row.bytes || sha256(bytes) !== row.sha256) {
+      fail(FIXED_STATUS.linuxBindingInvalid);
+    }
+    captured.push(bytes);
+  }
+  let sidecar;
+  try {
+    sidecar = validateLinuxCredentialMutexBindingManifest(
+      JSON.parse(captured[1].toString("utf8")),
+    );
+  } catch { fail(FIXED_STATUS.linuxBindingInvalid); }
+  if (sidecar.bytes !== captured[0].byteLength || sidecar.sha256 !== sha256(captured[0])) {
+    fail(FIXED_STATUS.linuxBindingInvalid);
+  }
+  return Object.freeze({ bytes: sidecar.bytes, sha256: sidecar.sha256 });
 }
 
 async function validateWindowsBinding({ appPath, staged }) {
@@ -1054,7 +1097,7 @@ async function compareArtifactToStaged({ appPath, staged, archive, unpacked }) {
 }
 
 function summarizeBinding(target, binding) {
-  if (target !== WINDOWS_TARGET) {
+  if (target !== WINDOWS_TARGET && target !== "linux-x64") {
     return Object.freeze({ status: "not_applicable", bytes: 0, sha256: "0".repeat(64) });
   }
   return Object.freeze({
@@ -1089,7 +1132,9 @@ export async function verifyElectronDevelopmentArtifact({
     const unpacked = await walkFiles(selectedUnpackedPath);
     const binding = target === WINDOWS_TARGET
       ? await validateWindowsBinding({ appPath: selectedAppPath, staged })
-      : null;
+      : target === "linux-x64"
+        ? await validateLinuxBinding({ appPath: selectedAppPath, staged })
+        : null;
     validateTargetKeytar({ target, staged });
     validateNativeBoundary({
       target,

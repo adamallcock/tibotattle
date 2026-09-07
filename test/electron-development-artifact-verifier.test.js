@@ -13,6 +13,14 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import {
+  SYNTHETIC_LINUX_BINDING_BYTES,
+  syntheticLinuxBindingManifest,
+} from "./helpers/linux-packaging-binding.js";
+import {
+  LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH as LINUX_BINDING,
+  LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_RELATIVE_PATH as LINUX_MANIFEST,
+} from "../src/platform/linux-credential-mutex.js";
 
 import {
   ELECTRON_SHELL_RUNTIME_FILES,
@@ -182,7 +190,7 @@ async function makeFixture(
     extraArchive = null,
     keytarMutation = null,
     physicalUnpackedMutation = null,
-    unpackPattern = "**/*.node",
+    unpackPattern = target === "linux-x64" ? "{**/*.node,**/linux_credential_mutex.node.manifest.json}" : "**/*.node",
   } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-artifact-"));
@@ -228,6 +236,12 @@ async function makeFixture(
       Buffer.from(`${JSON.stringify(sidecar, null, 2)}\n`),
     );
   }
+  if (target === "linux-x64") {
+    files.set(LINUX_BINDING, SYNTHETIC_LINUX_BINDING_BYTES);
+    const linuxManifest = JSON.parse(JSON.stringify(syntheticLinuxBindingManifest()));
+    bindingManifestMutation?.(linuxManifest);
+    files.set(LINUX_MANIFEST, Buffer.from(JSON.stringify(linuxManifest)));
+  }
 
   const kinds = new Map([
     ["package.json", "runtime_metadata"],
@@ -239,6 +253,10 @@ async function makeFixture(
   if (target === "win32-x64") {
     kinds.set(WINDOWS_BINDING, "windows_native_binding");
     kinds.set(WINDOWS_BINDING_MANIFEST, "windows_native_binding");
+  }
+  if (target === "linux-x64") {
+    kinds.set(LINUX_BINDING, "linux_native_binding");
+    kinds.set(LINUX_MANIFEST, "linux_native_binding");
   }
   for (const [path, bytes] of files) await writeRelative(appPath, path, bytes);
   const rows = [...files.entries()]
@@ -348,8 +366,8 @@ test("verifies the target-specific Keytar boundary for macOS x64 and Linux x64",
       const result = await verify(fixture, target);
       assert.equal(result.status, FIXED_STATUS.verified, target);
       assert.equal(result.target, target, target);
-      assert.equal(result.nativeFileCount, 1, target);
-      assert.equal(result.binding.status, "not_applicable", target);
+      assert.equal(result.nativeFileCount, target === "linux-x64" ? 2 : 1, target);
+      assert.equal(result.binding.status, target === "linux-x64" ? "included_unverified" : "not_applicable", target);
       assert.equal(result.staged.sha256, result.artifact.sha256, target);
     });
   }
@@ -368,6 +386,21 @@ test("verifies the rebuilt macOS arm64 Electron directory artifact when present"
   assert.equal(result.target, "darwin-arm64");
   assert.equal(result.staged.count, result.artifact.count);
   assert.equal(result.nativeFileCount, 1);
+});
+
+test("Linux native artifact requires a matching closed sidecar and physical manifest", async () => {
+  for (const mutate of [
+    (manifest) => { manifest.sha256 = "f".repeat(64); },
+    (manifest) => { manifest.nativeClaims.productionSafe = true; },
+    (manifest) => { manifest.unreviewed = true; },
+  ]) {
+    await withFixture("linux-x64", { bindingManifestMutation: mutate }, async (fixture) => {
+      await assert.rejects(verify(fixture, "linux-x64"), { code: FIXED_STATUS.linuxBindingInvalid });
+    });
+  }
+  await withFixture("linux-x64", { unpackPattern: "**/*.node" }, async (fixture) => {
+    await assert.rejects(verify(fixture, "linux-x64"), { code: FIXED_STATUS.nativeInventoryInvalid });
+  });
 });
 
 test("verifies Windows x64 binding and sidecar digests without promoting provenance", async () => {

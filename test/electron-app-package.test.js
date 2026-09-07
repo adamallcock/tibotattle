@@ -27,6 +27,11 @@ import {
   ELECTRON_SHELL_RUNTIME_FILES,
 } from "../scripts/build-electron-runtime.mjs";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
+import { writeSyntheticLinuxBindingPair } from "./helpers/linux-packaging-binding.js";
+import {
+  LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH as LINUX_BINDING,
+  LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_RELATIVE_PATH as LINUX_MANIFEST,
+} from "../src/platform/linux-credential-mutex.js";
 
 const require = createRequire(import.meta.url);
 const BUILDER_CONFIG = require("../apps/electron/electron-builder.config.cjs");
@@ -105,6 +110,8 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
         "native/macos-keychain/contract.js",
         "native/windows-filesystem/build/Release/windows_filesystem.node",
         "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+        LINUX_BINDING,
+        LINUX_MANIFEST,
         "schemas/**",
         "src/**",
         "generated/**",
@@ -206,6 +213,11 @@ test("Electron builder configuration maps every development target to its native
       // electron-builder 26 otherwise supplies a legacy --no-sandbox default
       // for AppImage desktop entries when executableArgs is omitted.
       assert.deepEqual(config.linux.executableArgs, []);
+      assert.deepEqual(config.asarUnpack, [
+        "node_modules/@github/keytar/prebuilds/linux-x64/keytar.node",
+        LINUX_BINDING,
+        LINUX_MANIFEST,
+      ]);
     }
     else assert.equal(config.linux, undefined);
     if (target === "linux-x64") assert.equal(config.linux.executableName, "tibotattle-dev");
@@ -214,10 +226,12 @@ test("Electron builder configuration maps every development target to its native
 
 test("Electron app staging supports the non-Windows target-specific shell inputs", async () => {
   await withTemporaryDirectory(async (root) => {
+    const linuxInputs = await writeSyntheticLinuxBindingPair(root);
     for (const target of ["darwin-x64", "linux-x64"]) {
       const result = await buildElectronApp({
         output: join(root, target),
         target,
+        ...(target === "linux-x64" ? linuxInputs : {}),
       });
       const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
       assert.equal(manifest.target, ELECTRON_TARGETS[target].platform, target);
@@ -227,17 +241,25 @@ test("Electron app staging supports the non-Windows target-specific shell inputs
       assert.ok(manifest.files.some(({ path }) => path
         === `node_modules/@github/keytar/prebuilds/${ELECTRON_TARGETS[target].keytarArchitecture}/keytar.node`), target);
       assert.ok(manifest.files.some(({ path }) => path === "apps/electron/main.js"), target);
+      if (target === "linux-x64") {
+        for (const path of [LINUX_BINDING, LINUX_MANIFEST]) {
+          assert.equal(manifest.files.find((row) => row.path === path)?.kind, "linux_native_binding");
+        }
+        assert.equal(JSON.stringify(manifest).includes(linuxInputs.linuxBindingPath), false);
+      }
     }
   });
 });
 
 test("staged Electron main links in isolated plain Node for every target", async () => {
   await withTemporaryDirectory(async (root) => {
+    const linuxInputs = await writeSyntheticLinuxBindingPair(root);
     for (const target of Object.keys(ELECTRON_TARGETS)) {
       const result = await buildElectronRuntime({
         output: join(root, target),
         target,
         includeElectronShell: true,
+        ...(target === "linux-x64" ? linuxInputs : {}),
       });
       const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
       assert.equal(manifest.windowsBinding.included, false, target);
@@ -247,6 +269,22 @@ test("staged Electron main links in isolated plain Node for every target", async
       // buildElectronRuntime runs the same isolated plain-Node linkage check
       // before publishing the staged tree for every target.
     }
+  });
+});
+
+test("Linux shell staging refuses mismatched native sidecars and foreign-target input", async () => {
+  await withTemporaryDirectory(async (root) => {
+    const inputs = await writeSyntheticLinuxBindingPair(root);
+    await assert.rejects(buildElectronRuntime({
+      output: join(root, "foreign"), target: "darwin-arm64", includeElectronShell: true, ...inputs,
+    }), { code: "ELECTRON_RUNTIME_LINUX_BINDING_TARGET" });
+    const manifest = JSON.parse(await readFile(inputs.linuxManifestPath, "utf8"));
+    manifest.sha256 = "f".repeat(64);
+    await writeFile(inputs.linuxManifestPath, JSON.stringify(manifest));
+    await assert.rejects(buildElectronRuntime({
+      output: join(root, "mismatch"), target: "linux-x64", includeElectronShell: true, ...inputs,
+    }), { code: "ELECTRON_RUNTIME_LINUX_BINDING_MANIFEST" });
+    await assert.rejects(access(join(root, "mismatch")), { code: "ENOENT" });
   });
 });
 

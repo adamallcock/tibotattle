@@ -640,6 +640,19 @@ upload-only authority, enable production selection, or establish installed
 Linux qualification. Abandoned mutations require recovery and the underlying
 backend still reports `crashRecoveryComplete: false` and `productionSafe: false`.
 
+The Linux shell package requires the exact native mutex `.node` and sidecar
+from `native/linux-credential-mutex/build/qualification`, alongside the pinned
+Linux Keytar prebuild. Both mutex files are unpacked physical files so the
+loader's descriptor-based checks remain effective. Module-owned path mapping
+handles only the fixed `app.asar` to `app.asar.unpacked` layout; source paths
+remain unchanged. Staging and artifact verification use
+`validateLinuxCredentialMutexBindingManifest` for the closed sidecar schema,
+then independently compare its size/digest against captured bytes. The runtime
+manifest keeps its existing schema and records the pair as `linux_native_binding`
+inventory rows. These three exact unpacked files are required for Linux and
+cannot broaden another target's native inventory. Native execution and
+installed qualification remain separate.
+
 The dormant Linux accountless adapter uses a separate owner-private XDG-state
 record, not the legacy provider or social credential store. Its
 [fixed native boundary](../../native/linux-credential-mutex/README.md) exposes

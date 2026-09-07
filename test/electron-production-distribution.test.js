@@ -366,6 +366,20 @@ test("development builder retains the adapter contract but excludes the producti
   }
 });
 
+test("Linux development and production configs preserve the same physical credential pair", () => {
+  const pair = [
+    "native/linux-credential-mutex/build/qualification/linux_credential_mutex.node",
+    "native/linux-credential-mutex/build/qualification/linux_credential_mutex.node.manifest.json",
+  ];
+  for (const config of [loadDevelopmentBuilderConfig("linux-x64"), loadProductionBuilderConfig("linux-x64")]) {
+    for (const path of pair) assert.ok(config.files[0].filter.includes(path));
+    assert.deepEqual(config.asarUnpack, [
+      "node_modules/@github/keytar/prebuilds/linux-x64/keytar.node",
+      ...pair,
+    ]);
+  }
+});
+
 test("Windows candidate mapping is lossless, ordered, and accepted by the pinned builder resource path", () => {
   const candidates = ["1", "65535", "65536", BUILD_NUMBER, "9999999999"];
   let previous = -1n;

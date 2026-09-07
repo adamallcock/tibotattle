@@ -85,6 +85,8 @@ module.exports = {
         "native/macos-keychain/contract.js",
         "native/windows-filesystem/build/Release/windows_filesystem.node",
         "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
+        "native/linux-credential-mutex/build/qualification/linux_credential_mutex.node",
+        "native/linux-credential-mutex/build/qualification/linux_credential_mutex.node.manifest.json",
         "schemas/**",
         "src/**",
         "generated/**",
@@ -111,6 +113,10 @@ module.exports = {
       `node_modules/@github/keytar/prebuilds/${targetSpec.platform === "darwin"
         ? `${targetSpec.platform}-${targetSpec.architecture}`
         : `linux-${targetSpec.architecture}`}/keytar.node`,
+      ...(linuxTarget ? [
+        "native/linux-credential-mutex/build/qualification/linux_credential_mutex.node",
+        "native/linux-credential-mutex/build/qualification/linux_credential_mutex.node.manifest.json",
+      ] : []),
     ],
   extraMetadata: {
     main: "apps/electron/main.js",

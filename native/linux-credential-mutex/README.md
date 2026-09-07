@@ -81,6 +81,7 @@ Build and create the adjacent sidecar only on native Linux x86_64:
 
 ```text
 node "$(npm root --global)/npm/node_modules/node-gyp/bin/node-gyp.js" rebuild --directory native/linux-credential-mutex
+node scripts/stage-linux-credential-mutex-binding.mjs
 node scripts/build-linux-credential-mutex-manifest.mjs
 node scripts/qualify-linux-credential-mutex.mjs
 ```
@@ -91,3 +92,15 @@ provenance. `productionSafe` is deliberately false in both the binding and
 manifest. Source tests, native Ubuntu x86_64 qualification, or this README do
 not select this backend, Secret Service, participant identity, Electron
 composition, packaging, update feeds, or Linux support.
+
+Linux Electron shell staging requires the qualified `.node` and its adjacent
+manifest at the fixed `build/qualification` paths. The development and
+production builder configurations place both physical files in
+`app.asar.unpacked`; the loader derives that sibling path only from its own
+`app.asar` module location. Normal source-checkout paths are unchanged. The
+sidecar remains subject to the same descriptor, inode, no-symlink and digest
+checks. The public pure `validateLinuxCredentialMutexBindingManifest` function
+shares the closed schema with staging and artifact verification without loading
+native code or asserting provenance. Packaging rejects a missing/mismatched
+pair and does not include these files on other targets. This source contract
+does not establish an installed native or Secret Service runtime result.

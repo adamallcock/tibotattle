@@ -63,6 +63,11 @@ import {
 } from "./lib/electron-builder-package-json.mjs";
 import { extractEsmImports } from "./lib/esm-imports.mjs";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
+import {
+  LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH,
+  LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_RELATIVE_PATH,
+  validateLinuxCredentialMutexBindingManifest,
+} from "../src/platform/linux-credential-mutex.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -299,6 +304,7 @@ const WEB_FILE_KIND = "dashboard_asset";
 const WORKSPACE_PACKAGE_KIND = "workspace_dependency";
 const THIRD_PARTY_KIND = "third_party_dependency";
 const NATIVE_KIND = "windows_native_binding";
+const LINUX_NATIVE_KIND = "linux_native_binding";
 const METADATA_KIND = "runtime_metadata";
 const INVENTORY_KINDS = new Set([
   SOURCE_FILE_KIND,
@@ -307,6 +313,7 @@ const INVENTORY_KINDS = new Set([
   WORKSPACE_PACKAGE_KIND,
   THIRD_PARTY_KIND,
   NATIVE_KIND,
+  LINUX_NATIVE_KIND,
   METADATA_KIND,
 ]);
 
@@ -454,7 +461,10 @@ function assertReviewedRuntimePath(relativePath, label = "runtime path") {
   if (new Set(["package-lock.json", "pnpm-lock.yaml", ".npmrc"]).has(folded)
       || (folded.startsWith("native/windows-filesystem/build/")
         && folded !== WINDOWS_BINDING_RELATIVE_PATH.toLowerCase()
-        && folded !== WINDOWS_MANIFEST_RELATIVE_PATH.toLowerCase())) {
+        && folded !== WINDOWS_MANIFEST_RELATIVE_PATH.toLowerCase())
+      || (folded.startsWith("native/linux-credential-mutex/build/")
+        && folded !== LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH
+        && folded !== LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_RELATIVE_PATH)) {
     fail("FORBIDDEN_SOURCE", `${label} is not a runtime input: ${selected}`);
   }
   return selected;
@@ -1248,6 +1258,35 @@ async function stageWindowsBinding({ stagingRoot, pair }) {
   ];
 }
 
+async function stageLinuxBinding({ stagingRoot, bindingPath, manifestPath }) {
+  const binding = await captureRegularFile(bindingPath, "Linux binding", {
+    maximumBytes: MAXIMUM_BINDING_BYTES,
+  });
+  const sidecar = await captureRegularFile(manifestPath, "Linux binding manifest", {
+    maximumBytes: 64 * 1024,
+  });
+  let manifest;
+  try {
+    manifest = validateLinuxCredentialMutexBindingManifest(
+      JSON.parse(sidecar.bytes.toString("utf8")),
+    );
+  } catch {
+    fail("LINUX_BINDING_MANIFEST", "Linux binding manifest is invalid");
+  }
+  if (manifest.bytes !== binding.byteLength || manifest.sha256 !== binding.sha256) {
+    fail("LINUX_BINDING_MANIFEST", "Linux binding manifest does not match its binding");
+  }
+  await writeCapturedFile(
+    outputPath(stagingRoot, LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH),
+    binding.bytes,
+    0o555,
+  );
+  await writeCapturedFile(
+    outputPath(stagingRoot, LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_RELATIVE_PATH),
+    sidecar.bytes,
+  );
+}
+
 async function collectInventory(stagingRoot) {
   const files = await walkFiles(stagingRoot);
   const rows = [];
@@ -1265,6 +1304,8 @@ async function collectInventory(stagingRoot) {
     if (path === "package.json") kind = METADATA_KIND;
     if (path === WINDOWS_BINDING_RELATIVE_PATH
         || path === WINDOWS_MANIFEST_RELATIVE_PATH) kind = NATIVE_KIND;
+    if (path === LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH
+        || path === LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_RELATIVE_PATH) kind = LINUX_NATIVE_KIND;
     rows.push({
       bytes: captured.byteLength,
       kind,
@@ -1515,6 +1556,8 @@ export async function buildElectronRuntime({
   replace = false,
   windowsBindingPath,
   windowsManifestPath,
+  linuxBindingPath,
+  linuxManifestPath,
   includeElectronShell = false,
   packagingProfile = DEFAULT_PACKAGING_PROFILE,
   packageVersion = RELEASE_VERSION,
@@ -1571,6 +1614,10 @@ export async function buildElectronRuntime({
   if (selectedTarget !== WINDOWS_X64_TARGET
       && (windowsBindingPath || windowsManifestPath)) {
     fail("WINDOWS_BINDING_TARGET", "Windows binding arguments require the Windows target");
+  }
+  if ((selectedTarget !== LINUX_X64_TARGET || !includeElectronShell)
+      && (linuxBindingPath || linuxManifestPath)) {
+    fail("LINUX_BINDING_TARGET", "Linux binding arguments require the Linux shell target");
   }
   const destination = await validateOutputDestination(output, REPOSITORY_ROOT, replace);
   if (destination.existed) {
@@ -1688,9 +1735,16 @@ export async function buildElectronRuntime({
       });
     }
 
-    if (includeElectronShell) {
-      await assertStagedElectronShellNodeLinkage(temporaryRoot);
+    if (includeElectronShell && selectedTarget === LINUX_X64_TARGET) {
+      const bindingPath = resolve(linuxBindingPath
+        ?? join(REPOSITORY_ROOT, LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH));
+      await stageLinuxBinding({
+        stagingRoot: temporaryRoot,
+        bindingPath,
+        manifestPath: resolve(linuxManifestPath ?? `${bindingPath}.manifest.json`),
+      });
     }
+    if (includeElectronShell) await assertStagedElectronShellNodeLinkage(temporaryRoot);
 
     const inventory = await collectInventory(temporaryRoot);
     if (windowsBinding.included) {
