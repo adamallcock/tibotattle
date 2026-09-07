@@ -104,6 +104,14 @@ deferrals log `queriesUsed`, `phaseQueries`, `elapsedMs` and
 refresh interval. Never extend freshness or edit generation timestamps to hide
 publication starvation.
 
+The separate admin growth-history cache has the same two-hour read limit.
+Inspect `admin_metrics_history_cache.generated_at` and the latest
+`admin_metric_snapshots.captured_at` independently of allowance availability.
+Even-minute passes give these self-throttled caches an early opportunity after
+allowance publication. `admin_metrics_snapshot` and `admin_metrics_history_cache`
+log refresh/failure timing or `OWNER_METRICS_BUDGET_DEFERRED`; a current cache is
+quiet. Their failure must not be reported as an allowance or database outage.
+
 ### Only one day in the admin "By model" chart
 
 The original per-model view recorded forward daily snapshots, whereas the

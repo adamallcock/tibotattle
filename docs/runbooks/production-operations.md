@@ -93,6 +93,12 @@ incomplete cohort repeatedly crowd out the calculations needed to repair it.
 An unavailable early preview retries after reconstruction and before daily
 reconciliation. A current preview keeps its normal refresh interval;
 neither a browser read nor a scheduler deadline extends its two-hour validity.
+Even-minute passes also admit owner gauge capture and growth-history cache
+refresh after the allowance preview but before reconstruction. Each retains its
+55-minute self-throttle and runs at most once per invocation; odd-minute passes
+and other reconstruction modes retain the late fallback. GitHub synchronization
+remains late. Required lifecycle work still comes first, and every optional
+admission uses the same statement meter and deadline.
 Content-free preview/analysis phase logs include elapsed time, remaining time
 and actual statement counts. The lifecycle `last_completed_at` stamp precedes
 optional work and must not be mistaken for the whole invocation duration.

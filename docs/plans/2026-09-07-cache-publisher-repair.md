@@ -39,6 +39,21 @@ fixed setup receipt (49 statements, 46 primary and 3 ledger), keeps the unchange
 900-query ceiling, and covers both priority paths. Final qualification and
 natural live recovery remain pending; no production repair is claimed yet.
 
+`d46084ed` then passed all 805 Worker tests and guarded deployment. Natural
+publication at 16:18:35 UTC refreshed the preview after 16,331ms and 27 phase
+statements; independent public/admin response and rendered plan/model checks
+passed. A concurrent Intel website deployment at `9ae9be5c` replaced that
+scheduler afterward. Its two commits are now merged locally; coordination is
+authorized and the next deployment must preserve both changes.
+
+The independently checked admin growth-history cache also expired: generation
+13:20:23 UTC, 227,912 bytes, latest gauge 13:20:22 UTC, HTTP 503. Its admission is
+after the same exhausted deadline. Give gauge capture and history refresh an
+early opportunity after the even-minute allowance preview, keep odd-minute
+reconstruction intact, retain late fallback and attempt each cache at most once.
+Preserve their existing shape validation, 55-minute cadence and two-hour limit.
+Combined source qualification and natural metrics recovery remain open.
+
 - Isolate the publisher refusal after successful account-cache validation,
   using a local reproduction and bounded, content-free production observations.
   Prior observations establish expiry and publication failure, not root cause.

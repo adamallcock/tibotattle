@@ -3804,6 +3804,40 @@ export async function runScheduledMaintenance(
   } });
   const maintenanceStartedMs = Date.now();
   const optionalDeadlineMs = maintenanceStartedMs + 40_000;
+  const phaseTiming = () => {
+    const nowMs = Date.now();
+    return { queriesUsed: queryMeter.queriesUsed,
+      elapsedMs: Math.max(0, nowMs - maintenanceStartedMs),
+      deadlineRemainingMs: Math.max(0, optionalDeadlineMs - nowMs) };
+  };
+  const attemptedMetricCaches = new Set<string>();
+  const warmOwnerMetricCaches = async (phase: "before_analysis" | "after_analysis") => {
+    // These scheduled-only helpers retain their 55-minute self-throttle. A
+    // browser never rebuilds them; at most one attempt per cache per invocation.
+    for (const task of [
+      { event: "admin_metrics_snapshot", current: "SNAPSHOT_CURRENT", unavailable: "SNAPSHOT_UNAVAILABLE", run: captureAdminMetricSnapshot },
+      { event: "admin_metrics_history_cache", current: "HISTORY_CACHE_CURRENT", unavailable: "HISTORY_CACHE_UNAVAILABLE", run: warmAdminMetricsHistoryCache },
+    ]) {
+      if (attemptedMetricCaches.has(task.event)) continue;
+      if (queryMeter.remainingQueries < 40 || Date.now() >= optionalDeadlineMs) {
+        console.log(JSON.stringify({level:"info",event:task.event,phase,outcome:"deferred",
+          code:"OWNER_METRICS_BUDGET_DEFERRED",...phaseTiming()}));
+        continue;
+      }
+      attemptedMetricCaches.add(task.event);
+      const startedQueries = queryMeter.queriesUsed;
+      let code = task.unavailable;
+      try { code = (await task.run(env.USAGE_MONITOR_DB, Date.now())).code; }
+      catch { /* Keep prior cache; diagnostics cannot undo required work. */ }
+      if (code === task.current) continue;
+      const unavailable = code === task.unavailable;
+      const log = {level:unavailable ? "warn" : "info",event:task.event,phase,
+        outcome:unavailable ? "failure" : "success",code,
+        phaseQueries:queryMeter.queriesUsed-startedQueries,...phaseTiming()};
+      if (unavailable) console.warn(JSON.stringify(log));
+      else console.log(JSON.stringify(log));
+    }
+  };
   let lifecycleComplete = false;
   let quarantineRetentionComplete = false;
   let restoreReplayComplete = false;
@@ -3970,12 +4004,6 @@ export async function runScheduledMaintenance(
             // their conservative allocation within each phase, while this one
             // meter enforces the sum across both bindings and ALL phases.
             const phaseBudget = () => ({ remainingQueries: Math.max(0, queryMeter.remainingQueries), deadlineMs: optionalDeadlineMs });
-            const phaseTiming = () => {
-              const nowMs = Date.now();
-              return { queriesUsed: queryMeter.queriesUsed,
-                elapsedMs: Math.max(0, nowMs - maintenanceStartedMs),
-                deadlineRemainingMs: Math.max(0, optionalDeadlineMs - nowMs) };
-            };
             const publishPreview = async (phase: "before_analysis" | "after_analysis") => {
               const startedQueries = queryMeter.queriesUsed;
               const result = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime,
@@ -3999,6 +4027,10 @@ export async function runScheduledMaintenance(
             const priorPreview = Math.floor(scheduledTime / 60_000) % 2 === 0
               ? await publishPreview("before_analysis")
               : null;
+            // The independent growth-history cache has the same expiry risk.
+            // Give it an early chance only on preview-first passes, retaining
+            // the odd-minute reconstruction budget and the late fallback.
+            if (priorPreview !== null) await warmOwnerMetricCaches("before_analysis");
             try {
               if (queryMeter.remainingQueries >= 249 && Date.now() < optionalDeadlineMs) {
               let backfill = await backfillV1QuotaFitProjection(env.USAGE_MONITOR_DB);
@@ -4089,22 +4121,7 @@ export async function runScheduledMaintenance(
         if (sync.code === "GITHUB_SYNC_FAILED") console.warn(JSON.stringify({level:"warn",event:"github_distribution_sync",outcome:"failure",code:sync.failureCode}));
       } catch { /* Optional diagnostics never block maintenance. */ }
     }
-    if (queryMeter.remainingQueries >= 40 && Date.now() < optionalDeadlineMs) {
-      try {
-        const snapshot = await captureAdminMetricSnapshot(env.USAGE_MONITOR_DB, Date.now());
-        if (snapshot.code === "SNAPSHOT_UNAVAILABLE") {
-          console.warn(JSON.stringify({level:"warn",event:"admin_metrics_snapshot",outcome:"failure",code:snapshot.code}));
-        }
-      } catch { /* Source remains unavailable. */ }
-    }
-    if (queryMeter.remainingQueries >= 40 && Date.now() < optionalDeadlineMs) {
-      try {
-        const historyCache = await warmAdminMetricsHistoryCache(env.USAGE_MONITOR_DB, Date.now());
-        if (historyCache.code === "HISTORY_CACHE_UNAVAILABLE") {
-          console.warn(JSON.stringify({level:"warn",event:"admin_metrics_history_cache",outcome:"failure",code:historyCache.code}));
-        }
-      } catch { /* Keep prior cache. */ }
-    }
+    await warmOwnerMetricCaches("after_analysis");
 
     const complete = lifecycleComplete
       && quarantineReconciliationComplete

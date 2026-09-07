@@ -29,6 +29,7 @@ vi.mock("../src/quota-fit-projection", async original => {
 
 import { runScheduledMaintenance } from "../src/index";
 import { validCachedAdminCommunityAllowancePreview } from "../src/admin-community-allowance";
+import { readCachedAdminMetricsHistory } from "../src/admin-metrics-history";
 import { putTrackedQuarantineObject } from "../src/quarantine-reconciliation";
 import { createV11DeviceFixture } from "./helpers/telemetry-v11";
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
@@ -307,6 +308,44 @@ describe("actual scheduled resumable analysis recovery", () => {
     expect(warnSpy.mock.calls.some(([message]) => String(message).includes("admin_allowance_preview_cache"))).toBe(false);
     expect(logs.some(log => log.event === "scheduled_model_history")).toBe(false);
     expect(observation.queries.filter(entry => entry.sql === V1_PLAN_QUOTA_PAGE_SQL || entry.sql === V1_FIT_QUOTA_PAGE_SQL)).toEqual([]);
+    expect(inspection.rawFits).not.toHaveBeenCalled(); expect(inspection.rawModels).not.toHaveBeenCalled();
+    assertMeter(observation); await released();
+  });
+
+  it("refreshes expired owner metrics before slow account probes and never attempts a cache twice", async () => {
+    await seedQuota(200);
+    const started = Date.now();
+    let currentTime = started;
+    vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+    const setup = observe();
+    await runScheduledMaintenance(bindings(setup), NOW);
+    const prior = await readCachedAdminMetricsHistory(db(), started);
+    expect(prior.generatedAt).toBe(new Date(started).toISOString());
+    assertMeter(setup); await released();
+
+    const refreshedAt = started + 3 * 3_600_000;
+    currentTime = refreshedAt;
+    await expect(readCachedAdminMetricsHistory(db(), currentTime)).rejects.toMatchObject({ code: "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE" });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const metricsAtProbe: { generatedAt?: string; capturedAt?: string } = {};
+    const observation = observe(async (entry, moment) => {
+      if (metricsAtProbe.generatedAt || moment !== "after" || !entry.sql.includes("FROM community_model_composition_cache")
+          || !entry.sql.includes("WHERE participant_id=?1")) return;
+      metricsAtProbe.generatedAt = (await readCachedAdminMetricsHistory(db(), refreshedAt)).generatedAt;
+      metricsAtProbe.capturedAt = (await db().prepare("SELECT MAX(captured_at) AS captured_at FROM admin_metric_snapshots")
+        .first<{ captured_at: string }>())!.captured_at;
+      currentTime = refreshedAt + 40_001;
+    });
+    expect(await runScheduledMaintenance(bindings(observation), NOW + 3 * 3_600_000))
+      .toMatchObject({ outcome: "success", lifecycleComplete: true });
+    expect(metricsAtProbe).toEqual({ generatedAt: new Date(refreshedAt).toISOString(), capturedAt: new Date(refreshedAt).toISOString() });
+    expect(observation.queries.filter(entry => entry.sql.includes("FROM admin_metrics_history_cache"))).toHaveLength(1);
+    expect(observation.queries.filter(entry => entry.sql.includes("SELECT MAX(captured_at) AS captured_at FROM admin_metric_snapshots"))).toHaveLength(1);
+    const logs = logSpy.mock.calls.map(([message]) => JSON.parse(String(message)) as { event: string });
+    expect(logs).toContainEqual(expect.objectContaining({ event: "admin_metrics_history_cache", phase: "before_analysis",
+      outcome: "success", code: "HISTORY_CACHE_REFRESHED", phaseQueries: 18, elapsedMs: 0, deadlineRemainingMs: 40_000 }));
+    expect(logs).toContainEqual(expect.objectContaining({ event: "admin_metrics_snapshot", phase: "before_analysis",
+      outcome: "success", code: "SNAPSHOT_CAPTURED", phaseQueries: 5 }));
     expect(inspection.rawFits).not.toHaveBeenCalled(); expect(inspection.rawModels).not.toHaveBeenCalled();
     assertMeter(observation); await released();
   });
