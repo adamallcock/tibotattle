@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-07
 type: status
 status: current
-source_commit: 3f82d9aca1c5de73b63f929b61a3f0b5fa842cad
+source_commit: df5599707df189678079c15e683c18a7e0a5da1f
 observation_date: 2026-09-07
 ---
 
@@ -41,7 +41,29 @@ substitutes for SLSA build provenance. Follow
 
 ## Hosted service and community graphs
 
-### Verified public graph state
+### Current presentation and live-data availability
+
+On 2026-09-07 the guarded deployment published
+`df5599707df189678079c15e683c18a7e0a5da1f`. Public and admin plan cards now
+include the actual plan's weekly API-equivalent value beneath the normalized
+Pro 20x figure (divide by 1, 4 or 20). Admin also shares the compact model
+themes/order, fitted All-history dates, legend focus and responsive chart
+labels. All 545 web and 802 Worker runtime tests passed, alongside deployment
+and release checks. Exact live source/assets, private-route isolation and the
+authenticated admin module graph are verified; both existing 0.1.18 installers
+remain unchanged. See the [deployment receipt](./receipts/2026-09-07-plan-values-admin-graph-parity.md).
+
+Live plan/model rendering is currently blocked independently of that update.
+Before deployment at 15:09 UTC, the shared preview cache was already unavailable:
+its 13:05:41 UTC snapshot exceeded the two-hour freshness limit. Public plan/model
+views and the admin allowance preview therefore withhold values. The aggregate
+allowance and activity views remain available. Bounded metadata and a natural
+scheduled log confirm current account caches and healthy maintenance, followed
+by aggregate cache-publication failure; the deeper cause is not established.
+No freshness bypass, manual rebuild or telemetry rewrite was performed. This
+supersedes the availability claims below, not their point-in-time evidence.
+
+### Earlier verified public graph state
 
 On 2026-09-07 the guarded deployment published
 `3f82d9aca1c5de73b63f929b61a3f0b5fa842cad`. Independent health, public response
@@ -55,7 +77,7 @@ dense markers are thinned without discarding inspection points and legends can
 focus one series. See the [presentation receipt](./receipts/2026-09-07-public-graph-polish.md)
 and the [original view deployment](./receipts/2026-09-07-public-allowance-views-deployment.md).
 
-The inspected public cache supplied 69 closed-date breakdown rows. Identified
+The earlier inspected public cache supplied 69 closed-date breakdown rows. Identified
 GPT-5.5 and GPT-5.6 history covered September 2–6; Astra covered September 5–6.
 Read-only metadata confirms September 1 completed at 13:21:16 UTC, after the
 13:05:41 public snapshot; August 31 is next. Automatic backfill targets the
