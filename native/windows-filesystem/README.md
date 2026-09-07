@@ -77,6 +77,16 @@ step fails.
   protects ordinary application races; a same-user process can still swap the
   destination name in the final kernel operation, so callers must retain the
   production gate until a stronger conditional-replacement proof is accepted.
+- `inspectProtectedChild(root, rootIdentity, child)`,
+  `readProtectedChild(root, rootIdentity, child, maximumBytes)`,
+  `createProtectedChild(root, rootIdentity, child, bytes)`,
+  `deleteProtectedChild(root, rootIdentity, child, expectedIdentity)`, and
+  `replaceProtectedChild(root, rootIdentity, child, expectedIdentity, bytes)`
+  first reopen and authenticate `root`, compare its handle identity with the
+  caller-supplied identity, then resolve each child component relative to that
+  held root handle. Child input is parsed again natively, so a JavaScript path
+  check cannot redirect the operation. The read variant rejects a file larger
+  than `maximumBytes` before allocating the returned byte vector.
 - `acquireCredentialMutex(capabilityId)` accepts only one of four fixed numeric
   capability IDs, derives a per-user `Local\` kernel-object name from the
   current SID, applies and revalidates a protected owner-only DACL, and performs
@@ -102,3 +112,10 @@ runtime or package is introduced. The native binding remains Windows x64-only.
 Credential mutation audit durability is provided separately by the fixed
 SQLite prepared/settled/recovered journal; neither the mutex nor audit enables
 the still-disabled Windows production selectors.
+
+The protected-child operations are real binding exports, but the v1 manifest
+does not yet require them and the public protected-state readiness facts remain
+false. Native Windows x64 CI must build this source, execute the protected-child
+security tests, and retain its receipt before an installed Electron path can
+rely on root-binding or bounded-read claims. The residual same-user replacement
+race and installer/signing provenance remain separate production gates.

@@ -24,12 +24,14 @@ export const WINDOWS_PROTECTED_STATE_STORE_CONTRACT_VERSION =
 export const WINDOWS_PROTECTED_STATE_STORE_LEASE_VERSION =
   "windows-protected-state-store-lease-v1";
 // Keep the store's bound at or below the native adapter's authenticated
-// read ceiling.  The native implementation currently rejects a larger
-// request before allocating a result buffer.
+// read ceiling. The source binding enforces the requested cap before its
+// result allocation; this readiness fact remains false until the native
+// Windows build and security suite have retained that evidence.
 export const WINDOWS_PROTECTED_STATE_STORE_DEFAULT_MAX_BYTES = 1024 * 1024;
-// These are explicit readiness facts, not claims.  The current native
-// adapter does not bind a root identity/handle to each child operation, and
-// its read method can materialize more than this store's post-read bound.
+// These are explicit readiness facts, not source-feature flags. The binding
+// source now has root-bound child operations and a requested read cap, but an
+// installed Windows binary, its manifest, and native Windows tests have not
+// yet qualified either guarantee for production use.
 export const WINDOWS_PROTECTED_STATE_STORE_ROOT_BINDING_SAFE = false;
 export const WINDOWS_PROTECTED_STATE_STORE_NATIVE_READ_BOUNDED = false;
 
@@ -43,6 +45,13 @@ const RESERVED_DEVICE_NAMES = new Set([
   "CON", "PRN", "AUX", "NUL",
   "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
   "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+]);
+const ROOT_BOUND_CHILD_METHODS = Object.freeze([
+  "inspectProtectedChild",
+  "readProtectedChild",
+  "createProtectedChild",
+  "deleteProtectedChild",
+  "replaceProtectedChild",
 ]);
 
 const ERROR_CODES = new Set([
@@ -196,7 +205,17 @@ function validateConfiguration(options) {
     windowsQualificationModeContext = null,
     resourceRoot = null,
   } = options;
-  if (!isWindowsFilesystemAdapter(adapter)) fail("invalid_adapter");
+  let supportsRootBoundChildren = false;
+  try {
+    supportsRootBoundChildren = isWindowsFilesystemAdapter(adapter)
+      && ROOT_BOUND_CHILD_METHODS.every((method) => typeof adapter[method] === "function");
+  } catch {
+    supportsRootBoundChildren = false;
+  }
+  // Refuse an older native binding before ensureProtectedDirectory could
+  // create a root. A source-level fake must expose the same complete child
+  // surface as the installed native binary that this store will invoke.
+  if (!supportsRootBoundChildren) fail("invalid_adapter");
   if (typeof audit !== "function" && audit !== null) fail("invalid_configuration");
   if (typeof idFactory !== "function") fail("invalid_configuration");
   if (!Number.isSafeInteger(maxBytes)

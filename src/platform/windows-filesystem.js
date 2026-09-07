@@ -375,11 +375,11 @@ export function createWindowsFilesystemAdapter({
       && native.pathWalkRaceSafe === true,
     pathWalkRaceSafe: approvedPolicy?.pathWalkRaceSafe === true
       && native.pathWalkRaceSafe === true,
-    // The current native contract predates the protected-child operations.
-    // Preserve the existing filesystem adapter surface while forwarding these
-    // optional methods when a newer, explicitly injected/native binding has
-    // them. The protected Windows state store validates the branded adapter
-    // before using this optional closure.
+    // The binding source exports these root-bound child operations. Keep them
+    // optional at this v1 manifest boundary until a native Windows build and
+    // qualification record make the installed binary surface required. The
+    // protected store rejects an adapter missing any one of them before it
+    // creates its root.
     ...(typeof native.inspectProtectedChild === "function"
       ? {
         inspectProtectedChild(rootPath, rootIdentity, childPath) {

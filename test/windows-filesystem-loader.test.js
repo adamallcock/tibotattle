@@ -11,6 +11,12 @@ import {
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../src/platform/windows-filesystem.js";
+import {
+  createWindowsProtectedStateStore,
+  isWindowsProtectedStateStoreError,
+  WINDOWS_PROTECTED_STATE_STORE_NATIVE_READ_BOUNDED,
+  WINDOWS_PROTECTED_STATE_STORE_ROOT_BINDING_SAFE,
+} from "../src/platform/windows-protected-state-store.js";
 
 const IDENTITY = Object.freeze({
   volumeSerialNumber: "0000000000000001",
@@ -275,6 +281,74 @@ test("adapter validates native identities and keeps operation errors fixed", () 
   });
   assert.equal(isWindowsFilesystemNotFound({ code: "ENOENT" }), true);
   assert.equal(isWindowsFilesystemAlreadyExists({ code: "EEXIST" }), true);
+});
+
+test("adapter forwards every root-bound protected-child operation", () => {
+  const calls = [];
+  const protectedMetadata = Object.freeze({ marker: "inspect" });
+  const protectedRead = Object.freeze({ data: Buffer.from("protected"), identity: IDENTITY });
+  const protectedDelete = Object.freeze({ deleted: true, identity: IDENTITY });
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding({
+      inspectProtectedChild(...arguments_) {
+        calls.push(["inspect", ...arguments_]);
+        return protectedMetadata;
+      },
+      readProtectedChild(...arguments_) {
+        calls.push(["read", ...arguments_]);
+        return protectedRead;
+      },
+      createProtectedChild(...arguments_) {
+        calls.push(["create", ...arguments_]);
+        return IDENTITY;
+      },
+      deleteProtectedChild(...arguments_) {
+        calls.push(["delete", ...arguments_]);
+        return protectedDelete;
+      },
+      replaceProtectedChild(...arguments_) {
+        calls.push(["replace", ...arguments_]);
+        return IDENTITY;
+      },
+    }),
+  });
+  const root = "C:\\state\\private";
+  const child = "settings.json";
+  const first = Buffer.from("first", "utf8");
+  const second = Buffer.from("second", "utf8");
+
+  assert.equal(adapter.inspectProtectedChild(root, IDENTITY, child), protectedMetadata);
+  assert.equal(adapter.readProtectedChild(root, IDENTITY, child, 64), protectedRead);
+  assert.deepEqual(adapter.createProtectedChild(root, IDENTITY, child, first), IDENTITY);
+  assert.equal(adapter.deleteProtectedChild(root, IDENTITY, child, IDENTITY), protectedDelete);
+  assert.deepEqual(adapter.replaceProtectedChild(root, IDENTITY, child, IDENTITY, second), IDENTITY);
+  assert.deepEqual(calls, [
+    ["inspect", root, IDENTITY, child],
+    ["read", root, IDENTITY, child, 64],
+    ["create", root, IDENTITY, child, first],
+    ["delete", root, IDENTITY, child, IDENTITY],
+    ["replace", root, IDENTITY, child, IDENTITY, second],
+  ]);
+});
+
+test("protected state rejects an adapter without the complete native child surface", () => {
+  assert.equal(WINDOWS_PROTECTED_STATE_STORE_ROOT_BINDING_SAFE, false);
+  assert.equal(WINDOWS_PROTECTED_STATE_STORE_NATIVE_READ_BOUNDED, false);
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding(),
+  });
+  assert.throws(
+    () => createWindowsProtectedStateStore({
+      adapter,
+      rootPath: "C:\\state\\private",
+    }),
+    (error) => isWindowsProtectedStateStoreError(error)
+      && error.code === "windows_protected_state_store_invalid_adapter",
+  );
 });
 
 test("adapter rejects malformed native identities before use", () => {
