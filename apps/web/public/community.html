@@ -305,6 +305,34 @@
                     <img class="download-platform-icon" src="./apple.svg" alt="" width="22" height="22">
                     <span data-i18n="installer.macosIntel.download">Download for macOS Intel</span>
                   </a>
+                  <div
+                    class="homebrew-install"
+                    id="intel-homebrew-install"
+                    role="group"
+                    aria-label="Install with Homebrew"
+                    data-i18n-aria-label="aria.installWithHomebrew"
+                    hidden
+                  >
+                    <span class="homebrew-prompt" aria-hidden="true">$</span>
+                    <code id="intel-homebrew-install-command" data-i18n-skip>brew install --cask adamallcock/tap/tibotattle</code>
+                    <button
+                      class="homebrew-copy-button"
+                      id="intel-homebrew-copy-button"
+                      type="button"
+                      aria-label="Copy Homebrew install command"
+                      aria-describedby="intel-homebrew-copy-status"
+                      data-i18n-aria-label="aria.copyHomebrewCommand"
+                    >
+                      <span id="intel-homebrew-copy-label" data-i18n="installer.homebrew.copy">Copy</span>
+                    </button>
+                  </div>
+                  <span
+                    class="sr-only"
+                    id="intel-homebrew-copy-status"
+                    role="status"
+                    aria-live="polite"
+                    aria-atomic="true"
+                  ></span>
                 </div>
                 <div class="installer-details installer-details-compact" id="intel-installer-details" hidden>
                   <span class="installer-summary">
