@@ -1,0 +1,231 @@
+#!/usr/bin/env node
+
+// A disposable, synthetic qualification of an already verified Windows package.
+// The ordinary development launcher never enables this mutation-only test seam.
+import { spawn, execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { lstat, open, readFile, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import {
+  assertWindowsDevelopmentPackageLayout,
+  prepareWindowsDevelopmentProfile,
+  buildWindowsDevelopmentLaunchSpec,
+} from "./launch-electron-windows-development.mjs";
+import { verifyElectronDevelopmentArtifact } from "./verify-electron-development-artifact.mjs";
+
+const TYPE = "windows-electron-smoke-v1";
+const PREFIX = "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_";
+const SHA = /^[0-9a-f]{64}$/u;
+const REVISION = /^[0-9a-f]{40}$/u;
+const COMMANDS = new Set(["status-v1", "accountless-storage-v1", "quit-v1"]);
+const delay = (ms) => new Promise((done) => setTimeout(done, ms));
+function fail(code) { throw Object.assign(new Error(`${PREFIX}${code}`), { code: `${PREFIX}${code}` }); }
+function fixedCode(error) { return new RegExp(`^${PREFIX}[A-Z_]+$`, "u").test(error?.code ?? "") ? error.code : `${PREFIX}FAILED`; }
+
+export function parseWindowsAccountlessSmokeArguments(argv) {
+  const keys = new Map([
+    ["--app", "appPath"], ["--staged-app", "stagedAppPath"],
+    ["--package-receipt", "packageReceiptPath"], ["--source-revision", "sourceRevision"],
+    ["--receipt", "receiptPath"],
+  ]);
+  const result = {};
+  if (!Array.isArray(argv)) fail("ARGUMENT_INVALID");
+  for (let index = 0; index < argv.length; index += 2) {
+    const key = keys.get(argv[index]);
+    const value = argv[index + 1];
+    if (!key || Object.hasOwn(result, key) || typeof value !== "string" || !value || value.includes("\0")) fail("ARGUMENT_INVALID");
+    if (key === "sourceRevision" ? !REVISION.test(value) : !isAbsolute(value)) fail("ARGUMENT_INVALID");
+    result[key] = value;
+  }
+  if (Object.keys(result).length !== keys.size) fail("ARGUMENT_INVALID");
+  return Object.freeze(result);
+}
+
+async function regularFile(path, maxBytes = Infinity) {
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1 || metadata.size > maxBytes) fail("FILE_UNSAFE");
+  return metadata;
+}
+
+async function digest(path) {
+  await regularFile(path);
+  const handle = await open(path, "r");
+  try {
+    const hash = createHash("sha256");
+    let bytes = 0;
+    for await (const chunk of handle.createReadStream({ autoClose: false })) { hash.update(chunk); bytes += chunk.length; }
+    return { bytes, sha256: hash.digest("hex") };
+  } finally { await handle.close(); }
+}
+
+export function assertWindowsAccountlessPackageIdentity({ receipt, sourceRevision, executable, asar }) {
+  if (!REVISION.test(sourceRevision ?? "") || receipt?.sourceRevision !== sourceRevision
+      || receipt?.target !== "win32-x64" || receipt?.status !== "development_package_verified"
+      || receipt?.runtimeExecuted !== false) fail("PACKAGE_IDENTITY_INVALID");
+  for (const [key, observed] of Object.entries({ executable, asar })) {
+    const expected = receipt[key];
+    if (!SHA.test(expected?.sha256 ?? "") || !Number.isSafeInteger(expected?.bytes) || expected.bytes <= 0
+        || expected.sha256 !== observed?.sha256 || expected.bytes !== observed?.bytes) fail("PACKAGE_IDENTITY_INVALID");
+  }
+}
+
+export async function verifyWindowsAccountlessSmokePackage(options) {
+  await assertWindowsDevelopmentPackageLayout({ appPath: options.appPath, platform: "win32", architecture: "x64" });
+  await regularFile(options.packageReceiptPath, 256 * 1024);
+  const receipt = JSON.parse(await readFile(options.packageReceiptPath, "utf8"));
+  const asarPath = join(dirname(options.appPath), "resources", "app.asar");
+  const executable = await digest(options.appPath);
+  const asar = await digest(asarPath);
+  assertWindowsAccountlessPackageIdentity({ receipt, sourceRevision: options.sourceRevision, executable, asar });
+  await verifyElectronDevelopmentArtifact({ target: "win32-x64", appPath: options.stagedAppPath, asarPath, unpackedPath: `${asarPath}.unpacked` });
+  return Object.freeze({ sourceRevision: options.sourceRevision, artifactSha256: asar.sha256, executableSha256: executable.sha256 });
+}
+
+// Install listeners before sending. No credential bytes or caller-selected
+// operation can enter this protocol, even when the packaged app misbehaves.
+export function createWindowsAccountlessSmokeProtocol(child, { timeoutMs = 60000 } = {}) {
+  let closed = false;
+  let pending = null;
+  const finish = (error, value) => {
+    const selected = pending;
+    if (!selected) return;
+    pending = null;
+    clearTimeout(selected.timer);
+    clearInterval(selected.poll);
+    if (error) selected.reject(error); else selected.resolve(value);
+  };
+  const failure = (code) => Object.assign(new Error(`${PREFIX}${code}`), { code: `${PREFIX}${code}` });
+  const onEnd = () => { closed = true; finish(failure("CHILD_EXITED")); };
+  const onMessage = (value) => {
+    if (!pending || value?.type !== TYPE) return;
+    const command = pending.command;
+    if (command === "status-v1" && value.message === "state-v1") {
+      if (Object.keys(value).length !== 7 || ["started", "primary", "window", "visible", "tray"].some((key) => typeof value[key] !== "boolean")) return finish(failure("RESPONSE_INVALID"));
+      return finish(null, value);
+    }
+    if (command === "accountless-storage-v1" && value.message === "credential-v1") {
+      if (Object.keys(value).length !== 4 || value.operation !== command || value.status !== "passed-v1") return finish(failure("STORAGE_FAILED"));
+      return finish(null, true);
+    }
+    if (command === "quit-v1" && value.message === "quit-v1") {
+      if (Object.keys(value).length !== 3 || value.status !== "accepted-v1") return finish(failure("RESPONSE_INVALID"));
+      return finish(null, true);
+    }
+  };
+  child.on("message", onMessage);
+  child.on("error", onEnd);
+  child.on("exit", onEnd);
+  return Object.freeze({
+    request(command) {
+      if (!COMMANDS.has(command) || closed || pending) return Promise.reject(failure("COMMAND_REFUSED"));
+      return new Promise((resolveRequest, reject) => {
+        const request = { command, resolve: resolveRequest, reject, timer: setTimeout(() => finish(failure("TIMEOUT")), timeoutMs), poll: null };
+        pending = request;
+        const send = () => {
+          if (pending !== request) return;
+          try {
+            child.send({ type: TYPE, message: "command-v1", command }, (error) => { if (error && pending === request) finish(failure("SEND_FAILED")); });
+          } catch { if (pending === request) finish(failure("SEND_FAILED")); }
+        };
+        // Startup can precede installation of the app's observation listener.
+        // Only the read-only status request is repeatable; never replay storage.
+        if (command === "status-v1") request.poll = setInterval(send, 250);
+        send();
+      });
+    },
+    close() {
+      closed = true;
+      finish(failure("CLOSED"));
+      child.off("message", onMessage); child.off("error", onEnd); child.off("exit", onEnd);
+    },
+  });
+}
+
+async function waitForChildExit(child, timeoutMs) {
+  if (child.exitCode !== null || child.signalCode !== null) return true;
+  return new Promise((done) => {
+    const onExit = () => { clearTimeout(timer); done(true); };
+    const timer = setTimeout(() => { child.off("exit", onExit); done(false); }, timeoutMs);
+    child.once("exit", onExit);
+  });
+}
+
+export async function exerciseWindowsAccountlessSmoke(child, { timeoutMs = 60000 } = {}) {
+  const protocol = createWindowsAccountlessSmokeProtocol(child, { timeoutMs });
+  try {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const state = await protocol.request("status-v1");
+      if (state.started && state.primary && state.window && state.tray) break;
+      if (Date.now() >= deadline) fail("STARTUP_TIMEOUT");
+      await delay(250);
+    }
+    await protocol.request("accountless-storage-v1");
+    await protocol.request("quit-v1");
+    if (!await waitForChildExit(child, 10000)) fail("QUIT_TIMEOUT");
+    if (child.exitCode !== 0) fail("CHILD_FAILED");
+  } finally { protocol.close(); }
+}
+
+async function stopOwnedChild(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return true;
+  if (!Number.isSafeInteger(child.pid) || child.pid <= 0) return false;
+  // Kill only this runner's still-live process tree, never a process name.
+  const systemRoot = process.env.SystemRoot;
+  if (typeof systemRoot !== "string" || !isAbsolute(systemRoot)) return false;
+  await new Promise((done) => execFile(join(systemRoot, "System32", "taskkill.exe"), ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true, timeout: 10000 }, () => done()));
+  return waitForChildExit(child, 5000);
+}
+
+export async function runWindowsAccountlessSmoke(options) {
+  if (process.platform !== "win32" || process.arch !== "x64") fail("WINDOWS_X64_REQUIRED");
+  // Reserve a new receipt before launching; no overwrite of prior evidence.
+  const receiptHandle = await open(options.receiptPath, "wx", 0o600);
+  let profileRoot = null;
+  let child = null;
+  let identity = null;
+  let errorCode = null;
+  let stopped = true;
+  try {
+    identity = await verifyWindowsAccountlessSmokePackage(options);
+    profileRoot = await mkdtemp(join(tmpdir(), "tibotattle-windows-accountless-smoke-"));
+    const profile = await prepareWindowsDevelopmentProfile({ appPath: options.appPath, profilePath: profileRoot });
+    const spec = buildWindowsDevelopmentLaunchSpec({ appPath: options.appPath, profile });
+    child = spawn(spec.command, spec.args, { ...spec.options,
+      env: { ...spec.options.env, USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
+        USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: randomUUID() },
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+    await exerciseWindowsAccountlessSmoke(child);
+  } catch (error) { errorCode = fixedCode(error); }
+  finally {
+    stopped = await stopOwnedChild(child);
+    if (!stopped) errorCode = `${PREFIX}CLEANUP_UNCONFIRMED`;
+    if (profileRoot && stopped) {
+      try { await rm(profileRoot, { recursive: true, force: true }); }
+      catch { errorCode = `${PREFIX}PROFILE_CLEANUP_FAILED`; }
+    }
+    const receipt = {
+      schemaVersion: "windows-electron-accountless-storage-smoke-v1",
+      status: errorCode ? "failed" : "passed", ...identity,
+      target: "win32-x64", errorCode,
+      packagedApplicationExecuted: child !== null,
+      syntheticCredentialOnly: true, realCredentialAccessed: false,
+      accountlessStorageAndChildRestartVerified: errorCode === null,
+      fullApplicationRestartVerified: false, hostedUploadPerformed: false,
+      installationPerformed: false, productionReady: false,
+      ownedProcessStopped: stopped,
+    };
+    try { await receiptHandle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`); await receiptHandle.sync(); }
+    finally { await receiptHandle.close(); }
+  }
+  if (errorCode) throw Object.assign(new Error(errorCode), { code: errorCode });
+  return Object.freeze({ status: "passed", ...identity });
+}
+
+if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+  try { process.stdout.write(`${JSON.stringify(await runWindowsAccountlessSmoke(parseWindowsAccountlessSmokeArguments(process.argv.slice(2))))}\n`); }
+  catch (error) { process.stderr.write(`${fixedCode(error)}\n`); process.exitCode = 1; }
+}

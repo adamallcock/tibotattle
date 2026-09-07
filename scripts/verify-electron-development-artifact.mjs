@@ -100,6 +100,7 @@ export const ELECTRON_SHELL_FILES = Object.freeze([
   "apps/electron/desktop-sharing-installation.js",
   "apps/electron/desktop-tray.js",
   "apps/electron/desktop-tray-popover.js",
+  "apps/electron/desktop-tray-preferences.js",
   "apps/electron/desktop-status-monitor.js",
   "apps/electron/desktop-tray-status.js",
   "apps/electron/desktop-windows-accountless-credential.js",

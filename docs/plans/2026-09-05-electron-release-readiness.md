@@ -23,13 +23,17 @@ protected-child binding lane. The separately approved Mac signing source remains
 `d5dc802575b6b6a0ad0faee26c05fd50778b77e1`, whose four development jobs passed
 [run 34151603489](https://github.com/adamallcock/tibotattle/actions/runs/34151603489).
 The integrated source includes upstream
-changes through `11276bb84793b273276a3026029d3a8efb99467e` and the new Mac
+changes through native `dffe64d60c3ea6de985c697c31678bdf22feb815` and Electron
+tray PR113 `23a506dd2fcccf05be56868b7e1cb400ec6715fd`, and the new Mac
 credential-broker, renewable accountless upload leases, closed Mac update
 rehearsal and production-disclosure source. The inspected local Mac
 candidate at that same `d5dc8025` revision runs against a private
 copied profile with hosted contributions disabled and repairs the accounting
-compatibility defect found in the earlier package. Both include the latest
-shared model-attribution and retained-view fixes.
+compatibility defect found in the earlier package. Both include the shared
+model-attribution and retained-view fixes. The sealed `d5dc8025` installers and
+successful `ae8f5bb6` four-target build predate these new tray changes and the
+Windows accountless storage integration; they do not qualify the current
+combined source.
 Native 0.1.18 is the predecessor baseline, whose tag resolves to
 `55c813a1bf7e67c00e47410b760104c0d9fbc0ea`.
 
@@ -41,8 +45,9 @@ restored cache-task links, including Auto Review parent links. Settings/About
 and the shared contribution-settings destination were inspected; sharing stayed
 off. The subsequent `aead5d00` candidate passed the same page/control checks,
 active-refresh responsiveness, cancellation and a durable-launcher restart with
-sharing still off. Actual tray interaction still needs its final check because the native
-menu-bar automation surface is unavailable. The earlier production updater and
+sharing still off. PR113 subsequently recorded a packaged ARM tray smoke and
+visual inspection. The current combined candidate and physical platform tray
+behavior still need qualification. The earlier production updater and
 native migration source at `91355893` had a
 [four-target CI run 34137413523](https://github.com/adamallcock/tibotattle/actions/runs/34137413523)
 failure at shared packaging contracts before installer creation. The repaired
@@ -431,8 +436,10 @@ history or a hosted migration receipt.
 Read-only signing access checks found a valid local Developer ID Application
 identity. The repository-level GitHub Actions secret list is empty; environment
 secrets and Windows signing access are not yet established. Windows production
-startup still needs its actual storage/binding qualification and entry wiring;
-its development CI receipts cannot satisfy that gate.
+startup still needs its actual storage/binding qualification and production
+composition. The main-owned factory guard and qualification-only accountless
+wrapper now exist; a successful development test does not activate either
+platform's production selector.
 
 A bounded Windows review separated the qualification-only file replacement
 primitive from credential writes, which already hold a per-capability native
@@ -566,6 +573,26 @@ the newly integrated Mac interruption/recovery tests. Its packages are separate
 from the previously retained `677c5e2b` development packages and the sealed
 `d5dc8025` signed Mac installers. Local recovery validation additionally passes
 74 release workflow/evidence tests and the 20-test documentation preflight.
+
+The combined source at `b20d0b21` merges native PR112 and Electron PR113 and adds
+the Windows fixed accountless credential backend plus its Electron guard and
+real FD3 storage smoke. All 478 Electron tests pass with owned companion IPC.
+The new outer Windows runner verifies the package's source revision, EXE and
+ASAR hashes and exact staged/archive closure before launching a disposable
+profile. It tests synthetic create/read, a second child reading the retained
+record, exact deletion and absence, then clean app quit. It sends no real
+credential or upload request, exposes no run identifier or record bytes, and
+does not claim a full app restart, installation or production readiness.
+The existing four-target workflow now compiles and runs the native Windows
+accountless tests and this packaged IPC journey, retaining its content-free
+receipt even on failure. Actual Windows execution is pending the next build.
+
+Combining the tray and Windows changes exposed a missing tray-preferences entry
+in the independent packaging verifier. The reviewed file list and its separate
+test fixture now include that module, matching the actual runtime closure.
+The repaired package/runner suite passes 26 tests with two explicit optional
+artifact/host exclusions; 78 release-trust checks, architecture and tool inventory
+checks also pass. The failed closure check remains in its separate local log.
 
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)

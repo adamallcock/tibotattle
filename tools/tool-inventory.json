@@ -1989,6 +1989,22 @@
     {
       "classification": "build_release_operation",
       "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-windows-accountless.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit Windows package and source inputs are required for a disposable synthetic accountless IPC qualification.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-development-packages.yml",
+        "test/electron-windows-accountless-smoke.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
       "canonicalPath": "scripts/build-electron-macos-keychain-adapter.mjs",
       "stableAlias": null,
       "stableAliasReason": "Compile the fixed unsigned macOS adapter for a prepared source candidate; signing remains separate.",
