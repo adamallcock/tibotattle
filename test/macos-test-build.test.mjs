@@ -223,6 +223,13 @@ test("test compiler profile builds a development-only launcher that runs", {
       refreshSettingsSmoke.stdout,
       /detailed_attempt_cadence=3600 startup=quick quick_join=restored newer_attempt=preserved external_attempt=actual-start stale_idle=ignored/u,
     );
+    const trayCustomizationSmoke = spawnSync(
+      launcher,
+      ["--tray-customization-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(trayCustomizationSmoke.status, 0, trayCustomizationSmoke.stderr || trayCustomizationSmoke.stdout);
+    assert.match(trayCustomizationSmoke.stdout, /TIBOTATTLE_TRAY_CUSTOMIZATION preferences=closed,migrated,future-protected,atomic,undo/u);
     const menuBarSmoke = spawnSync(
       launcher,
       ["--menu-bar-contract-smoke-test"],

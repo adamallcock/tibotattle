@@ -114,7 +114,8 @@ Every installed-app and DMG validation now runs the packaged
 asserts the full status/outcome policy, and reports zero real ServiceManagement
 calls. It never changes an operator's Login Items.
 
-Before publishing a signed build, a human must complete a disposable-profile
+Except for an explicit release-specific exception recorded below, before
+publishing a signed build a human must complete a disposable-profile
 rehearsal on the Developer-ID-signed app installed at
 `/Applications/TiboTattle.app`. The machine-checkable, privacy-safe receipt
 schema was originally `usage-monitor-macos-login-item-release-rehearsal-v1`.
@@ -149,7 +150,7 @@ Current qualification requires
 `evidenceKind: "manual_observation"`. V1 records remain historical; the current
 gate rejects them rather than inferring missing architecture or source proof.
 All ten lifecycle checks and the disposable-profile/Applications requirements
-remain mandatory.
+remain mandatory for a passing manual-observation receipt.
 
 The receipt's `application` binds bundle identifier, build, short version,
 `architecture`, `channel`, `sourceCommit` and `payloadSha256` to the inspected
@@ -168,6 +169,23 @@ The CLI defaults to `--architecture arm64 --channel stable`. Intel RC2 uses
 `--architecture x64 --channel internal-dogfood`, with its own matching receipt.
 Both native validators receive the exact selection. The gate still makes no
 real ServiceManagement changes and does not install the app.
+
+### 2026-09-05 release-specific 0.1.18 exception
+
+The owner's [0.1.18 manual qualification
+waiver](./2026-09-05-release-0-1-18-manual-qualification-waiver.md) accepts the
+unavailable disposable clean-profile/manual Login Item matrix and physical Intel
+qualification as release risks for 0.1.18 only. This is an authorization decision,
+not manual-observation evidence. No v2 receipt is manufactured and its validator
+is not changed or reported as passing for unperformed checks. The owner's report
+that other testers are running the app is not independently verified hardware or
+exact-artifact evidence.
+
+The actual automated fake-manager/isolated smoke, native signing and final-byte
+checks, data preservation, updater integrity and unexpected-Keychain-prompt stop
+conditions remain unchanged. Historical receipts retain their original scope;
+this exception neither qualifies physical Intel nor waives a later release's
+manual requirements.
 
 ## Privacy and removal
 

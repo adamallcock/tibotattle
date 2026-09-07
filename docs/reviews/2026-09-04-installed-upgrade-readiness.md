@@ -224,17 +224,23 @@ real-state semantics gates. Fresh full R7 regeneration subsequently completed
 on `38aaeef4`: all ten receipts validate and reconstruct on both pinned runtimes.
 Its unchanged open resource decisions, original aborted run and measurement
 limitations remain explicit in the [preparation plan](../plans/2026-09-04-release-0-1-18-publication-preparation.md).
-The complete root-suite rerun remains required before signing or replacement.
+The complete root-suite rerun on clean `3a785e6d` passes 3,859 tests with zero
+failures and seventeen existing native-Windows skips in 479.3 seconds. No test
+exclusions or new skips were added, and no Windows qualification is inferred.
+Documentation and both pinned-runtime R7 freshness checks also pass.
 
 ## Remaining work
 
-- Complete the full root-suite rerun after the verified R7 generation and the
-  exact export/inventory corrections, without test exclusions or new skips.
-  Existing native-Windows checks cannot be qualified on this Mac.
-- Build and verify fresh signed ARM/Intel RC3 `1025.2` on a common new clean
-  annotated source tag. Keep RC2 `1025.1` unchanged; stable remains `1026`.
-- Perform the authorized installed ARM transition after the completed copy-only
-  rehearsal, then observe launch/refresh/restart,
+- Fresh signed ARM/Intel RC3 `1025.2` now passes exact-artifact and replacement
+  checks on common clean `7701debf` and its new local annotated tag; see the
+  [RC3 receipt](../receipts/2026-09-04-macos-combined-rc3-signed-candidates.md).
+  RC1/RC2 remain unchanged; stable remains `1026`.
+- The authorized Finder replacement installed the final signed ARM app and
+  production installed-artifact validation passes. Full original state,
+  preferences and old app matched the rollback copy immediately before
+  replacement. The Mac locked before observable normal launch; the UI refused
+  to proceed and no TiboTattle process was running afterward. Resume after the
+  owner unlocks, then observe launch/refresh/restart,
   preserved state and prompt behavior. Do not reopen migrated state with an
   older reader; rollback includes its matching pre-upgrade state copy.
 - Record the actual manual-v2 clean-profile/Login Item and failure-path matrix;

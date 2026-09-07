@@ -294,7 +294,10 @@ These source paths do not qualify real Intel hardware, final signed/notarized
 installers or updater installation. See the
 [Intel release plan](../../docs/plans/2026-09-03-macos-intel-release.md) and
 [macOS release runbook](../../docs/runbooks/macos-stable-release-runbook.md)
-for the remaining gates. The commands below show the default Apple silicon
+for the remaining gates. The owner's [0.1.18-only manual qualification
+waiver](../../docs/decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+accepts unavailable physical Intel testing as a release risk, not a passed
+hardware test. The commands below show the default Apple silicon
 packaging path; pass `--architecture x64` and the Intel app path for Intel.
 
 Create a deterministic-layout developer DMG:
@@ -708,7 +711,14 @@ smoke against an injected fake manager; that check makes zero real
 ServiceManagement calls. It is not a substitute for a truly clean machine.
 The manual clean-profile and physical Login Item matrix was deferred for
 0.1.17 only; see the [release-specific decision](../../docs/plans/2026-09-03-public-0.1.17-release.md).
-That decision does not qualify or waive the matrix for 0.1.18 or Intel.
+That historical decision does not carry forward. The owner separately approved
+the [0.1.18-only waiver](../../docs/decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+of the disposable clean-profile/manual Login Item matrix and physical Intel
+qualification. Those checks remain unperformed, not passed. Reports that other
+testers are running the app are owner-reported, not independently verified
+hardware or artifact-bound evidence. The waiver does not change the v2 receipt
+validator or justify manufacturing a manual receipt; exact signed-artifact,
+data-preservation, updater-integrity and unexpected-Keychain-prompt gates remain.
 
 For Finder metadata, inspect the app directly on the final frozen DMG, read-only,
 after stapling. Derive the expected timestamp from the sealed source commit in
@@ -716,8 +726,10 @@ after stapling. Derive the expected timestamp from the sealed source commit in
 dates with that source-derived value. The isolated `ditto` copy used for
 clean-profile smoke is not evidence of mounted-volume Finder metadata.
 
-Before sending the DMG to any external user, perform a human clean-Mac or
-disposable-VM rehearsal:
+The normal release policy requires the following human clean-Mac or disposable-VM
+rehearsal before external distribution. For 0.1.18, apply only the explicitly
+waived scope above; do not report the unperformed matrix or its receipt gate as
+passed:
 
 1. transfer the DMG through the intended download channel so quarantine
    metadata is present;
@@ -794,3 +806,43 @@ The repository implements and tests the fail-closed updater build boundary.
 Current source, signed candidate, notarization, publication, feed availability,
 installed upgrade, and rollback rehearsal remain separate gates recorded in
 the [current status matrix](../../docs/current-status.md).
+
+## Menu bar customization
+
+**Settings → General → Menu bar → Customize menu bar…** and **More →
+Customize menu bar…** open the same native presentation settings. Changes apply
+immediately and persist locally in the existing state root's
+`tray-preferences-v1.json`. The file contains no allowance observations.
+Unreadable and newer schemas are preserved, with a visible save warning.
+
+Choose labeled 5-hour, 7-day, both, or icon-only contents; a plain app icon,
+single meter, or fixed top 5-hour/bottom 7-day meters; and remaining allowance,
+reset time, or both for a single window. Reset times use a minute countdown or
+the local clock, including a date outside today. Optional low-allowance emphasis
+enters at 10% and clears at 12% within a verified observation; stale/unavailable
+evidence, reset changes, and replacement observations clear it. The compact DTO
+has no account identity, so an 11% replacement observation cannot inherit a prior
+source's low state. This changes presentation only and sends no notifications.
+
+Show, hide, and reorder Allowances, Weekly pace, Local usage, and Cache reuse.
+Choose 7 or 30 days, chart visibility, tokens/API-equivalent cost/usage-change
+totals, and compact or detailed density. Cache reuse uses the existing dashboard
+projection and its coverage, never a separate accounting calculation. The cache
+action opens Usage and costs. Partial pricing, retained history, missing evidence,
+and permanent header/actions stay explicit. Hiding sections does not stop collection.
+
+New installations default to 7-day remaining with a 7-day meter and the three
+original popup sections. Existing installations keep the current automatic
+primary-window choice; community PR #73 selections migrate from
+`tibotattle.menu-bar-allowance.v1`, including icon-only for `off`. Initial choices
+are materialized so later upgrades retain them. Undo reverses the last saved
+customization; Restore tray defaults deliberately selects new-install defaults.
+Synthetic Example states and an example popup preview changes without fetching
+account data. UI preferences never change refresh cadence or dashboard filters.
+
+The compiled `--tray-customization-smoke-test` exercises the closed preference
+contract, legacy mapping, persistence, failed writes, future-schema preservation,
+pinned/missing/zero lanes, retained refresh, reset expiry and low-allowance
+hysteresis. Development-only `--tray-customization-render-smoke-test <directory>`
+renders synthetic Settings and popup states; it does not qualify an installed
+signed application or physical secondary-display behavior.

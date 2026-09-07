@@ -348,3 +348,11 @@ Integration validation passed 507 Electron/core/package/smoke contracts
 Architecture and localization checks passed. The packaged popup was visually
 inspected with synthetic data. This is development qualification; the installed
 0.1.18 application and production release remain unchanged.
+
+### Native main-line reconciliation status (2026-09-07)
+
+The local reconciliation of the upstream native tray source remains
+source-unqualified at this point. Its macOS source lane stops before compiling
+the tray changes because the current base has a separate helper-inventory
+mismatch. That repair is deliberately separate from this merge; this record
+makes no app-build, signing, installation, or release claim.

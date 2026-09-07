@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-05
+date: 2026-09-07
 type: status
 status: current
-source_commit: 14e6a02c131936177cbb0acf1d801d3653658a1b
-observation_date: 2026-09-05
+source_commit: 6a06df23fd15d8365a6fb92a997b62d7370d681e
+observation_date: 2026-09-07
 ---
 
 # Current product and release status
@@ -16,13 +16,14 @@ operational decision.
 
 ## Source boundaries for this snapshot
 
-The `source_commit` above is the Electron source review base:
-`14e6a02c131936177cbb0acf1d801d3653658a1b`. It is the current checkout's
-development-source boundary, not the provenance of the published native
-release. The native `v0.1.18` tag resolves to the distinct commit
-`55c813a1bf7e67c00e47410b760104c0d9fbc0ea`. Those histories diverge at
-`3a785e6d2c3421345151a32f07195ddaa6e9a614`; neither source is an ancestor of
-the other.
+The `source_commit` above is the local Electron development-integration
+boundary: `6a06df23fd15d8365a6fb92a997b62d7370d681e`. It combines the accountless
+source line with the completed Electron tray source, but is neither a
+main-branch merge nor the provenance of the published native release. The
+Electron PR #111 remains a draft development branch. The native `v0.1.18` tag
+resolves to the distinct commit `55c813a1bf7e67c00e47410b760104c0d9fbc0ea`.
+Those histories diverge at `3a785e6d2c3421345151a32f07195ddaa6e9a614`; neither
+source is an ancestor of the other.
 
 Published-native facts below are carried forward from the 2026-09-05 release
 record. This Electron source review did not rerun the native source-to-artifact,
@@ -86,10 +87,10 @@ incomplete estimate. Recovery requires successful scheduled rebuilding, a
 subsequent valid preview cache and a rendered live graph; health HTTP 200 alone
 is not sufficient. This Electron review did not re-observe that hosted state.
 
-The Electron checkout retains accountless source work, including local migration
-`0046`, as an un-deployed prototype. It does not alter the deployed `0042`–`0045`
-prefix, activate accountless enrollment or contribution, deploy the Worker, or
-authorize a further `0047` migration. The [Electron readiness plan](./plans/2026-09-05-electron-release-readiness.md)
+The Electron checkout retains accountless source work through local migrations
+`0046`–`0048` as an un-deployed prototype. It does not alter the deployed
+`0042`–`0045` prefix, activate accountless enrollment, renewal or contribution,
+deploy the Worker, or authorize a remote migration. The [Electron readiness plan](./plans/2026-09-05-electron-release-readiness.md)
 is development planning, not hosted or release evidence.
 
 ## Platform support and qualification limits
