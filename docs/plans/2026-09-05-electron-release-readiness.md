@@ -15,12 +15,13 @@ fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
 The latest four-target successful development build is
-`aead5d009d4a34a7c24b7e4d3cf8a2b7e749f548`. Its unsigned packages passed
-[CI run 34144823459](https://github.com/adamallcock/tibotattle/actions/runs/34144823459),
+`d5dc802575b6b6a0ad0faee26c05fd50778b77e1`. Its unsigned packages passed
+[CI run 34151603489](https://github.com/adamallcock/tibotattle/actions/runs/34151603489),
 including native Windows protected-child binding tests. It includes upstream
 changes through `11276bb84793b273276a3026029d3a8efb99467e` and the new Mac
-credential-broker and production-disclosure source. The inspected local Mac
-candidate at that same `aead5d00` revision runs against a private
+credential-broker, renewable accountless upload leases, closed Mac update
+rehearsal and production-disclosure source. The inspected local Mac
+candidate at that same `d5dc8025` revision runs against a private
 copied profile with hosted contributions disabled and repairs the accounting
 compatibility defect found in the earlier package. Both include the latest
 shared model-attribution and retained-view fixes.
@@ -44,6 +45,16 @@ inventory, independent verifier and platform staging passed the subsequent
 four-target run at `aead5d00`; the failed run remains preserved. Physical
 platform, credential continuity and installed
 upgrade evidence remain incomplete.
+
+The exact `d5dc8025` Mac package subsequently passed settings/About and shared
+sharing-destination inspection, both cache-table pages, refresh cancellation
+with completed results retained, native-menu Quit and restart through the
+durable launcher. Sharing remained off after restart. The launcher now selects
+this package; the previous `aead5d00` package/profile/launcher are preserved.
+All 180 active-refresh samples in 45 seconds passed: health and status p95 were
+1 ms, maxima 28 ms, with no failures and the unchanged 250 ms p95 budget.
+Settings remained interactive during the same refresh. Parent task URLs are
+present; the external Codex navigation postcondition remains unqualified.
 
 # Workstreams and completion evidence
 
@@ -262,7 +273,11 @@ client/scheduler/transport tests pass. Worker renewal and migration focused
 tests pass 27 cases, including due and expired leases, concurrent requests,
 revocation, erasure and transaction rollback. The actual client also passes the
 local HTTP Worker journey with the new renewal route and rejects renewal after
-disconnect. Full Worker regression qualification is in progress.
+disconnect. The clean frozen `d5dc8025` source passes all 581 Worker tests
+and 190 script checks, including package/type guards and generated assets.
+Dry-deployment checks pass; staging remains unconfigured with collection
+unauthorized. The renewal-enabled actual-client/local-Worker journey also
+passes from that frozen source. No remote migration or deployment occurred.
 
 Updater source review also confirmed that a higher build number alone cannot
 trigger an Electron update: the successor needs a higher semantic app version.
@@ -270,8 +285,13 @@ The production source now supports a closed, explicitly supplied pair of later
 Mac prerelease versions on a fixed isolated feed. Automatic download is disabled
 for this exercise; only the first candidate can manually download its exact
 named successor. The 27 focused updater/distribution/manifest tests pass,
-including rejection of unrelated feed versions. Clean frozen source staging of
-both candidates precedes the signed upgrade gate; no feed was published.
+including rejection of unrelated feed versions. Both Mac architectures have
+clean frozen source stages for versions
+`0.1.19-native-to-electron-handover.1` and `.2`, builds `2026090701` and
+`2026090702`. Every stage's 693 files and package/runtime metadata were verified.
+The user approved private signing and Apple notarization of these exact
+`d5dc8025` candidates on 2026-09-07. Installation, update-feed publication and
+public release remain separate operations; no feed was published.
 
 Accountless synthetic enrollment/upload/deduplication/disconnect tests have
 run against disposable Worker databases. Independent review identified two
@@ -320,9 +340,21 @@ revisions, so neither qualifies the proposed Ubuntu 24.04/GNOME target.
 The earlier source-only migration approval request is superseded by the user's
 explicit request to complete every stage. Source implementation and disposable
 synthetic migration/upload rehearsals are proceeding. Hosted activation and
-migration, signing, installed replacement and publication will be bound to the
-concrete qualified candidate and exact target operation. Actual target desktop
-access and signing/update credentials remain to be verified before those steps.
+migration, installed replacement and publication remain bound to the concrete
+qualified candidate and exact target operation. Private Mac signing/notarization
+is now approved as recorded above. An escalated, redacted Keychain probe confirms
+a valid Developer ID Application identity; a sandboxed zero-identity result was
+an environment limitation. Actual target desktop/update qualification remains
+outstanding.
+
+The public-sample decision remains pending explanation and confirmation.
+Current social sign-in establishes continuity of a Google/Apple identity, not
+a unique person or ownership of an OpenAI account. Accountless uploads are
+currently private and excluded from public figures. The proposed common sample
+would use contribution sources as its unit and retain suppression, bounded
+influence, deduplication and revocation controls; it requires an explicit
+versioned public-use policy and consistent eligibility across all aggregate
+paths before activation.
 
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
