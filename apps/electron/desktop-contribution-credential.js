@@ -5,7 +5,7 @@ const FILE = "accountless-installation-credential-v1.json";
 const SCHEMA = "accountless-encrypted-credential-v1";
 const LIMIT = 4096;
 const TEMPORARILY_UNAVAILABLE_MESSAGE = "safeStorage.decryptStringAsync is temporarily unavailable. Please try again.";
-const LEGACY_PROBE_PLATFORMS = new Set(["darwin", "linux"]);
+const LEGACY_PROBE_PLATFORMS = new Set(["darwin", "linux", "win32"]);
 const failures = new WeakSet();
 const unavailable = ({ retryable = false } = {}) => {
   const error = Object.assign(new Error("Installation credential unavailable"),
@@ -114,25 +114,36 @@ export function createDesktopContributionCredentialLegacyRecoveryBackend({
 export function createDesktopContributionCredentialLegacyProbe({
   platform = process.platform,
   rootPath,
+  windowsProtectedStateStore,
   storage,
 } = {}) {
   if (!LEGACY_PROBE_PLATFORMS.has(platform)) {
-    throw new TypeError("legacy credential probe requires a supported POSIX platform");
+    throw new TypeError("legacy credential probe requires a supported platform");
   }
-  const selected = storage ?? createPosixDesktopSettingsBackend({
-    platform,
-    rootPath,
-    filename: FILE,
-    maximumBytes: LIMIT,
-    codec,
-  });
-  if (!selected || typeof selected.load !== "function") {
+  if (storage !== undefined && (!storage || typeof storage.load !== "function")) {
     throw new TypeError("legacy credential probe storage is invalid");
   }
+  // Create the platform store only when inspection begins. A native backend
+  // factory failure must stop startup before this probe opens the old record.
+  const selected = () => storage ?? (platform === "win32"
+    ? createWindowsDesktopSettingsBackend({
+      platform,
+      windowsProtectedStateStore,
+      childName: FILE,
+      maximumBytes: LIMIT,
+      codec,
+    })
+    : createPosixDesktopSettingsBackend({
+      platform,
+      rootPath,
+      filename: FILE,
+      maximumBytes: LIMIT,
+      codec,
+    }));
   return Object.freeze({
     async inspect() {
       let stored;
-      try { stored = await selected.load(); }
+      try { stored = await selected().load(); }
       catch { return "unavailable"; }
       try {
         if (stored === null) return "absent";
@@ -145,11 +156,21 @@ export function createDesktopContributionCredentialLegacyProbe({
 }
 
 export function createDesktopContributionCredentialBackend({
-  safeStorage, platform = process.platform, rootPath, windowsProtectedStateStore, storage,
+  safeStorage, platform = process.platform, rootPath, storage,
 } = {}) {
-  const selected = storage ?? (platform === "win32"
-    ? createWindowsDesktopSettingsBackend({ platform, rootPath, windowsProtectedStateStore, childName: FILE, maximumBytes: LIMIT, codec })
-    : createPosixDesktopSettingsBackend({ platform, rootPath, filename: FILE, maximumBytes: LIMIT, codec }));
+  // Windows accountless identity is deliberately absent from the generic
+  // Electron safeStorage path. It must be composed through the reviewed,
+  // qualification-only native factory, never silently downgraded here.
+  if (platform === "win32") {
+    throw new TypeError("Windows accountless credential requires a native factory");
+  }
+  const selected = storage ?? createPosixDesktopSettingsBackend({
+    platform,
+    rootPath,
+    filename: FILE,
+    maximumBytes: LIMIT,
+    codec,
+  });
   let queue = Promise.resolve();
   const serialize = (operation) => {
     const next = queue.then(operation, operation);

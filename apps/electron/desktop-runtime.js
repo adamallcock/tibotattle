@@ -441,6 +441,8 @@ export async function launchDesktopRuntime({
     && platform === "darwin";
   const accountlessProductionUsesLinuxNativeCredential = accountlessProduction !== undefined
     && platform === "linux";
+  const accountlessProductionUsesWindowsNativeCredential = accountlessProduction !== undefined
+    && platform === "win32";
   if (accountlessProduction !== undefined && (
     accountlessProduction === null || typeof accountlessProduction !== "object"
       || Array.isArray(accountlessProduction)
@@ -449,11 +451,15 @@ export async function launchDesktopRuntime({
           ? "createMacOSCredentialBackend,origin,policyVersion"
           : accountlessProductionUsesLinuxNativeCredential
             ? "createLinuxCredentialBackend,origin,policyVersion"
-            : "origin,policyVersion")
+            : accountlessProductionUsesWindowsNativeCredential
+              ? "createWindowsCredentialBackend,origin,policyVersion"
+              : "origin,policyVersion")
       || (accountlessProductionUsesMacNativeCredential
         && typeof accountlessProduction.createMacOSCredentialBackend !== "function")
       || (accountlessProductionUsesLinuxNativeCredential
         && typeof accountlessProduction.createLinuxCredentialBackend !== "function")
+      || (accountlessProductionUsesWindowsNativeCredential
+        && typeof accountlessProduction.createWindowsCredentialBackend !== "function")
       || accountlessProduction.origin !== DEPLOYMENT_ENDPOINTS.public.origin
       || accountlessProduction.policyVersion !== "accountless-opt-out-v1"
       || accountlessLaboratory !== undefined || app.isPackaged !== true
@@ -688,22 +694,29 @@ export async function launchDesktopRuntime({
       rootPath: settingsRootPath,
     })
     : null;
-  // Production macOS and Linux composition uses a main-process native adapter.
+  // Production macOS, Linux, and Windows composition uses a main-process
+  // native adapter. Windows has no selected factory today, so an explicit
+  // factory requirement prevents a future production flag from falling back
+  // to Electron safeStorage before its native credential route qualifies.
   // Do not call Electron safeStorage there: its asynchronous availability probe
   // can initialize a platform credential provider. Existing encrypted records
   // are inspected without decrypting or changing them so a prior installation
   // stops for explicit recovery instead of rotating identity.
   if (accountlessEnabled) {
     if (accountlessProductionUsesMacNativeCredential
-        || accountlessProductionUsesLinuxNativeCredential) {
+        || accountlessProductionUsesLinuxNativeCredential
+        || accountlessProductionUsesWindowsNativeCredential) {
       const legacyCredentialProbe = createDesktopContributionCredentialLegacyProbe({
         platform,
         rootPath: settingsRootPath,
+        windowsProtectedStateStore,
       });
       const nativeBackend = accountlessProduction[
         accountlessProductionUsesMacNativeCredential
           ? "createMacOSCredentialBackend"
-          : "createLinuxCredentialBackend"
+          : accountlessProductionUsesLinuxNativeCredential
+            ? "createLinuxCredentialBackend"
+            : "createWindowsCredentialBackend"
       ]({
         legacyCredentialProbe: legacyCredentialProbe.inspect,
       });
@@ -714,10 +727,12 @@ export async function launchDesktopRuntime({
           )) {
         throw shellError("electron_configuration_invalid");
       }
-      // macOS owns this recovery check within its signed adapter. Linux keeps
-      // the equivalent boundary in this generic main-process wrapper until a
-      // reviewed native Linux accountless backend is selected by the entrypoint.
-      installationCredentialBackend = accountlessProductionUsesLinuxNativeCredential
+      // macOS owns this recovery check within its signed adapter. Linux and
+      // Windows keep the equivalent metadata-only boundary in this generic
+      // main-process wrapper until their reviewed native backends are selected
+      // by an entrypoint.
+      installationCredentialBackend = (accountlessProductionUsesLinuxNativeCredential
+        || accountlessProductionUsesWindowsNativeCredential)
         ? createDesktopContributionCredentialLegacyRecoveryBackend({
           backend: nativeBackend,
           legacyCredentialProbe: legacyCredentialProbe.inspect,

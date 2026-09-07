@@ -65,6 +65,20 @@ class FakeChild extends EventEmitter {
   }
 }
 
+class FakeIpcChild extends FakeChild {
+  constructor() {
+    super();
+    this.connected = true;
+    this.messages = [];
+  }
+
+  send(message, callback) {
+    this.messages.push(structuredClone(message));
+    callback?.();
+    return true;
+  }
+}
+
 class FakeApp extends EventEmitter {
   constructor({ lockResult = true } = {}) {
     super();
@@ -320,6 +334,7 @@ async function launchFixture({
   sharingBackend,
   sharingInstallationState,
   ownedCompanionScript,
+  childFactory,
   onSpawn = () => {},
   environment = {
     HOME: "/Users/adam",
@@ -360,7 +375,8 @@ async function launchFixture({
       spawnChild(_command, args, options) {
         spawnCalls.push({ args: [...args], options });
         onSpawn({ args: [...args], options });
-        const child = ownedCompanionScript ? spawn(_command, args, options) : new FakeChild();
+        const child = ownedCompanionScript ? spawn(_command, args, options)
+          : childFactory?.() ?? new FakeChild();
         children.push(child);
         if (productionDistribution && !ownedCompanionScript) queueMicrotask(() => {
           child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4811/\n"));
@@ -704,6 +720,150 @@ test("Linux production accountless composition requires a main-only native facto
   }), { code: "electron_shell_electron_configuration_invalid" });
   assert.equal(app.readyCalls, 0);
   assert.equal(spawned, 0);
+  assert.equal(safeStorageCalls, 0);
+});
+
+test("Windows production accountless requires an explicit native factory before readiness", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let safeStorageCalls = 0;
+  let spawned = 0;
+  await assert.rejects(launchFixture({
+    app,
+    platform: "win32",
+    architecture: "x64",
+    load: async () => null,
+    runtimeOverrides: {
+      safeStorage: {
+        isAsyncEncryptionAvailable: async () => { safeStorageCalls += 1; return true; },
+        encryptStringAsync: async () => { safeStorageCalls += 1; return Buffer.alloc(0); },
+        decryptStringAsync: async () => { safeStorageCalls += 1; return null; },
+      },
+    },
+    environment: { USERPROFILE: "C:\\synthetic" },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+    },
+    onSpawn: () => { spawned += 1; },
+  }), { code: "electron_shell_electron_configuration_invalid" });
+  assert.equal(app.readyCalls, 0);
+  assert.equal(spawned, 0);
+  assert.equal(safeStorageCalls, 0);
+});
+
+test("Windows production accountless factory failure prevents child startup without safeStorage", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let safeStorageCalls = 0;
+  let factoryCalls = 0;
+  let spawned = 0;
+  await assert.rejects(launchFixture({
+    app,
+    platform: "win32",
+    architecture: "x64",
+    load: async () => null,
+    runtimeOverrides: {
+      safeStorage: {
+        isAsyncEncryptionAvailable: async () => { safeStorageCalls += 1; return true; },
+        encryptStringAsync: async () => { safeStorageCalls += 1; return Buffer.alloc(0); },
+        decryptStringAsync: async () => { safeStorageCalls += 1; return null; },
+      },
+    },
+    environment: { USERPROFILE: "C:\\synthetic" },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createWindowsCredentialBackend() {
+        factoryCalls += 1;
+        throw new Error("Windows native credential backend is unavailable");
+      },
+    },
+    onSpawn: () => { spawned += 1; },
+  }), /Windows native credential backend is unavailable/u);
+  assert.equal(factoryCalls, 1);
+  assert.equal(spawned, 0);
+  assert.equal(safeStorageCalls, 0);
+});
+
+test("Windows native accountless recovery remains FD3-only and never initializes safeStorage", async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "windows-accountless-runtime-"));
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  app.getPath = () => profile;
+  let fixture;
+  let factoryCalls = 0;
+  let nativeCalls = 0;
+  let safeStorageCalls = 0;
+  t.after(async () => {
+    try { await fixture?.desktop.lifecycle.requestQuit(); }
+    finally { await rm(profile, { recursive: true, force: true }); }
+  });
+  fixture = await launchFixture({
+    app,
+    platform: "win32",
+    architecture: "x64",
+    load: async () => null,
+    runtimeOverrides: {
+      safeStorage: {
+        isAsyncEncryptionAvailable: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
+        encryptStringAsync: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
+        decryptStringAsync: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
+      },
+    },
+    environment: { USERPROFILE: profile },
+    platformServices: {
+      ...platformServices(),
+      defaultCodexHome: "C:\\synthetic\\.codex",
+    },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createWindowsCredentialBackend({ legacyCredentialProbe }) {
+        factoryCalls += 1;
+        assert.equal(typeof legacyCredentialProbe, "function");
+        return {
+          async read() { nativeCalls += 1; throw new Error("must not access native credential"); },
+          async createIfMissing() { nativeCalls += 1; throw new Error("must not access native credential"); },
+          async deleteExact() { nativeCalls += 1; throw new Error("must not access native credential"); },
+        };
+      },
+    },
+    childFactory: () => new FakeIpcChild(),
+  });
+  assert.equal(factoryCalls, 1);
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  assert.equal(Object.hasOwn(fixture.spawnCalls[0].options.env, "USAGE_MONITOR_KEYCHAIN_BROKER_FD"), false);
+  assert.equal(Object.hasOwn(fixture.spawnCalls[0].options.env, "USAGE_MONITOR_WINDOWS_ACCOUNTLESS_CREDENTIAL"), false);
+  fixture.children[0].emit("message", {
+    schemaVersion: "accountless-process-v1",
+    kind: "request",
+    id: 1,
+    operation: "read",
+    value: null,
+  });
+  const deadline = Date.now() + 5_000;
+  while (!fixture.children[0].messages.some((message) => message.kind === "response" && message.id === 1)) {
+    assert.ok(Date.now() < deadline, "Windows accountless recovery did not stay on the private FD3 route");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(fixture.children[0].messages, [{
+    schemaVersion: "accountless-process-v1",
+    kind: "response",
+    id: 1,
+    ok: false,
+    value: "credential_recovery_required",
+  }]);
+  assert.equal(nativeCalls, 0);
   assert.equal(safeStorageCalls, 0);
 });
 

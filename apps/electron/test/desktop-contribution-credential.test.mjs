@@ -36,9 +36,9 @@ function cryptoFixture() {
   };
 }
 
-test("legacy POSIX ciphertext inspection never initializes or decrypts safeStorage", async () => {
+test("legacy ciphertext inspection is metadata-only on every supported desktop platform", async () => {
   const calls = [];
-  for (const platform of ["darwin", "linux"]) {
+  for (const platform of ["darwin", "linux", "win32"]) {
     for (const [stored, expected] of [
       [null, "absent"],
       [{ schemaVersion: "accountless-encrypted-credential-v1", encrypted: "AAAA" }, "present"],
@@ -57,14 +57,74 @@ test("legacy POSIX ciphertext inspection never initializes or decrypts safeStora
       assert.equal(await probe.inspect(), expected);
     }
   }
-  assert.deepEqual(calls, ["darwin", "darwin", "darwin", "linux", "linux", "linux"]);
+  assert.deepEqual(calls, [
+    "darwin", "darwin", "darwin",
+    "linux", "linux", "linux",
+    "win32", "win32", "win32",
+  ]);
   assert.throws(
     () => createDesktopContributionCredentialLegacyProbe({
-      platform: "win32",
-      rootPath: "C:\\synthetic\\profile",
+      platform: "freebsd",
+      rootPath: "/synthetic/profile",
     }),
-    /supported POSIX platform/u,
+    /supported platform/u,
   );
+});
+
+test("Windows legacy ciphertext requires recovery without safeStorage or record mutation", async () => {
+  const calls = [];
+  const legacy = {
+    schemaVersion: "accountless-encrypted-credential-v1",
+    encrypted: "AAAA",
+  };
+  const probe = createDesktopContributionCredentialLegacyProbe({
+    platform: "win32",
+    storage: {
+      async load() {
+        calls.push("load");
+        return legacy;
+      },
+      async save() {
+        calls.push("save");
+        assert.fail("legacy inspection must not write");
+      },
+    },
+  });
+  const guarded = createDesktopContributionCredentialLegacyRecoveryBackend({
+    backend: {
+      async read() { calls.push("native-read"); return null; },
+      async createIfMissing() { calls.push("native-create"); return "created"; },
+      async deleteExact() { calls.push("native-delete"); return "missing"; },
+    },
+    legacyCredentialProbe: probe.inspect,
+  });
+  await assert.rejects(guarded.read(), (error) => error?.code
+    === "contribution_device_credential_recovery_required"
+    && error?.retryable === false);
+  assert.deepEqual(calls, ["load"]);
+  assert.deepEqual(legacy, {
+    schemaVersion: "accountless-encrypted-credential-v1",
+    encrypted: "AAAA",
+  });
+});
+
+test("generic Electron safeStorage credential factory refuses Windows before any access", () => {
+  let safeStorageCalls = 0;
+  let storageCalls = 0;
+  assert.throws(() => createDesktopContributionCredentialBackend({
+    platform: "win32",
+    safeStorage: {
+      isAsyncEncryptionAvailable: async () => { safeStorageCalls += 1; return true; },
+      encryptStringAsync: async () => { safeStorageCalls += 1; return Buffer.alloc(0); },
+      decryptStringAsync: async () => { safeStorageCalls += 1; return null; },
+    },
+    storage: {
+      async load() { storageCalls += 1; return null; },
+      async save() { storageCalls += 1; },
+    },
+  }), /requires a native factory/u);
+  assert.equal(safeStorageCalls, 0);
+  assert.equal(storageCalls, 0);
 });
 
 test("Linux legacy recovery blocks native accountless access without interpreting ciphertext", async () => {
