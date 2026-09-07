@@ -24,10 +24,16 @@ export const MACOS_SOURCE_TEST_FILES = Object.freeze([
   "test/i18n-foundation.test.js",
   "test/macos-localization.test.js",
   "test/macos-app-bundle.test.js",
+  "test/macos-keychain-migration-artifact.test.js",
+  "test/macos-keychain-migration-runner.test.js",
+  "test/macos-keychain-migration-ui.test.js",
 ]);
 
 export const MACOS_ARTIFACT_TEST_FILES = Object.freeze([
   "test/macos-app-bundle.test.js",
+  "test/macos-keychain-migration-artifact.test.js",
+  "test/macos-keychain-migration-runner.test.js",
+  "test/macos-keychain-migration-ui.test.js",
   "test/macos-updater.test.js",
   "test/macos-updater-release.test.mjs",
 ]);
@@ -134,6 +140,13 @@ function classifyKnownPath(path, lanes) {
     return true;
   }
   if (path === "test/macos-app-bundle.test.js") {
+    lanes.add("macos-source");
+    lanes.add("macos-artifact");
+    return true;
+  }
+  if (path === "test/macos-keychain-migration-artifact.test.js"
+      || path === "test/macos-keychain-migration-runner.test.js"
+      || path === "test/macos-keychain-migration-ui.test.js") {
     lanes.add("macos-source");
     lanes.add("macos-artifact");
     return true;
@@ -403,6 +416,9 @@ async function runLane(lane) {
     await runNodeTests([
       "--test-concurrency=1",
       "test/macos-app-bundle.test.js",
+      "test/macos-keychain-migration-artifact.test.js",
+      "test/macos-keychain-migration-runner.test.js",
+      "test/macos-keychain-migration-ui.test.js",
     ], {
       environment: {
         ...process.env,
@@ -422,6 +438,9 @@ async function runLane(lane) {
     await runNodeTests([
       "--test-concurrency=1",
       "test/macos-app-bundle.test.js",
+      "test/macos-keychain-migration-artifact.test.js",
+      "test/macos-keychain-migration-runner.test.js",
+      "test/macos-keychain-migration-ui.test.js",
     ], {
       environment: {
         ...process.env,

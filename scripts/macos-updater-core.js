@@ -16,6 +16,12 @@ import {
   sep,
 } from "node:path";
 
+import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
+import {
+  normalizeReleaseArchitecture,
+  resolveReleaseChannel,
+} from "../config/release-channels.js";
+
 export const SPARKLE_VERSION = "2.9.3";
 export const SPARKLE_ARCHIVE_URL =
   "https://github.com/sparkle-project/Sparkle/releases/download/2.9.3/Sparkle-2.9.3.tar.xz";
@@ -279,9 +285,11 @@ function normalizePublicEdKey(value) {
 }
 
 export function normalizeMacOSUpdaterMetadata({
+  architecture = "arm64",
   appcastURL = null,
   publicEdKey = null,
 } = {}) {
+  normalizeReleaseArchitecture(architecture);
   if (appcastURL === null || appcastURL === undefined || appcastURL === ""
       || publicEdKey === null || publicEdKey === undefined
       || publicEdKey === "") {
@@ -290,19 +298,31 @@ export function normalizeMacOSUpdaterMetadata({
       "MACOS_UPDATER_REQUIRED_FOR_DISTRIBUTION",
     );
   }
+  const normalizedURL = normalizeAppcastURL(appcastURL);
+  const intelPaths = [
+    resolveReleaseChannel("stable", { architecture: "x64" }).sparkle.appcastURL,
+    resolveReleaseChannel("internal-dogfood", { architecture: "x64" }).sparkle.appcastURL,
+    DEPLOYMENT_ENDPOINTS.sparkle.intelPreviewAppcastURL,
+  ].map((url) => new URL(url).pathname);
+  const intelPath = intelPaths.includes(new URL(normalizedURL).pathname);
+  if ((architecture === "x64") !== intelPath) {
+    fail("Updater feed path does not match its release architecture", "MACOS_UPDATER_ARCHITECTURE_MISMATCH");
+  }
   return Object.freeze({
-    appcastURL: normalizeAppcastURL(appcastURL),
+    appcastURL: normalizedURL,
     publicEdKey: normalizePublicEdKey(publicEdKey),
   });
 }
 
 export async function normalizeMacOSUpdaterConfiguration({
+  architecture = "arm64",
   appcastURL = null,
   externalDistribution = false,
   previewDistribution = false,
   frameworkPath = null,
   publicEdKey = null,
 } = {}) {
+  normalizeReleaseArchitecture(architecture);
   if (typeof externalDistribution !== "boolean") {
     fail("externalDistribution must be a boolean");
   }
@@ -346,6 +366,7 @@ export async function normalizeMacOSUpdaterConfiguration({
   }
   const framework = await inspectPinnedSparkleFramework(frameworkPath);
   const metadata = normalizeMacOSUpdaterMetadata({
+    architecture,
     appcastURL,
     publicEdKey,
   });

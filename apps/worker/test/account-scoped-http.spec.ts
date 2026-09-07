@@ -243,6 +243,14 @@ async function participantFrom(response: Response): Promise<Participant> {
   return { ...body, cookie: setCookie.split(";", 1)[0]! };
 }
 
+async function enableLegacyTransportForFixture(): Promise<void> {
+  // local_preview is necessary but not sufficient: this deliberately dormant
+  // format also needs an explicit policy opt-in in this synthetic database.
+  await bindings().USAGE_MONITOR_DB.prepare(
+    "UPDATE telemetry_transport_formats SET lifecycle = 'accepted' WHERE schema_version = 'telemetry-contribution-v0.2'",
+  ).run();
+}
+
 async function upload(
   participant: Participant,
   value: unknown,
@@ -384,6 +392,7 @@ describe("account-scoped local HTTP ingestion", () => {
   });
 
   it("accepts, reprices, analyzes, exports, and deletes encrypted v0.2 data", async () => {
+    await enableLegacyTransportForFixture();
     const enrollment = await enrollAccountScoped();
     expect(enrollment.status).toBe(201);
     await expect(enrollment.clone().json()).resolves.toMatchObject({
@@ -439,6 +448,7 @@ describe("account-scoped local HTTP ingestion", () => {
   });
 
   it("replays exact content and rejects conflicting account-track reuse", async () => {
+    await enableLegacyTransportForFixture();
     const participant = await participantFrom(await enrollAccountScoped());
     const first = await upload(participant, contribution());
     const firstReceipt = await first.response.json<{ contributionId: string }>();
@@ -463,6 +473,7 @@ describe("account-scoped local HTTP ingestion", () => {
   });
 
   it("supports an upload-only v0.2 device without granting private-result access", async () => {
+    await enableLegacyTransportForFixture();
     const participant = await participantFrom(await enrollAccountScoped());
     const pairingResponse = await api("/api/v1/me/device-pairings", {
       method: "POST",
@@ -531,5 +542,50 @@ describe("account-scoped local HTTP ingestion", () => {
       },
     });
     expect(denied.status).toBe(401);
+  });
+
+  it("keeps v0.2 blocked by default even in local preview with explicit device consent", async () => {
+    const participant = await participantFrom(await enrollAccountScoped());
+    const database = bindings().USAGE_MONITOR_DB;
+    expect(await database.prepare(
+      "SELECT lifecycle FROM telemetry_transport_formats WHERE schema_version = 'telemetry-contribution-v0.2'",
+    ).first("lifecycle")).toBe("blocked");
+    const denied = await upload(participant, contribution());
+    expect(denied.response.status).toBe(403);
+    await expect(denied.response.json()).resolves.toMatchObject({
+      error: { code: "TELEMETRY_TRANSPORT_BLOCKED" },
+    });
+    expect(await database.prepare(
+      "SELECT count(*) AS total FROM telemetry_contributions WHERE participant_id = ?",
+    ).bind(participant.participantId).first("total")).toBe(0);
+    expect(await database.prepare(
+      "SELECT minimum_rank, revision FROM telemetry_transport_participant_floors WHERE participant_id = ?",
+    ).bind(participant.participantId).first()).toEqual({ minimum_rank: 1, revision: 0 });
+  });
+
+  it("refuses an accepted legacy format below the participant floor after new-device pairing", async () => {
+    await enableLegacyTransportForFixture();
+    const participant = await participantFrom(await enrollAccountScoped());
+    const database = bindings().USAGE_MONITOR_DB;
+    await database.prepare(
+      "UPDATE telemetry_transport_participant_floors SET minimum_rank = 10, revision = revision + 1 WHERE participant_id = ?",
+    ).bind(participant.participantId).run();
+    const denied = await upload(participant, contribution());
+    expect(denied.response.status).toBe(403);
+    await expect(denied.response.json()).resolves.toMatchObject({
+      error: { code: "TELEMETRY_TRANSPORT_BLOCKED" },
+    });
+    expect(await database.prepare(
+      "SELECT count(*) AS total FROM device_credentials WHERE participant_id = ?",
+    ).bind(participant.participantId).first("total")).toBe(1);
+    expect(await database.prepare(
+      "SELECT count(*) AS total FROM telemetry_contributions WHERE participant_id = ?",
+    ).bind(participant.participantId).first("total")).toBe(0);
+    await expect(database.prepare(
+      "UPDATE telemetry_transport_participant_floors SET minimum_rank = 2, revision = revision + 1 WHERE participant_id = ?",
+    ).bind(participant.participantId).run()).rejects.toThrow("telemetry_transport_rollback_required");
+    expect(await database.prepare(
+      "SELECT minimum_rank, revision FROM telemetry_transport_participant_floors WHERE participant_id = ?",
+    ).bind(participant.participantId).first()).toEqual({ minimum_rank: 10, revision: 1 });
   });
 });

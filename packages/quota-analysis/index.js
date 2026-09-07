@@ -5,6 +5,15 @@ export {
 } from "./src/quota-tracks.js";
 
 export {
+  PLAN_ATTRIBUTION_POLICY,
+  buildPlanAttributionIndex,
+  classifyUsageAttribution,
+  planAttributionContextKey,
+  planAttributionObservationFromSnapshot,
+  planEraForInterval,
+} from "./src/plan-attribution.js";
+
+export {
   QUOTA_CALIBRATION_POLICY,
   analyzeQuotaCalibration,
   fitResetCapacity,

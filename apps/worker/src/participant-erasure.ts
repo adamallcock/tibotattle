@@ -26,6 +26,7 @@ import {
   telemetryV1ChunkCount,
   telemetryV1ChunkR2KeyPage,
 } from "./telemetry-v1-repository";
+import { telemetryV11ChunkCount, telemetryV11ChunkR2KeyPage } from "./telemetry-v11-repository";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
@@ -153,6 +154,7 @@ async function eraseParticipantData(
   }
   const telemetryTotal = await telemetryContributionCount(env.USAGE_MONITOR_DB, participantId);
   const telemetryV1Total = await telemetryV1ChunkCount(env.USAGE_MONITOR_DB, participantId);
+  const telemetryV11Total = await telemetryV11ChunkCount(env.USAGE_MONITOR_DB, participantId);
   if (contributions.length > 0) {
     await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
     await env.QUARANTINE.delete(contributions.map((row) => row.r2_key));
@@ -175,16 +177,27 @@ async function eraseParticipantData(
     }
     chunkCursor = page.nextCursor;
   } while (chunkCursor);
+  let stagedCursor: { createdAt: string; chunkRowId: string } | null = null;
+  do {
+    const page = await telemetryV11ChunkR2KeyPage(env.USAGE_MONITOR_DB, participantId, stagedCursor);
+    if (page.rows.length > 0) {
+      await assertDeletionOwner(env.USAGE_MONITOR_DB, participantId, deletionFence);
+      await env.QUARANTINE.delete(page.rows.map((row) => row.r2Key));
+    }
+    stagedCursor = page.nextCursor;
+  } while (stagedCursor);
   const currentTelemetryTotal = await telemetryContributionCount(env.USAGE_MONITOR_DB, participantId);
   const currentTelemetryV1Total = await telemetryV1ChunkCount(env.USAGE_MONITOR_DB, participantId);
-  if (currentTelemetryTotal !== telemetryTotal || currentTelemetryV1Total !== telemetryV1Total) {
+  const currentTelemetryV11Total = await telemetryV11ChunkCount(env.USAGE_MONITOR_DB, participantId);
+  if (currentTelemetryTotal !== telemetryTotal || currentTelemetryV1Total !== telemetryV1Total
+      || currentTelemetryV11Total !== telemetryV11Total) {
     throw new ApiError(409, "UPLOAD_IN_PROGRESS");
   }
   await finishParticipantDeletion(env.USAGE_MONITOR_DB, participantId, deletionFence);
   return {
     deleted: true,
     alreadyDeleted: false,
-    contributionsDeleted: contributions.length + telemetryTotal + telemetryV1Total,
+    contributionsDeleted: contributions.length + telemetryTotal + telemetryV1Total + telemetryV11Total,
   };
 }
 

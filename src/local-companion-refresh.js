@@ -1,6 +1,7 @@
 import { randomInt, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 import {
   isValidQuotaWindowDuration,
 } from "@app-usagemonitor/quota-analysis";
@@ -65,6 +66,7 @@ const INDEXING_PHASES = new Set([
   "paused",
   "prospective",
 ]);
+const LOCAL_REFRESH_MODES = new Set(["quick", "detailed"]);
 const ACCOUNTING_REFRESH_STATUSES = new Set(["reused", "rebuilt", "deferred"]);
 const GENERATION_TOKEN_PATTERN = /^[A-Za-z0-9._:-]{1,256}$/u;
 // Accounting reader failures are deliberately closed over a fixed vocabulary.
@@ -884,6 +886,7 @@ export function createLocalCollectorRefreshRunner({
   stateFile = null,
   accountObservationOperationLockFile = null,
   selectAccountObservationSecret = selectProductionAccountObservationSecret,
+  readAccountAttributionBinding = null,
   runCollector = runCollectorOnce,
   readAccountingCache = readReplaySafeAccountingCache,
   refreshAccounting = null,
@@ -918,6 +921,9 @@ export function createLocalCollectorRefreshRunner({
 } = {}) {
   if (typeof selectAccountObservationSecret !== "function") {
     throw new TypeError("selectAccountObservationSecret must be a function");
+  }
+  if (readAccountAttributionBinding !== null && typeof readAccountAttributionBinding !== "function") {
+    throw new TypeError("readAccountAttributionBinding must be a function or null");
   }
   if (typeof runCollector !== "function") throw new TypeError("runCollector must be a function");
   if (typeof readAccountingCache !== "function") {
@@ -977,6 +983,7 @@ export function createLocalCollectorRefreshRunner({
   return async function refreshLocalCollector({
     signal = null,
     onProgress = null,
+    mode = "detailed",
   } = {}) {
     if (onProgress !== null && typeof onProgress !== "function") {
       throw new TypeError("onProgress must be a function");
@@ -986,6 +993,10 @@ export function createLocalCollectorRefreshRunner({
         || typeof signal.addEventListener !== "function")) {
       throw new TypeError("signal must be an AbortSignal or null");
     }
+    if (!LOCAL_REFRESH_MODES.has(mode)) {
+      throw new TypeError("mode must be quick or detailed");
+    }
+    const detailed = mode === "detailed";
     // A refresh failure that reaches the app collapses to one generic code,
     // and companion stderr is deliberately discarded. Stamp every escaping
     // error with the pipeline step it left from, so the refresh status can
@@ -1004,7 +1015,7 @@ export function createLocalCollectorRefreshRunner({
     // the attempted use before any collector/accounting work so a later
     // failure still leaves a durable, bounded receipt in owner-only state.
     let legacyRefreshUse = null;
-    if (accountingSourceMode === "legacy" && stateFile !== null) {
+    if (detailed && accountingSourceMode === "legacy" && stateFile !== null) {
       try {
         legacyRefreshUse = await recordLocalCollectorLegacyRefreshAttempt({
           stateFile,
@@ -1053,15 +1064,14 @@ export function createLocalCollectorRefreshRunner({
       ...(stateFile === null ? {} : { stateFile }),
       staleAfterMs: 0,
       refreshStale: true,
-      // Usage facts are authoritative in the unified index. In that mode the
-      // collector remains responsible for the provider quota/quick headline,
-      // but must not resume an inherited legacy recent-7d rollout backfill.
-      // Legacy mode keeps the historical two-pass collector unchanged.
-      backfill: accountingSourceMode === "legacy",
-      ...(accountingSourceMode === "legacy"
+      // Quick refresh reads only provider quota/headline evidence regardless
+      // of storage authority. Unified detailed refresh also leaves usage facts
+      // to its index; only detailed legacy collection may backfill rollouts.
+      backfill: detailed && accountingSourceMode === "legacy",
+      ...(detailed && accountingSourceMode === "legacy"
         ? { backfillSinceAt: new Date(clock() - recentIndexWindowMs).toISOString() }
         : {}),
-      ...(accountingSourceMode === "unified"
+      ...(!detailed || accountingSourceMode === "unified"
         ? { skipRolloutIngestion: true }
         : {}),
       signal,
@@ -1073,6 +1083,7 @@ export function createLocalCollectorRefreshRunner({
       maximumRecordBatchSize: 500,
       maximumRecentEventKeys: 5_000,
       loadAccountObservationSecret: selection.loadAccountObservationSecret,
+      ...(readAccountAttributionBinding === null ? {} : { readAccountAttributionBinding }),
     };
     // The headline pass uses the collector's ordinary atomic SQLite state
     // transaction with a much smaller read budget. It therefore publishes
@@ -1103,11 +1114,11 @@ export function createLocalCollectorRefreshRunner({
     if (earlyIndex?.status === "bounded_pause"
         && signal?.aborted !== true) {
       const earlyLimit = collectorResourceLimit(result);
-      if (accountingSourceMode === "unified") {
+      if (!detailed || accountingSourceMode === "unified") {
         // A custom/injected collector may still report its own bounded pause
-        // even though unified production collection opts out of rollout
+        // even though quota-only production collection opts out of rollout
         // ingestion. Remember the fixed limit for the assemble decision, but
-        // never launch a second legacy continuation in unified mode.
+        // never launch a second legacy continuation from a quota-only pass.
         collectorResourceLimitDeferred = earlyLimit !== null;
       } else if (earlyLimit !== null
           && earlyLimit.dimension !== "source_bytes") {
@@ -1127,23 +1138,21 @@ export function createLocalCollectorRefreshRunner({
     }
     const completedIndex = publicIndexingResult(result?.indexing);
     await publishHeadline(completedIndex);
-    const accountingMayRun = accountingSourceMode === "unified"
-      ? completedIndex === null
-        || [
-          "recent_7d_complete",
-          "recent_7d_partial",
-          "prospective_only",
-          // Unified accounting reads the published index, not the bounded
-          // collector ledger, so a collector-only pause must not suppress a
-          // complete-generation accounting pass.
-          "bounded_pause",
-        ].includes(completedIndex.status)
-      : completedIndex === null
+    // Unified accounting reads the independently published unified index.
+    // The quota-only collector deliberately preserves its inherited legacy
+    // indexing descriptor, which may still say `recent_7d_indexing`; that
+    // retired checkpoint must not suppress an authoritative unified rebuild.
+    // `unifiedGenerationAuthoritative` remains the fail-closed source gate.
+    const accountingMayRun = detailed && (
+      accountingSourceMode === "unified"
+        || completedIndex === null
         || ["recent_7d_complete", "recent_7d_partial", "prospective_only"]
-          .includes(completedIndex.status);
+          .includes(completedIndex.status)
+    );
     let unifiedIndex = null;
     refreshStep = "unified_index";
-    if (accountingSourceMode === "unified"
+    if (detailed
+        && accountingSourceMode === "unified"
         && refreshUnifiedIndex !== null
         && signal?.aborted !== true) {
       const publishUnifiedIndexProgress = onProgress === null
@@ -1192,7 +1201,8 @@ export function createLocalCollectorRefreshRunner({
     let accounting = null;
     let accountingRefreshStatus = null;
     let accountingRebuildDeferred = null;
-    let accountingUnavailableCode = accountingSourceMode === "unified"
+    let accountingUnavailableCode = detailed
+        && accountingSourceMode === "unified"
         && !unifiedAccountingReady
       ? unifiedIndex?.status === "failed"
         ? "accounting_unified_source_unavailable"
@@ -1202,16 +1212,6 @@ export function createLocalCollectorRefreshRunner({
     if (refreshAccounting !== null
         && accountingMayRun
         && unifiedAccountingReady) {
-      if (accountingSourceMode === "unified" && signal?.aborted !== true) {
-        // Cursor reuse means the last scan count can be only a handful of
-        // changed files. It is no longer progress once ingestion has returned.
-        // Keep this count-free stage through accounting and the controller's
-        // full snapshot reload; neither boundary is a completion claim.
-        await onProgress?.({
-          kind: ACCOUNTING_PROGRESS_KIND,
-          status: "calculating",
-        });
-      }
       // A provider quota observation does not alter replay-safe token
       // accounting. Reuse a current cache when no rollout usage record was
       // added, while the collector state continues to supply the fresh quota
@@ -1263,6 +1263,19 @@ export function createLocalCollectorRefreshRunner({
         }
       }
       if (accounting === null && !withinRebuildBackoff) {
+        if (accountingSourceMode === "unified" && signal?.aborted !== true) {
+          // This exact count-free marker is emitted only after the current
+          // cache has failed the authoritative reuse check and immediately
+          // before a full replay-safe rebuild. The controller can therefore
+          // grant the bounded cold-work deadline without guessing from stale
+          // presentation state or extending an ordinary cache-hit refresh.
+          // Keep it through the controller's full snapshot reload; neither
+          // boundary is itself a completion claim.
+          await onProgress?.({
+            kind: ACCOUNTING_PROGRESS_KIND,
+            status: "calculating",
+          });
+        }
         let rebuilt = null;
         try {
           rebuilt = await refreshAccounting({
@@ -1385,7 +1398,8 @@ export function createLocalCollectorRefreshRunner({
     );
     let archiveIndex = null;
     refreshStep = "archive_index";
-    if (accountingSourceMode === "legacy"
+    if (detailed
+        && accountingSourceMode === "legacy"
         && refreshArchiveIndex !== null
         && signal?.aborted !== true) {
       // Archive coverage is independent of the recent collector's accounting
@@ -1458,7 +1472,7 @@ export function createLocalCollectorRefreshRunner({
               accounting.diagnostics?.forkReplayEventsExcluded ?? 0,
           },
         }
-        : accountingSourceMode === "unified"
+        : detailed && accountingSourceMode === "unified"
           ? {
             accounting: {
               status: "unavailable",
@@ -1707,10 +1721,17 @@ export const LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS =
   4 * 60 * 60_000;
 export const LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS =
   LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS;
+export const LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MS = 30_000;
+const LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MAX_MS = 60_000;
+const CANCEL_SETTLEMENT_EXPIRED = Symbol("cancel_settlement_expired");
 
 export class LocalCompanionRefreshController {
+  #accountingTimeoutMs;
   #abortController = null;
+  #beginCancellationSettlement = null;
+  #cancelSettlementMs;
   #cancelRequested = false;
+  #clearTimeoutImpl;
   #clock;
   #createRefreshId;
   #dataStore;
@@ -1720,16 +1741,23 @@ export class LocalCompanionRefreshController {
   #onDegradedOutcome;
   #onTerminalFailure;
   #runner;
+  #setTimeoutImpl;
   #state;
   #timeoutMs;
   #timeoutMsForRun;
+  #monotonicClock;
 
   constructor({
     runner,
     dataStore,
     timeoutMs = 5 * 60_000,
     timeoutMsForRun = null,
+    accountingTimeoutMs = LOCAL_COMPANION_FRESH_INDEX_REFRESH_TIMEOUT_MS,
+    cancelSettlementMs = LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MS,
     clock = () => Date.now(),
+    monotonicClock = () => performance.now(),
+    setTimeoutImpl = setTimeout,
+    clearTimeoutImpl = clearTimeout,
     createRefreshId = randomUUID,
     // Observer for terminal refresh failures. Receives only the bounded
     // identity the failed state itself carries — errorCode, and failedStep /
@@ -1756,6 +1784,30 @@ export class LocalCompanionRefreshController {
     if (timeoutMsForRun !== null && typeof timeoutMsForRun !== "function") {
       throw new TypeError("timeoutMsForRun must be a function or null");
     }
+    if (!Number.isSafeInteger(accountingTimeoutMs)
+        || accountingTimeoutMs < 1_000
+        || accountingTimeoutMs > LOCAL_COMPANION_REFRESH_TIMEOUT_MAX_MS) {
+      throw new TypeError(
+        "accountingTimeoutMs must be between 1,000 and 14,400,000",
+      );
+    }
+    if (!Number.isSafeInteger(cancelSettlementMs)
+        || cancelSettlementMs < 1_000
+        || cancelSettlementMs
+          > LOCAL_COMPANION_REFRESH_CANCEL_SETTLEMENT_MAX_MS) {
+      throw new TypeError(
+        "cancelSettlementMs must be between 1,000 and 60,000",
+      );
+    }
+    if (typeof monotonicClock !== "function") {
+      throw new TypeError("monotonicClock must be a function");
+    }
+    if (typeof setTimeoutImpl !== "function"
+        || typeof clearTimeoutImpl !== "function") {
+      throw new TypeError(
+        "setTimeoutImpl and clearTimeoutImpl must be functions",
+      );
+    }
     if (typeof createRefreshId !== "function") {
       throw new TypeError("createRefreshId must be a function");
     }
@@ -1769,13 +1821,19 @@ export class LocalCompanionRefreshController {
     this.#dataStore = dataStore;
     this.#timeoutMs = timeoutMs;
     this.#timeoutMsForRun = timeoutMsForRun;
+    this.#accountingTimeoutMs = accountingTimeoutMs;
+    this.#cancelSettlementMs = cancelSettlementMs;
     this.#clock = clock;
+    this.#monotonicClock = monotonicClock;
+    this.#setTimeoutImpl = setTimeoutImpl;
+    this.#clearTimeoutImpl = clearTimeoutImpl;
     this.#createRefreshId = createRefreshId;
     this.#onTerminalFailure = onTerminalFailure;
     this.#onDegradedOutcome = onDegradedOutcome;
     this.#state = {
       status: "idle",
       refreshId: null,
+      mode: null,
       startedAt: null,
       finishedAt: null,
       result: null,
@@ -1803,6 +1861,11 @@ export class LocalCompanionRefreshController {
       ...this.#state,
       status: "cancelling",
     };
+    // An explicit cancel supersedes the ordinary or extended work deadline.
+    // Bound settlement independently so an injected or defective runner that
+    // ignores AbortSignal cannot hold the foreground refresh lock for the
+    // remainder of a four-hour cold-accounting allowance.
+    this.#beginCancellationSettlement?.();
     this.#abortController.abort();
     return true;
   }
@@ -1848,7 +1911,10 @@ export class LocalCompanionRefreshController {
     }
   }
 
-  start() {
+  start({ mode = "detailed" } = {}) {
+    if (!LOCAL_REFRESH_MODES.has(mode)) {
+      throw new TypeError("mode must be quick or detailed");
+    }
     if (this.#inFlight !== null) return false;
     const selectedTimeoutMs = this.#timeoutMsForRun === null
       ? this.#timeoutMs
@@ -1872,6 +1938,7 @@ export class LocalCompanionRefreshController {
     this.#state = {
       status: "running",
       refreshId,
+      mode,
       startedAt: new Date(startedAt).toISOString(),
       finishedAt: null,
       result: null,
@@ -1881,16 +1948,77 @@ export class LocalCompanionRefreshController {
     };
     let timedOut = false;
     let timeout;
+    let cancellationSettlementTimeout;
+    let accountingDeadlineApplied = false;
+    const timeoutStartedAt = this.#monotonicClock();
     const controller = new AbortController();
     this.#abortController = controller;
-    const work = Promise.resolve()
+    const expire = () => {
+      if (this.#state.refreshId !== refreshId
+          || this.#cancelRequested
+          || !["running", "cancelling"].includes(this.#state.status)) return;
+      timedOut = true;
+      controller.abort();
+      this.#state = {
+        status: "failed",
+        refreshId: this.#state.refreshId,
+        mode,
+        startedAt: this.#state.startedAt,
+        finishedAt: new Date(this.#clock()).toISOString(),
+        result: null,
+        progress: terminalRefreshProgress(this.#state.progress),
+        quickResultAt: this.#state.quickResultAt,
+        errorCode: "refresh_timed_out",
+      };
+      // The timeout IS the terminal failure the user sees, and a hung runner
+      // may never settle — file the trail entry now, not at settlement.
+      this.#notifyTerminalFailure();
+    };
+    const armTimeoutFromStart = (budgetMs) => {
+      this.#clearTimeoutImpl(timeout);
+      const elapsedMs = Math.max(
+        0,
+        this.#monotonicClock() - timeoutStartedAt,
+      );
+      const remainingMs = Math.max(1, Math.ceil(budgetMs - elapsedMs));
+      timeout = this.#setTimeoutImpl(expire, remainingMs);
+      timeout.unref?.();
+    };
+    let resolveCancellationSettlement;
+    const cancellationSettlement = new Promise((resolve) => {
+      resolveCancellationSettlement = resolve;
+    });
+    this.#beginCancellationSettlement = () => {
+      this.#clearTimeoutImpl(timeout);
+      if (cancellationSettlementTimeout !== undefined) return;
+      cancellationSettlementTimeout = this.#setTimeoutImpl(
+        () => resolveCancellationSettlement(CANCEL_SETTLEMENT_EXPIRED),
+        this.#cancelSettlementMs,
+      );
+      cancellationSettlementTimeout.unref?.();
+    };
+    const runnerWork = Promise.resolve()
       .then(() => this.#runner({
         signal: controller.signal,
+        mode,
         onProgress: async (progress) => {
-          if (timedOut
+          if (this.#state.refreshId !== refreshId
+              || timedOut
               || !["running", "cancelling"].includes(this.#state.status)) return;
           const projected = publicRefreshProgress(progress);
           if (projected === null) return;
+          if (!accountingDeadlineApplied
+              && !this.#cancelRequested
+              && this.#state.status === "running"
+              && projected.kind === ACCOUNTING_PROGRESS_KIND
+              && this.#accountingTimeoutMs > selectedTimeoutMs) {
+            // The runner emits this exact marker only for an actual full
+            // replay-safe rebuild. Extend once to the same four-hour total
+            // bound used by a fresh index; repeated or malformed progress
+            // cannot keep a run alive indefinitely.
+            accountingDeadlineApplied = true;
+            armTimeoutFromStart(this.#accountingTimeoutMs);
+          }
           let quickResultAt = this.#state.quickResultAt;
           if (projected.kind !== ARCHIVE_INDEX_PROGRESS_KIND
               && projected.phase === "quick_result"
@@ -1913,19 +2041,27 @@ export class LocalCompanionRefreshController {
             quickResultAt,
           };
         },
-      }))
+      }));
+    const work = Promise.race([runnerWork, cancellationSettlement])
       .then(async (result) => {
         if (this.#cancelRequested) {
           // The data store already owns the last verified snapshot. A cancel
-          // must become terminal as soon as worker shutdown is confirmed,
-          // rather than entering another potentially expensive projection.
+          // becomes terminal as soon as worker shutdown is confirmed. If a
+          // defective runner ignores abort, the short settlement watchdog
+          // instead detaches it from the foreground generation; the runner's
+          // AbortSignal still fences durable accounting publication.
           this.#state = {
             status: "cancelled",
             refreshId: this.#state.refreshId,
+            mode,
             startedAt: this.#state.startedAt,
             finishedAt: new Date(this.#clock()).toISOString(),
-            result: publicRefreshResult(result, this.#clock()),
-            progress: publicIndexingResult(result?.indexing)
+            result: result === CANCEL_SETTLEMENT_EXPIRED
+              ? null
+              : publicRefreshResult(result, this.#clock()),
+            progress: result === CANCEL_SETTLEMENT_EXPIRED
+              ? terminalRefreshProgress(this.#state.progress)
+              : publicIndexingResult(result?.indexing)
               ?? terminalRefreshProgress(this.#state.progress),
             quickResultAt: this.#state.quickResultAt,
             errorCode: "refresh_cancelled",
@@ -1939,6 +2075,7 @@ export class LocalCompanionRefreshController {
           this.#state = {
             status: "failed",
             refreshId: this.#state.refreshId,
+            mode,
             startedAt: this.#state.startedAt,
             finishedAt: this.#state.finishedAt
               ?? new Date(this.#clock()).toISOString(),
@@ -1952,15 +2089,18 @@ export class LocalCompanionRefreshController {
           return;
         }
         await this.#dataStore.reload({
-          purpose: "full",
+          purpose: mode === "quick" ? "quick" : "full",
           signal: controller.signal,
-          unifiedProjectionReuse: reusableUnifiedProjection(result),
+          ...(mode === "detailed"
+            ? { unifiedProjectionReuse: reusableUnifiedProjection(result) }
+            : {}),
         });
         const finalProgress = publicIndexingResult(result?.indexing);
         const degradation = unifiedIndexDegradation(result);
         this.#state = {
           status: degradation === null ? "succeeded" : "degraded",
           refreshId: this.#state.refreshId,
+          mode,
           startedAt: this.#state.startedAt,
           finishedAt: new Date(this.#clock()).toISOString(),
           result: publicRefreshResult(result, this.#clock()),
@@ -1982,6 +2122,7 @@ export class LocalCompanionRefreshController {
           this.#state = {
             status: "cancelled",
             refreshId: this.#state.refreshId,
+            mode,
             startedAt: this.#state.startedAt,
             finishedAt: new Date(this.#clock()).toISOString(),
             result: null,
@@ -2009,6 +2150,7 @@ export class LocalCompanionRefreshController {
         this.#state = {
           status: "failed",
           refreshId: this.#state.refreshId,
+          mode,
           startedAt: this.#state.startedAt,
           finishedAt: new Date(this.#clock()).toISOString(),
           result: null,
@@ -2031,29 +2173,14 @@ export class LocalCompanionRefreshController {
         this.#notifyTerminalFailure();
       })
       .finally(() => {
-        clearTimeout(timeout);
+        this.#clearTimeoutImpl(timeout);
+        this.#clearTimeoutImpl(cancellationSettlementTimeout);
         this.#abortController = null;
+        this.#beginCancellationSettlement = null;
         this.#cancelRequested = false;
         this.#inFlight = null;
       });
-    timeout = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-      this.#state = {
-        status: "failed",
-        refreshId: this.#state.refreshId,
-        startedAt: this.#state.startedAt,
-        finishedAt: new Date(this.#clock()).toISOString(),
-        result: null,
-        progress: terminalRefreshProgress(this.#state.progress),
-        quickResultAt: this.#state.quickResultAt,
-        errorCode: "refresh_timed_out",
-      };
-      // The timeout IS the terminal failure the user sees, and a hung runner
-      // may never settle — file the trail entry now, not at settlement.
-      this.#notifyTerminalFailure();
-    }, selectedTimeoutMs);
-    timeout.unref?.();
+    armTimeoutFromStart(selectedTimeoutMs);
     this.#inFlight = work;
     return true;
   }

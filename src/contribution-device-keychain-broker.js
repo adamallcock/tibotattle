@@ -34,9 +34,10 @@ const WIRE_CAPABILITIES = new Set(
 
 // KEYCHAIN_LOCKED, KEYCHAIN_DENIED, and KEYCHAIN_MIGRATION_REQUIRED are the
 // exact fixed codes the export-identity backend classifies. Migration remains
-// distinct so the product can ask the user to quit and reopen the signed app,
-// which is the broker's only authorized retry boundary, instead of offering a
-// destructive credential reset or looping another prompt in this process.
+// distinct so the product can direct the user to the native Secure upgrade
+// review after bounded silent retries. Only deliberate native approval may
+// enable a prompt; the companion cannot approve or reset the retry budget.
+// Credential reset is not migration recovery.
 // Other broker failures collapse to the existing credential-unavailable
 // surface.
 const ERROR_CODES = new Set([

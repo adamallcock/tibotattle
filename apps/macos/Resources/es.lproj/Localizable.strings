@@ -29,7 +29,7 @@
 "nativeDashboard.progressQuotaRefresh" = "Actualizando el límite…";
 "nativeDashboard.progressSaving" = "Guardando el progreso del análisis…";
 "nativeDashboard.refreshUsage" = "Actualizar";
-"nativeDashboard.refreshUsageTooltip" = "Actualiza desde las carpetas de sesiones de Codex seleccionadas y las fuentes locales de cuenta, límite, configuración y linaje de ejecuciones de Codex. El procesamiento permanece en este Mac.";
+"nativeDashboard.refreshUsageTooltip" = "Actualiza el límite actual, el historial local y la contabilidad detallada. Reutiliza los resultados en caché válidos; todo el procesamiento permanece en este Mac.";
 "nativeDashboard.share" = "Compartir";
 "nativeDashboard.showSidebar" = "Mostrar barra lateral";
 "nativeDashboard.shareTooltip" = "Abrir la tarjeta local para compartir.";
@@ -44,6 +44,16 @@
 "menu.selectAll" = "Seleccionar todo";
 "menu.settings" = "Configuración…";
 "menu.view" = "Visualización";
+"dialog.approveKeychainMigration" = "Aprobar migración";
+"dialog.keychainMigrationTitle" = "¿Aprobar la migración segura del llavero?";
+"dialog.keychainMigrationDescription" = "Las claves guardadas en el llavero mantienen la correspondencia de cuentas locales y tu identidad de contribución existente. Esta actualización las traslada a elementos del llavero propios de la app sin cambiar sus valores.\n\nLa migración silenciosa no pudo finalizar. macOS puede pedirte la contraseña del llavero de inicio de sesión. Introdúcela solo en el diálogo de macOS; TiboTattle no recibe la contraseña.\n\nAprobar esta migración no restablece nada ni sube datos. El historial existente se conserva. Cancelar deja la migración pendiente.";
+"settings.keychainMigrationTitle" = "Actualización segura";
+"settings.keychainMigrationSummary" = "El acceso guardado al llavero necesita una aprobación única para finalizar esta actualización. Tu historial se conserva; revísalo cuando quieras.";
+"settings.keychainMigrationRetrying" = "Preparando el acceso seguro automáticamente. No se necesita contraseña mientras se realizan estas comprobaciones.";
+"settings.keychainMigrationApproving" = "Finalizando la migración aprobada del llavero… Se conservan los valores de tus claves y el historial existentes.";
+"settings.keychainMigrationDeferred" = "La migración de las claves restantes sigue pendiente. No se ha restablecido nada y se conserva el historial local. Puedes revisarla de nuevo cuando quieras.";
+"settings.keychainMigrationReview" = "Revisar migración…";
+"settings.keychainMigrationMenu" = "Finalizar actualización segura…";
 "menuBar.analyzeLocalUsage" = "Analizar uso local";
 "menuBar.analyzingLocalUsage" = "Analizando uso local…";
 "menuBar.allowanceTitle" = "%@ · %@ de límite";
@@ -359,7 +369,7 @@
 "settings.startAtLoginUnregistrationNotConfirmedMessage" = "macOS no confirmó que TiboTattle se eliminó de los elementos de inicio de sesión. Revisa Configuración del Sistema → Elementos de inicio de sesión antes de confiar en ello.";
 "settings.startAtLoginUnregistrationNotConfirmedTitle" = "No se confirmó la eliminación del inicio al iniciar sesión";
 "settings.refreshInterval" = "Intervalo de actualización";
-"settings.refreshIntervalDetail" = "Se guarda en este Mac y se usa mientras TiboTattle está abierto.";
+"settings.refreshIntervalDetail" = "Comprueba el límite actual mientras TiboTattle está abierto. La contabilidad detallada se actualiza automáticamente como máximo una vez por hora; elige Actualizar para actualizarlo todo ahora.";
 "settings.refreshIntervalOneMinute" = "Cada minuto";
 "settings.refreshIntervalFiveMinutes" = "Cada 5 minutos";
 "settings.refreshIntervalFifteenMinutes" = "Cada 15 minutos";

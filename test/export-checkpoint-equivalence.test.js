@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as zlib from "node:zlib";
 import { populateCheckpointedCodexSources } from "../src/codex-export-checkpoint-scan.js";
 import { exportCompatibilityTuple } from "../src/export-contract.js";
 import { deriveParticipantId } from "../src/export-identity.js";
@@ -26,6 +27,8 @@ const END_AT = "2026-07-24T12:10:00.000Z";
 const PRIVATE_CHECKPOINT_CANARIES = Object.freeze([
   "PRIVATE_PARENT", "PRIVATE_CHILD", "PRIVATE_PARENT_TASK", "PRIVATE_TOOL_1", "PRIVATE_TOOL_2",
   "ordinary private-looking text without a scanner needle", "await tools.spawn_agent({})",
+  "private-response-thread-canary", "private-response-turn-canary", "private-response-root-canary",
+  "private-root-turn-canary", "private-response-canary",
 ]);
 
 function usage({ input, cached = 0, cacheWrite = 0, output = 0, reasoning = 0, total }) {
@@ -57,7 +60,7 @@ function tokenCount(timestamp, total, last, usedPercent, explicitModel = undefin
   });
 }
 
-async function fixture({ replayTool = false } = {}) {
+async function fixture({ replayTool = false, responseRecords = false, responseOnly = false, compressed = false } = {}) {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-checkpoint-equivalence-"));
   const home = join(root, "codex-home");
   const sessions = join(home, "sessions");
@@ -118,8 +121,27 @@ async function fixture({ replayTool = false } = {}) {
     JSON.stringify({ timestamp: "2026-07-24T12:03:20.000Z", type: "response_item", payload: { type: "custom_tool_call", name: "exec", input: "await tools.spawn_agent({})" } }),
     tokenCount("2026-07-24T12:04:00.000Z", { input_tokens: 240, total_tokens: 280 }, { input_tokens: 50, total_tokens: 55 }, 19.8),
   ];
-  await writeFile(join(sessions, "rollout-2026-07-24T12-00-00-parent.jsonl"), `${parent.join("\n")}\n`);
-  await writeFile(join(sessions, "rollout-2026-07-24T12-03-10-child.jsonl"), `${child.join("\n")}\n`);
+  if (responseRecords) {
+    const response = { thread_id: "private-response-thread-canary", turn_id: "private-response-turn-canary",
+      session_id: "private-response-root-canary", root_turn_id: "private-root-turn-canary", response_id: "private-response-canary",
+      usage: usage({ input: 1000 }), turn_token_usage: usage({ input: 2000 }), thread_token_usage: usage({ input: 3000 }) };
+    for (const records of [parent, child]) {
+      if (responseOnly) {
+        for (let index = records.length - 1; index >= 0; index -= 1) {
+          if (records[index].includes('"token_count"')) records.splice(index, 1);
+        }
+      }
+      records.splice(2, 0, JSON.stringify({ timestamp: "2026-07-24T12:00:00.002Z", type: "token_usage_record", payload: response }));
+      records.push(JSON.stringify({ timestamp: "2026-07-24T12:04:01.000Z", type: "compacted", payload: { latest_token_usage_record: response } }));
+      records.push(JSON.stringify({ timestamp: "2026-07-24T12:04:02.000Z", type: "token_usage_record", payload: response }));
+    }
+  }
+  const contents = (records) => compressed
+    ? zlib.zstdCompressSync(Buffer.from(`${records.join("\n")}\n`))
+    : `${records.join("\n")}\n`;
+  const suffix = compressed ? ".jsonl.zst" : ".jsonl";
+  await writeFile(join(sessions, `rollout-2026-07-24T12-00-00-parent${suffix}`), contents(parent));
+  await writeFile(join(sessions, `rollout-2026-07-24T12-03-10-child${suffix}`), contents(child));
   return { root, home };
 }
 
@@ -154,6 +176,45 @@ function workspaceEnvelopes(workspace) {
     record: item.record,
   })));
 }
+
+test("checkpoint and provider readers ignore overlapping response records and compacted copies across replay and resume", async () => {
+  const value = await fixture({ responseRecords: true });
+  try {
+    const legacy = await legacyResult(value.home);
+    assert.equal(legacy.records.filter((item) => item.recordType === "usageEvent").length, 4);
+    const checkpointed = await checkpointResult({ ...value, label: "response-records", maximumLinesPerBatch: 1, interruptAfterBatch: 9 });
+    assert.deepEqual(checkpointed.records, legacy.records);
+    assert.deepEqual(checkpointed.diagnostics, legacy.diagnostics);
+    assert.deepEqual(checkpointed.privateCanariesPresent, []);
+    assert.equal(JSON.stringify(checkpointed.records).includes("private-response"), false);
+  } finally { await rm(value.root, { recursive: true }); }
+});
+
+test("response-record-only sources do not become observed zero-token export records", async () => {
+  const value = await fixture({ responseRecords: true, responseOnly: true });
+  try {
+    const legacy = await legacyResult(value.home);
+    const checkpointed = await checkpointResult({ ...value, label: "response-only", maximumLinesPerBatch: 1 });
+    assert.equal(legacy.records.filter((item) => item.recordType === "usageEvent").length, 0);
+    assert.equal(checkpointed.records.filter((item) => item.recordType === "usageEvent").length, 0);
+    assert.deepEqual(checkpointed.records, legacy.records);
+    assert.deepEqual(checkpointed.privateCanariesPresent, []);
+  } finally { await rm(value.root, { recursive: true }); }
+});
+
+test("compressed parent and child histories retain checkpoint batch/resume parity", {
+  skip: typeof zlib.zstdCompressSync !== "function" && "Native Zstd requires Node 22.15 or newer",
+}, async () => {
+  const value = await fixture({ compressed: true, responseRecords: true });
+  try {
+    const legacy = await legacyResult(value.home);
+    assert.equal(legacy.records.filter((item) => item.recordType === "usageEvent").length, 4);
+    const checkpointed = await checkpointResult({ ...value, label: "compressed-resume", maximumLinesPerBatch: 1, interruptAfterBatch: 9 });
+    assert.deepEqual(checkpointed.records, legacy.records);
+    assert.deepEqual(checkpointed.diagnostics, legacy.diagnostics);
+    assert.deepEqual(checkpointed.privateCanariesPresent, []);
+  } finally { await rm(value.root, { recursive: true }); }
+});
 
 async function checkpointResult({ root, home, label, maximumLinesPerBatch, interruptAfterBatch = null }) {
   const plan = await createCodexExportSourcePlan({ codexHome: home, startAt: START_AT, endAt: END_AT });

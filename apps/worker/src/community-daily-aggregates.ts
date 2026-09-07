@@ -1,12 +1,17 @@
 import { canonicalJson } from "./canonical-json";
 import {
   COMMUNITY_ALLOWANCE_BASIS,
+  COMMUNITY_ATTRIBUTION_METHOD_VERSION,
   COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
   collectCommunityAllowanceFits,
   summarizeCommunityAllowanceDay,
 } from "./community-allowance";
 import type { CommunityAllowanceFit } from "./community-allowance";
 import { sha256Hex } from "./crypto";
+import {
+  loadV1SourcePin,
+  V1_WINNER_FILTER_SQL,
+} from "./telemetry-v1-source-selection";
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -185,14 +190,19 @@ async function enqueueCommunityAllowanceDriftRebuilds(
   await db.prepare(
     `INSERT INTO community_allowance_publication_state (
        singleton, publication_state, expected_basis,
-       safe_from_day, safe_to_day, changed_at
-     ) VALUES (1, ?1, ?2, ?3, ?4, ?5)
+       safe_from_day, safe_to_day, changed_at, attribution_method_version
+     ) SELECT 1, ?1, ?2, ?3, ?4, ?5, ?7
+       WHERE EXISTS (
+         SELECT 1 FROM community_snapshot_mutation_control
+          WHERE singleton_id = 1 AND mutation_epoch = ?6
+       )
      ON CONFLICT(singleton) DO UPDATE SET
        publication_state = excluded.publication_state,
        expected_basis = excluded.expected_basis,
        safe_from_day = excluded.safe_from_day,
        safe_to_day = excluded.safe_to_day,
-       changed_at = excluded.changed_at
+       changed_at = excluded.changed_at,
+       attribution_method_version = excluded.attribution_method_version
      WHERE community_allowance_publication_state.publication_state
              <> excluded.publication_state
         OR community_allowance_publication_state.expected_basis
@@ -200,13 +210,17 @@ async function enqueueCommunityAllowanceDriftRebuilds(
         OR community_allowance_publication_state.safe_from_day
              <> excluded.safe_from_day
         OR community_allowance_publication_state.safe_to_day
-             <> excluded.safe_to_day`,
+             <> excluded.safe_to_day
+        OR community_allowance_publication_state.attribution_method_version
+             IS NOT excluded.attribution_method_version`,
   ).bind(
     publicationState,
     COMMUNITY_ALLOWANCE_BASIS,
     reconcileFromDay,
     reconcileToDay,
     new Date(nowMs).toISOString(),
+    reconcileEpoch,
+    COMMUNITY_ATTRIBUTION_METHOD_VERSION,
   ).run();
   for (const day of drifted) {
     await db.prepare(
@@ -219,54 +233,6 @@ async function enqueueCommunityAllowanceDriftRebuilds(
     ).bind(day, reconcileEpoch).run();
   }
 }
-
-/**
- * Cross-device dedupe: for one participant and one day, count that day's
- * records exactly once.
- *
- * Sync state and chunk supersession are per-(participant, device), so a
- * participant whose device credential is irrecoverably lost re-pairs a fresh
- * device that reads an empty per-device cursor and re-uploads its entire
- * history — while the lost device's chunks stay current forever. Devices are
- * an upload transport, not a data partition: two devices of one participant
- * observe the SAME underlying local index, so summing records across devices
- * would double-count every overlapping day. The honest general rule applied
- * here: per (participant, day), aggregate only the records of the winning
- * device — the device whose current chunks holding records for that day have
- * the newest created_at (freshest evidence wins, across all streams), with a
- * deterministic tiebreak on the larger device_id. Records only ever belong
- * to current chunks (supersession deletes the superseded revision's records
- * in the same transaction), so joining records to their owning chunk is the
- * exact current-evidence set. The rule is self-healing and direction-free: a
- * newer upload by ANY device of the participant flips the winner at the next
- * rebuild, and a single-device participant is always its own winner, leaving
- * single-device aggregation unchanged.
- */
-const WINNING_DEVICE_CTE = `
-  WITH day_device_evidence AS (
-    SELECT r.participant_id AS participant_id,
-           r.device_id AS device_id,
-           MAX(c.created_at) AS newest_chunk_created_at
-      FROM telemetry_v1_records r
-      JOIN telemetry_v1_chunks c ON c.id = r.chunk_row_id
-     WHERE r.observed_day = ?
-     GROUP BY r.participant_id, r.device_id
-  ),
-  winning_devices AS (
-    SELECT participant_id, device_id
-      FROM day_device_evidence winner
-     WHERE NOT EXISTS (
-       SELECT 1 FROM day_device_evidence rival
-        WHERE rival.participant_id = winner.participant_id
-          AND (
-            rival.newest_chunk_created_at > winner.newest_chunk_created_at
-            OR (
-              rival.newest_chunk_created_at = winner.newest_chunk_created_at
-              AND rival.device_id > winner.device_id
-            )
-          )
-     )
-  )`;
 
 async function buildCommunityDailyAggregate(
   db: D1Database,
@@ -287,14 +253,16 @@ async function buildCommunityDailyAggregate(
   if (!Number.isSafeInteger(buildEpoch) || buildEpoch < 0) {
     throw new Error("community daily aggregate mutation control unavailable");
   }
+  // Resolve once for BOTH totals and cells. This is the same analytical-stream
+  // winner policy as calibration, with explicit session-only fallback.
+  const sourcePin = await loadV1SourcePin(db, { day });
   const [totals, cells, revisionRow] = await Promise.all([
     // contributing_devices deliberately counts only winning devices — the
     // devices whose records the published numbers actually include (one per
     // participant per day). A losing transport duplicate is not a
     // contribution.
     db.prepare(
-      `${WINNING_DEVICE_CTE}
-      SELECT
+      `SELECT
         COUNT(DISTINCT r.participant_id) AS contributing_participants,
         COUNT(DISTINCT r.participant_id || ':' || r.device_id)
           AS contributing_devices,
@@ -315,16 +283,12 @@ async function buildCommunityDailyAggregate(
           COALESCE(r.output_text_tokens, 0)
             + COALESCE(r.output_reasoning_tokens, 0))), 0)
           AS output_combined_tokens
-       FROM telemetry_v1_records r
-       JOIN winning_devices w
-         ON w.participant_id = r.participant_id
-        AND w.device_id = r.device_id
+       FROM telemetry_analytical_records r
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-       WHERE r.observed_day = ?`,
-    ).bind(day, day).first<DailyTotalsRow>(),
+       WHERE ${V1_WINNER_FILTER_SQL} AND r.observed_day = ?`,
+    ).bind(sourcePin.winnersJson, day).first<DailyTotalsRow>(),
     db.prepare(
-      `${WINNING_DEVICE_CTE}
-      SELECT r.provider, r.model_id,
+      `SELECT r.provider, r.model_id,
         COUNT(*) AS usage_events,
         COALESCE(SUM(r.input_uncached_tokens), 0) AS input_uncached_tokens,
         COALESCE(SUM(r.input_cache_read_tokens), 0)
@@ -338,16 +302,13 @@ async function buildCommunityDailyAggregate(
           COALESCE(r.output_text_tokens, 0)
             + COALESCE(r.output_reasoning_tokens, 0))), 0)
           AS output_combined_tokens
-       FROM telemetry_v1_records r
-       JOIN winning_devices w
-         ON w.participant_id = r.participant_id
-        AND w.device_id = r.device_id
+       FROM telemetry_analytical_records r
        JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-       WHERE r.observed_day = ? AND r.stream = 'usage'
+       WHERE ${V1_WINNER_FILTER_SQL} AND r.observed_day = ? AND r.stream = 'usage'
        GROUP BY r.provider, r.model_id
        ORDER BY r.provider, r.model_id
        LIMIT ?`,
-    ).bind(day, day, MAX_DAILY_AGGREGATE_CELLS + 1).all<DailyCellRow>(),
+    ).bind(sourcePin.winnersJson, day, MAX_DAILY_AGGREGATE_CELLS + 1).all<DailyCellRow>(),
     db.prepare(
       `SELECT COALESCE(MAX(revision), 0) + 1 AS revision
          FROM community_daily_aggregates WHERE day = ?`,
@@ -409,6 +370,9 @@ async function buildCommunityDailyAggregate(
   };
   const payloadJson = canonicalJson(payload);
   const payloadHash = await sha256Hex(payloadJson);
+  if ((await loadV1SourcePin(db, { day })).fingerprint !== sourcePin.fingerprint) {
+    return { state: "conflicted", aggregateId };
+  }
   const results = await db.batch([
     // The finalization predicate mirrors the weekly builder's: the build is
     // cancelled outright when the mutation epoch moved after its source
@@ -539,8 +503,22 @@ export interface PublishedCommunityDailyAggregateRow {
 export interface CommunityAllowancePublicationStateRow {
   publication_state: "updating" | "ready";
   expected_basis: string;
+  attribution_method_version: string | null;
   safe_from_day: string;
   safe_to_day: string;
+}
+
+/** Shared by the public payload and operator gauges; old publication is not
+ * current merely because an immutable daily row still says 'published'. */
+export function isCurrentCommunityAllowancePublication(
+  state: CommunityAllowancePublicationStateRow | null | undefined,
+  nowMs: number,
+): boolean {
+  return Number.isFinite(nowMs) && state?.publication_state === "ready"
+    && state.expected_basis === COMMUNITY_ALLOWANCE_BASIS
+    && state.attribution_method_version === COMMUNITY_ATTRIBUTION_METHOD_VERSION
+    && state.safe_from_day === driftReconcileFromDay(nowMs)
+    && state.safe_to_day === driftReconcileToDay(nowMs);
 }
 
 export interface PublishedCommunityDailyRead {
@@ -579,6 +557,7 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
             requested.released_at,
             state.publication_state,
             state.expected_basis,
+            state.attribution_method_version,
             state.safe_from_day,
             state.safe_to_day
        FROM (SELECT 1 AS singleton) gate
@@ -593,6 +572,7 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
     released_at: string | null;
     publication_state: "updating" | "ready" | null;
     expected_basis: string | null;
+    attribution_method_version: string | null;
     safe_from_day: string | null;
     safe_to_day: string | null;
   }>();
@@ -605,6 +585,7 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
     ? {
         publication_state: first.publication_state,
         expected_basis: first.expected_basis,
+        attribution_method_version: first.attribution_method_version,
         safe_from_day: first.safe_from_day,
         safe_to_day: first.safe_to_day,
       }

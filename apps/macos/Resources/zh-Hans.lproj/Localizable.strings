@@ -29,7 +29,7 @@
 "nativeDashboard.progressQuotaRefresh" = "正在刷新额度…";
 "nativeDashboard.progressSaving" = "正在保存分析进度…";
 "nativeDashboard.refreshUsage" = "刷新";
-"nativeDashboard.refreshUsageTooltip" = "从所选 Codex 会话文件夹，以及本地 Codex 帐户、额度、配置和运行谱系来源中更新。所有处理都留在这台 Mac 上。";
+"nativeDashboard.refreshUsageTooltip" = "刷新当前额度、本地历史和详细核算。重复使用有效的缓存结果；所有处理都留在这台 Mac 上。";
 "nativeDashboard.share" = "分享";
 "nativeDashboard.showSidebar" = "显示边栏";
 "nativeDashboard.shareTooltip" = "打开本地分享卡片。";
@@ -44,6 +44,16 @@
 "menu.selectAll" = "全选";
 "menu.settings" = "设置…";
 "menu.view" = "显示";
+"dialog.approveKeychainMigration" = "批准迁移";
+"dialog.keychainMigrationTitle" = "批准安全钥匙串迁移？";
+"dialog.keychainMigrationDescription" = "钥匙串中保存的密钥可维持本地帐户匹配以及现有贡献身份的一致性。此次更新会将它们移至由本应用拥有的钥匙串项目，但不会改变其值。\n\n静默迁移未能完成。macOS 可能会要求输入登录钥匙串密码。请仅在 macOS 对话框中输入；TiboTattle 不会收到该密码。\n\n批准此次迁移不会重置任何内容，也不会上传数据。现有历史记录会保留。取消后，迁移将保持待处理状态。";
+"settings.keychainMigrationTitle" = "安全升级";
+"settings.keychainMigrationSummary" = "保存的钥匙串访问权限需要一次批准才能完成此次升级。历史记录会保留；你可以在方便时查看。";
+"settings.keychainMigrationRetrying" = "正在自动准备安全访问。检查期间无需输入密码。";
+"settings.keychainMigrationApproving" = "正在完成已批准的钥匙串迁移… 现有密钥值和历史记录会保留。";
+"settings.keychainMigrationDeferred" = "其余密钥仍待迁移。没有重置任何内容，本地历史记录会保留。你可以在方便时再次查看。";
+"settings.keychainMigrationReview" = "查看迁移…";
+"settings.keychainMigrationMenu" = "完成安全升级…";
 "menuBar.analyzeLocalUsage" = "分析本地使用情况";
 "menuBar.analyzingLocalUsage" = "正在分析本地使用情况…";
 "menuBar.allowanceTitle" = "%@ · %@ 额度";
@@ -359,7 +369,7 @@
 "settings.startAtLoginUnregistrationNotConfirmedMessage" = "macOS 未确认 TiboTattle 已从登录项中移除。在依赖它之前，请检查“系统设置”→“登录项”。";
 "settings.startAtLoginUnregistrationNotConfirmedTitle" = "未确认移除登录时启动";
 "settings.refreshInterval" = "刷新间隔";
-"settings.refreshIntervalDetail" = "保存在这台 Mac 上，仅在 TiboTattle 打开时使用。";
+"settings.refreshIntervalDetail" = "TiboTattle 打开时检查当前额度。详细核算最多每小时自动更新一次；选择“刷新”可立即更新所有数据。";
 "settings.refreshIntervalOneMinute" = "每分钟";
 "settings.refreshIntervalFiveMinutes" = "每 5 分钟";
 "settings.refreshIntervalFifteenMinutes" = "每 15 分钟";

@@ -3,7 +3,8 @@
  *
  * Local companion contract:
  *   GET  /api/local/{onboarding,overview,gradient,weekly,quality}
- *   POST /api/local/refresh
+ *   POST /api/local/refresh/quick (automatic/lightweight observation refresh)
+ *   POST /api/local/refresh       (explicit detailed-accounting rebuild)
  *
  * Hosted browser-session contract:
  *   GET  /api/v1/session
@@ -15,7 +16,15 @@
  * responses, but never silently turn a failure into real-looking data.
  */
 
-import { TELEMETRY_PLAN_TYPES } from "./telemetry-shared.generated.js";
+import {
+  codexCacheReasoningConfiguration,
+  REVIEWED_CODEX_MODEL_IDS,
+  TELEMETRY_PLAN_TYPES,
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
+  TELEMETRY_V11_ACCOUNT_BASES,
+  TELEMETRY_V11_PLAN_BASES,
+  telemetryV11RequiredConsent,
+} from "./telemetry-shared.generated.js";
 
 export {
   COMMUNITY_SNAPSHOT_SCHEMA_VERSION,
@@ -865,6 +874,11 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
   return Object.freeze({
     status: "available",
     keychainPrompt,
+    ...(payload.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      ? { contractVersion: payload.contractVersion } : {}),
+    ...(payload.attributionUpgrade?.available === true
+      && payload.attributionUpgrade?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION
+      ? { attributionUpgradeAvailable: true } : {}),
     consent: Object.freeze({
       approved: payload.consent.approved,
       current: payload.consent.current,
@@ -880,6 +894,52 @@ export function normalizeIncrementalContributionSyncStatus(payload) {
     lastAttemptAt,
     nextAttemptAt,
     lastOutcome
+  });
+}
+
+export function normalizeAttributionContributionReview(payload) {
+  const required = telemetryV11RequiredConsent();
+  const consent = payload?.consent;
+  const inventory = payload?.inventory;
+  const fields = inventory?.fields;
+  let destination;
+  try { destination = new URL(consent?.destinationOrigin); } catch { return null; }
+  const loopback = destination.protocol === "http:"
+    && ["localhost", "127.0.0.1", "[::1]"].includes(destination.hostname);
+  if (payload?.schemaVersion !== "local-incremental-contribution-review-v1.1" || payload.status !== "ready"
+      || payload.includesContent !== false || payload.includesPaths !== false
+      || payload.includesAccountIdentifiers !== false || payload.includesCredentials !== false
+      || !/^[A-Za-z0-9_-]{43}$/u.test(payload.reviewToken ?? "")
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(payload.grantDeviceId ?? "")
+      || (destination.protocol !== "https:" && !loopback) || destination.origin !== consent.destinationOrigin
+      || !consent || Object.keys(consent).length !== 4
+      || Object.entries(required).some(([key, value]) => consent[key] !== value || inventory?.consent?.[key] !== value)
+      || inventory?.schemaVersion !== "telemetry-field-inventory-v1.1"
+      || !/^[0-9a-f]{64}$/u.test(inventory.inventoryDigest ?? "")
+      || !fields || Object.keys(fields).length !== 4
+      || ["usage", "quota", "session", "accountPlanAttribution"].some((stream) =>
+        !Array.isArray(fields[stream]) || fields[stream].length < 1 || fields[stream].length > 40
+        || fields[stream].some((field) => typeof field !== "string" || !/^[A-Za-z][A-Za-z0-9]{0,63}$/u.test(field)))
+      || JSON.stringify(inventory.accountBases) !== JSON.stringify(TELEMETRY_V11_ACCOUNT_BASES)
+      || JSON.stringify(inventory.planBases) !== JSON.stringify(TELEMETRY_V11_PLAN_BASES)
+      || JSON.stringify(inventory.nullableQuotaMeasurements) !== JSON.stringify(["usedPercent", "windowDurationMinutes", "resetsAt"])
+      || !INCREMENTAL_SYNC_DAY_PATTERN.test(payload.sample?.day ?? "")
+      || !/^[0-9a-f]{64}$/u.test(payload.sample?.manifestDigest ?? "")
+      || ["usage", "quota", "session"].some((stream) => count(payload.sample?.recordCounts?.[stream], null) === null)
+      || typeof payload.hostedConsentCurrent !== "boolean") return null;
+  return Object.freeze({
+    reviewToken: payload.reviewToken, grantDeviceId: payload.grantDeviceId,
+    consent: Object.freeze({ ...required, destinationOrigin: destination.origin }),
+    inventory: Object.freeze({ inventoryDigest: inventory.inventoryDigest,
+      fields: Object.freeze(Object.fromEntries(["usage", "quota", "session", "accountPlanAttribution"]
+        .map((stream) => [stream, Object.freeze([...fields[stream]])]))),
+      accountBases: Object.freeze([...inventory.accountBases]), planBases: Object.freeze([...inventory.planBases]),
+      nullableQuotaMeasurements: Object.freeze([...inventory.nullableQuotaMeasurements]),
+    }),
+    sample: Object.freeze({ day: payload.sample.day, manifestDigest: payload.sample.manifestDigest,
+      recordCounts: Object.freeze(Object.fromEntries(["usage", "quota", "session"]
+        .map((stream) => [stream, payload.sample.recordCounts[stream]]))) }),
+    hostedConsentCurrent: payload.hostedConsentCurrent,
   });
 }
 
@@ -2082,25 +2142,7 @@ const LOCAL_COMPONENT_KEYS = Object.freeze([
   "output_reasoning_tokens",
   "output_combined_tokens"
 ]);
-const LOCAL_MODELS = new Set([
-  "gpt-5.6-sol",
-  "gpt-5.6-sol-wm",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-  "gpt-5.5",
-  "gpt-5.5-codex",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5",
-  "gpt-4.1",
-  // Recognised identities that carry no published API price card. They were
-  // missing here, so the local report's rows for them were discarded at this
-  // boundary and their usage silently reappeared as "unknown".
-  "codex-auto-review",
-  // Metered against its own subscription allowance, never the primary pool.
-  "gpt-5.3-codex-spark",
-  "unknown"
-]);
+const LOCAL_MODELS = new Set([...REVIEWED_CODEX_MODEL_IDS, "unknown"]);
 const LOCAL_MODEL_PRICING_STATUSES = new Set([
   "priced",
   "known_unpriced",
@@ -2630,10 +2672,6 @@ function normalizeCacheSwitchState(value) {
   return { model, reasoningEffort };
 }
 
-function effectiveCacheSwitchEffort(value) {
-  return value === "ultra" ? "max" : value;
-}
-
 // This separate contract is only for interactive local navigation. Never add
 // its names or raw thread identifiers to normalized accounting/report DTOs.
 const LOCAL_CACHE_DROP_THREAD_LINKS_SCHEMA = "local-cache-drop-thread-links-v1";
@@ -2766,14 +2804,15 @@ function normalizeCacheSwitchRecent(rows, maximumRows) {
         && previous.model !== current.model;
       const reasoningChanged = previous.reasoningEffort !== "unknown"
         && current.reasoningEffort !== "unknown"
-        && effectiveCacheSwitchEffort(previous.reasoningEffort)
-          !== effectiveCacheSwitchEffort(current.reasoningEffort);
+        && codexCacheReasoningConfiguration(previous.model, previous.reasoningEffort)
+          !== codexCacheReasoningConfiguration(current.model, current.reasoningEffort);
       const changeMatches = changeType === "model_only"
         ? modelChanged && !reasoningChanged
         : changeType === "reasoning_only"
           ? !modelChanged && reasoningChanged
           : modelChanged && reasoningChanged;
       if (observedAt === null
+          || previous.model === "unknown" || current.model === "unknown"
           || !changeMatches
           || previousCacheReadTokens === null
           || currentCacheReadTokens === null
@@ -3265,7 +3304,8 @@ const FAST_MODE_MULTIPLIERS = Object.freeze({
   "gpt-5.5": 2.5,
   "gpt-5.6-luna": 2,
   "gpt-5.6-sol": 2,
-  "gpt-5.6-terra": 2
+  "gpt-5.6-terra": 2,
+  "gpt-6-astra": 2
 });
 const FAST_MODE_FAMILY_KEYS = Object.freeze([
   ...Object.keys(FAST_MODE_MULTIPLIERS), "unsupported"
@@ -3284,6 +3324,9 @@ const ALLOWANCE_BASIS_FAMILY_ID =
   "codex_primary:speed_priced_api_equivalent:v3:priority_card_ratio_2026_08_30:event_time:observed_declared_scenario";
 const TIMELINE_ALLOWANCE_WEIGHTING_SCHEMA_VERSION =
   "quota-weighted-timeline-v0.1";
+const PLAN_SCOPED_TIMELINE_SCHEMA_VERSION =
+  "local-plan-scoped-accounting-timeline-v1";
+const PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION = "plan-era-v1";
 const TIMELINE_WEIGHTING_STATUS_BY_CODE = Object.freeze([
   "complete",
   "partial",
@@ -3597,10 +3640,10 @@ function normalizeAccountingDimension(value, allowedKeys) {
   }));
 }
 
-function normalizeLocalUsageTimeline(value, weightingEncoding = undefined) {
+function normalizeLocalUsageTimeline(value, weightingEncoding = undefined, maximumRows = 3_000) {
   if (weightingEncoding === null) return [];
   const rows = [];
-  for (const row of array(value).slice(-3_000)) {
+  for (const row of array(value).slice(-maximumRows)) {
     const startAt = text(row?.startAt, "");
     const endAt = text(row?.endAt, "");
     const startMs = Date.parse(startAt);
@@ -3659,11 +3702,58 @@ function unavailableAllowanceCapacity(reason = "allowance_capacity_unavailable")
       unresolved_as_standard: null,
       unresolved_as_fast: null
     },
+    planScope: null,
+    stale: null,
     accountAttribution: {
       status: "historical_unattributed",
       maySpanMultipleAccounts: true
     }
   };
+}
+
+function normalizePlanScope(value) {
+  const planType = normalizePlanType(value?.planType);
+  const cohortId = typeof value?.cohortId === "string"
+      && /^[0-9a-f]{64}$/u.test(value.cohortId)
+    ? value.cohortId
+    : null;
+  const rawGeneration = value?.sourceGeneration;
+  const sourceGeneration = Number.isSafeInteger(rawGeneration)
+      && rawGeneration >= 0
+    ? String(rawGeneration)
+    : typeof rawGeneration === "string"
+        && /^[A-Za-z0-9._:-]{1,256}$/u.test(rawGeneration)
+      ? rawGeneration
+      : "";
+  const sourceGenerationFingerprint = text(
+    value?.sourceGenerationFingerprint,
+    ""
+  );
+  if (value?.methodVersion !== PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION
+      || planType === "unknown"
+      || value?.basisFamilyId !== ALLOWANCE_BASIS_FAMILY_ID
+      || cohortId === null
+      || sourceGeneration === ""
+      || sourceGenerationFingerprint === "") return null;
+  return {
+    methodVersion: PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION,
+    planType,
+    basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
+    cohortId,
+    sourceGeneration,
+    sourceGenerationFingerprint
+  };
+}
+
+function matchingPlanScope(left, right) {
+  return left !== null && right !== null
+    && left.methodVersion === right.methodVersion
+    && left.planType === right.planType
+    && left.basisFamilyId === right.basisFamilyId
+    && left.cohortId === right.cohortId
+    && left.sourceGeneration === right.sourceGeneration
+    && left.sourceGenerationFingerprint
+      === right.sourceGenerationFingerprint;
 }
 
 function normalizeAllowanceCapacityScenario(value, scenario) {
@@ -3873,11 +3963,18 @@ function normalizeAllowanceCapacity(value) {
   const selectedScenario = ALLOWANCE_SCENARIOS.includes(value.selectedScenario)
     ? value.selectedScenario
     : null;
+  const planScope = normalizePlanScope(value.planScope);
+  const stale = normalizeStaleProvenance(value.stale);
+  // Prior cache formats predate plan-scoped timelines. Retain their explicitly
+  // stale scalar for historical display, never as a current plan numerator.
+  const legacyStale = value.planScope == null && stale !== null;
   if (value.status === "available") {
-    if (selectedScenario === null || scenarios[selectedScenario] === null) {
+    if (selectedScenario === null || scenarios[selectedScenario] === null
+        || (!legacyStale && (planScope === null
+          || planScope.cohortId !== scenarios[selectedScenario].cohortId))) {
       return unavailableAllowanceCapacity("allowance_capacity_invalid");
     }
-  } else if (selectedScenario !== null) {
+  } else if (selectedScenario !== null || planScope !== null) {
     return unavailableAllowanceCapacity("allowance_capacity_invalid");
   }
   if (value.status === "range"
@@ -3896,11 +3993,134 @@ function normalizeAllowanceCapacity(value) {
     basisFamilyId: ALLOWANCE_BASIS_FAMILY_ID,
     selectedScenario,
     scenarios,
-    stale: normalizeStaleProvenance(value.stale),
+    planScope,
+    stale,
     accountAttribution: {
       status: "historical_unattributed",
       maySpanMultipleAccounts: true
     }
+  };
+}
+
+function unavailablePlanScopedTimeline(reason = "plan_scoped_timeline_unavailable") {
+  return {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    status: "unavailable",
+    reason,
+    planScope: null,
+    usage: [],
+    quota: [],
+    comparisonIntervals: []
+  };
+}
+
+function normalizePlanScopedTimeline(value, weightingEncoding, capacity) {
+  if (value?.schemaVersion !== PLAN_SCOPED_TIMELINE_SCHEMA_VERSION
+      || value?.status !== "available" || value.reason !== null
+      || value.encoding !== "plan_bucket_v1") {
+    return unavailablePlanScopedTimeline();
+  }
+  const planScope = normalizePlanScope(value.planScope);
+  const capacityScope = capacity?.status === "available"
+    ? capacity.planScope : null;
+  if (planScope === null || capacityScope === null
+      || !matchingPlanScope(planScope, capacityScope)) {
+    return unavailablePlanScopedTimeline("plan_scoped_timeline_scope_mismatch");
+  }
+  if (!Array.isArray(value.usage) || value.usage.length > 100_000
+      || !Array.isArray(value.quota) || value.quota.length > 100_000
+      || !Array.isArray(value.comparisonIntervals) || value.comparisonIntervals.length > 100_000) {
+    return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+  }
+  const comparisonIntervals = [];
+  let priorEnd = -Infinity;
+  for (const interval of value.comparisonIntervals) {
+    if (!Array.isArray(interval) || interval.length !== 2
+        || !interval.every((ms) => Number.isSafeInteger(ms)
+          && ms % 900_000 === 0 && Number.isFinite(new Date(ms).getTime()))
+        || interval[0] < priorEnd || interval[1] <= interval[0]) {
+      return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    }
+    comparisonIntervals.push([...interval]);
+    priorEnd = interval[1];
+  }
+  const decodedUsage = value.usage.map(decodePlanTimelineUsage);
+  if (decodedUsage.includes(null)) return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+  const usage = normalizeLocalUsageTimeline(decodedUsage, weightingEncoding, 100_000);
+  const decodedQuota = [];
+  for (const row of value.quota) {
+    if (!Array.isArray(row) || row.length !== 3
+        || !row.every((n) => typeof n === "number" && Number.isFinite(n))
+        || !Number.isSafeInteger(row[0]) || !Number.isFinite(new Date(row[0]).getTime())
+        || !Number.isFinite(new Date(row[1] * 1000).getTime())
+        || row[2] < 0 || row[2] > 100) return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    decodedQuota.push({ observedAt: new Date(row[0]).toISOString(), resetAt: new Date(row[1] * 1000).toISOString(),
+      usedPercent: row[2], remainingPercent: 100 - row[2], limitId: "codex", durationMinutes: 10_080,
+      slot: "unknown", planType: planScope.planType, accountAttribution: "unattributed" });
+  }
+  const quota = normalizeLocalQuotaTimeline(decodedQuota, 100_000);
+  if (usage.length !== value.usage.length || quota.length !== value.quota.length
+      || quota.some((row) => row.planType !== planScope.planType)) {
+    return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+  }
+  let intervalAt = 0;
+  priorEnd = -Infinity;
+  for (const row of usage) {
+    const start = Date.parse(row.startAt);
+    const end = Date.parse(row.endAt);
+    while (intervalAt < comparisonIntervals.length
+        && comparisonIntervals[intervalAt][1] <= start) intervalAt += 1;
+    const interval = comparisonIntervals[intervalAt];
+    if (start < priorEnd || !interval || start < interval[0] || end > interval[1]) {
+      return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    }
+    priorEnd = end;
+  }
+  intervalAt = 0;
+  priorEnd = -Infinity;
+  for (const row of quota) {
+    const at = Date.parse(row.observedAt);
+    while (intervalAt < comparisonIntervals.length
+        && comparisonIntervals[intervalAt][1] <= at) intervalAt += 1;
+    const interval = comparisonIntervals[intervalAt];
+    if (at <= priorEnd || !interval || at < interval[0] || at >= interval[1]) {
+      return unavailablePlanScopedTimeline("plan_scoped_timeline_invalid");
+    }
+    priorEnd = at;
+  }
+  return {
+    schemaVersion: PLAN_SCOPED_TIMELINE_SCHEMA_VERSION,
+    status: "available",
+    reason: null,
+    planScope,
+    usage,
+    quota,
+    comparisonIntervals
+  };
+}
+
+function decodePlanTimelineUsage(row) {
+  if (!Array.isArray(row) || row.length !== 16
+      || row.some((n) => typeof n !== "number" || !Number.isFinite(n))
+      || !Number.isSafeInteger(row[0]) || row[0] % 900_000 !== 0
+      || !Number.isFinite(new Date(row[0] + 900_000).getTime())
+      || row.slice(1).some((n) => n < 0)
+      || [1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15].some((i) => !Number.isSafeInteger(row[i]))
+      || row[1] < 1 || row[11] + row[12] > row[1] || row[13] + row[14] > row[1]) return null;
+  const priced = row[13] + row[14] === row[1];
+  return {
+    startAt: new Date(row[0]).toISOString(), endAt: new Date(row[0] + 900_000).toISOString(),
+    usageEvents: row[1], totalTokens: row[15], apiPriceEquivalentUsd: row[8],
+    components: Object.fromEntries(LOCAL_COMPONENT_KEYS.map((key, i) => [key, row[i + 2]])),
+    pricingCoverage: { fullyPricedEvents: row[13], partiallyPricedEvents: row[14],
+      unpricedEvents: row[1] - row[13] - row[14] },
+    // Existing weighting encoding: complete=0, unknown=2; unpriced events
+    // withhold the whole bucket, while unresolved speed remains a scenario.
+    allowanceWeighting: [row[9], row[10]].flatMap((usd) => [
+      priced ? 0 : 2, priced ? usd : null, priced ? usd : 0,
+      priced ? row[11] : 0, priced ? row[12] : 0,
+      priced ? row[1] - row[11] - row[12] : 0, 0, priced ? 0 : row[1],
+    ]),
   };
 }
 
@@ -3919,7 +4139,30 @@ function normalizeLocalTimeline(value = {}) {
     value.calibrationUsage,
     weightingEncoding
   );
-  const quota = array(value.quota).slice(-10_000).flatMap((row) => {
+  const allowanceCapacity = normalizeAllowanceCapacity(value.allowanceCapacity);
+  const planScoped = normalizePlanScopedTimeline(
+    value.planScoped,
+    weightingEncoding,
+    allowanceCapacity
+  );
+  const quota = normalizeLocalQuotaTimeline(value.quota);
+  return {
+    bucketMinutes: count(value.bucketMinutes, 15),
+    coveredAt: {
+      startAt: text(value?.coveredAt?.startAt, ""),
+      endAt: text(value?.coveredAt?.endAt, "")
+    },
+    usage,
+    calibrationUsage,
+    allowanceCapacity,
+    planScoped,
+    quota,
+    history: normalizeTimelineHistory(value.history)
+  };
+}
+
+function normalizeLocalQuotaTimeline(value, maximumRows = 10_000) {
+  return array(value).slice(-maximumRows).flatMap((row) => {
     const observedAt = text(row?.observedAt, "");
     const usedPercent = finite(row?.usedPercent, null);
     const remainingPercent = finite(row?.remainingPercent, null);
@@ -3948,18 +4191,6 @@ function normalizeLocalTimeline(value = {}) {
         : "unattributed"
     }];
   });
-  return {
-    bucketMinutes: count(value.bucketMinutes, 15),
-    coveredAt: {
-      startAt: text(value?.coveredAt?.startAt, ""),
-      endAt: text(value?.coveredAt?.endAt, "")
-    },
-    usage,
-    calibrationUsage,
-    allowanceCapacity: normalizeAllowanceCapacity(value.allowanceCapacity),
-    quota,
-    history: normalizeTimelineHistory(value.history)
-  };
 }
 
 /**
@@ -5441,30 +5672,65 @@ function normalizeWeeklyPaceForecast(value) {
   };
 }
 
-function normalizeWeekly(payload = {}) {
-  const envelope = payload?.weekly ?? payload;
-  const source = artifactData(envelope);
-  const weeklyValues = array(source.weeklyValues ?? source.weekly_values)
-    .map((row) => ({
-      ...row,
-      priceCardIds: array(row?.priceCardIds ?? row?.price_card_ids)
-        .filter((id) => typeof id === "string" && id.length > 0)
-        .slice(0, 32),
-      priceCardBreakdown: array(row?.priceCardBreakdown ?? row?.price_card_breakdown)
-        .flatMap((item) => {
-          if (typeof item?.priceCardId !== "string"
-              || !/^\d+(?:\.\d+)?$/u.test(item?.costUsd ?? "")
-              || !Number.isSafeInteger(item?.events)
-              || item.events < 0) return [];
-          return [{
-            priceCardId: item.priceCardId,
-            events: item.events,
-            costUsd: item.costUsd,
-          }];
-        })
-        .slice(0, 32),
-    }));
+function normalizeWeeklyPlanAttribution(value) {
+  if (value?.methodVersion !== "plan-era-v1"
+      || value?.status !== "historical_plan_conditional"
+      || value?.accountVerified !== false) return null;
   return {
+    methodVersion: "plan-era-v1",
+    status: "historical_plan_conditional",
+    accountVerified: false,
+    comparisonEligibility: value.comparisonEligibility === "single_plan_conditional"
+      ? "single_plan_conditional" : "unavailable",
+  };
+}
+
+function normalizeWeeklyPopulation(envelope = {}) {
+  const source = artifactData(envelope);
+  const weeklyValueColumns = new Set([
+    "sequence", "first_observed_at", "last_observed_at", "reset_due_at",
+    "resetAt", "slot", "displayed_span_pp", "value_usd", "value",
+    "pairwise_p10_usd", "pairwise_p90_usd", "lower", "upper",
+    "holdout_mae_pp", "known_speed_fraction", "eligible_transitions",
+    "unique_percentage_boundaries",
+  ]);
+  const weeklyValues = array(source.weeklyValues ?? source.weekly_values)
+    .map((row) => {
+      // A local era key can encode account context. It has no presentation
+      // purpose. Carry only the displayed fit columns, never opaque context.
+      const columns = Object.fromEntries(Object.entries(row ?? {})
+        .filter(([key]) => weeklyValueColumns.has(key)));
+      return {
+        ...columns,
+        planType: normalizePlanType(row?.planType ?? row?.plan_type),
+        planVariant: typeof (row?.planVariant ?? row?.plan_variant) === "string"
+            && /^[a-z][a-z0-9_-]{0,31}$/u.test(row.planVariant ?? row.plan_variant)
+          ? row.planVariant ?? row.plan_variant : "unknown",
+        aggregationEligibility: ["primary_conditional", "primary_scoped", "diagnostic_only"]
+          .includes(row?.aggregationEligibility ?? row?.aggregation_eligibility)
+          ? row.aggregationEligibility ?? row.aggregation_eligibility : null,
+        priceCardIds: array(row?.priceCardIds ?? row?.price_card_ids)
+          .filter((id) => typeof id === "string" && id.length > 0)
+          .slice(0, 32),
+        priceCardBreakdown: array(row?.priceCardBreakdown ?? row?.price_card_breakdown)
+          .flatMap((item) => {
+            if (typeof item?.priceCardId !== "string"
+                || !/^\d+(?:\.\d+)?$/u.test(item?.costUsd ?? "")
+                || !Number.isSafeInteger(item?.events)
+                || item.events < 0) return [];
+            return [{
+              priceCardId: item.priceCardId,
+              events: item.events,
+              costUsd: item.costUsd,
+            }];
+          })
+          .slice(0, 32),
+      };
+    });
+  return {
+    status: text(envelope?.status, "unavailable"),
+    planType: normalizePlanType(envelope?.planType),
+    planAttribution: normalizeWeeklyPlanAttribution(envelope?.planAttribution),
     summary: array(source.summary)[0] ?? source.summary ?? {},
     weeklyValues,
     valueSeries: array(source.valueSeries ?? source.value_series),
@@ -5481,6 +5747,112 @@ function normalizeWeekly(payload = {}) {
       label: text(envelope?.accountAttribution?.label, "")
     }
   };
+}
+
+function normalizeWeekly(payload = {}) {
+  const envelope = payload?.weekly ?? payload;
+  const weekly = normalizeWeeklyPopulation(envelope);
+  const planPopulations = [];
+  const candidates = array(envelope?.planPopulations).slice(0, 16);
+  const planCounts = new Map();
+  for (const row of candidates) {
+    planCounts.set(row?.planType, (planCounts.get(row?.planType) ?? 0) + 1);
+  }
+  for (const population of candidates) {
+    const planType = population?.planType;
+    if (!TELEMETRY_PLAN_TYPES.includes(planType) || planCounts.get(planType) !== 1) continue;
+    const normalized = normalizeWeeklyPopulation(population);
+    if (normalized.planAttribution === null) continue;
+    planPopulations.push({
+      ...normalized,
+      // The envelope is the selected population, not a license to relabel a
+      // positively different plan's historical fit.
+      weeklyValues: normalized.weeklyValues.filter((row) => row.planType === planType),
+    });
+  }
+  return {
+    ...weekly,
+    selectedPlanType: normalizePlanType(envelope?.selectedPlanType ?? envelope?.planType),
+    planPopulations,
+  };
+}
+
+const allowancePlanViews = new WeakMap();
+const allowancePlanViewRoots = new WeakMap();
+
+/**
+ * One selected population for every allowance-facing surface. Selection never
+ * changes the all-plan usage ledger or manufactures historical current pace.
+ * The root DTO names the latest observed plan, even when it has no fitted value.
+ */
+export function selectAllowancePlanPopulation(data, requestedPlanType = null) {
+  const root = allowancePlanViewRoots.get(data) ?? data;
+  const weekly = root?.weekly;
+  if (!weekly || weekly.planAttribution?.methodVersion !== "plan-era-v1") return root;
+  const populations = array(weekly.planPopulations);
+  const currentPlanType = normalizePlanType(weekly.selectedPlanType ?? weekly.planType);
+  const selectedPlanType = populations.some((row) => row.planType === requestedPlanType)
+    ? requestedPlanType : currentPlanType;
+  let views = allowancePlanViews.get(root);
+  if (views?.has(selectedPlanType)) return views.get(selectedPlanType);
+  const population = populations.find((row) => row.planType === selectedPlanType)
+    ?? normalizeWeeklyPopulation({ planType: selectedPlanType });
+  const isCurrentPlan = selectedPlanType === currentPlanType;
+  const allowanceCapacity = root.timeline?.allowanceCapacity ?? null;
+  const planScoped = root.timeline?.planScoped ?? null;
+  // The old gate asked whether the whole retained history contained one plan.
+  // That made a perfectly coherent current-plan fit unusable as soon as an
+  // earlier plan existed, then paired the selected capacity with all-plan
+  // usage anyway. The new gate is stricter where it matters: the scoped usage
+  // and fitted capacity must name the same current plan, method, basis, reset
+  // cohort and unified-index generation. Historical selections remain
+  // unavailable because no historical scoped numerator is published.
+  const comparisonAvailable = isCurrentPlan
+    && population.status === "available"
+    && allowanceCapacity?.status === "available"
+    && planScoped?.status === "available"
+    && planScoped.planScope?.planType === selectedPlanType
+    && matchingPlanScope(
+      planScoped.planScope,
+      allowanceCapacity.planScope
+    );
+  const selected = {
+    ...root,
+    weekly: {
+      ...population,
+      selectedPlanType: currentPlanType,
+      planPopulations: populations,
+      stale: weekly.stale,
+      paceForecast: isCurrentPlan ? weekly.paceForecast : null,
+    },
+    quotaWindows: isCurrentPlan
+      ? array(root.quotaWindows).filter((window) => window.planType === selectedPlanType)
+      : [],
+    timeline: {
+      ...root.timeline,
+      // Keep `usage` and `calibrationUsage` as the conserved all-plan ledger.
+      // Trends consumes this explicit selected-plan lane; Usage & costs and
+      // every all-plan total continue to read the established fields.
+      selectedPlanUsage: comparisonAvailable ? planScoped.usage : [],
+      selectedPlanCalibrationUsage: comparisonAvailable ? planScoped.usage : [],
+      // The scoped quota lane was built before the generic cross-plan collapse.
+      // Keep the original root DTO untouched for all-plan consumers.
+      quota: comparisonAvailable ? planScoped.quota : [],
+      comparisonIntervals: comparisonAvailable ? planScoped.comparisonIntervals : [],
+      allowanceCapacity: comparisonAvailable ? allowanceCapacity : null,
+    },
+    allowancePlanSelection: {
+      planType: selectedPlanType,
+      currentPlanType,
+      isCurrentPlan,
+      comparisonAvailable,
+    },
+  };
+  views ??= new Map();
+  views.set(selectedPlanType, selected);
+  allowancePlanViews.set(root, views);
+  allowancePlanViewRoots.set(selected, root);
+  return selected;
 }
 
 function normalizeQuality(payload = {}) {
@@ -5778,6 +6150,17 @@ export class LocalCompanionClient {
   }
 
   async refresh() {
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh/quick`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1"
+      },
+      body: JSON.stringify({})
+    });
+  }
+
+  async recalculateDetailedAccounting() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/refresh`, {
       method: "POST",
       headers: {
@@ -6079,6 +6462,21 @@ export class LocalCompanionClient {
     });
   }
 
+  async reviewAttributionContribution() {
+    const review = normalizeAttributionContributionReview(
+      await this.localContributionMutation("incremental-review-v11"),
+    );
+    if (review === null) throw new Error("Attribution review is unavailable.");
+    return review;
+  }
+
+  approveAttributionContribution(review) {
+    return this.localContributionMutation("incremental-approve", {
+      reviewToken: review.reviewToken, consent: review.consent,
+      fieldInventoryDigest: review.inventory.inventoryDigest,
+    });
+  }
+
   localContributionMutation(path, body = {}) {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/contribution/${path}`, {
       method: "POST",
@@ -6259,6 +6657,18 @@ export class CommunityClient {
           : "ongoing-privacy-safe-telemetry-v1.0",
         ongoingUpload: true
       })
+    }));
+  }
+
+  grantAttributionContribution(review) {
+    const consent = telemetryV11RequiredConsent();
+    if (!review || Object.entries(consent).some(([key, value]) => review.consent?.[key] !== value)
+        || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(review.grantDeviceId ?? "")) {
+      throw new TypeError("Attribution consent requires a reviewed device target.");
+    }
+    return fetchJson(this.fetchImpl, `${CENTRAL_ROOT}/me/device-telemetry-consents`, this.mutationOptions({
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ deviceId: review.grantDeviceId, consent, ongoingUpload: true }),
     }));
   }
 

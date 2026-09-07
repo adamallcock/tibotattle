@@ -7,6 +7,10 @@ import {
   readLatestCommunityDailyAggregate,
   rebuildPendingCommunityDailyAggregates,
 } from "../src/community-daily-aggregates";
+import {
+  assertV1SourcePinCurrent,
+  loadV1SourcePin,
+} from "../src/telemetry-v1-source-selection";
 
 /**
  * Cross-device dedupe in the daily community aggregates.
@@ -18,8 +22,8 @@ import {
  * not a data partition — both devices observed the SAME underlying local
  * index — so the aggregation must count each (participant, day) exactly
  * once: only the winning device's records, winner = newest current-chunk
- * created_at for the day (all streams), deterministic tiebreak on the
- * larger device_id.
+ * created_at for the day (analytical streams first, explicit session-only
+ * fallback), deterministic bytewise tiebreak on the larger device_id.
  *
  * These tests seed the journal directly (through the full 0031 trigger
  * chain: consuming upload authorization, admission windows, and the
@@ -231,6 +235,64 @@ beforeEach(async () => {
 });
 
 describe("community daily aggregate cross-device dedupe", () => {
+  it("does not let a later session-only device erase analytical totals or cells", async () => {
+    const participant = await seedParticipant("session-after-usage");
+    await seedDevice(participant, "device-analytical");
+    await seedDevice(participant, "device-session-only");
+    await seedChunk({ participantId: participant, deviceId: "device-analytical",
+      createdAt: "2026-08-02T01:00:00.000Z", records: [{ occurrenceId: "usage-one", inputUncachedTokens: 42 }] });
+    await seedChunk({ participantId: participant, deviceId: "device-session-only", stream: "session",
+      createdAt: "2026-08-03T01:00:00.000Z", records: [{ occurrenceId: "session-one" }] });
+    const dayPin = await loadV1SourcePin(db(), { day: DAY });
+    const participantPin = await loadV1SourcePin(db(), { participantId: participant, fromDay: DAY });
+    expect(dayPin.winners).toEqual(participantPin.winners);
+    expect(dayPin.winners).toEqual([{ participant_id: participant, observed_day: DAY,
+      device_id: "device-analytical", evidence: "analytical" }]);
+    const payload = await rebuildAndReadDay("2026-08-03T12:00:00.000Z");
+    expect(payload.totals.inputUncachedTokens).toBe(42);
+    expect(payload.totals.usageEvents).toBe(1);
+    expect(payload.totals.sessionDimensions).toBe(0);
+    expect(payload.cells[0]?.inputUncachedTokens).toBe(42);
+  });
+
+  it("retains a newest-device fallback for a genuinely session-only participant-day", async () => {
+    const participant = await seedParticipant("session-fallback");
+    await seedDevice(participant, "device-old-session");
+    await seedDevice(participant, "device-new-session");
+    await seedChunk({ participantId: participant, deviceId: "device-old-session", stream: "session",
+      createdAt: "2026-08-02T01:00:00.000Z", records: [{ occurrenceId: "session-old" }] });
+    await seedChunk({ participantId: participant, deviceId: "device-new-session", stream: "session",
+      createdAt: "2026-08-03T01:00:00.000Z", records: [{ occurrenceId: "session-new-a" }, { occurrenceId: "session-new-b" }] });
+    const pin = await loadV1SourcePin(db(), { participantId: participant, fromDay: DAY });
+    expect(pin.winners[0]).toMatchObject({ device_id: "device-new-session", evidence: "session_only" });
+    const payload = await rebuildAndReadDay("2026-08-03T12:00:00.000Z");
+    expect(payload.totals.sessionDimensions).toBe(2);
+    expect(payload.totals.usageEvents).toBe(0);
+  });
+
+  it("keeps a participant fingerprint stable across unrelated uploads but invalidates its own changed input", async () => {
+    const participant = await seedParticipant("pin-owner");
+    await seedDevice(participant, "device-pin-owner");
+    await seedChunk({ participantId: participant, deviceId: "device-pin-owner",
+      createdAt: "2026-08-02T01:00:00.000Z", records: [{ occurrenceId: "owner-usage", inputUncachedTokens: 42 }] });
+    const scope = { participantId: participant, fromDay: DAY };
+    const pin = await loadV1SourcePin(db(), scope);
+    expect(pin.inputRevision).toBeGreaterThan(0);
+    const other = await seedParticipant("pin-other");
+    await seedDevice(other, "device-pin-other");
+    await seedChunk({ participantId: other, deviceId: "device-pin-other",
+      createdAt: "2026-08-02T02:00:00.000Z", records: [{ occurrenceId: "other-usage", inputUncachedTokens: 99 }] });
+    const unchanged = await loadV1SourcePin(db(), scope);
+    expect(unchanged.fingerprint).toBe(pin.fingerprint);
+    expect(unchanged.inputRevision).toBe(pin.inputRevision);
+    expect(unchanged.mutationEpoch).toBeGreaterThan(pin.mutationEpoch);
+    await expect(assertV1SourcePinCurrent(db(), pin)).resolves.toBeUndefined();
+    await seedChunk({ participantId: participant, deviceId: "device-pin-owner", seq: 1,
+      createdAt: "2026-08-02T01:00:00.000Z", records: [{ occurrenceId: "owner-usage-two", inputUncachedTokens: 1 }] });
+    await expect(assertV1SourcePinCurrent(db(), pin)).rejects.toThrow("v1 source changed during analysis");
+    await expect(loadV1SourcePin(db(), scope, { maxChunks: 1 })).rejects.toThrow("v1 source chunk limit exceeded");
+  });
+
   it("counts an overlapping participant-day once, the newest device winning across streams", async () => {
     const participant = await seedParticipant("alpha");
     await seedDevice(participant, "device-lost");

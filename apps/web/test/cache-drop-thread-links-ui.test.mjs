@@ -93,7 +93,11 @@ function createHarness({ locale = "en-US", lookup, local = true } = {}) {
 }
 
 function localDashboard(generation = "35") {
-  return { mode: "local", accounting: { generation, generationMatched: true } };
+  return { mode: "local", accounting: {
+    generation, generationMatched: true,
+    cacheSwitchImpact: { status: "available", recent: [row()] },
+    cacheContinuityImpact: { status: "available", recent: [row("continuity")] },
+  } };
 }
 
 function lookupResult(kind = "switch", generation = "35", thread = {}) {
@@ -228,6 +232,111 @@ test("late lookup is fenced by generation, match attestation, dashboard identity
     assert.equal(cell.textContent, "Thread unavailable", scenario);
     assert.equal(harness.state.entries.size, 0, scenario);
   }
+});
+
+test("unchanged rows retain names and links through indexing, failed lookup and retry", async () => {
+  for (const kind of ["switch", "continuity"]) {
+    let response = lookupResult(kind);
+    let calls = 0;
+    const harness = createHarness({ lookup: async () => {
+      calls += 1;
+      if (response instanceof Error) throw response;
+      return response;
+    } });
+    let data = localDashboard();
+    harness.setDashboard(data);
+    await harness.load(data);
+    const indexing = localDashboard("36");
+    indexing.accounting.generationMatched = false;
+    harness.setDashboard(indexing);
+    const retained = harness.cell(kind, row(kind));
+    assert.equal(retained.textContent, "Synthetic thread");
+    assert.equal(retained.querySelector("a").href, `codex://threads/${THREAD_ID}`);
+    await harness.load(indexing);
+    assert.equal(calls, 1, "indexing does not fetch unattested new identities");
+
+    data = localDashboard("37");
+    harness.setDashboard(data);
+    const cell = harness.cell(kind, row(kind));
+    cell.querySelector("a").focus();
+    for (const failure of [new Error("temporary failure"),
+      { status: "unavailable", generation: null, entries: [] },
+      lookupResult(kind, "36")]) {
+      response = failure;
+      await harness.load(data);
+      assert.equal(cell.textContent, "Synthetic thread");
+      assert.equal(cell.querySelector("a").href, `codex://threads/${THREAD_ID}`);
+      assert.equal(harness.state.requested, false, "later renders can retry this snapshot");
+    }
+    response = lookupResult(kind, "37", { name: "Renamed thread" });
+    await harness.load(data);
+    assert.equal(cell.textContent, "Renamed thread");
+    assert.equal(harness.document.activeElement, cell.querySelector("a"));
+    assert.equal(cell.querySelector("a").href, `codex://threads/${THREAD_ID}`);
+    assert.deepEqual(data, localDashboard("37"), "reuse stays outside accounting DTOs");
+  }
+});
+
+test("partial lookup and missing optional metadata retain known details, authoritative identity changes replace them", async () => {
+  let response = lookupResult("switch", "35", {
+    nickname: "Synthetic worker", parent: { id: PARENT_ID, name: "Synthetic parent" },
+  });
+  const harness = createHarness({ lookup: async () => response });
+  let data = localDashboard();
+  harness.setDashboard(data);
+  await harness.load(data);
+  for (const entries of [[], lookupResult("switch", "36", { name: null }).entries]) {
+    data = localDashboard("36");
+    harness.setDashboard(data);
+    const cell = harness.cell("switch", row());
+    response = { ...lookupResult("switch", "36"), entries };
+    await harness.load(data);
+    assert.equal(cell.textContent, "Synthetic parent [Synthetic worker subworker]");
+    assert.deepEqual(cell.querySelectorAll("a").map(a => a.href), [
+      `codex://threads/${PARENT_ID}`, `codex://threads/${THREAD_ID}`,
+    ]);
+  }
+  data = localDashboard("37");
+  harness.setDashboard(data);
+  const cell = harness.cell("switch", row());
+  response = lookupResult("switch", "37", { id: PARENT_ID, name: null });
+  await harness.load(data);
+  assert.equal(cell.textContent, "Thread 00000002", "old identity metadata cannot carry to a different UUID");
+  assert.equal(cell.querySelector("a").href, `codex://threads/${PARENT_ID}`);
+});
+
+test("reuse follows exact rows across periods and drops removed rows and non-local dashboards", async () => {
+  for (const target of ["changed-row", "removed-row", "demo", "unavailable"]) {
+    const harness = createHarness({ lookup: async () => lookupResult() });
+    harness.setDashboard(localDashboard());
+    await harness.load(harness.state.dashboard);
+    const period = localDashboard("36");
+    period.accounting.cacheSwitchImpact = {
+      status: "available", recent: [], periods: [{ periodId: "30d", recent: [row()] }],
+    };
+    harness.setDashboard(period);
+    assert.equal(harness.cell("switch", row()).textContent, "Synthetic thread");
+    const next = localDashboard("37");
+    if (target === "changed-row") next.accounting.cacheSwitchImpact.recent[0].gapSeconds = 61;
+    if (target === "removed-row") next.accounting.cacheSwitchImpact.recent = [];
+    if (target === "demo") next.mode = "demo";
+    harness.setDashboard(target === "unavailable" ? null : next);
+    assert.equal(harness.state.entries.size, 0, target);
+    assert.equal(harness.cell("switch", row()).textContent, "Thread unavailable", target);
+  }
+});
+
+test("failed dashboard refresh keeps the displayed snapshot and its resolved cells", async () => {
+  const harness = createHarness({ lookup: async () => lookupResult() });
+  const data = localDashboard();
+  harness.setDashboard(data);
+  const cell = harness.cell("switch", row());
+  await harness.load(data);
+  harness.reset(harness.state.dashboard);
+  assert.equal(cell.textContent, "Synthetic thread");
+  assert.equal(harness.state.cells.switch[0].cell, cell);
+  assert.equal(harness.state.requested, false);
+  assert.match(source, /function renderDashboardUnavailableState\(kind\) \{[\s\S]*?resetCacheDropThreadLinks\(cacheDropThreadLinks.dashboard\);/u);
 });
 
 test("missing route, unavailable metadata, demo and non-local pages retain a quiet fallback", async () => {

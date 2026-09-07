@@ -13,5 +13,10 @@
   "appcastContentType": "application/xml; charset=utf-8",
   "appcastCacheControl": "public, max-age=300, must-revalidate",
   "artifactContentType": "application/x-apple-diskimage",
-  "artifactCacheControl": "public, max-age=31536000, immutable"
+  "artifactCacheControl": "public, max-age=31536000, immutable",
+  "intel": {
+    "appcastURL": "https://dogfood-updates.tibotattle.com/internal-dogfood/intel/appcast.xml",
+    "appcastObjectKey": "internal-dogfood/intel/appcast.xml",
+    "objectPrefix": "internal-dogfood/intel/releases"
+  }
 }

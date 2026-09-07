@@ -37,13 +37,22 @@ prototype and benchmark readers remain in the source tree for development
 evaluation, but the installed companion exposes no setting, route, UI, or
 upload surface that enables them.
 
+Codex history discovery also recognizes cold `.jsonl.zst` representations. On
+native-Zstd-capable runtimes, bounded streaming decompression feeds the same
+allowlisted metadata projection. It creates no decoded transcript files and
+never edits the source tree. The physical filename remains private; durable
+cursors refer to logical uncompressed byte offsets. Unsupported runtimes or
+damaged histories produce explicit partial coverage. See the
+[compressed-history contract](./unified-index-schema.md#compressed-codex-histories)
+for runtime and resource limits.
+
 ## Optional local integrations
 
 | Integration | Activation | Data boundary | Persistence |
 | --- | --- | --- | --- |
 | Managed Claude status-line callback | Explicit standalone CLI install/repair lifecycle | Bounded JSON status input through the managed local broker; projected status/usage fields only. | Managed callback state plus provider-isolated pseudonym capability. This is not an installed-app feature. |
 | Custom Codex home | User chooses a directory in Settings | It replaces the default Codex home anchor; the same fixed subpaths and allowlists apply. | Owner-only launcher setting. |
-| Local cache-drop thread links | Local interactive dashboard, for recent displayed drops only | Read-only bounded `session_index.jsonl` (`id`, `thread_name`, `updated_at`) and `state_5.sqlite` (`id`, explicit `name`, worker nickname, and allowlisted `source.subagent.thread_spawn` ancestry). Never uses prompt-bearing `threads.title`, first messages, or transcripts. | Names and IDs exist only in a separate `no-store`, same-origin local response and transient UI memory. No snapshot/cache/report/share-card/diagnostic/contribution persistence. Clicking hands only the canonical thread UUID to the local Codex URL handler. |
+| Local cache-drop thread links | Local interactive dashboard, for recent displayed drops only | Read-only bounded `session_index.jsonl` (`id`, `thread_name`, `updated_at`) and `state_5.sqlite` (`id`, explicit `name`, worker nickname, and allowlisted `source.subagent.thread_spawn` ancestry). Never uses prompt-bearing `threads.title`, first messages, or transcripts. | Names and IDs exist only in a separate `no-store`, same-origin local response and transient UI memory, reused for unchanged displayed event pairs during refresh. No snapshot/cache/report/share-card/diagnostic/contribution persistence. Clicking hands only the canonical thread UUID to the local Codex URL handler. |
 | Export workspace | Explicit CLI or review flow | Only allowlisted metadata for the selected time range and sources. | Journaled workspace, chunks, manifest, and verification/deletion receipts at explicit paths. |
 | Contribution preparation | Explicit review/consent flow | Closed telemetry schema; exact payload is locally reviewable before first approval. | Prepared spool/review archive and replay-safe sync state under the app state root. |
 
@@ -77,10 +86,23 @@ TiboTattle keeps separate credential capabilities for:
 The optional managed Claude callback has its own standalone CLI/local-review
 pseudonym capability. It is not exposed by the native app.
 
-The device credential is served to the companion through the signed native
-Keychain broker. A content-free binding/renewal record lives under Application
+These installed-app capabilities are served to the companion through the signed
+native Keychain broker. A content-free binding/renewal record lives under Application
 Support; it is not the credential. Keys are intentionally separate so one
 identity namespace cannot be joined to another by accident.
+
+The [silent native migration change](../decisions/2026-08-31-silent-keychain-migration.md)
+adds a narrow compatibility helper for existing legacy keys. It authenticates
+its native parent, accepts only fixed capabilities, and passes the unchanged
+value over a private descriptor for app-owned storage and exact readback. It
+adds no network destination, diagnostic field, consent, or uploaded data. The
+legacy recovery copy is retained during migration. Automatic attempts cannot
+open a Keychain prompt; only an explained native approval can do so. An explicit
+credential reset removes that capability's legacy copy before its modern copy,
+and waits for retiring companion writers before deletion. A failed deletion
+does not authorize a new identity or inferred success. Signed synthetic
+qualification is recorded in that decision; this source description does not
+qualify an installed upgrade.
 
 **Reset identity and device** is a separate two-step action from local data
 erase. It removes the selected local Keychain capabilities and associated app
@@ -112,6 +134,43 @@ quality thresholds are not met.
 
 Stable pseudonyms and identity reattachment permit longitudinal linkage.
 Content-free, pseudonymous contribution is not anonymous data.
+
+### Account/plan attribution successor (staged)
+
+The source includes a closed v1.1 successor, disabled for new writes by default
+until a separately authorized hosted cutover. Its additional fields are account
+basis, a purpose-separated account pseudonym or null, plan basis/type, and an
+opaque plan-era pseudonym or null. The exact field inventory and derived sample
+must be reviewed; an explicit hosted-session consent grant and local approval
+bind the new schema, field dictionary, privacy contract and destination. Existing
+consent, pairing or an app update alone does not authorize these fields.
+
+The derivation reuses a leased existing account-observation root. It binds to
+the canonical destination and authenticated enrollment namespace, never creates
+a missing root during export, and makes no cross-device identity claim. Missing
+root/history proof leaves attribution unknown without dropping raw local usage.
+Current quota capture is bracketed by compatible account reads; logout, read
+failure and disagreement clear provisional markers. Markers cannot tag history
+before capture and are not upgraded to exact source proof.
+
+Day chunks remain staged until one complete replacement domain passes source,
+occurrence and base-accounting compatibility checks. Old accepted data remains
+stored; a partial replacement cannot become a hybrid primary. Immutable consent
+grants, enrollment bindings, staged chunks and active domains participate in the
+existing owner-erasure/restore boundaries. Device disconnect retains accepted
+history; format rollback changes upload admission only, not the selected data.
+No account/era pseudonyms or finer account cells are added to public aggregates.
+
+An owner-only progress file beside the local index preserves interrupted
+replacement uploads. Its closed, at-most-1-MiB payload contains day/manifest
+digests and control fingerprints, never credentials, root bytes, account
+markers or raw provider identifiers. Loss of this file can require revalidation
+and retry, but it does not erase local evidence or accepted hosted history.
+
+Accepted v0.2 history keeps its existing analytical source. Until a compatible
+replacement adapter exists, this history blocks the stronger-format upgrade
+before consent or admission-floor changes; disjoint dates do not make it safe
+to hide the old source. No local or hosted history is deleted by this refusal.
 
 ## Network destinations
 

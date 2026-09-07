@@ -178,6 +178,13 @@ function canonicalFutureInstant(value: string, nowEpoch: number): boolean {
     && epoch > nowEpoch;
 }
 
+function returnedTargetId(result: D1Result<unknown> | undefined, expectedId: string): boolean {
+  const rows = result?.results;
+  return Array.isArray(rows) && rows.length === 1
+    && typeof rows[0] === "object" && rows[0] !== null
+    && Reflect.get(rows[0], "id") === expectedId;
+}
+
 export async function enroll(
   db: D1Database,
   consentVersion: string,
@@ -208,7 +215,7 @@ export async function enroll(
       id, access_token_id, access_token_hash, recovery_token_id,
       recovery_token_hash, state, consent_version, consented_at, created_at,
       identity_link_key, identity_cooldown_digest
-    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?) RETURNING id`,
   ).bind(
     participantId,
     legacyAccessId,
@@ -266,12 +273,14 @@ export async function enroll(
         sessionInsert(db, session),
         ...(pairing ? [devicePairingInsert(db, pairing, consentVersion)] : []),
       ]);
-      if (results.some((entry) => entry.meta.changes !== 1)) {
+      if (results.some((entry, index) => index === 0
+        ? !returnedTargetId(entry, participantId) : entry.meta.changes !== 1)) {
         throw new ApiError(500, "INTERNAL_ERROR");
       }
     } else {
       const results = await db.batch(enrollmentStatements);
-      if (results.some((entry) => entry.meta.changes !== 1)) {
+      if (results.some((entry, index) => index === 0
+        ? !returnedTargetId(entry, participantId) : entry.meta.changes !== 1)) {
         throw new ApiError(500, "INTERNAL_ERROR");
       }
     }
@@ -305,7 +314,8 @@ export async function enroll(
         sessionInsert(db, session),
         ...(pairing ? [devicePairingInsert(db, pairing, consentVersion)] : []),
       ]);
-      if (result.some((entry) => entry.meta.changes !== 1)) {
+      if (result.some((entry, index) => index === 0
+        ? !returnedTargetId(entry, participantId) : entry.meta.changes !== 1)) {
         throw new ApiError(400, "INVITE_GRANT_INVALID");
       }
     } catch (error) {
@@ -364,12 +374,13 @@ export async function reattachParticipantByLinkKey(
     db.prepare(
       `UPDATE participants
           SET recovery_token_id = ?, recovery_token_hash = ?
-        WHERE id = ? AND state = 'active'`,
+        WHERE id = ? AND state = 'active' RETURNING id`,
     ).bind(recovery.id, recoveryHash, row.id),
     sessionInsert(db, session),
     ...(pairing ? [devicePairingInsert(db, pairing, consentVersion)] : []),
   ]);
-  if (results.some((entry) => entry.meta.changes !== 1)) {
+  if (results.some((entry, index) => index === 0
+    ? !returnedTargetId(entry, row.id) : entry.meta.changes !== 1)) {
     throw new ApiError(500, "INTERNAL_ERROR");
   }
   return {
@@ -964,7 +975,7 @@ export async function markParticipantDeleting(
           AND NOT EXISTS (
             SELECT 1 FROM device_upload_authorizations
              WHERE participant_id = ? AND state = 'consuming'
-          )`,
+          ) RETURNING id`,
     ).bind(currentSessionId, participantId, participantId, participantId),
     db.prepare(
       `UPDATE web_sessions SET state = 'revoked', revoked_at = ?
@@ -1007,7 +1018,7 @@ export async function markParticipantDeleting(
           )`,
     ).bind(now, participantId, participantId, currentSessionId),
   ]);
-  if ((results[2]?.meta.changes ?? 0) < 1) {
+  if (!returnedTargetId(results[2], participantId)) {
     const consuming = await db.prepare(
       `SELECT (
           (SELECT COUNT(*) FROM upload_authorizations

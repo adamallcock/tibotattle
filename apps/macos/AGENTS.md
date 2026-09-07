@@ -39,6 +39,28 @@ Apply the repository root guidance first.
 - Keep app termination, child-process cleanup, retry, cancellation, and repeated
   launch idempotent. Do not leave orphaned companions or update processes.
 
+## Prompt-free Keychain operation
+
+- Disable Keychain interaction for startup, refresh, background work, and
+  automatic upgrade/migration. Use bounded silent retries; refreshes and
+  companion restarts must not create retry or password-prompt loops.
+- Preserve each credential reader's narrow signing identity and designated
+  requirement across releases. Matching Team IDs alone, successful notarization,
+  or an ad-hoc build do not prove access to an existing Keychain item.
+- After silent recovery is exhausted, offer a quiet native Settings action.
+  Explain the requested access before deliberate approval can enable an OS
+  dialog. Cancel must be the default; denial/cancellation preserve credentials
+  and history. Never request a Keychain password in app UI or trigger approval
+  from a background task, web message, or automatic retry.
+- Never broaden ACLs, entitlements, or access groups; disable macOS protection;
+  use plaintext secret storage; or reset/delete/rotate an identity to suppress
+  a prompt. Do not recommend blanket Always Allow access as a workaround.
+- Qualify clean install and same-identity upgrades with exact signed artifacts,
+  including normal launch/refresh/restart, locked or unavailable Keychain,
+  exhausted retries, denial/cancellation, and partial migration. Unexpected
+  prompts block dogfood replacement and public release; record unavailable
+  evidence honestly rather than treating source tests as signed-upgrade proof.
+
 ## Build and release discipline
 
 - Bundle construction requires macOS arm64 and exactly Node.js 26.2.0. The build
@@ -48,6 +70,8 @@ Apply the repository root guidance first.
   retained release gate.
 - Preparing pinned public dependencies and validating local output is distinct
   from accessing private signing material or publishing an update.
+- The release command's `--prepare-candidate` flag continues into signing and
+  notarization; it is not a compile-only or dry-run boundary.
 - Never run preview installation/reinstallation, signing, notarization, appcast
   publication, system replacement, or stable release commands without explicit
   authorization for that operation and exact target.

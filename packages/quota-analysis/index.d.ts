@@ -66,6 +66,131 @@ export type PricingStatus =
   | "partially_priced"
   | "unpriced";
 
+export const PLAN_ATTRIBUTION_POLICY: Readonly<{
+  methodVersion: "plan-attribution-v1";
+  maxObservations: number;
+  maxContexts: number;
+  maxEras: number;
+}>;
+
+export interface PlanAttributionObservation {
+  contextKey: string;
+  observedAtMs: number;
+  planType: string | null | undefined;
+  planVariant?: string;
+  /** Optional bounded continuity claim; splits same-plan eras, never account proof. */
+  continuityId?: string | null;
+  /** Explicit contradictory evidence is a barrier, unlike an ordinary unknown plan. */
+  conflicted?: boolean;
+  /** Positively comparable account evidence only; never a device/transport ID. */
+  accountScopeId?: string | null;
+  observationId?: string;
+}
+
+export interface PlanAttributionEra {
+  readonly eraKey: string;
+  readonly contextKey: string;
+  readonly accountScopeId: string | null;
+  readonly planType: string;
+  readonly planVariant: string;
+  readonly continuityId: string | null;
+  readonly firstObservedAtMs: number;
+  readonly lastObservedAtMs: number;
+  /** Inclusive observation anchors; null is open, not verified continuity. */
+  readonly lowerBoundMs: number | null;
+  readonly upperBoundMs: number | null;
+}
+
+export interface PlanAttributionConflict {
+  readonly contextKey: string;
+  readonly accountScopeId: string | null;
+  readonly observedAtMs: number;
+}
+
+/** Opaque in-memory analysis input. Do not serialize into transport/cache DTOs. */
+export interface PlanAttributionIndex {
+  readonly methodVersion: "plan-attribution-v1";
+  readonly status: "ready" | "limit_exceeded";
+  readonly observationCount: number;
+  readonly ignoredObservationCount: number;
+  readonly eras: readonly PlanAttributionEra[];
+  readonly conflicts: readonly PlanAttributionConflict[];
+  readonly contexts: ReadonlyMap<string, {
+    readonly eras: readonly PlanAttributionEra[];
+    readonly conflicts: readonly PlanAttributionConflict[];
+    readonly singlePlan: boolean;
+  }>;
+}
+
+export interface PlanAttributionInterval {
+  contextKey: string;
+  observedAtMs: number;
+  /** Quantity interval is (intervalStartMs, observedAtMs]; omission is a point. */
+  intervalStartMs?: number | null;
+  accountScopeId?: string | null;
+}
+
+export type PlanAttributionEraMatch = {
+  status: "matched";
+  era: PlanAttributionEra;
+  reason: string;
+} | {
+  status: "unavailable" | "conflicted";
+  era: null;
+  reason: string;
+};
+
+export interface PlanAttributionUsage extends PlanAttributionInterval {
+  observedPlanType?: string | null;
+  observedPlanVariant?: string;
+  quantityBasis?: "reported-increment" | "reconstructed-counter-delta" | "legacy-unknown";
+}
+
+export interface PlanAttributionTarget {
+  contextKey?: string;
+  accountScopeId?: string | null;
+  planType?: string;
+  eraKey?: string;
+}
+
+export type PlanAttributionClassification = PlanAttributionEraMatch & {
+  disposition: "compatible" | "legacy_conditional" | "unresolved" | "incompatible";
+  planType: string | null;
+  planVariant: string;
+  accountScopeId: string | null;
+};
+
+export function planAttributionContextKey(provider: string, limitId: string): string;
+export function planAttributionObservationFromSnapshot(snapshot: {
+  provider?: string;
+  limitId?: string;
+  observedAt?: string;
+  observedAtMs?: number;
+  planType?: string | null;
+  planVariant?: string;
+  continuityId?: string | null;
+  conflicted?: boolean;
+  accountScopeId?: string | null;
+  accountTrackId?: string;
+  snapshotId?: string;
+} | null | undefined, options?: {
+  contextKey?: string;
+  accountScopeId?: string | null;
+}): PlanAttributionObservation | null;
+export function buildPlanAttributionIndex(
+  observations?: readonly (PlanAttributionObservation | null)[],
+  options?: { maxObservations?: number; maxContexts?: number; maxEras?: number },
+): PlanAttributionIndex;
+export function planEraForInterval(
+  index: PlanAttributionIndex,
+  input: PlanAttributionInterval,
+): PlanAttributionEraMatch;
+export function classifyUsageAttribution(
+  index: PlanAttributionIndex,
+  usage: PlanAttributionUsage,
+  target?: PlanAttributionTarget,
+): PlanAttributionClassification;
+
 export interface QuotaContinuityInput {
   accountTrackId: string;
   provider: string;

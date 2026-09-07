@@ -31,7 +31,12 @@ setFormattingLocale(localization.formatLocale());
 setMessageLocale(localization.locale());
 export const HOMEBREW_INSTALL_COMMAND =
   "brew install --cask adamallcock/tap/tibotattle";
-export const PUBLIC_PLATFORMS = Object.freeze(["macos", "windows", "linux"]);
+export const PUBLIC_PLATFORMS = Object.freeze([
+  "macos",
+  "macos-intel",
+  "windows",
+  "linux",
+]);
 const PUBLIC_PLATFORM_STORAGE_KEY = "tibotattle.download-platform.v1";
 // Resolve generated copy from the document language at render time. The
 // browser localizer updates that attribute before emitting its locale-change
@@ -70,6 +75,8 @@ function normalizePublicPlatform(candidate) {
  * Coarse browser-reported platform detection is used only to choose the first
  * visible tab. It never redirects, hides alternatives, starts a download, or
  * claims that the app is installed. Unknown and mobile platforms return null.
+ * MacIntel and Intel Mac OS X tokens also occur on Apple Silicon browsers, so
+ * Intel selection requires an explicit tab, URL, or saved choice.
  */
 export function detectPublicPlatform({
   userAgentDataPlatform = "",
@@ -252,32 +259,42 @@ export function setPublicDailyPresentation(documentRef, state, {
   }
 }
 
-function renderPublicInstallerJourney() {
-  const release = renderInstallerJourney(document, {
-    compactDetails: true,
-    showUnavailableAction: true,
-    showReleaseLinks: false,
-    formatLocale: getFormattingLocale(),
-    translateMessage: t,
-  });
-  const headerDownloadLabel = $("#header-download-label");
+export function renderPublicInstallerJourney(documentRef = document) {
+  const select = (selector) => documentRef.querySelector(selector);
+  const renderArchitecture = (architecture) => {
+    const prefix = architecture === "x64" ? "intel-" : "";
+    const release = renderInstallerJourney(documentRef, {
+      architecture,
+      compactDetails: true,
+      showUnavailableAction: true,
+      showReleaseLinks: false,
+      formatLocale: getFormattingLocale(),
+      translateMessage: t,
+    });
+    const checksumCopy = select(`#${prefix}installer-sha256-copy`);
+    if (checksumCopy) {
+      if (release) checksumCopy.dataset.checksum = release.sha256;
+      else delete checksumCopy.dataset.checksum;
+    }
+    const checksumFallback = select(`#${prefix}installer-sha256`);
+    if (checksumFallback) {
+      checksumFallback.textContent = release?.sha256 ?? "";
+      checksumFallback.hidden = true;
+    }
+    renderInstallerAssurance(documentRef, release, { architecture });
+    return release;
+  };
+  const release = renderArchitecture("arm64");
+  const intelRelease = renderArchitecture("x64");
+  const intelInstallation = select("#intel-installation");
+  if (intelInstallation) intelInstallation.hidden = intelRelease === null;
+  const headerDownloadLabel = select("#header-download-label");
   if (headerDownloadLabel) {
     headerDownloadLabel.dataset.i18n = "installer.headerDownload";
     headerDownloadLabel.textContent = t("installer.headerDownload");
   }
-  const homebrewInstall = $("#homebrew-install");
+  const homebrewInstall = select("#homebrew-install");
   if (homebrewInstall) homebrewInstall.hidden = release === null;
-  const checksumCopy = $("#installer-sha256-copy");
-  if (checksumCopy) {
-    if (release) checksumCopy.dataset.checksum = release.sha256;
-    else delete checksumCopy.dataset.checksum;
-  }
-  const checksumFallback = $("#installer-sha256");
-  if (checksumFallback) {
-    checksumFallback.textContent = release?.sha256 ?? "";
-    checksumFallback.hidden = true;
-  }
-  renderInstallerAssurance(document, release);
   return release;
 }
 
@@ -347,8 +364,8 @@ function wireHomebrewInstallCommand() {
   });
 }
 
-function selectInstallerChecksum() {
-  const checksum = $("#installer-sha256");
+function selectInstallerChecksum(prefix = "") {
+  const checksum = $(`#${prefix}installer-sha256`);
   const selection = window.getSelection?.();
   const range = document.createRange?.();
   if (!checksum || !selection || !range) return;
@@ -358,11 +375,11 @@ function selectInstallerChecksum() {
   selection.addRange(range);
 }
 
-function renderInstallerChecksumCopyState(state = "idle") {
-  const button = $("#installer-sha256-copy");
-  const label = $("#installer-sha256-copy-label");
-  const status = $("#installer-sha256-copy-status");
-  const fallback = $("#installer-sha256");
+function renderInstallerChecksumCopyState(state = "idle", prefix = "") {
+  const button = $(`#${prefix}installer-sha256-copy`);
+  const label = $(`#${prefix}installer-sha256-copy-label`);
+  const status = $(`#${prefix}installer-sha256-copy-status`);
+  const fallback = $(`#${prefix}installer-sha256`);
   if (!button || !label || !status || !fallback) return;
   const presentation = {
     copied: ["installer.sha256.copied", "installer.sha256.copySuccess"],
@@ -377,11 +394,11 @@ function renderInstallerChecksumCopyState(state = "idle") {
     || !installerChecksumPattern.test(fallback.textContent);
 }
 
-function wireInstallerChecksumCopy() {
-  const button = $("#installer-sha256-copy");
+function wireInstallerChecksumCopy(prefix = "") {
+  const button = $(`#${prefix}installer-sha256-copy`);
   if (!button || button.dataset.copyBound === "true") return;
   button.dataset.copyBound = "true";
-  renderInstallerChecksumCopyState();
+  renderInstallerChecksumCopyState("idle", prefix);
   button.addEventListener("click", async () => {
     button.disabled = true;
     const copied = await copyInstallerChecksum(
@@ -389,8 +406,8 @@ function wireInstallerChecksumCopy() {
       navigator.clipboard,
     );
     button.disabled = false;
-    if (!copied) selectInstallerChecksum();
-    renderInstallerChecksumCopyState(copied ? "copied" : "failed");
+    if (!copied) selectInstallerChecksum(prefix);
+    renderInstallerChecksumCopyState(copied ? "copied" : "failed", prefix);
   });
 }
 
@@ -558,6 +575,7 @@ if (typeof document !== "undefined") {
   wirePublicPlatformSelector();
   wireHomebrewInstallCommand();
   wireInstallerChecksumCopy();
+  wireInstallerChecksumCopy("intel-");
   wireAllowanceRangeControls();
   wireAllowanceDialog();
   void loadCommunityDailySeries();
@@ -570,6 +588,9 @@ if (typeof document !== "undefined") {
     );
     renderInstallerChecksumCopyState(
       $("#installer-sha256-copy")?.dataset.copyState ?? "idle",
+    );
+    renderInstallerChecksumCopyState(
+      $("#intel-installer-sha256-copy")?.dataset.copyState ?? "idle", "intel-",
     );
     if (communityDailySettled) {
       renderCommunityDailyResult({

@@ -33,6 +33,16 @@ const DAILY_PAYLOAD = Object.freeze({
   to: "2026-08-17",
 });
 
+const INTEL_META = [
+  '<meta name="usage-monitor-intel-installer-url" content="https://downloads.tibotattle.com/TiboTattle-1.2.3-macOS-x64.dmg">',
+  '<meta name="usage-monitor-intel-installer-version" content="1.2.3">',
+  `<meta name="usage-monitor-intel-installer-sha256" content="${"b".repeat(64)}">`,
+  '<meta name="usage-monitor-intel-installer-bytes" content="50000000">',
+  '<meta name="usage-monitor-intel-minimum-macos" content="14.0">',
+  '<meta name="usage-monitor-intel-architectures" content="x64">',
+].join("\n");
+const DUAL_HOME = PUBLISHED_HOME.replace("</head>", `${INTEL_META}</head>`);
+
 function publishedFetch(requests) {
   return async (input, options) => {
     const url = new URL(String(input));
@@ -112,6 +122,30 @@ test("published release metadata stays display-safe and complete", () => {
     ),
     /missing usage-monitor-installer-url/u,
   );
+});
+
+test("Intel preview metadata is optional but must be complete and match the ARM release", async (t) => {
+  const metadata = extractPublicReleaseMetadata(DUAL_HOME);
+  assert.equal(metadata.intelInstaller.architectures, "x64");
+  assert.equal(metadata.intelInstaller.installerSha256, "b".repeat(64));
+  assert.equal(metadata.intelInstaller.installerVersion, metadata.installerVersion);
+  assert.equal(extractPublicReleaseMetadata(PUBLISHED_HOME).intelInstaller, undefined);
+  for (const invalid of [
+    DUAL_HOME.replace('name="usage-monitor-intel-installer-bytes"', 'name="missing-intel-bytes"'),
+    DUAL_HOME.replace('name="usage-monitor-intel-installer-version" content="1.2.3"', 'name="usage-monitor-intel-installer-version" content="1.2.4"'),
+    DUAL_HOME.replace('name="usage-monitor-intel-architectures" content="x64"', 'name="usage-monitor-intel-architectures" content="arm64"'),
+    DUAL_HOME.replace("TiboTattle-1.2.3-macOS-x64.dmg", "TiboTattle-1.2.3-macOS-arm64.dmg"),
+  ]) assert.throws(() => extractPublicReleaseMetadata(invalid));
+  const preview = await startPublicReleaseSitePreview({
+    fetchImpl: async () => new Response(DUAL_HOME, {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    }),
+    upstream: "https://tibotattle.com",
+  });
+  t.after(() => preview.close());
+  const html = await (await fetch(preview.url)).text();
+  assert.ok(html.includes('name="usage-monitor-intel-architectures" content="x64"'));
+  assert.ok(html.includes(`name="usage-monitor-intel-installer-sha256" content="${"b".repeat(64)}"`));
 });
 
 test("live-data preview serves only generated public output and its one aggregate read", async (t) => {

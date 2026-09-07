@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { telemetryV11JsonSchemas } from "../src/telemetry-v1.1-schemas.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const PACKAGE_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -30,6 +31,11 @@ const SCHEMA_MIRRORS = Object.freeze([
     basename,
   ),
 })));
+
+const V11_MIRRORS = Object.freeze(Object.entries(telemetryV11JsonSchemas()).flatMap(([basename, value]) => [
+  { value, output: join(PACKAGE_ROOT, "schemas", "v1.1", basename) },
+  { value, output: join(REPOSITORY_ROOT, "schemas", "telemetry-contribution-v1.1", basename) },
+]));
 
 async function canonicalSchemaBytes(path) {
   const bytes = await readFile(path);
@@ -59,8 +65,12 @@ export async function checkTelemetrySchemaMirrors() {
       `${mirror.output} is stale; regenerate telemetry schema mirrors`,
     );
   }
+  for (const mirror of V11_MIRRORS) {
+    assert.deepEqual(await readFile(mirror.output), Buffer.from(`${JSON.stringify(mirror.value, null, 2)}\n`),
+      `${mirror.output} is stale; regenerate telemetry schema mirrors`);
+  }
   return Object.freeze({
-    schemaCount: SCHEMA_MIRRORS.length,
+    schemaCount: SCHEMA_MIRRORS.length + V11_MIRRORS.length,
   });
 }
 
@@ -90,8 +100,11 @@ export async function writeTelemetrySchemaMirrors() {
       await canonicalSchemaBytes(mirror.source),
     );
   }
+  for (const mirror of V11_MIRRORS) {
+    await writeAtomically(mirror.output, Buffer.from(`${JSON.stringify(mirror.value, null, 2)}\n`));
+  }
   return Object.freeze({
-    schemaCount: SCHEMA_MIRRORS.length,
+    schemaCount: SCHEMA_MIRRORS.length + V11_MIRRORS.length,
   });
 }
 

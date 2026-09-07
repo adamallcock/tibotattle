@@ -966,10 +966,12 @@ export async function rotateContributionDeviceCredential({
   expectedOrigin = null,
   performRemoteRotation,
   generateSecret = () => randomBytes(SECRET_BYTES),
+  deriveSecret = null,
 } = {}) {
   const selected = assertBackend(backend);
   if (typeof performRemoteRotation !== "function"
-      || typeof generateSecret !== "function") {
+      || typeof generateSecret !== "function"
+      || (deriveSecret !== null && typeof deriveSecret !== "function")) {
     fail("invalid_configuration");
   }
   const state = await readState(stateFile);
@@ -989,7 +991,12 @@ export async function rotateContributionDeviceCredential({
     }
     oldSecret = copySecret(oldStored);
     try {
-      newValue = generateSecret();
+      // Fresh-social re-pairing uses a deterministic, purpose-separated target
+      // so an unacknowledged remote commit can be reconstructed on retry. The
+      // ordinary renewal API retains its existing random-secret default.
+      newValue = deriveSecret === null ? generateSecret() : deriveSecret(Object.freeze({
+        currentSecret: oldSecret, origin: state.origin, deviceId: state.deviceId,
+      }));
     } catch {
       fail("credential_unavailable");
     }

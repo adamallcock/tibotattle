@@ -48,6 +48,20 @@ Display windows do not delete older local history. The dashboard may show a
 shorter horizon while the local index retains the evidence needed for replay,
 corrections, and longer-term views.
 
+When local history contains more than one plan, **Allowance** separates the
+plans instead of averaging Plus and Pro reset estimates together. The plan
+selector keeps the headline, history, range, pace and share card on the same
+selected population. The newest observed plan is selected even if it does not
+yet have enough usable evidence; older-plan estimates remain selectable rather
+than being presented as the current plan's allowance.
+
+These historical estimates are conditional on the locally observed plan, not
+proof of which provider account generated every token. Known plan switches and
+ambiguous boundary quantities are excluded narrowly; coherent older history is
+still useful. **Usage and costs** continues to retain all-plan accounting totals.
+Community figures intentionally retain their common Pro-equivalent scale; this
+does not authorize mixing personal Plus and Pro allowance histories.
+
 Switching and cache-drop overheads estimate the API-equivalent premium in
 observed comparisons, not a proven cause or a bill. A labelled covered subtotal
 includes only comparisons with usable ordering and prices. Sessions whose
@@ -66,15 +80,38 @@ diagnostics, or community contributions.
 
 ## Refresh, progress, and recovery
 
-Use Refresh to request a new local analysis pass. The app keeps verified prior
-figures visible while newer data is being reconciled where the evidence permits.
-Do not repeatedly relaunch during first-run indexing; that can make progress
-appear to restart even when source data is intact.
+Use **Refresh** (or Cmd-R in the native app) to update quota, retained history,
+and detailed Usage-and-costs and Trends evidence together. A valid
+generation-bound accounting cache is reused; a changed generation is
+recalculated. There is no separate detailed-accounting button. The app keeps
+verified prior figures visible, with their current freshness state, while work
+is in progress. If another refresh is already running, the shared controller
+keeps that single operation authoritative. Native controls follow its progress;
+the browser shows an informational notice without starting a second operation.
 
-After source scanning, **Calculating accounting…** means the app is calculating
-and preparing the updated dashboard. It replaces the file counter: a small
-number of changed files does not mean all the unchanged files are being read
-again. Only the terminal refresh status establishes completion.
+Startup and frequent automatic quota checks stay light. While the app remains
+open it may make one automatic detailed attempt after an hour. Failed,
+cancelled, and interrupted detailed attempts count toward that hour so they do
+not become a retry loop. After an already-running quick quota check finishes,
+you can choose Refresh again to request detailed work.
+
+Trends compares the selected plan's compatible usage and quota history. Earlier
+history on another plan does not disable a usable current-plan fit, and it is
+not borrowed into that fit. Ambiguous intervals and plan transitions remain
+gaps. Unresolved speed uses the labelled Standard scenario, without pretending
+that Standard speed was observed. During refresh, its last compatible plan-specific
+history stays visible with the retained calibration. Expanded model/speed details
+for unchanged periods stay open and keep their last successful result while
+updated details load; temporary lookup failures do not erase that result.
+
+Do not repeatedly relaunch during a detailed pass; that can make progress appear
+to restart even when source data is intact.
+
+During an explicit or hourly detailed pass, **Calculating accounting…** means
+the app is calculating and preparing the updated dashboard. It replaces the
+file counter: a small number of changed files does not mean all the unchanged
+files are being read again. Only the terminal refresh status establishes
+completion.
 
 If the dashboard stays blank or reports a schema/index error:
 
@@ -94,11 +131,37 @@ Maintainers use the preservation-first
 [unified-index recovery runbook](./runbooks/unified-index-recovery.md). Recovery
 is performed against a copy before replacing durable state.
 
+### Secure upgrade
+
+In builds with the [native migration change](./decisions/2026-08-31-silent-keychain-migration.md),
+TiboTattle first tries to preserve older saved keys silently, up to three times.
+If it cannot finish, **Secure upgrade** appears quietly in **Settings… →
+General**. Choose **Review migration…** when ready. The explanation tells you
+why access is needed before **Approve migration** can open a macOS Keychain
+dialog. Enter a password only in that macOS dialog; TiboTattle does not receive
+it. Cancel leaves migration pending, and approval changes neither key values
+nor contribution consent. Do not reset keys or delete local history to resolve
+this state. The linked decision records qualification; this is not a claim
+that an older installed app already has the new flow.
+
 ## Optional community contribution
 
 Community participation requires sign-in and explicit consent. Before the first
 upload, TiboTattle presents the derived, allowlisted contribution. Contributions
 are pseudonymous and omit session content; pseudonymous does not mean anonymous.
+
+A staged successor contribution format can add account/plan attribution only
+after a separate field review and explicit new consent, and only if the hosted
+service enables that format. Existing consent is not upgraded automatically.
+Its pseudonyms can link observations within an enrollment/destination; they
+never include raw provider account identifiers. Interrupted replacement uploads
+remain staged while the previous complete hosted history stays selected.
+Missing identity proof does not erase local usage or imply zero usage.
+
+Re-pairing or renewing this Mac's contribution credential pauses delivery while
+the credential changes. If completion cannot be verified, delivery stays paused
+and the app offers device repair; an ordinary refresh cannot bypass that pause.
+Local usage analysis and previously contributed history remain available.
 
 Signing in, pairing a device, local indexing, successful upload, aggregate
 publication, and device disconnect are separate states. Keep the app’s

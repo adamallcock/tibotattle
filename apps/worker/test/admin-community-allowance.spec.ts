@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { ADMIN_MODEL_CONFIG, ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION, expandAdminModelHistoryDay,
+  projectAdminModelHistoryDay } from "@app-usagemonitor/telemetry-contract";
 
 import {
   ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS,
@@ -10,6 +13,7 @@ import {
   warmAdminCommunityAllowancePreviewCache,
 } from "../src/admin-community-allowance";
 import {
+  COMMUNITY_ATTRIBUTION_METHOD_VERSION,
   readCachedCommunityAllowanceCorpus,
   readCachedCommunityAllowanceFits,
   summarizeCommunityAllowanceDay,
@@ -22,16 +26,30 @@ interface CacheRow {
   expected_cache_key: string | null;
   cache_key: string | null;
   fits_json: string | null;
+  input_fingerprint: string;
+  source_method_version: string;
 }
 
-function cacheDatabase(rows: CacheRow[], { fail = false } = {}) {
+const ACTIVE_V11_SOURCE_QUERY =
+  "SELECT 1 AS present FROM telemetry_v11_domain_heads WHERE participant_id = ? LIMIT 1";
+
+function cacheDatabase(rows: CacheRow[], { fail = false,
+  modelDays = [] as { day: string; payload_json: string }[],
+} = {}) {
   const statements: string[] = [];
   const bindings: unknown[][] = [];
   const database = {
+    async batch(prepared: D1PreparedStatement[]) {
+      return Promise.all(prepared.map((statement) => statement.all()));
+    },
     prepare(statement: string) {
       statements.push(statement);
       const handle = {
         async first() {
+          if (statement === ACTIVE_V11_SOURCE_QUERY) return null;
+          if (statement.includes("community_snapshot_mutation_control")) {
+            return { mutation_epoch: 1, input_revision: 1 };
+          }
           if (statement.includes("community_model_composition_cache")) {
             return null;
           }
@@ -43,16 +61,24 @@ function cacheDatabase(rows: CacheRow[], { fail = false } = {}) {
         },
         async all() {
           if (fail) throw new Error("cache unavailable");
-          if (statement.includes("day_device_evidence")
-              || statement.includes("community_model_composition_days")) {
+          if (statement.includes("community_snapshot_mutation_control")) {
+            return { results: [{ mutation_epoch: 1, input_revision: 1 }] };
+          }
+          if (!/^\s*WITH\b/u.test(statement) && /telemetry_(?:v1|analytical)_chunks/u.test(statement)) {
+            return { results: [] };
+          }
+          if (statement.includes("community_model_composition_days")) {
+            return { results: modelDays };
+          }
+          if (statement.includes("day_device_evidence")) {
             return { results: [] };
           }
           return { results: rows };
         },
         async run() {
-          // The per-model day series is the single write this scheduled
-          // source path is allowed; anything else stays a hard failure.
-          if (statement.includes("community_model_composition_days")) {
+          // Scheduled construction may cache a composition refusal and its
+          // model day. The fit-cache reader itself remains SELECT-only.
+          if (/^\s*INSERT INTO community_model_composition_(?:cache|days)\b/u.test(statement)) {
             return { meta: { changes: 1 } };
           }
           throw new Error("read-only cache reader attempted a write");
@@ -121,11 +147,18 @@ function previewWarmDatabase(
   const bindings: unknown[][] = [];
   let stored = options.existing ?? null;
   const database = {
+    async batch(prepared: D1PreparedStatement[]) {
+      return Promise.all(prepared.map((statement) => statement.all()));
+    },
     prepare(statement: string) {
       statements.push(statement);
       let bound: unknown[] = [];
       const handle = {
         async first() {
+          if (statement === ACTIVE_V11_SOURCE_QUERY) return null;
+          if (statement.includes("community_snapshot_mutation_control")) {
+            return { mutation_epoch: 1, input_revision: 1 };
+          }
           if (statement.includes("admin_community_allowance_preview_cache")) {
             return stored;
           }
@@ -139,6 +172,12 @@ function previewWarmDatabase(
           throw new Error("unexpected first query");
         },
         async all() {
+          if (statement.includes("community_snapshot_mutation_control")) {
+            return { results: [{ mutation_epoch: 1, input_revision: 1 }] };
+          }
+          if (!/^\s*WITH\b/u.test(statement) && /telemetry_(?:v1|analytical)_chunks/u.test(statement)) {
+            return { results: [] };
+          }
           if (statement.includes("day_device_evidence")
               || statement.includes("community_model_composition_days")) {
             return { results: [] };
@@ -149,7 +188,7 @@ function previewWarmDatabase(
           return { results: rows };
         },
         async run() {
-          if (statement.includes("community_model_composition_days")) {
+          if (/^\s*INSERT INTO community_model_composition_(?:cache|days)\b/u.test(statement)) {
             return { meta: { changes: 1 } };
           }
           if (!/^\s*INSERT INTO admin_community_allowance_preview_cache\b/u
@@ -185,6 +224,8 @@ function cacheRow(overrides: Partial<CacheRow> = {}): CacheRow {
     expected_cache_key: "current-cache-key",
     cache_key: "current-cache-key",
     fits_json: JSON.stringify([fit({ participantId })]),
+    input_fingerprint: "a".repeat(64),
+    source_method_version: COMMUNITY_ATTRIBUTION_METHOD_VERSION,
     ...overrides,
   };
 }
@@ -199,7 +240,84 @@ function fit(overrides: Partial<CommunityAllowanceFit> = {}): CommunityAllowance
   };
 }
 
+function expectPinnedCompositionRefresh(statements: string[]) {
+  // Both callers have two preliminary reads. Assert the complete successful
+  // refusal-cache path, not merely its count: an unsupported mock query must
+  // not masquerade as an optimization by aborting the analyzer before its pin
+  // recheck and cache write.
+  expect(statements.slice(2, 16)).toEqual([
+    expect.stringMatching(/^\s*SELECT mutation_epoch FROM community_snapshot_mutation_control\b/u),
+    expect.stringMatching(/^\s*WITH\b[\s\S]*community_allowance_fit_cache\b/u),
+    expect.stringMatching(/^\s*WITH\b[\s\S]*FROM participant_sources\b/u),
+    "SELECT 1 FROM community_model_composition_cache LIMIT 1",
+    expect.stringMatching(/^\s*SELECT mutation_epoch,[\s\S]*community_analytical_input_versions\b/u),
+    expect.stringMatching(/^\s*SELECT c\.id,[\s\S]*FROM telemetry_analytical_chunks c\b/u),
+    expect.stringMatching(/^\s*SELECT composition_json FROM community_model_composition_cache\b/u),
+    ACTIVE_V11_SOURCE_QUERY,
+    expect.stringMatching(/^\s*SELECT mutation_epoch,[\s\S]*community_analytical_input_versions\b/u),
+    expect.stringMatching(/^\s*SELECT c\.id,[\s\S]*FROM telemetry_analytical_chunks c\b/u),
+    expect.stringMatching(/^\s*INSERT INTO community_model_composition_cache\b/u),
+    expect.stringMatching(/^\s*INSERT INTO community_model_composition_days\b/u),
+    expect.stringMatching(/^\s*SELECT day, payload_json\s+FROM community_model_composition_days\b/u),
+    expect.stringMatching(/^\s*SELECT mutation_epoch FROM community_snapshot_mutation_control\b/u),
+  ]);
+  expect(statements[6]).toBe(statements[10]);
+  expect(statements[7]).toBe(statements[11]);
+  expect(statements[7]).toContain("p.state = 'active'");
+  expect(statements[7]).toMatch(/\bLIMIT \?/u);
+  expect(statements[8]).toContain("input_fingerprint = ? AND source_method_version = ?");
+  expect(statements[12]).toContain("p.state = 'active'");
+  expect(statements[12]).toContain("v.revision = ?6");
+  expect(statements[13]).toContain("mutation_epoch = ?4");
+  expect(statements.join("\n")).not.toMatch(/\bFROM telemetry_(?:v1|v11_active|analytical)_records\b/u);
+}
+
 describe("admin community allowance preview", () => {
+  it("scheduled reads retain legacy model days without inventing newer-model coverage", async () => {
+    const legacy = { day: "2026-08-22", byModel: Object.fromEntries([
+      "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+    ].map((id) => [id, { capacityUsd: null, participantCount: 0 }])),
+    fittedParticipantCount: 0, unstableParticipantCount: 1, staleParticipantCount: 0,
+    refusedParticipantCount: 0, v1ParticipantCount: 1, unsupportedSourceParticipantCount: 0 };
+    const source = cacheDatabase([cacheRow()], { modelDays: [
+      { day: "2026-08-23", payload_json: JSON.stringify({ ...legacy, day: "2026-08-23", rawModel: "private-canary" }) },
+      { day: legacy.day, payload_json: JSON.stringify(legacy) },
+    ] });
+    const preview = await buildAdminCommunityAllowancePreviewFromSource(
+      source.database, Date.parse("2026-08-23T10:30:00.000Z"),
+    );
+    expect(preview?.models.days).toHaveLength(1);
+    const kept = preview!.models.days[0]!;
+    expect(kept.catalogVersion).toBe(LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION);
+    expect(kept.day).toBe(legacy.day);
+    expect(expandAdminModelHistoryDay(kept)!.byModel["gpt-6-astra"])
+      .toEqual({ capacityUsd: null, participantCount: null });
+    expect(JSON.stringify(preview)).not.toContain("private-canary");
+  });
+
+  it("serves all 70 fully populated catalog days inside the bounded cache", async () => {
+    const now = Date.parse("2026-09-03T12:00:00.000Z");
+    const base = buildAdminCommunityAllowancePreview([], now);
+    const models = { ...base.models, days: base.days.map(({ day }) => {
+      const projected = projectAdminModelHistoryDay({
+        day, catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+        values: ADMIN_MODEL_CONFIG.filter((model) => model.allowanceTrack === "primary")
+          .map((model) => [model.modelId, 1.7976931348623157e308, Number.MAX_SAFE_INTEGER]),
+        fittedParticipantCount: Number.MAX_SAFE_INTEGER,
+        unstableParticipantCount: 0, staleParticipantCount: 0, refusedParticipantCount: 0,
+        v1ParticipantCount: Number.MAX_SAFE_INTEGER, unsupportedSourceParticipantCount: 0,
+      });
+      expect(projected).not.toBeNull();
+      return projected!;
+    }) };
+    const preview = { ...base, models };
+    const payload = JSON.stringify(preview);
+    expect(new TextEncoder().encode(payload).byteLength).toBeLessThan(256 * 1024);
+    const cached = previewCacheDatabase({ generated_at: preview.generatedAt, payload_json: payload });
+    await expect(readCachedAdminCommunityAllowancePreview(cached.database, now)).resolves.toEqual(preview);
+    expect(cached.statements).toHaveLength(1);
+  });
+
   it("normalizes eligible fits before merging and deduplicates participants", () => {
     const fits = [
       fit(),
@@ -362,9 +480,10 @@ describe("admin community allowance preview", () => {
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu,
     );
     expect(bindings).toHaveLength(2);
-    // The single bound value is the shared writer/reader cache-key suffix, so
-    // the two compositions can never diverge again.
-    expect(bindings[0]).toHaveLength(1);
+    // One UTC horizon and one shared method/pricing suffix keep the SELECT
+    // cache reader aligned with the scheduled writer without scanning inputs.
+    expect(bindings[0]).toHaveLength(2);
+    expect(bindings[0]?.[1]).toContain(COMMUNITY_ATTRIBUTION_METHOD_VERSION);
 
     const preview = await buildAdminCommunityAllowancePreviewFromSource(
       database,
@@ -379,7 +498,10 @@ describe("admin community allowance preview", () => {
     expect(serializedPreview).not.toContain("participant-1");
     expect(serializedPreview).not.toContain("capacityNanousd");
     expect(serializedPreview).not.toContain("lastObservedAt");
-    expect(statements).toHaveLength(11);
+    // Publication epochs, both source-pin reads and the active-successor guard
+    // remain bounded; no raw usage scan is introduced on a cache read.
+    expect(statements).toHaveLength(16);
+    expectPinnedCompositionRefresh(statements);
     const writes = statements.filter((statement) => (
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu
         .test(statement)
@@ -395,12 +517,7 @@ describe("admin community allowance preview", () => {
       /^INSERT INTO community_model_composition_days\b/u,
     );
     expect(preview?.models.days).toEqual([]);
-    expect(preview?.models.modelConfig.map((model) => model.modelId)).toEqual([
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.5",
-    ]);
+    expect(preview?.models.modelConfig).toEqual(ADMIN_MODEL_CONFIG);
   });
 
   it("reports the production-shaped 8/8/6/5 coverage without exposing IDs", async () => {
@@ -443,6 +560,8 @@ describe("admin community allowance preview", () => {
       [cacheRow({ source: "v0.2", expected_cache_key: null })],
       [cacheRow({ cache_key: null, fits_json: null })],
       [cacheRow({ cache_key: "stale-cache-key" })],
+      [cacheRow({ input_fingerprint: "untrusted" })],
+      [cacheRow({ source_method_version: "old-attribution" })],
       [cacheRow({ fits_json: "not-json" })],
       [cacheRow({
         fits_json: JSON.stringify([fit({ participantId: "other-participant" })]),
@@ -498,7 +617,7 @@ describe("admin community allowance preview", () => {
     expect(statements[0]).not.toMatch(
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu,
     );
-    expect(bindings).toEqual([[128 * 1_024]]);
+    expect(bindings).toEqual([[256 * 1_024, COMMUNITY_ATTRIBUTION_METHOD_VERSION]]);
     expect(JSON.stringify(cached)).not.toContain("participant-1");
   });
 
@@ -516,7 +635,7 @@ describe("admin community allowance preview", () => {
         [],
         nowEpoch - 3 * 60 * 60 * 1_000,
       )),
-      { generated_at: preview.generatedAt, payload_json: "x".repeat(128 * 1_024 + 1) },
+      { generated_at: preview.generatedAt, payload_json: "x".repeat(256 * 1_024 + 1) },
       { generated_at: preview.generatedAt, payload_json: "{" },
       { generated_at: preview.generatedAt, payload_json: JSON.stringify(withIdentifier) },
     ];
@@ -546,7 +665,8 @@ describe("admin community allowance preview", () => {
       source.database,
       nowEpoch,
     )).resolves.toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_REFRESHED" });
-    expect(source.statements).toHaveLength(11);
+    expect(source.statements).toHaveLength(17);
+    expectPinnedCompositionRefresh(source.statements);
     const warmWrites = source.statements.filter((statement) => (
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu
         .test(statement)
@@ -564,13 +684,16 @@ describe("admin community allowance preview", () => {
     expect(source.statements[0]).toMatch(
       /^\s*SELECT generated_at, payload_json\s+FROM admin_community_allowance_preview_cache/u,
     );
-    expect(source.statements[1]!.trimStart()).toMatch(/^WITH\b/u);
-    expect(source.statements[1]).not.toMatch(
+    expect(source.statements[1]).toContain("community_snapshot_mutation_control");
+    expect(source.statements[2]).toContain("community_snapshot_mutation_control");
+    expect(source.statements[3]!.trimStart()).toMatch(/^WITH\b/u);
+    expect(source.statements[3]).not.toMatch(
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu,
     );
     expect(source.statements.at(-1)).toMatch(
       /^\s*INSERT INTO admin_community_allowance_preview_cache\b/u,
     );
+    expect(source.statements.at(-1)).toContain("mutation_epoch = ?4");
     const stored = source.stored();
     expect(stored).not.toBeNull();
     expect(new TextEncoder().encode(stored?.payload_json ?? "").byteLength)

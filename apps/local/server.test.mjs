@@ -26,6 +26,9 @@ import {
   LOCAL_COMPANION_SCHEMA_VERSION,
 } from "../../src/local-companion-data.js";
 import {
+  readLocalUnifiedCompanionProjection,
+} from "../../src/local-unified-companion-source.js";
+import {
   ingestLocalUnifiedIndexOffMain,
 } from "../../src/local-unified-index-off-main.js";
 import {
@@ -348,8 +351,11 @@ test("refresh timeout classifier grants the cold window only to missing or prove
   }
 });
 
-test("published v10 parser upgrades receive a cold deadline without extending current or uncertain state", async () => {
+test("published v10 v11 v12 v13 v14 upgrades to v15 receive a cold deadline without extending current or uncertain state", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-timeout-parser-upgrade-"));
+  // Deliberately pin the target: another parser release must review its
+  // predecessor set, not silently keep passing a generic mismatch test.
+  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v15");
   const fixtures = [
     { name: "complete", cold: true },
     { name: "quarantine-partial", cold: true, generation: {
@@ -361,9 +367,17 @@ test("published v10 parser upgrades receive a cold deadline without extending cu
     // Every fixture retains an older parser/generation row. Only publication
     // provenance may select the deadline, so this stays an ordinary refresh.
     { name: "current-with-old-history", parserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
-    { name: "future", parserVersion: "unified-rollout-typed-v12" },
+    { name: "future", parserVersion: "unified-rollout-typed-v16" },
     { name: "unknown", parserVersion: "unknown-parser" },
+    { name: "empty", parserVersion: "" },
+    { name: "malformed-version", parserVersion: "unified-rollout-typed-v011" },
+    { name: "decorated-version", parserVersion: "unified-rollout-typed-v11 " },
     { name: "partial-parser", parserVersion: "unified-rollout-typed-v10-partial" },
+    { name: "v11-partial-parser", parserVersion: "unified-rollout-typed-v11-partial" },
+    { name: "v12-partial-parser", parserVersion: "unified-rollout-typed-v12-partial" },
+    { name: "v14-partial-parser", parserVersion: "unified-rollout-typed-v14-partial" },
+    { name: "v13-partial-parser", parserVersion: "unified-rollout-typed-v13-partial" },
+    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v15-partial" },
     { name: "unreviewed-predecessor", parserVersion: "unified-rollout-typed-v9" },
     { name: "missing-publication", metadata: { current_generation_id: undefined } },
     { name: "unknown-publication", metadata: { current_generation_id: "99" } },
@@ -394,17 +408,23 @@ test("published v10 parser upgrades receive a cold deadline without extending cu
       .map((key) => ({ name: `incomplete-${key}`, generation: { [key]: 0 } })),
   ];
   try {
-    for (const fixture of fixtures) {
-      const indexFile = join(root, `${fixture.name}.sqlite`);
-      writeParserUpgradeTimeoutIndex(indexFile, fixture);
-      await chmod(indexFile, 0o600);
-      const beforeBytes = await readFile(indexFile);
-      const beforeNames = await readdir(root);
-      assert.equal(localCompanionRefreshTimeoutForUnifiedIndex(indexFile),
-        fixture.cold === true ? 14_400_000 : LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
-        fixture.name);
-      assert.deepEqual(await readFile(indexFile), beforeBytes, fixture.name);
-      assert.deepEqual(await readdir(root), beforeNames, fixture.name);
+    for (const predecessor of [10, 11, 12, 13, 14]) {
+      for (const fixture of fixtures) {
+        const name = `v${predecessor}-${fixture.name}`;
+        const indexFile = join(root, `${name}.sqlite`);
+        writeParserUpgradeTimeoutIndex(indexFile, {
+          parserVersion: `unified-rollout-typed-v${predecessor}`,
+          ...fixture,
+        });
+        await chmod(indexFile, 0o600);
+        const beforeBytes = await readFile(indexFile);
+        const beforeNames = await readdir(root);
+        assert.equal(localCompanionRefreshTimeoutForUnifiedIndex(indexFile),
+          fixture.cold === true ? 14_400_000 : LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+          name);
+        assert.deepEqual(await readFile(indexFile), beforeBytes, name);
+        assert.deepEqual(await readdir(root), beforeNames, name);
+      }
     }
   } finally {
     await rm(root, { recursive: true });
@@ -484,8 +504,18 @@ test("large legacy and parser-upgrade timeout classification never scans integri
     );
     assert.deepEqual(await readdir(root), beforeNames);
 
-    const parserIndex = join(root, "schema11-parser10-large.sqlite");
-    writeParserUpgradeTimeoutIndex(parserIndex);
+    const parserIndex = join(root, "schema11-parser11-large.sqlite");
+    // Match the stable predecessor for RC3: v11, physical schema11,
+    // no skipped sources, and only incomplete historical tool provenance.
+    writeParserUpgradeTimeoutIndex(parserIndex, {
+      parserVersion: "unified-rollout-typed-v11",
+      generation: {
+        status: "partial",
+        blockReason: "tool_provenance_incomplete",
+        toolProvenanceComplete: 0,
+        skippedSourceCount: 0,
+      },
+    });
     await chmod(parserIndex, 0o600);
     await truncate(parserIndex, sparseSize);
     const parserBefore = await lstat(parserIndex);
@@ -1583,6 +1613,12 @@ test("initialization failure retains the retirement lock until idempotent runtim
     async pauseForDeviceDisconnect() {
       return {};
     },
+    async pauseForDeviceRepair() {
+      return {};
+    },
+    async resumeAfterDeviceRepair() {
+      return {};
+    },
   };
   const baseOptions = {
     resourceRoot: files.resourceRoot,
@@ -1673,6 +1709,7 @@ test("the port and readiness answer before the first snapshot is built", async (
   const buildStarted = deferred();
   const buildBarrier = deferred();
   const store = fakeStore();
+  let initializationOptions;
   let app;
   try {
     const startedAt = Date.now();
@@ -1683,7 +1720,8 @@ test("the port and readiness answer before the first snapshot is built", async (
       staticRoot: files.staticRoot,
       dataStore: {
         ...store,
-        async initialize() {
+        async initialize(options) {
+          initializationOptions = options;
           buildStarted.resolve();
           await buildBarrier.promise;
         },
@@ -1693,6 +1731,7 @@ test("the port and readiness answer before the first snapshot is built", async (
     });
     const base = `http://127.0.0.1:${app.port}`;
     await buildStarted.promise;
+    assert.deepEqual(initializationOptions, { purpose: "startup" });
 
     // Listening, and honest about what is not ready yet. Before the port moved
     // ahead of the build this request could not even be sent: a real install
@@ -1730,6 +1769,72 @@ test("the port and readiness answer before the first snapshot is built", async (
     );
   } finally {
     buildBarrier.resolve();
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("startup snapshot defers unified history until an explicit full refresh", async () => {
+  const files = await fixture();
+  const projectionModes = [];
+  let fullRefreshRequested = false;
+  let app;
+  try {
+    app = await startLocalCompanionServer({
+      environment: {},
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      homeDirectory: join(files.root, "home"),
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      accountingSourceMode: "unified",
+      codexSpeedBaseline: { readWindows: async () => [] },
+      unifiedProjectionReader: async (options) => {
+        projectionModes.push(options.mode);
+        if (options.mode === "full" && !fullRefreshRequested) {
+          throw new Error("startup_must_not_build_full_projection");
+        }
+        return readLocalUnifiedCompanionProjection(options);
+      },
+      refreshRunner: async () => ({}),
+      port: 0,
+    });
+    await app.snapshotReady;
+    const base = `http://127.0.0.1:${app.port}`;
+    assert.deepEqual(projectionModes, ["deferred"]);
+    const health = await fetch(`${base}/api/local/health`)
+      .then((response) => response.json());
+    assert.deepEqual(health.snapshot, { status: "ready", errorCode: null });
+    const response = await fetch(`${base}/api/local/overview`);
+    assert.equal(response.status, 200);
+    const overview = await response.json();
+    assert.equal(overview.accounting.generationMatched, false);
+    assert.equal(overview.accounting.projection.status, "unavailable");
+    assert.equal(
+      overview.accounting.projection.reason,
+      "local_unified_index_deferred",
+    );
+    assert.deepEqual(overview.timeline.usage, []);
+    assert.equal(overview.timeline.history.status, "loading");
+
+    fullRefreshRequested = true;
+    const started = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: "{}",
+    });
+    assert.equal(started.status, 202);
+    await waitFor(async () => {
+      const payload = await fetch(`${base}/api/local/refresh`)
+        .then((result) => result.json());
+      return payload.refresh.status === "succeeded";
+    });
+    assert.deepEqual(projectionModes, ["deferred", "full"]);
+  } finally {
     await app?.close();
     await rm(files.root, { recursive: true });
   }
@@ -2176,6 +2281,67 @@ test("server rejects forged hosts and requires same-origin refresh authorization
     });
     assert.equal(JSON.stringify(completed).includes("/Users/private"), false);
     assert.equal(store.reloads, 1);
+  } finally {
+    await app.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("loopback quick refresh is separately authorized and selects the quick controller mode", async () => {
+  const files = await fixture();
+  const store = fakeStore();
+  const modes = [];
+  const app = await startLocalCompanionServer({
+    resourceRoot: files.resourceRoot,
+    stateRoot: files.stateRoot,
+    codexHome: files.codexHome,
+    staticRoot: files.staticRoot,
+    dataStore: store,
+    refreshRunner: async ({ mode }) => {
+      modes.push(mode);
+      return {
+        rolloutRecordsWritten: 0,
+        filesDiscovered: 0,
+        quotaRefresh: {
+          attempted: true,
+          recordWritten: false,
+          errorCode: null,
+        },
+      };
+    },
+    port: 0,
+  });
+  try {
+    const base = `http://127.0.0.1:${app.port}`;
+    const unauthorized = await fetch(`${base}/api/local/refresh/quick`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(unauthorized.status, 403);
+
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Usage-Monitor-Local": "1",
+      Origin: base,
+    };
+    const started = await fetch(`${base}/api/local/refresh/quick`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ reason: "user_request" }),
+    });
+    assert.equal(started.status, 202);
+    await waitFor(async () => {
+      const status = await fetch(`${base}/api/local/refresh`)
+        .then((response) => response.json());
+      return status.refresh.status === "succeeded";
+    });
+    assert.deepEqual(modes, ["quick"]);
+    assert.equal(store.reloads, 1);
+    assert.equal(
+      (await fetch(`${base}/api/local/refresh/quick`)).status,
+      405,
+    );
   } finally {
     await app.close();
     await rm(files.root, { recursive: true });
@@ -3861,7 +4027,7 @@ test("a declined legacy Keychain migration is preserved and never routed to rese
     );
     assert.match(
       appSource,
-      /contribution_device_keychain_migration_required:[\s\S]{0,500}Quit and reopen TiboTattle[\s\S]{0,500}Do not reset or delete the credential/u,
+      /contribution_device_keychain_migration_required:[\s\S]{0,500}Settings… → General[\s\S]{0,500}Review migration… under Secure upgrade[\s\S]{0,500}Do not reset or delete the credential/u,
     );
   } finally {
     await app.close();

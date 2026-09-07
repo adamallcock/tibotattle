@@ -5,6 +5,15 @@ export {
 } from "./bounded-jsonl-reader.js";
 export { readBoundedDirectoryEntries } from "./bounded-directory-reader.js";
 export {
+  COMPRESSED_ROLLOUT_LIMITS,
+  compressedRolloutHandle,
+  inspectCompressedRollout,
+  isCompressedRolloutSource,
+  readCompressedRolloutBytes,
+  supportsCompressedRollouts,
+} from "./bounded-rollout-bytes.js";
+export { createTelemetryV11Envelope } from "./telemetry-v11-envelope.js";
+export {
   CODEX_CONFIG_RETAINED_KEYS,
   CODEX_CONFIG_SERVICE_TIER_STATUSES,
   readCodexConfigServiceTier,

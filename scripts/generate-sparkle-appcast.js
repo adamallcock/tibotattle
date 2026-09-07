@@ -80,7 +80,10 @@ import {
   compareAppleMacOSBundleVersions,
   isAppleMacOSBundleVersion,
 } from "./macos-bundle-version.js";
-import { resolveReleaseChannel } from "../config/release-channels.js";
+import {
+  normalizeReleaseArchitecture,
+  resolveReleaseChannel,
+} from "../config/release-channels.js";
 import { validateCandidateAppcastShape } from "./publish-sparkle-update.js";
 import { validateSignedSparkleFeed } from "./sparkle-signed-feed-validation.js";
 
@@ -382,10 +385,16 @@ async function readRetainedVersion(channelDirectory, name) {
 export async function discoverRetainedVersions({
   archiveRoot,
   channelName,
+  architecture = "arm64",
   candidateBundleVersion,
   maxDeltas,
 }) {
-  const channelDirectory = join(archiveRoot, channelName);
+  normalizeReleaseArchitecture(architecture);
+  // Keep legacy ARM archives in place; Intel can never prune or replace them.
+  const channelDirectory = join(
+    archiveRoot,
+    architecture === "x64" ? `${channelName}-x64` : channelName,
+  );
   const entries = await readdir(channelDirectory, { withFileTypes: true })
     .catch((error) => {
       if (error.code === "ENOENT") return null;
@@ -403,7 +412,12 @@ export async function discoverRetainedVersions({
         "SPARKLE_APPCAST_RETAINED_ARCHIVE_INVALID",
       );
     }
-    versions.push(await readRetainedVersion(channelDirectory, entry.name));
+    const retained = await readRetainedVersion(channelDirectory, entry.name);
+    if (normalizeReleaseArchitecture(retained.metadata.architecture) !== architecture
+        || retained.metadata.channel !== channelName) {
+      fail("Retained archive architecture/channel mismatch", "SPARKLE_APPCAST_RETAINED_ARCHIVE_INVALID");
+    }
+    versions.push(retained);
   }
   const priors = versions
     .filter((version) => compareBundleVersions(
@@ -427,11 +441,17 @@ export async function retainCandidateArchive({
   archiveRoot,
   bundleVersion,
   channelName,
+  architecture = "arm64",
   dmg,
   maxRetained,
   shortVersion,
 }) {
-  const channelDirectory = join(archiveRoot, channelName);
+  normalizeReleaseArchitecture(architecture);
+  // Keep legacy ARM archives in place; Intel can never prune or replace them.
+  const channelDirectory = join(
+    archiveRoot,
+    architecture === "x64" ? `${channelName}-x64` : channelName,
+  );
   const versionDirectory = join(channelDirectory, bundleVersion);
   const stagingDirectory = join(
     channelDirectory,
@@ -454,6 +474,7 @@ export async function retainCandidateArchive({
       appName,
       bundleVersion,
       channel: channelName,
+      architecture,
       dmg: { bytes: dmg.size, fileName: basename(dmg.path), sha256: dmg.sha256 },
       retainedAt: new Date().toISOString(),
       shortVersion: shortVersion ?? null,
@@ -554,6 +575,7 @@ async function generateOfficialSignedAppcast({
     // Ed25519 signature checks (feed envelope and DMG enclosure); named
     // failure codes explain exactly which property broke.
     const validated = validateSignedSparkleFeed({
+      architecture: channel.architecture,
       appcastText: text,
       dmg: {
         bytes: dmg.bytes,
@@ -592,7 +614,9 @@ async function generateOfficialSignedAppcast({
     }
     // Self-check with the exact validation the publisher applies, so a
     // generated appcast can never be shaped in a way the publisher rejects.
-    validateCandidateAppcastShape(text, channel.name);
+    validateCandidateAppcastShape(text, channel.name, {
+      architecture: channel.architecture,
+    });
     return Object.freeze({ bytes, validated });
   } finally {
     await rm(workRoot, { recursive: true, force: true });
@@ -645,6 +669,7 @@ ${deltasBlock}</item></channel></rss>
 export function parseGenerateSparkleAppcastArguments(argv) {
   const options = {
     account: null,
+    architecture: null,
     appPath: null,
     archiveRoot: null,
     bundleVersion: null,
@@ -662,6 +687,7 @@ export function parseGenerateSparkleAppcastArguments(argv) {
   };
   const flags = new Map([
     ["--account", "account"],
+    ["--architecture", "architecture"],
     ["--app", "appPath"],
     ["--archive-root", "archiveRoot"],
     ["--bundle-version", "bundleVersion"],
@@ -702,6 +728,7 @@ export function parseGenerateSparkleAppcastArguments(argv) {
       fail(`${flag} is required`);
     }
   }
+  options.architecture = normalizeReleaseArchitecture(options.architecture ?? "arm64");
   if (!isAppleMacOSBundleVersion(options.bundleVersion)) {
     fail("--bundle-version must be an Apple-compatible CFBundleVersion");
   }
@@ -740,7 +767,9 @@ export function parseGenerateSparkleAppcastArguments(argv) {
 }
 
 export async function generateSparkleAppcast(options) {
-  const channel = resolveReleaseChannel(options.channel);
+  const channel = resolveReleaseChannel(options.channel, {
+    architecture: options.architecture,
+  });
   const publicKey = importPublicEdKey(options.sparklePublicEdKey);
   await assertRealDirectory(options.appPath, "--app");
   if (!basename(options.appPath).endsWith(".app")) {
@@ -814,6 +843,7 @@ export async function generateSparkleAppcast(options) {
         archiveRoot: options.archiveRoot,
         bundleVersion: options.bundleVersion,
         channelName: channel.name,
+        architecture: channel.architecture,
         dmg,
         maxRetained: options.maxDeltas + 1,
         shortVersion: options.shortVersion,
@@ -822,6 +852,7 @@ export async function generateSparkleAppcast(options) {
     return Object.freeze({
       appcastPath: options.output,
       channel: channel.name,
+      architecture: channel.architecture,
       deltas: Object.freeze([]),
       feedSigned: true,
       full: Object.freeze({
@@ -863,6 +894,7 @@ export async function generateSparkleAppcast(options) {
     archiveRoot: options.archiveRoot,
     candidateBundleVersion: options.bundleVersion,
     channelName: channel.name,
+    architecture: channel.architecture,
     maxDeltas: options.maxDeltas,
   });
   if (!archiveState.available || archiveState.priors.length === 0) {
@@ -933,7 +965,9 @@ export async function generateSparkleAppcast(options) {
   });
   // Self-check with the exact validation the publisher applies, so a
   // generated appcast can never be shaped in a way the publisher rejects.
-  validateCandidateAppcastShape(appcast, channel.name);
+  validateCandidateAppcastShape(appcast, channel.name, {
+    architecture: channel.architecture,
+  });
   await writeFile(options.output, appcast);
 
   let retained = null;
@@ -943,6 +977,7 @@ export async function generateSparkleAppcast(options) {
       archiveRoot: options.archiveRoot,
       bundleVersion: options.bundleVersion,
       channelName: channel.name,
+      architecture: channel.architecture,
       dmg,
       maxRetained: options.maxDeltas + 1,
       shortVersion: options.shortVersion,

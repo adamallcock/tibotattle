@@ -69,6 +69,11 @@ function fakeController() {
       state = { ...state, paused: true, pausedReason: "device_disconnected", nextAttemptAt: null };
       return structuredClone(state);
     },
+    async pauseForDeviceRepair() {
+      state = { ...state, paused: true, pausedReason: "device_repair_required", nextAttemptAt: null };
+      return structuredClone(state);
+    },
+    async resumeAfterDeviceRepair() { return this.resume(); },
   };
 }
 

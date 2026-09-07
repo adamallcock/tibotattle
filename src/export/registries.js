@@ -1,20 +1,12 @@
-export const TELEMETRY_V01_REGISTRY_VERSION = "telemetry-v0.1-registry-2026-08-06.1";
-export const TELEMETRY_V01_REVIEWED_AT = "2026-08-06";
+import {
+  REVIEWED_CODEX_MODEL_IDS,
+  REVIEWED_CLAUDE_MODEL_IDS,
+} from "@app-usagemonitor/telemetry-contract";
 
-export const OPENAI_CODEX_MODEL_IDS = Object.freeze([
-  "codex-auto-review",
-  "gpt-4.1",
-  "gpt-5",
-  "gpt-5.3-codex-spark",
-  "gpt-5.4",
-  "gpt-5.4-mini",
-  "gpt-5.5",
-  "gpt-5.5-codex",
-  "gpt-5.6-luna",
-  "gpt-5.6-sol",
-  "gpt-5.6-sol-wm",
-  "gpt-5.6-terra",
-]);
+export const TELEMETRY_V01_REGISTRY_VERSION = "telemetry-v0.1-registry-2026-09-03.1";
+export const TELEMETRY_V01_REVIEWED_AT = "2026-09-03";
+
+export const OPENAI_CODEX_MODEL_IDS = REVIEWED_CODEX_MODEL_IDS;
 
 // Codex-emitted model identities that are reviewed and safe to display but
 // that OpenAI publishes no API price card for. They are deliberately kept
@@ -41,13 +33,7 @@ export const OPENAI_CODEX_LIMIT_IDS = Object.freeze([
   "codex-spark",
 ]);
 
-export const ANTHROPIC_CLAUDE_MODEL_IDS = Object.freeze([
-  "claude-fable-5",
-  "claude-haiku-4-5-20251001",
-  "claude-opus-4-8",
-  "claude-sonnet-4-6",
-  "claude-sonnet-5",
-]);
+export const ANTHROPIC_CLAUDE_MODEL_IDS = REVIEWED_CLAUDE_MODEL_IDS;
 
 export const EXPORT_DIAGNOSTIC_CODES = Object.freeze([
   "collector_empty_lines",

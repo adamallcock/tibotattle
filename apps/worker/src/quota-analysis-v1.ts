@@ -1,18 +1,24 @@
 import {
   MODEL_COMPOSITION_POLICY,
+  PLAN_ATTRIBUTION_POLICY,
   QUOTA_CALIBRATION_POLICY,
   SEVEN_DAY_WINDOW_MINUTES,
   analyzeQuotaCalibration,
+  buildPlanAttributionIndex,
   buildCompositionObservations,
   buildResetEvidence,
   calibrateCompositionCapacities,
   isSupportedQuotaWindowDuration,
+  planAttributionContextKey,
+  planEraForInterval,
 } from "@app-usagemonitor/quota-analysis";
 import type {
   CompositionFit,
   CompositionQuotaRow,
   CompositionUsageRow,
   PricingStatus,
+  PlanAttributionIndex,
+  PlanAttributionObservation,
   QuotaSlot,
   QuotaSnapshotInput,
   QuotaUsageEventInput,
@@ -22,6 +28,17 @@ import { sha256Hex } from "./crypto";
 import { priceTelemetryUsageEvent } from "./server-pricing";
 import { parseStoredRecordJson } from "./stored-record";
 import type { TelemetryUsageEvent } from "./telemetry-validation";
+import {
+  loadV1SourcePin,
+  assertV1SourcePinCurrent,
+  V1_SOURCE_SELECTION_METHOD_VERSION,
+  V1_WINNER_FILTER_SQL,
+} from "./telemetry-v1-source-selection";
+import type { V1SourcePin } from "./telemetry-v1-source-selection";
+
+/** Bump fit/composition caches whenever this adapter attribution changes. */
+export const V1_PLAN_ATTRIBUTION_ADAPTER_VERSION =
+  `${V1_SOURCE_SELECTION_METHOD_VERSION}:${PLAN_ATTRIBUTION_POLICY.methodVersion}:v1-era-buckets-2`;
 
 /**
  * Reset-fit analysis for the telemetry-contribution-v1.0 chunk corpus, computed
@@ -31,7 +48,7 @@ import type { TelemetryUsageEvent } from "./telemetry-validation";
  * This reproduces `accountScopedQuotaAnalysis` (quota-analysis.ts, the v0.2
  * path) in shape — the same seed/bucket/loop, the same MAX_CONTINUITY_TRACKS
  * gate, the same per-seed `buildResetEvidence` + `analyzeQuotaCalibration` from
- * the shared calibration package — and differs ONLY in two respects:
+ * the shared calibration package. Its acquisition differs in these respects:
  *
  *   1. Row source: the v1 current record view (`telemetry_v1_records`), read
  *      through the same per-(participant, day) winning-device dedupe the daily
@@ -40,10 +57,16 @@ import type { TelemetryUsageEvent } from "./telemetry-validation";
  *   2. Synthesized fields: v1 records carry no server pricing, track
  *      attribution, dataset, or receipt metadata, so those are derived here —
  *      pricing from the same `priceTelemetryUsageEvent` the v0.2 ingest uses
- *      (never a client-declared cost), attribution/receipt as deterministic
- *      synthetic values pinned to the participant. Events that do not fully
+ *      (never a client-declared cost), dataset/receipt as deterministic
+ *      synthetic values pinned to the participant. The synthetic account track
+ *      is a kernel placeholder, never evidence of a provider account. Events that do not fully
  *      price STAY in the bucket and correctly refuse their reset via
  *      `incomplete_server_pricing`; a price is never dropped or fabricated.
+ *   3. Plan attribution uses all admitted quota evidence, including short and
+ *      non-fitting windows, before any quota reduction. Usage is folded only
+ *      within a coherent conditional plan era; unresolved quantities refuse
+ *      their affected resets. Era fragments remain diagnostic until the shared
+ *      community collector applies its population gates and parent selection.
  *
  * SCALE (why this does not "load all rows then cap"): the owner's genuine dense
  * v1 corpus is ~1.22M records (a Codex rate_limits snapshot ~every 15s), which
@@ -58,7 +81,8 @@ import type { TelemetryUsageEvent } from "./telemetry-validation";
  *     trailing horizon snapped to whole reset cycles, pre-filters to the only
  *     track the consumer keeps (limit_id='codex', window=10080), drops reset
  *     groups the shared calibration always refuses (the fitable HAVING), and
- *     collapses each flat used_percent run to its endpoints via LAG/LEAD. A
+ *     collapses each flat used_percent run to its endpoints via indexed
+ *     predecessor/successor seeks. A
  *     boundary is emitted only on a strict used_percent increase and anchors
  *     lowerCost on the LAST row of the preceding run and upperCost on the FIRST
  *     row of the new run, so keeping both run endpoints is byte-identical for
@@ -93,10 +117,17 @@ const SEVEN_DAY_WINDOW_MS = SEVEN_DAY_WINDOW_MINUTES * 60_000;
 // participant (~4k downsampled) never approaches its cap; exceeding it means a
 // pathological count of distinct resets_at each sweeping the full percent range.
 export const MAX_DOWNSAMPLED_QUOTA_ROWS = 60_000;
+// Flat plan runs collapse to endpoints before entering JS. This includes quota
+// observations that cannot fit a reset, so a one-row foreign plan is not lost.
+export const MAX_PLAN_ATTRIBUTION_ROWS = 120_000;
 // Running counter across usage pages (observed heaviest ~306k/100d; the local
 // miner's ceiling is 750k/stream).
 export const MAX_WINDOWED_USAGE_ROWS = 1_000_000;
+const MAX_SESSION_INTERVAL_SCOPES = 100_000;
 const USAGE_PAGE_SIZE = 5_000;
+// Same synthetic-row bound enforced by the quota-tracks kernel and v1.1
+// adapter. Refuse explicitly here rather than throw on an invalid folded row.
+const MAX_SCALAR_BUCKET_COST_NANOUSD = 90_000_000_000_000;
 // Identical purpose to the v0.2 path: reject a high-cardinality corpus before
 // any per-track analysis rather than let distinct-seed count multiply the cost.
 const MAX_CONTINUITY_TRACKS = 256;
@@ -141,12 +172,23 @@ interface DownsampledQuotaRow {
   used_percent: number;
   window_duration_minutes: number;
   resets_at: string;
+  plan_era_key: string;
+}
+
+interface PlanEvidenceRow {
+  observed_at: string;
+  provider: string;
+  limit_id: string;
+  plan_type: string | null;
+  plan_variant: string | null;
 }
 
 interface WindowedUsageRow {
   id: number;
+  occurrence_id: string;
   observed_at: string;
   provider: string;
+  session_uuid: string | null;
   record_json: string;
 }
 
@@ -156,6 +198,7 @@ interface ReferenceRecordRowV1 {
   occurrence_id: string;
   observed_at: string;
   provider: string;
+  session_uuid: string | null;
   plan_type: string | null;
   plan_variant: string | null;
   limit_id: string | null;
@@ -180,13 +223,22 @@ interface RawQuotaRow {
   resets_at: string | null;
 }
 
-// Usage events are matched to a track by the subset the per-track usage filter
-// uses: account track, provider, and policy epoch. Plan/limit fields are
-// stamped from the seed, not the row.
+// v1 has no usage plan/account fields. Its conditional plan era is assigned
+// before cost reduction; seed fields are stamped ONLY onto that era's usage.
 type UsageEventPartial = Omit<
   QuotaUsageEventInput,
   "planType" | "planVariant" | "limitId"
 >;
+
+interface AttributedUsageEventPartial extends UsageEventPartial {
+  contextKey: string;
+  planEraKey: string | null;
+  attribution: "legacy_conditional" | "unresolved";
+}
+
+interface AttributedQuotaSnapshot extends QuotaSnapshotInput {
+  planEraKey: string;
+}
 
 interface TrackSeed {
   accountTrackId: string;
@@ -196,6 +248,7 @@ interface TrackSeed {
   limitId: string;
   windowDurationMinutes: number;
   policyEpoch: string;
+  planEraKey: string;
 }
 
 /** Tuning knobs; production uses the defaults, tests pin them for determinism. */
@@ -206,6 +259,8 @@ export interface V1AnalysisOptions {
   maxDownsampledQuotaRows?: number;
   /** Override the windowed-usage-row cap (tests exercise the bail cheaply). */
   maxWindowedUsageRows?: number;
+  /** Reuse the collector's exact day/device vector; never re-elect mid-read. */
+  sourcePin?: V1SourcePin;
 }
 
 function notTestable(reason: string): object {
@@ -226,6 +281,7 @@ function seedKey(row: TrackSeed): string {
     row.limitId,
     row.windowDurationMinutes,
     row.policyEpoch,
+    row.planEraKey,
   ]);
 }
 
@@ -320,7 +376,7 @@ function buildPricingEvent(
  * semantics); a record it can shape but not fully price returns its
  * (0-cost, partially_priced/unpriced) result so the reset correctly refuses.
  */
-function priceV1UsageRecord(
+export function priceChunkUsageRecord(
   recordJson: string,
   observedAt: string,
 ): { costNanousd: number; pricingStatus: PricingStatus; modelId: string | null } | null {
@@ -402,92 +458,73 @@ async function v1AccountTrackId(
   return `account-track:v1:${await sha256Hex(`${participantId}|${provider}`)}`;
 }
 
-// The winning-device dedupe the daily aggregates use: per (participant, day),
-// count only the records of the device whose current chunks are freshest
-// (newest created_at, tiebreak larger device_id). Considers BOTH streams so the
-// same winner is chosen for the quota and usage reads.
-const WINNING_DEVICE_CTE = `
-  WITH day_device_evidence AS (
-    SELECT r.observed_day AS observed_day,
-           r.device_id AS device_id,
-           MAX(c.created_at) AS newest
-      FROM telemetry_v1_records r
-      JOIN telemetry_v1_chunks c ON c.id = r.chunk_row_id
-     WHERE r.participant_id = ?1
-       AND r.stream IN ('usage', 'quota')
-     GROUP BY r.observed_day, r.device_id
-  ),
-  winning_devices AS (
-    SELECT observed_day, device_id
-      FROM day_device_evidence winner
-     WHERE NOT EXISTS (
-       SELECT 1 FROM day_device_evidence rival
-        WHERE rival.observed_day = winner.observed_day
-          AND (
-            rival.newest > winner.newest
-            OR (
-              rival.newest = winner.newest
-              AND rival.device_id > winner.device_id
-            )
-          )
-     )
-  )`;
+const WINNER_FILTER_SQL = V1_WINNER_FILTER_SQL;
 
-interface WinningDeviceRow {
-  observed_day: string;
-  device_id: string;
+// All admitted Codex-family quota evidence, before duration, reset, span, and
+// fitability gates. Distinct equal-time contradictory labels BOTH survive.
+// Adjacent equal-plan runs need only their first/last anchors for the index.
+const PLAN_EVIDENCE_SQL = `WITH plan_times AS MATERIALIZED (
+  SELECT DISTINCT r.observed_at, r.provider, r.limit_id,
+    COALESCE(r.plan_type, 'unknown') AS plan_type,
+    COALESCE(r.plan_variant, 'unknown') AS plan_variant
+  FROM telemetry_v1_records r
+  JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
+  WHERE ${WINNER_FILTER_SQL} AND r.participant_id = ?
+    AND r.stream = 'quota' AND r.observed_at >= ? AND r.limit_id = 'codex'
+), marked AS (
+  SELECT *, LAG(plan_type || '|' || plan_variant) OVER win AS prior_plan,
+    LEAD(plan_type || '|' || plan_variant) OVER win AS next_plan
+  FROM plan_times
+  WINDOW win AS (PARTITION BY provider, limit_id ORDER BY observed_at, plan_type, plan_variant)
+)
+SELECT observed_at, provider, limit_id, plan_type, plan_variant FROM marked
+WHERE prior_plan IS NULL OR next_plan IS NULL
+  OR plan_type || '|' || plan_variant <> prior_plan
+  OR plan_type || '|' || plan_variant <> next_plan
+ORDER BY provider, limit_id, observed_at, plan_type, plan_variant LIMIT ?`;
+
+function planObservation(row: PlanEvidenceRow): PlanAttributionObservation | null {
+  if (!SAFE_TOKEN.test(row.provider) || !SAFE_TOKEN.test(row.limit_id)) return null;
+  return {
+    contextKey: planAttributionContextKey(row.provider, row.limit_id),
+    observedAtMs: Date.parse(row.observed_at),
+    planType: row.plan_type, planVariant: row.plan_variant ?? "unknown",
+    // v1 does not carry comparable account evidence. Keep this honest lane.
+    accountScopeId: null,
+  };
 }
 
-/**
- * Resolve the winning (observed_day, device_id) set ONCE per analysis.
- *
- * The reads below inject this as a literal VALUES table instead of recomputing
- * WINNING_DEVICE_CTE inline. The old inline form re-scanned the participant's
- * whole record partition on the quota downsample AND on every usage page
- * (~1 page per 5k events), so at the owner's ~1.22M-record scale one analysis
- * read hundreds of millions of rows and never finished inside the per-minute
- * cron. Resolving it once (a single corpus scan) and threading a ~tens-of-rows
- * VALUES table keeps every downstream `JOIN winning_devices` byte-identical
- * while the per-read queries become indexed range scans.
- */
-async function loadWinningDevices(
-  db: D1Database,
-  participantId: string,
-): Promise<WinningDeviceRow[]> {
-  const result = await db.prepare(
-    `${WINNING_DEVICE_CTE}
-     SELECT observed_day, device_id FROM winning_devices`,
-  ).bind(participantId).all<WinningDeviceRow>();
-  return result.results;
+async function loadPlanAttributionIndex(
+  db: D1Database, participantId: string, winnersJson: string, observedAtCutoff: string,
+): Promise<PlanAttributionIndex | null> {
+  const result = await db.prepare(PLAN_EVIDENCE_SQL)
+    .bind(winnersJson, participantId, observedAtCutoff, MAX_PLAN_ATTRIBUTION_ROWS + 1)
+    .all<PlanEvidenceRow>();
+  if (result.results.length > MAX_PLAN_ATTRIBUTION_ROWS) return null;
+  const index = buildPlanAttributionIndex(result.results.map(planObservation));
+  return index.status === "ready" ? index : null;
 }
 
-/**
- * Serialize the winner set to a single JSON array of `[observed_day, device_id]`
- * pairs, bound as ONE parameter and expanded back to rows with `json_each` in
- * the winner filter (see WINNER_FILTER_SQL).
- *
- * One JSON parameter rather than a `VALUES (?,?),…` list on purpose: D1 caps a
- * query at ~100 bound parameters, and a real corpus resolves to ~90 winning
- * days = ~180 binds, which overflows that cap and throws. json_each takes the
- * whole set as a single string, so the bind count is fixed regardless of how
- * many winning days a participant has.
- */
-function winnersJson(winners: WinningDeviceRow[]): string {
-  return JSON.stringify(winners.map((w) => [w.observed_day, w.device_id]));
+function eraMarkersJson(index: PlanAttributionIndex): string {
+  return JSON.stringify(index.eras.map((era, ordinal) => {
+    const [provider, limitId] = era.contextKey.split("|");
+    return [provider, limitId, era.planType, era.planVariant, era.eraKey,
+      era.lowerBoundMs === null ? "" : new Date(era.lowerBoundMs).toISOString(),
+      era.upperBoundMs === null ? null : new Date(era.upperBoundMs).toISOString(), ordinal + 1];
+  }));
 }
 
-// The winner filter shared by the quota and usage reads: keep only rows whose
-// (observed_day, device_id) is a winning pair. A row-value IN over a json_each
-// subquery, NOT a JOIN on a VALUES table — measured against the owner's corpus,
-// `JOIN winning_devices(VALUES …)` was a 453k×N nested loop (SQLite does not
-// auto-index it), whereas this evaluates per row after the observed_at index
-// range scan. Byte-identical to the JOIN because winner pairs are distinct (one
-// device per day), so neither multiplies rows. Binds one parameter: winnersJson.
-const WINNER_FILTER_SQL =
-  `(r.observed_day, r.device_id) IN (
-     SELECT json_extract(je.value, '$[0]'), json_extract(je.value, '$[1]')
-       FROM json_each(?) je
-   )`;
+function attributeSnapshot(
+  snapshot: QuotaSnapshotInput, index: PlanAttributionIndex,
+): AttributedQuotaSnapshot | null {
+  const match = planEraForInterval(index, {
+    contextKey: planAttributionContextKey(snapshot.provider, snapshot.limitId),
+    observedAtMs: Date.parse(snapshot.observedAt),
+  });
+  return match.status === "matched" && match.era.planType === snapshot.planType
+      && match.era.planVariant === snapshot.planVariant
+    ? { ...snapshot, planEraKey: match.era.eraKey } : null;
+}
 
 /**
  * Windowed run-endpoint quota downsample.
@@ -497,101 +534,148 @@ const WINNER_FILTER_SQL =
  * window) includes a reset only when its ENTIRE first..last series is within the
  * window, so a cycle straddling the cutoff is excluded wholesale rather than
  * read partially and mis-fit. The fitable HAVING drops reset groups the shared
- * calibration always refuses; the LAG/LEAD collapse keeps every row that differs
+ * calibration always refuses; the neighbor collapse keeps every row that differs
  * from its predecessor OR successor — the first and last row of every flat
  * used_percent run — because a boundary anchors lowerCost on the last row of the
  * preceding run and upperCost on the first row of the new run. The partition
  * INCLUDES slot (an eligible multi-slot reset has time-disjoint slots); the
  * fitable GROUP BY EXCLUDES slot (= the shared resetKey).
  */
-// Binds (in order): winnersJson, participantId, observedAt cutoff, resetsAt
-// cutoff, window minutes, minimum boundaries, minimum span, row limit. Anonymous
-// `?` because the leading json_each winner filter binds one parameter and fixed
-// numbering across the CTE chain buys nothing. `scoped` is MATERIALIZED so its
-// winner-filtered index scan runs once rather than being re-evaluated by both
-// `fitable` and `survivors`.
-const QUOTA_DOWNSAMPLE_SQL = `WITH scoped AS MATERIALIZED (
-    SELECT r.occurrence_id AS occurrence_id,
-           r.observed_at AS observed_at,
-           r.provider AS provider,
-           r.plan_type AS plan_type,
-           r.plan_variant AS plan_variant,
-           r.limit_id AS limit_id,
-           r.slot AS slot,
-           r.used_percent AS used_percent,
-           r.window_duration_minutes AS window_duration_minutes,
-           r.resets_at AS resets_at,
-           r.id AS id
-      FROM telemetry_v1_records r
+const QUOTA_WINNER_FILTER_SQL = WINNER_FILTER_SQL.replace("?", "?2");
+
+// The tuple (time,id) predecessor/successor must use two explicit seeks, just
+// like the usage cursor below. Looking within the tied timestamp first preserves
+// rowid order; only an absent neighbor advances to the adjacent time. The other
+// partition fields and the exact winner/era bounds must also match. Every
+// accepted percentage is nonnegative, so -1 denotes an absent neighbor without
+// becoming a retained value or confusing a genuine zero-percent endpoint.
+function quotaNeighborSql(previous: boolean): string {
+  const comparison = previous ? "<" : ">";
+  const direction = previous ? "DESC" : "ASC";
+  const select = (sameTime: boolean) => `(SELECT n.used_percent FROM telemetry_v1_records n
+      INDEXED BY telemetry_v1_records_participant_stream_observed
+    WHERE n.participant_id = r.participant_id AND n.stream = 'quota'
+      AND ${sameTime ? `n.observed_at = r.observed_at AND n.id ${comparison} r.id` : `n.observed_at ${comparison} r.observed_at`}
+      AND n.observed_at >= MAX(?4, e.lower_bound)
+      AND n.observed_at <= COALESCE(e.upper_bound, '9999-12-31T23:59:59.999Z')
+      AND n.provider = r.provider AND n.limit_id = r.limit_id
+      AND n.plan_type = r.plan_type AND n.plan_variant = r.plan_variant
+      AND n.window_duration_minutes = r.window_duration_minutes
+      AND n.resets_at = r.resets_at AND n.slot = r.slot
+      AND n.used_percent IS NOT NULL AND ${QUOTA_WINNER_FILTER_SQL.replaceAll("r.", "n.")}
+    ORDER BY ${sameTime ? "" : `n.observed_at ${direction}, `}n.id ${direction} LIMIT 1)`;
+  return `COALESCE(${select(true)}, ${select(false)}, -1)`;
+}
+
+// Binds (in order): era markers JSON, winnersJson, participantId, observedAt
+// cutoff, resetsAt cutoff, window minutes, minimum boundaries, minimum span,
+// row limit. Numbered parameters reuse the same winner and cutoff bindings in
+// all four neighbor seeks. Plan-era bounds are disjoint within each
+// provider/limit context, including conflict gaps. Seek through deployed 0036;
+// no dense marker-stream table, partition sorter, or window spool is needed.
+// Materialize endpoints BEFORE reset eligibility: collapse preserves every
+// distinct percentage and extremum, so the same slot-independent gates commute
+// with this slot-partitioned reduction. Hydrate wide rows only after the cap.
+// NOT MATERIALIZED prevents retaining the dense per-record neighbor results;
+// the owning query-plan test forbids a sort/materialization before endpoints.
+export const QUOTA_DOWNSAMPLE_SQL = `WITH era_markers AS MATERIALIZED (
+    SELECT json_extract(e.value, '$[0]') AS provider,
+      json_extract(e.value, '$[1]') AS limit_id,
+      json_extract(e.value, '$[2]') AS plan_type,
+      json_extract(e.value, '$[3]') AS plan_variant,
+      json_extract(e.value, '$[4]') AS plan_era_key,
+      json_extract(e.value, '$[5]') AS lower_bound,
+      json_extract(e.value, '$[6]') AS upper_bound,
+      json_extract(e.value, '$[7]') AS era_ordinal
+    FROM json_each(?1) e
+  ), marked AS NOT MATERIALIZED (
+    SELECT r.id, r.observed_at, r.resets_at, r.used_percent, e.era_ordinal,
+           ${quotaNeighborSql(true)} AS prev_up,
+           ${quotaNeighborSql(false)} AS next_up
+      FROM era_markers e
+      CROSS JOIN telemetry_v1_records r INDEXED BY telemetry_v1_records_participant_stream_observed
       JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-     WHERE ${WINNER_FILTER_SQL}
-       AND r.participant_id = ?
+     WHERE ${QUOTA_WINNER_FILTER_SQL}
+       AND r.participant_id = ?3
        AND r.stream = 'quota'
-       AND r.observed_at >= ?
-       AND r.resets_at >= ?
+       AND r.observed_at >= MAX(?4, e.lower_bound)
+       AND r.resets_at >= ?5
        AND r.limit_id = 'codex'
-       AND r.window_duration_minutes = ?
+       AND r.window_duration_minutes = ?6
        AND r.resets_at IS NOT NULL
        AND r.slot IS NOT NULL
        AND r.used_percent IS NOT NULL
        AND r.plan_type IS NOT NULL
        AND r.plan_variant IS NOT NULL
-  ),
-  fitable AS (
-    SELECT provider, plan_type, plan_variant, limit_id,
-           window_duration_minutes, resets_at
-      FROM scoped
-     GROUP BY provider, plan_type, plan_variant, limit_id,
-              window_duration_minutes, resets_at
-    HAVING COUNT(DISTINCT used_percent) >= ?
-       AND (MAX(used_percent) - MIN(used_percent)) >= ?
-  ),
-  survivors AS (
-    SELECT s.*
-      FROM scoped s
-      JOIN fitable f
-        ON f.provider = s.provider
-       AND f.plan_type = s.plan_type
-       AND f.plan_variant = s.plan_variant
-       AND f.limit_id = s.limit_id
-       AND f.window_duration_minutes = s.window_duration_minutes
-       AND f.resets_at = s.resets_at
-  ),
-  marked AS (
-    SELECT survivors.*,
-           LAG(used_percent) OVER win AS prev_up,
-           LEAD(used_percent) OVER win AS next_up
-      FROM survivors
-    WINDOW win AS (
-      PARTITION BY provider, plan_type, plan_variant, limit_id,
-                   window_duration_minutes, resets_at, slot
-      ORDER BY observed_at, id
-    )
+       AND r.provider = e.provider AND r.limit_id = e.limit_id
+       AND r.plan_type = e.plan_type AND r.plan_variant = e.plan_variant
+       -- Accepted v1 anchors have canonical four-digit-year chunk days. A
+       -- finite open-era bound preserves that domain and makes BOTH ends seekable.
+       AND r.observed_at <= COALESCE(e.upper_bound, '9999-12-31T23:59:59.999Z')
+  ), endpoints AS MATERIALIZED (
+    SELECT id, observed_at, resets_at, used_percent, era_ordinal
+      FROM marked
+     WHERE used_percent <> prev_up OR used_percent <> next_up
+  ), fitable AS (
+    SELECT era_ordinal, resets_at FROM endpoints
+     GROUP BY era_ordinal, resets_at
+    HAVING COUNT(DISTINCT used_percent) >= ?7
+       AND MAX(used_percent) - MIN(used_percent) >= ?8
+  ), selected AS (
+    SELECT s.id, s.observed_at, s.era_ordinal FROM endpoints s
+      JOIN fitable f ON f.era_ordinal = s.era_ordinal AND f.resets_at = s.resets_at
+     ORDER BY s.observed_at, s.id
+     LIMIT ?9
   )
-  SELECT occurrence_id, observed_at, provider, plan_type, plan_variant,
-         limit_id, slot, used_percent, window_duration_minutes, resets_at
-    FROM marked
-   WHERE prev_up IS NULL
-      OR next_up IS NULL
-      OR used_percent <> prev_up
-      OR used_percent <> next_up
-   ORDER BY observed_at, id
-   LIMIT ?`;
+  SELECT r.occurrence_id, r.observed_at, r.provider, r.plan_type, r.plan_variant,
+         r.limit_id, r.slot, r.used_percent, r.window_duration_minutes, r.resets_at,
+         e.plan_era_key
+    FROM selected s JOIN telemetry_v1_records r ON r.id = s.id
+    JOIN era_markers e ON e.era_ordinal = s.era_ordinal
+   ORDER BY s.observed_at, s.id`;
 
-// Binds (in order): winnersJson, participantId, observedAt cutoff, keyset cursor
-// observed_at (twice — the `>` and `=` legs), keyset cursor id, page size.
-const USAGE_PAGE_SQL = `
-  SELECT r.id AS id, r.observed_at AS observed_at, r.provider AS provider,
-         r.record_json AS record_json
-    FROM telemetry_v1_records r
+// The already-deployed 0036 index has implicit rowid (= id) as its last key.
+// D1 does not seek that suffix through a row-value (time,id) predicate, but
+// DOES seek it after three explicit equalities. Drain the current timestamp
+// first, then advance time. Neither seek rescans the original window prefix
+// or sorts a potentially unbounded equal-time run. INDEXED BY makes the
+// required bounded access path explicit even where a newer index is present.
+const V1_USAGE_PAGE_SELECT_SQL = `
+  SELECT r.id AS id, r.occurrence_id AS occurrence_id,
+         r.observed_at AS observed_at, r.provider AS provider,
+         r.session_uuid AS session_uuid, r.record_json AS record_json
+    FROM telemetry_v1_records r INDEXED BY telemetry_v1_records_participant_stream_observed
     JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
    WHERE ${WINNER_FILTER_SQL}
      AND r.participant_id = ?
-     AND r.stream = 'usage'
-     AND r.observed_at >= ?
-     AND (r.observed_at > ? OR (r.observed_at = ? AND r.id > ?))
+     AND r.stream = 'usage'`;
+
+// Binds: winnersJson, participantId, cursor time, cursor id, page size.
+export const V1_USAGE_PAGE_AT_TIME_SQL = `${V1_USAGE_PAGE_SELECT_SQL}
+     AND r.observed_at = ? AND r.id > ?
+   ORDER BY r.id
+   LIMIT ?`;
+
+// Binds: winnersJson, participantId, cursor time, remaining page size.
+export const V1_USAGE_PAGE_AFTER_TIME_SQL = `${V1_USAGE_PAGE_SELECT_SQL}
+     AND r.observed_at > ?
    ORDER BY r.observed_at, r.id
    LIMIT ?`;
+
+/** Shared page/cursor contract for both scalar and model-composition readers. */
+export async function readV1UsagePage(
+  db: D1Database, winnersJson: string, participantId: string,
+  cursorObservedAt: string, cursorId: number, pageSize: number,
+): Promise<WindowedUsageRow[]> {
+  const sameTime = await db.prepare(V1_USAGE_PAGE_AT_TIME_SQL)
+    .bind(winnersJson, participantId, cursorObservedAt, cursorId, pageSize)
+    .all<WindowedUsageRow>();
+  if (sameTime.results.length === pageSize) return sameTime.results;
+  const later = await db.prepare(V1_USAGE_PAGE_AFTER_TIME_SQL)
+    .bind(winnersJson, participantId, cursorObservedAt, pageSize - sameTime.results.length)
+    .all<WindowedUsageRow>();
+  return sameTime.results.concat(later.results);
+}
 
 interface ProviderGrid {
   sortedMs: number[];
@@ -657,9 +741,9 @@ async function readAndBucketUsage(
   accountTrackByProvider: Map<string, string>,
   gridByProvider: Map<string, ProviderGrid>,
   maxWindowedUsageRows: number,
-  winners: WinningDeviceRow[],
-): Promise<UsageEventPartial[] | "limit_exceeded"> {
-  const winnersJsonArg = winnersJson(winners);
+  winnersJsonArg: string,
+  attributionIndex: PlanAttributionIndex,
+): Promise<AttributedUsageEventPartial[] | "limit_exceeded" | "session_scope_limit_exceeded" | "cost_limit_exceeded"> {
   // Per provider: strictly-interior events keyed by their ceiling grid instant,
   // and grid-exact events kept as their own singleton at that instant (the
   // matchedUsage lower bound is inclusive, so a grid-exact event that equals a
@@ -667,95 +751,138 @@ async function readAndBucketUsage(
   // are not — the singleton-split preserves that distinction).
   const buckets = new Map<string, Map<number, BucketAccumulator>>();
   const singletons = new Map<string, Map<number, BucketAccumulator>>();
+  const bucketScopes = new Map<string, { provider: string; planEraKey: string | null }>();
+  const priorSessionTimes = new Map<string, number>();
+
+  // Physical reads now use id within a timestamp, while the attribution
+  // contract uses occurrence order. Only the minimum occurrence for a session
+  // can inherit its earlier interval; every other tie has interval [t,t].
+  // Retain that one compact candidate, not the raw JSON or the whole tie run.
+  // priorSessionTimes includes pending sessions, so its existing cap bounds
+  // the UNION of both maps rather than permitting a second set of 100k scopes.
+  interface UsagePoint {
+    provider: string;
+    observedAtMs: number;
+    priced: ReturnType<typeof priceChunkUsageRecord>;
+  }
+  const pendingFirst = new Map<string, {
+    occurrenceId: string;
+    intervalStartMs: number | undefined;
+    point: UsagePoint;
+  }>();
+  let pendingObservedAt: string | null = null;
+  let costLimitExceeded = false;
+
+  const foldPoint = (point: UsagePoint, intervalStartMs: number | undefined): void => {
+    const { provider, observedAtMs: eMs, priced } = point;
+    if (priced === null) return;
+    const grid = gridByProvider.get(provider);
+    if (!grid || grid.sortedMs.length === 0 || eMs > grid.sortedMs[grid.sortedMs.length - 1]!) return;
+    const match = planEraForInterval(attributionIndex, {
+      contextKey: planAttributionContextKey(provider, "codex"), observedAtMs: eMs, intervalStartMs,
+    });
+    const planEraKey = match.status === "matched" ? match.era.eraKey : null;
+    const bucketKey = JSON.stringify([provider, planEraKey]);
+    bucketScopes.set(bucketKey, { provider, planEraKey });
+    const fullyPriced = priced.pricingStatus === "fully_priced";
+    const gridExact = grid.set.has(eMs);
+    const placement = gridExact ? eMs : ceilingGrid(grid.sortedMs, eMs);
+    if (placement === null) return;
+    const target = gridExact ? singletons : buckets;
+    const providerBuckets = target.get(bucketKey) ?? new Map<number, BucketAccumulator>();
+    const existing = providerBuckets.get(placement);
+    const validCost = Number.isSafeInteger(priced.costNanousd) && priced.costNanousd >= 0;
+    if (!validCost || priced.costNanousd > MAX_SCALAR_BUCKET_COST_NANOUSD - (existing?.costNanousd ?? 0)) {
+      // Partial pricing is not a permission to omit/truncate an overflowing
+      // scalar bucket: the kernel validates cost before its pricing refusal.
+      costLimitExceeded = true;
+      return;
+    }
+    if (existing) {
+      existing.costNanousd += priced.costNanousd;
+      existing.allFullyPriced = existing.allFullyPriced && fullyPriced;
+      // Keep the latest constituent strictly below its ceiling grid point.
+      existing.placementMs = Math.max(existing.placementMs, eMs);
+    } else {
+      providerBuckets.set(placement, {
+        costNanousd: priced.costNanousd, allFullyPriced: fullyPriced, placementMs: eMs,
+      });
+    }
+    target.set(bucketKey, providerBuckets);
+  };
+
+  const flushFirst = (): void => {
+    for (const candidate of pendingFirst.values()) foldPoint(candidate.point, candidate.intervalStartMs);
+    pendingFirst.clear();
+  };
 
   let total = 0;
   let cursorObs = observedAtCutoff;
   let cursorId = 0;
   for (;;) {
-    const page = await db.prepare(USAGE_PAGE_SQL)
-      .bind(
-        winnersJsonArg,
-        participantId,
-        observedAtCutoff,
-        cursorObs,
-        cursorObs,
-        cursorId,
-        USAGE_PAGE_SIZE,
-      )
-      .all<WindowedUsageRow>();
-    const rows = page.results;
+    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) return "limit_exceeded";
     for (const row of rows) {
       if (!SAFE_TOKEN.test(row.provider)) continue;
-      const grid = gridByProvider.get(row.provider);
-      if (!grid || grid.sortedMs.length === 0) continue;
       const eMs = Date.parse(row.observed_at);
       if (!Number.isFinite(eMs)) continue;
-      // Events after the last retained quota instant cannot enter any reset's
-      // matched window (matchedUsage requires observedAt <= lastObserved <=
-      // maxG), so they change no fit — drop them.
-      if (eMs > grid.sortedMs[grid.sortedMs.length - 1]!) continue;
-      const priced = priceV1UsageRecord(row.record_json, row.observed_at);
-      if (priced === null) continue;
-      const fullyPriced = priced.pricingStatus === "fully_priced";
-      if (grid.set.has(eMs)) {
-        const providerSingletons = singletons.get(row.provider)
-          ?? new Map<number, BucketAccumulator>();
-        const existing = providerSingletons.get(eMs);
-        if (existing) {
-          existing.costNanousd += priced.costNanousd;
-          existing.allFullyPriced = existing.allFullyPriced && fullyPriced;
-        } else {
-          providerSingletons.set(eMs, {
-            costNanousd: priced.costNanousd,
-            allFullyPriced: fullyPriced,
-            placementMs: eMs,
-          });
-        }
-        singletons.set(row.provider, providerSingletons);
-        continue;
+      if (pendingObservedAt !== row.observed_at) {
+        flushFirst();
+        pendingObservedAt = row.observed_at;
       }
-      const qc = ceilingGrid(grid.sortedMs, eMs);
-      if (qc === null) continue;
-      const providerBuckets = buckets.get(row.provider)
-        ?? new Map<number, BucketAccumulator>();
-      const existing = providerBuckets.get(qc);
-      if (existing) {
-        existing.costNanousd += priced.costNanousd;
-        existing.allFullyPriced = existing.allFullyPriced && fullyPriced;
-        // Place the synthetic at the MAX constituent observed_at (< qc), so it
-        // sits strictly between the previous grid point and qc.
-        existing.placementMs = Math.max(existing.placementMs, eMs);
+      // v1 has no quantity-basis field. A prior usage record in the SAME
+      // session gives a conservative interval bound, never account proof.
+      const sessionKey = row.session_uuid === null ? null
+        : JSON.stringify([row.provider, row.session_uuid]);
+      if (sessionKey !== null && !priorSessionTimes.has(sessionKey)
+          && priorSessionTimes.size >= MAX_SESSION_INTERVAL_SCOPES) {
+        return "session_scope_limit_exceeded";
+      }
+      const grid = gridByProvider.get(row.provider);
+      const point: UsagePoint = { provider: row.provider, observedAtMs: eMs,
+        priced: !grid || grid.sortedMs.length === 0 || eMs > grid.sortedMs[grid.sortedMs.length - 1]!
+          ? null : priceChunkUsageRecord(row.record_json, row.observed_at) };
+      if (sessionKey === null) {
+        foldPoint(point, undefined);
       } else {
-        providerBuckets.set(qc, {
-          costNanousd: priced.costNanousd,
-          allFullyPriced: fullyPriced,
-          placementMs: eMs,
-        });
+        const candidate = pendingFirst.get(sessionKey);
+        if (!candidate) {
+          pendingFirst.set(sessionKey, { occurrenceId: row.occurrence_id,
+            intervalStartMs: priorSessionTimes.get(sessionKey), point });
+          // Includes DROP/grid-ineligible candidates: the original clock
+          // advanced before those filters. Null sessions never share a clock.
+          priorSessionTimes.set(sessionKey, eMs);
+        } else if (row.occurrence_id < candidate.occurrenceId) {
+          foldPoint(candidate.point, eMs);
+          candidate.occurrenceId = row.occurrence_id;
+          candidate.point = point;
+        } else {
+          foldPoint(point, eMs);
+        }
       }
-      buckets.set(row.provider, providerBuckets);
     }
     if (rows.length < USAGE_PAGE_SIZE) break;
     const last = rows[rows.length - 1]!;
     cursorObs = last.observed_at;
     cursorId = last.id;
   }
+  flushFirst();
+  if (costLimitExceeded) return "cost_limit_exceeded";
 
-  const usageEvents: UsageEventPartial[] = [];
-  const providers = new Set<string>([...buckets.keys(), ...singletons.keys()]);
-  for (const provider of providers) {
+  const usageEvents: AttributedUsageEventPartial[] = [];
+  for (const [bucketKey, { provider, planEraKey }] of bucketScopes) {
     const accountTrackId = accountTrackByProvider.get(provider);
     if (accountTrackId === undefined) continue;
-    for (const [gridMs, acc] of singletons.get(provider) ?? []) {
+    for (const [gridMs, acc] of singletons.get(bucketKey) ?? []) {
       usageEvents.push(await synthUsageRow(
-        accountTrackId, datasetId, provider, acc, `s|${gridMs}`,
+        accountTrackId, datasetId, provider, acc, `s|${gridMs}|${planEraKey}`, planEraKey,
       ));
     }
-    for (const [qcMs, acc] of buckets.get(provider) ?? []) {
+    for (const [qcMs, acc] of buckets.get(bucketKey) ?? []) {
       usageEvents.push(await synthUsageRow(
-        accountTrackId, datasetId, provider, acc, `b|${qcMs}`,
+        accountTrackId, datasetId, provider, acc, `b|${qcMs}|${planEraKey}`, planEraKey,
       ));
     }
   }
@@ -768,7 +895,8 @@ async function synthUsageRow(
   provider: string,
   acc: BucketAccumulator,
   anchor: string,
-): Promise<UsageEventPartial> {
+  planEraKey: string | null,
+): Promise<AttributedUsageEventPartial> {
   // The eventId is a synthetic OPAQUE_ID over (track|kind|anchor): hundreds of
   // hashes instead of the ~306k per-event hashes the old path computed. The
   // kind prefix (s = grid-exact singleton, b = interior bucket) keeps a
@@ -786,6 +914,9 @@ async function synthUsageRow(
     // incomplete_server_pricing.
     pricingStatus: acc.allFullyPriced ? "fully_priced" : "partially_priced",
     policyEpoch: V1_POLICY_EPOCH,
+    contextKey: planAttributionContextKey(provider, "codex"),
+    planEraKey,
+    attribution: planEraKey === null ? "unresolved" : "legacy_conditional",
   };
 }
 
@@ -796,8 +927,8 @@ async function synthUsageRow(
  */
 function runV1SeedLoop(
   datasets: { datasetId: string; complete: boolean }[],
-  quotaSnapshots: QuotaSnapshotInput[],
-  usageEvents: UsageEventPartial[],
+  quotaSnapshots: AttributedQuotaSnapshot[],
+  usageEvents: AttributedUsageEventPartial[],
 ): object {
   const seeds = new Map<string, TrackSeed>();
   for (const snapshot of quotaSnapshots) {
@@ -810,6 +941,7 @@ function runV1SeedLoop(
       limitId: snapshot.limitId,
       windowDurationMinutes: snapshot.windowDurationMinutes,
       policyEpoch: snapshot.policyEpoch,
+      planEraKey: snapshot.planEraKey,
     };
     seeds.set(seedKey(seed), seed);
   }
@@ -818,7 +950,7 @@ function runV1SeedLoop(
     return notTestable("continuity_track_limit_exceeded");
   }
 
-  const quotaSnapshotsBySeed = new Map<string, QuotaSnapshotInput[]>();
+  const quotaSnapshotsBySeed = new Map<string, AttributedQuotaSnapshot[]>();
   for (const snapshot of quotaSnapshots) {
     const key = seedKey({
       accountTrackId: snapshot.accountTrackId,
@@ -828,23 +960,32 @@ function runV1SeedLoop(
       limitId: snapshot.limitId,
       windowDurationMinutes: snapshot.windowDurationMinutes,
       policyEpoch: snapshot.policyEpoch,
+      planEraKey: snapshot.planEraKey,
     });
     const bucket = quotaSnapshotsBySeed.get(key);
     if (bucket) bucket.push(snapshot);
     else quotaSnapshotsBySeed.set(key, [snapshot]);
   }
 
-  const usageEventsByTrackEpoch = new Map<string, UsageEventPartial[]>();
+  const usageEventsByTrackEpoch = new Map<string, AttributedUsageEventPartial[]>();
+  const unresolvedTimesByTrackEpoch = new Map<string, number[]>();
   for (const event of usageEvents) {
     const key = usageTrackEpochKey(
       event.accountTrackId,
       event.provider,
       event.policyEpoch,
     );
+    if (event.attribution === "unresolved") {
+      const times = unresolvedTimesByTrackEpoch.get(key) ?? [];
+      times.push(Date.parse(event.observedAt));
+      unresolvedTimesByTrackEpoch.set(key, times);
+      continue;
+    }
     const bucket = usageEventsByTrackEpoch.get(key);
     if (bucket) bucket.push(event);
     else usageEventsByTrackEpoch.set(key, [event]);
   }
+  for (const times of unresolvedTimesByTrackEpoch.values()) times.sort((left, right) => left - right);
 
   const tracks = [];
   for (const seed of [...seeds.values()].sort((left, right) => (
@@ -857,25 +998,93 @@ function runV1SeedLoop(
         seed.provider,
         seed.policyEpoch,
       )) ?? []
-    ).map((partial) => ({
-      ...partial,
-      planType: seed.planType,
-      planVariant: seed.planVariant,
-      limitId: seed.limitId,
-    }));
+    ).filter((partial) => partial.planEraKey === seed.planEraKey).map((partial) => {
+      const { contextKey: _context, planEraKey: _era, attribution: _attribution, ...event } = partial;
+      return { ...event, planType: seed.planType, planVariant: seed.planVariant, limitId: seed.limitId };
+    });
     const evidence = buildResetEvidence({
       datasets,
-      quotaSnapshots: seedQuotaSnapshots,
+      quotaSnapshots: seedQuotaSnapshots.map(({ planEraKey: _era, ...snapshot }) => snapshot),
       usageEvents: seedUsageEvents,
     });
-    const calibration = analyzeQuotaCalibration(evidence);
-    tracks.push({ continuity: seed, calibration });
+    const unresolvedTimes = unresolvedTimesByTrackEpoch.get(usageTrackEpochKey(
+      seed.accountTrackId, seed.provider, seed.policyEpoch,
+    )) ?? [];
+    const refusedResets = evidence.resets.filter((reset) => intervalHasTime(
+      unresolvedTimes, Date.parse(reset.firstObservedAt), Date.parse(reset.lastObservedAt),
+    ));
+    const refusedKeys = new Set(refusedResets.map((reset) => reset.resetKey));
+    const coherentResets = evidence.resets.filter((reset) => !refusedKeys.has(reset.resetKey));
+    // No partially attributed numerator reaches the calibration kernel. Source
+    // rows remain retained; only the affected reset estimate is withheld, with
+    // an explicit reason rather than a fabricated zero/price-status failure.
+    const calibration = analyzeQuotaCalibration({
+      ...evidence, resetCount: coherentResets.length, resets: coherentResets,
+    });
+    tracks.push({
+      continuity: seed, calibration,
+      attribution: {
+        status: "legacy_conditional", accountScope: "unknown", planEraKey: seed.planEraKey,
+        refusedResets: refusedResets.map((reset) => ({
+          resetKey: reset.resetKey, reason: "usage_plan_interval_unresolved",
+          firstObservedAt: reset.firstObservedAt, lastObservedAt: reset.lastObservedAt,
+        })),
+      },
+    });
   }
   return {
     schemaVersion: "account-scoped-quota-analysis-v0.1",
     status: "ready",
+    // These are era-level diagnostics, not independent population votes.
+    // The shared collector selects one qualifying reset-parent fragment after
+    // its fit and 40pp population gates; it never pools era summaries here.
+    fragmentSelection: "unselected_diagnostics",
     tracks,
   };
+}
+
+function intervalHasTime(sortedMs: number[], startMs: number, endMs: number): boolean {
+  let low = 0;
+  let high = sortedMs.length;
+  while (low < high) {
+    const mid = (low + high) >>> 1;
+    if (sortedMs[mid]! < startMs) low = mid + 1;
+    else high = mid;
+  }
+  return low < sortedMs.length && sortedMs[low]! <= endMs;
+}
+
+async function assertNoActiveV11Source(db: D1Database, participantId: string): Promise<void> {
+  const successor = await db.prepare(
+    "SELECT 1 AS present FROM telemetry_v11_domain_heads WHERE participant_id = ? LIMIT 1",
+  ).bind(participantId).first<{ present: number }>();
+  if (successor !== null) throw new Error("v1 analysis unavailable after v1.1 activation");
+}
+
+async function analysisSourcePin(
+  db: D1Database, participantId: string, observedAtCutoff: string, supplied?: V1SourcePin,
+): Promise<V1SourcePin> {
+  let sourcePin: V1SourcePin;
+  if (supplied) {
+    if (!("participantId" in supplied.scope) || supplied.scope.participantId !== participantId
+        || (supplied.scope.fromDay !== undefined && supplied.scope.fromDay > observedAtCutoff.slice(0, 10))
+        || supplied.methodVersion !== V1_SOURCE_SELECTION_METHOD_VERSION) {
+      throw new Error("v1 source pin scope mismatch");
+    }
+    sourcePin = supplied;
+  } else {
+    sourcePin = await loadV1SourcePin(db, {
+      participantId, fromDay: observedAtCutoff.slice(0, 10),
+    });
+  }
+  // loadV1SourcePin deliberately serves every active analytical transport so
+  // daily consumers can share one winner policy. This adapter, however, reads
+  // the retained telemetry_v1_records table directly. Never label those old
+  // rows with a successor pin after the atomic v1.1 source cutover.
+  // Check AFTER acquiring the pin: activation before this check is refused;
+  // activation after it changes the fingerprint caught by the final assertion.
+  await assertNoActiveV11Source(db, participantId);
+  return sourcePin;
 }
 
 /**
@@ -893,23 +1102,27 @@ export async function accountScopedQuotaAnalysisV1(
     options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
   const maxWindowedUsageRows =
     options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
-  const cutoffMs = nowMs - V1_ANALYSIS_WINDOW_MS;
-  const observedAtCutoff = new Date(cutoffMs).toISOString();
+  const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_MS).toISOString().slice(0, 10)
+    + "T00:00:00.000Z";
+  const cutoffMs = Date.parse(observedAtCutoff);
   // Snap the window to whole reset cycles: a weekly cycle's observations lie in
   // [resets_at - 7d, resets_at), so requiring resets_at >= cutoff + 7d includes
   // a cycle only when its entire series is at or after the observed_at cutoff.
   const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
 
   // Resolve the winner set once; every downstream read reuses it as an inline
-  // (observed_day, device_id) IN (VALUES …) filter (see loadWinningDevices).
+  // triple row-IN filter shared with the daily totals/model cells.
   // No winners means no analyzable records.
-  const winners = await loadWinningDevices(db, participantId);
-  if (winners.length === 0) {
+  const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin);
+  if (sourcePin.winners.length === 0) {
     return notTestable("supported_quota_track_unavailable");
   }
+  const attributionIndex = await loadPlanAttributionIndex(db, participantId, sourcePin.winnersJson, observedAtCutoff);
+  if (attributionIndex === null) return notTestable("plan_attribution_limit_exceeded");
 
   const quotaResult = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
-    winnersJson(winners),
+    eraMarkersJson(attributionIndex),
+    sourcePin.winnersJson,
     participantId,
     observedAtCutoff,
     resetsAtCutoff,
@@ -929,7 +1142,7 @@ export async function accountScopedQuotaAnalysisV1(
   const datasetId = await v1DatasetId(participantId);
   const datasets = [{ datasetId, complete: true }];
   const accountTrackByProvider = new Map<string, string>();
-  const quotaSnapshots: QuotaSnapshotInput[] = [];
+  const quotaSnapshots: AttributedQuotaSnapshot[] = [];
   for (const row of quotaResult.results) {
     let accountTrackId = accountTrackByProvider.get(row.provider);
     if (accountTrackId === undefined) {
@@ -937,7 +1150,8 @@ export async function accountScopedQuotaAnalysisV1(
       accountTrackByProvider.set(row.provider, accountTrackId);
     }
     const snapshot = await buildQuotaSnapshotInput(row, accountTrackId, datasetId);
-    if (snapshot) quotaSnapshots.push(snapshot);
+    const attributed = snapshot ? attributeSnapshot(snapshot, attributionIndex) : null;
+    if (attributed) quotaSnapshots.push(attributed);
   }
   if (quotaSnapshots.length === 0) {
     return notTestable("supported_quota_track_unavailable");
@@ -952,13 +1166,19 @@ export async function accountScopedQuotaAnalysisV1(
     accountTrackByProvider,
     gridByProvider,
     maxWindowedUsageRows,
-    winners,
+    sourcePin.winnersJson,
+    attributionIndex,
   );
   if (usageEvents === "limit_exceeded") {
     return notTestable("windowed_usage_limit_exceeded");
   }
+  if (usageEvents === "session_scope_limit_exceeded") return notTestable("session_interval_scope_limit_exceeded");
+  if (usageEvents === "cost_limit_exceeded") return notTestable("usage_cost_limit_exceeded");
 
-  return runV1SeedLoop(datasets, quotaSnapshots, usageEvents);
+  const analysis = runV1SeedLoop(datasets, quotaSnapshots, usageEvents);
+  await assertV1SourcePinCurrent(db, sourcePin);
+  return { ...analysis, attributionMethod: V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+    inputFingerprint: sourcePin.fingerprint };
 }
 
 /**
@@ -972,13 +1192,17 @@ export async function downsampleQuotaForTest(
   participantId: string,
   nowMs: number = Date.now(),
 ): Promise<DownsampledQuotaRow[]> {
-  const cutoffMs = nowMs - V1_ANALYSIS_WINDOW_MS;
-  const observedAtCutoff = new Date(cutoffMs).toISOString();
+  const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_MS).toISOString().slice(0, 10)
+    + "T00:00:00.000Z";
+  const cutoffMs = Date.parse(observedAtCutoff);
   const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
-  const winners = await loadWinningDevices(db, participantId);
-  if (winners.length === 0) return [];
+  const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff);
+  if (sourcePin.winners.length === 0) return [];
+  const attributionIndex = await loadPlanAttributionIndex(db, participantId, sourcePin.winnersJson, observedAtCutoff);
+  if (!attributionIndex) return [];
   const result = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
-    winnersJson(winners),
+    eraMarkersJson(attributionIndex),
+    sourcePin.winnersJson,
     participantId,
     observedAtCutoff,
     resetsAtCutoff,
@@ -1004,25 +1228,31 @@ export async function downsampleQuotaForTest(
 export async function accountScopedQuotaAnalysisV1FullReferenceForTest(
   db: D1Database,
   participantId: string,
+  options: { usageTieOrder?: "occurrence" | "rowid" } = {},
 ): Promise<object> {
-  const result = await db.prepare(`${WINNING_DEVICE_CTE}
-    SELECT r.stream, r.occurrence_id, r.observed_at, r.provider, r.plan_type,
+  const sourcePin = await loadV1SourcePin(db, { participantId });
+  await assertNoActiveV11Source(db, participantId);
+  const result = await db.prepare(`
+    SELECT r.stream, r.occurrence_id, r.observed_at, r.provider, r.session_uuid, r.plan_type,
            r.plan_variant, r.limit_id, r.slot, r.used_percent,
            r.window_duration_minutes, r.resets_at, r.record_json
       FROM telemetry_v1_records r
-      JOIN winning_devices wd
-        ON wd.observed_day = r.observed_day AND wd.device_id = r.device_id
       JOIN participants p ON p.id = r.participant_id AND p.state = 'active'
-     WHERE r.participant_id = ?1
+     WHERE ${WINNER_FILTER_SQL} AND r.participant_id = ?
        AND r.stream IN ('usage', 'quota')
-     ORDER BY r.observed_at, r.id`,
-  ).bind(participantId).all<ReferenceRecordRowV1>();
+     ORDER BY r.observed_at, ${options.usageTieOrder === "rowid"
+      ? "r.id" : "CASE WHEN r.stream = 'usage' THEN r.occurrence_id END, r.id"}`,
+  ).bind(sourcePin.winnersJson, participantId).all<ReferenceRecordRowV1>();
 
   const datasetId = await v1DatasetId(participantId);
   const datasets = [{ datasetId, complete: true }];
   const accountTrackByProvider = new Map<string, string>();
-  const quotaSnapshots: QuotaSnapshotInput[] = [];
-  const usageEvents: UsageEventPartial[] = [];
+  const attributionIndex = buildPlanAttributionIndex(result.results
+    .filter((row) => row.stream === "quota" && row.limit_id !== null)
+    .map((row) => planObservation({ ...row, limit_id: row.limit_id! })));
+  const quotaSnapshots: AttributedQuotaSnapshot[] = [];
+  const usageEvents: AttributedUsageEventPartial[] = [];
+  const priorSessionTimes = new Map<string, number>();
   for (const row of result.results) {
     let accountTrackId = accountTrackByProvider.get(row.provider);
     if (accountTrackId === undefined) {
@@ -1033,12 +1263,19 @@ export async function accountScopedQuotaAnalysisV1FullReferenceForTest(
       const snapshot = await buildQuotaSnapshotInput(
         row, accountTrackId, datasetId,
       );
-      if (snapshot) quotaSnapshots.push(snapshot);
+      const attributed = snapshot ? attributeSnapshot(snapshot, attributionIndex) : null;
+      if (attributed) quotaSnapshots.push(attributed);
       continue;
     }
     if (!SAFE_TOKEN.test(row.provider)) continue;
-    const priced = priceV1UsageRecord(row.record_json, row.observed_at);
+    const observedAtMs = Date.parse(row.observed_at);
+    const sessionKey = row.session_uuid === null ? null : JSON.stringify([row.provider, row.session_uuid]);
+    const intervalStartMs = sessionKey === null ? undefined : priorSessionTimes.get(sessionKey);
+    if (sessionKey !== null) priorSessionTimes.set(sessionKey, observedAtMs);
+    const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
     if (priced === null) continue;
+    const contextKey = planAttributionContextKey(row.provider, "codex");
+    const match = planEraForInterval(attributionIndex, { contextKey, observedAtMs, intervalStartMs });
     usageEvents.push({
       eventId: `u:v1:${await sha256Hex(row.occurrence_id)}`,
       datasetId,
@@ -1048,6 +1285,9 @@ export async function accountScopedQuotaAnalysisV1FullReferenceForTest(
       costNanousd: priced.costNanousd,
       pricingStatus: priced.pricingStatus,
       policyEpoch: V1_POLICY_EPOCH,
+      contextKey,
+      planEraKey: match.status === "matched" ? match.era.eraKey : null,
+      attribution: match.status === "matched" ? "legacy_conditional" : "unresolved",
     });
   }
   return runV1SeedLoop(datasets, quotaSnapshots, usageEvents);
@@ -1074,6 +1314,9 @@ export interface V1ModelComposition {
   readonly poisonedBinCount: number;
   /** Newest retained quota reading; the cohort layer's recency evidence. */
   readonly latestQuotaObservedAt: string;
+  readonly attributionStatus: "legacy_conditional";
+  readonly attributionMethod: string;
+  readonly inputFingerprint: string;
 }
 
 export interface V1ModelCompositionRefusal {
@@ -1120,17 +1363,31 @@ export async function accountScopedModelCompositionV1(
     options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
   const maxWindowedUsageRows =
     options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
-  const cutoffMs = nowMs - V1_ANALYSIS_WINDOW_MS;
-  const observedAtCutoff = new Date(cutoffMs).toISOString();
+  const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_MS).toISOString().slice(0, 10)
+    + "T00:00:00.000Z";
+  const cutoffMs = Date.parse(observedAtCutoff);
   const resetsAtCutoff = new Date(cutoffMs + SEVEN_DAY_WINDOW_MS).toISOString();
 
-  const winners = await loadWinningDevices(db, participantId);
-  if (winners.length === 0) {
+  const sourcePin = await analysisSourcePin(db, participantId, observedAtCutoff, options.sourcePin);
+  if (sourcePin.winners.length === 0) {
     return { status: "not_testable", reason: "supported_quota_track_unavailable" };
   }
-  const winnersJsonArg = winnersJson(winners);
+  const winnersJsonArg = sourcePin.winnersJson;
+  const attributionIndex = await loadPlanAttributionIndex(db, participantId, winnersJsonArg, observedAtCutoff);
+  if (attributionIndex === null) return { status: "not_testable", reason: "plan_attribution_limit_exceeded" };
+  // The single-plan composition contract is intentional at this gate. Inspect
+  // ALL admitted plan evidence first, including a one-row foreign plan or a
+  // five-hour-only observation that the weekly fitability query would drop.
+  const observedPlans = new Set(attributionIndex.eras.map((era) => era.planType).filter((plan) => plan !== "unknown"));
+  if (observedPlans.size > 1 || attributionIndex.conflicts.length > 0) {
+    return { status: "not_testable", reason: "multi_plan_window_unsupported" };
+  }
+  if (new Set(attributionIndex.eras.map((era) => era.contextKey)).size > 1) {
+    return { status: "not_testable", reason: "multi_provider_window_unsupported" };
+  }
 
   const quotaResult = await db.prepare(QUOTA_DOWNSAMPLE_SQL).bind(
+    eraMarkersJson(attributionIndex),
     winnersJsonArg,
     participantId,
     observedAtCutoff,
@@ -1181,8 +1438,8 @@ export async function accountScopedModelCompositionV1(
   // plan-multiplier-different dollars per plan — mixing regimes publishes
   // capacities wrong by up to that ratio (measured 14x on a synthetic
   // plus-to-pro switch), and the split-half gate cannot see it because both
-  // interleaved halves contain both regimes. The blended path is immune (it
-  // normalizes per fit); this path refuses instead of guessing.
+  // interleaved halves contain both regimes. The blended path separates plan
+  // eras before allocating usage; this path refuses instead of guessing.
   if (planCounts.size > 1) {
     return { status: "not_testable", reason: "multi_plan_window_unsupported" };
   }
@@ -1200,6 +1457,8 @@ export async function accountScopedModelCompositionV1(
   const grainMs = MODEL_COMPOSITION_POLICY.grainMs;
   const costByBinAndModel = new Map<string, {
     observedAtMs: number; model: string; costNanousd: number;
+    firstObservedAt: string; firstOccurrenceId: string;
+    overflowed: boolean;
   }>();
   let usageEventCount = 0;
   let unpricedUsageEventCount = 0;
@@ -1208,18 +1467,7 @@ export async function accountScopedModelCompositionV1(
   let cursorObs = observedAtCutoff;
   let cursorId = 0;
   for (;;) {
-    const page = await db.prepare(USAGE_PAGE_SQL)
-      .bind(
-        winnersJsonArg,
-        participantId,
-        observedAtCutoff,
-        cursorObs,
-        cursorObs,
-        cursorId,
-        USAGE_PAGE_SIZE,
-      )
-      .all<WindowedUsageRow>();
-    const rows = page.results;
+    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) {
@@ -1229,7 +1477,7 @@ export async function accountScopedModelCompositionV1(
       if (!SAFE_TOKEN.test(row.provider) || !quotaProviders.has(row.provider)) continue;
       const observedAtMs = Date.parse(row.observed_at);
       if (!Number.isFinite(observedAtMs)) continue;
-      const priced = priceV1UsageRecord(row.record_json, row.observed_at);
+      const priced = priceChunkUsageRecord(row.record_json, row.observed_at);
       if (priced === null) continue;
       const eventBinStartMs = Math.floor(observedAtMs / grainMs) * grainMs;
       if (priced.pricingStatus !== "fully_priced") {
@@ -1247,8 +1495,24 @@ export async function accountScopedModelCompositionV1(
       const binStartMs = eventBinStartMs;
       const key = `${binStartMs}\u0000${model}`;
       const existing = costByBinAndModel.get(key);
-      if (existing) existing.costNanousd += priced.costNanousd;
-      else costByBinAndModel.set(key, { observedAtMs: binStartMs, model, costNanousd: priced.costNanousd });
+      if (existing) {
+        if (!Number.isSafeInteger(priced.costNanousd) || priced.costNanousd < 0
+            || priced.costNanousd > Number.MAX_SAFE_INTEGER - existing.costNanousd) {
+          existing.overflowed = true;
+        } else if (!existing.overflowed) {
+          existing.costNanousd += priced.costNanousd;
+        }
+        if (row.observed_at < existing.firstObservedAt
+            || (row.observed_at === existing.firstObservedAt && row.occurrence_id < existing.firstOccurrenceId)) {
+          existing.firstObservedAt = row.observed_at;
+          existing.firstOccurrenceId = row.occurrence_id;
+        }
+      } else {
+        const validCost = Number.isSafeInteger(priced.costNanousd) && priced.costNanousd >= 0;
+        costByBinAndModel.set(key, { observedAtMs: binStartMs, model,
+          costNanousd: validCost ? priced.costNanousd : 0, overflowed: !validCost,
+          firstObservedAt: row.observed_at, firstOccurrenceId: row.occurrence_id });
+      }
     }
     if (rows.length < USAGE_PAGE_SIZE) break;
     const last = rows[rows.length - 1]!;
@@ -1257,9 +1521,25 @@ export async function accountScopedModelCompositionV1(
   }
 
   const usageRows: CompositionUsageRow[] = [];
+  // Reconstruct the former (time,occurrence) stream's first-model insertion
+  // order before the kernel converts costs to floating USD. Sorting by model
+  // instead would be deterministic but could change its reduction order.
+  // Fully priced zero-cost rows participate in this first-seen key just as
+  // before; poisoned/zero-total bins are still omitted below.
+  const orderedCosts = [];
   for (const entry of costByBinAndModel.values()) {
-    if (entry.costNanousd <= 0) continue;
     if (poisonedBins.has(entry.observedAtMs)) continue;
+    // Keep scanning after overflow: later unpriced evidence may legitimately
+    // poison this whole bin. Only a contributing, otherwise retained entry
+    // refuses the fit; never emit its partial sum or silently drop its cost.
+    if (entry.overflowed) return { status: "not_testable", reason: "usage_cost_limit_exceeded" };
+    if (entry.costNanousd > 0) orderedCosts.push(entry);
+  }
+  orderedCosts.sort((left, right) => (
+    left.firstObservedAt < right.firstObservedAt ? -1 : left.firstObservedAt > right.firstObservedAt ? 1
+      : left.firstOccurrenceId < right.firstOccurrenceId ? -1 : left.firstOccurrenceId > right.firstOccurrenceId ? 1 : 0
+  ));
+  for (const entry of orderedCosts) {
     usageRows.push({
       observedAtMs: entry.observedAtMs,
       model: entry.model,
@@ -1269,6 +1549,7 @@ export async function accountScopedModelCompositionV1(
 
   const corpus = buildCompositionObservations({ usageRows, quotaRows });
   const fit = calibrateCompositionCapacities(corpus.observations);
+  await assertV1SourcePinCurrent(db, sourcePin);
   return {
     status: "ready",
     planType,
@@ -1280,5 +1561,8 @@ export async function accountScopedModelCompositionV1(
     unpricedUsageEventCount,
     poisonedBinCount: poisonedBins.size,
     latestQuotaObservedAt: new Date(latestQuotaObservedAtMs).toISOString(),
+    attributionStatus: "legacy_conditional",
+    attributionMethod: V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+    inputFingerprint: sourcePin.fingerprint,
   };
 }

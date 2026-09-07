@@ -153,6 +153,36 @@ const EXACT_ROUTES = [
     authority: "device",
   },
   {
+    pathname: "/api/v1/device/sync-capabilities",
+    id: "device_sync_capabilities",
+    methods: ["GET"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/me/device-telemetry-consents",
+    id: "telemetry_v11_consent",
+    methods: ["POST"],
+    authority: "session",
+  },
+  {
+    pathname: "/api/v1/device/telemetry/v1.1/day-manifests",
+    id: "telemetry_v11_day_manifests",
+    methods: ["GET", "POST"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/me/telemetry-v11/domain-predecessor",
+    id: "telemetry_v11_domain_predecessor",
+    methods: ["POST"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/me/telemetry-v11/domain-activate",
+    id: "telemetry_v11_domain_activate",
+    methods: ["POST"],
+    authority: "device",
+  },
+  {
     pathname: "/api/v1/device/sync/manifest",
     id: "device_sync_manifest",
     methods: ["GET"],
@@ -198,7 +228,7 @@ const EXACT_ROUTES = [
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(31);
+    expect(EXACT_ROUTES).toHaveLength(36);
     expect(WORKER_ROUTE_POLICY).toEqual(EXACT_ROUTES);
     expect(Object.isFrozen(WORKER_ROUTE_POLICY)).toBe(true);
     for (const definition of WORKER_ROUTE_POLICY) {
@@ -268,6 +298,11 @@ describe("Worker route registry", () => {
       "/api/v1/enroll/",
       "/api/v1/not-a-route",
       "/api/health/",
+      "/api/v1/device/sync-capabilities/",
+      "/api/v1/me/device-telemetry-consents/",
+      "/api/v1/device/telemetry/v1.1/day-manifests/",
+      "/api/v1/me/telemetry-v11/domain-predecessor/",
+      "/api/v1/me/telemetry-v11/domain-activate/",
     ]) {
       expect(matchWorkerRoute(pathname), pathname).toEqual({
         kind: "unknown_api",

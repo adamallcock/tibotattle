@@ -138,6 +138,55 @@ dogfood build `1022`; the stable final also orders after the dogfood candidate.
 Release tooling refuses a signed version/channel without an owner-reviewed
 allocation, and an environment value can only assert the exact allocation.
 
+#### Allocation amendment, 2026-08-31
+
+The `1023` paragraph above records the first 0.1.17 dogfood allocation. RC2 used
+build `1023`, RC3 used `1023.1`, and the signed, notarized, installed
+startup-recovery RC4 used `1023.2`. The integrated RC5 allocation is now
+`1023.3`; stable remains reserved at `1024`. Each increment retains the same
+production bundle identity and therefore must be monotonic. RC4 evidence applies
+only to its frozen source and is not inherited by RC5 or stable.
+
+#### Allocation amendment, 2026-08-31 (RC6)
+
+RC5 build `1023.3` was subsequently signed, notarized, installed, and then
+failed its real full-accounting refresh gate because the ordinary five-minute
+deadline terminated a healthy v0.14 cache rebuild. The corrected RC6 dogfood is
+allocated `1023.4`, strictly after installed RC5 and before reserved stable
+`1024`. RC5 artifact evidence remains evidence for RC5 only; it cannot qualify
+RC6 or stable.
+
+#### Allocation amendment, 2026-09-01 (RC7)
+
+RC6 build `1023.4` was subsequently signed, notarized, installed, and refreshed
+against preserved schema-11 state. Its real accounting rebuild ran past five
+minutes and reached terminal refresh success, proving the RC5 deadline defect
+was corrected. The installed result then exposed an inherited
+`recent_7d_indexing` legacy checkpoint suppressing otherwise-authoritative
+unified accounting. RC7 removes only that retired collector checkpoint while
+retaining the fail-closed `unifiedGenerationAuthoritative` predicate and all
+generation, completeness, resource, and atomic-publication guards. Its monotonic
+internal-dogfood allocation is `1023.5`, strictly after installed RC6 and before
+reserved stable `1024`. RC6 artifact evidence remains evidence for RC6 only;
+RC7 requires fresh exact-source, R7, artifact, replacement, and installed checks.
+
+#### Allocation amendment, 2026-09-01 (RC8)
+
+RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, build
+`1023.5`, subsequently passed protected R7, the full source gate, Developer ID
+signing, notarization, stapling, and state-preserving installation. Its first
+installed refresh ingested unified-index generation 44, then the strict v0.14
+cache validator rejected inconsistent fit metadata. An early diagnostic-only
+transition was excluded from the fit, but its eligibility was still projected
+onto a reset fitted from later eligible transitions. RC8 preserves that strict
+validator and projects reset fit metadata from the first eligible row. Its
+monotonic internal-dogfood allocation is
+`1023.6`, strictly after installed RC7 and before reserved stable `1024`.
+RC7's artifact and R7 evidence remain evidence for RC7 only; RC8 requires a
+fresh exact-source freeze, protected R7, artifact, replacement, installed
+refresh, and physical native verification. Allocation does not claim those
+gates have passed.
+
 The separately identified Preview app uses the deterministic migration epoch
 `(2000 + major).minor.patch`, so preview package `0.1.17` maps to
 `2000.1.17`. That keeps local preview builds deterministic and valid within

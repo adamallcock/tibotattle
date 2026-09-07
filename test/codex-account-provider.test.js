@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { EventEmitter } from "node:events";
+import { PassThrough, Writable } from "node:stream";
 
 import * as accountFacade from "../src/providers/codex/account.js";
 import * as accountScope from "../src/providers/codex/account-scope.js";
@@ -24,6 +26,7 @@ const EXPECTED_PUBLIC_EXPORTS = [
   "inspectCodexBinary",
   "readCodexAccountSnapshot",
   "sanitizeAccountScope",
+  "sanitizeBracketedCodexAccountSnapshotWithSecretLoader",
   "sanitizeCodexAccountSnapshot",
   "sanitizeCodexAccountSnapshotWithSecretLoader",
   "sanitizePlanType",
@@ -40,6 +43,38 @@ test("Codex account facade exposes only reviewed exports with exact identities",
     );
   }
   assert.equal(accountFacade.OPENAI_ACCOUNT_SCOPE_PREFIX, undefined);
+});
+
+test("account-change protocol notifications expose only an invalidation signal", async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = new Writable({
+    write(chunk, _encoding, done) {
+      const request = JSON.parse(chunk.toString("utf8"));
+      if (request.method === "initialize") {
+        queueMicrotask(() => child.stdout.write(`${JSON.stringify({ id: request.id, result: {} })}\n`));
+      }
+      done();
+    },
+  });
+  child.kill = () => true;
+  const client = new accountFacade.CodexAppServerClient({ spawnProcess: () => child });
+  const notifications = [];
+  client.on("accountChanged", (...args) => notifications.push(args));
+  try {
+    await client.start();
+    for (const method of ["account/updated", "account/login/completed"]) {
+      child.stdout.write(`${JSON.stringify({ method, params: { accountId: "DO-NOT-LEAK", email: "synthetic@example.test", loginId: "DO-NOT-LEAK" } })}\n`);
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(notifications, [[], []]);
+  } finally {
+    client.close();
+    child.stdin.destroy();
+    child.stdout.destroy();
+    child.stderr.destroy();
+  }
 });
 
 test("Codex binary diagnostics preserve selection precedence without exposing paths", async () => {

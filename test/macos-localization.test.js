@@ -128,6 +128,16 @@ test("native catalogs have complete language parity and preserve placeholders", 
   }
   assert.equal(english.get("settings.language"), "Language");
   assert.equal(
+    english.get("nativeDashboard.refreshUsageTooltip"),
+    "Refresh the current allowance, local history, and detailed accounting. Reuses valid cached results; all processing stays on this Mac.",
+  );
+  assert.equal(
+    english.get("settings.refreshIntervalDetail"),
+    "Checks current allowance while TiboTattle is open. Detailed accounting updates automatically at most hourly; choose Refresh to update everything now.",
+  );
+  assert.equal(english.has("nativeDashboard.recalculateDetailedAccounting"), false,
+    "the removed duplicate action leaves no unused native localization key");
+  assert.equal(
     english.get("nativeDashboard.progressAccounting"),
     "Calculating accounting…",
   );

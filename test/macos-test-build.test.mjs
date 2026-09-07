@@ -179,6 +179,21 @@ test("test compiler profile builds a development-only launcher that runs", {
     });
     assert.equal(smoke.status, 0, smoke.error?.message ?? smoke.stderr);
     assert.match(smoke.stdout, /runtime=development_disabled/u);
+    const dashboardLayoutSmoke = spawnSync(
+      launcher,
+      ["--native-dashboard-layout-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      dashboardLayoutSmoke.status,
+      0,
+      dashboardLayoutSmoke.error?.message ?? dashboardLayoutSmoke.stderr,
+    );
+    assert.match(
+      dashboardLayoutSmoke.stdout,
+      /^USAGE_MONITOR_MACOS_DASHBOARD_READINESS early=true late=true once=true stale_callbacks=ignored cancelled=true hung_renderer=bounded hard_deadline=120$/mu,
+    );
+    assert.match(dashboardLayoutSmoke.stdout, /USAGE_MONITOR_MACOS_NATIVE_DASHBOARD_LAYOUT/u);
     const progressSmoke = spawnSync(
       launcher,
       ["--native-analysis-progress-contract-smoke-test"],
@@ -192,6 +207,21 @@ test("test compiler profile builds a development-only launcher that runs", {
     assert.match(
       progressSmoke.stdout,
       /phases=allowlisted[\s\S]*unified=scanning[\s\S]*accounting=calculating[\s\S]*counts=bounded[\s\S]*quick_result=evidence-gated[\s\S]*unknown=generic[\s\S]*free_text=ignored/u,
+    );
+    assert.match(progressSmoke.stdout, /attempt=mode-and-actual-start/u);
+    const refreshSettingsSmoke = spawnSync(
+      launcher,
+      ["--native-refresh-settings-contract-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(
+      refreshSettingsSmoke.status,
+      0,
+      refreshSettingsSmoke.error?.message ?? refreshSettingsSmoke.stderr,
+    );
+    assert.match(
+      refreshSettingsSmoke.stdout,
+      /detailed_attempt_cadence=3600 startup=quick quick_join=restored newer_attempt=preserved external_attempt=actual-start stale_idle=ignored/u,
     );
     const menuBarSmoke = spawnSync(
       launcher,

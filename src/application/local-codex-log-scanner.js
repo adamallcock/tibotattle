@@ -64,9 +64,23 @@ function snapshotCodexLogPorts(codexLogPorts) {
     safeFilesystem[name] = requireOwnCallable(filesystem, name);
   }
   const readBoundedUtf8Lines = requireOwnCallable(lineReader, "readBoundedUtf8Lines");
+  const compressedReader = {};
+  if (Object.hasOwn(lineReader, "supportsCompressedRollouts")) {
+    for (const key of ["compressedRolloutHandle", "inspectCompressedRollout",
+      "readCompressedRolloutBytes", "supportsCompressedRollouts"]) {
+      compressedReader[key] = requireOwnCallable(lineReader, key);
+    }
+    const inspect = compressedReader.inspectCompressedRollout;
+    const read = compressedReader.readCompressedRolloutBytes;
+    const optionsWithErrors = (options) => ({ ...options,
+      createLimitError: (code) => new ExportResourceLimitError(code) });
+    compressedReader.inspectCompressedRollout = (source, options) => inspect(source, optionsWithErrors(options));
+    compressedReader.readCompressedRolloutBytes = (source, options) => read(source, optionsWithErrors(options));
+  }
   return Object.freeze({
     filesystem: Object.freeze(safeFilesystem),
     lineReader: Object.freeze({
+      ...compressedReader,
       // Resource-limit failures must keep the reviewed error identity even
       // though the platform reader itself cannot import the export owner.
       readBoundedUtf8Lines: (source, options) => readBoundedUtf8Lines(source, {

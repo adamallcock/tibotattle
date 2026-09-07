@@ -26,12 +26,12 @@ function fail(code) {
   throw new AccountObservationSecretError(code);
 }
 
-function assertBackend(backend, capability) {
+function assertBackend(backend, capability, { createIfMissing = true } = {}) {
   let valid = capability !== null && capability !== undefined;
   try {
     valid = valid && backend !== null && typeof backend === "object"
       && typeof backend.read === "function"
-      && typeof backend.createIfMissing === "function";
+      && (!createIfMissing || typeof backend.createIfMissing === "function");
   } catch {
     valid = false;
   }
@@ -330,6 +330,7 @@ async function releaseOperationLease(path, lease) {
 export function createAccountObservationSecretLoader({
   backend,
   capability,
+  createIfMissing = true,
   operationLockFile = defaultAccountObservationOperationLockFile(),
   generateSecret = () => randomBytes(SECRET_BYTES),
   clock = () => Date.now(),
@@ -345,8 +346,9 @@ export function createAccountObservationSecretLoader({
   staleLockMilliseconds = DEFAULT_STALE_LOCK_MILLISECONDS,
   operationHook = null,
 } = {}) {
-  assertBackend(backend, capability);
-  if (typeof generateSecret !== "function" || typeof clock !== "function" || typeof processExists !== "function"
+  assertBackend(backend, capability, { createIfMissing });
+  if (typeof createIfMissing !== "boolean"
+      || typeof generateSecret !== "function" || typeof clock !== "function" || typeof processExists !== "function"
       || !Number.isSafeInteger(processId) || processId < 1
       || !Number.isFinite(staleLockMilliseconds) || staleLockMilliseconds < 1
       || (operationHook !== null && typeof operationHook !== "function")) {
@@ -371,6 +373,9 @@ export function createAccountObservationSecretLoader({
         if (Buffer.isBuffer(existing)) existing.fill(0);
         return result;
       }
+      // Upload/review may lease an existing observation root, but must never
+      // create an identity merely because contribution was requested.
+      if (!createIfMissing) return null;
 
       generatedValue = generateSecret();
       generated = copySecret(generatedValue);

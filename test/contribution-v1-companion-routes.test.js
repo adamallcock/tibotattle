@@ -115,6 +115,7 @@ function fakeIncrementalController() {
   };
   let approved = false;
   let disconnected = false;
+  let repairRequired = false;
   const projection = () => ({
     schemaVersion: "incremental-contribution-sync-status-v1.0",
     contractVersion: "telemetry-contribution-v1.0",
@@ -125,8 +126,8 @@ function fakeIncrementalController() {
       current: approved,
       consentedAt: approved ? "2026-08-03T00:00:00.000Z" : null,
     },
-    paused: disconnected,
-    pausedReason: disconnected ? "device_disconnected" : null,
+    paused: disconnected || repairRequired,
+    pausedReason: repairRequired ? "device_repair_required" : disconnected ? "device_disconnected" : null,
     running: false,
     progress: approved
       ? {
@@ -138,7 +139,7 @@ function fakeIncrementalController() {
       }
       : null,
     lastAttemptAt: null,
-    nextAttemptAt: approved && !disconnected ? "2026-08-03T00:00:00.000Z" : null,
+    nextAttemptAt: approved && !disconnected && !repairRequired ? "2026-08-03T00:00:00.000Z" : null,
     lastOutcome: approved
       ? {
         at: "2026-08-03T00:00:00.000Z",
@@ -176,6 +177,14 @@ function fakeIncrementalController() {
       calls.pauseForDeviceDisconnect += 1;
       disconnected = true;
       return projection();
+    },
+    async pauseForDeviceRepair() {
+      repairRequired = true;
+      return projection();
+    },
+    async resumeAfterDeviceRepair() {
+      repairRequired = false;
+      return this.resume();
     },
     async runDue() {
       calls.runDue += 1;
@@ -1530,6 +1539,12 @@ test("a consent-version change still prepares the fresh review its ceremony need
     },
     async pauseForDeviceDisconnect() {
       throw new Error("unexpected disconnect");
+    },
+    async pauseForDeviceRepair() {
+      throw new Error("unexpected repair");
+    },
+    async resumeAfterDeviceRepair() {
+      throw new Error("unexpected repair completion");
     },
     async inspect() {
       return {

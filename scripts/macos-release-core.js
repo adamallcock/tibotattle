@@ -52,8 +52,14 @@ import {
   normalizeMacOSUpdaterConfiguration,
 } from "./macos-updater-core.js";
 import {
+  MACOS_KEYCHAIN_MIGRATION_HELPER,
+  assertMacOSBundleArchitecture,
+  assertMacOSKeychainMigrationManifest,
   buildMacOSAppForRelease,
   buildMacOSReleaseCandidate,
+  normalizeMacOSBuildArchitecture,
+  readMacOSReleaseSourceTimestamp,
+  setMacOSBundleFinderMetadata,
   validateMacOSPreviewApp,
 } from "./build-macos-app.js";
 import {
@@ -111,6 +117,7 @@ const SPARKLE_FRAMEWORK_PREFIX =
 const BASE_NORMALIZED_MACH_O_PATHS = Object.freeze([
   APP_EXECUTABLE,
   NODE_EXECUTABLE,
+  MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
 ]);
 const SPARKLE_NORMALIZED_MACH_O_PATHS = Object.freeze(
   SPARKLE_MACH_O_PATHS.map(
@@ -131,12 +138,110 @@ const REQUIRED_SIGNED_RELEASE_ASSURANCES = Object.freeze([
   "dmgNotarizationAccepted",
   "dmgTicketStapled",
 ]);
+// This already-distributed DMG predates channel tags and embedded source seals.
+// It is a previous-artifact exception, never a way to build/publish a candidate.
+const LEGACY_DOGFOOD_PREVIOUS_RELEASE = Object.freeze({
+  artifactSha256:
+    "2b32964c8b3bc2912620dbbe078aaf4e2fd49f1725a4e94a62dff184cdc9f8c1",
+  artifactBytes: 49_341_249,
+  artifactFileName: "TiboTattle-0.1.16-macOS-arm64.dmg",
+  bundleVersion: "1022",
+  shortVersion: "0.1.16",
+  sourceCommit: "5adaca5fdc8f981c391144e0d29b6f4c764f0f96",
+  sourceTag: "v0.1.16",
+  sourceSha256:
+    "ff7f59ec074705f8ecb3d78810177a8e8a4795a1e58c2df24faa9b3e6e26fae7",
+  payloadSha256:
+    "a5740aac152d95b638989462584774c0e3039ecd7db511692bd8fe690d8d37c4",
+  publicEdKeySha256:
+    "77d5717947da768e7e96a1b1e6225d2cae4748a556f109f2a30444a5f41ff3d2",
+  frameworkSha256:
+    "2a43f8c41a29b195982354d7580036c178ed89e3b3e5dc0d8ab295290d91a0ac",
+  keytar: Object.freeze({
+    path: "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
+    bytes: 98_544,
+    mode: "555",
+    sha256:
+      "dd24fba62f187f494e86ab5c4d499dcb8cb2c5bd7345079651297aecb9c6f049",
+  }),
+});
+// The Symbol is transport only: a caller-controlled options Proxy can discover
+// it. Authorization requires an opaque object in the module-private WeakSet.
+const VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT = Symbol(
+  "verified legacy dogfood previous artifact",
+);
+const VERIFIED_LEGACY_DOGFOOD_CAPABILITIES = new WeakSet();
+// The published stable 0.1.16 has the same pre-policy payload shape, but its
+// distinct source, updater key, build digests and DMG bytes must all match.
+const LEGACY_STABLE_PREVIOUS_RELEASE = Object.freeze({
+  artifactSha256:
+    "5e3e60402ffa3c61d8279f5f759548a8b48084f1ae567eeb1b30156c7f30a9fe",
+  artifactBytes: 49_341_389,
+  artifactFileName: "TiboTattle-0.1.16-macOS-arm64.dmg",
+  bundleVersion: "0.1.16",
+  shortVersion: "0.1.16",
+  sourceCommit: "4f30508eff55c122e73025ad06d73b33cadbc508",
+  sourceTag: "v0.1.16",
+  sourceSha256:
+    "95de0721e5a29ab0988535a55935e516012e9230185bab79d1504b24fc59513a",
+  payloadSha256:
+    "23f41a17bc6f4fede452e53f61972999b7ea144e732cd59807d77aca2ada20e5",
+  publicEdKeySha256:
+    "ae8a8e00311a4cfc1e7e7f2eedcf7fa53d6bc197997c912a0b8f908e54a28fbf",
+  frameworkSha256:
+    "2a43f8c41a29b195982354d7580036c178ed89e3b3e5dc0d8ab295290d91a0ac",
+  keytar: Object.freeze({
+    path: "Contents/Resources/app/node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",
+    bytes: 98_544,
+    mode: "555",
+    sha256:
+      "dd24fba62f187f494e86ab5c4d499dcb8cb2c5bd7345079651297aecb9c6f049",
+  }),
+});
+const VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT = Symbol(
+  "verified legacy stable previous artifact",
+);
+const VERIFIED_LEGACY_STABLE_CAPABILITIES = new WeakSet();
+// This immutable rc2 was installed before the migration helper existed. Only
+// the checksum-verified previous side of a replacement may omit that helper;
+// every newly built/signable/public candidate must carry the current contract.
+const PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE = Object.freeze({
+  artifactSha256:
+    "125a15da9b0e260ec3797527d6b98e15aa1172e8b6fc8e7942d2a799cc2b29b0",
+  artifactBytes: 49_574_961,
+  artifactFileName: "TiboTattle-0.1.17-macOS-arm64.dmg",
+  bundleVersion: "1023",
+  shortVersion: "0.1.17",
+  sourceCommit: "3d9055fc8e58c84f8ba71feb5deb58b52c532138",
+  sourceTag: "tibotattle-internal-dogfood-0.1.17-rc2-source-20260831",
+  sourceSha256:
+    "d18945b354ed3431b49953c2fe756405ccb8b5d46cd866adcc96a640f2344275",
+  payloadSha256:
+    "dad884435aea0d1a471f1a7ff7cfbd908723c6cb26a95823ad600c8ccd1d1a7d",
+  publicEdKeySha256:
+    "77d5717947da768e7e96a1b1e6225d2cae4748a556f109f2a30444a5f41ff3d2",
+  frameworkSha256:
+    "2a43f8c41a29b195982354d7580036c178ed89e3b3e5dc0d8ab295290d91a0ac",
+});
+const VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT = Symbol(
+  "verified pre-migration previous artifact",
+);
+const VERIFIED_PRE_MIGRATION_CAPABILITIES = new WeakSet();
 const REQUIRED_NODE_RUNTIME_ENTITLEMENTS = Object.freeze([
   "com.apple.security.cs.allow-jit",
   "com.apple.security.cs.allow-unsigned-executable-memory",
 ]);
 const LOGIN_ITEM_RELEASE_REHEARSAL_SCHEMA =
-  "usage-monitor-macos-login-item-release-rehearsal-v1";
+  "usage-monitor-macos-login-item-release-rehearsal-v2";
+const LOGIN_ITEM_REHEARSAL_APPLICATION_FIELDS = Object.freeze([
+  "bundleIdentifier",
+  "bundleVersion",
+  "shortVersion",
+  "architecture",
+  "channel",
+  "sourceCommit",
+  "payloadSha256",
+]);
 const REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS = Object.freeze([
   "firstRunConsentIsVisibleAndAffirmative",
   "settingsReconcileAfterSystemSettingsChange",
@@ -164,14 +269,47 @@ function fail(message, code = "MACOS_RELEASE_FAILED") {
   throw error;
 }
 
-function resolveOperationalReleaseChannel(channel = "stable") {
+function validateLegacyDogfoodPreviousCapability(capability) {
+  if (capability === null) return false;
+  if (!VERIFIED_LEGACY_DOGFOOD_CAPABILITIES.has(capability)) {
+    fail(
+      "Legacy dogfood source compatibility requires a verified previous-artifact capability",
+      "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
+  return true;
+}
+
+function validatePreMigrationPreviousCapability(capability) {
+  if (capability === null) return false;
+  if (!VERIFIED_PRE_MIGRATION_CAPABILITIES.has(capability)) {
+    fail(
+      "Pre-migration helper compatibility requires a verified previous-artifact capability",
+      "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
+    );
+  }
+  return true;
+}
+
+function validateLegacyStablePreviousCapability(capability) {
+  if (capability === null) return false;
+  if (!VERIFIED_LEGACY_STABLE_CAPABILITIES.has(capability)) {
+    fail(
+      "Legacy stable compatibility requires a verified previous-artifact capability",
+      "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
+  return true;
+}
+
+function resolveOperationalReleaseChannel(channel = "stable", architecture = "arm64") {
   if (typeof channel !== "string") {
     fail(
       "Release inspection must select a named release channel",
       "MACOS_RELEASE_CHANNEL_NAME_REQUIRED",
     );
   }
-  return resolveReleaseChannel(channel);
+  return resolveReleaseChannel(channel, { architecture });
 }
 
 function stableValue(value) {
@@ -738,7 +876,39 @@ function validateManifestPayloadPath(path) {
   }
 }
 
-async function verifyMacOSBuildPayload(appPath, manifest) {
+async function verifyMacOSBuildPayload(
+  appPath,
+  manifest,
+  legacyDogfoodPreviousCapability = null,
+  preMigrationPreviousCapability = null,
+  legacyStablePreviousCapability = null,
+) {
+  const legacyDogfoodPrevious = validateLegacyDogfoodPreviousCapability(
+    legacyDogfoodPreviousCapability,
+  );
+  const preMigrationPrevious = validatePreMigrationPreviousCapability(
+    preMigrationPreviousCapability,
+  );
+  const legacyStablePrevious = validateLegacyStablePreviousCapability(
+    legacyStablePreviousCapability,
+  );
+  const legacyKeytarContract = legacyDogfoodPrevious
+    ? LEGACY_DOGFOOD_PREVIOUS_RELEASE.keytar
+    : legacyStablePrevious ? LEGACY_STABLE_PREVIOUS_RELEASE.keytar : null;
+  const helperRequired = !legacyDogfoodPrevious
+    && !preMigrationPrevious && !legacyStablePrevious;
+  if (helperRequired) {
+    assertMacOSKeychainMigrationManifest(manifest);
+  } else if (manifest.runtime?.keychainMigrationHelper !== undefined
+      || manifest.inputs?.keychainMigrationHelperSources !== undefined
+      || (Array.isArray(manifest.payload?.files)
+        && manifest.payload.files.some((entry) =>
+          entry?.path === MACOS_KEYCHAIN_MIGRATION_HELPER.executable))) {
+    fail(
+      "Pre-migration previous artifact unexpectedly includes migration-helper state",
+      "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
+    );
+  }
   const payload = manifest.payload;
   const updaterEnabled = manifest.release?.updater?.enabled === true;
   if (!payload
@@ -765,7 +935,9 @@ async function verifyMacOSBuildPayload(appPath, manifest) {
       );
     }
     previousPath = entry.path;
-    const expectedNormalization = NORMALIZED_MACH_O_PATHS.has(entry.path)
+    const legacyKeytar = entry.path === legacyKeytarContract?.path;
+    const expectedNormalization = (NORMALIZED_MACH_O_PATHS.has(entry.path)
+        || legacyKeytar)
       ? "mach_o_without_code_signature"
       : "raw";
     if (!Number.isSafeInteger(entry.bytes)
@@ -775,6 +947,8 @@ async function verifyMacOSBuildPayload(appPath, manifest) {
         || typeof entry.sha256 !== "string"
         || !/^[a-f0-9]{64}$/u.test(entry.sha256)
         || entry.normalization !== expectedNormalization
+        || (legacyKeytar && ["bytes", "mode", "sha256"].some((key) =>
+          entry[key] !== legacyKeytarContract[key]))
         || expected.has(entry.path)
         || [BUILD_MANIFEST_PATH, CODE_RESOURCES_PATH].includes(entry.path)) {
       fail(
@@ -784,13 +958,20 @@ async function verifyMacOSBuildPayload(appPath, manifest) {
     }
     expected.set(entry.path, entry);
   }
+  const selectedBaseMachOPaths = BASE_NORMALIZED_MACH_O_PATHS.filter((path) =>
+    helperRequired || path !== MACOS_KEYCHAIN_MIGRATION_HELPER.executable);
   const requiredMachOPaths = updaterEnabled
     ? [
-      ...BASE_NORMALIZED_MACH_O_PATHS,
+      ...selectedBaseMachOPaths,
       ...SPARKLE_NORMALIZED_MACH_O_PATHS,
     ]
-    : BASE_NORMALIZED_MACH_O_PATHS;
-  for (const required of requiredMachOPaths) {
+    : selectedBaseMachOPaths;
+  for (const required of [
+    ...requiredMachOPaths,
+    ...(legacyKeytarContract !== null
+      ? [legacyKeytarContract.path]
+      : []),
+  ]) {
     if (!expected.has(required)) {
       fail(
         "Application payload inventory omits required signed code",
@@ -974,7 +1155,25 @@ function hasAppOpenScheme(plist) {
       && entry.CFBundleURLSchemes.includes(APP_OPEN_SCHEME));
 }
 
-function hasExpectedProductBrand(plist) {
+function hasExpectedProductBrand(
+  plist,
+  legacyDogfoodPreviousCapability = null,
+  legacyStablePreviousCapability = null,
+) {
+  const legacyDogfoodPrevious = validateLegacyDogfoodPreviousCapability(
+    legacyDogfoodPreviousCapability,
+  );
+  const legacyStablePrevious = validateLegacyStablePreviousCapability(
+    legacyStablePreviousCapability,
+  );
+  // The pinned old app used the same identity constants in code, before these
+  // two fields were added to its plist. Do not exempt new candidates or accept
+  // a partially specified/different identity on the historical artifact.
+  const expectedKeychainIdentity = legacyDogfoodPrevious || legacyStablePrevious
+    ? !Object.hasOwn(plist, "UsageMonitorKeychainNamespace")
+      && !Object.hasOwn(plist, "UsageMonitorKeychainAccount")
+    : plist.UsageMonitorKeychainNamespace === PRODUCT_BRAND.keychainNamespace
+      && plist.UsageMonitorKeychainAccount === PRODUCT_BRAND.keychainAccount;
   return plist.CFBundleDisplayName === PRODUCT_BRAND.displayName
     && plist.CFBundleName === PRODUCT_BRAND.displayName
     && plist.UsageMonitorAppOpenHost === PRODUCT_BRAND.appOpenHost
@@ -983,10 +1182,7 @@ function hasExpectedProductBrand(plist) {
     && plist.UsageMonitorBundleName === PRODUCT_BRAND.bundleName
     && plist.UsageMonitorStateDirectoryName
       === PRODUCT_BRAND.stateDirectoryName
-    && plist.UsageMonitorKeychainNamespace
-      === PRODUCT_BRAND.keychainNamespace
-    && plist.UsageMonitorKeychainAccount
-      === PRODUCT_BRAND.keychainAccount
+    && expectedKeychainIdentity
     && plist.UsageMonitorMonitoredAppDisplayName
       === PRODUCT_BRAND.monitoredAppDisplayName
     && plist.UsageMonitorMonitoredAppBundleIdentifier
@@ -1084,12 +1280,28 @@ async function validateUpdaterBoundary(appPath, plist, manifest, {
 }
 
 export async function inspectMacOSApp(appPath, {
+  architecture = "arm64",
   allowLegacyUnsealedSource = false,
+  [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: legacyDogfoodPreviousCapability = null,
+  [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability = null,
+  [VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT]: legacyStablePreviousCapability = null,
   channel = "stable",
   requireExternalDistribution = false,
 } = {}) {
+  const selectedArchitecture = normalizeMacOSBuildArchitecture(architecture);
+  const legacyDogfoodPrevious = validateLegacyDogfoodPreviousCapability(
+    legacyDogfoodPreviousCapability,
+  );
+  const preMigrationPrevious = validatePreMigrationPreviousCapability(
+    preMigrationPreviousCapability,
+  );
+  const legacyStablePrevious = validateLegacyStablePreviousCapability(
+    legacyStablePreviousCapability,
+  );
   if (typeof allowLegacyUnsealedSource !== "boolean"
-      || (allowLegacyUnsealedSource && !requireExternalDistribution)) {
+      || (allowLegacyUnsealedSource && !legacyStablePrevious)
+      || ((legacyStablePrevious || legacyDogfoodPrevious || preMigrationPrevious)
+        && !requireExternalDistribution)) {
     fail(
       "Legacy unsealed source compatibility requires external artifact validation",
       "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
@@ -1115,14 +1327,66 @@ export async function inspectMacOSApp(appPath, {
       || manifest.application?.bundleIdentifier !== BUNDLE_IDENTIFIER) {
     fail("Application build manifest has an unexpected identity");
   }
-  await verifyMacOSBuildPayload(selected, manifest);
+  const exactLegacyStablePrevious = legacyStablePrevious
+    && channel === STABLE_RELEASE_CHANNEL
+    && manifest.application?.bundleVersion === LEGACY_STABLE_PREVIOUS_RELEASE.bundleVersion
+    && manifest.application?.shortVersion === LEGACY_STABLE_PREVIOUS_RELEASE.shortVersion
+    && manifest.release?.source === undefined
+    && manifest.inputs?.sourceSha256 === LEGACY_STABLE_PREVIOUS_RELEASE.sourceSha256
+    && manifest.payload?.payloadSha256 === LEGACY_STABLE_PREVIOUS_RELEASE.payloadSha256
+    && manifest.release?.updater?.publicEdKeySha256 === LEGACY_STABLE_PREVIOUS_RELEASE.publicEdKeySha256
+    && manifest.release?.updater?.frameworkSha256 === LEGACY_STABLE_PREVIOUS_RELEASE.frameworkSha256;
+  if (legacyStablePrevious && !exactLegacyStablePrevious) {
+    fail(
+      "Legacy stable compatibility does not match the exact previous build",
+      "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
+  if (preMigrationPrevious
+      && (channel !== INTERNAL_DOGFOOD_RELEASE_CHANNEL
+        || manifest.application?.bundleVersion !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.bundleVersion
+        || manifest.application?.shortVersion !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.shortVersion
+        || manifest.release?.source?.commit !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.sourceCommit
+        || manifest.release?.source?.tag !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.sourceTag
+        || manifest.inputs?.sourceSha256 !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.sourceSha256
+        || manifest.payload?.payloadSha256 !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.payloadSha256
+        || manifest.release?.updater?.publicEdKeySha256
+          !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.publicEdKeySha256
+        || manifest.release?.updater?.frameworkSha256
+          !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.frameworkSha256)) {
+    fail(
+      "Pre-migration helper compatibility does not match the exact previous build",
+      "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
+    );
+  }
+  await verifyMacOSBuildPayload(
+    selected,
+    manifest,
+    legacyDogfoodPreviousCapability,
+    preMigrationPreviousCapability,
+    legacyStablePreviousCapability,
+  );
+  if (manifest.runtime?.node?.architecture !== selectedArchitecture) {
+    fail("Application runtime does not match its selected architecture", "MACOS_BUNDLE_ARCHITECTURE_MISMATCH");
+  }
+  await assertMacOSBundleArchitecture(selected, {
+    architecture: selectedArchitecture,
+    updaterEnabled: manifest.release?.updater?.enabled === true,
+    helperRequired: !legacyDogfoodPrevious && !preMigrationPrevious && !legacyStablePrevious,
+  });
   const plistPath = join(selected, "Contents", "Info.plist");
   await regularPath(plistPath);
   const plist = parsePlist(plistPath);
+  if (plist.LSMinimumSystemVersion !== manifest.application.minimumMacOSVersion
+      || plist.LSMinimumSystemVersion !== "14.0") {
+    fail("Application minimum macOS version does not match its reviewed platform contract", "MACOS_MINIMUM_OS_MISMATCH");
+  }
   if (plist.CFBundleIdentifier !== BUNDLE_IDENTIFIER
       || plist.CFBundleExecutable !== PRODUCT_BRAND.executableName
       || !hasAppOpenScheme(plist)
-      || !hasExpectedProductBrand(plist)) {
+      || !hasExpectedProductBrand(
+        plist, legacyDogfoodPreviousCapability, legacyStablePreviousCapability,
+      )) {
     fail("Application bundle metadata is incomplete");
   }
   await validateUpdaterBoundary(selected, plist, manifest, {
@@ -1132,23 +1396,50 @@ export async function inspectMacOSApp(appPath, {
   for (const relativePath of [
     APP_EXECUTABLE,
     NODE_EXECUTABLE,
+    ...(!legacyDogfoodPrevious && !preMigrationPrevious && !exactLegacyStablePrevious
+      ? [MACOS_KEYCHAIN_MIGRATION_HELPER.executable]
+      : []),
   ]) {
     await regularPath(join(selected, ...relativePath.split("/")));
   }
   if (requireExternalDistribution) {
-    const releaseChannel = resolveOperationalReleaseChannel(channel);
-    const exactLegacyUnsealedSource = allowLegacyUnsealedSource
+    const releaseChannel = resolveOperationalReleaseChannel(channel, selectedArchitecture);
+    const exactLegacyUnsealedSource = exactLegacyStablePrevious
       && releaseChannel.name === STABLE_RELEASE_CHANNEL
       && plist.CFBundleVersion === LEGACY_STABLE_MACOS_BUNDLE_VERSION
       && plist.CFBundleShortVersionString
         === LEGACY_STABLE_MACOS_BUNDLE_VERSION;
-    if (allowLegacyUnsealedSource && !exactLegacyUnsealedSource) {
+    if (legacyStablePrevious && !exactLegacyUnsealedSource) {
       fail(
         "Legacy unsealed source compatibility applies only to the exact 0.1.16 stable rollback artifact",
         "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
       );
     }
-    sealedSource = exactLegacyUnsealedSource
+    const exactLegacyDogfoodSource = legacyDogfoodPrevious
+      && releaseChannel.name === INTERNAL_DOGFOOD_RELEASE_CHANNEL
+      && plist.CFBundleVersion === LEGACY_DOGFOOD_PREVIOUS_RELEASE.bundleVersion
+      && plist.CFBundleShortVersionString
+        === LEGACY_DOGFOOD_PREVIOUS_RELEASE.shortVersion
+      && manifest.application.bundleVersion
+        === LEGACY_DOGFOOD_PREVIOUS_RELEASE.bundleVersion
+      && manifest.application.shortVersion
+        === LEGACY_DOGFOOD_PREVIOUS_RELEASE.shortVersion
+      && manifest.inputs?.sourceSha256
+        === LEGACY_DOGFOOD_PREVIOUS_RELEASE.sourceSha256
+      && manifest.payload?.payloadSha256
+        === LEGACY_DOGFOOD_PREVIOUS_RELEASE.payloadSha256
+      && manifest.release?.source === undefined
+      && manifest.release?.updater?.publicEdKeySha256
+        === LEGACY_DOGFOOD_PREVIOUS_RELEASE.publicEdKeySha256
+      && manifest.release?.updater?.frameworkSha256
+        === LEGACY_DOGFOOD_PREVIOUS_RELEASE.frameworkSha256;
+    if (legacyDogfoodPrevious && !exactLegacyDogfoodSource) {
+      fail(
+        "Legacy dogfood source compatibility does not match the exact previous build",
+        "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+      );
+    }
+    sealedSource = (exactLegacyUnsealedSource || exactLegacyDogfoodSource)
         && manifest.release?.source === undefined
       ? null
       : validateSealedMacOSReleaseSource(
@@ -1226,6 +1517,8 @@ export async function inspectMacOSApp(appPath, {
   }
   return Object.freeze({
     appPath: selected,
+    architecture: selectedArchitecture,
+    minimumMacos: plist.LSMinimumSystemVersion,
     buildManifest: manifest,
     bundleIdentifier: plist.CFBundleIdentifier,
     bundleVersion: plist.CFBundleVersion,
@@ -1259,8 +1552,9 @@ export function readMacOSReleaseCredentials(environment = process.env) {
 export function readMacOSReleaseBuildConfiguration(
   environment = process.env,
   channel = "stable",
+  { architecture = "arm64" } = {},
 ) {
-  const releaseChannel = resolveOperationalReleaseChannel(channel);
+  const releaseChannel = resolveOperationalReleaseChannel(channel, architecture);
   const endpointSourceLabel = releaseChannel.name === "stable"
     ? "config/deployment-endpoints.js"
     : `the reviewed ${releaseChannel.name} channel`;
@@ -1286,9 +1580,7 @@ export function readMacOSReleaseBuildConfiguration(
   const productionOrigin = releaseChannel.name === STABLE_RELEASE_CHANNEL
     ? DEPLOYMENT_ENDPOINTS.public.origin
     : releaseChannel.serviceOrigin;
-  const sparkleAppcastURL = releaseChannel.name === STABLE_RELEASE_CHANNEL
-    ? DEPLOYMENT_ENDPOINTS.sparkle.appcastURL
-    : releaseChannel.sparkle.appcastURL;
+  const sparkleAppcastURL = releaseChannel.sparkle.appcastURL;
   if (configuredProductionOrigin !== undefined) {
     if (typeof configuredProductionOrigin !== "string") {
       fail(
@@ -1448,6 +1740,12 @@ function validateSignedReleaseChannel(manifest, label) {
     );
   }
   // Stable has no configured static key; the sealed manifest is authoritative.
+  if (channel.sparkle.appcastURL !== manifest.updater.appcastURL) {
+    fail(
+      `${label} updater feed does not match its architecture-specific channel provenance`,
+      "MACOS_RELEASE_CHANNEL_MISMATCH",
+    );
+  }
   if (channel.sparkle.publicEdKeySha256
       !== manifest.updater.publicEdKeySha256) {
     fail(
@@ -1458,8 +1756,25 @@ function validateSignedReleaseChannel(manifest, label) {
   return channelName;
 }
 
+export function macOSReleaseManifestArchitecture(manifest) {
+  const declared = manifest?.application?.architecture;
+  const architecture = normalizeMacOSBuildArchitecture(declared === undefined ? "arm64" : declared);
+  const channelArchitecture = manifest?.channel?.architecture === undefined
+    ? "arm64" : normalizeMacOSBuildArchitecture(manifest.channel.architecture);
+  if (channelArchitecture !== architecture) {
+    fail("Release application and channel architectures do not match", "MACOS_RELEASE_ARCHITECTURE_MISMATCH");
+  }
+  if (architecture === "x64" && manifest.artifact?.fileName
+      !== `TiboTattle-${manifest.application.shortVersion}-macOS-x64.dmg`) {
+    fail("Intel release filename does not match its version and architecture", "MACOS_RELEASE_ARCHITECTURE_MISMATCH");
+  }
+  return architecture;
+}
+
 function validateSignedReleaseManifest(manifest, label, {
   allowLegacyStableMigrationSource = false,
+  allowLegacyDogfoodPreviousSource = false,
+  allowPreMigrationDogfoodPreviousSource = false,
 } = {}) {
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)
       || manifest.schemaVersion !== RELEASE_MANIFEST_SCHEMA
@@ -1499,6 +1814,32 @@ function validateSignedReleaseManifest(manifest, label, {
   const channelName = manifest.channel === undefined
     ? null
     : validateSignedReleaseChannel(manifest, label);
+  macOSReleaseManifestArchitecture(manifest);
+  const legacyDogfoodPreviousSource = allowLegacyDogfoodPreviousSource
+    && isExactLegacyDogfoodPreviousRelease(manifest);
+  if (manifest.artifact.sha256 === LEGACY_STABLE_PREVIOUS_RELEASE.artifactSha256
+      && (!allowLegacyStableMigrationSource
+        || !isExactLegacyStablePreviousRelease(manifest))) {
+    fail(
+      "The historical stable artifact is allowed only as its exact previous release",
+      "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
+  if (manifest.artifact.sha256 === LEGACY_DOGFOOD_PREVIOUS_RELEASE.artifactSha256
+      && !legacyDogfoodPreviousSource) {
+    fail(
+      "The historical dogfood artifact is allowed only as its exact previous release",
+      "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
+  if (manifest.artifact.sha256 === PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.artifactSha256
+      && (!allowPreMigrationDogfoodPreviousSource
+        || !isExactPreMigrationDogfoodPreviousRelease(manifest))) {
+    fail(
+      "The pre-migration dogfood artifact is allowed only as its exact previous release",
+      "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
+    );
+  }
   const bundleVersion = manifest.application.bundleVersion;
   const legacyStableMigrationSource =
     allowLegacyStableMigrationSource
@@ -1511,7 +1852,7 @@ function validateSignedReleaseManifest(manifest, label, {
   }
   if (manifest.source !== undefined) {
     validateMacOSReleaseSource(manifest.source, label);
-    if (channelName !== null
+    if (channelName !== null && !legacyDogfoodPreviousSource
         && !isMacOSReleaseSourceTagForChannel(manifest.source.tag, {
           channel: channelName,
           expectedVersion: manifest.application.shortVersion,
@@ -1534,6 +1875,66 @@ function validateSignedReleaseManifest(manifest, label, {
     macOSBundleVersionParts(bundleVersion);
   }
   return manifest;
+}
+
+function isExactLegacyDogfoodPreviousRelease(manifest) {
+  const legacy = LEGACY_DOGFOOD_PREVIOUS_RELEASE;
+  return manifest?.channel?.name === INTERNAL_DOGFOOD_RELEASE_CHANNEL
+    && manifest.application?.bundleIdentifier === BUNDLE_IDENTIFIER
+    && manifest.application?.bundleVersion === legacy.bundleVersion
+    && manifest.application?.shortVersion === legacy.shortVersion
+    && manifest.artifact?.sha256 === legacy.artifactSha256
+    && manifest.artifact?.bytes === legacy.artifactBytes
+    && manifest.artifact?.fileName === legacy.artifactFileName
+    && manifest.source?.repository === PUBLIC_RELEASE_SOURCE_REPOSITORY
+    && manifest.source?.commit === legacy.sourceCommit
+    && manifest.source?.tag === legacy.sourceTag
+    && manifest.build?.sourceSha256 === legacy.sourceSha256
+    && manifest.build?.payloadSha256 === legacy.payloadSha256
+    && manifest.updater?.appcastURL === manifest.channel.sparkle.appcastURL
+    && manifest.updater?.publicEdKeySha256 === legacy.publicEdKeySha256
+    && manifest.updater?.frameworkSha256 === legacy.frameworkSha256
+    && manifest.updater?.verifyBeforeExtraction === true;
+}
+
+function isExactLegacyStablePreviousRelease(manifest) {
+  const legacy = LEGACY_STABLE_PREVIOUS_RELEASE;
+  return manifest?.channel?.name === STABLE_RELEASE_CHANNEL
+    && manifest.application?.bundleIdentifier === BUNDLE_IDENTIFIER
+    && manifest.application?.bundleVersion === legacy.bundleVersion
+    && manifest.application?.shortVersion === legacy.shortVersion
+    && manifest.artifact?.sha256 === legacy.artifactSha256
+    && manifest.artifact?.bytes === legacy.artifactBytes
+    && manifest.artifact?.fileName === legacy.artifactFileName
+    && manifest.source?.repository === PUBLIC_RELEASE_SOURCE_REPOSITORY
+    && manifest.source?.commit === legacy.sourceCommit
+    && manifest.source?.tag === legacy.sourceTag
+    && manifest.build?.sourceSha256 === legacy.sourceSha256
+    && manifest.build?.payloadSha256 === legacy.payloadSha256
+    && manifest.updater?.appcastURL === manifest.channel.sparkle.appcastURL
+    && manifest.updater?.publicEdKeySha256 === legacy.publicEdKeySha256
+    && manifest.updater?.frameworkSha256 === legacy.frameworkSha256
+    && manifest.updater?.verifyBeforeExtraction === true;
+}
+
+function isExactPreMigrationDogfoodPreviousRelease(manifest) {
+  const previous = PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE;
+  return manifest?.channel?.name === INTERNAL_DOGFOOD_RELEASE_CHANNEL
+    && manifest.application?.bundleIdentifier === BUNDLE_IDENTIFIER
+    && manifest.application?.bundleVersion === previous.bundleVersion
+    && manifest.application?.shortVersion === previous.shortVersion
+    && manifest.artifact?.sha256 === previous.artifactSha256
+    && manifest.artifact?.bytes === previous.artifactBytes
+    && manifest.artifact?.fileName === previous.artifactFileName
+    && manifest.source?.repository === PUBLIC_RELEASE_SOURCE_REPOSITORY
+    && manifest.source?.commit === previous.sourceCommit
+    && manifest.source?.tag === previous.sourceTag
+    && manifest.build?.sourceSha256 === previous.sourceSha256
+    && manifest.build?.payloadSha256 === previous.payloadSha256
+    && manifest.updater?.appcastURL === manifest.channel.sparkle.appcastURL
+    && manifest.updater?.publicEdKeySha256 === previous.publicEdKeySha256
+    && manifest.updater?.frameworkSha256 === previous.frameworkSha256
+    && manifest.updater?.verifyBeforeExtraction === true;
 }
 
 function compareCandidateToPreviousBundleVersion(candidate, previous) {
@@ -1623,12 +2024,14 @@ export async function readStableReleaseManifest(manifestPath) {
  * Missing prior state never silently turns into bootstrap mode.
  */
 export function assertStableSparkleKeyContinuity({
+  architecture = "arm64",
   channel,
   candidateBundleVersion,
   candidatePublicEdKeySha256,
   previousManifest = null,
   stableBootstrap = false,
 } = {}) {
+  normalizeMacOSBuildArchitecture(architecture);
   if (typeof stableBootstrap !== "boolean") {
     fail(
       "Stable Sparkle bootstrap mode must be an explicit boolean",
@@ -1702,6 +2105,9 @@ export function assertStableSparkleKeyContinuity({
       "MACOS_STABLE_VERSION_NOT_NEWER",
     );
   }
+  if (macOSReleaseManifestArchitecture(previous) !== architecture) {
+    fail("Stable continuity requires a previous release for the same architecture", "MACOS_RELEASE_ARCHITECTURE_MISMATCH");
+  }
   if (candidatePublicEdKeySha256
       !== previous.updater.publicEdKeySha256) {
     fail(
@@ -1723,12 +2129,23 @@ export function validateMacOSSignedReplacementPair({
   const previous = validateSignedReleaseManifest(
     previousManifest,
     "Previous release",
-    { allowLegacyStableMigrationSource: true },
+    {
+      allowLegacyStableMigrationSource: true,
+      allowLegacyDogfoodPreviousSource: true,
+      allowPreMigrationDogfoodPreviousSource: true,
+    },
   );
   const candidate = validateSignedReleaseManifest(
     candidateManifest,
     "Candidate release",
   );
+  if (previous.application.bundleVersion === LEGACY_STABLE_MACOS_BUNDLE_VERSION
+      && !isExactLegacyStablePreviousRelease(previous)) {
+    fail(
+      "Legacy stable replacement compatibility requires the exact previous release",
+      "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
   const previousChannelName = validateSignedReleaseChannel(
     previous,
     "Previous release",
@@ -1737,6 +2154,9 @@ export function validateMacOSSignedReplacementPair({
     candidate,
     "Candidate release",
   );
+  if (macOSReleaseManifestArchitecture(previous) !== macOSReleaseManifestArchitecture(candidate)) {
+    fail("Replacement and rollback artifacts must use the same architecture", "MACOS_RELEASE_ARCHITECTURE_MISMATCH");
+  }
   if (candidateChannelName !== previousChannelName) {
     fail(
       "Replacement and rollback manifests must use the same named release channel",
@@ -1786,7 +2206,11 @@ export function validateMacOSSignedReplacementPair({
 async function readReplacementReleaseArtifact(
   manifestPath,
   label,
-  { allowLegacyStableMigrationSource = false } = {},
+  {
+    allowLegacyStableMigrationSource = false,
+    allowLegacyDogfoodPreviousSource = false,
+    allowPreMigrationDogfoodPreviousSource = false,
+  } = {},
 ) {
   const selectedManifest = resolve(manifestPath);
   await regularPath(selectedManifest);
@@ -1801,6 +2225,8 @@ async function readReplacementReleaseArtifact(
   }
   validateSignedReleaseManifest(manifest, label, {
     allowLegacyStableMigrationSource,
+    allowLegacyDogfoodPreviousSource,
+    allowPreMigrationDogfoodPreviousSource,
   });
   const artifact = join(dirname(selectedManifest), manifest.artifact.fileName);
   const metadata = await regularPath(artifact);
@@ -1850,6 +2276,7 @@ export async function validateMacOSSignedReleaseArtifact({
   }
   await validateArtifact(candidate.artifact, {
     allowLegacyUnsealedSource: false,
+    architecture: macOSReleaseManifestArchitecture(candidate.manifest),
     channel: candidateChannelName,
     production: true,
   });
@@ -1879,7 +2306,11 @@ export async function validateMacOSSignedReplacementArtifacts({
   const previous = await readReplacementReleaseArtifact(
     previousReleaseManifestPath,
     "Previous release",
-    { allowLegacyStableMigrationSource: true },
+    {
+      allowLegacyStableMigrationSource: true,
+      allowLegacyDogfoodPreviousSource: true,
+      allowPreMigrationDogfoodPreviousSource: true,
+    },
   );
   const candidate = await readReplacementReleaseArtifact(
     candidateReleaseManifestPath,
@@ -1889,19 +2320,56 @@ export async function validateMacOSSignedReplacementArtifacts({
     previousManifest: previous.manifest,
     candidateManifest: candidate.manifest,
   });
-  const previousIsExactLegacyStable =
-    previous.manifest.channel.name === STABLE_RELEASE_CHANNEL
-    && previous.manifest.application.bundleVersion
-      === LEGACY_STABLE_MACOS_BUNDLE_VERSION
-    && previous.manifest.application.shortVersion
-      === LEGACY_STABLE_MACOS_BUNDLE_VERSION;
-  await validateArtifact(previous.artifact, {
-    allowLegacyUnsealedSource: previousIsExactLegacyStable,
-    channel: previous.manifest.channel.name,
-    production: true,
-  });
+  const legacyStablePreviousCapability = isExactLegacyStablePreviousRelease(
+    previous.manifest,
+  ) ? Object.freeze({}) : null;
+  if (legacyStablePreviousCapability !== null) {
+    VERIFIED_LEGACY_STABLE_CAPABILITIES.add(legacyStablePreviousCapability);
+  }
+  const previousArtifactCapability = isExactLegacyDogfoodPreviousRelease(
+    previous.manifest,
+  ) ? Object.freeze({}) : null;
+  if (previousArtifactCapability !== null) {
+    VERIFIED_LEGACY_DOGFOOD_CAPABILITIES.add(previousArtifactCapability);
+  }
+  const preMigrationPreviousCapability = isExactPreMigrationDogfoodPreviousRelease(
+    previous.manifest,
+  ) ? Object.freeze({}) : null;
+  if (preMigrationPreviousCapability !== null) {
+    VERIFIED_PRE_MIGRATION_CAPABILITIES.add(preMigrationPreviousCapability);
+  }
+  try {
+    await validateArtifact(previous.artifact, {
+      architecture: macOSReleaseManifestArchitecture(previous.manifest),
+      allowLegacyUnsealedSource: legacyStablePreviousCapability !== null,
+      ...(legacyStablePreviousCapability !== null ? {
+        [VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT]: legacyStablePreviousCapability,
+      } : {}),
+      ...(previousArtifactCapability !== null ? {
+        [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: previousArtifactCapability,
+      } : {}),
+      ...(preMigrationPreviousCapability !== null ? {
+        [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability,
+      } : {}),
+      channel: previous.manifest.channel.name,
+      production: true,
+    });
+  } finally {
+    // Even an injected validator that captures the token cannot reuse it after
+    // the previous-side await settles (including a failed native validation).
+    if (previousArtifactCapability !== null) {
+      VERIFIED_LEGACY_DOGFOOD_CAPABILITIES.delete(previousArtifactCapability);
+    }
+    if (preMigrationPreviousCapability !== null) {
+      VERIFIED_PRE_MIGRATION_CAPABILITIES.delete(preMigrationPreviousCapability);
+    }
+    if (legacyStablePreviousCapability !== null) {
+      VERIFIED_LEGACY_STABLE_CAPABILITIES.delete(legacyStablePreviousCapability);
+    }
+  }
   await validateArtifact(candidate.artifact, {
     allowLegacyUnsealedSource: false,
+    architecture: macOSReleaseManifestArchitecture(candidate.manifest),
     channel: candidate.manifest.channel.name,
     production: true,
   });
@@ -1924,7 +2392,142 @@ function releaseEnvironment() {
   return environment;
 }
 
+function keychainMigrationSignatureFailure() {
+  fail(
+    "Keychain migration helper does not preserve the approved legacy reader signing boundary",
+    "MACOS_KEYCHAIN_MIGRATION_SIGNATURE_INVALID",
+  );
+}
+
+function normalizedDesignatedRequirement(value) {
+  return value.replace(/\/\*\s*exists\s*\*\//gu, "")
+    .replace(/\s+/gu, " ").trim()
+    // codesign renders this simple identifier without quotes on some versions.
+    // Canonicalize only the reviewed leading Node token, not arbitrary clauses.
+    .replace(/^identifier node(?= and )/u, 'identifier "node"');
+}
+
+function keychainMigrationCodeDescription(description, identifier) {
+  if (typeof description !== "string" || description.length > 128 * 1024) {
+    keychainMigrationSignatureFailure();
+  }
+  const identifiers = [...description.matchAll(/^Identifier=([^\r\n]+)$/gmu)];
+  const requirements = [...description.matchAll(/^designated => ([^\r\n]+)$/gmu)];
+  if (identifiers.length !== 1 || identifiers[0][1] !== identifier
+      || requirements.length !== 1
+      || !/flags=0x[0-9a-f]+\(runtime\)/iu.test(description)) {
+    keychainMigrationSignatureFailure();
+  }
+  let trust;
+  try {
+    trust = parseMacOSDeveloperIDNativeTrust(description);
+  } catch {
+    keychainMigrationSignatureFailure();
+  }
+  return {
+    ...trust,
+    requirement: normalizedDesignatedRequirement(requirements[0][1]),
+    rawRequirement: requirements[0][1],
+  };
+}
+
+/**
+ * Validate the exact default Developer ID requirement used by the legacy Node
+ * reader, not merely membership in its Team. Inputs are captured code-sign
+ * metadata only; the result never exposes identities or requirements.
+ */
+export function validateMacOSKeychainMigrationSignatureDescriptions({
+  application,
+  node,
+  helper,
+  helperEntitlements,
+} = {}) {
+  const appDescription = keychainMigrationCodeDescription(application, BUNDLE_IDENTIFIER);
+  const nodeDescription = keychainMigrationCodeDescription(node, "node");
+  const helperDescription = keychainMigrationCodeDescription(
+    helper,
+    MACOS_KEYCHAIN_MIGRATION_HELPER.signingIdentifier,
+  );
+  const expectedRequirement = `identifier "node" and anchor apple generic `
+    + "and certificate 1[field.1.2.840.113635.100.6.2.6] "
+    + "and certificate leaf[field.1.2.840.113635.100.6.1.13] "
+    + `and certificate leaf[subject.OU] = "${appDescription.teamIdentifier}"`;
+  const emptyEntitlements = typeof helperEntitlements?.stdout === "string"
+    && helperEntitlements.stdout.length <= 128 * 1024
+    && (helperEntitlements.stdout.trim() === ""
+      || /^\s*(?:<\?xml[^?]*\?>\s*)?(?:<!DOCTYPE plist[^>]*>\s*)?<plist version="1\.0">\s*(?:<dict\s*\/>|<dict>\s*<\/dict>)\s*<\/plist>\s*$/u
+        .test(helperEntitlements.stdout));
+  if (nodeDescription.teamIdentifier !== appDescription.teamIdentifier
+      || helperDescription.teamIdentifier !== appDescription.teamIdentifier
+      || nodeDescription.developerIdAuthority !== appDescription.developerIdAuthority
+      || helperDescription.developerIdAuthority !== appDescription.developerIdAuthority
+      || nodeDescription.requirement !== expectedRequirement
+      || helperDescription.requirement !== nodeDescription.requirement
+      || !emptyEntitlements
+      || typeof helperEntitlements?.stderr !== "string"
+      || helperEntitlements.stderr.length > 128 * 1024
+      || /^\s*(?:warning|error):/imu.test(helperEntitlements.stderr)) {
+    keychainMigrationSignatureFailure();
+  }
+  return Object.freeze({
+    legacyNodeDesignatedRequirementMatched: true,
+    sameDeveloperIDTeam: true,
+    helperHardenedRuntime: true,
+    helperEntitlementsAbsent: true,
+  });
+}
+
+export function verifyMacOSKeychainMigrationSignatures(appPath, {
+  commandRunner = runMacOSReleaseCommand,
+  secrets = [],
+} = {}) {
+  const selected = resolve(appPath);
+  const inspect = (relativePath) => {
+    const result = commandRunner("/usr/bin/codesign", [
+      "-d", "-r-", "--verbose=4", join(selected, ...relativePath.split("/")),
+    ], {
+      env: releaseEnvironment(),
+      failureMessage: "Keychain migration signing metadata is unavailable",
+      secrets,
+    });
+    return `${result.stdout}${result.stderr}`;
+  };
+  // A code-sign diagnostic can contain an identity or requirement even when
+  // codesign fails. Keep this boundary's errors content-free in every case.
+  try {
+    const application = inspect(APP_EXECUTABLE);
+    const node = inspect(NODE_EXECUTABLE);
+    const helper = inspect(MACOS_KEYCHAIN_MIGRATION_HELPER.executable);
+    const helperPath = join(selected, ...MACOS_KEYCHAIN_MIGRATION_HELPER.executable.split("/"));
+    const helperEntitlements = commandRunner("/usr/bin/codesign", [
+      "--display", "--entitlements", "-", "--xml", helperPath,
+    ], {
+      env: releaseEnvironment(),
+      failureMessage: "Keychain migration helper entitlement inspection failed",
+      secrets,
+    });
+    const result = validateMacOSKeychainMigrationSignatureDescriptions({
+      application, node, helper, helperEntitlements,
+    });
+    const requirement = keychainMigrationCodeDescription(node, "node").rawRequirement;
+    for (const relativePath of [NODE_EXECUTABLE, MACOS_KEYCHAIN_MIGRATION_HELPER.executable]) {
+      commandRunner("/usr/bin/codesign", [
+        "--verify", "--strict", `-R=${requirement}`,
+        join(selected, ...relativePath.split("/")),
+      ], {
+        env: releaseEnvironment(),
+        failureMessage: "Keychain migration reader requirement verification failed",
+        secrets: [...secrets, requirement],
+      });
+    }
+    return result;
+  } catch {
+    keychainMigrationSignatureFailure();
+  }
+}
+
 export async function developerIDSignMacOSApp(appPath, {
+  architecture = "arm64",
   channel = STABLE_RELEASE_CHANNEL,
   identity,
   commandRunner = runMacOSReleaseCommand,
@@ -1933,6 +2536,7 @@ export async function developerIDSignMacOSApp(appPath, {
     fail("Developer ID identity is required", "MACOS_DEVELOPER_ID_REQUIRED");
   }
   const inspected = await inspectMacOSApp(appPath, {
+    architecture,
     channel,
     requireExternalDistribution: true,
   });
@@ -1967,6 +2571,7 @@ export async function developerIDSignMacOSApp(appPath, {
   const sign = (relativePath, {
     entitlements = null,
     preserveEntitlements = false,
+    identifier = null,
   } = {}) => {
     const arguments_ = [
       "--force",
@@ -1978,6 +2583,9 @@ export async function developerIDSignMacOSApp(appPath, {
     ];
     if (entitlements) {
       arguments_.push("--entitlements", entitlements);
+    }
+    if (identifier !== null) {
+      arguments_.push("--identifier", identifier);
     }
     if (preserveEntitlements) {
       arguments_.push("--preserve-metadata=entitlements");
@@ -1998,6 +2606,12 @@ export async function developerIDSignMacOSApp(appPath, {
   sign(SPARKLE_FRAMEWORK_PREFIX);
   await validateNodeRuntimeEntitlements();
   sign(NODE_EXECUTABLE, { entitlements: NODE_ENTITLEMENTS });
+  // Preserve the legacy Node reader's exact designated identity, but none of
+  // Node's JIT exceptions. The native helper accepts only authenticated local
+  // migration requests; it is not a general Node/keytar credential backend.
+  sign(MACOS_KEYCHAIN_MIGRATION_HELPER.executable, {
+    identifier: MACOS_KEYCHAIN_MIGRATION_HELPER.signingIdentifier,
+  });
   // The app bundle carries no entitlements of its own. Sign in with Apple is
   // a restricted entitlement that a Developer ID provisioning profile does
   // not grant (verified 2026-08-01 against two freshly generated profiles for
@@ -2031,6 +2645,10 @@ export async function developerIDSignMacOSApp(appPath, {
       || !/flags=0x[0-9a-f]+\(runtime\)/iu.test(signature)) {
     fail("Signed application is missing Developer ID hardened runtime");
   }
+  verifyMacOSKeychainMigrationSignatures(inspected.appPath, {
+    commandRunner,
+    secrets,
+  });
   return inspected;
 }
 
@@ -2075,15 +2693,17 @@ async function inspectMacOSDMGInput(
   appPath,
   distribution,
   channel = STABLE_RELEASE_CHANNEL,
+  architecture = "arm64",
 ) {
   if (distribution === DMG_DISTRIBUTIONS.release) {
     return inspectMacOSApp(appPath, {
+      architecture,
       channel,
       requireExternalDistribution: true,
     });
   }
   if (distribution === DMG_DISTRIBUTIONS.development) {
-    const inspected = await inspectMacOSApp(appPath);
+    const inspected = await inspectMacOSApp(appPath, { architecture });
     const release = inspected.buildManifest.release;
     if (release?.channel !== "development"
         || release.channelName !== "development"
@@ -2101,7 +2721,7 @@ async function inspectMacOSDMGInput(
     return inspected;
   }
   if (distribution === DMG_DISTRIBUTIONS.preview) {
-    await validateMacOSPreviewApp(appPath);
+    await validateMacOSPreviewApp(appPath, { architecture });
     const selected = resolve(appPath);
     const manifest = JSON.parse(await readFile(join(
       selected,
@@ -2132,19 +2752,28 @@ function validateNonReleaseDMGName(path, distribution) {
 }
 
 export async function packageMacOSDMG({
+  architecture = "arm64",
   appPath,
   output,
   replace = false,
   distribution,
   channel = STABLE_RELEASE_CHANNEL,
-}) {
+}, {
+  inspectInput = inspectMacOSDMGInput,
+  commandRunner = runMacOSReleaseCommand,
+  finderMetadataSetter = setMacOSBundleFinderMetadata,
+} = {}) {
   if (!Object.values(DMG_DISTRIBUTIONS).includes(distribution)) {
     fail(
       "DMG packaging requires an explicit development, preview, or release distribution",
       "MACOS_DMG_DISTRIBUTION_REQUIRED",
     );
   }
-  const inspected = await inspectMacOSDMGInput(appPath, distribution, channel);
+  normalizeMacOSBuildArchitecture(architecture);
+  const inspected = await inspectInput(appPath, distribution, channel, architecture);
+  const releaseFinderTimestamp = distribution === DMG_DISTRIBUTIONS.release
+    ? readMacOSReleaseSourceTimestamp(inspected.source)
+    : null;
   const selectedOutput = resolve(output);
   if (basename(selectedOutput).startsWith(".")
       || !selectedOutput.endsWith(".dmg")) {
@@ -2180,7 +2809,7 @@ export async function packageMacOSDMG({
   );
   try {
     await mkdir(staging, { recursive: true, mode: 0o755 });
-    runMacOSReleaseCommand("/usr/bin/ditto", [
+    commandRunner("/usr/bin/ditto", [
       "--noqtn",
       inspected.appPath,
       stagedApp,
@@ -2201,8 +2830,17 @@ export async function packageMacOSDMG({
         await utimes(current, FIXED_EPOCH_SECONDS, FIXED_EPOCH_SECONDS);
       }
     }
+    if (releaseFinderTimestamp !== null) {
+      // The payload tree remains normalized to the fixed epoch. Restore the
+      // source-bound outer bundle dates so Finder does not expose that
+      // reproducibility sentinel as a release date.
+      finderMetadataSetter(stagedApp, {
+        birthTimeSeconds: releaseFinderTimestamp,
+        modificationTimeSeconds: releaseFinderTimestamp,
+      });
+    }
     await symlink("/Applications", join(staging, "Applications"));
-    runMacOSReleaseCommand("/usr/bin/hdiutil", [
+    commandRunner("/usr/bin/hdiutil", [
       "create",
       "-ov",
       "-srcfolder",
@@ -2223,7 +2861,7 @@ export async function packageMacOSDMG({
       failureMessage: "DMG creation failed",
       timeout: 300_000,
     });
-    runMacOSReleaseCommand("/usr/bin/hdiutil", [
+    commandRunner("/usr/bin/hdiutil", [
       "verify",
       temporaryDMG,
     ], {
@@ -2399,39 +3037,88 @@ function isValidRehearsalDate(value) {
     && candidate.getUTCDate() === day;
 }
 
-function isSafeRehearsalString(value) {
-  return typeof value === "string"
-    && value.length > 0
-    && value.length <= 128
-    && !value.includes("\0");
+function hasExactRehearsalFields(value, fields) {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    && Object.keys(value).length === fields.length
+    && fields.every((field) => Object.hasOwn(value, field));
+}
+
+function rehearsalMacOSVersionParts(value) {
+  if (typeof value !== "string"
+      || !/^[1-9][0-9]?\.(?:0|[1-9][0-9]?)(?:\.(?:0|[1-9][0-9]?))?$/u.test(value)) {
+    return null;
+  }
+  const [major, minor, patch = 0] = value.split(".").map(Number);
+  return [major, minor, patch];
+}
+
+function rehearsalMacOSAtLeast(actual, minimum) {
+  const actualParts = rehearsalMacOSVersionParts(actual);
+  const minimumParts = rehearsalMacOSVersionParts(minimum);
+  if (actualParts === null || minimumParts === null || minimumParts[0] < 14) {
+    return false;
+  }
+  for (let index = 0; index < minimumParts.length; index += 1) {
+    if (actualParts[index] !== minimumParts[index]) {
+      return actualParts[index] > minimumParts[index];
+    }
+  }
+  return true;
+}
+
+function isValidRehearsalApplication(application) {
+  return application?.bundleIdentifier === BUNDLE_IDENTIFIER
+    && isAppleMacOSBundleVersion(application.bundleVersion)
+    && typeof application.shortVersion === "string"
+    && application.shortVersion.length <= 32
+    && RELEASE_SOURCE_VERSION_PATTERN.test(application.shortVersion)
+    && (application.architecture === "arm64" || application.architecture === "x64")
+    && (application.channel === STABLE_RELEASE_CHANNEL
+      || application.channel === INTERNAL_DOGFOOD_RELEASE_CHANNEL)
+    && typeof application.sourceCommit === "string"
+    && /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u.test(application.sourceCommit)
+    && typeof application.payloadSha256 === "string"
+    && /^[a-f0-9]{64}$/u.test(application.payloadSha256);
 }
 
 /**
  * Validate a privacy-safe human rehearsal receipt. The receipt makes the
  * non-automatable lifecycle checks (real sign-in, replacement, move, and
  * uninstall) explicit without allowing release tooling to mutate a person's
- * Login Items database itself.
+ * Login Items database itself. Native hardware, OS, and non-Rosetta execution
+ * are manual observations, not facts automatically proved by this validator.
+ * All expected identity fields must come from the verified installed artifact;
+ * historical v1 receipts cannot qualify a current artifact.
  */
-export function validateMacOSLoginItemReleaseRehearsal(receipt, {
-  bundleIdentifier = BUNDLE_IDENTIFIER,
-  bundleVersion,
-  shortVersion,
-} = {}) {
+export function validateMacOSLoginItemReleaseRehearsal(receipt, expected = {}) {
   const recordedOn = receipt?.recordedOn;
-  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+  if (!hasExactRehearsalFields(expected, [
+    ...LOGIN_ITEM_REHEARSAL_APPLICATION_FIELDS, "minimumMacos",
+  ])
+      || !isValidRehearsalApplication(expected)
+      || !hasExactRehearsalFields(receipt, [
+        "schemaVersion", "evidenceKind", "recordedOn", "environment", "application", "checks",
+      ])
       || receipt.schemaVersion !== LOGIN_ITEM_RELEASE_REHEARSAL_SCHEMA
+      || receipt.evidenceKind !== "manual_observation"
       || !isValidRehearsalDate(recordedOn)
-      || receipt.environment?.cleanDisposableProfile !== true
-      || receipt.environment?.installedInApplications !== true
-      || receipt.application?.bundleIdentifier !== bundleIdentifier
-      || !isSafeRehearsalString(receipt.application?.bundleVersion)
-      || !isSafeRehearsalString(receipt.application?.shortVersion)
-      || (bundleVersion !== undefined
-        && receipt.application.bundleVersion !== bundleVersion)
-      || (shortVersion !== undefined
-        && receipt.application.shortVersion !== shortVersion)
+      || !hasExactRehearsalFields(receipt.environment, [
+        "cleanDisposableProfile", "installedInApplications", "hardwareArchitecture",
+        "macosVersion", "rosetta",
+      ])
+      || receipt.environment.cleanDisposableProfile !== true
+      || receipt.environment.installedInApplications !== true
+      || receipt.environment.hardwareArchitecture !== expected.architecture
+      || receipt.environment.rosetta !== false
+      || !rehearsalMacOSAtLeast(receipt.environment.macosVersion, expected.minimumMacos)
+      || !hasExactRehearsalFields(receipt.application, LOGIN_ITEM_REHEARSAL_APPLICATION_FIELDS)
+      || !isValidRehearsalApplication(receipt.application)
+      || LOGIN_ITEM_REHEARSAL_APPLICATION_FIELDS.some(
+        (key) => receipt.application[key] !== expected[key],
+      )
+      || !hasExactRehearsalFields(receipt.checks, REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS)
       || REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS.some(
-        (key) => receipt.checks?.[key] !== true,
+        (key) => receipt.checks[key] !== true,
       )) {
     fail(
       "Login Item release rehearsal receipt is incomplete or does not match the installed app",
@@ -2439,10 +3126,11 @@ export function validateMacOSLoginItemReleaseRehearsal(receipt, {
     );
   }
   return Object.freeze({
-    bundleIdentifier: receipt.application.bundleIdentifier,
-    bundleVersion: receipt.application.bundleVersion,
+    ...receipt.application,
+    evidenceKind: "manual_observation",
+    environment: Object.freeze({ ...receipt.environment }),
     recordedOn,
-    requiredChecks: [...REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS],
+    requiredChecks: Object.freeze([...REQUIRED_LOGIN_ITEM_REHEARSAL_CHECKS]),
   });
 }
 
@@ -2470,15 +3158,26 @@ function parseMacOSDeveloperIDNativeTrust(signature) {
 }
 
 export async function validateInstalledMacOSApp(appPath, {
+  architecture = "arm64",
   allowLegacyUnsealedSource = false,
+  [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: legacyDogfoodPreviousCapability = null,
+  [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability = null,
+  [VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT]: legacyStablePreviousCapability = null,
   channel = "stable",
   expectedBundleIdentifier = null,
   expectedBundleVersion = null,
   expectedShortVersion = null,
   production = true,
 } = {}) {
+  validateLegacyDogfoodPreviousCapability(legacyDogfoodPreviousCapability);
+  validatePreMigrationPreviousCapability(preMigrationPreviousCapability);
+  validateLegacyStablePreviousCapability(legacyStablePreviousCapability);
   const inspected = await inspectMacOSApp(appPath, {
+    architecture,
     allowLegacyUnsealedSource,
+    [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: legacyDogfoodPreviousCapability,
+    [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability,
+    [VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT]: legacyStablePreviousCapability,
     channel,
     requireExternalDistribution: production,
   });
@@ -2516,6 +3215,9 @@ export async function validateInstalledMacOSApp(appPath, {
       fail("Installed application is not Developer ID hardened");
     }
     nativeTrust = parseMacOSDeveloperIDNativeTrust(signature);
+    if (inspected.buildManifest.runtime?.keychainMigrationHelper !== undefined) {
+      verifyMacOSKeychainMigrationSignatures(inspected.appPath);
+    }
     runMacOSReleaseCommand("/usr/bin/xcrun", [
       "stapler",
       "validate",
@@ -2577,6 +3279,8 @@ export async function validateInstalledMacOSApp(appPath, {
   }
   const result = {
     bundleIdentifier: inspected.bundleIdentifier,
+    architecture: inspected.architecture,
+    minimumMacos: inspected.minimumMacos,
     production,
     shortVersion: inspected.shortVersion,
   };
@@ -2589,7 +3293,11 @@ export async function validateInstalledMacOSApp(appPath, {
 }
 
 export async function validateMacOSDMG(path, {
+  architecture = "arm64",
   allowLegacyUnsealedSource = false,
+  [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: legacyDogfoodPreviousCapability = null,
+  [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability = null,
+  [VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT]: legacyStablePreviousCapability = null,
   channel = "stable",
   distribution = null,
   expectedBundleIdentifier = null,
@@ -2597,10 +3305,21 @@ export async function validateMacOSDMG(path, {
   expectedShortVersion = null,
   production = true,
 } = {}) {
+  normalizeMacOSBuildArchitecture(architecture);
+  const legacyDogfoodPrevious = validateLegacyDogfoodPreviousCapability(
+    legacyDogfoodPreviousCapability,
+  );
+  const preMigrationPrevious = validatePreMigrationPreviousCapability(
+    preMigrationPreviousCapability,
+  );
+  const legacyStablePrevious = validateLegacyStablePreviousCapability(
+    legacyStablePreviousCapability,
+  );
   const selectedDistribution = distribution ?? (
     production ? DMG_DISTRIBUTIONS.release : DMG_DISTRIBUTIONS.development
   );
   if (typeof allowLegacyUnsealedSource !== "boolean"
+      || (allowLegacyUnsealedSource && !legacyStablePrevious)
       || (allowLegacyUnsealedSource && !production)
       || !Object.values(DMG_DISTRIBUTIONS).includes(selectedDistribution)
       || production !== (selectedDistribution === DMG_DISTRIBUTIONS.release)) {
@@ -2614,7 +3333,37 @@ export async function validateMacOSDMG(path, {
     ? PREVIEW_PRODUCT_BRAND
     : PRODUCT_BRAND;
   const selected = resolve(path);
-  await regularPath(selected);
+  const metadata = await regularPath(selected);
+  if (legacyStablePrevious
+      && (!production || channel !== STABLE_RELEASE_CHANNEL
+        || metadata.size !== LEGACY_STABLE_PREVIOUS_RELEASE.artifactBytes
+        || await sha256File(selected)
+          !== LEGACY_STABLE_PREVIOUS_RELEASE.artifactSha256)) {
+    fail(
+      "Legacy stable compatibility requires the exact previous DMG bytes",
+      "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
+  if (legacyDogfoodPrevious
+      && (!production || channel !== INTERNAL_DOGFOOD_RELEASE_CHANNEL
+        || metadata.size !== LEGACY_DOGFOOD_PREVIOUS_RELEASE.artifactBytes
+        || await sha256File(selected)
+          !== LEGACY_DOGFOOD_PREVIOUS_RELEASE.artifactSha256)) {
+    fail(
+      "Legacy dogfood source compatibility requires the exact previous DMG bytes",
+      "MACOS_LEGACY_SOURCE_COMPATIBILITY_INVALID",
+    );
+  }
+  if (preMigrationPrevious
+      && (!production || channel !== INTERNAL_DOGFOOD_RELEASE_CHANNEL
+        || metadata.size !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.artifactBytes
+        || await sha256File(selected)
+          !== PRE_MIGRATION_DOGFOOD_PREVIOUS_RELEASE.artifactSha256)) {
+    fail(
+      "Pre-migration helper compatibility requires the exact previous DMG bytes",
+      "MACOS_KEYCHAIN_MIGRATION_COMPATIBILITY_INVALID",
+    );
+  }
   runMacOSReleaseCommand("/usr/bin/hdiutil", ["verify", selected], {
     failureMessage: "DMG verification failed",
     timeout: 300_000,
@@ -2670,7 +3419,7 @@ export async function validateMacOSDMG(path, {
       failureMessage: "Mounted application copy failed",
     });
     if (selectedDistribution === DMG_DISTRIBUTIONS.preview) {
-      const inspectedPreview = await validateMacOSPreviewApp(installedApp);
+      const inspectedPreview = await validateMacOSPreviewApp(installedApp, { architecture });
       if ((expectedBundleIdentifier !== null
           && inspectedPreview.bundleIdentifier !== expectedBundleIdentifier)
           || (expectedBundleVersion !== null
@@ -2684,12 +3433,18 @@ export async function validateMacOSDMG(path, {
       }
       return Object.freeze({
         bundleIdentifier: inspectedPreview.bundleIdentifier,
+        architecture: inspectedPreview.architecture,
+        minimumMacos: inspectedPreview.minimumMacos,
         production: false,
         shortVersion: inspectedPreview.shortVersion,
       });
     }
     return await validateInstalledMacOSApp(installedApp, {
+      architecture,
       allowLegacyUnsealedSource,
+      [VERIFIED_LEGACY_DOGFOOD_PREVIOUS_ARTIFACT]: legacyDogfoodPreviousCapability,
+      [VERIFIED_PRE_MIGRATION_PREVIOUS_ARTIFACT]: preMigrationPreviousCapability,
+      [VERIFIED_LEGACY_STABLE_PREVIOUS_ARTIFACT]: legacyStablePreviousCapability,
       channel,
       expectedBundleIdentifier,
       expectedBundleVersion,
@@ -2744,13 +3499,15 @@ async function assertReplaceableReleaseTarget(path, {
  * credentials, and key continuity inside the builder before writing output.
  */
 export async function prepareMacOSReleaseCandidate({
+  architecture = "arm64",
+  nodeRuntime = null,
   channel,
   output,
   environment = process.env,
   previousStableManifestPath = null,
   stableBootstrap = false,
 }) {
-  const releaseChannel = resolveReleaseChannel(channel);
+  const releaseChannel = resolveReleaseChannel(channel, { architecture });
   if (releaseChannel.name !== STABLE_RELEASE_CHANNEL
       && (previousStableManifestPath !== null || stableBootstrap)) {
     fail(
@@ -2761,14 +3518,18 @@ export async function prepareMacOSReleaseCandidate({
   const buildConfiguration = readMacOSReleaseBuildConfiguration(
     environment,
     releaseChannel.name,
+    { architecture },
   );
   const updaterConfiguration = await normalizeMacOSUpdaterConfiguration({
+    architecture,
     appcastURL: buildConfiguration.sparkleAppcastURL,
     externalDistribution: true,
     frameworkPath: buildConfiguration.sparkleFramework,
     publicEdKey: buildConfiguration.sparklePublicEdKey,
   });
   return buildMacOSReleaseCandidate({
+    architecture,
+    nodeRuntime,
     output: resolve(output),
     centralOrigin: buildConfiguration.productionOrigin,
     externalDistribution: true,
@@ -2784,6 +3545,8 @@ export async function prepareMacOSReleaseCandidate({
 }
 
 export async function releaseMacOSApp({
+  architecture = "arm64",
+  nodeRuntime = null,
   appPath,
   channel,
   output,
@@ -2792,7 +3555,7 @@ export async function releaseMacOSApp({
   replace = false,
   stableBootstrap = false,
 }) {
-  const releaseChannel = resolveReleaseChannel(channel);
+  const releaseChannel = resolveReleaseChannel(channel, { architecture });
   if (previousStableManifestPath !== null
       && (typeof previousStableManifestPath !== "string"
         || previousStableManifestPath.length === 0
@@ -2810,8 +3573,9 @@ export async function releaseMacOSApp({
     );
   }
   const buildConfiguration =
-    readMacOSReleaseBuildConfiguration(environment, releaseChannel.name);
+    readMacOSReleaseBuildConfiguration(environment, releaseChannel.name, { architecture });
   const updaterConfiguration = await normalizeMacOSUpdaterConfiguration({
+    architecture,
     appcastURL: buildConfiguration.sparkleAppcastURL,
     externalDistribution: true,
     frameworkPath: buildConfiguration.sparkleFramework,
@@ -2821,6 +3585,7 @@ export async function releaseMacOSApp({
     ? null
     : await readStableReleaseManifest(previousStableManifestPath);
   assertStableSparkleKeyContinuity({
+    architecture,
     candidateBundleVersion: buildConfiguration.bundleVersion,
     candidatePublicEdKeySha256: createHash("sha256")
       .update(Buffer.from(updaterConfiguration.publicEdKey, "base64"))
@@ -2835,6 +3600,7 @@ export async function releaseMacOSApp({
   // raw Git remote is ever written to a customer-facing artifact.
   const credentials = readMacOSReleaseCredentials(environment);
   const inspectedCandidate = await inspectMacOSApp(appPath, {
+    architecture,
     channel: releaseChannel.name,
     requireExternalDistribution: true,
   });
@@ -2867,6 +3633,10 @@ export async function releaseMacOSApp({
       || !selectedOutput.endsWith(".dmg")) {
     fail("Release output must be a visible .dmg file");
   }
+  if (basename(selectedOutput)
+      !== `TiboTattle-${inspectedCandidate.shortVersion}-macOS-${architecture}.dmg`) {
+    fail("Release output filename must match the application version and architecture", "MACOS_RELEASE_ARCHITECTURE_MISMATCH");
+  }
   const releaseManifestPath = `${selectedOutput}.release.json`;
   const outputParent = dirname(selectedOutput);
   await mkdir(outputParent, { recursive: true, mode: 0o755 });
@@ -2895,6 +3665,8 @@ export async function releaseMacOSApp({
   );
   try {
     await buildMacOSAppForRelease({
+      architecture,
+      nodeRuntime,
       output: stagedApp,
       centralOrigin: buildConfiguration.productionOrigin,
       externalDistribution: true,
@@ -2909,6 +3681,7 @@ export async function releaseMacOSApp({
       sparklePublicEdKey: updaterConfiguration.publicEdKey,
     });
     const inspected = await inspectMacOSApp(stagedApp, {
+      architecture,
       channel: releaseChannel.name,
       requireExternalDistribution: true,
     });
@@ -2938,6 +3711,7 @@ export async function releaseMacOSApp({
       );
     }
     await developerIDSignMacOSApp(stagedApp, {
+      architecture,
       channel: releaseChannel.name,
       identity: credentials.identity,
     });
@@ -2956,10 +3730,12 @@ export async function releaseMacOSApp({
     });
     stapleAndValidate(stagedApp);
     await validateInstalledMacOSApp(stagedApp, {
+      architecture,
       channel: releaseChannel.name,
       production: true,
     });
     await packageMacOSDMG({
+      architecture,
       appPath: stagedApp,
       output: stagedDMG,
       replace: false,
@@ -2975,6 +3751,7 @@ export async function releaseMacOSApp({
     });
     stapleAndValidate(stagedDMG);
     const validatedDMG = await validateMacOSDMG(stagedDMG, {
+      architecture,
       channel: releaseChannel.name,
       production: true,
     });
@@ -3001,6 +3778,7 @@ export async function releaseMacOSApp({
     const releaseManifest = {
       schemaVersion: RELEASE_MANIFEST_SCHEMA,
       application: {
+        architecture,
         bundleIdentifier: inspected.bundleIdentifier,
         bundleVersion: inspected.bundleVersion,
         shortVersion: inspected.shortVersion,
@@ -3028,6 +3806,7 @@ export async function releaseMacOSApp({
           inspected.buildManifest.inputs.sourceSha256,
       },
       channel: createReleaseChannelProvenance(releaseChannel.name, {
+        architecture,
         publicEdKeySha256:
           inspected.buildManifest.release.updater.publicEdKeySha256,
       }),

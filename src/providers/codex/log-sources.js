@@ -19,6 +19,8 @@ const DISCOVERY_REASON_CODES = new Set([
   "codex_rollout_filename_identity_mismatch",
   "codex_rollout_generation_ambiguous",
   "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
 ]);
 
 function sourceName(path) {
@@ -36,9 +38,8 @@ function normalizeCodexIdentity(value) {
  * Parse the two identities Codex encodes in canonical rollout basenames.
  * The first UUID is the stable thread. The optional UUID after `_` is the
  * immutable replacement rollout; an ordinary file uses the thread UUID as
- * its rollout UUID. Compressed siblings are recognized so they can terminate
- * once with an explicit bounded diagnostic instead of disappearing from
- * discovery or being handed to the JSONL reader.
+ * its rollout UUID. Compression changes the physical representation, never
+ * the immutable rollout identity or logical uncompressed byte offsets.
  */
 export function parseCodexRolloutFilename(path) {
   if (typeof path !== "string") return null;
@@ -290,6 +291,12 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       const stats = await handle.stat();
       assertActiveSourceStats(stats, info);
       await statActiveSourcePath(info.path, stats);
+      if (info.compressed) {
+        if (stats.size !== info.physicalSize || stats.mtimeMs !== info.mtimeMs
+            || stats.ctimeMs !== info.ctimeMs) sourceChanged();
+        const prefixSha256 = await hashActiveSourcePrefix(handle, stats.size, resourceGuard, signal);
+        return { handle: lineReader.compressedRolloutHandle(handle), prefixSha256 };
+      }
       if (stats.size < info.size) sourceChanged();
       if (stats.size === info.size
           && (stats.mtimeMs !== info.mtimeMs || stats.ctimeMs !== info.ctimeMs)) sourceChanged();
@@ -336,6 +343,17 @@ export function createCodexLogSources({ filesystem, lineReader }) {
     signal = null,
   ) {
     const { handle, prefixSha256 } = snapshot;
+    if (info.compressed) {
+      const before = await handle.stat();
+      assertActiveSourceStats(before, info);
+      if (before.size !== info.physicalSize || before.mtimeMs !== info.mtimeMs
+          || before.ctimeMs !== info.ctimeMs) sourceChanged();
+      if (await hashActiveSourcePrefix(handle, before.size, resourceGuard, signal) !== prefixSha256) sourceChanged();
+      const after = await handle.stat();
+      const pathStats = await statActiveSourcePath(info.path, after);
+      if (!sameSourceState(before, after) || !sameSourceState(after, pathStats)) sourceChanged();
+      return;
+    }
     for (let attempt = 0; attempt < 3; attempt += 1) {
       throwIfAborted(signal);
       let before;
@@ -378,8 +396,18 @@ export function createCodexLogSources({ filesystem, lineReader }) {
     sourceChanged();
   }
 
-  async function assertCompleteRolloutTail(info, signal = null) {
+  async function assertCompleteRolloutTail(info, signal = null, resourceGuard = null) {
     throwIfAborted(signal);
+    if (info?.compressed) {
+      const inspected = await lineReader.inspectCompressedRollout(info.path, { signal, resourceGuard });
+      if (inspected.size > 0 && inspected.lastByte !== 0x0a) {
+        const error = new Error("Codex rollout has an unfinished final JSONL record");
+        error.name = "CodexRolloutCoverageError";
+        error.code = "codex_rollout_tail_incomplete";
+        throw error;
+      }
+      return;
+    }
     if (Number(info?.size ?? 0) === 0) return;
     let handle;
     try {
@@ -458,17 +486,33 @@ export function createCodexLogSources({ filesystem, lineReader }) {
     resourceGuard = null,
     maximumTotalBytes = MAXIMUM_ROLLOUT_LINEAGE_BYTES,
     signal = null,
+    prefix = null,
   } = {}) {
     if (!validAbortSignal(signal)) throw new TypeError("signal must be an AbortSignal or null");
     throwIfAborted(signal);
-    for await (const line of boundedScannerLines(
+    // Compressed discovery already validated and hashed the complete stream.
+    // Reuse its bounded complete-line prefix instead of decompressing it twice.
+    function* prefixLines() {
+      let start = 0;
+      for (;;) {
+        const end = prefix.indexOf(0x0a, start);
+        if (end < 0) return;
+        // Decode lazily: stop at session metadata without decoding any later
+        // prompt-bearing records that share the bounded source prefix.
+        yield prefix.toString("utf8", start, end);
+        start = end + 1;
+      }
+    }
+    const lines = prefix === null ? boundedScannerLines(
       path,
       resourceGuard,
       maximumTotalBytes,
       signal,
-    )) {
+    ) : prefixLines();
+    for await (const line of lines) {
       throwIfAborted(signal);
       if (line === null) continue;
+      if (prefix !== null) resourceGuard?.observeLine(Buffer.byteLength(line));
       if (!line.includes('"session_meta"')) continue;
       try {
         const record = JSON.parse(line);
@@ -486,16 +530,18 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           ? "paginated"
           : "legacy";
         const rawBase = record.payload.history_base;
-        const historyBase = rawBase && typeof rawBase === "object"
-          && !Array.isArray(rawBase)
-          ? {
-            rolloutId: typeof rawBase.thread_id === "string"
+        // Only absent/null means an independent reset. Preserve malformed
+        // non-null shapes as an invalid base so discovery cannot silently
+        // reinterpret a damaged continuation as fresh, countable history.
+        const historyBase = rawBase === undefined || rawBase === null
+          ? null
+          : {
+            rolloutId: typeof rawBase?.thread_id === "string"
               ? normalizeCodexIdentity(rawBase.thread_id)
               : null,
-            endOrdinalExclusive: rawBase.end_ordinal_exclusive,
-            endByteOffset: rawBase.end_byte_offset,
-          }
-          : null;
+            endOrdinalExclusive: rawBase?.end_ordinal_exclusive,
+            endByteOffset: rawBase?.end_byte_offset,
+          };
         const startOrdinalValid = Number.isSafeInteger(record.ordinal)
           && record.ordinal >= 0;
         return {
@@ -591,12 +637,47 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       ...archived.map((info) => [rolloutKey(info.path), { ...info, location: "archive" }]),
       ...active.map((info) => [rolloutKey(info.path), { ...info, location: "active" }]),
     ];
+    // Retain existing plain-file parallelism, but permit at most two native
+    // decoder windows while discovering cold histories.
+    const decoderWaiters = [];
+    let activeDecoders = 0;
+    async function inspectColdSource(path) {
+      if (activeDecoders >= 2) await new Promise((resolve) => decoderWaiters.push(resolve));
+      else activeDecoders += 1;
+      try {
+        throwIfAborted(signal);
+        return await lineReader.inspectCompressedRollout(path, { resourceGuard, signal });
+      } finally {
+        const next = decoderWaiters.shift();
+        if (next) next();
+        else activeDecoders -= 1;
+      }
+    }
     const all = await mapWithConcurrency(representations, 16, async ([key, info]) => {
       throwIfAborted(signal);
       const filename = parseCodexRolloutFilename(info.path);
-      const lineage = filename?.compressed === true
+      const compressed = info.path.endsWith(".jsonl.zst");
+      let compressionReason = null;
+      let inspection = null;
+      if (compressed) {
+        if (lineReader.supportsCompressedRollouts?.() !== true) {
+          compressionReason = "codex_rollout_compression_unsupported";
+        } else {
+          try {
+            inspection = await inspectColdSource(info.path);
+            if (inspection.size > 0 && inspection.lastByte !== 0x0a) {
+              compressionReason = "codex_rollout_tail_incomplete";
+            }
+          } catch (error) {
+            rethrowScannerControlError(error);
+            if (error?.code === "codex_rollout_source_changed") sourceChanged();
+            compressionReason = "codex_rollout_content_invalid";
+          }
+        }
+      }
+      const lineage = compressionReason !== null
         ? {
-          sessionId: filename.threadId,
+          sessionId: filename?.threadId ?? null,
           parentId: null,
           isFork: false,
           isInlineFork: false,
@@ -619,12 +700,19 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           // its fixed `line_bytes` error.
           maximumTotalBytes: MAXIMUM_ROLLOUT_LINEAGE_BYTES,
           signal,
+          prefix: inspection?.prefix ?? null,
         });
       return {
         ...info,
+        ...(inspection === null ? {} : {
+          physicalSize: info.size,
+          size: inspection.size,
+          contentSha256: inspection.sha256,
+        }),
         rolloutKey: key,
         canonicalFilename: filename !== null,
-        compressed: filename?.compressed === true,
+        compressed,
+        compressionReason,
         threadId: filename?.threadId ?? lineage.sessionId ?? null,
         rolloutId: filename?.rolloutId ?? null,
         sourceIdentity: filename?.rolloutId ?? key,
@@ -650,10 +738,10 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       const group = groups.get(groupKey) ?? [];
       group.push(info);
       groups.set(groupKey, group);
-      if (info.compressed) {
+      if (info.compressionReason !== null) {
         invalidGroupReason.set(
           groupKey,
-          "codex_rollout_compression_unsupported",
+          info.compressionReason,
         );
       } else if (info.canonicalFilename
           && info.lineage?.sessionId !== info.threadId) {
@@ -698,6 +786,7 @@ export function createCodexLogSources({ filesystem, lineReader }) {
 
     const duplicateRepresentations = new Set();
     async function digestSource(info) {
+      if (info.compressed && info.contentSha256) return info.contentSha256;
       let handle;
       try {
         handle = await filesystem.openReadOnlyNoFollow(info.path);
@@ -752,7 +841,8 @@ export function createCodexLogSources({ filesystem, lineReader }) {
           break;
         }
         const ordered = sameSource.toSorted((left, right) => (
-          (left.location === "active" ? 0 : 1)
+          Number(left.compressed) - Number(right.compressed)
+          || (left.location === "active" ? 0 : 1)
             - (right.location === "active" ? 0 : 1)
           || left.rolloutKey.localeCompare(right.rolloutKey)
           || left.path.localeCompare(right.path)
@@ -882,8 +972,32 @@ export function createCodexLogSources({ filesystem, lineReader }) {
         handle = await filesystem.openReadOnlyNoFollow(parent.path);
         const stats = await handle.stat();
         assertActiveSourceStats(stats, parent);
-        if (stats.size !== parent.size || base.endByteOffset > stats.size) {
+        if (stats.size !== (parent.physicalSize ?? parent.size) || base.endByteOffset > parent.size) {
           return false;
+        }
+        if (parent.compressed) {
+          let bytes = 0;
+          let lines = 0;
+          let lastByte = null;
+          for await (const chunk of lineReader.readCompressedRolloutBytes(
+            lineReader.compressedRolloutHandle(handle),
+            { end: base.endByteOffset, resourceGuard, signal },
+          )) {
+            bytes += chunk.length;
+            let from = 0;
+            for (;;) {
+              const newline = chunk.indexOf(0x0a, from);
+              if (newline < 0) break;
+              lines += 1;
+              from = newline + 1;
+            }
+            lastByte = chunk[chunk.length - 1] ?? lastByte;
+          }
+          const startOrdinal = Number(parent.lineage?.startOrdinal ?? 0);
+          valid = bytes === base.endByteOffset && base.endOrdinalExclusive > startOrdinal
+            && lines === base.endOrdinalExclusive - startOrdinal
+            && (bytes === 0 || lastByte === 0x0a);
+          return valid;
         }
         const buffer = Buffer.allocUnsafe(256 * 1024);
         let offset = 0;
@@ -1298,6 +1412,8 @@ export function createCodexLogSources({ filesystem, lineReader }) {
       }
       const path = sourcePaths[key];
       if (typeof path !== "string") return false;
+      // Cold compressed representations are immutable, never append sources.
+      if (path.endsWith(".jsonl.zst")) return false;
       if (prior.size > 0) {
         let lastCharacter = "";
         for await (const chunk of filesystem.readUtf8Range(path, {

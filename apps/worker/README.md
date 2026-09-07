@@ -130,6 +130,26 @@ credential hash while claiming the pairing. Device authority can synchronize,
 renew or disconnect itself, and mint Upload authority; it cannot read session
 controls, export data, manage other devices, or delete hosted participation.
 
+The account/plan-attributed v1.1 successor is implemented but starts **staged**
+in migration 0044. It requires accepted server capabilities, an explicit
+hosted-session grant for the exact contract, and separate local field review
+and approval. Pairing, device renewal and existing v1 consent cannot grant it.
+The participant's persisted minimum write rank applies to every ingestion path,
+including v0.2 if that dormant format is deliberately re-enabled.
+
+Staged day chunks are immutable. Migration 0045 adds a complete-domain activation
+boundary with exact legacy/successor occurrence compatibility proof, rather than
+a per-day schema switch. Partial delivery leaves the old analytical source
+selected; same-vector retries do not republish. Quota, usage, daily and model
+consumers share source pins and existing publication/cache fences. Account
+attribution remains conditional where quantity intervals cannot be proven.
+Participants with accepted v0.2 history cannot raise their floor to v1.1 or
+activate a successor, even on disjoint dates, until a semantic replacement
+adapter is proven. Their existing analytical source remains selected.
+Applying these migrations, enabling lifecycle acceptance or uploading real data
+requires separate owner authorization and rehearsal; source tests are not a
+production cutover receipt.
+
 The current public product series is `GET /api/v1/community/daily`.
 Self-service `DELETE /api/v1/me` is retired: the unknown API response is
 `404 NOT_FOUND`, without D1 access or participant mutation. `GET /api/v1/me`,
@@ -148,6 +168,13 @@ and admin CSRF remain required. Omitting that object means ordinary maintenance
 only; there is no new route or action enum. Follow the
 [owner procedure](../../docs/runbooks/production-operations.md#private-owner-participant-erasure)
 for response, audit, retry, and safe-pipeline requirements.
+
+The same owner maintenance boundary also accepts a closed `transportRollback`
+operation with the exact participant, expected floor revision, old/new rank and
+`confirmation: "lower_transport_admission_preserving_analytical_source"`.
+It records a purpose-separated participant digest in the audit and changes only
+future upload admission. It never unpins an active v1.1 domain, erases consent
+history or restores deleted records. Stale/replayed revisions fail closed.
 
 Health advertises `participantDeletion: false` separately from
 `deletionSafeRestoreReplay: true`. Retirement does not change retention,
@@ -173,6 +200,14 @@ the live row counts or deployed Worker revision.
 Forward-only D1 migrations are under `migrations/` and are applied in numeric
 order. Never document a hard-coded migration ceiling as the operating contract;
 the checked-in directory is the current set.
+
+The 2026-09-04 lineage reconciliation preserves the already-applied historical
+`0041_community_model_composition_cache.sql` and numbers the separate model
+composition and attribution migrations `0042`–`0045`. These are not aliases for
+the historical migration. See the
+[lineage review](../../docs/reviews/2026-09-04-hosted-migration-lineage-reconciliation.md)
+before reconciling any environment with a different ledger; exact ordered-prefix
+validation remains fail-closed.
 
 Deploying Worker code does not apply D1 migrations. Applying D1 migrations does
 not deploy code. For schema-dependent changes, locally prove both pre-migration

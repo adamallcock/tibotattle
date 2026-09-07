@@ -1,6 +1,6 @@
 {
   "name": "@app-usagemonitor/identity-core",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "private": true,
   "type": "module",
   "description": "Deterministic pseudonym derivation primitives shared by local Node runtimes.",

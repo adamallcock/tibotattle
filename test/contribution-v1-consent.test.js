@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 
 import {
   createLocalIncrementalContributionSyncContext,
+  incrementalContributionRequiredConsent,
 } from "../src/application/local-incremental-contribution-sync.js";
+import { TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
 
 const ORIGIN = "https://usage.example";
 const SETTINGS_FILE = "/state/private/incremental-contribution-sync-v1.json";
@@ -115,6 +117,35 @@ test("nothing syncs before the approve-once consent is recorded", async () => {
   assert.equal(status.consent.current, false);
   assert.equal(status.nextAttemptAt, null);
   assert.equal(status.progress, null);
+});
+
+test("v1.1 requires an explicit exact destination-bound approval and survives controller restart", async () => {
+  const seen = [];
+  const runner = async ({ consent }) => { seen.push(consent); return runOutcome(); };
+  const first = harness({ runner });
+  await first.controller.start();
+  await first.controller.approve();
+  await first.controller.runDue();
+  assert.equal(seen[0].telemetrySchemaVersion, "telemetry-contribution-v1.0");
+  const consent = incrementalContributionRequiredConsent({ destinationOrigin: ORIGIN,
+    telemetrySchemaVersion: TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION });
+  for (const invalid of [
+    { ...consent, destinationOrigin: "https://other.example" },
+    { ...consent, fieldDictionaryVersion: "telemetry-v1.0-registry-2026-08-07.1" },
+    { ...consent, consentedAt: first.nowIso() },
+  ]) await assert.rejects(first.controller.approve({ consent: invalid }), { code: "incremental_contribution_consent_unavailable" });
+  assert.equal((await first.controller.inspect()).contractVersion, "telemetry-contribution-v1.0");
+  const approved = await first.controller.approve({ consent });
+  assert.equal(approved.contractVersion, TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION);
+  assert.equal(approved.progress, null, "old v1 acknowledged days are not v1.1 activation evidence");
+  await first.controller.stop();
+  const restarted = harness({ storage: first.storage, runner });
+  await restarted.controller.start();
+  assert.equal((await restarted.controller.inspect()).consent.current, true);
+  await restarted.controller.runDue();
+  assert.deepEqual(seen[1], consent);
+  assert.equal(Object.isFrozen(seen[1]), true);
+  await restarted.controller.stop();
 });
 
 test("approval records the exact v1.0 consent once and syncing runs without further action", async () => {
@@ -574,6 +605,38 @@ test("disconnect before approval does not invent consent, progress, or a pass", 
   await controller.runDue();
   assert.equal(runs.length, 1);
   await controller.stop();
+});
+
+test("device repair pause survives restart and only validated repair completion can rearm delivery", async () => {
+  const first = harness();
+  await first.controller.start();
+  await first.controller.approve();
+  await first.controller.runDue();
+  const before = JSON.parse(first.storage.files.get(SETTINGS_FILE));
+  const paused = await first.controller.pauseForDeviceRepair();
+  assert.equal(paused.pausedReason, "device_repair_required");
+  assert.deepEqual(JSON.parse(first.storage.files.get(SETTINGS_FILE)), {
+    ...before, paused: true, pausedReason: "device_repair_required", nextAttemptAt: null,
+  });
+  await first.controller.stop();
+  const second = harness({ storage: first.storage });
+  await second.controller.start();
+  second.advance(7 * 24 * 60 * 60 * 1_000);
+  for (const bypass of [() => second.controller.resume(), () => second.controller.approve(),
+    () => second.controller.pauseForDeviceDisconnect()]) {
+    await assert.rejects(bypass(), { code: "incremental_contribution_device_repair_required" });
+  }
+  await second.controller.runDue();
+  assert.equal(second.runs.length, 0);
+  assert.equal((await second.controller.inspect()).pausedReason, "device_repair_required");
+  const resumed = await second.controller.resumeAfterDeviceRepair();
+  assert.equal(resumed.paused, false);
+  assert.deepEqual(resumed.consent, paused.consent);
+  assert.deepEqual(resumed.progress, paused.progress);
+  assert.deepEqual(resumed.lastOutcome, paused.lastOutcome);
+  await second.controller.runDue();
+  assert.equal(second.runs.length, 1);
+  await second.controller.stop();
 });
 
 for (const completion of ["success", "rejection", "deadline"]) {

@@ -3,7 +3,6 @@ title: Unified Index Preservation and Recovery
 date: 2026-08-27
 type: runbook
 status: maintained
-last_verified_commit: 52399658
 ---
 
 # Unified index preservation and recovery
@@ -80,14 +79,56 @@ Compare the copy with the current constants in `src/local-unified-index.js`:
 
 - schema family `local-unified-index-v2`;
 - `user_version` 11;
-- parser `unified-rollout-typed-v11`; and
+- parser `unified-rollout-typed-v15`; and
 - source identity `codex-immutable-rollout-v1`.
 
-A physical schema-11 index can still need a one-time v10-to-v11 parser rescan.
-The companion grants a proven supported published transition the bounded
-four-hour cold-refresh deadline; ordinary current-parser refreshes keep five
-minutes. Missing, unknown, or inconsistent provenance must not be relabelled to
-obtain that budget.
+A physical schema-11 index can still need older-parser sources reparsed under
+v15. Still-present sources are rescanned; facts whose sources have rotated away
+retain their original parser provenance. Parser v12 preserves missing counters
+as unknown rather than zero, and v13 recognizes ordinal-bearing compaction
+headers. Parser v14 prevents paginated resets or unknown physical-base settings
+from inheriting a logical parent's later model, effort or speed. Only the
+explicit physical history boundary or the segment's own observations/cursor
+can supply paginated carried settings. Missing evidence remains unknown.
+Descendants also stop tier and replay-snapshot inheritance at the selected
+paginated history. A retired physical export remains counted but cannot replace
+the explicitly resolved logical head, regardless of scan order. Ambiguous heads
+do not supply inherited state.
+Parser v15 restores a model-only assumption for a fork without an exact base:
+use the parent's declaration at/before the usage and child-creation boundary,
+then let explicit child selections override it. Per-row `-parent-model` parser
+variants preserve this inferred provenance. It does not inherit tier, effort,
+counters or replay state; the safeguards above still apply to those fields.
+
+These interpretation changes do not change the physical schema or the
+`codex-immutable-rollout-v1` source-identity contract; never relabel retained
+facts to the new parser.
+
+The companion grants the bounded four-hour cold-refresh deadline only to the
+reviewed published v10/v11/v12/v13/v14-to-v15 parser transitions. The target is pinned
+to v15; a future parser must review its predecessor set explicitly. Physical
+schema, reader/writer compatibility, source identity, and telemetry contracts
+must match, and the published generation must be complete or one of the
+already supported quarantine/tool-provenance partial states. Only the current
+publication selects the budget: rotated sources' older parser rows do not
+extend an ordinary refresh. Current, unknown, malformed, future, and otherwise
+uncertain parser evidence retains the five-minute deadline.
+
+An absent index or a proven supported older physical schema also qualifies
+for the bounded four-hour cold-refresh deadline. This replaces the former
+parser-only v10-to-v11 deadline exception, not the historical physical-schema
+migration rules. Missing, unknown, or inconsistent provenance must not be
+relabelled to obtain that budget. If a rescan cannot finish inside its actual
+bound, preserve state and resolve the qualification gap instead of repeatedly
+restarting it.
+
+A current-parser index can also require a full accounting rebuild after the
+current cache fails its authoritative schema, generation, context, or reuse
+check. The runner emits the fixed accounting-work marker only immediately before
+that rebuild; the controller then applies the same four-hour total deadline.
+Do not infer this state from displayed retained figures, edit cache metadata, or
+retry a five-minute failure in a loop: accounting has no durable mid-build
+checkpoint, so an interrupted rebuild restarts from its retained source state.
 
 Index publication and accounting completion are separate stages. If a refresh
 times out after publishing, inspect its published generation and accounting

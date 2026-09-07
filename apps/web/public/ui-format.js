@@ -365,6 +365,7 @@ export function formatAge(value) {
  * vendor does not use.
  */
 const MODEL_NAME_FRAGMENTS = Object.freeze({
+  astra: "Astra",
   auto: "Auto",
   claude: "Claude",
   codex: "Codex",

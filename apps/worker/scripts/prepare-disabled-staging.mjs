@@ -408,6 +408,7 @@ export async function prepareDisabledStaging({
   );
   if (!afterMigrations.checks.migrationsCurrent
       || !afterMigrations.checks.pilotSchemaCurrent
+      || !afterMigrations.checks.attributionSchemaCurrent
       || !afterMigrations.checks.collectionContained
       || !identityProtectionSchemaVerified(afterMigrations)
       || migrationVerificationBlockers.length > 0) {
@@ -434,6 +435,7 @@ export async function prepareDisabledStaging({
         afterMigrations.checks.remoteMigrationInventoryCurrent,
       migrationsCurrent: afterMigrations.checks.migrationsCurrent,
       pilotSchemaCurrent: afterMigrations.checks.pilotSchemaCurrent,
+      attributionSchemaCurrent: afterMigrations.checks.attributionSchemaCurrent,
       primaryReenrollmentSchemaCurrent:
         afterMigrations.checks.primaryReenrollmentSchemaCurrent,
       deletionLedgerSchemaCurrent:

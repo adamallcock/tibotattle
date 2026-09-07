@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { localCodexLogScanner } from "../src/local-node-runtime.js";
+import { supportsCompressedRollouts } from "../src/platform/index.js";
 import {
   readCodexSelectedRolloutNames,
 } from "../src/platform/local-codex-thread-store.js";
@@ -935,7 +936,7 @@ test("quarantine propagates through a deep logical chain without recursion", asy
   }
 });
 
-test("compressed and filename-mismatched rollouts are explicit bounded quarantines", async () => {
+test("malformed compressed and filename-mismatched rollouts are explicit bounded quarantines", async () => {
   const fixture = await emptyCanonicalHome();
   try {
     await writeRecent(join(
@@ -955,7 +956,7 @@ test("compressed and filename-mismatched rollouts are explicit bounded quarantin
     assert.equal(infos.length, 0);
     assert.equal(receipt.skippedThreadCount, 2);
     assert.deepEqual(receipt.reasonCounts, {
-      codex_rollout_compression_unsupported: 1,
+      [supportsCompressedRollouts() ? "codex_rollout_content_invalid" : "codex_rollout_compression_unsupported"]: 1,
       codex_rollout_filename_identity_mismatch: 1,
     });
   } finally {

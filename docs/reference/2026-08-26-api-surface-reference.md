@@ -39,18 +39,18 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 24 paths, 26 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 26 paths, 28 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
-| Participant relay | Loopback companion → configured hosted origin | 8 paths, 8 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 30 API paths, 30 method/path operations |
+| Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 35 API paths, 36 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
 | Cloudflare service bindings | Worker → platform-managed resources | 3 D1 bindings, 3 production R2 bindings, 1 Durable Object, 8 rate limiters, 1 assets binding, 1 cron schedule |
 | Reviewed code APIs | App/source owners → reusable modules | 5 workspace packages and 24 reviewed source-owner entrypoints |
-| JSON/wire contracts | Collectors, exports, release tooling, hosted intake | 37 JSON contract/schema files plus code-defined telemetry v1 |
-| Storage schema APIs | Hosted and local persistence owners | 43 hosted SQL migrations, 12 local SQLite schema owners, plus object/Keychain contracts |
+| JSON/wire contracts | Collectors, exports, release tooling, hosted intake | Closed versioned families, including generated staged v1.1 and frozen code-defined telemetry v1.0; see schema lifecycle inventory |
+| Storage schema APIs | Hosted and local persistence owners | Ordered hosted SQL migrations, local SQLite schemas, and object/Keychain contracts; attribution adds hosted 0043–0045 without relabeling local schema 11 |
 
 The route counts are checked against the source allowlists by
 [`test/api-surface-reference.test.js`](../../test/api-surface-reference.test.js).
@@ -65,7 +65,7 @@ flowchart LR
     Native[macOS shell<br/>AppKit + WKWebView]
     Web[Dashboard document]
     Local[Loopback companion<br/>127.0.0.1 : ephemeral]
-    Evidence[(Local Codex and Claude evidence)]
+    Evidence[(Local Codex evidence)]
     Codex[Codex app-server<br/>JSONL over stdio]
     Keychain[macOS Keychain<br/>closed capability broker v2]
   end
@@ -94,7 +94,7 @@ flowchart LR
   Local --> |read-only local files| Evidence
   Local <--> |sanitized account protocol| Codex
   Native <--> |four capabilities; get / set / delete| Keychain
-  Local --> |health-only central relay + 8 participant relays| Worker
+  Local --> |health-only central relay + 9 participant relays| Worker
   Local --> |device bearer + one-use Upload authority| Worker
   Worker <--> Data
   Worker <--> Objects
@@ -167,7 +167,8 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/weekly-pace-outlook` | Privacy-safe weekly allowance pace projection bound to the current observed window |
 | `GET` | `/api/local/quality` | Monitoring-quality report data |
 | `GET` | `/api/local/timeline/window-breakdown` | Bounded indexed timeline breakdown for `from` and `to` epoch-millisecond bounds |
-| `GET`, `POST` | `/api/local/refresh` | Inspect refresh state or start one bounded local refresh |
+| `GET`, `POST` | `/api/local/refresh` | Inspect refresh state or explicitly start one bounded retained-history and detailed-accounting refresh |
+| `POST` | `/api/local/refresh/quick` | Refresh current quota/headline evidence without advancing retained history or rebuilding detailed accounting |
 | `POST` | `/api/local/refresh/cancel` | Cooperatively cancel the active refresh |
 | `POST` | `/api/local/contribution/prepare` | Build and validate a reviewed local contribution set |
 | `GET` | `/api/local/contribution/sync-status` | Inspect the replay-safe contribution queue and pause state |
@@ -177,6 +178,7 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `POST` | `/api/local/contribution/device-credential-reset` | Remove the local contribution-device credential under the fixed reset contract |
 | `POST` | `/api/local/contribution/sync-inspect-exact` | Inspect exact next-upload bytes and authority without sending |
 | `GET` | `/api/local/contribution/incremental-status` | Inspect incremental v1 eligibility, watermark, and state |
+| `POST` | `/api/local/contribution/incremental-review-v11` | Review the capability-gated v1.1 field inventory and derived sample; issue a publication/destination/contract-bound single-use token without uploading |
 | `POST` | `/api/local/contribution/incremental-approve` | Record explicit approval for the incremental contract |
 | `POST` | `/api/local/contribution/incremental-run` | Run one bounded incremental preparation/delivery cycle |
 
@@ -213,10 +215,12 @@ into `allowanceImpact` or hide excluded sessions. No priced observations means
 `coveredSubtotal: null`, not a zero-valued placeholder.
 
 When contribution preparation encounters a preserved legacy export identity
-whose one interactive migration read was declined, it returns the fixed
-`identity_migration_required` code. The dashboard directs the user to quit and
-reopen TiboTattle before choosing **Check again**; it does not offer identity
-reset, deletion, or rotation.
+whose bounded silent migration has not completed, it returns the fixed
+`identity_migration_required` code. The dashboard directs the user to native
+**Settings… → General → Secure upgrade → Review migration…**, then **Check
+again**. Only a separate, explained native approval can enable a Keychain
+prompt. The dashboard offers neither approval authority nor identity reset,
+deletion, or rotation as migration recovery.
 
 ### Fixed report pages
 
@@ -275,6 +279,7 @@ relayed through loopback.
 | `GET` | `/api/v1/session` | Read the current hosted session projection |
 | `POST` | `/api/v1/logout` | End the hosted browser session |
 | `POST` | `/api/v1/me/device-pairings` | Create a one-use local-device pairing code |
+| `POST` | `/api/v1/me/device-telemetry-consents` | Relay explicit v1.1 consent under the hosted personal session and CSRF; never substitute device authority |
 
 ## 3. Hosted Cloudflare Worker HTTP API
 
@@ -340,6 +345,11 @@ Authority vocabulary:
 | `POST` | `/api/v1/device/credential/renew` | Device | Rotate an active device secret in place without consuming a new slot |
 | `GET` | `/api/v1/device/sync/state` | Device | Read the device's accepted-through and synchronization state |
 | `GET` | `/api/v1/device/sync/manifest` | Device | Read the bounded manifest for `fromDay` and `toDay` ISO-day bounds |
+| `GET` | `/api/v1/device/sync-capabilities` | Device | Read accepted formats, consent/floor state and authenticated enrollment/destination binding |
+| `POST` | `/api/v1/me/device-telemetry-consents` | Session | Grant the exact v1.1 contract for a selected device with explicit ongoing-upload approval |
+| `GET`, `POST` | `/api/v1/device/telemetry/v1.1/day-manifests` | Device | Read bounded date-range candidates, or register/resume an immutable staged day manifest and return the exact accepted chunk vector |
+| `POST` | `/api/v1/me/telemetry-v11/domain-predecessor` | Device | Pin the prior analytical domain and legacy source vector for complete replacement |
+| `POST` | `/api/v1/me/telemetry-v11/domain-activate` | Device | Atomically activate a complete proven domain or acknowledge an unchanged vector; never activate a partial day |
 | `GET` | `/api/v1/me/devices` | Session | List the participant's bounded device projections |
 | `POST` | `/api/v1/me/devices/revoke` | Session | Revoke a selected device |
 | `GET` | `/api/v1/envelope-key` | Public | Return the active public wrapping key and key identifier |
@@ -555,17 +565,30 @@ never cross the channel:
 | `delete` | `{v: 2, id, op: "delete", capability}` | `{id, ok: true}` |
 
 The broker reads the `.app.v1` generation first. When only the corresponding
-legacy keytar-backed `.v1` item exists, it permits one interactive legacy read
-for that capability per app process, writes and reads back the exact secret in
-the app-owned item, and only then deletes the legacy item. A denied migration
-returns `migration_required` and preserves the legacy item; it never falls back
-to a reset or fresh credential. It also suppresses any further interactive read
-for that capability in the same process. Quit and reopen TiboTattle, then repeat
-the initiating action and allow the fixed migration prompt: app restart is the
-only authorized retry boundary. All four capability adapters preserve a fixed,
-content-free migration-required diagnostic rather than collapsing it to generic
-unavailability. Protocol v1 remains accepted only for the historical
-contribution-device-only client and cannot name a wider capability.
+legacy keytar-backed `.v1` item exists, it attempts a noninteractive read through
+`Contents/Helpers/TiboTattleKeychainMigration`. The helper retains the legacy
+`node` Developer ID identity, has no entitlements, and authenticates its native
+parent's live audit token and signing identity. The parent authenticates the
+spawned helper and pins its code hash. The helper accepts only the four fixed
+capabilities; stable/Preview storage identity comes from the authenticated
+parent, never the request. Its private descriptor frames and lifetime are
+bounded, including when the parent exits during a Keychain call.
+
+Up to three silent attempts use 250 ms and 750 ms backoff after the first
+attempt. The app-process budget survives companion replacement. Each automatic
+read forbids Keychain interaction. Adoption is create-if-absent with exact
+readback, preserves a conflicting modern item, and retains the legacy recovery
+copy. Failure returns `migration_required`; it never invents a fresh identity.
+After exhaustion a quiet native Settings action offers an explanation with
+Cancel as the default. Only deliberate **Approve migration** enables an
+interactive legacy read. Denial preserves the key and stops the approval pass;
+another prompt requires another explicit review. Teardown fences both admission
+and adoption. All four adapters preserve a fixed, content-free migration-required
+diagnostic. No broker operation approves migration or resets its retry budget.
+Protocol v1 remains accepted only for the historical contribution-device-only
+client and cannot name a wider capability. The
+[migration decision](../decisions/2026-08-31-silent-keychain-migration.md)
+records signed qualification and the retained-copy explicit-reset gate.
 
 The broker protocol admits exactly these four capabilities. The packaged
 companion's current runtime graph injects it for export identity, account
@@ -671,7 +694,7 @@ The package's `index.js` and `index.d.ts` are its complete public contract.
 |---|---|
 | [`@app-usagemonitor/accounting`](../../packages/accounting/index.js) | Exact decimal cost ledger; pinned official price registry; Codex fast-mode inference/weighting; local Codex and Claude API-price-equivalent projections |
 | [`@app-usagemonitor/quota-analysis`](../../packages/quota-analysis/index.js) | Quota tracks/reset evidence; capacity calibration; rolling comparisons; pace forecast; model composition; provider-pool naming, classification, and window formatting |
-| [`@app-usagemonitor/telemetry-contract`](../../packages/telemetry-contract/index.js) | Closed constants and error codes; telemetry v0.1/v0.2 parse/inspect/validate; canonicalization; envelope validation; upload validation |
+| [`@app-usagemonitor/telemetry-contract`](../../packages/telemetry-contract/index.js) | Reviewed model catalog and requested-effort mapping; bounded admin model history; closed constants and error codes; telemetry v0.1/v0.2 parse/inspect/validate; staged v1.1 attribution/chunks; canonicalization; envelope and upload validation |
 | [`@app-usagemonitor/identity-core`](../../packages/identity-core/index.js) | `deriveExportPseudonym` and `deriveExportPseudonymV2` |
 | [`@app-usagemonitor/i18n`](../../packages/i18n/index.js) | Locale catalogs and negotiation; closed language preferences; translation/interpolation; locale-aware number, percent, and date formatting |
 
@@ -679,11 +702,11 @@ The complete symbol inventory follows as a reviewable appendix. Each package
 is grouped by capability so readers can scan the contract without a wall of
 undifferentiated names.
 
-#### `@app-usagemonitor/accounting` — 27 public symbols
+#### `@app-usagemonitor/accounting` — 30 public symbols
 
 - Cost ledger: `addUsdStrings`, `priceUsageEvent`.
 - Price registry: `APP_OFFICIAL_PRICE_CARDS`, `APP_PRICE_REGISTRY_MANIFEST`, `OPENAI_PRICE_EVIDENCE_START_DATE`.
-- Speed accounting: `CODEX_SPEED_MODE_DECLARATION`, `CODEX_SPEED_MODE_OBSERVABILITY`, `DEFAULT_FAST_MODE_PREFERENCE`, `FAST_MODE_MODEL_FAMILY_KEYS`, `FAST_MODE_MULTIPLIER_SOURCE`, `FAST_MODE_PREFERENCE_VALUES`, `FAST_MODE_QUOTA_MULTIPLIERS`, `OBSERVED_SPEED_MODE_KEYS`, `QUOTA_WEIGHTED_API_PRICE_METRIC`, `emptySpeedWeightingCrossing`, `fastModeModelFamilyKey`, `fastModeQuotaMultiplier`, `inferFastModeFromCalibrationWindows`, `isFastModePreference`, `resolveEffectiveSpeedMode`, `summarizeQuotaWeightedAccounting`.
+- Speed accounting: `CODEX_SPEED_MODE_DECLARATION`, `CODEX_SPEED_MODE_OBSERVABILITY`, `DEFAULT_UNRESOLVED_SPEED_SCENARIO`, `FAST_MODE_ASSUMED_MULTIPLIER`, `FAST_MODE_ASSUMED_MULTIPLIER_SOURCE`, `FAST_MODE_MODEL_FAMILY_KEYS`, `FAST_MODE_MULTIPLIER_SOURCE`, `FAST_MODE_QUOTA_MULTIPLIERS`, `OBSERVED_SPEED_MODE_KEYS`, `QUOTA_WEIGHTED_API_PRICE_METRIC`, `SPEED_MODE_PROVENANCE_VALUES`, `deriveFastModePriorityRatiosFromRegistry`, `emptySpeedWeightingCrossing`, `fastModeModelFamilyKey`, `fastModeQuotaMultiplier`, `inferFastModeFromCalibrationWindows`, `quotaWeightedApiPriceEquivalent`, `resolveEffectiveSpeedMode`, `summarizeQuotaWeightedAccounting`.
 - Local pricing: `aggregateLocalApiPriceResults`, `apiPriceResolutionSummary`, `costWarningCodes`, `priceClaudeUsageRecord`, `priceCodexProviderToolUnits`, `priceCodexUsageEvent`.
 
 #### `@app-usagemonitor/quota-analysis` — 32 public symbols
@@ -694,13 +717,17 @@ undifferentiated names.
 - Composition: `MODEL_COMPOSITION_POLICY`, `blendedCompositionCapacityUsd`, `buildCompositionObservations`, `calibrateCompositionCapacities`, `compositionExpectedPp`.
 - Windows and provider pools: `CODEX_PRIMARY_LIMIT_ID`, `CODEX_SPARK_LIMIT_ID`, `CODEX_SPARK_LIMIT_IDS`, `CODEX_SPARK_RESERVED_LIMIT_ID`, `FIVE_HOUR_WINDOW_MINUTES`, `formatQuotaWindowDuration`, `MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH`, `MAX_QUOTA_WINDOW_DURATION_MINUTES`, `QUOTA_LIMIT_DISPLAY_ALIASES`, `QUOTA_WINDOW_KINDS`, `classifyQuotaWindowKind`, `isSparkQuotaLimitId`, `isSupportedQuotaWindowDuration`, `isValidQuotaWindowDuration`, `quotaLimitDisplayAlias`, `quotaWindowLabel`, `sanitizeQuotaLimitDisplayName`, `sanitizeQuotaLimitId`, `SEVEN_DAY_WINDOW_MINUTES`.
 
-#### `@app-usagemonitor/telemetry-contract` — 24 public symbols
+#### `@app-usagemonitor/telemetry-contract` — 63 public symbols
 
+- Reviewed model catalog: `REVIEWED_MODEL_CATALOG_VERSION`, `REVIEWED_MODEL_CATALOG`, `REVIEWED_CODEX_MODEL_IDS`, `REVIEWED_CLAUDE_MODEL_IDS`, `reviewedModelIdentity`, `codexRequestReasoningEffort`, `codexCacheReasoningConfiguration`.
+- Admin model history: `ADMIN_MODEL_CONFIG`, `ADMIN_MODEL_HISTORY_CATALOG_VERSION`, `LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION`, `projectAdminModelHistoryDay`, `expandAdminModelHistoryDay`.
 - Constants: `ACCOUNT_SCOPED_TELEMETRY_CONSENT_VERSION`, `ACCOUNT_SCOPED_TELEMETRY_ENVELOPE_SCHEMA_VERSION`, `ACCOUNT_SCOPED_TELEMETRY_SCHEMA_VERSION`, `MAX_TELEMETRY_BROWSER_BYTES`, `TELEMETRY_CONTRIBUTION_SCHEMA_VERSION`, `TELEMETRY_ENVELOPE_SCHEMA_VERSION`, `TELEMETRY_MODEL_IDS`, `TELEMETRY_PLAN_DISPLAY_NAMES`, `TELEMETRY_PLAN_TYPES`, `TELEMETRY_SCHEMA_VERSION`, `TELEMETRY_TOOL_CLASSES`.
 - Errors: `TELEMETRY_CONTRACT_ERROR_CODES`, `TelemetryContractError`, `isTelemetryContractError`.
 - Telemetry v0.1: `parseTelemetryContribution`, `validateTelemetryContribution`.
 - Telemetry v0.2: `canonicalTelemetryContributionV01`, `inspectTelemetryContributionDatasetV02`, `inspectTelemetryContributionV02`, `parseTelemetryContributionV02`, `validateAccountScopedTelemetryContribution`.
 - Envelope and upload: `parseTelemetryEnvelope`, `validateTelemetryEnvelope`, `validateContributionForUpload`.
+- Staged v1.1 constants: `TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION`, `TELEMETRY_V11_ENVELOPE_SCHEMA_VERSION`, `TELEMETRY_V11_DAY_MANIFEST_SCHEMA_VERSION`, `TELEMETRY_V11_FIELD_DICTIONARY_VERSION`, `TELEMETRY_V11_PRIVACY_CONTRACT_VERSION`, `TELEMETRY_V11_CONTRACT_STATE`, `MAX_TELEMETRY_V11_CHUNK_RECORDS`, `MAX_TELEMETRY_V11_CHUNK_CANONICAL_BYTES`, `MAX_TELEMETRY_V11_DAY_CHUNKS`, `TELEMETRY_V11_STREAMS`, `TELEMETRY_V11_ACCOUNT_BASES`, `TELEMETRY_V11_PLAN_BASES`, `TELEMETRY_V11_DOMAIN_MANIFEST_SCHEMA_VERSION`, `MAX_TELEMETRY_V11_DOMAIN_DAYS`.
+- Staged v1.1 behavior: `telemetryV11RequiredConsent`, `isTelemetryV11ConsentCurrent`, `parseTelemetryV11Attribution`, `parseTelemetryV11Record`, `parseTelemetryV11ChunkId`, `parseTelemetryV11Chunk`, `parseTelemetryV11DayManifest`, `telemetryV11RecordAnchor`, `canonicalTelemetryV11Json`, `telemetryV11DayManifestDigestInput`, `validateTelemetryV11Envelope`, `parseTelemetryV11DomainManifest`, `telemetryV11DomainManifestDigestInput`.
 
 #### `@app-usagemonitor/identity-core` — 2 public symbols
 

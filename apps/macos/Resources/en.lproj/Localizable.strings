@@ -11,6 +11,16 @@
 "menu.selectAll" = "Select All";
 "menu.settings" = "Settings…";
 "menu.view" = "View";
+"dialog.approveKeychainMigration" = "Approve migration";
+"dialog.keychainMigrationTitle" = "Approve secure Keychain migration?";
+"dialog.keychainMigrationDescription" = "Saved Keychain keys keep local account matching and your existing contribution identity consistent. This update moves them to app-owned Keychain items without changing their values.\n\nSilent migration could not finish. macOS may ask for your login Keychain password. Enter it only in the macOS dialog; TiboTattle does not receive the password.\n\nApproving this migration does not reset anything or upload data. Existing history is kept. Cancel leaves migration pending.";
+"settings.keychainMigrationTitle" = "Secure upgrade";
+"settings.keychainMigrationSummary" = "Saved Keychain access needs one-time approval to finish this upgrade. Your history is kept; review when you’re ready.";
+"settings.keychainMigrationRetrying" = "Preparing secure access automatically. No password is needed while these checks run.";
+"settings.keychainMigrationApproving" = "Finishing the approved Keychain migration… Your existing key values and history are kept.";
+"settings.keychainMigrationDeferred" = "Migration is still pending for the remaining keys. Nothing has been reset, and local history is kept. You can review again when ready.";
+"settings.keychainMigrationReview" = "Review migration…";
+"settings.keychainMigrationMenu" = "Finish secure upgrade…";
 "notification.allowanceThresholdBody" = "A fresh provider-reported allowance observation crossed your %d%% usage alert. Open TiboTattle for details.";
 "notification.allowanceTitle" = "Allowance alert";
 "notification.resetBody" = "A provider-reported allowance window reset. Open TiboTattle for details.";
@@ -102,7 +112,7 @@
 "settings.startAtLoginUnregistrationNotConfirmedMessage" = "macOS did not confirm that TiboTattle was removed from Login Items. Review System Settings → Login Items before relying on it.";
 "settings.startAtLoginUnregistrationNotConfirmedTitle" = "Removal from login was not confirmed";
 "settings.refreshInterval" = "Refresh interval";
-"settings.refreshIntervalDetail" = "Saved on this Mac and used while TiboTattle is open.";
+"settings.refreshIntervalDetail" = "Checks current allowance while TiboTattle is open. Detailed accounting updates automatically at most hourly; choose Refresh to update everything now.";
 "settings.refreshIntervalOneMinute" = "Every minute";
 "settings.refreshIntervalFiveMinutes" = "Every 5 minutes";
 "settings.refreshIntervalFifteenMinutes" = "Every 15 minutes";
@@ -138,7 +148,7 @@
 "nativeDashboard.progressQuotaRefresh" = "Refreshing allowance…";
 "nativeDashboard.progressSaving" = "Saving analysis progress…";
 "nativeDashboard.refreshUsage" = "Refresh";
-"nativeDashboard.refreshUsageTooltip" = "Update from selected Codex session folders and local Codex account, quota, configuration, and rollout-lineage sources. Processing stays on this Mac.";
+"nativeDashboard.refreshUsageTooltip" = "Refresh the current allowance, local history, and detailed accounting. Reuses valid cached results; all processing stays on this Mac.";
 "nativeDashboard.share" = "Share";
 "nativeDashboard.showSidebar" = "Show Sidebar";
 "nativeDashboard.shareTooltip" = "Open the local share card.";

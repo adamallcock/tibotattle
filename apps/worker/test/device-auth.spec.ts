@@ -181,6 +181,147 @@ async function freshLoginSession(
 }
 
 describe("device lifecycle primitives", () => {
+  it("repair receipts allow only the same current attempt or the immediate real predecessor", async () => {
+    const fixture = await pair();
+    const now = fixture.nowEpoch;
+    const sessionId = await freshLoginSession(fixture.db, fixture.participantId, now);
+    const firstPairing = await createDevicePairing(fixture.db, fixture.participantId, sessionId, CONSENT, now);
+    const secondSecret = crypto.getRandomValues(new Uint8Array(32));
+    const secondHash = await deviceSecretHash(fixture.deviceId, secondSecret);
+    await claimDevicePairing(fixture.db, "Pairing " + firstPairing.pairingCode, fixture.deviceId,
+      secondHash, now, {}, fixture.authorization);
+    const recoveryPairing = await createDevicePairing(fixture.db, fixture.participantId, sessionId, CONSENT, now + 1);
+    const thirdHash = await deviceSecretHash(fixture.deviceId, crypto.getRandomValues(new Uint8Array(32)));
+    const recovery = await claimDevicePairing(fixture.db, "Pairing " + recoveryPairing.pairingCode, fixture.deviceId,
+      thirdHash, now + 1, {}, fixture.authorization);
+    expect(await claimDevicePairing(fixture.db, "Pairing " + recoveryPairing.pairingCode, fixture.deviceId,
+      thirdHash, now + 2, {}, fixture.authorization)).toEqual(recovery);
+    // The initial attempt is no longer current, even though its secrets remain
+    // in the bounded journal. It cannot roll the device back.
+    await expect(claimDevicePairing(fixture.db, "Pairing " + firstPairing.pairingCode, fixture.deviceId,
+      secondHash, now + 2, {}, fixture.authorization)).rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+    const later = now + DEFAULT_DEVICE_LIFECYCLE_POLICY.pairingIssueWindowMilliseconds + 1;
+    const laterSession = await freshLoginSession(fixture.db, fixture.participantId, later);
+    const newerPairing = await createDevicePairing(fixture.db, fixture.participantId, laterSession, CONSENT, later);
+    await expect(claimDevicePairing(fixture.db, "Pairing " + newerPairing.pairingCode, fixture.deviceId,
+      await deviceSecretHash(fixture.deviceId, crypto.getRandomValues(new Uint8Array(32))), later, {}, fixture.authorization))
+      .rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+    expect((await fixture.db.prepare("SELECT credential_generation FROM device_credentials WHERE id = ?")
+      .bind(fixture.deviceId).first<{ credential_generation: number }>())?.credential_generation).toBe(3);
+    await revokeParticipantDevice(fixture.db, fixture.participantId, fixture.deviceId);
+    await expect(claimDevicePairing(fixture.db, "Pairing " + recoveryPairing.pairingCode, fixture.deviceId,
+      thirdHash, now + 4, {}, fixture.authorization)).rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+    expect((await fixture.db.prepare("SELECT state FROM device_credentials WHERE id = ?")
+      .bind(fixture.deviceId).first<{ state: string }>())?.state).toBe("revoked");
+  });
+
+  it("fresh social recovery never accepts the immediate predecessor on another participant or a deleting owner", async () => {
+    const fixture = await pair();
+    const pairing = await createDevicePairing(fixture.db, fixture.participantId, fixture.sessionId, CONSENT, fixture.nowEpoch);
+    const nextHash = await deviceSecretHash(fixture.deviceId, crypto.getRandomValues(new Uint8Array(32)));
+    await claimDevicePairing(fixture.db, "Pairing " + pairing.pairingCode, fixture.deviceId,
+      nextHash, fixture.nowEpoch, {}, fixture.authorization);
+    const other = await participantFixture(fixture.nowEpoch);
+    const foreignPairing = await createDevicePairing(fixture.db, other.participantId, other.sessionId, CONSENT, fixture.nowEpoch);
+    await expect(claimDevicePairing(fixture.db, "Pairing " + foreignPairing.pairingCode, fixture.deviceId,
+      await deviceSecretHash(fixture.deviceId, crypto.getRandomValues(new Uint8Array(32))), fixture.nowEpoch, {}, fixture.authorization))
+      .rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+    const ownPairing = await createDevicePairing(fixture.db, fixture.participantId, fixture.sessionId, CONSENT, fixture.nowEpoch + 1);
+    await fixture.db.prepare("UPDATE participants SET state = 'deleting' WHERE id = ?").bind(fixture.participantId).run();
+    await expect(claimDevicePairing(fixture.db, "Pairing " + ownPairing.pairingCode, fixture.deviceId,
+      await deviceSecretHash(fixture.deviceId, crypto.getRandomValues(new Uint8Array(32))), fixture.nowEpoch + 1, {}, fixture.authorization))
+      .rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+    expect((await fixture.db.prepare("SELECT credential_generation FROM device_credentials WHERE id = ?")
+      .bind(fixture.deviceId).first<{ credential_generation: number }>())?.credential_generation).toBe(2);
+  });
+
+  it("fresh pairing renews an expired-but-active device in place, preserving enrollment and consent", async () => {
+    const now = Date.now();
+    const fixture = await pair({ nowEpoch: now });
+    // D1's admission triggers use their own wall clock. Age only the already
+    // authenticated fixture instead of pretending an expired pairing can mint.
+    await fixture.db.prepare(`UPDATE device_credentials
+      SET issued_at = ?, social_verified_at = ?, expires_at = ? WHERE id = ?`).bind(
+      new Date(now - 181 * 86_400_000).toISOString(), new Date(now - 181 * 86_400_000).toISOString(),
+      new Date(now - 86_400_000).toISOString(), fixture.deviceId,
+    ).run();
+    const before = await fixture.db.prepare("SELECT issued_at, credential_generation FROM device_credentials WHERE id = ?")
+      .bind(fixture.deviceId).first<{ issued_at: string; credential_generation: number }>();
+    const namespace = await fixture.db.prepare("SELECT namespace FROM attribution_enrollments WHERE participant_id = ?")
+      .bind(fixture.participantId).first<{ namespace: string }>();
+    await expect(authenticateDevice(fixture.db, fixture.authorization)).rejects.toMatchObject({ code: "DEVICE_AUTH_INVALID" });
+    const sessionId = await freshLoginSession(fixture.db, fixture.participantId, now);
+    const pairing = await createDevicePairing(fixture.db, fixture.participantId, sessionId, CONSENT, now);
+    const nextSecret = crypto.getRandomValues(new Uint8Array(32));
+    const nextHash = await deviceSecretHash(fixture.deviceId, nextSecret);
+    const renewed = await claimDevicePairing(fixture.db, `Pairing ${pairing.pairingCode}`,
+      fixture.deviceId, nextHash, now, {}, fixture.authorization);
+    expect(renewed.deviceId).toBe(fixture.deviceId);
+    expect(await claimDevicePairing(fixture.db, `Pairing ${pairing.pairingCode}`,
+      fixture.deviceId, nextHash, now, {}, fixture.authorization)).toEqual(renewed);
+    const current = await fixture.db.prepare("SELECT issued_at, credential_generation, social_verified_at FROM device_credentials WHERE id = ?")
+      .bind(fixture.deviceId).first<{ issued_at: string; credential_generation: number; social_verified_at: string }>();
+    expect(current).toEqual({ issued_at: before!.issued_at, credential_generation: before!.credential_generation + 1,
+      social_verified_at: new Date(now).toISOString() });
+    expect(await fixture.db.prepare("SELECT namespace FROM attribution_enrollments WHERE participant_id = ?")
+      .bind(fixture.participantId).first()).toEqual(namespace);
+    expect((await authenticateDevice(fixture.db,
+      `Device um_device_${fixture.deviceId}.${encodeBase64Url(nextSecret)}`, { nowEpoch: now + 1 })).deviceId).toBe(fixture.deviceId);
+  });
+
+  it("a reauthentication cannot renew a revoked credential or erase its revoked state", async () => {
+    const fixture = await pair();
+    const sessionId = await freshLoginSession(fixture.db, fixture.participantId, fixture.nowEpoch + 1);
+    const pairing = await createDevicePairing(fixture.db, fixture.participantId, sessionId, CONSENT, fixture.nowEpoch + 1);
+    await revokeParticipantDevice(fixture.db, fixture.participantId, fixture.deviceId);
+    const nextHash = await deviceSecretHash(fixture.deviceId, crypto.getRandomValues(new Uint8Array(32)));
+    await expect(claimDevicePairing(fixture.db, `Pairing ${pairing.pairingCode}`, fixture.deviceId,
+      nextHash, fixture.nowEpoch + 2, {}, fixture.authorization)).rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+    expect((await fixture.db.prepare("SELECT state FROM device_credentials WHERE id = ?")
+      .bind(fixture.deviceId).first<{ state: string }>())?.state).toBe("revoked");
+  });
+
+  it("continuity proof cannot cross participants, survive deletion, or use a stale browser session", async () => {
+    const fixture = await pair();
+    const other = await participantFixture(fixture.nowEpoch + 1);
+    const otherPairing = await createDevicePairing(other.db, other.participantId, other.sessionId, CONSENT, other.nowEpoch);
+    const nextHash = await deviceSecretHash(fixture.deviceId, crypto.getRandomValues(new Uint8Array(32)));
+    await expect(claimDevicePairing(fixture.db, `Pairing ${otherPairing.pairingCode}`, fixture.deviceId,
+      nextHash, other.nowEpoch, {}, fixture.authorization)).rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+    const staleNow = fixture.nowEpoch + 11 * 60_000;
+    const stalePairing = await createDevicePairing(fixture.db, fixture.participantId, fixture.sessionId, CONSENT, staleNow);
+    await expect(claimDevicePairing(fixture.db, `Pairing ${stalePairing.pairingCode}`, fixture.deviceId,
+      nextHash, staleNow, {}, fixture.authorization)).rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+    await fixture.db.prepare("DELETE FROM participants WHERE id = ?").bind(fixture.participantId).run();
+    await expect(claimDevicePairing(fixture.db, `Pairing ${stalePairing.pairingCode}`, fixture.deviceId,
+      nextHash, staleNow, {}, fixture.authorization)).rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+    expect(await fixture.db.prepare("SELECT id FROM device_credentials WHERE id = ?").bind(fixture.deviceId).first()).toBeNull();
+  });
+
+  it("wrong previous proof leaves both credential and fresh pairing untouched", async () => {
+    const fixture = await pair();
+    const pairing = await createDevicePairing(fixture.db, fixture.participantId, fixture.sessionId, CONSENT, fixture.nowEpoch);
+    const nextHash = await deviceSecretHash(fixture.deviceId, crypto.getRandomValues(new Uint8Array(32)));
+    await expect(claimDevicePairing(fixture.db, `Pairing ${pairing.pairingCode}`, fixture.deviceId, nextHash,
+      fixture.nowEpoch, {}, `Device um_device_${fixture.deviceId}.${encodeBase64Url(new Uint8Array(32))}`))
+      .rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+    expect((await authenticateDevice(fixture.db, fixture.authorization, { nowEpoch: fixture.nowEpoch })).credentialGeneration).toBe(1);
+    const states = await fixture.db.prepare("SELECT state FROM device_pairings WHERE participant_id = ? ORDER BY state")
+      .bind(fixture.participantId).all<{ state: string }>();
+    expect(states.results.map((row) => row.state)).toEqual(["consumed", "unused"]);
+  });
+
+  it("a consumed pairing retry does not report a revoked device as active", async () => {
+    const base = await participantFixture();
+    const pairing = await createDevicePairing(base.db, base.participantId, base.sessionId, CONSENT, base.nowEpoch);
+    const deviceId = crypto.randomUUID();
+    const hash = await deviceSecretHash(deviceId, crypto.getRandomValues(new Uint8Array(32)));
+    await claimDevicePairing(base.db, `Pairing ${pairing.pairingCode}`, deviceId, hash, base.nowEpoch);
+    await revokeParticipantDevice(base.db, base.participantId, deviceId);
+    await expect(claimDevicePairing(base.db, `Pairing ${pairing.pairingCode}`, deviceId, hash, base.nowEpoch))
+      .rejects.toMatchObject({ code: "PAIRING_AUTH_INVALID" });
+  });
+
   it("atomically rotates a hash-only credential and makes same-attempt retry idempotent", async () => {
     const fixture = await pair();
     const nextSecret = crypto.getRandomValues(new Uint8Array(32));

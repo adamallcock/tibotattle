@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 
 import {
   ensureContributionDeviceCapability,
@@ -17,6 +17,7 @@ const ERROR_CODES = new Set([
   "pairing_invalid",
   "service_unavailable",
   "pairing_rejected",
+  "continuity_required",
   "disconnect_rejected",
   "renewal_rejected",
   "response_invalid",
@@ -40,7 +41,7 @@ function normalizePairingCode(value) {
   return value;
 }
 
-async function boundedJsonResponse(response, rejectionCode = "pairing_rejected") {
+async function boundedJsonResponse(response, rejectionCode = "pairing_rejected", allowContinuity = false) {
   if (!(response instanceof Response)) fail("response_invalid");
   const cacheControl = response.headers.get("cache-control");
   const contentType = response.headers.get("content-type") ?? "";
@@ -60,8 +61,31 @@ async function boundedJsonResponse(response, rejectionCode = "pairing_rejected")
   } catch {
     fail("response_invalid");
   }
-  if (!response.ok) fail(response.status >= 500 ? "service_unavailable" : rejectionCode);
+  if (!response.ok) {
+    if (allowContinuity && response.status === 409 && payload && typeof payload === "object"
+        && !Array.isArray(payload) && Object.keys(payload).join(",") === "error"
+        && payload.error && typeof payload.error === "object" && !Array.isArray(payload.error)
+        && ["code", "code,requestId"].includes(Object.keys(payload.error).sort().join(","))
+        && payload.error.code === "DEVICE_CONTINUITY_REQUIRED"
+        && (payload.error.requestId === undefined || (typeof payload.error.requestId === "string"
+          && payload.error.requestId.length > 0 && payload.error.requestId.length <= 128))) {
+      fail("continuity_required");
+    }
+    fail(response.status >= 500 ? "service_unavailable" : rejectionCode);
+  }
   return payload;
+}
+
+function pairingReceipt(payload, deviceId) {
+  const keys = Object.keys(payload ?? {}).sort().join("\0");
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)
+      || !["deviceId\0expiresAt\0state", "deviceId\0expiresAt\0scope\0state"].includes(keys)
+      || payload.deviceId !== deviceId || payload.state !== "active"
+      || (payload.scope !== undefined && payload.scope !== "upload_registration")
+      || typeof payload.expiresAt !== "string" || !Number.isFinite(Date.parse(payload.expiresAt))) {
+    fail("response_invalid");
+  }
+  return new Date(payload.expiresAt).toISOString();
 }
 
 function canonicalOrigin(value) {
@@ -77,9 +101,10 @@ export async function claimContributionDevicePairing({
   pairingCode,
   fetchImpl = globalThis.fetch,
   ensureCapability = ensureContributionDeviceCapability,
+  rotate = rotateContributionDeviceCredential,
   capabilityOptions = {},
 } = {}) {
-  if (typeof fetchImpl !== "function" || typeof ensureCapability !== "function"
+  if (typeof fetchImpl !== "function" || typeof ensureCapability !== "function" || typeof rotate !== "function"
       || !capabilityOptions || typeof capabilityOptions !== "object"
       || Array.isArray(capabilityOptions)) {
     fail("invalid_configuration");
@@ -95,44 +120,72 @@ export async function claimContributionDevicePairing({
     fail("invalid_configuration");
   }
 
-  let response;
-  try {
-    response = await fetchImpl(
-      new URL("/api/v1/device-pairings/claim", capability.origin),
-      {
-        method: "POST",
-        credentials: "omit",
-        redirect: "error",
-        headers: {
-          Accept: "application/json",
-          Authorization: `Pairing ${selectedPairing}`,
-          "Content-Type": "application/json",
+  const claim = async (deviceSecretHash, currentSecret = null) => {
+    let response;
+    try {
+      response = await fetchImpl(
+        new URL("/api/v1/device-pairings/claim", capability.origin),
+        {
+          method: "POST",
+          credentials: "omit",
+          redirect: "error",
+          headers: {
+            Accept: "application/json",
+            Authorization: `Pairing ${selectedPairing}`,
+            "Content-Type": "application/json",
+            ...(currentSecret === null ? {} : {
+              "X-Previous-Device-Authorization":
+                `Device um_device_${capability.deviceId}.${currentSecret.toString("base64url")}`,
+            }),
+          },
+          body: JSON.stringify({
+            deviceId: capability.deviceId,
+            deviceSecretHash,
+          }),
         },
-        body: JSON.stringify({
-          deviceId: capability.deviceId,
-          deviceSecretHash: capability.deviceSecretHash,
-        }),
+      );
+    } catch {
+      fail("service_unavailable");
+    }
+    return pairingReceipt(await boundedJsonResponse(response, "pairing_rejected", currentSecret === null),
+      capability.deviceId);
+  };
+  let expiresAt;
+  try {
+    // A local binding does not prove server registration. Preserve creation
+    // and initial lost-ack replay before requesting any prior-secret lease.
+    expiresAt = await claim(capability.deviceSecretHash);
+  } catch (error) {
+    if (!(error instanceof ContributionDeviceClientError)
+        || error.code !== "contribution_device_client_continuity_required") throw error;
+    const result = await rotate({
+      ...capabilityOptions,
+      expectedOrigin: requestedOrigin,
+      deriveSecret: ({ currentSecret, origin: bindingOrigin, deviceId }) => {
+        if (bindingOrigin !== requestedOrigin || deviceId !== capability.deviceId
+            || !Buffer.isBuffer(currentSecret) || currentSecret.byteLength !== 32) fail("invalid_configuration");
+        return createHmac("sha256", currentSecret)
+          .update("app-usagemonitor/device-pairing-repair/v1\0")
+          .update(JSON.stringify([requestedOrigin, deviceId, selectedPairing])).digest();
       },
-    );
-  } catch {
-    fail("service_unavailable");
-  }
-  const payload = await boundedJsonResponse(response);
-  const keys = Object.keys(payload ?? {}).sort().join("\0");
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)
-      || !["deviceId\0expiresAt\0state", "deviceId\0expiresAt\0scope\0state"].includes(keys)
-      || payload.deviceId !== capability.deviceId
-      || payload.state !== "active"
-      || (payload.scope !== undefined && payload.scope !== "upload_registration")
-      || !Number.isFinite(Date.parse(payload.expiresAt))) {
-    fail("response_invalid");
+      performRemoteRotation: async ({ origin: bindingOrigin, deviceId, currentSecret, nextDeviceSecretHash }) => {
+        if (bindingOrigin !== requestedOrigin || deviceId !== capability.deviceId
+            || !Buffer.isBuffer(currentSecret) || currentSecret.byteLength !== 32
+            || !SECRET_HASH_PATTERN.test(nextDeviceSecretHash)) fail("invalid_configuration");
+        return Object.freeze({ committed: true, expiresAt: await claim(nextDeviceSecretHash, currentSecret) });
+      },
+    });
+    if (!result || result.status !== "renewed" || result.deviceId !== capability.deviceId
+        || result.origin !== requestedOrigin || typeof result.expiresAt !== "string"
+        || !Number.isFinite(Date.parse(result.expiresAt))) fail("response_invalid");
+    expiresAt = new Date(result.expiresAt).toISOString();
   }
   return Object.freeze({
     status: "paired",
     origin: capability.origin,
     deviceId: capability.deviceId,
     scope: "upload_registration",
-    expiresAt: new Date(payload.expiresAt).toISOString(),
+    expiresAt,
   });
 }
 

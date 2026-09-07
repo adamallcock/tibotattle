@@ -24,10 +24,12 @@ export function selectProductionAccountObservationSecret({
   operationLockFile = defaultAccountObservationOperationLockFile(),
   createKeychainBackend = createExportIdentityKeychainBackend,
   keychainCapability = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
+  createIfMissing = true,
   developmentSecret = null,
   windowsReadiness = null,
   createWindowsBackend = null,
 } = {}) {
+  if (typeof createIfMissing !== "boolean") fail("ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_INVALID");
   if (developmentSecret !== null) {
     return Object.freeze({
       mode: "injected_development_secret",
@@ -57,13 +59,17 @@ export function selectProductionAccountObservationSecret({
           backend,
           capability: keychainCapability,
           operationLockFile,
+          createIfMissing,
         }),
       });
     } catch {
       fail("ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE");
     }
   }
-  if (platform !== "darwin" || architecture !== "arm64") {
+  // Accept the packaged app's broker on Intel without widening the legacy
+  // native-binding policy or falling back when broker construction fails.
+  if (platform !== "darwin"
+      || (architecture !== "arm64" && architecture !== "x64")) {
     fail("ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE");
   }
   if (typeof createKeychainBackend !== "function"
@@ -82,6 +88,7 @@ export function selectProductionAccountObservationSecret({
       backend,
       capability: keychainCapability,
       operationLockFile,
+      createIfMissing,
     }),
   });
 }

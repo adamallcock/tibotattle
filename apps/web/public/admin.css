@@ -147,6 +147,8 @@
 .admin-allowance-plan-summaries { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 18px; }
 .admin-allowance-plan-summary { padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: rgba(255, 254, 249, .72); }
 .admin-allowance-plan-summary-selected { border-color: rgba(31, 90, 73, .42); box-shadow: 0 0 0 2px rgba(31, 90, 73, .08); }
+.admin-allowance-model-filter { display: flex; align-items: center; flex-wrap: wrap; gap: .5rem; margin-bottom: 1rem; }
+.admin-allowance-model-filter select { max-width: 100%; padding: .4rem .6rem; font: inherit; }
 .admin-allowance-plan-summary span { display: block; color: var(--muted); font-size: .64rem; font-weight: 760; letter-spacing: .05em; text-transform: uppercase; }
 .admin-allowance-plan-summary strong { display: block; margin-top: 4px; font-family: var(--serif); font-size: 1.55rem; font-weight: 500; }
 .admin-allowance-plan-summary small { color: var(--muted); font-size: .68rem; }
@@ -198,6 +200,17 @@
 .admin-allowance-dot-model-terra { fill: #2b6cb0; }
 .admin-allowance-dot-model-luna { fill: #c05621; }
 .admin-allowance-dot-model-gpt55 { fill: #4a5568; }
+.admin-allowance-line[class*="model-catalog-"] { stroke: var(--model-series-color); }
+.admin-allowance-dot[class*="model-catalog-"] { fill: var(--model-series-color); }
+.admin-allowance-swatch[class*="model-catalog-"] { background: var(--model-series-color); }
+[class*="admin-allowance-"][class$="model-catalog-0"] { --model-series-color: #0e7490; }
+[class*="admin-allowance-"][class$="model-catalog-1"] { --model-series-color: #9f3b32; }
+[class*="admin-allowance-"][class$="model-catalog-2"] { --model-series-color: #64722a; }
+[class*="admin-allowance-"][class$="model-catalog-3"] { --model-series-color: #914a78; }
+[class*="admin-allowance-"][class$="model-catalog-4"] { --model-series-color: #285ca3; }
+[class*="admin-allowance-"][class$="model-catalog-5"] { --model-series-color: #9b601a; }
+[class*="admin-allowance-"][class$="model-catalog-6"] { --model-series-color: #34775c; }
+[class*="admin-allowance-"][class$="model-catalog-7"] { --model-series-color: #6153a0; }
 .admin-allowance-dot:focus { outline: none; stroke: var(--ink); stroke-width: 2.5; }
 @media (max-width: 800px) {
   .admin-card-grid, .admin-two-column { grid-template-columns: 1fr 1fr; }

@@ -11,6 +11,7 @@ import {
   demoDashboard,
   isValidQuotaWindowDuration,
   normalizeIncrementalContributionSyncStatus,
+  selectAllowancePlanPopulation,
   selectPrimaryCodexQuotaWindow
 } from "./data-client.js";
 import {
@@ -48,6 +49,7 @@ import {
 import {
   TELEMETRY_PLAN_DISPLAY_NAMES,
   TELEMETRY_PLAN_TYPES,
+  TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION,
 } from "./telemetry-shared.generated.js";
 import {
   compact,
@@ -136,6 +138,9 @@ let activeAccountingPeriod = "7d";
 // visible reason, which is the inconsistency this settles.
 let activeWeeklyRangeDays = 30;
 let activeWeeklyMinimumObservedSpanPp = 50;
+// Null follows the latest observed plan, including an insufficient one. An
+// explicit choice stays in memory across refreshes, ranges and locale changes.
+let activeWeeklyPlanType = null;
 let timelineViewport = null;
 let usageTimelineViewport = null;
 let timelinePointerStart = null;
@@ -231,6 +236,9 @@ let contributionSyncAutoReviewedKey = null;
 let incrementalConsentApproved = false;
 let incrementalConsentBusy = false;
 let incrementalSyncStatus = null;
+let attributionContributionReview = null;
+let attributionContributionBusy = false;
+let attributionContributionNotice = null;
 // The optional lastOutcome.detail.code the 0.1.2 companion records beside the
 // bare outcome code, so "Last error: device credential unavailable" can be
 // stated instead of an anonymous "run_failed". The bounded normalizer keeps
@@ -319,6 +327,9 @@ let hostedSignInCancellationInFlight = false;
 let appleSignInUnavailable = false;
 let googleSignInUnavailable = false;
 let localActionBusy = false;
+// Overlapping primary reads share the original busy owner. Publication uses
+// the same load token as quick reloads and cache-drop links below.
+let activeLocalDashboardLoad = null;
 let localRefreshInProgress = false;
 let localRefreshCancelRequested = false;
 // Archive indexing progress is intentionally transient: the durable dashboard
@@ -913,7 +924,8 @@ function hideConnectionNotice() {
 }
 
 function renderDashboardUnavailableState(kind) {
-  resetCacheDropThreadLinks();
+  // The last accounting rows remain visible during a failed refresh.
+  resetCacheDropThreadLinks(cacheDropThreadLinks.dashboard);
   const companionCopy = isLoopbackDashboard()
     ? "dashboard.unavailable.companionInAppCopy"
     : "dashboard.unavailable.companionCopy";
@@ -1673,7 +1685,7 @@ function humanize(value) {
 }
 
 function matchedRollingPairs(data) {
-  if (data.timeline?.usage?.length) {
+  if (allowanceTimelineUsage(data).length) {
     return liveTimelinePoints(data, {
       windowHours: CALIBRATION_WINDOW_HOURS,
       rangeDays: activeUsageRangeDays,
@@ -1686,7 +1698,21 @@ function matchedRollingPairs(data) {
   return [];
 }
 
+function allowanceTimelineUsage(data) {
+  return data.allowancePlanSelection
+    ? data.timeline?.selectedPlanUsage ?? []
+    : data.timeline?.usage ?? [];
+}
+
 function renderComparison(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
+  const planNote = $("#comparison-plan-note");
+  if (planNote) {
+    planNote.hidden = data.allowancePlanSelection?.comparisonAvailable !== true;
+    if (!planNote.hidden) setLocalizedText(planNote,
+      "weekly.plan.comparisonConditional",
+      { plan: shareCardPlanLabel(data.weekly.planType) || t("weekly.plan.unknown") });
+  }
   // The observed-versus-calculated comparison depends on the calibration
   // capacity; when that capacity is served from the previous version's cache
   // during a recalculation, the comparison says so, quietly.
@@ -1698,7 +1724,7 @@ function renderComparison(data) {
   const pair = matchedPairs.at(-1) ?? null;
   const summary = data.gradient.summary ?? {};
   const weeklySummary = data.weekly.summary ?? {};
-  const legacyDemo = data.mode === "demo";
+  const legacyDemo = data.mode === "demo" && !data.allowancePlanSelection;
   const mae = matchedPairs.length > 0
     ? matchedPairs.reduce(
       (sum, row) => sum + Math.abs(row.observed - row.expected),
@@ -1760,11 +1786,20 @@ function renderComparison(data) {
     modelCostShares,
   });
   if (!pair || pair.observed === null || pair.expected === null) {
+    // A new population must not retain the previous plan's visible bars.
+    for (const row of $("#comparison-visual").querySelectorAll(".comparison-row")) {
+      row.querySelector("i").style.width = "0%";
+      row.querySelector("strong").textContent = "—";
+    }
     setProductText(chip, "Insufficient");
-    setProductText(
-      $("#comparison-result"),
-      "There is not yet a matched quota-and-cost window to compare.",
-    );
+    if (data.allowancePlanSelection?.comparisonAvailable === false) {
+      setLocalizedText($("#comparison-result"), "weekly.plan.comparisonPending");
+    } else {
+      setProductText(
+        $("#comparison-result"),
+        "There is not yet a matched quota-and-cost window to compare.",
+      );
+    }
     return;
   }
   const max = Math.max(Math.abs(pair.observed), Math.abs(pair.expected), 1);
@@ -2302,12 +2337,15 @@ function buildShareCard(data, {
   const summary = data?.weekly?.summary ?? {};
 
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
-  const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
+  const isWeeklyWindow = data.allowancePlanSelection !== undefined
+    || shareCardWindowKind(allowanceWindow) === "seven_day";
   const remaining = finite(allowanceWindow?.remainingPercent);
   const windowLabel = shareCardWindowLabel(allowanceWindow);
   // The reader's most-recent plan, read from the same bounded plan_type enum
   // the quota cards use. "" leaves the header chip off entirely.
-  const planLabel = shareCardPlan(data?.quotaWindows ?? []);
+  const planLabel = data.allowancePlanSelection
+    ? shareCardPlanLabel(data?.weekly?.planType) || t("weekly.plan.unknown")
+    : shareCardPlan(data?.quotaWindows ?? []);
 
   const weighted = !accountingEvidenceAvailable
     ? null
@@ -2372,7 +2410,8 @@ function buildShareCard(data, {
       // allowance. The label must make the different denominator clear on the
       // image itself: an activity total can legitimately exceed one estimated
       // allowance without being a billing error or an allowance overrun.
-      label: t("share.stat.recordedActivity"),
+      label: t(data.allowancePlanSelection
+        ? "share.stat.recordedActivityAllPlans" : "share.stat.recordedActivity"),
       value: spend === null ? t("share.value.notAvailable") : formatMoney(spend, 0),
       // The "event-time API equivalent" caption is gone (owner-directed,
       // 2026-08-10): the detail line states the selected range and nothing
@@ -2401,6 +2440,9 @@ function buildShareCard(data, {
   const caveats = [];
   if (isDemo) {
     caveats.push(t("share.caveat.demo"));
+  }
+  if (data.allowancePlanSelection) {
+    caveats.push(t("share.caveat.planConditional"));
   }
   if (spend !== null && excluded > 0) {
     caveats.push(t("share.caveat.unweighted", {
@@ -2447,7 +2489,10 @@ function buildShareCard(data, {
     // The Codex plan name is presented as-is; only the surrounding word is
     // localized (share.plan). "" when no window named a plan, so a card that
     // cannot name a plan carries no chip and no empty wrapper.
-    plan: planLabel === "" ? "" : t("share.plan", { plan: planLabel }),
+    plan: planLabel === "" ? "" : t(
+      data.allowancePlanSelection ? "share.planAllowance" : "share.plan",
+      { plan: planLabel },
+    ),
     stats: Object.freeze(stats.map((stat) => Object.freeze({ ...stat }))),
     // Reset-fit history is an explicitly seven-day model. It is never drawn
     // behind a five-hour or provider-reported generic allowance window.
@@ -3192,7 +3237,8 @@ function shareCardActivitySelection(data, rangeDays) {
 function renderShareCard(data, { history: sharedHistory = null } = {}) {
   const canvas = $("#share-card-canvas");
   const allowanceWindow = shareCardWindow(data?.quotaWindows ?? []);
-  const isWeeklyWindow = shareCardWindowKind(allowanceWindow) === "seven_day";
+  const isWeeklyWindow = data.allowancePlanSelection !== undefined
+    || shareCardWindowKind(allowanceWindow) === "seven_day";
   const history = isWeeklyWindow
     ? sharedHistory ?? allowanceHistoryChartModel(data)
     : null;
@@ -3208,6 +3254,7 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
     finite(allowanceWindow?.durationMinutes),
     finite(allowanceWindow?.remainingPercent),
     shareCardPlan(data?.quotaWindows ?? []),
+    data.allowancePlanSelection ?? null,
     finite(data?.pricing?.quotaWeightedTotalCostUsd),
     finite(data?.pricing?.totalCostUsd),
     finite(data?.pricing?.coveragePercent),
@@ -3239,6 +3286,10 @@ function renderShareCard(data, { history: sharedHistory = null } = {}) {
   // The header's reference chip is gone (owner-directed, 2026-08-08): the
   // reference still exists — the saved file name carries it — but the panel
   // header no longer prints a code the reader cannot act on.
+  // This generated transcript replaces the initial placeholder. The static
+  // localizer must not overwrite the selected-plan figures after a language
+  // change; renderWeekly rebuilds the transcript in the new language.
+  canvas.removeAttribute("data-i18n-aria-label");
   canvas.setAttribute("aria-label", shareCardText(shareCard));
   if (!drawShareCard(canvas, shareCard)) {
     shareCard = null;
@@ -3385,7 +3436,7 @@ function groupRolling(rows, hours) {
 }
 
 function latestTimelineObservationMs(data) {
-  const latest = data.timeline.usage.at(-1)?.endAt
+  const latest = allowanceTimelineUsage(data).at(-1)?.endAt
     ?? mainWeeklyQuotaTrack(data.timeline.quota).at(-1)?.observedAt
     ?? data.freshness.latestObservedAt;
   const latestMs = Date.parse(latest);
@@ -3794,12 +3845,28 @@ function timelineAllowanceWeightedCost(row, capacitySelection) {
     : null;
 }
 
+function timelineComparisonInterval(data, startMs, endMs) {
+  // Legacy DTOs have no plan-selection contract. A selected-plan view must
+  // positively cover the entire span; absence is not evidence of continuity.
+  if (!data.allowancePlanSelection) return null;
+  const intervals = data.timeline.comparisonIntervals ?? [];
+  let low = 0;
+  let high = intervals.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (intervals[middle][0] <= startMs) low = middle + 1;
+    else high = middle;
+  }
+  const interval = intervals[low - 1];
+  return interval && endMs <= interval[1] ? interval : false;
+}
+
 function liveTimelinePoints(
   data,
   {
     windowHours = CALIBRATION_WINDOW_HOURS,
     rangeDays = activeCalibrationRangeDays,
-    usage = data.timeline.usage,
+    usage = allowanceTimelineUsage(data),
   } = {},
 ) {
   const capacitySelection = timelineCalibrationCapacity(data);
@@ -3846,10 +3913,17 @@ function liveTimelinePoints(
   let driftCostUsd = 0;
   let comparisonSegment = 0;
   let previousComparable = false;
+  let previousPlanInterval = null;
   for (let index = 0; index < usage.length; index += 1) {
     const current = usage[index];
     const endMs = Date.parse(current.endAt);
     const currentWeightedCost = weightedCosts[index];
+    const planInterval = timelineComparisonInterval(data, Date.parse(current.startAt), endMs);
+    if (planInterval === false || planInterval !== previousPlanInterval) {
+      driftAnchor = null;
+      driftCostUsd = 0;
+    }
+    previousPlanInterval = planInterval;
     if (currentWeightedCost === null) rollingWeightingGaps += 1;
     else rollingCost += currentWeightedCost;
     rollingEvents += current.usageEvents;
@@ -3907,7 +3981,11 @@ function liveTimelinePoints(
     }
     const before = startMatch?.row ?? null;
     const after = afterMatch?.row ?? null;
+    const planComparable = timelineComparisonInterval(data,
+      Math.min(spanStartMs, startMatch?.timestampMs ?? spanStartMs),
+      Math.max(spanEndMs, afterMatch?.timestampMs ?? spanEndMs)) !== false;
     const bracketed = before && after
+      && planComparable
       && spanStartMs - startMatch.timestampMs <= maximumBracketGapMs
       && endMs - afterMatch.timestampMs <= maximumBracketGapMs;
     const sameReset = Boolean(bracketed)
@@ -3965,6 +4043,7 @@ function liveTimelinePoints(
       windowEvents = Math.max(0, eventsPrefix[top] - eventsPrefix[lower]);
     }
     const expected = !poolSaturated
+        && planComparable
         && capacity !== null && capacity > 0
         && windowWeightingGaps === 0
       ? windowCostUsd / capacity * 100
@@ -3978,9 +4057,10 @@ function liveTimelinePoints(
       apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : 0,
       poolSaturated,
     });
-    const evidence = windowWeightingGaps === 0
-      ? classifiedEvidence
-      : { status: "quota_weighting_unavailable", residual: null };
+    const evidence = !planComparable
+      ? { status: "reset_or_track_change", residual: null }
+      : windowWeightingGaps === 0 ? classifiedEvidence
+        : { status: "quota_weighting_unavailable", residual: null };
     let cumulativeResidual = null;
     // A re-anchor marks the first drift observation of a new reset or track:
     // the deviation-period detector splits its runs here, so a sustained drift
@@ -3990,6 +4070,8 @@ function liveTimelinePoints(
     if (capacity !== null && capacity > 0
         && currentWeightedCost !== null
         && after !== null
+        && timelineComparisonInterval(data,
+          Math.min(Date.parse(current.startAt), afterMatch.timestampMs), endMs) !== false
         && Number.isFinite(finite(after.usedPercent))
         && endMs - afterMatch.timestampMs <= maximumBracketGapMs) {
       // A used_percent DECREASE beyond display jitter inside one boundary is
@@ -4072,8 +4154,8 @@ function liveTimelinePoints(
       // Kept under the legacy internal key for downstream chart diagnostics,
       // but this is now the selected speed-priced amount, never Standard
       // dollars paired with a Fast-adjusted capacity.
-      apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : null,
-      allowanceWeightedUsd: windowWeightingGaps === 0
+      apiCostUsd: planComparable && windowWeightingGaps === 0 ? windowCostUsd : null,
+      allowanceWeightedUsd: planComparable && windowWeightingGaps === 0
         ? windowCostUsd
         : null,
       allowanceBasisId: capacitySelection?.basisId ?? null,
@@ -4094,7 +4176,7 @@ function groupedUsageTimeline(data) {
   const hourMs = 60 * 60 * 1_000;
   const cutoff = timelineCutoffMs(data, activeUsageRangeDays);
   const groups = new Map();
-  for (const row of data.timeline.usage) {
+  for (const row of allowanceTimelineUsage(data)) {
     const timestamp = Date.parse(row.startAt);
     if (!Number.isFinite(timestamp) || timestamp < cutoff) continue;
     let key;
@@ -4549,13 +4631,18 @@ function selectedTimelinePoints(data) {
       && timelineSeriesMemo.rangeDays === activeCalibrationRangeDays) {
     return timelineSeriesMemo.selection;
   }
-  const sideChatAdjusted = data.accounting?.sideChatEstimates?.status
+  const scopedUsage = allowanceTimelineUsage(data);
+  // Side-chat estimates predate plan-era attribution. They remain visible in
+  // all-plan accounting, but cannot enter a current-plan numerator until they
+  // carry the same plan/generation scope as the exact usage timeline.
+  const sideChatAdjusted = !data.allowancePlanSelection
+    && data.accounting?.sideChatEstimates?.status
       === "available"
     && data.accounting.sideChatEstimates.methodology
       ?.includedInCalibrationTimeline === true
     && Array.isArray(data.timeline.calibrationUsage)
     && data.timeline.calibrationUsage.length > 0;
-  const exactByBucket = new Map(data.timeline.usage.map((row) => [
+  const exactByBucket = new Map(scopedUsage.map((row) => [
     `${row.startAt}|${row.endAt}`,
     row,
   ]));
@@ -4611,7 +4698,7 @@ function selectedTimelinePoints(data) {
   const livePoints = liveTimelinePoints(data, {
     usage: sideChatAdjusted
       ? data.timeline.calibrationUsage
-      : data.timeline.usage,
+      : scopedUsage,
   });
   // Retained gradient artifacts carry only Standard-rate rolling cost. They
   // can remain historical evidence elsewhere, but may never replace the
@@ -4632,6 +4719,7 @@ function selectedTimelinePoints(data) {
 }
 
 function renderTimeline(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
   const {
     points,
     baselinePoints,
@@ -4679,6 +4767,8 @@ function renderTimeline(data) {
         : tPlural("dashboard.timeline.series", 0, { window: windowLabel });
     empty.querySelector("p").textContent = unavailable
       ? t(projectionUnavailableCopyKey(data))
+      : data.allowancePlanSelection?.comparisonAvailable === false
+        ? t("weekly.plan.comparisonPending")
       : visiblePoints.length
         ? t("dashboard.timeline.noBracket", { window: windowLabel })
         : t("dashboard.timeline.missingData");
@@ -4770,6 +4860,11 @@ function renderTimelineConfidence(
   if (accountingIsUnavailable(data)) {
     element.classList.add("low");
     setLocalizedText(element, projectionUnavailableCopyKey(data));
+    return;
+  }
+  if (data.allowancePlanSelection?.comparisonAvailable === false) {
+    element.classList.add("low");
+    setLocalizedText(element, "weekly.plan.comparisonPending");
     return;
   }
   const activePoints = visiblePoints.filter((point) => point.status !== "inactive");
@@ -5291,6 +5386,55 @@ function renderResidualInspectionTable() {
 // panel has a stable target for its toggle's `aria-controls`.
 let nextDivergenceBreakdownId = 0;
 
+// Display-only state for the detector's bounded set of visible windows. Index
+// revisions refresh details without changing a window's identity; a changed
+// population or contributor mix cannot inherit another window's answer.
+const divergenceDetails = new Map();
+const MAX_DIVERGENCE_DETAILS = 20;
+
+function divergenceDetailScope(data) {
+  const scope = data?.timeline?.planScoped?.planScope;
+  return JSON.stringify([
+    data?.mode,
+    data?.allowancePlanSelection?.planType ?? null,
+    scope?.planType ?? null,
+    scope?.methodVersion ?? null,
+    scope?.basisFamilyId ?? null,
+    scope?.cohortId ?? null,
+  ]);
+}
+
+function divergenceDetailKey(period, scope) {
+  return JSON.stringify([scope, period.startMs, period.endMs, period.contributors]);
+}
+
+function prepareDivergenceDetails(data, periods) {
+  const scope = divergenceDetailScope(data);
+  const generation = data?.accounting?.generation;
+  const planScope = data?.timeline?.planScoped?.planScope;
+  const revision = generation == null && !planScope?.sourceGeneration
+    ? data
+    : JSON.stringify([generation, data?.accounting?.generationFingerprint,
+      planScope?.sourceGeneration, planScope?.sourceGenerationFingerprint]);
+  const retained = new Set();
+  for (const period of periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
+    const key = divergenceDetailKey(period, scope);
+    retained.add(key);
+    let state = divergenceDetails.get(key);
+    if (!state) {
+      state = { key, expanded: false, breakdown: null, loadedRevision: null,
+        pending: false, render: null, load: null };
+      divergenceDetails.set(key, state);
+    }
+    state.revision = revision;
+    state.local = ["local", "real_local_evidence"].includes(data?.mode);
+  }
+  for (const key of divergenceDetails.keys()) {
+    if (!retained.has(key)) divergenceDetails.delete(key);
+  }
+  return scope;
+}
+
 function divergenceRangeContext(data) {
   const accounting = accountingPeriod(data);
   if (!accounting) return null;
@@ -5299,9 +5443,11 @@ function divergenceRangeContext(data) {
     ?? models[0]
     ?? null;
   const modelLabel = topModel === null ? null
-    : topModel.model === "unknown" || topModel.pricingStatus === "unrecognized"
-      ? t("accounting.model.unrecognized")
-      : formatModelName(topModel.model) || topModel.model;
+    : topModel.model === "unknown"
+      ? t("accounting.model.identityUnavailable")
+      : topModel.pricingStatus === "unrecognized"
+        ? t("accounting.model.unrecognized")
+        : formatModelName(topModel.model) || topModel.model;
   const bySpeed = accounting.bySpeed ?? {};
   const rankedSpeed = ["fast", "standard", "unknown"]
     .map((key) => [key, finite(bySpeed?.[key]?.events, 0)])
@@ -5329,7 +5475,7 @@ function divergenceSpeedLabel(key) {
  * magnitude, and the contributor mix (exact per-period totals plus range-level
  * model/speed context).
  */
-function divergencePeriodItem(period, rangeContext) {
+function divergencePeriodItem(period, rangeContext, state) {
   const item = node(
     "li",
     `divergence-period ${period.direction === "under_costed"
@@ -5406,27 +5552,49 @@ function divergencePeriodItem(period, rangeContext) {
   panel.id = breakdownId;
   panel.hidden = true;
 
-  let loadState = "idle";
+  const renderBreakdown = () => {
+    if (state.breakdown !== null || !state.pending) {
+      renderDivergenceBreakdown(panel, state.breakdown, rangeContext);
+    } else {
+      clear(panel);
+      panel.append(localizedNode(
+        "p",
+        "divergence-breakdown-status",
+        "divergence.breakdown.loading",
+      ));
+    }
+  };
+  state.render = renderBreakdown;
   const loadBreakdown = async () => {
-    if (loadState === "loaded" || loadState === "loading") return;
-    loadState = "loading";
-    clear(panel);
-    panel.append(localizedNode(
-      "p",
-      "divergence-breakdown-status",
-      "divergence.breakdown.loading",
-    ));
+    if (!state.local || state.pending
+        || state.loadedRevision === state.revision) return;
+    const revision = state.revision;
+    state.pending = true;
+    renderBreakdown();
     let breakdown = null;
     try {
       breakdown = await localClient.windowBreakdown(period.startMs, period.endMs);
     } catch {
       breakdown = null;
     }
-    loadState = "loaded";
-    renderDivergenceBreakdown(panel, breakdown, rangeContext);
+    state.pending = false;
+    if (divergenceDetails.get(state.key) !== state) return;
+    if (state.revision !== revision) {
+      if (state.expanded) state.load();
+      return;
+    }
+    if (breakdown?.status === "available") {
+      state.breakdown = breakdown;
+      state.loadedRevision = revision;
+    }
+    // Failed refreshes never erase a successful answer or mark failure as
+    // loaded. Reopening or the next dashboard refresh can try again.
+    state.render();
   };
+  state.load = loadBreakdown;
   toggle.addEventListener("click", () => {
     const open = toggle.getAttribute("aria-expanded") === "true";
+    state.expanded = !open;
     toggle.setAttribute("aria-expanded", open ? "false" : "true");
     setLocalizedText(
       toggle,
@@ -5435,7 +5603,14 @@ function divergencePeriodItem(period, rangeContext) {
     panel.hidden = open;
     if (!open) loadBreakdown();
   });
+  toggle.setAttribute("aria-expanded", String(state.expanded));
+  setLocalizedText(toggle, state.expanded
+    ? "divergence.breakdown.hide" : "divergence.breakdown.show");
+  panel.hidden = !state.expanded;
+  renderBreakdown();
+  if (state.expanded) loadBreakdown();
 
+  state.toggle = toggle;
   item.append(toggle, panel);
   return item;
 }
@@ -5445,7 +5620,7 @@ function divergencePeriodItem(period, rangeContext) {
 // exists to supply; an unavailable breakdown falls back to the range-level
 // context rather than pretending this window had none.
 function divergenceModelLabel(model) {
-  if (model === "unknown") return t("accounting.model.unrecognized");
+  if (model === "unknown") return t("accounting.model.identityUnavailable");
   return formatModelName(model) || model;
 }
 
@@ -5550,11 +5725,14 @@ function renderDivergencePeriods(data, points) {
   const summary = $("#divergence-summary");
   const caveat = $("#divergence-caveat");
   if (!list || !empty || !summary) return;
+  const focusedKey = [...divergenceDetails.values()]
+    .find((state) => state.toggle === document.activeElement)?.key;
   clear(list);
 
   const result = detectDeviationPeriods(points, {
     usageBuckets: data?.timeline?.usage ?? [],
   });
+  const detailScope = prepareDivergenceDetails(data, result.periods);
 
   if (!result.periods.length) {
     list.hidden = true;
@@ -5601,8 +5779,11 @@ function renderDivergencePeriods(data, points) {
   }
 
   const rangeContext = divergenceRangeContext(data);
-  for (const period of result.periods) {
-    list.append(divergencePeriodItem(period, rangeContext));
+  for (const period of result.periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
+    const key = divergenceDetailKey(period, detailScope);
+    const state = divergenceDetails.get(key);
+    list.append(divergencePeriodItem(period, rangeContext, state));
+    if (key === focusedKey) state.toggle.focus({ preventScroll: true });
   }
 }
 
@@ -7373,7 +7554,44 @@ function renderWeeklyPaceForecast(data) {
   card.hidden = false;
 }
 
+function renderWeeklyPlanControl(data) {
+  const control = $("#weekly-plan-control");
+  const select = $("#weekly-plan-select");
+  const note = $("#weekly-plan-note");
+  if (!control || !select || !note) return;
+  const selection = data.allowancePlanSelection;
+  control.hidden = !selection;
+  note.hidden = !selection;
+  if (!selection) return;
+  const populations = data.weekly.planPopulations ?? [];
+  const signature = JSON.stringify([
+    populations.map((row) => row.planType),
+    selection.currentPlanType,
+    localization.locale(),
+  ]);
+  if (select.dataset.populationSignature !== signature) {
+    select.replaceChildren(...populations.map((row) => {
+      const option = node("option");
+      option.value = row.planType;
+      option.textContent = t(row.planType === selection.currentPlanType
+        ? "weekly.plan.latestOption" : "weekly.plan.historyOption", {
+        plan: shareCardPlanLabel(row.planType) || t("weekly.plan.unknown"),
+      });
+      return option;
+    }));
+    select.dataset.populationSignature = signature;
+  }
+  select.value = selection.planType;
+  select.disabled = populations.length < 2;
+  setLocalizedText(note, selection.isCurrentPlan
+    ? "weekly.plan.conditional" : "weekly.plan.historicalConditional", {
+    plan: shareCardPlanLabel(selection.planType) || t("weekly.plan.unknown"),
+  });
+}
+
 function renderWeekly(data) {
+  data = selectAllowancePlanPopulation(data, activeWeeklyPlanType);
+  renderWeeklyPlanControl(data);
   renderWeeklyPaceForecast(data);
   // A weekly estimate carried over from the previous app version while the
   // recalculation runs announces itself here, quietly.
@@ -7398,13 +7616,17 @@ function renderWeekly(data) {
   // underneath reports how much of that population the chart is drawing. The
   // headline is deliberately not made to follow the filter — a figure people
   // quote should not move when they adjust a chart control.
-  setLocalizedText($("#weekly-estimate-label"), "weekly.headline.label");
+  const planLabel = shareCardPlanLabel(data.weekly.planType) || t("weekly.plan.unknown");
+  setLocalizedText($("#weekly-estimate-label"), data.allowancePlanSelection
+    ? "weekly.headline.planLabel" : "weekly.headline.label", { plan: planLabel });
   $("#weekly-estimate").textContent = estimate === null
     ? t("weekly.headline.insufficient")
     : t("weekly.headline.value", { amount: formatMoney(estimate) });
   $("#weekly-range").textContent = lower === null || upper === null
     ? t("weekly.headline.rangeUnavailable")
-    : t("weekly.headline.range", {
+    : t(data.allowancePlanSelection
+      ? "weekly.headline.planRange" : "weekly.headline.range", {
+      plan: planLabel,
       lower: formatMoney(lower),
       upper: formatMoney(upper),
     });
@@ -8160,7 +8382,29 @@ function updateCacheDropThreadCells() {
   }
 }
 
+function cacheDropThreadKeys(data) {
+  const keys = new Set();
+  if (!isCacheDropThreadDashboard(data) || !isLoopbackDashboard()) return keys;
+  for (const [kind, impact] of [
+    ["switch", data.accounting?.cacheSwitchImpact],
+    ["continuity", data.accounting?.cacheContinuityImpact],
+  ]) {
+    if (impact?.status !== "available") continue;
+    const periods = Array.isArray(impact.periods) ? impact.periods.slice(0, 4) : [];
+    for (const period of [impact, ...periods]) {
+      const recent = Array.isArray(period?.recent) ? period.recent.slice(0, 20) : [];
+      for (const row of recent) {
+        const key = cacheDropThreadLookupKey(kind, row);
+        if (key !== null) keys.add(key);
+        if (keys.size === 160) return keys;
+      }
+    }
+  }
+  return keys;
+}
+
 function resetCacheDropThreadLinks(data = null) {
+  const sameDashboard = cacheDropThreadLinks.dashboard === data;
   cacheDropThreadLinks.requestToken += 1;
   cacheDropThreadLinks.dashboard = data;
   cacheDropThreadLinks.generation = isCacheDropThreadDashboard(data)
@@ -8168,11 +8412,15 @@ function resetCacheDropThreadLinks(data = null) {
     ? data.accounting.generation
     : null;
   cacheDropThreadLinks.requested = false;
-  cacheDropThreadLinks.entries.clear();
-  // Remove old names even when a failed dashboard load leaves its previous
-  // accounting rows visible underneath the unavailable-state notice.
+  // A new accounting generation does not change an already resolved thread.
+  // Reuse only exact event-pair keys still present in the local snapshot, across
+  // all selectable periods. New/changed rows must resolve independently.
+  const retainedKeys = cacheDropThreadKeys(data);
+  for (const key of cacheDropThreadLinks.entries.keys()) {
+    if (!retainedKeys.has(key)) cacheDropThreadLinks.entries.delete(key);
+  }
   updateCacheDropThreadCells();
-  cacheDropThreadLinks.cells = { switch: [], continuity: [] };
+  if (!sameDashboard) cacheDropThreadLinks.cells = { switch: [], continuity: [] };
 }
 
 async function loadCacheDropThreadLinks(data) {
@@ -8186,6 +8434,7 @@ async function loadCacheDropThreadLinks(data) {
   cacheDropThreadLinks.requested = true;
   const token = ++cacheDropThreadLinks.requestToken;
   const loadToken = cacheDropThreadLinks.loadToken;
+  let completed = false;
   try {
     const result = await localClient.cacheDropThreadLinks();
     if (token !== cacheDropThreadLinks.requestToken
@@ -8196,13 +8445,31 @@ async function loadCacheDropThreadLinks(data) {
         || data.accounting?.generationMatched !== true
         || result?.status !== "available"
         || result.generation !== generation) return;
-    cacheDropThreadLinks.entries = new Map(
-      result.entries.map((entry) => [entry.key, entry.thread]),
-    );
+    const selectedKeys = cacheDropThreadKeys(data);
+    for (const { key, thread } of result.entries) {
+      if (!selectedKeys.has(key)) continue;
+      const previous = cacheDropThreadLinks.entries.get(key);
+      // Optional name-store failures must not erase details already known for
+      // this UUID. A newly resolved identity replaces the old entry outright.
+      cacheDropThreadLinks.entries.set(key, previous?.id === thread.id ? {
+        ...thread,
+        name: thread.name ?? previous.name,
+        nickname: thread.nickname ?? previous.nickname,
+        parent: thread.parent === null ? previous.parent : {
+          ...thread.parent,
+          name: thread.parent.name ?? (thread.parent.id === previous.parent?.id
+            ? previous.parent.name : null),
+        },
+      } : thread);
+    }
+    completed = true;
     updateCacheDropThreadCells();
   } catch {
-    // Older companions and unavailable local metadata are a normal, quiet
-    // fallback. Accounting remains usable and no private lookup error leaks.
+    // Keep resolved details usable through temporary local lookup failures.
+  } finally {
+    if (!completed && token === cacheDropThreadLinks.requestToken) {
+      cacheDropThreadLinks.requested = false;
+    }
   }
 }
 
@@ -10141,7 +10408,9 @@ function modelApiEquivalentCell(row) {
     // guessed one would be worse than none. Printing "$0.00" here read as a
     // priced zero, which is a different and untrue claim.
     setLocalizedText(cell, "accounting.model.notPricedUnknown");
-    cell.title = t("accounting.model.notPricedUnknownTitle");
+    cell.title = t(row.model === "unknown"
+      ? "accounting.model.identityUnavailableTitle"
+      : "accounting.model.notPricedUnknownTitle");
     return cell;
   }
   const amount = finite(row?.apiPriceEquivalentUsd);
@@ -10243,7 +10512,9 @@ function modelComponentRow(model, key, labelKey, totals) {
         : model.pricingStatus === "known_unpriced"
           ? "accounting.model.noPublishedPriceTitle"
           : model.pricingStatus === "unrecognized"
-            ? "accounting.model.notPricedUnknownTitle"
+            ? model.model === "unknown"
+              ? "accounting.model.identityUnavailableTitle"
+              : "accounting.model.notPricedUnknownTitle"
             : "accounting.model.componentCostWithheldTitle",
     );
     costShareCell = localizedNode(
@@ -10315,9 +10586,13 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
   for (const model of page.rows) {
     const row = node("tr");
     const identity = node("td", "model-identity");
-    // "Unrecognized model" now means exactly one thing: an identifier this
-    // build has never reviewed, so it is withheld rather than printed.
-    if (model.model === "unknown" || model.pricingStatus === "unrecognized") {
+    // The unknown aggregate combines missing attribution and unreviewed
+    // identifiers. Its label must not claim either cause as established.
+    if (model.model === "unknown") {
+      const label = localizedNode("span", "", "accounting.model.identityUnavailable");
+      label.title = t("accounting.model.identityUnavailableTitle");
+      identity.append(label);
+    } else if (model.pricingStatus === "unrecognized") {
       identity.append(localizedNode("span", "", "accounting.model.unrecognized"));
     } else {
       // The wire identifier is what the provider reported and what any
@@ -10375,7 +10650,11 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
             row.getAttribute("aria-expanded") === "true"
               ? "accounting.model.collapse"
               : "accounting.model.expand",
-            { model: formatModelName(model.model) },
+            { model: model.model === "unknown"
+              ? t("accounting.model.identityUnavailable")
+              : model.pricingStatus === "unrecognized"
+                ? t("accounting.model.unrecognized")
+                : formatModelName(model.model) },
           ),
         );
       };
@@ -10830,7 +11109,7 @@ async function prepareIncrementalReviewInstance() {
 // on the approve card, so each names the reader's actual next action there.
 const INCREMENTAL_PREPARATION_ERROR_COPY = {
   identity_migration_required:
-    "TiboTattle preserved an older local identity because its move into app-owned keychain storage was not allowed. Quit and reopen TiboTattle, then choose Check again and allow the migration when macOS asks. Do not reset, delete, or rotate the identity. No upload occurred.",
+    "Your existing local identity and history are unchanged. In TiboTattle, open Settings… → General and choose Review migration… under Secure upgrade when you’re ready. No upload occurred. Do not reset, delete, or rotate the identity.",
   identity_unavailable:
     "The local Keychain identity is unavailable. Open Keychain Access, select the login Keychain, unlock it, then choose Check again. Do not reset, delete, rotate, or broaden access to the identity. No upload occurred.",
   coverage_unavailable:
@@ -11066,6 +11345,56 @@ async function copyContributionDiagnostics() {
   }
 }
 
+async function loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable }) {
+  const read = async (request, publish = () => {}) => {
+    const value = await Promise.resolve().then(request).catch(() => null);
+    if (isCurrent()) publish(value);
+    return value;
+  };
+  const health = read(() => localClient.health(), (localHealth) => {
+    // A failed read says nothing about the companion. Never replace a health
+    // answer that landed with one that did not.
+    if (localHealth === null) return;
+    localCompanionHealth = localHealth;
+    renderHostedIdentity();
+    if (!primaryAvailable && dashboard === null) {
+      renderDashboardUnavailableState("dashboard-unavailable");
+    }
+  });
+  const onboarding = read(() => localClient.onboarding(), (value) => {
+    if (value === null) return;
+    renderLocalOnboarding(value);
+    // Bootstrap may have finished before this verdict arrived. Preserve the
+    // browser's existing return-visit cadence; the native shell owns its own.
+    scheduleReturningUserRefresh();
+  });
+  const refresh = read(() => localClient.refreshStatus(), (refreshState) => {
+    if (refreshState === null) return;
+    accountingRebuildDeferral =
+      refreshState?.refresh?.result?.accountingRebuildDeferred ?? null;
+    if (dashboard) renderAccounting(dashboard);
+  });
+  const status = read(
+    () => localClient.contributionSyncStatus(),
+    (value) => renderContributionSyncStatus(primaryAvailable ? value : null),
+  );
+  const preview = read(() => localClient.contributionSyncPreview());
+  const consentAndPreview = (async () => {
+    // These settled answers prevent duplicate recovery reads. Consent must
+    // still precede preview publication: an approved Mac must not re-prepare
+    // a review merely because its usage data was ready first.
+    await Promise.all([health, onboarding]);
+    if (!isCurrent()) return;
+    await loadIncrementalSyncStatus({ isCurrent });
+    if (!isCurrent()) return;
+    scheduleReturningUserRefresh();
+    const value = await preview;
+    if (!isCurrent()) return;
+    renderContributionSyncPreview(primaryAvailable ? value : null);
+  })();
+  await Promise.all([refresh, status, consentAndPreview]);
+}
+
 /** Mark the first real local-dashboard render for the native shell. */
 function markLocalDashboardReady() {
   // The native shell uses this app-owned marker instead of mistaking static
@@ -11076,25 +11405,28 @@ function markLocalDashboardReady() {
 }
 
 async function loadLocalDashboard() {
-  cacheDropThreadLinks.loadToken += 1;
-  const previousBusy = localActionBusy;
+  const loadToken = ++cacheDropThreadLinks.loadToken;
+  const load = {
+    previousBusy: activeLocalDashboardLoad?.pending
+      ? activeLocalDashboardLoad.previousBusy
+      : localActionBusy,
+    pending: true,
+  };
+  activeLocalDashboardLoad = load;
+  const isCurrent = () => cacheDropThreadLinks.loadToken === loadToken;
+  let primaryAvailable = false;
   localActionBusy = true;
   const button = $("#refresh-button");
   button.textContent = "Connecting…";
   updateLocalActionButtons();
   try {
-    const syncState = (async () => {
-      const [preview, status] = await Promise.all([
-        localClient.contributionSyncPreview().catch(() => null),
-        localClient.contributionSyncStatus().catch(() => null)
-      ]);
-      return { preview, status };
-    })();
     const loadDashboardData = async () => {
       try {
         return await localClient.load();
       } catch (firstError) {
+        if (!isCurrent()) throw firstError;
         await new Promise((resolve) => window.setTimeout(resolve, 250));
+        if (!isCurrent()) throw firstError;
         try {
           return await localClient.load();
         } catch {
@@ -11102,60 +11434,34 @@ async function loadLocalDashboard() {
         }
       }
     };
-    const [data, sync, localHealth, onboarding, refreshState] = await Promise.all([
-      loadDashboardData(),
-      syncState,
-      localClient.health().catch(() => null),
-      localClient.onboarding().catch(() => null),
-      localClient.refreshStatus().catch(() => null)
-    ]);
-    // A read that did not land says nothing about the companion, so it may not
-    // replace one that did: the same rule the accounting-rebuild note above
-    // follows. Only the unavailable-state decision below reads THIS load's
-    // answer, because that is the one it is reporting on.
-    if (localHealth !== null) localCompanionHealth = localHealth;
-    if (refreshState !== null) {
-      accountingRebuildDeferral =
-        refreshState?.refresh?.result?.accountingRebuildDeferred ?? null;
-    }
+    const data = await loadDashboardData();
+    if (!isCurrent()) return;
     renderDashboard(data);
-    // Health arrives after the first paint, and the sign-in controls are gated
-    // on a capability it carries. Without this re-render they keep the
-    // disabled state bootstrap gave them when the capability was still unknown.
-    renderHostedIdentity();
-    renderContributionSyncStatus(sync.status);
-    // Before the consent read, because that read now also recovers whichever
-    // companion answers are still unsettled — and an onboarding verdict this
-    // load already holds is not one of them.
-    renderLocalOnboarding(onboarding);
-    // The primary local result is now rendered. Do not keep the native
-    // readiness signal waiting on the secondary contribution-status read;
-    // its consent invariant still completes before the preview renders.
+    // Clear the first-run evidence curtain using the result we actually have,
+    // even while the next optional onboarding verdict is still pending.
+    renderLocalOnboarding(localOnboarding);
     markLocalDashboardReady();
-    // Consent state is read from the companion before the queue renders, so
-    // an already-approved Mac never re-prepares a review instance it no
-    // longer needs.
-    await loadIncrementalSyncStatus();
-    renderContributionSyncPreview(sync.preview);
+    primaryAvailable = true;
   } catch {
-    const [localHealth, onboarding] = await Promise.all([
-      localClient.health().catch(() => null),
-      localClient.onboarding().catch(() => null),
-    ]);
-    if (localHealth !== null) localCompanionHealth = localHealth;
+    if (!isCurrent()) return;
     dashboard = null;
-    renderHostedIdentity();
-    renderContributionSyncStatus(null);
-    renderLocalOnboarding(onboarding);
-    await loadIncrementalSyncStatus();
-    renderContributionSyncPreview(null);
+    renderLocalOnboarding(localOnboarding);
     renderDashboardUnavailableState(
-      localHealth ? "dashboard-unavailable" : "companion-unavailable",
+      localCompanionHealth ? "dashboard-unavailable" : "companion-unavailable",
     );
     markLocalDashboardReady();
   } finally {
-    localActionBusy = previousBusy;
-    updateLocalActionButtons();
+    if (activeLocalDashboardLoad === load) {
+      load.pending = false;
+      localActionBusy = load.previousBusy;
+      updateLocalActionButtons();
+    }
+  }
+  if (isCurrent()) {
+    // Optional reads never own primary readiness or the action's busy state.
+    void loadLocalDashboardSecondaryState({ isCurrent, primaryAvailable }).catch(() => {
+      if (isCurrent()) scheduleIncrementalSyncStatusPoll();
+    });
   }
 }
 
@@ -11183,10 +11489,35 @@ function renderDashboardSkeleton() {
 }
 
 async function loadQuickResultDashboard() {
+  const loadToken = ++cacheDropThreadLinks.loadToken;
+  const isCurrent = () => cacheDropThreadLinks.loadToken === loadToken;
+  try {
+    const data = await localClient.load();
+    if (!isCurrent()) return;
+    renderDashboard(data);
+    renderLocalOnboarding(localOnboarding);
+  } finally {
+    // This generation replaces any pending startup reads too. Keep optional
+    // recovery alive without making native evidence reloads wait for it.
+    if (isCurrent()) {
+      void loadLocalDashboardSecondaryState({
+        isCurrent,
+        primaryAvailable: dashboard !== null && dashboard.mode !== "demo",
+      }).catch(() => {
+        if (isCurrent()) scheduleIncrementalSyncStatusPoll();
+      });
+    }
+  }
+}
+
+function showDemoDashboard() {
   cacheDropThreadLinks.loadToken += 1;
-  const data = await localClient.load();
-  renderDashboard(data);
-  if (localOnboarding) renderLocalOnboarding(localOnboarding);
+  if (activeLocalDashboardLoad?.pending) {
+    localActionBusy = activeLocalDashboardLoad.previousBusy;
+  }
+  activeLocalDashboardLoad = null;
+  renderDashboard(demoDashboard());
+  updateLocalActionButtons();
 }
 
 /**
@@ -11217,7 +11548,7 @@ function historyProgressReceipt() {
 }
 
 /**
- * After a successful refresh that left the history index incomplete, run the
+ * After an explicit detailed refresh that left the history index incomplete, run the
  * next pass promptly instead of waiting for the sparse auto-cadence, bounded
  * by REINDEX_AUTO_CONTINUE_LIMIT. Stops the moment coverage completes, the
  * user interacts, or the bound is reached (the ordinary cadence then carries
@@ -11244,11 +11575,11 @@ function scheduleReindexAutoContinuation() {
       return;
     }
     reindexAutoContinuations += 1;
-    void requestRefresh({ autoContinue: true });
+    void requestRefresh({ autoContinue: true, detailed: true });
   }, REINDEX_AUTO_CONTINUE_DELAY_MS);
 }
 
-async function requestRefresh({ autoContinue = false } = {}) {
+async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   if (localActionBusy) return;
   // Fence continuation against the exact coverage visible before this pass.
   // If the terminal reload presents the same generation/count/byte receipt,
@@ -11278,11 +11609,15 @@ async function requestRefresh({ autoContinue = false } = {}) {
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
   archiveHistoryScanActive = false;
-  button.textContent = "Starting local analysis…";
+  button.textContent = detailed
+    ? "Starting detailed accounting…"
+    : "Starting local analysis…";
   updateLocalActionButtons();
   setGlobalState("updating");
   try {
-    await localClient.refresh();
+    await (detailed
+      ? localClient.recalculateDetailedAccounting()
+      : localClient.refresh());
     refreshAccepted = true;
     let activePassStartedMs = Date.now();
     const pollingBudget = createRefreshPollingBudget();
@@ -11379,7 +11714,9 @@ async function requestRefresh({ autoContinue = false } = {}) {
           throw new Error("The bounded continuation limit was reached.");
         }
         try {
-          await localClient.refresh();
+          await (detailed
+            ? localClient.recalculateDetailedAccounting()
+            : localClient.refresh());
           pollingBudget.noteContinuation();
           activePassStartedMs = Date.now();
           timeoutSettlementNoted = false;
@@ -11480,12 +11817,23 @@ async function requestRefresh({ autoContinue = false } = {}) {
     archiveHistoryScanActive = false;
     button.textContent = "Loading updated evidence…";
     await loadLocalDashboard();
-    scheduleReindexAutoContinuation();
+    if (detailed) scheduleReindexAutoContinuation();
   } catch (error) {
     if (dashboard) {
       setGlobalState(dashboard.state, {
         companionReachable: dashboard.mode !== "demo",
       });
+    }
+    if (!refreshAccepted && error?.status === 409) {
+      // Another surface owns the shared controller. In particular, a quick
+      // run is not proof that this request's detailed work was accepted. Do
+      // not enqueue an escalation or turn a safe conflict into a failure.
+      showConnectionNotice({
+        title: t("refresh.alreadyRunningTitle"),
+        copy: t("refresh.alreadyRunningCopy"),
+        kind: "info",
+      });
+      return;
     }
     // This was a bare `catch {}`: it printed one of three sentences for every
     // possible cause and discarded the only evidence of which one occurred.
@@ -11677,7 +12025,7 @@ const CONTRIBUTION_DEVICE_CONFLICT_COPY =
 // situation: nothing here is leftover, broken, or in need of clearing. The
 // sentence must say what is true (uploads are paused) and name the one action
 // that changes it (unlock), because the recovery copy above would send the
-// user to a destructive reset for a condition their login password fixes.
+// user to a destructive reset while the intact credential is unavailable.
 const CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY =
   "Your Mac's login keychain is locked, so TiboTattle cannot reach this Mac's upload credential. Nothing is wrong with the credential and nothing was uploaded — uploads stay paused until you unlock it. Open Keychain Access, unlock the login keychain, then try again. Do not reset or delete the entry.";
 
@@ -11823,13 +12171,13 @@ const LOCAL_COMPANION_ERROR_COPY = {
   contribution_device_recovery_required: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_credential_conflict: CONTRIBUTION_DEVICE_CONFLICT_COPY,
   contribution_device_keychain_access_denied:
-    "macOS did not let TiboTattle read the upload credential it just stored for this Mac — this happens when Deny is chosen in the macOS keychain dialog. Nothing was uploaded. Clear the credential below, choose Review and approve again, and choose Always Allow when macOS asks.",
+    "Uploads are paused because TiboTattle could not access this Mac's upload credential. The existing credential and local history are unchanged. Nothing was uploaded. You can try again later.",
   // Locked is NOT a defect and must never read like one: the credential and
   // its local record are both intact and become readable the moment the
   // keychain is unlocked. Uploads pause; nothing needs clearing or re-pairing.
   contribution_device_keychain_locked: CONTRIBUTION_DEVICE_KEYCHAIN_LOCKED_COPY,
   contribution_device_keychain_migration_required:
-    "TiboTattle left this Mac's older upload credential untouched because its move into app-owned keychain storage was not allowed. Nothing was uploaded. Quit and reopen TiboTattle, then return here and approve again; allow TiboTattle to continue when macOS asks. Do not reset or delete the credential.",
+    "This Mac's existing upload credential and local history are unchanged. In TiboTattle, open Settings… → General and choose Review migration… under Secure upgrade when you’re ready. Nothing was uploaded. Do not reset or delete the credential.",
   unsupported_media_type:
     "The local companion rejected this request format. Nothing was uploaded; reload TiboTattle and try again.",
   request_too_large:
@@ -11953,6 +12301,19 @@ const LOCAL_COMPANION_ERROR_COPY = {
     "The local relay does not forward that participant action. Nothing was uploaded; install the current signed build."
 };
 
+const LOCALIZED_KEYCHAIN_RECOVERY_CODES = new Set([
+  "identity_migration_required",
+  "contribution_device_keychain_migration_required",
+  "contribution_device_keychain_access_denied",
+]);
+
+function localizedKeychainRecoveryExplanation(explanation, code) {
+  return LOCALIZED_KEYCHAIN_RECOVERY_CODES.has(code)
+    && typeof explanation === "string"
+    ? localization.translateText(explanation)
+    : explanation;
+}
+
 /**
  * Turn one failure into honest copy plus a quotable reference.
  *
@@ -12007,10 +12368,17 @@ async function describeFailure({ surface, error, messages = {}, fallback }) {
       `Diagnostic note ${reference} was refused by the local companion.`
     );
   }
-  const explanation = fixedCopy(messages, code)
+  const fixedExplanation = fixedCopy(messages, code)
     ?? fixedCopy(SERVICE_ERROR_COPY, code)
-    ?? fixedCopy(LOCAL_COMPANION_ERROR_COPY, code)
-    ?? fallback;
+    ?? fixedCopy(LOCAL_COMPANION_ERROR_COPY, code);
+  // These fixed Keychain sentences explain a pause or native recovery.
+  // Translate the product-owned sentence before the diagnostic reference is added;
+  // translating the combined text would miss the exact catalog entry. No raw
+  // error, reference, request ID, or unrelated failure passes through here.
+  const explanation = localizedKeychainRecoveryExplanation(
+    fixedExplanation,
+    code,
+  ) ?? fallback;
   const trailer = diagnosticReferenceSentence({
     reference,
     requestId,
@@ -12835,6 +13203,8 @@ function renderCommunityJourney() {
     } else {
       stage("community", "waiting", "journey.community.waitingIndex");
     }
+  } else if (incrementalConsentApproved && incrementalSyncStatus?.pausedReason === "device_repair_required") {
+    stage("community", "action", "consent.repairConnection");
   } else if (incrementalConsentApproved && incrementalUploadAuthorityLost()) {
     // The transparent re-pair is pending, so this stage must not claim
     // "done · syncing" while the approve card is asking for a sign-in
@@ -12863,6 +13233,164 @@ function renderCommunityJourney() {
 // that transport exists the surface stays out of the document entirely, so
 // the page never claims an automatic upload that cannot happen.
 const INCREMENTAL_SYNC_CONTRACT = "telemetry-contribution-v1.0";
+
+function attributionContributionSelected() {
+  return incrementalSyncStatus?.contractVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION;
+}
+
+function renderAttributionContribution() {
+  const surface = $("#attribution-consent");
+  if (!surface) return;
+  const selected = attributionContributionSelected();
+  const approved = selected && incrementalSyncStatus?.consent?.approved === true
+    && incrementalSyncStatus.consent.current === true;
+  surface.hidden = !selected && incrementalSyncStatus?.attributionUpgradeAvailable !== true;
+  if (surface.hidden) return;
+  const busy = attributionContributionBusy || incrementalConsentBusy || communityConnectBusy
+    || contributionDisconnectBusy || contributionDisconnectDialogOpen();
+  const repair = incrementalUploadAuthorityLost() || contributionDeviceDisconnectPaused();
+  const repairRequired = approved && incrementalSyncStatus?.pausedReason === "device_repair_required";
+  const button = $("#attribution-review-open");
+  button.hidden = approved && !repair;
+  button.disabled = busy || contributionDisconnectOutcome === "cleanup_pending";
+  setLocalizedText(button, repairRequired ? "consent.repairConnection" : "attributionConsent.review");
+  setLocalizedText($("#attribution-consent-description"), repairRequired
+    ? "consent.repairRequired" : approved ? "attributionConsent.approved" : "attributionConsent.description");
+  const review = attributionContributionReview;
+  const details = $("#attribution-review");
+  details.hidden = review === null;
+  if (review !== null) {
+    setLocalizedText($("#attribution-review-destination"), "attributionConsent.destination", {
+      destination: review.consent.destinationOrigin,
+    });
+    setRawText($("#attribution-review-contract"), [review.consent.telemetrySchemaVersion,
+      review.consent.fieldDictionaryVersion, review.consent.privacyContractVersion].join(" · "));
+    setLocalizedText($("#attribution-review-sample"), "attributionConsent.sample", {
+      day: review.sample.day, usage: formatNumber(review.sample.recordCounts.usage),
+      quota: formatNumber(review.sample.recordCounts.quota), sessions: formatNumber(review.sample.recordCounts.session),
+    });
+    const inventory = $("#attribution-review-inventory");
+    inventory.replaceChildren();
+    for (const [stream, fields] of Object.entries(review.inventory.fields)) {
+      const row = document.createElement("div");
+      const label = document.createElement("dt");
+      label.textContent = t(`attributionConsent.fields.${stream}`);
+      const values = document.createElement("dd");
+      values.textContent = fields.join(", ");
+      row.append(label, values);
+      inventory.append(row);
+    }
+    setLocalizedText($("#attribution-review-bases"), "attributionConsent.bases", {
+      accounts: review.inventory.accountBases.join(", "), plans: review.inventory.planBases.join(", "),
+      nullable: review.inventory.nullableQuotaMeasurements.join(", "),
+    });
+  }
+  $("#attribution-consent-confirm").disabled = busy;
+  $("#attribution-consent-approve").disabled = busy || review === null
+    || !$("#attribution-consent-confirm").checked || hostedSignInRequired();
+  $("#attribution-review-cancel").disabled = busy;
+  const note = $("#attribution-consent-status");
+  const key = attributionContributionNotice ?? (review && hostedSignInRequired() ? "consent.signInFirst" : null);
+  note.hidden = key === null;
+  if (key !== null) setLocalizedText(note, key);
+}
+
+async function ensureAttributionHostedSession() {
+  if (hostedIdentity !== null) {
+    const enrollment = await communityClient.enroll(null, "telemetry-contribution-v0.1", {
+      deviceBootstrap: false, identity: hostedIdentity,
+    });
+    if (enrollment?.schemaVersion !== "participant-bootstrap-v0.1" || typeof enrollment.csrfToken !== "string") {
+      throw new Error("Hosted session is unavailable.");
+    }
+    setCommunitySession({ csrfToken: enrollment.csrfToken, participantId: enrollment.participantId ?? null,
+      consentVersion: "privacy-safe-telemetry-v0.1" });
+    await clearPendingHostedSignIn().catch(() => {});
+    hostedIdentity = null;
+    communitySessionMintedAt = Date.now();
+  }
+  if (!hasCommunitySession()) throw new Error("Hosted sign-in is required.");
+}
+
+async function openAttributionContributionReview() {
+  if (attributionContributionBusy || incrementalConsentBusy || communityConnectBusy
+      || contributionDisconnectBusy || contributionDisconnectDialogOpen()) return;
+  if (!attributionContributionSelected() && incrementalSyncStatus?.attributionUpgradeAvailable !== true) return;
+  const repairNeeded = ["device_unavailable", "device_repair_required"].includes(incrementalSyncStatus?.pausedReason)
+    || contributionDeviceDisconnectPaused();
+  if (!attributionContributionSelected() && repairNeeded) {
+    // The existing-format repair may resume an upload immediately. Keep it
+    // separate from new-format review instead of racing that credential use.
+    attributionContributionNotice = "attributionConsent.repairBeforeReview";
+    renderAttributionContribution();
+    return;
+  }
+  const repairing = attributionContributionSelected() && repairNeeded;
+  const alreadyApproved = attributionContributionSelected() && incrementalSyncStatus?.consent?.approved === true
+    && incrementalSyncStatus.consent.current === true;
+  attributionContributionBusy = true;
+  attributionContributionReview = null;
+  attributionContributionNotice = repairing ? "consent.syncRefreshingAuthority" : "attributionConsent.reviewing";
+  $("#attribution-consent-confirm").checked = false;
+  renderAttributionContribution();
+  try {
+    if (repairing) {
+      // Clear the repair pause first. Only current exact successor consent
+      // can resume an upload; stale consent still needs the fresh review.
+      await ensureAttributionHostedSession();
+      const pairing = await mintDevicePairingWithCookieCommitRetry();
+      await localClient.pairContributionDevice(pairing.pairingCode);
+      contributionDisconnectOutcome = null;
+      if (alreadyApproved) {
+        await loadIncrementalSyncStatus().catch(() => {});
+        scheduleIncrementalSyncStatusPoll({ reset: true });
+        attributionContributionNotice = "consent.authorityRefreshed";
+        return;
+      }
+    }
+    attributionContributionReview = await localClient.reviewAttributionContribution();
+    attributionContributionNotice = null;
+    $("#attribution-review").hidden = false;
+    $("#attribution-review-title").focus();
+  } catch {
+    attributionContributionNotice = repairing ? "consent.repairIncomplete" : "attributionConsent.reviewUnavailable";
+  } finally {
+    attributionContributionBusy = false;
+    renderAttributionContribution();
+  }
+}
+
+async function approveAttributionContribution() {
+  const review = attributionContributionReview;
+  if (review === null || attributionContributionBusy || incrementalConsentBusy || communityConnectBusy
+      || contributionDisconnectBusy || contributionDisconnectDialogOpen()
+      || !$("#attribution-consent-confirm").checked || hostedSignInRequired()) return;
+  attributionContributionBusy = true;
+  attributionContributionNotice = "attributionConsent.approving";
+  renderAttributionContribution();
+  try {
+    await ensureAttributionHostedSession();
+    // Distinct authority: this call carries the hosted session + CSRF, never
+    // the upload device credential. The local approval verifies the grant.
+    await communityClient.grantAttributionContribution(review);
+    const result = await localClient.approveAttributionContribution(review);
+    if (result?.status !== "approved" || result.contractVersion !== TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION) {
+      throw new Error("Attribution approval did not finish.");
+    }
+    attributionContributionReview = null;
+    attributionContributionNotice = "attributionConsent.approved";
+    await loadIncrementalSyncStatus();
+    scheduleIncrementalSyncStatusPoll({ reset: true });
+  } catch {
+    // A grant may have landed while local approval lost its response. Never
+    // claim no hosted change, auto-approve, or fall back to the older format.
+    attributionContributionReview = null;
+    attributionContributionNotice = "attributionConsent.approvalIncomplete";
+  } finally {
+    attributionContributionBusy = false;
+    renderContributionActionState();
+  }
+}
 
 function incrementalSyncCapabilityAdvertised() {
   return localCompanionHealth?.capabilities?.incrementalContributionSync
@@ -12919,18 +13447,19 @@ function incrementalGrantRejected() {
 
 /**
  * Whether this Mac's upload authority is lost and only the connect ceremony
- * can restore it. Two paused reasons qualify: consent_rejected (the service
+ * can restore it. Paused reasons include consent_rejected (the service
  * refused the grant) and device_unavailable (no readable device credential —
  * after a credential reset or a broken Keychain binding). Gating repair on
  * consent_rejected alone was a designed-in deadlock: with no credential,
  * every pass dies at device_unavailable before any upload can be refused,
  * so the only state that re-opened the ceremony was unreachable from the
- * state that needed it.
+ * state that needed it. An uncertain credential rotation is separately
+ * device_repair_required: only an explicit repair may resume that pause.
  */
 function incrementalUploadAuthorityLost() {
   return incrementalGrantRejected()
     || (incrementalSyncStatus?.status === "available"
-      && incrementalSyncStatus.pausedReason === "device_unavailable");
+      && ["device_unavailable", "device_repair_required"].includes(incrementalSyncStatus.pausedReason));
 }
 
 /**
@@ -12953,7 +13482,7 @@ function renderIncrementalConsent() {
   const chip = $("#incremental-consent-state");
   const reviewVerified = contributionSyncExactReview?.state === "ready";
   const busy = incrementalConsentBusy || communityConnectBusy
-    || contributionDisconnectBusy || contributionDisconnectDialogOpen();
+    || contributionDisconnectBusy || contributionDisconnectDialogOpen() || attributionContributionBusy;
   // A recorded approval whose upload authority is lost — a claim that
   // carried the v0.1 consent, or a missing device credential — re-opens the
   // same single action (the transparent re-pair). The chip stays "Approved":
@@ -12961,6 +13490,8 @@ function renderIncrementalConsent() {
   const disconnected = contributionDeviceDisconnectPaused();
   const repairNeeded = incrementalConsentApproved
     && (incrementalUploadAuthorityLost() || disconnected);
+  const repairRequired = incrementalSyncStatus?.pausedReason === "device_repair_required";
+  setLocalizedText(approve, repairRequired ? "consent.repairConnection" : "consent.reviewAndApprove");
   setLocalizedText(chip, incrementalConsentApproved
     ? "consent.stateApproved"
     : "consent.stateNotApproved");
@@ -12972,10 +13503,9 @@ function renderIncrementalConsent() {
     || (incrementalConsentApproved && !repairNeeded)
     || (!incrementalConsentApproved && !reviewVerified)
     || hostedSignInRequired();
-  // Keychain guidance is shown only where a dialog can be raised: at the
-  // connect step for an unbrokered companion, at the migrating credential's
-  // next protected read for a brokered one, and nowhere for a fresh brokered
-  // install (S3, red-team review of PR #34).
+  // The retained surface classifier selects neutral connection information or
+  // native migration guidance. It never authorizes an OS dialog; unknown or
+  // missing broker state must not turn into password-prompt preparation.
   const keychainSurface = keychainPromptSurface();
   const pairingNote = $("#incremental-keychain-pairing-note");
   const migrationNote = $("#incremental-keychain-migration-note");
@@ -13012,6 +13542,9 @@ function renderIncrementalConsent() {
       : hostedSignInRequired()
         ? "contribution.disconnect.signInToReconnect"
         : "contribution.disconnect.paused");
+  } else if (repairRequired && hostedSignInRequired()) {
+    gate.hidden = false;
+    setLocalizedText(gate, "consent.signInFirst");
   } else if (incrementalConsentApproved && !(repairNeeded && hostedSignInRequired())) {
     forgetLocalizedNode(gate);
     gate.textContent = "";
@@ -13034,6 +13567,7 @@ function renderIncrementalConsent() {
   }
   renderIncrementalSyncStatusLine();
   renderIncrementalSyncRetry();
+  renderAttributionContribution();
 }
 
 /**
@@ -13057,6 +13591,11 @@ function renderIncrementalSyncStatusLine() {
     forgetLocalizedNode(line);
     line.textContent = "";
     line.hidden = true;
+    return;
+  }
+  if (incrementalSyncStatus.pausedReason === "device_repair_required") {
+    setLocalizedText(line, "consent.repairRequired");
+    line.hidden = false;
     return;
   }
   // The transparent re-pair state renders as the routine it is — an
@@ -13127,15 +13666,13 @@ function boundedOutcomeDetailCode(payload) {
 }
 
 /**
- * Where this install can still meet a macOS Keychain dialog, as the companion
- * reports it: "pairing" (the companion mints its own credential, so the
- * connect step can raise one), "migration" (the app brokers the Keychain but
- * a legacy credential still has to migrate on its next protected read),
- * or "none" (brokered with nothing to migrate — no dialog exists).
+ * The companion's retained Keychain information uses "pairing" for
+ * connection information, "migration" for an older credential's secure
+ * upgrade, or "none" when no Keychain annotation applies.
  *
  * "pairing" is the default before the first projection lands and whenever the
- * companion cannot answer, so guidance is only ever withheld on a positive
- * statement that it cannot apply.
+ * companion cannot answer. That default is neutral information, not evidence
+ * that an authorization dialog is expected or permission to trigger one.
  */
 function keychainPromptSurface() {
   const reported = incrementalSyncStatus?.keychainPrompt;
@@ -13158,6 +13695,7 @@ function renderIncrementalSyncRetry() {
     && incrementalConsentApproved
     && status?.status === "available"
     && !incrementalGrantRejected()
+    && status.pausedReason !== "device_repair_required"
     && !contributionDeviceDisconnectPaused();
   button.hidden = !visible;
   if (!visible) {
@@ -13178,7 +13716,8 @@ function hideIncrementalSyncRetryNote() {
 
 async function runIncrementalSyncNow() {
   if (incrementalSyncRetryBusy || contributionDisconnectBusy
-      || contributionDisconnectDialogOpen() || contributionDeviceDisconnectPaused()) return;
+      || contributionDisconnectDialogOpen() || contributionDeviceDisconnectPaused()
+      || incrementalSyncStatus?.pausedReason === "device_repair_required") return;
   incrementalSyncRetryBusy = true;
   hideIncrementalSyncRetryNote();
   renderIncrementalSyncRetry();
@@ -13290,7 +13829,7 @@ function scheduleIncrementalSyncStatusPoll({ reset = false } = {}) {
  * landed — a transient loopback failure must not un-advertise a transport the
  * companion confirmed.
  */
-async function recoverLocalCompanionReads() {
+async function recoverLocalCompanionReads({ isCurrent = () => true } = {}) {
   const [localHealth, onboarding] = await Promise.all([
     incrementalSyncCapabilitySettled()
       ? null
@@ -13299,6 +13838,7 @@ async function recoverLocalCompanionReads() {
       ? localClient.onboarding().catch(() => null)
       : null,
   ]);
+  if (!isCurrent()) return;
   let recovered = false;
   if (localHealth !== null) {
     const wasAdvertised = incrementalSyncCapabilityAdvertised();
@@ -13330,8 +13870,14 @@ async function recoverLocalCompanionReads() {
  * consent verdict — so an approved Mac renders as approved after a reload —
  * and the progress facts the status line prints.
  */
-async function loadIncrementalSyncStatus() {
-  await recoverLocalCompanionReads();
+async function loadIncrementalSyncStatus({ isCurrent } = {}) {
+  // Polls and consent actions also cross dashboard loads. A response begun
+  // before a newer primary/quick result or demo selection may not replace it.
+  const loadToken = cacheDropThreadLinks.loadToken;
+  const readIsCurrent = isCurrent
+    ?? (() => cacheDropThreadLinks.loadToken === loadToken);
+  await recoverLocalCompanionReads({ isCurrent: readIsCurrent });
+  if (!readIsCurrent()) return;
   if (!incrementalSyncCapabilityAdvertised()) {
     incrementalSyncStatus = null;
     incrementalConsentApproved = false;
@@ -13356,6 +13902,7 @@ async function loadIncrementalSyncStatus() {
   } catch {
     payload = null;
   }
+  if (!readIsCurrent()) return;
   incrementalSyncStatus = normalizeIncrementalContributionSyncStatus(payload);
   observeContributionDisconnectPause(incrementalSyncStatus);
   incrementalSyncLastOutcomeDetailCode = boundedOutcomeDetailCode(payload);
@@ -13433,6 +13980,10 @@ async function recordFreshLocalContributionApproval(
  * failure, because nothing the user did failed.
  */
 async function approveIncrementalContribution() {
+  if (attributionContributionSelected()) {
+    await openAttributionContributionReview();
+    return;
+  }
   if (incrementalConsentBusy || communityConnectBusy
       || contributionDisconnectBusy || contributionDisconnectDialogOpen()
       || contributionDisconnectOutcome === "cleanup_pending"
@@ -13460,9 +14011,9 @@ async function approveIncrementalContribution() {
     return;
   }
   incrementalConsentBusy = true;
-  if (contributionDeviceDisconnectPaused()) {
-    // This function is reached only by an explicit approval after disconnect;
-    // both silent repair entrypoints refuse the durable disconnect pause.
+  if (contributionDeviceDisconnectPaused() || incrementalSyncStatus?.pausedReason === "device_repair_required") {
+    // Explicit reconnect must replace any remembered pairing. Silent repair
+    // entrypoints refuse both disconnect and uncertain-rotation pauses.
     communityDevicePaired = false;
     communityDevicePairedV1 = false;
   }
@@ -13602,7 +14153,8 @@ async function approveIncrementalContribution() {
       await renderContributionSessionSignInGate(status, error);
     } else if (contributionConnectStepOf(error) !== null
         || contributionDeviceRecoveryIsRequired(error)
-        || contributionDeviceKeychainIsLocked(error)) {
+        || contributionDeviceKeychainIsLocked(error)
+        || contributionDeviceKeychainAccessIsDenied(error)) {
       await reportContributionConnectFailure(status, error, {
         enrollmentAttemptedWithHostedIdentity,
         enrollmentEstablished,
@@ -13675,6 +14227,8 @@ async function mintDevicePairingWithCookieCommitRetry() {
  * failure or ask again.
  */
 function maybeRepairIncrementalAuthorization() {
+  if (attributionContributionSelected()) return;
+  if (incrementalSyncStatus?.pausedReason === "device_repair_required") return;
   if (contributionDisconnectBlocksRepair()) return;
   if (incrementalRepairAttempted) return;
   if (incrementalConsentBusy || communityConnectBusy) return;
@@ -13695,6 +14249,11 @@ function maybeRepairIncrementalAuthorization() {
  * Review-and-approve action.
  */
 function resumeContributionCeremonyAfterSignIn() {
+  if (attributionContributionSelected()) {
+    renderAttributionContribution();
+    return;
+  }
+  if (incrementalSyncStatus?.pausedReason === "device_repair_required") return;
   if (contributionDisconnectBlocksRepair()) return;
   if (!incrementalSyncCapabilityAdvertised()) return;
   if (!incrementalConsentApproved || !incrementalUploadAuthorityLost()) return;
@@ -13847,8 +14406,18 @@ async function disconnectCommunityDevice() {
 function contributionDeviceRecoveryIsRequired(error) {
   try {
     return error?.code === "contribution_device_recovery_required"
-      || error?.code === "contribution_device_credential_conflict"
-      || error?.code === "contribution_device_keychain_access_denied";
+      || error?.code === "contribution_device_credential_conflict";
+  } catch {
+    return false;
+  }
+}
+
+// Denied access does not establish an unusable credential. Preserve it and
+// keep this pause outside the destructive reset family, including when the
+// error was not tagged with a connection step.
+function contributionDeviceKeychainAccessIsDenied(error) {
+  try {
+    return error?.code === "contribution_device_keychain_access_denied";
   } catch {
     return false;
   }
@@ -14035,7 +14604,7 @@ async function resetContributionDeviceCredential() {
  * Deliberately offers no reset button. The credential is fine; the keychain is
  * locked. The only action that changes anything is unlocking it, so that is
  * the only action named — offering the destructive clear here would cost a
- * needless re-pair for a condition the user's login password fixes. Both
+ * needless re-pair while an intact credential is unavailable. Both
  * sentences take the localized path: a reader in Chinese or Spanish is exactly
  * as likely to meet a locked keychain as anyone else.
  */
@@ -14127,22 +14696,9 @@ const CONTRIBUTION_CONNECT_STEPS = Object.freeze({
   }),
   device_pairing: Object.freeze({
     connects: true,
-    // This step is the one that stores the upload credential in the login
-    // keychain, so the macOS access dialog — a password prompt naming the
-    // bundled helper, node, with zero context of its own — can appear the
-    // moment it runs (observed live 2026-08-19, first pairing on a fresh
-    // Mac). The preparation must already be on screen when that happens:
-    // what asks, why, and that Always Allow is the answer that keeps
-    // background passes running instead of re-prompting every six hours.
-    progress: "Connecting this Mac as an upload-only device… macOS may ask for your login password to protect this Mac's upload credential; the request comes from TiboTattle's bundled helper, which macOS lists as node. Choose Always Allow so background uploads keep working.",
-    // The line above is for installs whose companion still mints the
-    // credential itself. When the signed app brokers the Keychain no dialog
-    // is reachable at this step at all, so naming a process the reader will
-    // never see would be a warning about nothing (S3, red-team review of
-    // PR #34). The remaining case — a legacy item migrating — meets its
-    // dialog on its next protected read, and the approve card's annotation
-    // carries that guidance.
-    brokeredProgress: "Connecting this Mac as an upload-only device…",
+    // Connection progress never prepares or authorizes a Keychain prompt.
+    // Deliberate secure-upgrade approval belongs to native Settings only.
+    progress: "Connecting this Mac as an upload-only device…",
     stopped: "Connecting stopped at step 3 of 3, pairing this Mac as an upload-only device.",
     failure:
       "The pairing was not completed, so this Mac is not connected. Nothing was uploaded; retrying is safe.",
@@ -14163,12 +14719,7 @@ async function contributionConnectStep(stepId, status, run) {
   const step = CONTRIBUTION_CONNECT_STEPS[stepId];
   status.hidden = false;
   status.className = "participant-action-status";
-  // A step keeps its dialog-preparing copy only where a dialog can actually
-  // be raised; "pairing" is the default the companion reports when it cannot
-  // tell, so an unanswering companion behaves exactly as before.
-  setProductText(status, keychainPromptSurface() === "pairing"
-    ? step.progress
-    : step.brokeredProgress ?? step.progress);
+  setProductText(status, step.progress);
   try {
     return await run();
   } catch (error) {
@@ -14203,8 +14754,24 @@ async function reportContributionConnectFailure(status, error, {
   enrollmentAttemptedWithHostedIdentity,
   enrollmentEstablished,
 }) {
-  // Locked is checked first and separately: it is the one member of the 409
-  // family whose cure is not the reset ceremony.
+  // Access denial is a pause, not proof that anything needs clearing. The
+  // existing retry controls remain available; this branch adds no recovery
+  // action and cannot invoke native approval or discard the credential.
+  if (contributionDeviceKeychainAccessIsDenied(error)) {
+    const described = await describeFailure({
+      surface: "contribution_connect",
+      error,
+      fallback: "Uploads are paused. Nothing was uploaded; you can try again later.",
+    });
+    status.hidden = false;
+    status.className = "participant-action-status";
+    // Retire the earlier progress translation so a later language update
+    // cannot resurrect "Connecting…" over the completed pause and reference.
+    setRawText(status, described.text);
+    return;
+  }
+  // A locked Keychain also stays outside the explicit unusable-credential
+  // reset ceremony.
   if (contributionDeviceKeychainIsLocked(error)) {
     await renderContributionDeviceKeychainLocked(status, { error });
     return;
@@ -14288,8 +14855,12 @@ async function restoreCommunitySession() {
   }
 }
 
-$("#refresh-button").addEventListener("click", requestRefresh);
-$("#setup-refresh").addEventListener("click", requestRefresh);
+$("#refresh-button").addEventListener("click", () => {
+  void requestRefresh({ detailed: true });
+});
+$("#setup-refresh").addEventListener("click", () => {
+  void requestRefresh({ detailed: true });
+});
 $("#cancel-refresh").addEventListener("click", cancelLocalAnalysis);
 $("#open-installed-app").addEventListener("click", openInstalledApp);
 $("#connection-check").addEventListener("click", checkLocalSetup);
@@ -14328,7 +14899,7 @@ window.addEventListener("tibotattle:local-evidence-updated", () => {
 // the two-card flow (owner-directed, 2026-08-08): after sign-in, the single
 // Review-and-approve button below is the one contribution action, and its
 // explicit approval is the consent.
-$("#demo-button").addEventListener("click", () => renderDashboard(demoDashboard()));
+$("#demo-button").addEventListener("click", showDemoDashboard);
 // The prepare, lookback, and send controls left with the legacy prepare flow
 // (owner-directed, 2026-08-08). The approve card's only companion control is
 // the error-recovery re-check for its invisible review bootstrap.
@@ -14340,6 +14911,17 @@ $("#incremental-copy-diagnostics").addEventListener("click", () => {
 });
 $("#incremental-consent-approve").addEventListener("click", () => {
   void approveIncrementalContribution();
+});
+$("#attribution-review-open")?.addEventListener("click", () => { void openAttributionContributionReview(); });
+$("#attribution-consent-confirm")?.addEventListener("change", renderAttributionContribution);
+$("#attribution-consent-approve")?.addEventListener("click", () => { void approveAttributionContribution(); });
+$("#attribution-review-cancel")?.addEventListener("click", () => {
+  if (attributionContributionBusy) return;
+  attributionContributionReview = null;
+  attributionContributionNotice = null;
+  $("#attribution-consent-confirm").checked = false;
+  renderAttributionContribution();
+  $("#attribution-review-open").focus();
 });
 $("#incremental-sync-retry").addEventListener("click", () => {
   void runIncrementalSyncNow();
@@ -14580,6 +15162,16 @@ $("#weekly-range-controls").addEventListener("click", (event) => {
   // renderWeekly itself re-renders the share card from the same model
   // (owner-verified regression, 2026-08-08), so a control cannot redraw the
   // chart while leaving the card on the previous filters.
+  renderWeekly(dashboard);
+});
+$("#weekly-plan-select")?.addEventListener("change", (event) => {
+  if (!dashboard || !dashboard.weekly.planPopulations.some(
+    (population) => population.planType === event.target.value,
+  )) return;
+  activeWeeklyPlanType = event.target.value;
+  timelineSeriesMemo = null;
+  renderComparison(dashboard);
+  renderTimeline(dashboard);
   renderWeekly(dashboard);
 });
 $("#weekly-span-control").addEventListener("input", (event) => {

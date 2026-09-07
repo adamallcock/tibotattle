@@ -19,17 +19,41 @@ account observation, Claude-session pseudonym, and contribution device; no
 service/account string crosses the wire. The current packaged-companion graph
 uses the export-identity, account-observation, and contribution-device
 mappings; the Claude callback remains a standalone CLI/local-review
-composition. A legacy `.v1` item is copied to the app-owned `.app.v1` item,
-read back, and only then deleted. A denied prompt returns
-`migration_required` and preserves the legacy item. The packaged runtime will
-not prompt for that capability again in the same app process. Quit and reopen
-TiboTattle before repeating the initiating action; restart is the only retry
-boundary, and reset or deletion is not recovery for this condition. All four
-adapters retain a content-free migration-required diagnostic. The packaged
-runtime excludes `@github/keytar`; standalone CLI/local-review tooling retains
-that compatibility backend.
+composition. When only a legacy `.v1` item exists, a narrow native helper with
+the legacy Node signing identity attempts a silent read up to three times, with
+short backoff. Automatic reads forbid Keychain interaction. The retry budget is
+shared for the app process, including companion restarts. The helper can serve
+only an authenticated native parent over its private descriptor; it accepts no
+service, account, path, or arbitrary credential query.
+
+The native app creates the `.app.v1` item only if absent and verifies an exact
+readback. A conflicting modern item is never overwritten; the legacy item is
+retained as a recovery copy. If silent attempts cannot finish, the broker
+returns `migration_required` and the app quietly offers **Settings… → General →
+Secure upgrade → Review migration…**. Only the explained **Approve migration**
+action can enable a Keychain prompt. Cancel is the default, and a denial leaves
+the key intact and does not schedule another prompt. The menu's **Finish secure
+upgrade…** action opens Settings, not the system prompt. Reset or deletion is
+not migration recovery. All four adapters retain a content-free
+migration-required diagnostic. The packaged runtime excludes `@github/keytar`;
+standalone CLI/local-review tooling retains that compatibility backend. See the
+[migration decision and remaining qualification gates](../../docs/decisions/2026-08-31-silent-keychain-migration.md)
+before treating source tests as signed-upgrade evidence.
 
 ## Consumer lifecycle in the app
+
+The companion's first snapshot uses its bounded startup projection and retains
+only validated last-good evidence with explicit coverage labels. The initial
+automatic refresh updates current quota/headline evidence only. Manual
+**Refresh** updates quota and detailed accounting together; detailed accounting
+also runs through the bounded hourly attempt;
+optional contribution requests do not define local-dashboard readiness.
+The native host treats 20 seconds as a quiet slow-load threshold, keeps the
+document visible, and continues one generation-fenced readiness observation for
+at most 120 seconds. A stalled JavaScript reply cannot suspend that deadline.
+New navigation or teardown cancels the old observation. A valid late result (or
+an explicit Open Dashboard after the hard deadline) consumes the pending initial
+refresh once and clears the stale readiness-timeout diagnostic.
 
 1. Launch **TiboTattle.app**.
 2. On the first launch, review the one-time **Get Started** disclosure. It
@@ -45,7 +69,7 @@ that compatibility backend.
    Login Item. The acknowledgement is an owner-only local receipt; moving
    local app data to Trash makes the disclosure appear again.
 3. The native window starts one private loopback companion on an ephemeral
-   port and performs its existing bounded local refresh while the normal app
+   port and performs a quick quota/headline refresh while the normal app
    remains open. The Login Item adds no separate scanner; raw logs and prompts
    are never uploaded by the launch itself, and optional contribution keeps its
    separate review and consent controls.
@@ -184,8 +208,15 @@ no names or identifiers are logged or persisted by this handoff. Native
 context-menu **Open Link** does not perform this Codex handoff; use the link
 itself. Existing HTTPS and hosted sign-in-return behavior are unchanged.
 
-The toolbar has no independent data authority. **Refresh usage** reuses the
-already-running loopback Node companion and its existing local refresh route.
+The toolbar has no independent data authority. **Refresh usage**, Cmd-R, and
+menu-bar/popover Refresh use the already-running loopback companion's detailed
+route: quota and retained history advance together, and valid cached accounting
+is reused. There is no separate detailed-accounting action. The foreground interval may make at
+most one automatic detailed attempt per hour while no refresh is in flight;
+startup and intervening checks stay quick. Failed, cancelled, and interrupted
+detailed attempts count toward the hourly budget. A companion terminal receipt
+clears the native busy state before optional presentation reads; activation and
+wake reconcile that state without launching a second refresh.
 There is still one companion child while the app is open; the in-app refresh
 timer is only foreground scheduling, not a daemon, login item, LaunchAgent, or
 background URL session. The separate Keychain-reset helper remains available
@@ -224,13 +255,46 @@ The ordinary uninstall journey is simply: quit TiboTattle and move
 
 ## Developer build
 
-The current bundle is pinned to Node 26.2.0 and Apple silicon:
+The builder requires Node 26.2.0 on Apple silicon. Its default target remains
+Apple silicon:
 
 ```bash
 npm run product:macos:build
 npm run product:macos:validate:development
 open ".release-build/macos/TiboTattle.app"
 ```
+
+An Intel target is available on the same builder; it is not yet publicly qualified:
+
+```bash
+node scripts/build-macos-app.js --architecture x64 \
+  --node-runtime "<verified-node-v26.2.0-darwin-x64>/bin/node" \
+  --test-build --output ".release-build/macos-intel-test/TiboTattle.app"
+```
+
+Use the official Node 26.2.0 Darwin x64 distribution, including its adjacent
+`LICENSE`. The builder checks the pinned executable and license hashes before
+executing the staged runtime. It compiles the launcher and native Keychain
+migration helper for `x86_64`. A development build retains ad-hoc signing and a
+disabled updater. Do not install this shared-identity development app over a
+stable app or run it against stable user state as a qualification shortcut.
+
+The DMG packager, installer validator and release CLI accept `--architecture
+x64`; native inspection checks all bundled executables against that target.
+Release construction also requires the verified `--node-runtime`. Preview and
+release modes retain their existing signing, source, identity and credential
+gates. Intel uses separate stable/dogfood/Preview feeds; it cannot consume the
+Apple silicon feed. No new Homebrew Intel support is claimed.
+
+These source paths do not qualify real Intel hardware, final signed/notarized
+installers or updater installation. See the
+[Intel release plan](../../docs/plans/2026-09-03-macos-intel-release.md) and
+[macOS release runbook](../../docs/runbooks/macos-stable-release-runbook.md)
+for the remaining gates. The owner's [0.1.18-only manual qualification
+waiver](../../docs/decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+accepts unavailable physical Intel testing as a release risk, not a passed
+hardware test. The commands below show the default Apple silicon
+packaging path; pass `--architecture x64` and the Intel app path for Intel.
 
 Create a deterministic-layout developer DMG:
 
@@ -399,11 +463,26 @@ a claim that Sparkle has updated the preview client.
 
 `CFBundleShortVersionString` remains the user-facing package version. The
 Sparkle ordering key, `CFBundleVersion`, is explicitly allocated for signed
-builds that retain the stable bundle identifier. The 0.1.17 internal-dogfood
-build is `1023`; the 0.1.17 stable final is `1024`. These clear the observed
-shared-identity dogfood build `1022`, and stable orders after the tested
-dogfood candidate. A future signed version/channel must add a reviewed
-monotonic allocation before release tooling will run.
+builds that retain the stable bundle identifier. The 0.1.17 stable allocation
+uses build `1024` and accepted runtime basis
+`394c8a03a986e0daadbe662679fd002202682e44`; internal RC9 build `1023.7` was the
+preceding dogfood allocation. The exact source provenance is the annotated
+[`v0.1.17` tag](https://github.com/adamallcock/tibotattle/tree/v0.1.17). A future
+signed version/channel must add a reviewed monotonic allocation before release
+tooling will run. Corrected combined Astra/Intel 0.1.18 RC3 reserves `1025.2`
+for dogfood and retains `1026` for stable on both architectures. Signed Intel
+RC1 build `1025` and combined RC2 build `1025.1` remain immutable; their evidence
+does not qualify the corrected RC3 source. The ordering is
+`1025 < 1025.1 < 1025.2 < 1026`, and allocation alone proves neither signing,
+installation nor release.
+
+Earlier RCs are historical qualification evidence only. The build-1024
+release retains the fail-closed source, generation, resource, validation,
+atomic-publication, selected-plan Trends, and snapshot safeguards. PR #94
+outcome is `passed_with_historical_artifact_refusal` in the
+[qualification receipt](../../docs/receipts/2026-09-03-pr94-account-plan-attribution-qualification.md).
+Hosted migrations and end-to-end device pairing are not activated by the
+desktop release.
 
 Release tooling accepts `USAGE_MONITOR_BUNDLE_VERSION` only when it exactly
 matches the checked-in channel allocation, and the signed stable path still
@@ -448,10 +527,15 @@ npm run product:macos:release -- \
   --previous-stable-manifest "/path/to/previous-stable-release.json"
 ```
 
-`--stable-bootstrap` is retained only as the historical first-stable-release
-decision and is not the normal current path. Every later stable release must
-use the manifest from the immediately previous stable release so the gate can
-prove version continuity.
+`--prepare-candidate` does not stop after compilation: this command continues
+into Developer ID signing and notarization. It is a protected release action,
+not a secret-free build check or dry run.
+
+`--stable-bootstrap` is an explicit owner-only first-stable-release decision
+for one architecture, not the normal upgrade path. The first Intel stable
+release has no prior Intel artifact and uses this flow. Every later release
+in that lane must use its immediately previous same-architecture stable
+manifest; an ARM receipt cannot establish Intel continuity.
 
 The command rejects a missing origin, HTTP, loopback, credentials, paths,
 queries, fragments, missing artwork, missing provenance, placeholder
@@ -465,6 +549,13 @@ accepts only `vX.Y.Z` matching the short version. Internal dogfood accepts only
 `tibotattle-internal-dogfood-X.Y.Z-rcN-source-YYYYMMDD`, with a positive
 non-zero-padded `N` and a real calendar date. Lightweight tags, aliases, wrong
 versions, and multiple matching channel tags at HEAD fail closed.
+
+External-release bundles set only the outer `.app` Finder creation and
+modification dates from the sealed source commit's Git committer timestamp.
+Payload files retain the fixed epoch used for reproducible inventories, and the
+DMG packager reapplies the same source-bound dates after staging. This
+filesystem metadata is outside the signed and inventoried payload; no build-host
+wall clock is used for it.
 
 ## Developer ID and notarization
 
@@ -495,8 +586,10 @@ For a later stable release, use `--previous-stable-manifest` in place of
 the release command refuses to guess which continuity policy applies.
 `USAGE_MONITOR_BUNDLE_VERSION` is optional as an operator assertion only; when
 present it must exactly equal the checked-in allocation for the selected
-signed release version and channel (`1023` for 0.1.17 internal dogfood,
-`1024` for 0.1.17 stable).
+signed release version and channel (`1025.2` for corrected 0.1.18 RC3 internal
+dogfood, `1026` for 0.1.18 stable). Earlier signed RC1 build `1025` and RC2 build
+`1025.1`, together with their immutable evidence, remain unchanged and cannot
+be reused as the current signing allocation.
 
 `config/deployment-endpoints.js` is the reviewed source for the public origin
 and the distinct stable and preview Sparkle appcasts. Legacy
@@ -511,14 +604,18 @@ The release command:
    the candidate;
 2. verifies every regular candidate payload file, mode, size, and digest against the
    build inventory, rejects unlisted entries and symbolic links, and
-   normalizes only the three expected Mach-O signature envelopes;
+   normalizes only the reviewed Mach-O signature envelopes for the launcher,
+   embedded Node, migration helper, and Sparkle code;
 3. rebuilds into an isolated directory from the checked-out source and approved
    inputs, requires the fresh source and payload digests to match the reviewed
    candidate, and discards the candidate bytes;
 4. signs Sparkle's Installer XPC, Downloader XPC (preserving its entitlement),
    Autoupdate helper, Updater app, and framework in the upstream-documented
-   inside-out order, followed by embedded Node, the native launcher, and the
-   outer app;
+   inside-out order, followed by embedded Node, the migration helper, the native
+   launcher, and the outer app. The helper must have the exact legacy Node
+   Developer ID designated requirement, the same Team ID, hardened runtime,
+   and no entitlements; the finalizer verifies those requirements against the
+   actual signatures;
 5. applies hardened runtime and a minimal, reviewed Node runtime entitlement
    file;
 6. verifies the complete Developer ID signature;
@@ -608,9 +705,27 @@ The automated validator proves the bundle and Gatekeeper contract on the build
 Mac with an empty temporary home. It also runs the packaged Login Item contract
 smoke against an injected fake manager; that check makes zero real
 ServiceManagement calls. It is not a substitute for a truly clean machine.
+The manual clean-profile and physical Login Item matrix was deferred for
+0.1.17 only; see the [release-specific decision](../../docs/plans/2026-09-03-public-0.1.17-release.md).
+That historical decision does not carry forward. The owner separately approved
+the [0.1.18-only waiver](../../docs/decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+of the disposable clean-profile/manual Login Item matrix and physical Intel
+qualification. Those checks remain unperformed, not passed. Reports that other
+testers are running the app are owner-reported, not independently verified
+hardware or artifact-bound evidence. The waiver does not change the v2 receipt
+validator or justify manufacturing a manual receipt; exact signed-artifact,
+data-preservation, updater-integrity and unexpected-Keychain-prompt gates remain.
 
-Before sending the DMG to any external user, perform a human clean-Mac or
-disposable-VM rehearsal:
+For Finder metadata, inspect the app directly on the final frozen DMG, read-only,
+after stapling. Derive the expected timestamp from the sealed source commit in
+`build-manifest.json`, then compare the outer bundle's creation and modification
+dates with that source-derived value. The isolated `ditto` copy used for
+clean-profile smoke is not evidence of mounted-volume Finder metadata.
+
+The normal release policy requires the following human clean-Mac or disposable-VM
+rehearsal before external distribution. For 0.1.18, apply only the explicitly
+waived scope above; do not report the unperformed matrix or its receipt gate as
+passed:
 
 1. transfer the DMG through the intended download channel so quarantine
    metadata is present;
@@ -650,6 +765,17 @@ disposable-VM rehearsal:
      --app "/Applications/TiboTattle.app" \
      --rehearsal "docs/receipts/YYYY-MM-DD-macos-login-item-release-rehearsal.json"
    ```
+
+   This gate defaults to Apple silicon (`--architecture arm64`) and
+   `--channel stable`. For an Intel internal-dogfood rehearsal, add
+   `--architecture x64 --channel internal-dogfood`; both installed-app validation
+   and bundle inspection require that exact selection. The receipt still binds
+   to the inspected signed app's identity/version at the required Applications
+   path; these options neither install it nor perform the manual rehearsal.
+   The current v2 receipt additionally binds architecture, channel, source commit
+   and normalized payload SHA-256, and requires human-observed native hardware,
+   a supported macOS version and `rosetta: false`. Old v1 receipts are historical,
+   not current qualification. See the [receipt amendment](../../docs/decisions/2026-08-03-macos-login-item-lifecycle-decision.md#2026-09-04-two-architecture-receipt-amendment).
 
 ## Protected per-release inputs and gates
 

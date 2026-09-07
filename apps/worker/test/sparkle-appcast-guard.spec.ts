@@ -5,6 +5,7 @@ import { beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import {
   handleSparkleAppcastGuard,
+  handleSparkleAppcastGuardForContract,
   readSparkleAppcastGuardConfiguration,
   SPARKLE_APPCAST_GUARD_CACHE_CONTROL,
   SPARKLE_APPCAST_GUARD_CHANNEL,
@@ -18,6 +19,8 @@ import {
   SPARKLE_APPCAST_GUARD_ROUTE,
   SPARKLE_APPCAST_GUARD_SCHEMA,
 } from "../src/sparkle-appcast-guard";
+
+import dogfoodContract from "../src/dogfood-sparkle-release-contract.json";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -296,10 +299,11 @@ async function appcastEnclosure(
 async function officialSignedAppcastBytes(
   version: string,
   artifactBytes = ARTIFACT_BYTES,
+  { architecture = "arm64", mutatePrefix = (value: string) => value } = {},
 ): Promise<Uint8Array> {
   const digest = await sha256Hex(artifactBytes);
   const artifactSignature = await sparkleSignature(artifactBytes);
-  const prefix = `<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
+  const prefix = mutatePrefix(`<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:
 IMPORTANT: This file was signed by Sparkle. Any modifications to this file requires re-signing this file with generate_appcast or sign_update! The signed signature will be embedded at the end of this file.
 --><rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
     <channel>
@@ -309,12 +313,12 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
             <pubDate>Wed, 05 Aug 2026 14:55:05 -0400</pubDate>
             <sparkle:version>${version}</sparkle:version>
             <sparkle:shortVersionString>0.1.0</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
-            <enclosure url="https://updates.tibotattle.com/${artifactKey(version, digest)}" length="${artifactBytes.byteLength}" type="application/octet-stream" sparkle:edSignature="${artifactSignature}"></enclosure>
+            <sparkle:minimumSystemVersion>${architecture === "x64" ? "14.0" : "13.0"}</sparkle:minimumSystemVersion>
+            ${architecture === "arm64" ? "<sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>" : ""}
+            <enclosure url="https://updates.tibotattle.com/${architecture === "x64" ? intelArtifactKey(version, digest) : artifactKey(version, digest)}" length="${artifactBytes.byteLength}" type="application/octet-stream" sparkle:edSignature="${artifactSignature}"></enclosure>
         </item>
     </channel>
-</rss>`;
+</rss>`);
   const prefixBytes = encoder.encode(prefix);
   const envelopeSignature = await sparkleSignature(prefixBytes);
   return encoder.encode(`${prefix}<!-- sparkle-signatures:
@@ -1094,5 +1098,117 @@ describe("Sparkle appcast atomic guard", () => {
     );
     expect(response.status).toBe(422);
     expect(bucket.putCalls).toBe(0);
+  });
+});
+
+
+function intelArtifactKey(version: string, digest: string): string {
+  return `intel/releases/${version}/${digest}/TiboTattle-0.1.0-macOS-x64.dmg`;
+}
+
+async function installIntelArtifact(bucket: FakeR2Bucket, version: string): Promise<void> {
+  bucket.setArtifact(intelArtifactKey(version, await sha256Hex(ARTIFACT_BYTES)), {
+    bytes: ARTIFACT_BYTES,
+    etag: `${version}-intel-artifact`,
+    contentType: SPARKLE_APPCAST_GUARD_ARTIFACT_CONTENT_TYPE,
+    cacheControl: SPARKLE_APPCAST_GUARD_ARTIFACT_CACHE_CONTROL,
+  });
+}
+
+describe("Intel Sparkle publication isolation", () => {
+  it("publishes dogfood Intel through its own reviewed namespace with shared guard authentication", async () => {
+    const bucket = new FakeR2Bucket();
+    const version = "1025";
+    const candidate = await officialSignedAppcastBytes(version, ARTIFACT_BYTES, {
+      architecture: "x64",
+      mutatePrefix: (value) => value.replace(
+        "https://updates.tibotattle.com/intel/releases/",
+        "https://dogfood-updates.tibotattle.com/internal-dogfood/intel/releases/",
+      ),
+    });
+    bucket.setArtifact(`internal-dogfood/${intelArtifactKey(version, await sha256Hex(ARTIFACT_BYTES))}`, {
+      bytes: ARTIFACT_BYTES, etag: "dogfood-intel-artifact",
+      contentType: SPARKLE_APPCAST_GUARD_ARTIFACT_CONTENT_TYPE,
+      cacheControl: SPARKLE_APPCAST_GUARD_ARTIFACT_CACHE_CONTROL,
+    });
+    const body = await payload({ candidate, key: "internal-dogfood/intel/appcast.xml", channel: "internal-dogfood" });
+    body.bucket = dogfoodContract.r2Bucket;
+    const response = await handleSparkleAppcastGuardForContract(await signedRequest(body), bindings(bucket, {
+      SPARKLE_APPCAST_GUARD_CHANNEL: dogfoodContract.channel,
+      SPARKLE_APPCAST_GUARD_BUCKET: dogfoodContract.r2Bucket,
+      SPARKLE_APPCAST_GUARD_APPCAST_KEY: dogfoodContract.appcastObjectKey,
+    }), dogfoodContract, NOW);
+    expect(response.status).toBe(200);
+    expect(await (await bucket.get("internal-dogfood/intel/appcast.xml"))?.bytes()).toEqual(candidate);
+    expect(await bucket.get("internal-dogfood/appcast.xml")).toBeNull();
+    expect(bucket.object).toBeNull();
+  });
+
+  it("commits the Intel feed without reading or overwriting the ARM feed", async () => {
+    const bucket = new FakeR2Bucket();
+    const armBytes = await seedAppcast(bucket, "1024");
+    await installIntelArtifact(bucket, "1026");
+    const candidate = await officialSignedAppcastBytes("1026", ARTIFACT_BYTES, { architecture: "x64" });
+    const body = await payload({ candidate, key: "intel/appcast.xml" });
+    const response = await invoke(await signedRequest(body), bindings(bucket));
+    expect(response.status).toBe(200);
+    expect(bucket.object?.bytes).toEqual(armBytes);
+    expect(await (await bucket.get("intel/appcast.xml"))?.bytes()).toEqual(candidate);
+    const replay = await invoke(await signedRequest(body), bindings(bucket));
+    expect(replay.status).toBe(401);
+    expect(bucket.putCalls).toBe(1);
+  });
+
+  it("rejects valid signed feeds submitted to the other architecture", async () => {
+    const bucket = new FakeR2Bucket();
+    for (const [index, entry] of [
+      { candidate: await officialSignedAppcastBytes("1026"), key: "intel/appcast.xml" },
+      { candidate: await officialSignedAppcastBytes("1026", ARTIFACT_BYTES, { architecture: "x64" }), key: "appcast.xml" },
+    ].entries()) {
+      const response = await invoke(await signedRequest(await payload(entry), TOKEN,
+        Math.floor(NOW / 1000), `cross-architecture-nonce-${index}`), bindings(bucket));
+      expect(response.status).toBe(422);
+    }
+    expect(bucket.putCalls).toBe(0);
+  });
+
+  it("rejects wrong Intel artifact namespace, filename, requirements, and unsigned feeds", async () => {
+    const bucket = new FakeR2Bucket();
+    const mutations = [
+      (value: string) => value.replace("/intel/releases/", "/releases/"),
+      (value: string) => value.replace("-macOS-x64.dmg", "-macOS-arm64.dmg"),
+      (value: string) => value.replace("<sparkle:shortVersionString>0.1.0", "<sparkle:shortVersionString>0.1.1"),
+      (value: string) => value.replace("<sparkle:minimumSystemVersion>14.0", "<sparkle:minimumSystemVersion>13.0"),
+      (value: string) => value.replace("<enclosure", "<sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements><enclosure"),
+    ];
+    for (const [index, mutatePrefix] of mutations.entries()) {
+      const candidate = await officialSignedAppcastBytes("1026", ARTIFACT_BYTES,
+        { architecture: "x64", mutatePrefix });
+      const response = await invoke(await signedRequest(await payload({ candidate, key: "intel/appcast.xml" }), TOKEN,
+        Math.floor(NOW / 1000), `intel-shape-nonce-${index}`), bindings(bucket));
+      expect(response.status).toBe(422);
+    }
+    const unsigned = await appcastBytes("1026");
+    const response = await invoke(await signedRequest(await payload({ candidate: unsigned, key: "intel/appcast.xml" }), TOKEN,
+      Math.floor(NOW / 1000), "intel-unsigned-nonce-001"), bindings(bucket));
+    expect(response.status).toBe(422);
+    expect(bucket.putCalls).toBe(0);
+  });
+
+  it("compares Intel replacement state against its own feed", async () => {
+    const bucket = new FakeR2Bucket();
+    const arm = await seedAppcast(bucket, "1024");
+    const prior = await officialSignedAppcastBytes("1025", ARTIFACT_BYTES, { architecture: "x64" });
+    bucket.setArtifact("intel/appcast.xml", { bytes: prior, etag: "intel-prior-etag",
+      contentType: SPARKLE_APPCAST_GUARD_CONTENT_TYPE, cacheControl: SPARKLE_APPCAST_GUARD_CACHE_CONTROL });
+    await installIntelArtifact(bucket, "1025");
+    await installIntelArtifact(bucket, "1026");
+    const candidate = await officialSignedAppcastBytes("1026", ARTIFACT_BYTES, { architecture: "x64" });
+    const expectedCurrent = { state: "present", bytes: arm.length, sha256: await sha256Hex(arm), etag: "1024-appcast-etag" };
+    const response = await invoke(await signedRequest(await payload({ candidate, key: "intel/appcast.xml", expectedCurrent })), bindings(bucket));
+    expect(response.status).toBe(409);
+    expect(bucket.putCalls).toBe(0);
+    expect(bucket.object?.bytes).toEqual(arm);
+    expect(await (await bucket.get("intel/appcast.xml"))?.bytes()).toEqual(prior);
   });
 });

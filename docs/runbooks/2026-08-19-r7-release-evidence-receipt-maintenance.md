@@ -38,10 +38,11 @@ generated test result rather than inferring reachability from a filename.
 
 ## Protected inputs
 
-The real-history profile reads the owner's private local Codex corpus. Running
-it is an owner-authorized, local-only operation. Never upload the corpus, copy
-it into fixtures, print private paths, or send it to an external model. A normal
-documentation or source change does not authorize regeneration.
+The real-history profile reads the owner's private local Codex and Claude
+corpora. Running it is an owner-authorized, local-only operation. Never upload
+these corpora, copy them into fixtures, print private paths, or send them to an
+external model. A normal documentation or source change does not authorize
+regeneration.
 
 The generator requires exact, hash-pinned binaries:
 
@@ -100,6 +101,23 @@ Wall time and child CPU are environment-sensitive. Peak RSS also varies with
 GC timing, page-cache state, and memory pressure. Deterministic projection
 digests are the strongest content comparison. Do not attribute a metric change
 to a commit until the measured worker actually reaches the changed code.
+
+The filesystem sampler measures a changing task-owned tree, not an atomic disk
+snapshot. Its v0.2 transient-file rule permits one zero-link observation followed
+by a distinct owned, singly-linked regular inode on the same device, only while
+the exact parent and root stay bound. Both observed inode sizes are counted
+conservatively; enumerated pathname count and observed file count can differ.
+Persistent zero links, unsafe replacements, identity changes, and arithmetic
+overflow still fail closed. This handles SQLite DELETE-journal pathname reuse
+without changing product verification, resource limits, or retrying until a
+sample passes. A sampler change invalidates prior workload-source provenance
+and requires the complete protected regeneration, not partial receipt reuse.
+
+Symlink refusals distinguish an unapproved basename, a different owner, fewer
+than one link, and more than two links using fixed outcome labels. These labels
+never include paths, targets or owner identifiers. They do not broaden the
+single explicitly allowed export-lock name or permit a zero-link symlink;
+failure classification alone is not evidence that an entry was safe.
 
 ## Interrupted generation
 

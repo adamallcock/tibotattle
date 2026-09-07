@@ -121,6 +121,20 @@ Do not collapse these identities:
 Raw account identifiers and credentials do not enter contribution payloads,
 diagnostics, public aggregates, or documentation.
 
+Prospective v1.1 account/era pseudonyms reuse the account-observation root under
+a separate purpose and authenticated enrollment/destination binding. The upload
+path only leases an existing root; it does not mint one or infer cross-device
+continuity. Bracketed collection remains provisional evidence. Historical quota
+occurrences and cumulative quantity bounds are a separate provenance layer.
+
+Device credential use is serialized locally across delivery, pairing, renewal,
+reset and credential-bearing review/capability reads. Before a rotation, the
+contribution controller persists `device_repair_required`. Ordinary approval or
+manual resume cannot bypass it. A validated remote receipt and local credential
+commit are required before re-arming delivery; monthly renewal also persists
+its scheduling hint. An ambiguous failure stays paused across restart without
+retrying an old bearer. Local analysis and accepted history remain available.
+
 ## Hosted data flow
 
 1. A participant starts Google or Apple sign-in. The Worker owns the provider
@@ -150,6 +164,48 @@ remove deletion-safe restore; the baseline review commit above predates it.
 
 The full HTTP inventory and authority model is in
 [`api-surface.md`](./api-surface.md).
+
+### Attribution-correct analytical selection
+
+The shared quota-analysis package builds plan/conflict eras from all admitted
+quota evidence before fit filtering. Local reset estimates are plan-selected;
+unresolved quantity only blocks intervals it could contribute to. Positively
+identified other-account usage does not poison an unrelated account. An absent
+account key by itself does not discard coherent legacy plan history.
+
+Hosted legacy quota, usage, daily totals and model composition share one pinned
+winning-device/day vector. Its exact journal fingerprint and participant input
+revision accompany existing fit/composition caches; the global mutation epoch
+fences the existing publication singleton and admin preview. Changed input
+invalidates publication atomically. Fragment selection occurs after fit/coverage
+gates and cannot give one reset multiple votes. Public Pro-equivalent conversion
+and existing cohort limits are unchanged.
+
+The staged v1.1 path adds immutable day manifests and a complete-domain head.
+First activation uses a null predecessor plus the observed legacy fingerprint;
+successors preserve every selected prior occurrence's base accounting. Candidate
+arrival is not publication. A transactional head switch selects v1.1 for the
+whole participant domain, queues daily rebuilds and invalidates prior caches.
+Even an explicit admission-floor rollback cannot silently select a legacy day
+outside that domain. Any accepted v0.2 corpus prevents a v1.1 consent upgrade
+and activation until a semantic replacement mapping is proven, including when
+its dates do not overlap the candidate. This preserves the existing v0.2 source
+instead of hiding it behind a participant-wide successor head. Identical complete vectors acknowledge the
+existing generation without cache churn when no source revision changed.
+
+The local runner retains an owner-only, closed progress journal beside the
+index (at most 1 MiB). It contains completed day-manifest digests and bounded
+control fingerprints, not account markers, root bytes, provider identifiers or
+session content. Each invocation checks consent and predecessor continuity;
+publication or marker-presence changes revalidate the completed prefix locally.
+A changed day restarts only the affected suffix, while a new day can extend the
+vector. Interrupted staging is not analytical acknowledgment.
+
+Closure is bounded to 4,096 contiguous days and 30,000 chunks (at most 6,000,000
+records); larger transfers pause without deleting or silently truncating history.
+Hosted fitting has a bounded 100-day evidence horizon and remains conditional:
+the wire format does not prove complete historical quantity intervals. No
+scoped-primary account billing claim is introduced by the new transport.
 
 ## Hosted storage
 

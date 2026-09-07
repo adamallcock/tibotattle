@@ -68,9 +68,9 @@ function fixture(overrides: Partial<TelemetryUsageEvent> = {}): TelemetryUsageEv
   };
 }
 
-// Exercise the pricing kernel's complete reviewed registry independently of
-// telemetry's deliberately narrower canonical-model ingestion allowlist. This
-// test-only cast does not make an alias or extra registry model ingestible.
+// Exercise the pricing kernel independently of the contribution fixture's
+// literal type. Ingestibility is established separately through the closed
+// shared catalog, not by this test-only cast.
 function registryModelPricingFixture(
   modelId: string,
   overrides: Omit<Partial<TelemetryUsageEvent>, "modelId"> = {},
@@ -133,14 +133,68 @@ function validateIngestibleEvent(event: TelemetryUsageEvent): TelemetryUsageEven
 }
 
 describe("server pricing", () => {
+  it("prices all eight Astra cards identically through validated telemetry and the local adapter", () => {
+    const expected = {
+      standard: ["6.99999", "7", "11.50002"],
+      batch: ["3.499995", "3.5", "5.75001"],
+      flex: ["3.499995", "3.5", "5.75001"],
+      priority: ["13.99998", "14", "23.00004"],
+    } as const;
+    for (const apiServiceTier of ["standard", "batch", "flex", "priority"] as const) {
+      for (const [index, totalInputContextTokens] of [271_999, 272_000, 272_001].entries()) {
+        const event = validateIngestibleEvent(fixture({
+          modelId: "gpt-6-astra", eventTime: "2026-09-03T12:00:00.000Z",
+          billingSurface: "openai_api", apiServiceTier, speedMode: "standard",
+          totalInputContextTokens, reasoningEffort: "max",
+          components: {
+            ...fixture().components,
+            inputUncachedTokens: totalInputContextTokens - 172_000,
+            inputCacheReadTokens: 100_000, inputCacheWriteTokens: 72_000,
+            outputTextTokens: 40_000, outputReasoningTokens: 60_000,
+          },
+        }));
+        const worker = priceTelemetryUsageEvent(event);
+        const local = priceCodexUsageEvent({
+          model: event.modelId, timestamp: event.eventTime,
+          totalInputContextTokens, components: event.components,
+        }, { apiServiceTier, priceEpochBasis: "event_time" });
+        expect(worker.coverageStatus).toBe("fully_priced");
+        expect(worker.exactCostUsd).toBe(expected[apiServiceTier][index]);
+        expect(worker.exactCostUsd).toBe(local.totalUsd);
+        expect(worker.selectedPriceCardIds).toEqual(local.selectedPriceCardIds);
+        if (!local.registry) throw new Error("A priced Astra event must include registry provenance");
+        expect(worker.registryVersion).toBe(local.registry.version);
+        expect(worker.registrySha256).toBe(local.registry.sha256);
+      }
+    }
+  });
+
+  it("uses Astra's API 2x Fast ratio while rejecting missing context and pre-release price epochs", () => {
+    const event = validateIngestibleEvent(fixture({
+      modelId: "gpt-6-astra", eventTime: "2026-09-03T12:00:00.000Z",
+      totalInputContextTokens: 272_000, speedMode: "fast",
+      components: { ...fixture().components, inputUncachedTokens: 272_000,
+        inputCacheReadTokens: 0, inputCacheWriteTokens: 0,
+        outputTextTokens: 0, outputReasoningTokens: 0 },
+    }));
+    expect(priceTelemetryUsageEvent(event)).toMatchObject({
+      exactCostUsd: "5.44", speedMultiplier: 2, coverageStatus: "fully_priced",
+    });
+    expect(priceTelemetryUsageEvent({ ...event, totalInputContextTokens: null })).toMatchObject({
+      coverageStatus: "unpriced", unpricedReasonCodes: ["total_input_context_missing"],
+    });
+    expect(priceTelemetryUsageEvent({ ...event, eventTime: "2026-09-02T12:00:00.000Z" }).coverageStatus).toBe("unpriced");
+  });
+
   it("prices every registry Priority model, alias and epoch identically to the local kernel", () => {
     let checked = 0;
+    let checkedAstra = 0;
     for (const card of APP_OFFICIAL_PRICE_CARDS.filter(
       (entry) => entry.provider === "openai" && entry.service_tier === "priority",
     )) {
       const eventTime = `${card.effective?.from ?? card.effective?.to ?? "2026-08-30"}T12:00:00.000Z`;
       const totalInputContextTokens = card.metadata?.total_input_context_band === "long"
-        ? 272_000 : 4_000;
+        ? Number(card.components[0]?.conditions?.min_total_input_tokens) : 4_000;
       const tokens = Object.fromEntries(card.components
         .filter((component) => component.usage_component.endsWith("_tokens"))
         .map((component) => [component.usage_component, 1_000]));
@@ -164,13 +218,17 @@ describe("server pricing", () => {
           eventTime, totalInputContextTokens, standardPriceCardIds: standard.selectedPriceCardIds,
         });
         expect(worker.coverageStatus, card.id).toBe("fully_priced");
+        expect(priority.selectedPriceCardIds, card.id).toContain(card.id);
         expect(worker.tierBasis, card.id).toBe("subscription_speed_priority_price_ratio");
         expect(Number(worker.exactCostUsd), `${card.id}/${modelId}`).toBe(Number(priority.totalUsd));
         expect(Number(worker.exactCostUsd), `${card.id}/${modelId}`).toBe(localWeighted.usd);
         checked += 1;
+        if (card.model === "gpt-6-astra") checkedAstra += 1;
       }
     }
-    expect(checked).toBe(26);
+    expect(checkedAstra).toBe(2);
+    expect(checked - checkedAstra).toBe(26);
+    expect(checked).toBe(28);
     const provenance: SpeedModeProvenance = "assumed_fast_scenario";
     expect(resolveEffectiveSpeedMode({ unresolvedScenario: "unresolved_as_fast" }).provenance).toBe(provenance);
   });

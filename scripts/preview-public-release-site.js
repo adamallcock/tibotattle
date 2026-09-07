@@ -62,6 +62,12 @@ const METADATA_FIELDS = Object.freeze([
   "usage-monitor-minimum-macos",
   "usage-monitor-installer-architectures",
   "usage-monitor-architectures",
+  "usage-monitor-intel-installer-url",
+  "usage-monitor-intel-installer-version",
+  "usage-monitor-intel-installer-sha256",
+  "usage-monitor-intel-installer-bytes",
+  "usage-monitor-intel-minimum-macos",
+  "usage-monitor-intel-architectures",
   "usage-monitor-release-notes-url",
   "usage-monitor-privacy-url",
   "usage-monitor-security-url",
@@ -232,6 +238,31 @@ function verifiedArchitecture(value) {
   return value;
 }
 
+function optionalIntelMetadata(values, version) {
+  const names = METADATA_FIELDS.filter((name) => name.startsWith("usage-monitor-intel-"));
+  if (!names.some((name) => values.has(name))) return null;
+  const metadata = Object.fromEntries(names.map((name) => [name, requiredMeta(values, name)]));
+  const intelVersion = metadata["usage-monitor-intel-installer-version"];
+  const installerUrl = publicHttpsUrl(metadata["usage-monitor-intel-installer-url"],
+    "Published Intel installer URL", { dmg: true });
+  const installerSha256 = metadata["usage-monitor-intel-installer-sha256"];
+  const installerBytes = metadata["usage-monitor-intel-installer-bytes"];
+  const minimumMacos = metadata["usage-monitor-intel-minimum-macos"];
+  if (intelVersion !== version
+      || installerUrl.pathname.split("/").at(-1) !== `TiboTattle-${version}-macOS-x64.dmg`
+      || metadata["usage-monitor-intel-architectures"] !== "x64"
+      || !/^[a-f0-9]{64}$/u.test(installerSha256)
+      || !/^[1-9][0-9]{0,15}$/u.test(installerBytes)
+      || !Number.isSafeInteger(Number(installerBytes))
+      || !/^(?:1[0-9]|[2-9][0-9])\.(?:0|[1-9][0-9]?)(?:\.(?:0|[1-9][0-9]?))?$/u.test(minimumMacos)) {
+    throw new TypeError("Published Intel installer metadata is invalid or does not match the release");
+  }
+  return Object.freeze({
+    installerUrl: installerUrl.href, installerVersion: intelVersion,
+    installerSha256, installerBytes, minimumMacos, architectures: "x64",
+  });
+}
+
 /**
  * Extract the display metadata from an already-public page. The result is
  * intentionally only a preview input: it does not verify the installer
@@ -272,7 +303,9 @@ export function extractPublicReleaseMetadata(html) {
   if (!architectures) {
     throw new TypeError("Published homepage is missing installer architecture metadata");
   }
+  const intelInstaller = optionalIntelMetadata(values, installerVersion);
   return Object.freeze({
+    ...(intelInstaller ? { intelInstaller } : {}),
     architectures: verifiedArchitecture(architectures),
     installerBytes,
     installerSha256,
@@ -320,6 +353,13 @@ function metadataTags(metadata) {
     ["usage-monitor-security-url", metadata.securityUrl],
     ["usage-monitor-support-url", metadata.supportUrl],
   ];
+  if (metadata.intelInstaller) {
+    for (const [name, key] of [
+      ["installer-url", "installerUrl"], ["installer-version", "installerVersion"],
+      ["installer-sha256", "installerSha256"], ["installer-bytes", "installerBytes"],
+      ["minimum-macos", "minimumMacos"], ["architectures", "architectures"],
+    ]) values.push([`usage-monitor-intel-${name}`, metadata.intelInstaller[key]]);
+  }
   return values.map(([name, value]) =>
     `<meta name="${name}" content="${htmlAttribute(value)}">`).join("\n");
 }

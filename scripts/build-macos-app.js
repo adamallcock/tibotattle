@@ -8,6 +8,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readlink,
   readdir,
@@ -93,6 +94,14 @@ const WEB_MODULE_ROOT = join(
 );
 const PINNED_NODE_VERSION = "v26.2.0";
 const PINNED_NODE_ARCHITECTURE = "arm64";
+// These Intel file digests are from the official
+// node-v26.2.0-darwin-x64.tar.xz archive, SHA-256
+// 50e3fb7cda816f0ab8929551516530669d1c0449a3f6a8a044be82a57cc642a4.
+// Verify the archive before extracting it; never execute an unverified input.
+const PINNED_INTEL_NODE_SHA256 =
+  "51ef33e35c9cd96192baba41dfb592a9568380a5b2190d64e63332c4bd807e0f";
+const PINNED_INTEL_NODE_LICENSE_SHA256 =
+  "148eacf7863ef4329224a29398623077200a27194aa075569faf4a0a85566ca5";
 const MINIMUM_MACOS_VERSION = "14.0";
 const PACKAGE_NAME = "app-usagemonitor";
 const SHORT_VERSION = RELEASE_VERSION;
@@ -121,6 +130,12 @@ const DISTRIBUTION_CHANNEL_PRODUCTION = "production";
 const MACOS_BUILD_PROFILE_RELEASE = "release";
 const MACOS_BUILD_PROFILE_TEST = "test";
 const FIXED_EPOCH_SECONDS = 946_684_800;
+const GIT_PATH = "/usr/bin/git";
+const SET_FILE_PATH = "/usr/bin/SetFile";
+const MACOS_TOOL_ENV = Object.freeze({
+  PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+  TZ: "UTC",
+});
 const MAXIMUM_BUNDLE_BYTES = 512 * 1024 * 1024;
 const MANIFEST_SCHEMA = "usage-monitor-macos-app-build-v0.1";
 const CODESIGN_PATH = "/usr/bin/codesign";
@@ -132,10 +147,19 @@ const SPARKLE_FRAMEWORK_PREFIX =
   "Contents/Frameworks/Sparkle.framework";
 const SIGNED_EXECUTABLE_PATH =
   `Contents/MacOS/${PRODUCT_BRAND.executableName}`;
+export const MACOS_KEYCHAIN_MIGRATION_HELPER = Object.freeze({
+  executable: "Contents/Helpers/TiboTattleKeychainMigration",
+  signingIdentifier: "node",
+});
+export const MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES = Object.freeze([
+  "apps/macos/Helpers/KeychainMigrationHelper.swift",
+  "apps/macos/Sources/KeychainMigration.swift",
+]);
 const CODE_RESOURCES_PATH = "Contents/_CodeSignature/CodeResources";
 const NORMALIZED_MACH_O_PATHS = new Set([
   SIGNED_EXECUTABLE_PATH,
   "Contents/Resources/runtime/bin/node",
+  MACOS_KEYCHAIN_MIGRATION_HELPER.executable,
   ...SPARKLE_MACH_O_PATHS.map(
     (path) => `${SPARKLE_FRAMEWORK_PREFIX}/${path}`,
   ),
@@ -216,7 +240,9 @@ const MACOS_PREVIEW_APPCAST_PATH = "/preview/appcast.xml";
 export const MACOS_PREVIEW_DISTRIBUTION_CHANNEL =
   DISTRIBUTION_CHANNEL_PREVIEW;
 
-function assertMacOSPreviewAppcastBoundary(value) {
+function assertMacOSPreviewAppcastBoundary(value, architecture = "arm64") {
+  const expectedPath = architecture === "x64"
+    ? "/preview/intel/appcast.xml" : MACOS_PREVIEW_APPCAST_PATH;
   let selected;
   try {
     selected = new URL(value);
@@ -226,7 +252,7 @@ function assertMacOSPreviewAppcastBoundary(value) {
       "MACOS_PREVIEW_FEED_PATH_INVALID",
     );
   }
-  if (selected.pathname !== MACOS_PREVIEW_APPCAST_PATH) {
+  if (selected.pathname !== expectedPath) {
     fail(
       "Preview distribution requires the reviewed /preview/appcast.xml path",
       "MACOS_PREVIEW_FEED_PATH_INVALID",
@@ -271,7 +297,7 @@ const PINNED_PACKAGES = Object.freeze({
   "@app-usagemonitor/telemetry-contract": RELEASE_VERSION,
   ajv: "8.20.0",
   "fast-deep-equal": "3.1.3",
-  "fast-uri": "3.1.5",
+  "fast-uri": "3.1.6",
   "json-schema-traverse": "1.0.0",
   "require-from-string": "2.0.2",
   runcost: "0.2.1",
@@ -289,7 +315,9 @@ const PINNED_PACKAGE_TREE_DIGESTS = Object.freeze({
   ajv: "7fecaf9a9ff3f41dabc7f7d762c7fecb8384c38a3c0dd4e6da0f3b3ef04569ca",
   "fast-deep-equal":
     "6c98665ed0585630ce02fbf064e6ed854f8e6546cb1e534158dbfbc18e05aa85",
-  "fast-uri": "45d5024ff5b5207801db39d27aa6aa9fc6ca54b042d25cdf23dfbf9e526705eb",
+  // Security patch: the installed tree matches the official 3.1.6 archive
+  // whose SHA-512 integrity is pinned in pnpm-lock.yaml.
+  "fast-uri": "d267bdc69f6805e4b6dcab9d48d543c490ee3022adb3f7e1ba02f542f70e25c8",
   "json-schema-traverse":
     "71ac31baf5e8476eb746605c96d1961a1e7474d4491828506602cbf17b5c5af6",
   "require-from-string":
@@ -307,12 +335,17 @@ const TELEMETRY_CONTRACT_PACKAGE_ROOT = join(
 export const MACOS_TELEMETRY_CONTRACT_RUNTIME_FILES = Object.freeze([
   "index.js",
   "package.json",
+  "src/admin-model-history.js",
   "src/constants.js",
   "src/envelope.js",
   "src/errors.js",
+  "src/model-catalog.js",
   "src/primitives.js",
   "src/telemetry-v0.1.js",
   "src/telemetry-v0.2.js",
+  "src/telemetry-v1.1-domain.js",
+  "src/telemetry-v1.1-schemas.js",
+  "src/telemetry-v1.1.js",
   "src/upload.js",
 ]);
 
@@ -340,6 +373,7 @@ export const MACOS_QUOTA_ANALYSIS_RUNTIME_FILES = Object.freeze([
   "index.js",
   "package.json",
   "src/model-composition.js",
+  "src/plan-attribution.js",
   "src/quota-calibration.js",
   "src/quota-pace-forecast.js",
   "src/quota-rolling.js",
@@ -522,14 +556,14 @@ export function normalizeMacOSCentralOrigin(
   fail("Central origin must be an HTTPS DNS origin and non-loopback");
 }
 
-function resolveOperationalReleaseChannel(channel = STABLE_RELEASE_CHANNEL) {
+function resolveOperationalReleaseChannel(channel = STABLE_RELEASE_CHANNEL, architecture = "arm64") {
   if (typeof channel !== "string") {
     fail(
       "External distribution must select a named release channel",
       "MACOS_RELEASE_CHANNEL_NAME_REQUIRED",
     );
   }
-  return resolveReleaseChannel(channel);
+  return resolveReleaseChannel(channel, { architecture });
 }
 
 function normalizeMacOSReleaseChannelOrigin(channel) {
@@ -1056,6 +1090,15 @@ export async function collectMacOSSwiftSources({
         if (SWIFT_EXCLUDED_DIRECTORY_NAMES.has(normalizedName)) {
           continue;
         }
+        if (directory === selectedSourceRoot && entry.name === "Helpers") {
+          // The migration entrypoint has its own @main. Review its exact
+          // closure, but never compile it into the foreground application.
+          await collectMacOSKeychainMigrationHelperSources({
+            repositoryRoot: selectedRepositoryRoot,
+            sourceRoot: selectedSourceRoot,
+          });
+          continue;
+        }
         if (directory === selectedSourceRoot && entry.name !== "Sources") {
           if (
             SWIFT_INTENTIONALLY_EXCLUDED_TOP_LEVEL_DIRECTORY_NAMES
@@ -1113,6 +1156,78 @@ export async function collectMacOSSwiftSources({
         "macOS Swift source",
       ))),
   });
+}
+
+export async function collectMacOSKeychainMigrationHelperSources({
+  repositoryRoot = REPOSITORY_ROOT,
+  sourceRoot = MACOS_SOURCE_ROOT,
+} = {}) {
+  const selectedRepositoryRoot = resolve(repositoryRoot);
+  const selectedSourceRoot = resolve(sourceRoot);
+  const helpersRoot = join(selectedSourceRoot, "Helpers");
+  await assertReviewedDirectory(
+    selectedRepositoryRoot,
+    helpersRoot,
+    "macOS migration helper source root",
+  );
+  const entries = await readdir(helpersRoot, { withFileTypes: true });
+  if (entries.length !== 1
+      || entries[0].name !== "KeychainMigrationHelper.swift"
+      || !entries[0].isFile()
+      || entries[0].isSymbolicLink()) {
+    fail("macOS migration helper must contain only its reviewed entrypoint");
+  }
+  const files = [];
+  for (const relativeFile of MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES) {
+    const file = join(
+      selectedSourceRoot,
+      ...relativeFile.slice("apps/macos/".length).split("/"),
+    );
+    reviewedRelative(selectedRepositoryRoot, file, "macOS migration helper source");
+    await assertReviewedDirectory(
+      selectedRepositoryRoot,
+      dirname(file),
+      "macOS migration helper source directory",
+    );
+    const metadata = await lstat(file);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.nlink !== 1) {
+      fail("macOS migration helper source must be an unlinked regular file");
+    }
+    if (selectedRepositoryRoot === REPOSITORY_ROOT) {
+      assertAllowedFirstPartyPath(file);
+    }
+    files.push(file);
+  }
+  return Object.freeze({
+    files: Object.freeze(files),
+    relativeFiles: Object.freeze(files.map((file) =>
+      reviewedRelative(selectedRepositoryRoot, file, "macOS migration helper source"))),
+  });
+}
+
+export function assertMacOSKeychainMigrationManifest(manifest) {
+  const helper = manifest?.runtime?.keychainMigrationHelper;
+  const helperSources = manifest?.inputs?.keychainMigrationHelperSources;
+  const appSources = manifest?.inputs?.swiftSources;
+  const files = manifest?.payload?.files;
+  const rows = Array.isArray(files) ? files.filter((entry) =>
+    entry?.path === MACOS_KEYCHAIN_MIGRATION_HELPER.executable) : [];
+  if (stableJson(helper) !== stableJson(MACOS_KEYCHAIN_MIGRATION_HELPER)
+      || stableJson(helperSources) !== stableJson(MACOS_KEYCHAIN_MIGRATION_HELPER_SOURCES)
+      || !Array.isArray(appSources)
+      || !appSources.includes("apps/macos/Sources/KeychainMigration.swift")
+      || appSources.includes("apps/macos/Helpers/KeychainMigrationHelper.swift")
+      || rows.length !== 1
+      || rows[0].normalization !== "mach_o_without_code_signature"
+      || rows[0].mode !== "555"
+      || !Number.isSafeInteger(rows[0].bytes) || rows[0].bytes < 1
+      || typeof rows[0].sha256 !== "string"
+      || !/^[a-f0-9]{64}$/u.test(rows[0].sha256)) {
+    fail(
+      "Application omits or changes the reviewed Keychain migration helper contract",
+      "MACOS_KEYCHAIN_MIGRATION_ARTIFACT_INVALID",
+    );
+  }
 }
 
 const LOCALIZATION_RESOURCE_PATTERN =
@@ -1872,6 +1987,93 @@ function run(command, args, options = {}) {
   return result.stdout.trim();
 }
 
+function macOSFinderDate(timestampSeconds, label) {
+  if (!Number.isSafeInteger(timestampSeconds) || timestampSeconds < 0) {
+    fail(`${label} must be a non-negative integer timestamp`);
+  }
+  const date = new Date(timestampSeconds * 1_000);
+  if (!Number.isFinite(date.getTime())
+      || date.getUTCFullYear() < 1904
+      || date.getUTCFullYear() > 9999) {
+    fail(`${label} is outside the supported macOS file-date range`);
+  }
+  const pad = (value) => String(value).padStart(2, "0");
+  return [
+    `${pad(date.getUTCMonth() + 1)}/${pad(date.getUTCDate())}/${date.getUTCFullYear()}`,
+    `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`,
+  ].join(" ");
+}
+
+/**
+ * Read the source commit's timestamp for external builds. The commit is
+ * already authenticated by the release-core preflight; reading it here keeps
+ * Finder metadata tied to that same immutable source revision without adding
+ * a wall-clock input or changing the public build manifest.
+ */
+export function readMacOSReleaseSourceTimestamp(source) {
+  if (!source || typeof source !== "object"
+      || typeof source.commit !== "string"
+      || !/^[0-9a-f]{40,64}$/u.test(source.commit)) {
+    fail(
+      "Release source commit is required for Finder metadata",
+      "MACOS_RELEASE_SOURCE_INVALID",
+    );
+  }
+  const output = run(GIT_PATH, [
+    "-C",
+    REPOSITORY_ROOT,
+    "show",
+    "-s",
+    "--format=%ct",
+    `${source.commit}^{commit}`,
+  ], { env: MACOS_TOOL_ENV });
+  if (!/^\d+$/u.test(output)) {
+    fail(
+      "Release source commit timestamp is invalid",
+      "MACOS_RELEASE_SOURCE_TIMESTAMP_INVALID",
+    );
+  }
+  const timestampSeconds = Number(output);
+  if (!Number.isSafeInteger(timestampSeconds) || timestampSeconds < 0) {
+    fail(
+      "Release source commit timestamp is outside the supported range",
+      "MACOS_RELEASE_SOURCE_TIMESTAMP_INVALID",
+    );
+  }
+  return timestampSeconds;
+}
+
+/**
+ * Set only the outer bundle directory's Finder birth/modify dates. Payload
+ * files retain the fixed normalization above; this filesystem metadata is not
+ * part of the signed or inventoried payload bytes.
+ */
+export function setMacOSBundleFinderMetadata(path, {
+  birthTimeSeconds,
+  modificationTimeSeconds = birthTimeSeconds,
+  commandRunner = run,
+} = {}) {
+  if (typeof path !== "string" || path.length === 0 || path.includes("\0")) {
+    fail("macOS bundle path is invalid for Finder metadata");
+  }
+  const birthDate = macOSFinderDate(birthTimeSeconds, "Finder birth time");
+  const modificationDate = macOSFinderDate(
+    modificationTimeSeconds,
+    "Finder modification time",
+  );
+  commandRunner(SET_FILE_PATH, [
+    "-d",
+    birthDate,
+    "-m",
+    modificationDate,
+    path,
+  ], { env: MACOS_TOOL_ENV });
+  return Object.freeze({
+    birthTimeSeconds,
+    modificationTimeSeconds,
+  });
+}
+
 function assertBuildPlatform() {
   if (process.platform !== "darwin"
       || process.arch !== PINNED_NODE_ARCHITECTURE) {
@@ -1882,6 +2084,143 @@ function assertBuildPlatform() {
       `Build requires pinned Node ${PINNED_NODE_VERSION}; found ${process.version}`,
     );
   }
+}
+
+export function normalizeMacOSBuildArchitecture(value = PINNED_NODE_ARCHITECTURE) {
+  if (value === "arm64" || value === "x64") return value;
+  fail(
+    "macOS target architecture must be arm64 or x64",
+    "MACOS_BUILD_ARCHITECTURE_INVALID",
+  );
+}
+
+function assertMacOSBuildArchitectureConfiguration({
+  architecture = PINNED_NODE_ARCHITECTURE,
+  nodeRuntime = null,
+  externalDistribution = false,
+  previewDistribution = false,
+} = {}) {
+  const selected = normalizeMacOSBuildArchitecture(architecture);
+  if (selected === "arm64" && nodeRuntime !== null) {
+    fail(
+      "Apple Silicon builds must use the pinned builder's Node runtime",
+      "MACOS_NODE_RUNTIME_OVERRIDE_FORBIDDEN",
+    );
+  }
+  if (selected === "x64" && (typeof nodeRuntime !== "string"
+      || nodeRuntime.length === 0 || nodeRuntime.includes("\0"))) {
+    fail(
+      "Intel builds require --node-runtime with the pinned official Intel Node executable",
+      "MACOS_INTEL_NODE_RUNTIME_REQUIRED",
+    );
+  }
+  return selected;
+}
+
+function machOArchitecture(architecture) {
+  return architecture === "x64" ? "x86_64" : "arm64";
+}
+
+export function assertMacOSMachOArchitecture(bytes, architecture) {
+  const selected = normalizeMacOSBuildArchitecture(architecture);
+  const cpuType = selected === "x64" ? 0x01000007 : 0x0100000c;
+  if (!Buffer.isBuffer(bytes) || bytes.length < 32
+      || bytes.readUInt32LE(0) !== 0xfeedfacf
+      || bytes.readUInt32LE(4) !== cpuType) {
+    fail(
+      "Bundle executable is not a thin Mach-O for the selected architecture",
+      "MACOS_BUNDLE_ARCHITECTURE_MISMATCH",
+    );
+  }
+}
+
+export async function assertMacOSBundleArchitecture(appPath, {
+  architecture = "arm64", updaterEnabled = false, helperRequired = true,
+} = {}) {
+  normalizeMacOSBuildArchitecture(architecture);
+  const files = [
+    SIGNED_EXECUTABLE_PATH,
+    "Contents/Resources/runtime/bin/node",
+    ...(helperRequired ? [MACOS_KEYCHAIN_MIGRATION_HELPER.executable] : []),
+    ...(updaterEnabled ? SPARKLE_MACH_O_PATHS.map((path) =>
+      `${SPARKLE_FRAMEWORK_PREFIX}/${path}`) : []),
+  ];
+  for (const path of files) {
+    const file = await open(join(appPath, ...path.split("/")),
+      fileSystemConstants.O_RDONLY | fileSystemConstants.O_NOFOLLOW);
+    try {
+      if (!(await file.stat()).isFile()) {
+        fail("Bundle executable must be a regular file", "MACOS_BUNDLE_ARCHITECTURE_MISMATCH");
+      }
+      const header = Buffer.alloc(32);
+      const { bytesRead } = await file.read(header, 0, 32, 0);
+      assertMacOSMachOArchitecture(header.subarray(0, bytesRead), architecture);
+    } finally {
+      await file.close();
+    }
+  }
+}
+
+function previewStagingRootForArchitecture(architecture) {
+  return architecture === "x64"
+    ? join(REPOSITORY_ROOT, ".release-build", "macos-preview", "intel", "current")
+    : DEFAULT_PREVIEW_STAGING_ROOT;
+}
+
+// Inspect input bytes without executing them. The copied runtime is checked
+// again before a bounded version/architecture probe in the private build tree.
+export async function validateMacOSNodeRuntimeInput({
+  architecture = PINNED_NODE_ARCHITECTURE,
+  nodeRuntime = null,
+} = {}) {
+  const selected = assertMacOSBuildArchitectureConfiguration({
+    architecture,
+    nodeRuntime,
+  });
+  let executable;
+  let license;
+  let executableSha256;
+  let licenseSha256;
+  try {
+    const requested = resolve(nodeRuntime ?? process.execPath);
+    executable = await realpath(requested);
+    license = resolve(dirname(executable), "..", "LICENSE");
+    for (const [path, maximumBytes] of [
+      [executable, MAXIMUM_BUNDLE_BYTES], [license, 1024 * 1024],
+    ]) {
+      const metadata = await lstat(path);
+      if (!metadata.isFile() || metadata.isSymbolicLink()
+          || metadata.nlink !== 1 || metadata.size > maximumBytes) {
+        throw new Error("not a regular unlinked input");
+      }
+    }
+    if (selected === "x64" && executable !== requested) {
+      throw new Error("Intel runtime must not traverse a symbolic link");
+    }
+    [executableSha256, licenseSha256] = await Promise.all([
+      sha256File(executable),
+      sha256File(license),
+    ]);
+  } catch {
+    fail(
+      "Selected Node runtime and license must be readable regular files",
+      "MACOS_NODE_RUNTIME_INPUT_INVALID",
+    );
+  }
+  if (selected === "x64" && (executableSha256 !== PINNED_INTEL_NODE_SHA256
+      || licenseSha256 !== PINNED_INTEL_NODE_LICENSE_SHA256)) {
+    fail(
+      "Intel Node runtime or license does not match the pinned official Node 26.2.0 bytes",
+      "MACOS_NODE_RUNTIME_DIGEST_MISMATCH",
+    );
+  }
+  return Object.freeze({
+    architecture: selected,
+    executable,
+    executableSha256,
+    license,
+    licenseSha256,
+  });
 }
 
 export function normalizeMacOSBuildProfile(value = MACOS_BUILD_PROFILE_RELEASE) {
@@ -1895,11 +2234,12 @@ export function normalizeMacOSBuildProfile(value = MACOS_BUILD_PROFILE_RELEASE) 
   );
 }
 
-function testCompilerModuleCachePath(sdk, toolchainVersion) {
+function testCompilerModuleCachePath(sdk, toolchainVersion, architecture) {
   const cacheKey = createHash("sha256")
     .update([
       process.version,
       process.arch,
+      architecture,
       sdk,
       toolchainVersion,
       MINIMUM_MACOS_VERSION,
@@ -1914,8 +2254,8 @@ function testCompilerModuleCachePath(sdk, toolchainVersion) {
   );
 }
 
-async function prepareTestCompilerModuleCache(sdk, toolchainVersion) {
-  const moduleCache = testCompilerModuleCachePath(sdk, toolchainVersion);
+async function prepareTestCompilerModuleCache(sdk, toolchainVersion, architecture) {
+  const moduleCache = testCompilerModuleCachePath(sdk, toolchainVersion, architecture);
   await mkdir(moduleCache, { recursive: true, mode: 0o700 });
   const metadata = await lstat(moduleCache);
   if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
@@ -1952,8 +2292,24 @@ function preSignLauncherForInventory(appBundle) {
   ]);
 }
 
-async function compileLauncher(destination, updater, swiftSources, {
+function preSignKeychainMigrationHelperForInventory(appBundle) {
+  run(CODESIGN_PATH, [
+    "--force",
+    "--sign",
+    "-",
+    "--identifier",
+    MACOS_KEYCHAIN_MIGRATION_HELPER.signingIdentifier,
+    "--options",
+    "runtime",
+    "--timestamp=none",
+    join(appBundle, ...MACOS_KEYCHAIN_MIGRATION_HELPER.executable.split("/")),
+  ]);
+}
+
+async function compileNativeExecutable(destination, updater, swiftSources, {
+  architecture = PINNED_NODE_ARCHITECTURE,
   buildProfile = MACOS_BUILD_PROFILE_RELEASE,
+  migrationHelper = false,
 } = {}) {
   const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
   const sdk = run("/usr/bin/xcrun", [
@@ -1973,6 +2329,7 @@ async function compileLauncher(destination, updater, swiftSources, {
       run("/usr/bin/xcrun", ["--sdk", "macosx", "swiftc", "--version"], {
         env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
       }),
+      architecture,
     )
     : compilerScratch;
   const compileEnvironment = {
@@ -1995,31 +2352,39 @@ async function compileLauncher(destination, updater, swiftSources, {
       ? ["-Onone"]
       : ["-O", "-whole-module-optimization"]),
     "-target",
-    `arm64-apple-macos${MINIMUM_MACOS_VERSION}`,
+    `${machOArchitecture(architecture)}-apple-macos${MINIMUM_MACOS_VERSION}`,
     "-sdk",
     sdk,
     "-module-name",
-    `${PRODUCT_BRAND.executableName}Launcher`,
+    migrationHelper
+      ? "TiboTattleKeychainMigration"
+      : `${PRODUCT_BRAND.executableName}Launcher`,
     "-module-cache-path",
     moduleCache,
-    "-framework",
-    "AppKit",
-    "-framework",
-    "Foundation",
-    // Login-at-login registration uses Apple's macOS 13+ ServiceManagement
-    // API directly.  The framework is provided by the OS and is not bundled.
-    "-framework",
-    "ServiceManagement",
-    // Native, opt-in local alerts use the macOS notification center only.
-    // This is a system framework; it adds no helper, service, or bundled
-    // network-capable dependency.
-    "-framework",
-    "UserNotifications",
-    // The dashboard is hosted in-app. WebKit is a system framework, so this
-    // adds no bundled binary and no new outbound reach: the embedded view is
-    // pinned to the loopback companion origin by its navigation delegate.
-    "-framework",
-    "WebKit",
+    // Darwin exposes audit_token_to_pid/euid declarations, but their
+    // implementations live in libbsm. Both peers authenticate the IPC audit
+    // token, so both the launcher and helper must link this system library.
+    "-lbsm",
+    // The migration helper has no UI, updater, JIT, or separately bundled
+    // runtime. Only the foreground launcher needs the system UI/lifecycle
+    // frameworks. Both use Security through reviewed native APIs.
+    ...(migrationHelper
+      ? ["-framework", "Foundation", "-framework", "Security"]
+      : [
+        "-framework",
+        "AppKit",
+        "-framework",
+        "Foundation",
+        // Login-at-login registration uses the system ServiceManagement API.
+        "-framework",
+        "ServiceManagement",
+        // Native alerts add no separately bundled networking dependency.
+        "-framework",
+        "UserNotifications",
+        // The foreground dashboard remains pinned to the loopback companion.
+        "-framework",
+        "WebKit",
+      ]),
   ];
   if (updater.enabled) {
     arguments_.push(
@@ -2046,12 +2411,12 @@ async function compileLauncher(destination, updater, swiftSources, {
   await chmod(destination, 0o555);
   await utimes(destination, FIXED_EPOCH_SECONDS, FIXED_EPOCH_SECONDS);
   const fileDescription = run("/usr/bin/file", ["-b", destination]);
-  if (!fileDescription.includes("Mach-O 64-bit executable arm64")) {
-    fail("Native launcher is not a macOS arm64 executable");
+  if (!fileDescription.includes(`Mach-O 64-bit executable ${machOArchitecture(architecture)}`)) {
+    fail("Native application code does not match the selected macOS architecture");
   }
 }
 
-async function copyPinnedSparkleFramework(contents, updater) {
+async function copyPinnedSparkleFramework(contents, updater, architecture) {
   if (!updater.enabled) return null;
   const destination = join(contents, "Frameworks", "Sparkle.framework");
   for (const entry of updater.framework.entries) {
@@ -2069,11 +2434,11 @@ async function copyPinnedSparkleFramework(contents, updater) {
   }
   for (const relativePath of SPARKLE_MACH_O_PATHS) {
     const executable = join(destination, ...relativePath.split("/"));
-    const replacement = `${executable}.arm64`;
+    const replacement = `${executable}.${machOArchitecture(architecture)}`;
     run("/usr/bin/lipo", [
       executable,
       "-thin",
-      PINNED_NODE_ARCHITECTURE,
+      machOArchitecture(architecture),
       "-output",
       replacement,
     ], {
@@ -2088,26 +2453,41 @@ async function copyPinnedSparkleFramework(contents, updater) {
   return destination;
 }
 
-async function copyPinnedNode(resourcesRoot) {
-  const selectedNode = await realpath(process.execPath);
-  const nodeVersion = run(selectedNode, ["--version"], {
-    env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
-  });
-  if (nodeVersion !== PINNED_NODE_VERSION) {
-    fail("The selected Node executable does not match the pinned version");
-  }
+async function copyPinnedNode(resourcesRoot, runtimeInput) {
   const destination = join(resourcesRoot, "runtime", "bin", "node");
-  await copyRegularFile(selectedNode, destination, 0o555);
-  const nodeLicense = resolve(dirname(selectedNode), "..", "LICENSE");
+  const licenseDestination = join(resourcesRoot, "licenses", "node-26.2.0.txt");
+  await copyRegularFile(runtimeInput.executable, destination, 0o555);
   await copyRegularFile(
-    nodeLicense,
-    join(resourcesRoot, "licenses", "node-26.2.0.txt"),
+    runtimeInput.license,
+    licenseDestination,
     0o444,
   );
+  const [runtimeSha256, licenseSha256] = await Promise.all([
+    sha256File(destination),
+    sha256File(licenseDestination),
+  ]);
+  if (runtimeSha256 !== runtimeInput.executableSha256
+      || licenseSha256 !== runtimeInput.licenseSha256) {
+    fail("Selected Node input changed during staging", "MACOS_NODE_RUNTIME_INPUT_CHANGED");
+  }
+  const runtimeIdentity = run(destination, [
+    "-p", "JSON.stringify([process.version, process.platform, process.arch])",
+  ], {
+    cwd: resourcesRoot,
+    env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+  });
+  if (runtimeIdentity !== JSON.stringify([
+    PINNED_NODE_VERSION, "darwin", runtimeInput.architecture,
+  ])) {
+    fail(
+      "The selected Node executable does not match the pinned version and target architecture",
+      "MACOS_NODE_RUNTIME_IDENTITY_MISMATCH",
+    );
+  }
   return Object.freeze({
-    architecture: PINNED_NODE_ARCHITECTURE,
+    architecture: runtimeInput.architecture,
     executable: "Contents/Resources/runtime/bin/node",
-    sha256: await sha256File(destination),
+    sha256: runtimeSha256,
     version: PINNED_NODE_VERSION.slice(1),
   });
 }
@@ -2414,6 +2794,7 @@ export async function calculateMacOSSourceInputDigest({
   graph,
   runtimeAssets,
   swiftSources,
+  keychainMigrationHelperSources = null,
   localizationResources = null,
   iconAssets = null,
   updater = null,
@@ -2438,6 +2819,7 @@ export async function calculateMacOSSourceInputDigest({
     CAPTURED_UTF8_SOURCE_HELPER,
     SCRIPT_FILE,
     ...swiftSources.files,
+    ...(keychainMigrationHelperSources?.files ?? []),
     ...localizationFiles,
     ...(iconAssets
       ? [iconAssets.icon.path, iconAssets.provenance.path]
@@ -2745,7 +3127,8 @@ function readMacOSInfoPlist(path) {
  * The validator intentionally accepts only the preview marker and never
  * writes an application or attempts an install into /Applications.
  */
-export async function validateMacOSPreviewApp(appPath) {
+export async function validateMacOSPreviewApp(appPath, { architecture = "arm64" } = {}) {
+  normalizeMacOSBuildArchitecture(architecture);
   if (typeof appPath !== "string"
       || appPath.length === 0
       || appPath.includes("\0")) {
@@ -2799,7 +3182,20 @@ export async function validateMacOSPreviewApp(appPath) {
       "MACOS_PREVIEW_METADATA_INVALID",
     );
   }
+  // A still-signed older Preview may be inspected for replacement, but any
+  // artifact declaring or carrying the new helper must have the complete
+  // current contract. Current builders enforce this unconditionally.
+  if (manifest.runtime?.keychainMigrationHelper !== undefined
+      || manifest.inputs?.keychainMigrationHelperSources !== undefined
+      || (Array.isArray(manifest.payload?.files)
+        && manifest.payload.files.some((entry) =>
+          entry?.path === MACOS_KEYCHAIN_MIGRATION_HELPER.executable))) {
+    assertMacOSKeychainMigrationManifest(manifest);
+  }
   const release = manifest.release;
+  if (manifest.runtime?.node?.architecture !== architecture) {
+    fail("Preview runtime architecture does not match the selected target", "MACOS_BUNDLE_ARCHITECTURE_MISMATCH");
+  }
   if (release?.channel !== DISTRIBUTION_CHANNEL_PREVIEW
       || release.channelName !== DISTRIBUTION_CHANNEL_PREVIEW
       || release.appOpenScheme !== PREVIEW_PRODUCT_BRAND.appOpenScheme
@@ -2869,6 +3265,7 @@ export async function validateMacOSPreviewApp(appPath) {
     );
   }
   const updaterMetadata = normalizeMacOSUpdaterMetadata({
+    architecture,
     appcastURL: plist.SUFeedURL,
     publicEdKey: plist.SUPublicEDKey,
   });
@@ -2878,7 +3275,11 @@ export async function validateMacOSPreviewApp(appPath) {
       "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN",
     );
   }
-  assertMacOSPreviewAppcastBoundary(updaterMetadata.appcastURL);
+  assertMacOSPreviewAppcastBoundary(updaterMetadata.appcastURL, architecture);
+  await assertMacOSBundleArchitecture(selected, {
+    architecture, updaterEnabled: true,
+    helperRequired: manifest.runtime?.keychainMigrationHelper !== undefined,
+  });
   const frameworkPath = join(
     selected,
     ...SPARKLE_FRAMEWORK_PREFIX.split("/"),
@@ -2983,8 +3384,14 @@ export async function validateMacOSPreviewApp(appPath) {
     );
   }
   run(CODESIGN_PATH, ["--verify", "--deep", "--strict", selected]);
+  if (plist.LSMinimumSystemVersion !== "14.0"
+      || manifest.application.minimumMacOSVersion !== plist.LSMinimumSystemVersion) {
+    fail("Preview minimum macOS version does not match its platform contract", "MACOS_MINIMUM_OS_MISMATCH");
+  }
   return Object.freeze({
     appPath: selected,
+    architecture,
+    minimumMacos: plist.LSMinimumSystemVersion,
     bundleIdentifier: plist.CFBundleIdentifier,
     bundleVersion: plist.CFBundleVersion,
     channel: DISTRIBUTION_CHANNEL_PREVIEW,
@@ -3138,7 +3545,15 @@ export async function assertMacOSExternalBuildOutputIsFresh(output) {
   );
 }
 
-export async function installMacOSExternalBuildOutput(stagedApp, output) {
+export async function installMacOSExternalBuildOutput(stagedApp, output, {
+  finderMetadata = null,
+} = {}) {
+  // Validate and apply Finder metadata while the bundle is still isolated.
+  // If SetFile is unavailable or rejects the staged bundle, no final output
+  // path has been claimed yet.
+  if (finderMetadata !== null) {
+    setMacOSBundleFinderMetadata(stagedApp, finderMetadata);
+  }
   try {
     // Claim the final bundle path without replacement. If an output appears
     // after the pre-build check, mkdir fails and the existing target remains.
@@ -3152,8 +3567,34 @@ export async function installMacOSExternalBuildOutput(stagedApp, output) {
     }
     throw error;
   }
-  for (const entry of await readdir(stagedApp)) {
-    await rename(join(stagedApp, entry), join(output, entry));
+  try {
+    // mkdir above claims the path; set its root metadata before moving any
+    // payload entries so a metadata failure cannot expose a final bundle.
+    if (finderMetadata !== null) {
+      setMacOSBundleFinderMetadata(output, finderMetadata);
+    }
+    for (const entry of await readdir(stagedApp)) {
+      await rename(join(stagedApp, entry), join(output, entry));
+    }
+    if (finderMetadata !== null) {
+      // Moving entries updates the claimed directory's mtime. Restore only
+      // that root field after the move; the source-bound SetFile preflight
+      // above already established the Finder birth date before installation.
+      const modificationTimeSeconds = finderMetadata.modificationTimeSeconds
+        ?? finderMetadata.birthTimeSeconds;
+      await utimes(
+        output,
+        modificationTimeSeconds,
+        modificationTimeSeconds,
+      );
+    }
+  } catch (error) {
+    try {
+      await rm(output, { recursive: true, force: false });
+    } catch (cleanupError) {
+      error.message = `${error.message}; failed to remove incomplete external output: ${cleanupError.message}`;
+    }
+    throw error;
   }
 }
 
@@ -3219,6 +3660,9 @@ async function prepareOutput(output, {
 
 export function parseMacOSBuildArguments(argv, environment = process.env) {
   let output = null;
+  let architecture = PINNED_NODE_ARCHITECTURE;
+  let architectureSeen = false;
+  let nodeRuntime = null;
   let centralOrigin = null;
   let centralOriginSeen = false;
   let allowLoopbackCentralOrigin = false;
@@ -3242,6 +3686,22 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         fail("--output must be provided exactly once with a value");
       }
       output = resolve(argv[++index] ?? "");
+    } else if (argument === "--architecture") {
+      if (architectureSeen || index + 1 >= argv.length) {
+        fail("--architecture must be provided at most once with a value");
+      }
+      architectureSeen = true;
+      architecture = normalizeMacOSBuildArchitecture(argv[++index]);
+    } else if (argument === "--node-runtime") {
+      if (nodeRuntime !== null || index + 1 >= argv.length) {
+        fail("--node-runtime must be provided at most once with a value");
+      }
+      nodeRuntime = argv[++index];
+      if (nodeRuntime.length === 0 || nodeRuntime.startsWith("--")
+          || nodeRuntime.includes("\0")) {
+        fail("--node-runtime requires a file path", "MACOS_NODE_RUNTIME_INPUT_INVALID");
+      }
+      nodeRuntime = resolve(nodeRuntime);
     } else if (argument === "--central-origin") {
       if (centralOriginSeen || index + 1 >= argv.length) {
         fail("--central-origin must be provided at most once with a value");
@@ -3317,6 +3777,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
   if (validatePreview) {
     if (appPath === null
         || output !== null
+        || nodeRuntime !== null
         || centralOriginSeen
         || allowLoopbackCentralOrigin
         || externalDistribution
@@ -3333,8 +3794,11 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         "MACOS_PREVIEW_VALIDATION_ARGUMENTS_INVALID",
       );
     }
-    return { appPath, validatePreview };
+    return { appPath, validatePreview, ...(architectureSeen ? { architecture } : {}) };
   }
+  assertMacOSBuildArchitectureConfiguration({
+    architecture, nodeRuntime, externalDistribution, previewDistribution,
+  });
   if (appPath !== null) {
     fail("--app is only valid with --validate-preview");
   }
@@ -3354,7 +3818,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
     );
   }
   if (externalDistribution) {
-    resolveOperationalReleaseChannel(releaseChannel);
+    resolveOperationalReleaseChannel(releaseChannel, architecture);
     fail(
       "External distribution is only available through the validated release-macos-app programmatic path",
       "MACOS_EXTERNAL_BUILD_RELEASE_CORE_REQUIRED",
@@ -3368,7 +3832,7 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         "MACOS_PREVIEW_OUTPUT_FORBIDDEN",
       );
     }
-    output = DEFAULT_PREVIEW_OUTPUT;
+    output = join(previewStagingRootForArchitecture(architecture), PREVIEW_PRODUCT_BRAND.bundleName);
     centralOrigin = centralOrigin
       ?? environment.USAGE_MONITOR_PREVIEW_CENTRAL_ORIGIN
       ?? MACOS_PREVIEW_PUBLIC_CONFIGURATION.centralOrigin;
@@ -3378,7 +3842,9 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
       ?? resolve(environmentFramework ?? DEFAULT_PREVIEW_FRAMEWORK);
     sparkleAppcastURL = sparkleAppcastURL
       ?? environment.USAGE_MONITOR_PREVIEW_SPARKLE_APPCAST_URL
-      ?? MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparkleAppcastURL;
+      ?? (architecture === "x64"
+        ? new URL("/preview/intel/appcast.xml", MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparkleAppcastURL).href
+        : MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparkleAppcastURL);
     sparklePublicEdKey = sparklePublicEdKey
       ?? environment.USAGE_MONITOR_PREVIEW_SPARKLE_PUBLIC_ED_KEY
       ?? MACOS_PREVIEW_PUBLIC_CONFIGURATION.sparklePublicEdKey;
@@ -3388,11 +3854,13 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
         "MACOS_PREVIEW_STABLE_FEED_FORBIDDEN",
       );
     }
-    assertMacOSPreviewAppcastBoundary(sparkleAppcastURL);
+    assertMacOSPreviewAppcastBoundary(sparkleAppcastURL, architecture);
   }
   if (!output) fail("--output is required");
   return {
     output,
+    architecture,
+    nodeRuntime,
     centralOrigin,
     allowLoopbackCentralOrigin,
     externalDistribution,
@@ -3410,6 +3878,8 @@ export function parseMacOSBuildArguments(argv, environment = process.env) {
 }
 
 async function buildApplication(stageApp, centralService, {
+  architecture,
+  runtimeInput,
   bundleVersion,
   buildProfile,
   distribution,
@@ -3422,21 +3892,25 @@ async function buildApplication(stageApp, centralService, {
 }) {
   const contents = join(stageApp, "Contents");
   const executables = join(contents, "MacOS");
+  const helpers = join(contents, "Helpers");
   const resources = join(contents, "Resources");
   const appRoot = join(resources, "app");
   await mkdir(executables, { recursive: true, mode: 0o755 });
+  await mkdir(helpers, { recursive: true, mode: 0o755 });
   await mkdir(appRoot, { recursive: true, mode: 0o755 });
 
   const [
     graph,
     webModules,
     swiftSources,
+    keychainMigrationHelperSources,
     localizationResources,
     workspaceRuntimePackages,
   ] = await Promise.all([
     collectMacOSRuntimeGraph(),
     collectVerifiedMacOSWebModuleGraph(),
     collectMacOSSwiftSources(),
+    collectMacOSKeychainMigrationHelperSources(),
     collectMacOSLocalizationResources(),
     captureMacOSWorkspaceRuntimePackages(),
   ]);
@@ -3457,14 +3931,21 @@ async function buildApplication(stageApp, centralService, {
     }),
   );
   await writeGeneratedFile(join(contents, "PkgInfo"), "APPL????");
-  await compileLauncher(
+  await compileNativeExecutable(
     join(executables, productBrand.executableName),
     updater,
     swiftSources,
-    { buildProfile },
+    { architecture, buildProfile },
   );
-  await copyPinnedSparkleFramework(contents, updater);
-  const node = await copyPinnedNode(resources);
+  await compileNativeExecutable(
+    join(stageApp, ...MACOS_KEYCHAIN_MIGRATION_HELPER.executable.split("/")),
+    { enabled: false },
+    keychainMigrationHelperSources,
+    { architecture, buildProfile, migrationHelper: true },
+  );
+  await copyPinnedSparkleFramework(contents, updater, architecture);
+  const node = await copyPinnedNode(resources, runtimeInput);
+  await assertMacOSBundleArchitecture(stageApp, { architecture, updaterEnabled: updater.enabled });
   await stageMacOSLocalizationResources(contents, appRoot, localizationResources);
   await copyFirstPartyRuntime(appRoot, graph, runtimeAssets, webModules);
   const dependencies = await copyRuntimeDependencies(
@@ -3485,6 +3966,7 @@ async function buildApplication(stageApp, centralService, {
   // Record a signature-independent digest for the launcher. Pre-signing makes
   // `codesign --remove-signature` canonical both here and after the outer app
   // signature is regenerated for Developer ID distribution.
+  preSignKeychainMigrationHelperForInventory(stageApp);
   if (updater.enabled) {
     signApplicationBundle(stageApp);
   } else {
@@ -3561,6 +4043,7 @@ async function buildApplication(stageApp, centralService, {
         account: productBrand.keychainAccount,
         namespace: productBrand.keychainNamespace,
       },
+      keychainMigrationHelper: MACOS_KEYCHAIN_MIGRATION_HELPER,
       node,
       stateRoot:
         `~/Library/Application Support/${productBrand.stateDirectoryName}`,
@@ -3581,6 +4064,7 @@ async function buildApplication(stageApp, centralService, {
         graph,
         runtimeAssets,
         swiftSources,
+        keychainMigrationHelperSources,
         localizationResources,
         iconAssets,
         updater,
@@ -3588,6 +4072,8 @@ async function buildApplication(stageApp, centralService, {
         workspaceRuntimePackages,
       }),
       firstPartyFiles: graph.relativeFiles,
+      swiftSources: swiftSources.relativeFiles,
+      keychainMigrationHelperSources: keychainMigrationHelperSources.relativeFiles,
       localizationResources: localizationResources.relativeFiles.map((path) =>
         `apps/macos/Resources/${path}`),
       staticAssets: runtimeAssets,
@@ -3598,6 +4084,7 @@ async function buildApplication(stageApp, centralService, {
     dependencies,
     payload: inventory,
   };
+  assertMacOSKeychainMigrationManifest(manifest);
   const serialized = stableJson(manifest);
   // The reviewed central origin is a deliberately configured public value and
   // may legitimately contain the account name of its host (a workers.dev
@@ -3654,13 +4141,15 @@ async function assertCurrentExportCompatibilityManifest() {
 
 export async function buildMacOSApp({
   output,
+  architecture = PINNED_NODE_ARCHITECTURE,
+  nodeRuntime = null,
   centralOrigin = null,
   allowLoopbackCentralOrigin = false,
   externalDistribution = false,
   previewDistribution = false,
   releaseChannel = STABLE_RELEASE_CHANNEL,
   replacePreviewOutput = false,
-  previewStagingRoot = DEFAULT_PREVIEW_STAGING_ROOT,
+  previewStagingRoot = null,
   bundleVersion = BUNDLE_VERSION,
   buildProfile = MACOS_BUILD_PROFILE_RELEASE,
   sparkleFramework = null,
@@ -3669,6 +4158,10 @@ export async function buildMacOSApp({
   releaseSource = null,
   releaseAuthorization = null,
 }) {
+  const selectedArchitecture = assertMacOSBuildArchitectureConfiguration({
+    architecture, nodeRuntime, externalDistribution, previewDistribution,
+  });
+  previewStagingRoot ??= previewStagingRootForArchitecture(selectedArchitecture);
   const selectedBuildProfile = normalizeMacOSBuildProfile(buildProfile);
   await assertCurrentExportCompatibilityManifest();
   if (externalDistribution && previewDistribution) {
@@ -3686,7 +4179,7 @@ export async function buildMacOSApp({
     );
   }
   const selectedReleaseChannel = externalDistribution
-    ? resolveOperationalReleaseChannel(releaseChannel)
+    ? resolveOperationalReleaseChannel(releaseChannel, selectedArchitecture)
     : null;
   if (externalDistribution
       && releaseAuthorization !== MACOS_RELEASE_BUILD_AUTHORIZATION) {
@@ -3753,9 +4246,10 @@ export async function buildMacOSApp({
     );
   }
   if (distribution.previewDistribution) {
-    assertMacOSPreviewAppcastBoundary(sparkleAppcastURL);
+    assertMacOSPreviewAppcastBoundary(sparkleAppcastURL, selectedArchitecture);
   }
   const updater = await normalizeMacOSUpdaterConfiguration({
+    architecture: selectedArchitecture,
     appcastURL: selectedReleaseChannel?.sparkle.appcastURL
       ?? sparkleAppcastURL,
     externalDistribution: distribution.externalDistribution,
@@ -3771,7 +4265,7 @@ export async function buildMacOSApp({
     );
   }
   if (distribution.previewDistribution) {
-    assertMacOSPreviewAppcastBoundary(updater.appcastURL);
+    assertMacOSPreviewAppcastBoundary(updater.appcastURL, selectedArchitecture);
   }
   const selectedPublicEdKeySha256 =
     selectedReleaseChannel?.sparkle.publicEdKeySha256 ?? null;
@@ -3789,6 +4283,13 @@ export async function buildMacOSApp({
     })
     : resolve(output);
   assertBuildPlatform();
+  const runtimeInput = await validateMacOSNodeRuntimeInput({
+    architecture: selectedArchitecture,
+    nodeRuntime,
+  });
+  const releaseFinderTimestamp = externalDistribution
+    ? readMacOSReleaseSourceTimestamp(sealedReleaseSource)
+    : null;
   const iconAssets = await loadIconAssets({
     required: distribution.externalDistribution || distribution.previewDistribution,
   });
@@ -3806,6 +4307,8 @@ export async function buildMacOSApp({
   const stagedApp = join(temporaryRoot, productBrand.bundleName);
   try {
     const manifest = await buildApplication(stagedApp, centralService, {
+      architecture: selectedArchitecture,
+      runtimeInput,
       bundleVersion: selectedBundleVersion,
       buildProfile: selectedBuildProfile,
       distribution,
@@ -3819,7 +4322,11 @@ export async function buildMacOSApp({
     });
     signApplicationBundle(stagedApp);
     if (externalDistribution) {
-      await installMacOSExternalBuildOutput(stagedApp, selectedOutput);
+      await installMacOSExternalBuildOutput(stagedApp, selectedOutput, {
+        finderMetadata: {
+          birthTimeSeconds: releaseFinderTimestamp,
+        },
+      });
     } else {
       let legacyPreviewArchive = null;
       if (await verifyExistingBuildTarget(selectedOutput, productBrand)) {
@@ -3831,7 +4338,7 @@ export async function buildMacOSApp({
             );
           }
           try {
-            await validateMacOSPreviewApp(selectedOutput);
+            await validateMacOSPreviewApp(selectedOutput, { architecture: selectedArchitecture });
           } catch (error) {
             const legacyManifest = await readReplaceableLegacyPreviewManifest(
               selectedOutput,
@@ -3873,6 +4380,7 @@ export async function buildMacOSApp({
         manifest.release.externalDistributionRequested,
       updaterEnabled: manifest.release.updater.enabled,
       buildProfile: selectedBuildProfile,
+      architecture: manifest.runtime.node.architecture,
     });
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
@@ -3886,6 +4394,8 @@ export async function buildMacOSApp({
  * caller having already performed the checks.
  */
 async function readMacOSReleaseBuildPreflight({
+  architecture = PINNED_NODE_ARCHITECTURE,
+  nodeRuntime = null,
   environment = process.env,
   previousStableManifestPath = null,
   stableBootstrap = false,
@@ -3896,12 +4406,18 @@ async function readMacOSReleaseBuildPreflight({
   sparkleAppcastURL,
   sparklePublicEdKey,
 }) {
+  // Validate explicit target/runtime selection before release preflights.
+  assertMacOSBuildArchitectureConfiguration({
+    architecture, nodeRuntime, externalDistribution: true,
+  });
   const releaseCore = await import("./macos-release-core.js");
   const buildConfiguration = releaseCore.readMacOSReleaseBuildConfiguration(
     environment,
     releaseChannel,
+    { architecture },
   );
   const updater = await normalizeMacOSUpdaterConfiguration({
+    architecture,
     appcastURL: buildConfiguration.sparkleAppcastURL,
     externalDistribution: true,
     frameworkPath: buildConfiguration.sparkleFramework,
@@ -3911,6 +4427,7 @@ async function readMacOSReleaseBuildPreflight({
     ? null
     : await releaseCore.readStableReleaseManifest(previousStableManifestPath);
   releaseCore.assertStableSparkleKeyContinuity({
+    architecture,
     candidateBundleVersion: buildConfiguration.bundleVersion,
     candidatePublicEdKeySha256: sha256(
       Buffer.from(updater.publicEdKey, "base64"),
@@ -3959,6 +4476,7 @@ async function assertMacOSReleaseBuildPreflight(options) {
     candidateAppPath,
     {
       channel: releaseChannel,
+      architecture: options.architecture ?? "arm64",
       requireExternalDistribution: true,
     },
   );
@@ -4011,6 +4529,8 @@ async function main(argv) {
   const {
     appPath,
     output,
+    architecture,
+    nodeRuntime,
     centralOrigin,
     allowLoopbackCentralOrigin,
     externalDistribution,
@@ -4025,7 +4545,7 @@ async function main(argv) {
     validatePreview,
   } = parseMacOSBuildArguments(argv);
   if (validatePreview) {
-    const result = await validateMacOSPreviewApp(appPath);
+    const result = await validateMacOSPreviewApp(appPath, { architecture });
     console.log("Preview validation: passed");
     console.log(`Bundle: ${result.bundleIdentifier}`);
     console.log(`Bundle version: ${result.bundleVersion}`);
@@ -4035,6 +4555,8 @@ async function main(argv) {
   }
   const result = await buildMacOSApp({
     output,
+    architecture,
+    nodeRuntime,
     centralOrigin,
     allowLoopbackCentralOrigin,
     externalDistribution,
@@ -4054,6 +4576,7 @@ async function main(argv) {
   console.log(`Source SHA-256: ${result.sourceSha256}`);
   console.log(`Payload bytes: ${result.totalBytes}`);
   console.log(`Compiler profile: ${result.buildProfile}`);
+  console.log(`Target architecture: ${result.architecture}`);
   console.log(`Channel: ${result.channel}`);
   console.log(`Central service: ${result.centralServiceMode}`);
   console.log(

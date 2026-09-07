@@ -13,19 +13,16 @@ import { dirname, join, resolve } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parse, printParseErrorCode } from "jsonc-parser";
-import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
+import {
+  ATTRIBUTION_SCHEMA_OBJECTS,
+  ATTRIBUTION_SCHEMA_PROBE_SQL,
+  attributionSchemaComplete,
+  EXPECTED_STAGING_MIGRATIONS,
+} from "./staging-readiness-lib.mjs";
 
 export const RELEASE_PREFLIGHT_SCHEMA_VERSION =
   "usage-monitor-worker-release-preflight-v0.1";
-export const REQUIRED_PRIMARY_MIGRATIONS = Object.freeze([
-  "0023_community_aggregate_safety.sql",
-  "0024_apple_signin_nonce_binding.sql",
-  "0025_device_lifecycle.sql",
-  "0026_signin_start_admission.sql",
-  "0027_identity_reenrollment_cooldown_guard.sql",
-  "0028_identity_link_secret_configuration.sql",
-  "0029_sparkle_appcast_guard_nonces.sql",
-]);
+export const REQUIRED_PRIMARY_MIGRATIONS = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
 
 const DATABASES = Object.freeze([
   Object.freeze({ binding: "USAGE_MONITOR_DB", migrationsDir: "migrations" }),
@@ -76,6 +73,7 @@ export const REQUIRED_SCHEMA_OBJECTS = Object.freeze([
   ["trigger", "community_aggregate_exclusion_changed"],
   ["trigger", "community_aggregate_exclusion_no_delete"],
   ["trigger", "participants_identity_reenrollment_cooldown_guard"],
+  ...ATTRIBUTION_SCHEMA_OBJECTS,
 ]);
 
 export const REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS = Object.freeze([
@@ -545,7 +543,7 @@ function baseReceipt(configChecks) {
     },
     blockers: [...configChecks.blockers],
     evidence: {
-      migrationWindow: "0023-0029",
+      migrationWindow: `${REQUIRED_PRIMARY_MIGRATIONS[0].slice(0, 4)}-${REQUIRED_PRIMARY_MIGRATIONS.at(-1).slice(0, 4)}`,
       database: "USAGE_MONITOR_DB",
       rollbackRestoreEquivalent: "isolated_cleanup",
       transactionAssumption: "migration-runner-owns-transaction-boundary",
@@ -700,7 +698,7 @@ export async function runReleasePreflight({
         stateDirectory,
         binding: "USAGE_MONITOR_DB",
         spawn,
-        sql: "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index', 'trigger') ORDER BY type, name",
+        sql: "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'index', 'trigger', 'view') ORDER BY type, name",
       });
       const objectNames = schemaObjectNames(objects);
       const objectsPresent = REQUIRED_SCHEMA_OBJECTS.every(([type, name]) =>
@@ -719,8 +717,19 @@ export async function runReleasePreflight({
           return hasColumns(rows, columns);
         }),
       );
+      const attributionRows = runQuery({
+        wrangler,
+        workerDirectory,
+        configPath,
+        stateDirectory,
+        binding: "USAGE_MONITOR_DB",
+        spawn,
+        sql: ATTRIBUTION_SCHEMA_PROBE_SQL,
+      });
       receipt.checks.requiredSchemaPresent = objectsPresent
-        && columnsPresent.every(Boolean);
+        && columnsPresent.every(Boolean)
+        && Array.isArray(attributionRows) && attributionRows.length === 1
+        && attributionSchemaComplete(attributionRows[0]);
       if (!receipt.checks.requiredSchemaPresent) {
         receipt.blockers.push("LOCAL_SCHEMA_INCOMPLETE");
       }

@@ -1,0 +1,107 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://tibotattle.com/schemas/telemetry-contribution-v1.1/day-manifest.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "day",
+    "parserVersion",
+    "consent",
+    "chunks",
+    "excluded",
+    "manifestDigest"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "telemetry-day-manifest-v1.1"
+    },
+    "day": {
+      "type": "string",
+      "format": "date",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+    },
+    "parserVersion": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]{1,64}$"
+    },
+    "consent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "telemetrySchemaVersion",
+        "fieldDictionaryVersion",
+        "privacyContractVersion"
+      ],
+      "properties": {
+        "telemetrySchemaVersion": {
+          "const": "telemetry-contribution-v1.1"
+        },
+        "fieldDictionaryVersion": {
+          "const": "telemetry-v1.1-registry-2026-08-31.1"
+        },
+        "privacyContractVersion": {
+          "const": "ongoing-privacy-safe-telemetry-v1.1"
+        }
+      }
+    },
+    "chunks": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "chunkId",
+          "chunkDigest",
+          "recordCount"
+        ],
+        "properties": {
+          "chunkId": {
+            "type": "string",
+            "pattern": "^(quota|session|usage):\\d{4}-\\d{2}-\\d{2}:(0|[1-9]\\d{0,4})$"
+          },
+          "chunkDigest": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "recordCount": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          }
+        }
+      }
+    },
+    "excluded": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "quota",
+        "session",
+        "usage"
+      ],
+      "properties": {
+        "quota": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000
+        },
+        "session": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000
+        },
+        "usage": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1000000000
+        }
+      }
+    },
+    "manifestDigest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    }
+  }
+}

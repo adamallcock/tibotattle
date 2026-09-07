@@ -7,6 +7,61 @@ import WebKit
 import Sparkle
 #endif
 
+private enum MacOSUpdaterFeedPolicy {
+    #if arch(x86_64)
+    static let architecture = "x64"
+    static let stableURL = "https://updates.tibotattle.com/intel/appcast.xml"
+    static let stablePath = "/intel/appcast.xml"
+    static let dogfoodURL = "https://dogfood-updates.tibotattle.com/internal-dogfood/intel/appcast.xml"
+    static let dogfoodPath = "/internal-dogfood/intel/appcast.xml"
+    static let previewPath = "/preview/intel/appcast.xml"
+    #else
+    static let architecture = "arm64"
+    static let stableURL = "https://updates.tibotattle.com/appcast.xml"
+    static let stablePath = "/appcast.xml"
+    static let dogfoodURL = "https://dogfood-updates.tibotattle.com/internal-dogfood/appcast.xml"
+    static let dogfoodPath = "/internal-dogfood/appcast.xml"
+    static let previewPath = "/preview/appcast.xml"
+    #endif
+
+    static func accepts(_ appcast: String, expectedURL: String?, requiredPath: String) -> Bool {
+        guard let components = URLComponents(string: appcast),
+              components.scheme?.lowercased() == "https",
+              let host = components.host?.lowercased(),
+              !host.isEmpty,
+              !["127.0.0.1", "localhost", "::1"].contains(host),
+              components.user == nil,
+              components.password == nil,
+              components.percentEncodedPath == requiredPath,
+              components.query == nil,
+              components.fragment == nil,
+              components.url?.absoluteString == appcast,
+              expectedURL == nil || appcast == expectedURL
+        else { return false }
+        return true
+    }
+
+    static func runContractSmokeTest() -> Int32 {
+        let cases: [(String, String, String?)] = [
+            (stableURL, stablePath, stableURL),
+            (dogfoodURL, dogfoodPath, dogfoodURL),
+            ("https://preview.example.test" + previewPath, previewPath, nil),
+        ]
+        for (url, path, expected) in cases {
+            let otherPath = architecture == "x64"
+                ? path.replacingOccurrences(of: "/intel/", with: "/")
+                : path.replacingOccurrences(of: "/appcast.xml", with: "/intel/appcast.xml")
+            let otherURL = url.replacingOccurrences(of: path, with: otherPath)
+            guard accepts(url, expectedURL: expected, requiredPath: path),
+                  !accepts(otherURL, expectedURL: expected, requiredPath: path),
+                  !accepts(url + "?architecture=other", expectedURL: expected, requiredPath: path)
+            else { return 1 }
+        }
+        print("USAGE_MONITOR_MACOS_UPDATER_ARCHITECTURE_CONTRACT architecture=\(architecture) cross_architecture=rejected")
+        return 0
+    }
+}
+
 private enum BundledProduct {
     private static func requiredString(_ key: String) -> String {
         guard let value = Bundle.main.object(
@@ -164,6 +219,7 @@ private enum BundledProduct {
         }
         validateSemanticOpenRegistration()
 
+
         switch (
             bundleIdentifier,
             buildChannel,
@@ -184,9 +240,8 @@ private enum BundledProduct {
             false
         ):
             validateDistributionUpdaterPolicy(
-                expectedAppcastURL:
-                    "https://updates.tibotattle.com/appcast.xml",
-                requiredAppcastPath: "/appcast.xml",
+                expectedAppcastURL: MacOSUpdaterFeedPolicy.stableURL,
+                requiredAppcastPath: MacOSUpdaterFeedPolicy.stablePath,
                 automaticUpdates: true
             )
         case (
@@ -196,10 +251,8 @@ private enum BundledProduct {
             false
         ):
             validateDistributionUpdaterPolicy(
-                expectedAppcastURL:
-                    "https://dogfood-updates.tibotattle.com/"
-                    + "internal-dogfood/appcast.xml",
-                requiredAppcastPath: "/internal-dogfood/appcast.xml",
+                expectedAppcastURL: MacOSUpdaterFeedPolicy.dogfoodURL,
+                requiredAppcastPath: MacOSUpdaterFeedPolicy.dogfoodPath,
                 automaticUpdates: true
             )
         case (
@@ -213,7 +266,7 @@ private enum BundledProduct {
             // manual-only behavior remain an invariant of the bundle ID.
             validateDistributionUpdaterPolicy(
                 expectedAppcastURL: nil,
-                requiredAppcastPath: "/preview/appcast.xml",
+                requiredAppcastPath: MacOSUpdaterFeedPolicy.previewPath,
                 automaticUpdates: false
             )
         default:
@@ -278,19 +331,11 @@ private enum BundledProduct {
         }
 
         let appcast = requiredString("SUFeedURL")
-        guard let components = URLComponents(string: appcast),
-              components.scheme?.lowercased() == "https",
-              let host = components.host?.lowercased(),
-              !host.isEmpty,
-              !["127.0.0.1", "localhost", "::1"].contains(host),
-              components.user == nil,
-              components.password == nil,
-              components.percentEncodedPath == requiredAppcastPath,
-              components.query == nil,
-              components.fragment == nil,
-              components.url?.absoluteString == appcast,
-              expectedAppcastURL == nil || appcast == expectedAppcastURL
-        else {
+        guard MacOSUpdaterFeedPolicy.accepts(
+            appcast,
+            expectedURL: expectedAppcastURL,
+            requiredPath: requiredAppcastPath
+        ) else {
             fatalError("Invalid bundled runtime identity")
         }
 
@@ -683,6 +728,148 @@ private struct NativeForegroundRefreshSchedule: Equatable {
                 in: defaults
             )
         )
+    }
+}
+
+/// Detailed accounting is deliberately attempt-based and rate-limited across
+/// launches. Recording before a request starts prevents a failed, cancelled,
+/// or interrupted pass from becoming a tight automatic retry loop. A missing
+/// or malformed value is seeded with `now`, making the first launch pass quick.
+enum NativeDetailedRefreshCadence {
+    static let defaultsKey = "tibotattle.detailed-refresh-last-attempt.v1"
+    static let reservationKey = "tibotattle.detailed-refresh-reservation.v1"
+    static let minimumInterval: TimeInterval = 60 * 60
+
+    struct Reservation {
+        let stampedAt: Double
+        let token: String
+        let previousAttempt: Double?
+        let previousToken: String?
+    }
+
+    static func automaticMode(
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) -> LocalAnalysisMode {
+        let nowInterval = now.timeIntervalSince1970
+        guard nowInterval.isFinite, nowInterval >= 0 else { return .quick }
+        guard let stored = defaults.object(forKey: defaultsKey) as? NSNumber,
+              stored.doubleValue.isFinite,
+              stored.doubleValue >= 0,
+              stored.doubleValue <= nowInterval
+        else {
+            defaults.set(nowInterval, forKey: defaultsKey)
+            return .quick
+        }
+        guard nowInterval - stored.doubleValue >= minimumInterval else {
+            return .quick
+        }
+        return .detailed
+    }
+
+    static func seedIfMissing(
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) {
+        guard defaults.object(forKey: defaultsKey) == nil else { return }
+        recordDetailedAttempt(now: now, defaults: defaults)
+    }
+
+    @discardableResult
+    static func recordDetailedAttempt(
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) -> Reservation? {
+        let value = now.timeIntervalSince1970
+        guard value.isFinite, value >= 0 else { return nil }
+        let reservation = Reservation(
+            stampedAt: value,
+            token: UUID().uuidString,
+            previousAttempt: (defaults.object(forKey: defaultsKey) as? NSNumber)
+                .map(\.doubleValue),
+            previousToken: defaults.string(forKey: reservationKey)
+        )
+        defaults.set(value, forKey: defaultsKey)
+        defaults.set(reservation.token, forKey: reservationKey)
+        return reservation
+    }
+
+    /// Only a confirmed conflict with a quick run proves that this detailed
+    /// request did no work. Unknown/rejected/interrupted responses retain the
+    /// optimistic stamp. Compare the token as well as time so a later attempt
+    /// at the same timestamp cannot be rolled back by an old callback.
+    static func restoreAfterQuickJoin(
+        _ reservation: Reservation?,
+        attempt: LocalAnalysisAttempt?,
+        defaults: UserDefaults = .standard
+    ) {
+        guard attempt?.mode == .quick, let reservation,
+              defaults.double(forKey: defaultsKey) == reservation.stampedAt,
+              defaults.string(forKey: reservationKey) == reservation.token
+        else { return }
+        if let previous = reservation.previousAttempt {
+            defaults.set(previous, forKey: defaultsKey)
+        } else {
+            defaults.removeObject(forKey: defaultsKey)
+        }
+        if let previousToken = reservation.previousToken {
+            defaults.set(previousToken, forKey: reservationKey)
+        } else {
+            defaults.removeObject(forKey: reservationKey)
+        }
+    }
+
+    /// Every native reader observes the same controller receipt, including
+    /// browser-started runs and terminal failures. Record its actual start
+    /// once, never `now` on every poll and never move a newer attempt backward.
+    static func observe(
+        _ attempt: LocalAnalysisAttempt?,
+        now: Date = Date(),
+        defaults: UserDefaults = .standard
+    ) {
+        guard let attempt, attempt.mode == .detailed else { return }
+        let started = attempt.startedAt.timeIntervalSince1970
+        let current = now.timeIntervalSince1970
+        guard started.isFinite, started >= 0,
+              current.isFinite, started <= current
+        else { return }
+        if let stored = defaults.object(forKey: defaultsKey) as? NSNumber,
+           stored.doubleValue.isFinite, stored.doubleValue >= started {
+            return
+        }
+        recordDetailedAttempt(now: attempt.startedAt, defaults: defaults)
+    }
+}
+
+/// A GET issued before a POST reply may still describe the previous idle
+/// controller. Its terminal result cannot settle the new request, even if
+/// that GET callback arrives after the POST's 202 callback.
+private struct NativeRefreshStartFence {
+    struct Observation {
+        let generation: UInt64
+        let startResolved: Bool
+    }
+
+    private var generation: UInt64 = 0
+    private var awaitingResponse = false
+
+    mutating func begin() {
+        generation &+= 1
+        awaitingResponse = true
+    }
+
+    mutating func resolve() {
+        generation &+= 1
+        awaitingResponse = false
+    }
+
+    func observation() -> Observation {
+        Observation(generation: generation, startResolved: !awaitingResponse)
+    }
+
+    func allowsTerminal(_ observation: Observation) -> Bool {
+        !awaitingResponse && observation.startResolved
+            && observation.generation == generation
     }
 }
 
@@ -1960,7 +2147,13 @@ private final class CompanionProcess {
     private var keychainBroker: ContributionDeviceKeychainBroker?
     private var stopCompletions: [() -> Void] = []
     private var stopped = false
+    private var terminationInProgress = false
+    private var terminationComplete = false
+    // A caller may detach the companion immediately after requesting stop.
+    // Keep it alive through OS exit and the broker's asynchronous writer barrier.
+    private var stopRetention: CompanionProcess?
     private let nodeRuntimeModeOverride: BundledNodeRuntimeMode?
+    private let onMigrationStatus: (KeychainMigrationStatus) -> Void
     private let onExit: (Bool, Bool) -> Void
     private let onReady: (URL) -> Void
 
@@ -1968,12 +2161,14 @@ private final class CompanionProcess {
         centralService: CentralServiceConfiguration?,
         codexHome: URL,
         nodeRuntimeModeOverride: BundledNodeRuntimeMode? = nil,
+        onMigrationStatus: @escaping (KeychainMigrationStatus) -> Void = { _ in },
         onReady: @escaping (URL) -> Void,
         onExit: @escaping (Bool, Bool) -> Void
     ) {
         self.centralService = centralService
         self.codexHome = codexHome
         self.nodeRuntimeModeOverride = nodeRuntimeModeOverride
+        self.onMigrationStatus = onMigrationStatus
         self.onReady = onReady
         self.onExit = onExit
     }
@@ -1991,7 +2186,44 @@ private final class CompanionProcess {
         return process.processIdentifier
     }
 
-    func launch() throws {
+    /// Only the native confirmation action reaches this seam. There is no
+    /// matching companion message, URL, or web-view operation for approval.
+    func approvePendingMigrations(completion: @escaping (Bool) -> Void) {
+        lock.lock()
+        let broker = keychainBroker
+        let canApprove = !stopped && process?.isRunning == true
+        lock.unlock()
+        guard canApprove, let broker else {
+            DispatchQueue.main.async { completion(false) }
+            return
+        }
+        broker.approvePendingMigrations(completion: completion)
+    }
+
+    func launch(
+        makeBroker: () throws -> ContributionDeviceKeychainBroker = {
+            try ContributionDeviceKeychainBroker(
+                namespace: BundledProduct.keychainNamespace,
+                account: BundledProduct.keychainAccount
+            )
+        }
+    ) throws {
+        // Require the private channel before resource access or child creation.
+        // The factory seam lets the native contract probe reject setup failures
+        // without exhausting descriptors or touching real credentials.
+        let broker: ContributionDeviceKeychainBroker
+        do {
+            broker = try makeBroker()
+        } catch {
+            throw LauncherError.companionLaunch("keychain")
+        }
+        var brokerOwnedByCompanion = false
+        defer {
+            if !brokerOwnedByCompanion { broker.shutdown() }
+        }
+        guard let childEndpoint = broker.childEndpoint else {
+            throw LauncherError.companionLaunch("keychain")
+        }
         let resources = try CompanionResources.bundled()
         let stateRoot = try ownerOnlyStateRoot()
         let homeDirectory = try currentUserHomeDirectory()
@@ -2004,20 +2236,11 @@ private final class CompanionProcess {
             nodeRuntimeModeOverride ?? resources.nodeRuntimeMode
         ).arguments(entrypoint: resources.entrypoint)
         child.currentDirectoryURL = resources.resourceRoot
-        // The companion's standard input is the app's Keychain broker
-        // channel: fresh contribution-device credentials are minted and read
-        // by this signed app, never by the companion's own Keychain access,
-        // which is what raised the first-pairing dialog. The environment
-        // names only the descriptor — the socketpair itself is the
+        // Every native credential operation uses the app's private broker.
+        // The environment names only the descriptor; the socketpair is the
         // authority, so no token or secret crosses argv or the environment.
-        // If the broker cannot be created (descriptor exhaustion), the
-        // companion runs without one and its own explained pairing path
-        // remains the net.
-        let broker = try? ContributionDeviceKeychainBroker(
-            namespace: BundledProduct.keychainNamespace,
-            account: BundledProduct.keychainAccount
-        )
-        child.standardInput = broker?.childEndpoint ?? FileHandle.nullDevice
+        broker.setMigrationStatusObserver(onMigrationStatus)
+        child.standardInput = childEndpoint
         child.standardOutput = standardOutput
         child.standardError = standardError
 
@@ -2036,11 +2259,9 @@ private final class CompanionProcess {
             "USAGE_MONITOR_STATE_ROOT": stateRoot.path,
             "CODEX_HOME": codexHome.path,
         ]
-        if broker?.childEndpoint != nil {
-            environment[
-                ContributionDeviceKeychainBroker.environmentVariable
-            ] = "0"
-        }
+        environment[
+            ContributionDeviceKeychainBroker.environmentVariable
+        ] = "0"
         for name in ["LANG", "LC_ALL", "TMPDIR"] {
             if let value = inherited[name], !value.contains("\0") {
                 environment[name] = value
@@ -2071,26 +2292,31 @@ private final class CompanionProcess {
         }
 
         lock.lock()
+        guard !stopped, process == nil, !terminationInProgress, !terminationComplete else {
+            lock.unlock()
+            throw LauncherError.companionLaunch("stopped")
+        }
         process = child
         keychainBroker = broker
-        stopped = false
+        brokerOwnedByCompanion = true
         pendingOutput = ""
         pendingStandardError = ""
         activeInstanceDetected = false
-        lock.unlock()
         do {
+            // Keep stop from observing an assigned but not-yet-started child.
+            // This is process creation only; no shutdown/Keychain wait is on main.
             try child.run()
-        } catch {
-            lock.lock()
-            process = nil
-            keychainBroker = nil
             lock.unlock()
-            broker?.shutdown()
+        } catch {
+            lock.unlock()
+            standardOutput.fileHandleForReading.readabilityHandler = nil
+            standardError.fileHandleForReading.readabilityHandler = nil
+            didTerminate(success: false, notifyExit: false)
             throw LauncherError.companionLaunch("run")
         }
         // The child holds its dup2'd copy; dropping ours is what turns a
         // companion exit into end-of-file on the broker channel.
-        broker?.closeChildEndpoint()
+        broker.closeChildEndpoint()
     }
 
     private func consumeStandardOutput(_ data: Data) {
@@ -2147,34 +2373,83 @@ private final class CompanionProcess {
         lock.unlock()
     }
 
-    private func didTerminate(success: Bool) {
+    private func didTerminate(success: Bool, notifyExit: Bool = true) {
         lock.lock()
+        guard !terminationInProgress, !terminationComplete else {
+            lock.unlock()
+            return
+        }
+        terminationInProgress = true
         process = nil
         let broker = keychainBroker
         keychainBroker = nil
+        let anotherInstanceIsActive = activeInstanceDetected
+        lock.unlock()
+        let finish = { [self] in
+            finishTermination(
+                success: success,
+                notifyExit: notifyExit,
+                anotherInstanceIsActive: anotherInstanceIsActive
+            )
+        }
+        if let broker {
+            broker.shutdown(completion: finish)
+        } else {
+            finish()
+        }
+    }
+
+    private func finishTermination(
+        success: Bool,
+        notifyExit: Bool,
+        anotherInstanceIsActive: Bool
+    ) {
+        lock.lock()
+        guard terminationInProgress, !terminationComplete else {
+            lock.unlock()
+            return
+        }
+        terminationInProgress = false
+        terminationComplete = true
         let completions = stopCompletions
         stopCompletions.removeAll()
         let wasStopped = stopped
-        let anotherInstanceIsActive = activeInstanceDetected
+        stopRetention = nil
         lock.unlock()
-        broker?.shutdown()
         for completion in completions {
             completion()
         }
-        onExit(success && wasStopped, anotherInstanceIsActive)
+        if notifyExit {
+            onExit(success && wasStopped, anotherInstanceIsActive)
+        }
     }
 
     func stop(completion: @escaping () -> Void) {
         lock.lock()
+        let firstStop = !stopped
         stopped = true
-        guard let child = process, child.isRunning else {
+        if terminationComplete {
             lock.unlock()
             completion()
             return
         }
         stopCompletions.append(completion)
-        child.terminate()
+        stopRetention = self
+        guard !terminationInProgress else {
+            lock.unlock()
+            return
+        }
+        guard let child = process else {
+            lock.unlock()
+            didTerminate(success: true, notifyExit: false)
+            return
+        }
+        let shouldTerminate = firstStop && child.isRunning
         lock.unlock()
+        // A stopped child may still have its Foundation termination handler
+        // pending. That handler and the broker barrier own the completions.
+        guard shouldTerminate else { return }
+        child.terminate()
 
         DispatchQueue.global(qos: .utility).asyncAfter(
             deadline: .now() + 2
@@ -2187,6 +2462,110 @@ private final class CompanionProcess {
                 _ = kill(child.processIdentifier, SIGKILL)
             }
         }
+    }
+
+    /// Deterministic pre-spawn failures through the real launch entrypoint.
+    /// A newly created broker has an endpoint; closing that endpoint models
+    /// the other setup failure without exhausting process-wide descriptors.
+    static func verifyKeychainLaunchContract() -> Bool {
+        enum Failure: CaseIterable { case construction, missingEndpoint }
+        for failure in Failure.allCases {
+            var factoryCalls = 0
+            var healthyEndpointObserved = false
+            var readyCalls = 0
+            var exitCalls = 0
+            let companion = CompanionProcess(
+                centralService: nil,
+                codexHome: URL(fileURLWithPath: "/synthetic-home-not-opened"),
+                onReady: { _ in readyCalls += 1 },
+                onExit: { _, _ in exitCalls += 1 }
+            )
+            do {
+                try companion.launch(makeBroker: {
+                    factoryCalls += 1
+                    if failure == .construction {
+                        throw ContributionDeviceKeychainBrokerUnavailable()
+                    }
+                    let broker = try ContributionDeviceKeychainBroker(
+                        namespace: BundledProduct.keychainNamespace,
+                        account: BundledProduct.keychainAccount
+                    )
+                    healthyEndpointObserved = broker.childEndpoint != nil
+                    broker.closeChildEndpoint()
+                    return broker
+                })
+                return false
+            } catch LauncherError.companionLaunch(let reason) {
+                guard reason == "keychain", factoryCalls == 1,
+                      failure == .construction || healthyEndpointObserved,
+                      companion.process == nil, companion.keychainBroker == nil,
+                      !companion.isRunning, companion.processIdentifier == nil,
+                      readyCalls == 0, exitCalls == 0
+                else { return false }
+            } catch {
+                return false
+            }
+            var stoppedCalls = 0
+            companion.stop { stoppedCalls += 1 }
+            companion.stop { stoppedCalls += 1 }
+            guard stoppedCalls == 2, readyCalls == 0, exitCalls == 0 else { return false }
+        }
+        return true
+    }
+
+    /// Memory-only composition probe: use the actual stop and termination
+    /// methods with an injected broker, never launch a companion or reset helper.
+    static func verifyKeychainShutdownContract() -> Bool {
+        enum Phase: CaseIterable { case alreadyAbsent, handlerPending, brokerDraining }
+        for phase in Phase.allCases {
+            let resultLock = NSLock()
+            var callbackCount = 0
+            var exitCount = 0
+            weak var retainedCompanion: CompanionProcess?
+            let passed = ContributionDeviceKeychainBroker.verifyExternalResetOrder { broker, reset in
+                let companion = CompanionProcess(
+                    centralService: nil,
+                    codexHome: URL(fileURLWithPath: "/synthetic-home-not-opened"),
+                    onReady: { _ in },
+                    onExit: { _, _ in
+                        resultLock.lock(); exitCount += 1; resultLock.unlock()
+                    }
+                )
+                retainedCompanion = companion
+                companion.keychainBroker = broker
+                if phase == .handlerPending {
+                    // A non-running Process models the interval before the
+                    // real Foundation termination handler has been delivered.
+                    companion.process = Process()
+                } else if phase == .brokerDraining {
+                    companion.didTerminate(success: true)
+                }
+                companion.stop {
+                    resultLock.lock(); callbackCount += 1; resultLock.unlock()
+                    reset()
+                }
+                companion.stop {
+                    resultLock.lock(); callbackCount += 1; resultLock.unlock()
+                }
+                if phase == .handlerPending { companion.didTerminate(success: true) }
+                // Drop the caller's reference while the broker is paused.
+                // Pending termination must retain it only through the barrier.
+            }
+            resultLock.lock()
+            let completedOnce = callbackCount == 2
+                && exitCount == (phase == .alreadyAbsent ? 0 : 1)
+            resultLock.unlock()
+            guard passed, completedOnce, retainedCompanion == nil else { return false }
+        }
+        let idle = CompanionProcess(
+            centralService: nil,
+            codexHome: URL(fileURLWithPath: "/synthetic-home-not-opened"),
+            onReady: { _ in }, onExit: { _, _ in }
+        )
+        var completedCount = 0
+        idle.stop { completedCount += 1 }
+        idle.stop { completedCount += 1 }
+        return completedCount == 2
     }
 }
 
@@ -2343,6 +2722,71 @@ private final class NativeDashboardWebView: WKWebView {
     }
 }
 
+/// One document's bounded readiness observation. The monotonic clock and
+/// generation are supplied by the host, so delayed JavaScript completions can
+/// never ready or fail a replacement document.
+private struct NativeDashboardReadiness {
+    enum Observation: Equatable {
+        case waiting(TimeInterval)
+        case takingLonger
+        case ready
+        case timedOut
+        case ignored
+    }
+
+    static let slowThreshold: TimeInterval = 20
+    static let hardDeadline: TimeInterval = 120
+    private(set) var generation: UInt64 = 0
+    private var beganAt: TimeInterval?
+    private var delayReported = false
+    private var finished = false
+
+    @discardableResult
+    mutating func invalidate() -> UInt64 {
+        generation &+= 1
+        beganAt = nil
+        delayReported = false
+        finished = false
+        return generation
+    }
+
+    mutating func start(generation expected: UInt64, at now: TimeInterval) -> Bool {
+        guard expected == generation, beganAt == nil, now.isFinite else {
+            return false
+        }
+        beganAt = now
+        return true
+    }
+
+    func isObserving(_ expected: UInt64) -> Bool {
+        expected == generation && beganAt != nil && !finished
+    }
+
+    mutating func observe(
+        generation expected: UInt64,
+        at now: TimeInterval,
+        ready: Bool
+    ) -> Observation {
+        guard isObserving(expected), let beganAt, now.isFinite else {
+            return .ignored
+        }
+        let elapsed = max(0, now - beganAt)
+        if elapsed >= Self.hardDeadline {
+            finished = true
+            return .timedOut
+        }
+        if ready {
+            finished = true
+            return .ready
+        }
+        if elapsed >= Self.slowThreshold, !delayReported {
+            delayReported = true
+            return .takingLonger
+        }
+        return .waiting(elapsed < Self.slowThreshold ? 0.25 : 1)
+    }
+}
+
 /// The dashboard is hosted inside the app, so this web view is the product's
 /// primary surface. It is deliberately the narrowest possible browser: it may
 /// load exactly one origin — the loopback companion this launcher started —
@@ -2358,6 +2802,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     )
     private let onLoaded: () -> Void
     private let onFailure: (LauncherError) -> Void
+    private let onReadinessDelay: () -> Void
     private let onDownloadFailure: () -> Void
     private let openExternally: (URL) -> Void
     private let onNavigation: (String) -> Void
@@ -2370,6 +2815,14 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     private var pendingDownloadDestination: URL?
     private var latestCompletedDownload: URL?
     private var viewportPreparationAttempts = 0
+    private var dashboardReadiness = NativeDashboardReadiness()
+    private var dashboardContentPoll: DispatchWorkItem?
+    private var dashboardContentEvaluationInFlight = false
+    private var activeDashboardNavigation: WKNavigation?
+    private let navigationGenerations = NSMapTable<WKNavigation, NSNumber>(
+        keyOptions: .weakMemory,
+        valueOptions: .strongMemory
+    )
     /// False while the view holds no dashboard, so the blank page loaded on
     /// teardown can never be reported as a dashboard that opened.
     private var hasDashboardTarget = false
@@ -2391,10 +2844,12 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         onNavigation: @escaping (String) -> Void,
         onLanguagePreferenceChange: @escaping (
             TiboTattleLocalization.LanguagePreference
-        ) -> Void
+        ) -> Void,
+        onReadinessDelay: @escaping () -> Void = {}
     ) {
         self.onLoaded = onLoaded
         self.onFailure = onFailure
+        self.onReadinessDelay = onReadinessDelay
         self.onDownloadFailure = onDownloadFailure
         self.openExternally = openExternally
         self.onNavigation = onNavigation
@@ -2601,6 +3056,10 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
     }
 
     func load(_ url: URL) {
+        let generation = invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
+        hasDashboardTarget = false
+        pendingDashboardURL = nil
         guard url.scheme?.lowercased() == "http",
               url.host == loopbackHost,
               let port = url.port
@@ -2612,15 +3071,18 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         hasDashboardTarget = true
         pendingDashboardURL = url
         viewportPreparationAttempts = 0
-        loadWhenViewportIsReady()
+        loadWhenViewportIsReady(generation: generation)
     }
 
     /// WKWebView can commit a document before AppKit has given its split pane a
     /// usable size. On a cold launch that produces a loaded, but white,
     /// dashboard until the user manually resizes the window. Defer the first
     /// request for a few main-loop passes until the embedded viewport exists.
-    private func loadWhenViewportIsReady() {
-        guard hasDashboardTarget, let url = pendingDashboardURL else { return }
+    private func loadWhenViewportIsReady(generation: UInt64) {
+        guard hasDashboardTarget,
+              generation == dashboardReadiness.generation,
+              let url = pendingDashboardURL
+        else { return }
         webView.superview?.layoutSubtreeIfNeeded()
         webView.layoutSubtreeIfNeeded()
         let viewport = webView.bounds.integral
@@ -2628,13 +3090,14 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
             guard viewportPreparationAttempts < 20 else {
                 pendingDashboardURL = nil
                 hasDashboardTarget = false
+                invalidateDashboardContentObservation()
                 onFailure(.dashboardViewportUnavailable)
                 return
             }
             viewportPreparationAttempts += 1
             DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
                 [weak self] in
-                self?.loadWhenViewportIsReady()
+                self?.loadWhenViewportIsReady(generation: generation)
             }
             return
         }
@@ -2642,10 +3105,17 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         refreshDocumentStartScripts()
-        webView.load(request)
+        activeDashboardNavigation = webView.load(request)
+        if let navigation = activeDashboardNavigation {
+            navigationGenerations.setObject(
+                NSNumber(value: generation), forKey: navigation
+            )
+        }
     }
 
     func stop() {
+        invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
         allowedPort = nil
         hasDashboardTarget = false
         // The page this flag described is being discarded, so the flag it set
@@ -2916,24 +3386,42 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         decisionHandler(navigationResponse.canShowMIMEType ? .allow : .download)
     }
 
-    /// How long the document is given to render something before the view is
-    /// declared unavailable, and how often it is asked.
-    ///
-    /// `didFinish` only reports that the *document* finished loading. This
-    /// dashboard then fetches its evidence from the loopback companion and
-    /// renders afterwards, so `#main` is legitimately near-empty at that
-    /// instant. Sampling it once there judged an asynchronous condition at a
-    /// single moment and reported a perfectly working view as broken - which
-    /// is why a right-click Reload failed with
-    /// `UM_MACOS_DASHBOARD_VIEW_UNAVAILABLE` while retrying moments later
-    /// succeeded. The deadline still fails closed: a document that never
-    /// renders is still reported, just not one that is merely slower than a
-    /// single turn of the run loop.
-    private static let dashboardContentDeadline: TimeInterval = 20
-    private static let dashboardContentPollInterval: TimeInterval = 0.25
+    @discardableResult
+    private func invalidateDashboardContentObservation() -> UInt64 {
+        dashboardContentPoll?.cancel()
+        dashboardContentPoll = nil
+        dashboardContentEvaluationInFlight = false
+        return dashboardReadiness.invalidate()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didStartProvisionalNavigation navigation: WKNavigation!
+    ) {
+        guard hasDashboardTarget, let navigation else { return }
+        if let generation = navigationGenerations.object(forKey: navigation) {
+            guard generation.uint64Value == dashboardReadiness.generation else {
+                return
+            }
+        } else {
+            // WebKit's own Reload does not pass through load(_:). It still
+            // owns a fresh generation and invalidates the prior page's work.
+            let generation = invalidateDashboardContentObservation()
+            navigationGenerations.setObject(
+                NSNumber(value: generation), forKey: navigation
+            )
+        }
+        activeDashboardNavigation = navigation
+    }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        guard hasDashboardTarget else { return }
+        guard hasDashboardTarget, let navigation,
+              navigation === activeDashboardNavigation
+        else { return }
+        let generation = dashboardReadiness.generation
+        guard dashboardReadiness.start(
+            generation: generation, at: ProcessInfo.processInfo.systemUptime
+        ) else { return }
         // A freshly loaded document has no sign-in in flight until it says so,
         // so a stale flag from a prior page never blocks teardown after a
         // reload.
@@ -2948,31 +3436,79 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         )
         awaitDashboardContent(
             in: webView,
-            deadline: Date().addingTimeInterval(Self.dashboardContentDeadline)
+            generation: generation
         )
     }
 
-    private func awaitDashboardContent(in webView: WKWebView, deadline: Date) {
-        guard hasDashboardTarget else { return }
+    /// One bounded heartbeat continues independently of a JavaScript reply.
+    /// A hung renderer therefore cannot evade the hard deadline, and at most
+    /// one evaluation is in flight. The slow threshold keeps the visible page
+    /// and its startup-refresh intent; it is not a terminal failure.
+    private func awaitDashboardContent(in webView: WKWebView, generation: UInt64) {
+        guard hasDashboardTarget, dashboardReadiness.isObserving(generation) else {
+            return
+        }
+        let observation = dashboardReadiness.observe(
+            generation: generation,
+            at: ProcessInfo.processInfo.systemUptime,
+            ready: false
+        )
+        let interval: TimeInterval
+        switch observation {
+        case .waiting(let nextInterval):
+            interval = nextInterval
+        case .takingLonger:
+            onReadinessDelay()
+            interval = 1
+        case .timedOut:
+            finishDashboardContentObservation(ready: false)
+            return
+        case .ready, .ignored:
+            return
+        }
+        let poll = DispatchWorkItem { [weak self, weak webView] in
+            guard let self, let webView,
+                  self.dashboardReadiness.isObserving(generation)
+            else { return }
+            self.dashboardContentPoll = nil
+            self.awaitDashboardContent(in: webView, generation: generation)
+        }
+        dashboardContentPoll = poll
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: poll)
+        guard !dashboardContentEvaluationInFlight else { return }
+        dashboardContentEvaluationInFlight = true
         webView.evaluateJavaScript(
             "document.documentElement?.dataset.localDashboardReady === 'true';"
         ) { [weak self] value, error in
-            guard let self, self.hasDashboardTarget else { return }
+            guard let self, self.hasDashboardTarget,
+                  self.dashboardReadiness.isObserving(generation)
+            else { return }
+            self.dashboardContentEvaluationInFlight = false
             let localDashboardReady = (value as? NSNumber)?.boolValue ?? false
             if error == nil, localDashboardReady {
-                self.onLoaded()
-                return
+                let outcome = self.dashboardReadiness.observe(
+                    generation: generation,
+                    at: ProcessInfo.processInfo.systemUptime,
+                    ready: true
+                )
+                if outcome == .ready {
+                    self.finishDashboardContentObservation(ready: true)
+                } else if outcome == .timedOut {
+                    self.finishDashboardContentObservation(ready: false)
+                }
             }
-            guard Date() < deadline else {
-                self.hasDashboardTarget = false
-                self.onFailure(.dashboardReadinessTimeout)
-                return
-            }
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + Self.dashboardContentPollInterval
-            ) { [weak self] in
-                self?.awaitDashboardContent(in: webView, deadline: deadline)
-            }
+        }
+    }
+
+    private func finishDashboardContentObservation(ready: Bool) {
+        dashboardContentPoll?.cancel()
+        dashboardContentPoll = nil
+        dashboardContentEvaluationInFlight = false
+        if ready {
+            onLoaded()
+        } else {
+            hasDashboardTarget = false
+            onFailure(.dashboardReadinessTimeout)
         }
     }
 
@@ -2981,7 +3517,7 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         didFail navigation: WKNavigation!,
         withError error: Error
     ) {
-        reportNavigationFailure(error)
+        reportNavigationFailure(error, navigation: navigation)
     }
 
     func webView(
@@ -2989,24 +3525,29 @@ private final class DashboardWebHost: NSObject, WKNavigationDelegate, WKUIDelega
         didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
-        reportNavigationFailure(error)
+        reportNavigationFailure(error, navigation: navigation)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         guard hasDashboardTarget else { return }
+        invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
         hasDashboardTarget = false
         onFailure(.dashboardContentProcessTerminated)
     }
 
-    private func reportNavigationFailure(_ error: Error) {
+    private func reportNavigationFailure(_ error: Error, navigation: WKNavigation?) {
         // A navigation this delegate cancelled on purpose is not a failure.
         let failure = error as NSError
         guard hasDashboardTarget,
+              navigation == nil || navigation === activeDashboardNavigation,
               failure.domain != NSURLErrorDomain
                 || failure.code != NSURLErrorCancelled
         else {
             return
         }
+        invalidateDashboardContentObservation()
+        activeDashboardNavigation = nil
         hasDashboardTarget = false
         onFailure(.dashboardNavigationFailed)
     }
@@ -3951,6 +4492,122 @@ private final class NativeSettingsToolbarDelegate: NSObject,
     }
 }
 
+/// Native presentation only: the broker owns the app-process retry budget and
+/// the saved keys. Observing status, opening Settings, and cancelling a review
+/// cannot authorize Keychain interaction or restart the silent retry budget.
+@MainActor
+private final class NativeKeychainMigrationApproval {
+    private(set) var status: KeychainMigrationStatus = .idle
+    private(set) var isReviewing = false
+    private(set) var approvalInFlight = false
+    private(set) var lastApprovalDeferred = false
+    private var reviewGeneration = 0
+    var onPresentationChange: (() -> Void)?
+    private let approve: (@escaping (Bool) -> Void) -> Void
+    private let onMigrationCompleted: () -> Void
+
+    init(
+        approve: @escaping (@escaping (Bool) -> Void) -> Void,
+        onMigrationCompleted: @escaping () -> Void
+    ) {
+        self.approve = approve
+        self.onMigrationCompleted = onMigrationCompleted
+    }
+
+    var showsSettings: Bool {
+        status.pendingCount > 0 || status.isRetrying || status.isApproving
+            || approvalInFlight
+    }
+
+    var showsMenuItem: Bool {
+        status.needsApproval || status.isApproving || approvalInFlight
+    }
+
+    var canReview: Bool {
+        status.needsApproval && !isReviewing && !approvalInFlight
+    }
+
+    var summaryKey: TiboTattleLocalization.Key {
+        if status.isApproving || approvalInFlight {
+            return .settingsKeychainMigrationApproving
+        }
+        if status.isRetrying { return .settingsKeychainMigrationRetrying }
+        if lastApprovalDeferred { return .settingsKeychainMigrationDeferred }
+        return .settingsKeychainMigrationSummary
+    }
+
+    func observe(_ next: KeychainMigrationStatus) {
+        let wasPending = status.pendingCount > 0
+            || status.isRetrying || status.isApproving
+        status = next
+        let completed = wasPending && next.pendingCount == 0
+            && !next.isRetrying && !next.isApproving
+        if completed { lastApprovalDeferred = false }
+        onPresentationChange?()
+        // Initial/current idle observations are not completion receipts and
+        // must never start an extra local refresh.
+        if completed { onMigrationCompleted() }
+    }
+
+    /// The confirmation callback is supplied only by the native review action.
+    /// Its one-shot guard also ignores duplicate sheet completions or a second
+    /// click while either the explanation or system approval is still open.
+    func review(confirm: (@escaping (Bool) -> Void) -> Void) {
+        guard canReview else { return }
+        reviewGeneration += 1
+        let selectedReviewGeneration = reviewGeneration
+        isReviewing = true
+        onPresentationChange?()
+        confirm { [weak self] approved in
+            guard let self, self.isReviewing,
+                  self.reviewGeneration == selectedReviewGeneration
+            else { return }
+            self.isReviewing = false
+            guard approved, self.status.needsApproval,
+                  !self.approvalInFlight
+            else {
+                self.onPresentationChange?()
+                return
+            }
+            self.approvalInFlight = true
+            self.lastApprovalDeferred = false
+            self.onPresentationChange?()
+            self.approve { [weak self] success in
+                guard let self, self.approvalInFlight,
+                      self.reviewGeneration == selectedReviewGeneration
+                else { return }
+                self.approvalInFlight = false
+                self.lastApprovalDeferred = !success
+                self.onPresentationChange?()
+            }
+        }
+    }
+
+    static func makeExplanation() -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = TiboTattleLocalization.string(
+            .dialogKeychainMigrationTitle
+        )
+        alert.informativeText = TiboTattleLocalization.string(
+            .dialogKeychainMigrationDescription
+        )
+        // Cancel is the safe default. A Return key that merely opened Settings
+        // must not turn into permission for a system password dialog.
+        let cancel = alert.addButton(
+            withTitle: TiboTattleLocalization.string(.commonCancel)
+        )
+        cancel.keyEquivalent = "\r"
+        let approve = alert.addButton(
+            withTitle: TiboTattleLocalization.string(
+                .dialogApproveKeychainMigration
+            )
+        )
+        approve.keyEquivalent = ""
+        return alert
+    }
+}
+
 @MainActor
 private final class AppDelegate: NSObject, NSApplicationDelegate,
     NSWindowDelegate, NSToolbarDelegate {
@@ -3960,9 +4617,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private var centralServiceMode: CentralServiceMode?
     private var codexHomeConfiguration: CodexHomeConfiguration?
     private var companion: CompanionProcess?
+    private var retiringCompanions = [ObjectIdentifier: CompanionProcess]()
     private var dashboardURL: URL?
     private var firstRunAcknowledged = false
     private var keychainResetProcess: Process?
+    private var keychainResetGeneration: Int?
     private var launchGeneration = 0
     private var pendingDashboardOpen = false
     private var quitting = false
@@ -3996,6 +4655,24 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var settingsQuotaNotificationStatusLabel: NSTextField?
     private weak var settingsAppearancePicker: NSPopUpButton?
     private weak var settingsRefreshIntervalPicker: NSPopUpButton?
+    private weak var settingsKeychainMigrationSection: NSView?
+    private weak var settingsKeychainMigrationLabel: NSTextField?
+    private weak var settingsKeychainMigrationButton: NSButton?
+    private weak var keychainMigrationMenuItem: NSMenuItem?
+    private var keychainMigrationRefreshPending = false
+    private lazy var keychainMigrationApproval = NativeKeychainMigrationApproval(
+        approve: { [weak self] completion in
+            guard let self, !self.quitting, let companion = self.companion
+            else {
+                completion(false)
+                return
+            }
+            companion.approvePendingMigrations(completion: completion)
+        },
+        onMigrationCompleted: { [weak self] in
+            self?.refreshAfterKeychainMigration()
+        }
+    )
     private let nativeEvidenceReader = LocalCompanionEvidenceReader()
     private var quotaNotificationCoordinator: QuotaNotificationCoordinator?
     private var nativeDashboardChrome: NativeDashboardChrome?
@@ -4007,9 +4684,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private weak var nativeShareToolbarItem: NSToolbarItem?
     private weak var nativeSettingsToolbarItem: NSToolbarItem?
     private var nativeRefreshPoll: DispatchWorkItem?
+    private var nativeRefreshStartWatchdog: DispatchWorkItem?
+    private var nativeRefreshReadWatchdog: DispatchWorkItem?
     private var nativeRefreshSchedule: DispatchWorkItem?
     private var nativeRefreshInFlight = false
+    private var nativeRefreshStartFence = NativeRefreshStartFence()
     private var nativeRefreshProgress: LocalAnalysisProgress?
+    private var nativeRefreshSequence: UInt64 = 0
+    private var nativeRefreshReadEpoch: UInt64 = 0
+    private var workspaceWakeObserver: NSObjectProtocol?
     /// One launch-only refresh waits until the page has rendered its first
     /// local result. This prevents the heavy collector from winning the
     /// loopback race against the dashboard's own initial reads.
@@ -4025,12 +4708,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     /// Opaque companion token for the particular refresh this surface started
     /// or joined. It is never persisted or exposed in UI/notification text.
     private var nativeRefreshID: String?
-    // A missing unified index receives the companion's bounded four-hour cold
-    // rebuild window. Keep native progress attached through that same window
-    // plus one minute for cooperative worker shutdown and the terminal read;
+    /// Notification evaluation belongs only to a refresh this native surface
+    /// explicitly started or joined. Reconciliation may adopt an external run
+    /// for UI liveness without claiming notification ownership.
+    private var nativeRefreshNotificationID: String?
+    // A fresh unified index or an authoritatively selected full accounting
+    // rebuild receives the companion's bounded four-hour cold-work window.
+    // Keep native progress attached through that same window plus one minute
+    // for cooperative worker shutdown and the terminal read;
     // the former 120 polls stopped after about 90 seconds and could label a
     // still-running first build as finished.
     private static let nativeRefreshPollIntervalMilliseconds = 750
+    private static let nativeRefreshStartWatchdogMilliseconds = 12_000
+    private static let nativeRefreshReadWatchdogMilliseconds = 12_000
     /// Once the companion's own maximum work window has elapsed, stay
     /// attached until its terminal receipt without keeping the ordinary
     /// sub-second progress cadence alive indefinitely.
@@ -4123,6 +4813,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         self.semanticOpenTarget = semanticOpenTarget
         self.loginItemManager = loginItemManager
         super.init()
+        keychainMigrationApproval.onPresentationChange = { [weak self] in
+            self?.updateKeychainMigrationPresentation()
+        }
         updater.onStateChange = { [weak self] in
             self?.updateUpdaterPresentation()
         }
@@ -4130,6 +4823,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         _ = umask(0o077)
+        workspaceWakeObserver = NSWorkspace.shared.notificationCenter
+            .addObserver(
+                forName: NSWorkspace.didWakeNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.reconcileNativeRefreshStatus()
+            }
         applyAppearancePreference(notifyDashboard: false)
         installApplicationMenu()
         createWindow()
@@ -4201,6 +4902,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // already updates native dynamic colors; this keeps the live report's
         // explicit document theme synchronized when the window returns.
         synchronizeResolvedAppearance()
+        reconcileNativeRefreshStatus()
     }
 
     private func showFirstRunDisclosure() -> Bool {
@@ -4294,8 +4996,28 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         return true
     }
 
+    /// Main-thread ownership includes detached generations until their broker
+    /// writer barriers finish. A later destructive reset must await them too.
+    private func retireCompanion(
+        _ previous: CompanionProcess,
+        completion: @escaping () -> Void = {}
+    ) {
+        let identifier = ObjectIdentifier(previous)
+        retiringCompanions[identifier] = previous
+        previous.stop { [weak self, weak previous] in
+            DispatchQueue.main.async {
+                if let self, let previous, self.retiringCompanions[identifier] === previous {
+                    self.retiringCompanions.removeValue(forKey: identifier)
+                }
+                completion()
+            }
+        }
+    }
+
     private func startCompanion() {
         guard !quitting, retryAllowed, firstRunAcknowledged,
+              keychainResetGeneration == nil, keychainResetProcess == nil,
+              companion == nil,
               let codexHomeConfiguration
         else { return }
         startupTimeout?.cancel()
@@ -4322,6 +5044,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         let process = CompanionProcess(
             centralService: centralService,
             codexHome: codexHomeConfiguration.url,
+            onMigrationStatus: { [weak self] status in
+                DispatchQueue.main.async {
+                    guard let self, !self.quitting,
+                          selectedGeneration == self.launchGeneration
+                    else { return }
+                    self.keychainMigrationApproval.observe(status)
+                }
+            },
             onReady: { [weak self] url in
                 DispatchQueue.main.async {
                     self?.companionReady(
@@ -4355,7 +5085,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 }
                 self.launchGeneration += 1
                 self.companion = nil
-                process.stop {}
+                self.retireCompanion(process)
                 self.showFailure(LauncherError.companionTimeout)
             }
             startupTimeout = timeout
@@ -4367,6 +5097,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             )
         } catch {
             companion = nil
+            retireCompanion(process)
             showFailure(error)
         }
     }
@@ -4898,7 +5629,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     @objc private func refreshDashboardFromToolbar() {
         // This reuses the existing foreground-only Node companion path. The
         // toolbar never starts a helper, daemon, or separate background task.
-        refreshLocalUsage(automatic: false)
+        refreshLocalUsage(automatic: false, mode: .detailed)
     }
 
     @objc private func showShareCardFromToolbar() {
@@ -5020,6 +5751,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 },
                 onLanguagePreferenceChange: { [weak self] preference in
                     self?.changeLanguagePreference(preference)
+                },
+                onReadinessDelay: { [weak self] in
+                    self?.dashboardWebViewTakingLonger()
                 }
             )
             let chrome = installDashboardChrome(webView: created.webView)
@@ -5059,7 +5793,22 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         host.load(url)
     }
 
+    private func dashboardWebViewTakingLonger() {
+        // The document is still loading honest local evidence. Keep it visible
+        // and keep the one pending startup refresh; no failure/reset is implied.
+        lastLifecycleStatus = "Dashboard loading slowly"
+        updateNativeToolbar(
+            title: TiboTattleLocalization.string(.nativeDashboardStarting),
+            isRefreshing: nativeRefreshInFlight,
+            refreshEnabled: dashboardURL != nil
+        )
+    }
+
     private func dashboardWebViewLoaded() {
+        if lastFailureCode == LauncherError.dashboardReadinessTimeout.failureCode {
+            lastFailureCode = nil
+            lastRecoverySuggestion = nil
+        }
         dashboardWebViewShowing = true
         dashboardContainer.isHidden = false
         statusStack.isHidden = true
@@ -5084,7 +5833,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
         if startupAutomaticRefreshPending {
             startupAutomaticRefreshPending = false
-            refreshLocalUsage(automatic: true)
+            refreshLocalUsage(automatic: true, mode: .quick)
         }
     }
 
@@ -5115,10 +5864,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     /// Updates are automatic only while the ordinary app is open. A login
     /// item (if enabled) launches that same foreground app; it never starts a
-    /// separate worker, daemon, or background URL session. The same bounded
-    /// loopback refresh route remains the only reader, so a manual click and
-    /// the foreground cadence cannot start two scans at once.
-    private func refreshLocalUsage(automatic: Bool) {
+    /// separate worker, daemon, or background URL session. Both explicit
+    /// loopback refresh modes share one companion controller, so a manual
+    /// click and the foreground cadence cannot start two scans at once.
+    private func refreshLocalUsage(
+        automatic: Bool,
+        mode requestedMode: LocalAnalysisMode,
+        allowAutomaticDetailed: Bool = false,
+        cadenceStatusChecked: Bool = false
+    ) {
         guard !quitting,
               !nativeRefreshInFlight,
               !(automatic
@@ -5127,9 +5881,67 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         else {
             return
         }
+        if automatic, allowAutomaticDetailed, !cadenceStatusChecked {
+            // A browser-started detailed run can finish between native polls.
+            // Reconcile its actual-start receipt before spending the hourly
+            // allowance; unavailable or running state permits only a quick
+            // request (which may join the one controller-owned active run).
+            let observedSequence = nativeRefreshSequence
+            var resolved = false
+            let fallback = DispatchWorkItem { [weak self] in
+                guard let self, !resolved, !self.quitting,
+                      !self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == observedSequence
+                else { return }
+                resolved = true
+                self.refreshLocalUsage(automatic: true, mode: .quick)
+            }
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(
+                    Self.nativeRefreshStartWatchdogMilliseconds
+                ),
+                execute: fallback
+            )
+            nativeEvidenceReader.readAnalysisActivity(base: dashboardURL) {
+                [weak self] activity in
+                guard let self, !resolved, !self.quitting,
+                      !self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == observedSequence
+                else { return }
+                resolved = true
+                fallback.cancel()
+                let controllerIdle: Bool
+                if case .idle = activity { controllerIdle = true }
+                else { controllerIdle = false }
+                self.refreshLocalUsage(
+                    automatic: true,
+                    mode: .quick,
+                    allowAutomaticDetailed: controllerIdle,
+                    cadenceStatusChecked: true
+                )
+            }
+            return
+        }
+        let mode: LocalAnalysisMode
+        if automatic, allowAutomaticDetailed {
+            mode = NativeDetailedRefreshCadence.automaticMode()
+        } else {
+            if automatic {
+                NativeDetailedRefreshCadence.seedIfMissing()
+            }
+            mode = requestedMode
+        }
+        let detailedReservation = mode == .detailed
+            ? NativeDetailedRefreshCadence.recordDetailedAttempt()
+            : nil
+        keychainMigrationRefreshPending = false
         cancelNativeRefreshSchedule()
         cancelNativeIndexingCoveragePoll()
         nativeRefreshInFlight = true
+        nativeRefreshStartFence.begin()
+        nativeRefreshSequence &+= 1
+        let refreshSequence = nativeRefreshSequence
+        nativeRefreshNotificationID = nil
         nativeRefreshProgress = nil
         updateNativeToolbar(
             title: automatic
@@ -5138,14 +5950,48 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             isRefreshing: true,
             refreshEnabled: false
         )
-        nativeEvidenceReader.startAnalysis(base: dashboardURL) { [weak self] result in
-            guard let self, !self.quitting else { return }
+        let startWatchdog = DispatchWorkItem { [weak self] in
+            guard let self, !self.quitting, self.nativeRefreshInFlight,
+                  self.nativeRefreshSequence == refreshSequence
+            else { return }
+            self.nativeRefreshNotificationID = nil
+            self.pollNativeRefresh(
+                base: dashboardURL,
+                remainingAttempts: Self.nativeRefreshMaximumPollAttempts,
+                sequence: refreshSequence
+            )
+        }
+        nativeRefreshStartWatchdog = startWatchdog
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(
+                Self.nativeRefreshStartWatchdogMilliseconds
+            ),
+            execute: startWatchdog
+        )
+        nativeEvidenceReader.startAnalysis(
+            base: dashboardURL,
+            mode: mode
+        ) { [weak self] result in
+            guard let self, !self.quitting,
+                  self.nativeRefreshSequence == refreshSequence
+            else { return }
+            self.nativeRefreshStartWatchdog?.cancel()
+            self.nativeRefreshStartWatchdog = nil
+            self.nativeRefreshStartFence.resolve()
+            if case let .alreadyRunning(_, attempt) = result {
+                NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+                    detailedReservation,
+                    attempt: attempt
+                )
+            }
             switch result {
-            case let .started(refreshID), let .alreadyRunning(refreshID):
+            case let .started(refreshID, _), let .alreadyRunning(refreshID, _):
                 self.nativeRefreshID = refreshID
+                self.nativeRefreshNotificationID = refreshID
                 self.pollNativeRefresh(
                     base: dashboardURL,
-                    remainingAttempts: Self.nativeRefreshMaximumPollAttempts
+                    remainingAttempts: Self.nativeRefreshMaximumPollAttempts,
+                    sequence: refreshSequence
                 )
             case .rejected:
                 self.nativeEvidenceState = .readFailed
@@ -5176,23 +6022,59 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         }
     }
 
-    private func pollNativeRefresh(base: URL, remainingAttempts: Int) {
+    private func pollNativeRefresh(
+        base: URL,
+        remainingAttempts: Int,
+        sequence: UInt64
+    ) {
         cancelNativeRefreshPoll()
         let pollIntervalMilliseconds = remainingAttempts > 0
             ? Self.nativeRefreshPollIntervalMilliseconds
             : Self.nativeRefreshSettlementPollIntervalMilliseconds
         let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.quitting, self.nativeRefreshInFlight else {
+            guard let self, !self.quitting, self.nativeRefreshInFlight,
+                  self.nativeRefreshSequence == sequence
+            else {
                 return
             }
+            self.nativeRefreshReadEpoch &+= 1
+            let readEpoch = self.nativeRefreshReadEpoch
+            let startObservation = self.nativeRefreshStartFence.observation()
+            let watchdog = DispatchWorkItem { [weak self] in
+                guard let self, !self.quitting, self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == sequence,
+                      self.nativeRefreshReadEpoch == readEpoch
+                else { return }
+                self.pollNativeRefresh(
+                    base: base,
+                    remainingAttempts: max(0, remainingAttempts - 1),
+                    sequence: sequence
+                )
+            }
+            self.nativeRefreshReadWatchdog = watchdog
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(
+                    Self.nativeRefreshReadWatchdogMilliseconds
+                ),
+                execute: watchdog
+            )
             self.nativeEvidenceReader.readAnalysisActivity(base: base) { [weak self] activity in
-                guard let self, !self.quitting, self.nativeRefreshInFlight else {
+                guard let self, !self.quitting, self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == sequence,
+                      self.nativeRefreshReadEpoch == readEpoch
+                else {
                     return
                 }
-                let terminalRefreshID: String?
+                self.nativeRefreshReadWatchdog?.cancel()
+                self.nativeRefreshReadWatchdog = nil
                 switch activity {
-                case let .running(_, progress):
-                    terminalRefreshID = nil
+                case let .running(refreshID, progress, _):
+                    if let refreshID {
+                        if self.nativeRefreshNotificationID != refreshID {
+                            self.nativeRefreshNotificationID = nil
+                        }
+                        self.nativeRefreshID = refreshID
+                    }
                     self.nativeRefreshProgress = progress
                     self.updateNativeToolbar(
                         // The refresh receipt has not supplied a matched
@@ -5225,17 +6107,35 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                         )
                         self.pollNativeRefresh(
                             base: base,
-                            remainingAttempts: 0
+                            remainingAttempts: 0,
+                            sequence: sequence
                         )
                         return
                     }
                     self.pollNativeRefresh(
                         base: base,
-                        remainingAttempts: remainingAttempts - 1
+                        remainingAttempts: remainingAttempts - 1,
+                        sequence: sequence
                     )
                     return
-                case let .idle(refreshID, _):
-                    terminalRefreshID = refreshID
+                case let .idle(refreshID, _, _):
+                    guard self.nativeRefreshStartFence.allowsTerminal(
+                        startObservation
+                    ) else {
+                        self.pollNativeRefresh(
+                            base: base,
+                            remainingAttempts: max(0, remainingAttempts - 1),
+                            sequence: sequence
+                        )
+                        return
+                    }
+                    self.handleNativeRefreshTerminal(
+                        base: base,
+                        terminalRefreshID: refreshID,
+                        sequence: sequence,
+                        startObservation: startObservation
+                    )
+                    return
                 case .none:
                     // A failed or future-schema activity read is not evidence
                     // that the accepted refresh stopped. Keep the control
@@ -5251,62 +6151,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     )
                     self.pollNativeRefresh(
                         base: base,
-                        remainingAttempts: max(0, remainingAttempts - 1)
+                        remainingAttempts: max(0, remainingAttempts - 1),
+                        sequence: sequence
                     )
                     return
-                }
-                self.nativeEvidenceReader.readOverview(base: base) { [weak self] overview in
-                    guard let self, !self.quitting else { return }
-                    if let overview {
-                        self.nativeEvidenceObservedAt = overview.observedAt
-                        switch LocalCompanionOverviewProjection.evidence(
-                            for: overview
-                        ) {
-                        case .live:
-                            self.nativeEvidenceState = .live
-                        case .stale:
-                            self.nativeEvidenceState = .stale
-                        case .none:
-                            self.nativeEvidenceState = .unknown
-                        }
-                    } else {
-                        // Keep any last observed timestamp for honest age
-                        // context, but distinguish a transient read failure
-                        // from a dead companion process.
-                        self.nativeEvidenceState = .readFailed
-                    }
-                    let title: String
-                    if let overview,
-                       LocalCompanionOverviewProjection.evidence(
-                        for: overview
-                       ) == .live {
-                        title = TiboTattleLocalization.string(.launcherUpToDate)
-                    } else if overview?.lanes.isEmpty == false {
-                        title = TiboTattleLocalization.string(
-                            .launcherNeedsAttention
-                        )
-                    } else {
-                        title = TiboTattleLocalization.string(
-                            .launcherNoAllowanceObserved
-                        )
-                    }
-                    let expectedRefreshID = terminalRefreshID == self.nativeRefreshID
-                        ? self.nativeRefreshID
-                        : nil
-                    self.evaluateQuotaNotificationsAfterRefresh(
-                        base: base,
-                        expectedRefreshID: expectedRefreshID
-                    )
-                    // The pill's terminal state is decided only after the
-                    // companion's own coverage counts and refresh receipt
-                    // have been re-read; a failed pass or a still-building
-                    // index then takes the title over the evidence prose.
-                    self.readNativeToolbarStatusFacts(base: base) { [weak self] in
-                        self?.finishNativeRefresh(
-                            title: title,
-                            refreshEnabled: true
-                        )
-                    }
                 }
             }
         }
@@ -5319,10 +6167,142 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
     }
 
+    /// The companion's terminal receipt is authoritative for whether work is
+    /// still running. Clear the busy latch before any optional overview or
+    /// coverage read: those reads may fail or lose a callback, but cannot turn
+    /// an already-terminal refresh back into an endless spinner.
+    private func handleNativeRefreshTerminal(
+        base: URL,
+        terminalRefreshID: String?,
+        sequence: UInt64,
+        startObservation: NativeRefreshStartFence.Observation
+    ) {
+        guard nativeRefreshInFlight, nativeRefreshSequence == sequence,
+              nativeRefreshStartFence.allowsTerminal(startObservation)
+        else {
+            return
+        }
+        let expectedRefreshID = terminalRefreshID == nativeRefreshNotificationID
+            ? nativeRefreshNotificationID
+            : nil
+        settleNativeRefresh(
+            title: TiboTattleLocalization.string(.nativeDashboardStatus),
+            refreshEnabled: true
+        )
+        let presentationSequence = nativeRefreshSequence
+        evaluateQuotaNotificationsAfterRefresh(
+            base: base,
+            expectedRefreshID: expectedRefreshID
+        )
+        nativeEvidenceReader.readOverview(base: base) { [weak self] overview in
+            guard let self, !self.quitting,
+                  !self.nativeRefreshInFlight,
+                  self.nativeRefreshSequence == presentationSequence
+            else { return }
+            if let overview {
+                self.nativeEvidenceObservedAt = overview.observedAt
+                switch LocalCompanionOverviewProjection.evidence(for: overview) {
+                case .live:
+                    self.nativeEvidenceState = .live
+                case .stale:
+                    self.nativeEvidenceState = .stale
+                case .none:
+                    self.nativeEvidenceState = .unknown
+                }
+            } else {
+                self.nativeEvidenceState = .readFailed
+            }
+            let title: String
+            if let overview,
+               LocalCompanionOverviewProjection.evidence(for: overview) == .live {
+                title = TiboTattleLocalization.string(.launcherUpToDate)
+            } else if overview?.lanes.isEmpty == false {
+                title = TiboTattleLocalization.string(.launcherNeedsAttention)
+            } else {
+                title = TiboTattleLocalization.string(
+                    .launcherNoAllowanceObserved
+                )
+            }
+            self.readNativeToolbarStatusFacts(base: base) { [weak self] in
+                guard let self, !self.quitting,
+                      !self.nativeRefreshInFlight,
+                      self.nativeRefreshSequence == presentationSequence
+                else { return }
+                self.updateNativeToolbar(
+                    title: title,
+                    isRefreshing: false,
+                    refreshEnabled: true
+                )
+            }
+        }
+    }
+
+    /// Re-adopt a companion run after activation or wake, and clear only from
+    /// an explicit terminal receipt. An unreadable or future-schema response
+    /// is deliberately a no-op because it is not evidence that work stopped.
+    private func reconcileNativeRefreshStatus() {
+        guard !quitting, let base = dashboardURL else { return }
+        let observedSequence = nativeRefreshSequence
+        let startObservation = nativeRefreshStartFence.observation()
+        nativeEvidenceReader.readAnalysisActivity(base: base) { [weak self] activity in
+            guard let self, !self.quitting,
+                  self.nativeRefreshSequence == observedSequence
+            else { return }
+            switch activity {
+            case let .running(refreshID, progress, _):
+                if !self.nativeRefreshInFlight {
+                    self.cancelNativeRefreshSchedule()
+                    self.cancelNativeIndexingCoveragePoll()
+                    self.nativeRefreshInFlight = true
+                    self.nativeRefreshSequence &+= 1
+                    self.nativeRefreshNotificationID = nil
+                }
+                let sequence = self.nativeRefreshSequence
+                if let refreshID {
+                    if self.nativeRefreshNotificationID != refreshID {
+                        self.nativeRefreshNotificationID = nil
+                    }
+                    self.nativeRefreshID = refreshID
+                }
+                self.nativeRefreshProgress = progress
+                self.updateNativeToolbar(
+                    title: progress?.nativeToolbarTitle()
+                        ?? TiboTattleLocalization.string(
+                            .nativeDashboardUpdating
+                        ),
+                    isRefreshing: true,
+                    refreshEnabled: false
+                )
+                self.pollNativeRefresh(
+                    base: base,
+                    remainingAttempts: Self.nativeRefreshMaximumPollAttempts,
+                    sequence: sequence
+                )
+            case let .idle(refreshID, _, _):
+                guard self.nativeRefreshInFlight else { return }
+                self.handleNativeRefreshTerminal(
+                    base: base,
+                    terminalRefreshID: refreshID,
+                    sequence: observedSequence,
+                    startObservation: startObservation
+                )
+            case .none:
+                return
+            }
+        }
+    }
+
     private func finishNativeRefresh(title: String, refreshEnabled: Bool) {
+        settleNativeRefresh(title: title, refreshEnabled: refreshEnabled)
+    }
+
+    private func settleNativeRefresh(title: String, refreshEnabled: Bool) {
+        nativeRefreshSequence &+= 1
         nativeRefreshInFlight = false
+        nativeRefreshStartFence.resolve()
         nativeRefreshProgress = nil
         nativeRefreshID = nil
+        nativeRefreshNotificationID = nil
         cancelNativeRefreshPoll()
         updateNativeToolbar(
             title: title,
@@ -5335,6 +6315,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         // refresh still leaves the page asserting a freshness this window can
         // no longer vouch for.
         dashboardWebHost?.notifyLocalEvidenceUpdated()
+        if keychainMigrationRefreshPending {
+            refreshAfterKeychainMigration()
+            return
+        }
         scheduleNativeRefresh()
         scheduleNativeIndexingCoveragePoll()
     }
@@ -5400,8 +6384,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func cancelNativeRefreshPoll() {
+        nativeRefreshStartWatchdog?.cancel()
+        nativeRefreshStartWatchdog = nil
         nativeRefreshPoll?.cancel()
         nativeRefreshPoll = nil
+        nativeRefreshReadWatchdog?.cancel()
+        nativeRefreshReadWatchdog = nil
+        nativeRefreshReadEpoch &+= 1
     }
 
     /// The foreground app keeps its own local evidence current while a
@@ -5417,7 +6406,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return
         }
         let work = NativeForegroundRefreshScheduler.schedule { [weak self] in
-            self?.refreshLocalUsage(automatic: true)
+            self?.refreshLocalUsage(
+                automatic: true,
+                mode: .quick,
+                allowAutomaticDetailed: true
+            )
         }
         nativeRefreshSchedule = work
     }
@@ -5503,6 +6496,15 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         )
         settings.target = self
         appMenu.addItem(settings)
+        let migration = NSMenuItem(
+            title: TiboTattleLocalization.string(.settingsKeychainMigrationMenu),
+            action: #selector(showKeychainMigrationSettings),
+            keyEquivalent: ""
+        )
+        migration.target = self
+        migration.isHidden = !keychainMigrationApproval.showsMenuItem
+        keychainMigrationMenuItem = migration
+        appMenu.addItem(migration)
         appMenu.addItem(.separator())
         let quit = NSMenuItem(
             title: TiboTattleLocalization.format(
@@ -5591,7 +6593,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     private func dashboardWebViewFailed(_ failure: LauncherError) {
         cancelNativeRefreshSchedule()
-        startupAutomaticRefreshPending = false
+        // A hard readiness deadline stops observation, not the still-unspent
+        // initial refresh. An explicit Open Dashboard can load a new document
+        // and consume it once. Genuine navigation/renderer failures cancel it.
+        if case .dashboardReadinessTimeout = failure {
+            // Preserved until a valid ready result or explicit teardown.
+        } else {
+            startupAutomaticRefreshPending = false
+        }
         nativeEvidenceState = .readFailed
         dashboardWebViewShowing = false
         dashboardContainer.isHidden = true
@@ -5664,6 +6673,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         nativeHistoryIndexingCoverage = nil
         nativeRefreshFailure = nil
         nativeRefreshInFlight = false
+        nativeRefreshStartFence.resolve()
         nativeRefreshProgress = nil
         nativeRefreshID = nil
         dashboardWebHost?.stop()
@@ -5762,6 +6772,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             return
         }
         dashboardURL = url
+        updateKeychainMigrationPresentation()
         nativeEvidenceState = .unknown
         nativeEvidenceObservedAt = nil
         // A restarted companion invalidates any earlier coverage counts and
@@ -5810,6 +6821,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         startupTimeout?.cancel()
         startupTimeout = nil
         startupAutomaticRefreshPending = false
+        updateKeychainMigrationPresentation()
         if quitting || requested { return }
         dashboardURL = nil
         companion = nil
@@ -5893,18 +6905,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     @objc private func retryCompanion() {
-        guard !quitting, retryAllowed, firstRunAcknowledged else { return }
+        guard !quitting, retryAllowed, firstRunAcknowledged,
+              keychainResetGeneration == nil, keychainResetProcess == nil else { return }
         automaticCompanionRecoveryUsed = false
-        if let previous = companion, previous.isRunning {
+        launchGeneration += 1
+        let retryGeneration = launchGeneration
+        let previous = companion
+        companion = nil
+        if let previous {
             retryButton.isEnabled = false
-            previous.stop { [weak self] in
-                DispatchQueue.main.async {
-                    self?.companion = nil
-                    self?.startCompanion()
-                }
+            retireCompanion(previous) { [weak self] in
+                guard let self, !self.quitting, self.launchGeneration == retryGeneration else { return }
+                self.startCompanion()
             }
         } else {
-            companion = nil
             startCompanion()
         }
     }
@@ -6042,6 +7056,47 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func updateSettingsCodexHomeSummary() {
         settingsCodexHomeLabel?.stringValue = codexHomeSettingsSummary()
         refitSettingsWindowToContent()
+    }
+
+    private func updateKeychainMigrationPresentation() {
+        let presentation = keychainMigrationApproval
+        settingsKeychainMigrationSection?.isHidden =
+            !presentation.showsSettings
+        settingsKeychainMigrationLabel?.stringValue =
+            TiboTattleLocalization.string(presentation.summaryKey)
+        settingsKeychainMigrationButton?.isEnabled =
+            presentation.canReview && !quitting && companion?.isRunning == true
+        keychainMigrationMenuItem?.isHidden = !presentation.showsMenuItem
+        // A status observation is deliberately non-modal and never opens
+        // Settings. Local quota/accounting presentation keeps its own truth.
+        refitSettingsWindowToContent()
+    }
+
+    private func refreshAfterKeychainMigration() {
+        guard !quitting else { return }
+        keychainMigrationRefreshPending = true
+        guard dashboardURL != nil, !nativeRefreshInFlight else { return }
+        // One repair refresh uses the existing local-only analysis route. It
+        // neither grants contribution consent nor starts a second scan while
+        // the current pass is still running.
+        refreshLocalUsage(automatic: false, mode: .detailed)
+    }
+
+    @objc private func showKeychainMigrationSettings() {
+        showSettings(selecting: 0)
+    }
+
+    @objc private func reviewKeychainMigration(_ sender: NSButton) {
+        guard sender === settingsKeychainMigrationButton,
+              !quitting, companion?.isRunning == true,
+              let settingsWindow
+        else { return }
+        keychainMigrationApproval.review { complete in
+            let explanation = NativeKeychainMigrationApproval.makeExplanation()
+            explanation.beginSheetModal(for: settingsWindow) { response in
+                complete(response == .alertSecondButtonReturn)
+            }
+        }
     }
 
     private func automaticUpdatesSettingsSummary() -> String {
@@ -6649,6 +7704,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsCheckForUpdatesButton = nil
         settingsAppearancePicker = nil
         settingsRefreshIntervalPicker = nil
+        settingsKeychainMigrationSection = nil
+        settingsKeychainMigrationLabel = nil
+        settingsKeychainMigrationButton = nil
         if shouldRestoreSettings {
             showSettings(selecting: selectedSettingsTab)
         }
@@ -6687,6 +7745,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             updateAppearanceSettingsControl()
             updateRefreshIntervalSettingsControl()
             updateStartAtLoginSettingsControl()
+            updateKeychainMigrationPresentation()
             quotaNotificationCoordinator?.refreshAuthorization()
             updateQuotaNotificationSettingsControls()
             refitSettingsWindowToContent()
@@ -6712,6 +7771,31 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             action: #selector(useDefaultCodexHome)
         )
         let sourceActions = settingsControlRow([chooseSource, useDefaultSource])
+        let migrationStatus = settingsLabel(
+            TiboTattleLocalization.string(keychainMigrationApproval.summaryKey),
+            font: .systemFont(ofSize: 12),
+            color: .secondaryLabelColor
+        )
+        settingsKeychainMigrationLabel = migrationStatus
+        let reviewMigration = NSButton(
+            title: TiboTattleLocalization.string(.settingsKeychainMigrationReview),
+            target: self,
+            action: #selector(reviewKeychainMigration(_:))
+        )
+        reviewMigration.bezelStyle = .rounded
+        reviewMigration.isEnabled = keychainMigrationApproval.canReview
+            && !quitting && companion?.isRunning == true
+        reviewMigration.setAccessibilityLabel(
+            TiboTattleLocalization.string(.settingsKeychainMigrationReview)
+        )
+        settingsKeychainMigrationButton = reviewMigration
+        let migrationSection = settingsGroup(
+            title: TiboTattleLocalization.string(.settingsKeychainMigrationTitle),
+            symbolName: "key",
+            views: [migrationStatus, settingsControlRow([reviewMigration])]
+        )
+        migrationSection.isHidden = !keychainMigrationApproval.showsSettings
+        settingsKeychainMigrationSection = migrationSection
         let appearancePicker = NSPopUpButton(
             frame: .zero,
             pullsDown: false
@@ -7048,6 +8132,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             title: TiboTattleLocalization.string(.settingsGeneral),
             summary: TiboTattleLocalization.string(.settingsGeneralSummary),
             views: [
+                migrationSection,
                 appearanceSection,
                 languageSection,
                 sourceSection,
@@ -7225,6 +8310,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         settingsWindow = newWindow
         settingsTabs = tabs
         settingsToolbarDelegate = toolbarDelegate
+        updateKeychainMigrationPresentation()
         updateQuotaNotificationSettingsControls()
         newWindow.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -7502,13 +8588,13 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         hideDashboardWebView()
         startupTimeout?.cancel()
         launchGeneration += 1
+        let restartGeneration = launchGeneration
         let previous = companion
         companion = nil
-        if let previous, previous.isRunning {
-            previous.stop { [weak self] in
-                DispatchQueue.main.async {
-                    self?.startCompanion()
-                }
+        if let previous {
+            retireCompanion(previous) { [weak self] in
+                guard let self, !self.quitting, self.launchGeneration == restartGeneration else { return }
+                self.startCompanion()
             }
         } else {
             startCompanion()
@@ -7574,7 +8660,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     }
 
     private func performLocalKeychainReset() {
-        guard keychainResetProcess == nil else { return }
+        guard !quitting, keychainResetGeneration == nil, keychainResetProcess == nil else { return }
         lastLifecycleStatus = "Resetting local identity"
         statusLabel.stringValue = TiboTattleLocalization.string(
             .launcherResettingLocalIdentity
@@ -7588,21 +8674,34 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         hideDashboardWebView()
         startupTimeout?.cancel()
         launchGeneration += 1
+        let resetGeneration = launchGeneration
+        // Claim the whole operation, including the asynchronous stop barrier.
+        // A second Reset action must not bypass it after companion is detached.
+        keychainResetGeneration = resetGeneration
         let previous = companion
         companion = nil
+        var pendingCompanions = retiringCompanions
+        if let previous { pendingCompanions[ObjectIdentifier(previous)] = previous }
         let runReset = { [weak self] in
             DispatchQueue.main.async {
-                self?.launchLocalKeychainResetHelper()
+                guard let self, self.keychainResetGeneration == resetGeneration else { return }
+                guard !self.quitting, self.launchGeneration == resetGeneration else {
+                    self.keychainResetGeneration = nil
+                    return
+                }
+                self.launchLocalKeychainResetHelper(generation: resetGeneration)
             }
         }
-        if let previous, previous.isRunning {
-            previous.stop(completion: runReset)
-        } else {
-            runReset()
+        let stopped = DispatchGroup()
+        for previous in pendingCompanions.values {
+            stopped.enter()
+            retireCompanion(previous) { stopped.leave() }
         }
+        stopped.notify(queue: .main, execute: runReset)
     }
 
-    private func launchLocalKeychainResetHelper() {
+    private func launchLocalKeychainResetHelper(generation: Int) {
+        guard keychainResetGeneration == generation, launchGeneration == generation, !quitting else { return }
         do {
             let resources = try CompanionResources.bundled()
             let stateRoot = try ownerOnlyStateRoot()
@@ -7642,11 +8741,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                 let errorOutput = standardError.fileHandleForReading
                     .readDataToEndOfFile()
                 DispatchQueue.main.async {
-                    self?.keychainResetProcess = nil
-                    self?.finishLocalKeychainReset(
+                    guard let self, self.keychainResetProcess === terminated else { return }
+                    self.keychainResetProcess = nil
+                    guard self.keychainResetGeneration == generation else { return }
+                    self.keychainResetGeneration = nil
+                    guard !self.quitting, self.launchGeneration == generation else { return }
+                    self.finishLocalKeychainReset(
                         status: terminated.terminationStatus,
                         output: output,
-                        errorOutput: errorOutput
+                        errorOutput: errorOutput,
+                        generation: generation
                     )
                 }
             }
@@ -7654,6 +8758,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             try child.run()
         } catch {
             keychainResetProcess = nil
+            if keychainResetGeneration == generation { keychainResetGeneration = nil }
             showFailure(LauncherError.keychainReset)
         }
     }
@@ -7661,7 +8766,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
     private func finishLocalKeychainReset(
         status: Int32,
         output: Data,
-        errorOutput: Data
+        errorOutput: Data,
+        generation: Int
     ) {
         let decoded = try? JSONDecoder().decode(
             LocalKeychainResetResult.self,
@@ -7678,6 +8784,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             )
             result.addButton(withTitle: TiboTattleLocalization.string(.dialogDone))
             result.runModal()
+            guard !quitting, launchGeneration == generation else { return }
             retryAllowed = true
             startCompanion()
             return
@@ -7720,9 +8827,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         dashboardWebHost?.stop()
         hideDashboardWebView()
         launchGeneration += 1
+        let eraseGeneration = launchGeneration
         let previous = companion
         companion = nil
         let erase = { [weak self] in
+            guard let self, !self.quitting, self.launchGeneration == eraseGeneration else { return }
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let stateRoot = try ownerOnlyStateRoot()
@@ -7732,7 +8841,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     )
                     DispatchQueue.main.async {
                         DashboardWebHost.clearPersistentWebsiteData {
-                            guard let self, !self.quitting else { return }
+                            guard !self.quitting, self.launchGeneration == eraseGeneration else { return }
                             do {
                                 self.codexHomeConfiguration =
                                     CodexHomeConfiguration(
@@ -7757,13 +8866,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     }
                 } catch {
                     DispatchQueue.main.async {
-                        self?.showFailure(LauncherError.dataErase)
+                        guard !self.quitting, self.launchGeneration == eraseGeneration else { return }
+                        self.showFailure(LauncherError.dataErase)
                     }
                 }
             }
         }
-        if let previous, previous.isRunning {
-            previous.stop(completion: erase)
+        if let previous {
+            retireCompanion(previous, completion: erase)
         } else {
             erase()
         }
@@ -7861,6 +8971,12 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
 
     func applicationWillTerminate(_ notification: Notification) {
         startupTimeout?.cancel()
+        if let workspaceWakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(
+                workspaceWakeObserver
+            )
+            self.workspaceWakeObserver = nil
+        }
         cancelNativeRefreshPoll()
         cancelNativeRefreshSchedule()
         cancelNativeIndexingCoveragePoll()
@@ -8261,6 +9377,7 @@ private enum LifecycleContractSmokeTest {
     }
 
     static func keychainResetContract() -> Int32 {
+        guard CompanionProcess.verifyKeychainShutdownContract() else { return 1 }
         let completePayload = Data(
             """
             {
@@ -8327,7 +9444,8 @@ private enum LifecycleContractSmokeTest {
         print(
             "USAGE_MONITOR_MACOS_KEYCHAIN_RESET_CONTRACT "
                 + "targets=2 app_state=targeted hosted_mutation=false "
-                + "secure_erasure=false confirmations=2"
+                + "secure_erasure=false confirmations=2 writer_barrier=drained "
+                + "callbacks=once reset_resurrection=false keychain_access=0"
         )
         return 0
     }
@@ -8453,12 +9571,240 @@ private enum NativeRefreshSettingsContractSmokeTest {
         else {
             return 1
         }
+        let cadenceStart = Date(timeIntervalSince1970: 10_000)
+        guard NativeDetailedRefreshCadence.automaticMode(
+            now: cadenceStart,
+            defaults: reloaded
+        ) == .quick,
+              reloaded.double(
+                forKey: NativeDetailedRefreshCadence.defaultsKey
+              ) == cadenceStart.timeIntervalSince1970,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: cadenceStart.addingTimeInterval(3_599),
+                defaults: reloaded
+              ) == .quick,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: cadenceStart.addingTimeInterval(3_600),
+                defaults: reloaded
+              ) == .detailed,
+              reloaded.double(
+                forKey: NativeDetailedRefreshCadence.defaultsKey
+              ) == cadenceStart.timeIntervalSince1970
+        else {
+            return 1
+        }
+        let attemptedAt = cadenceStart.addingTimeInterval(3_600)
+        let reservation = NativeDetailedRefreshCadence.recordDetailedAttempt(
+            now: attemptedAt, defaults: reloaded
+        )
+        NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+            reservation, attempt: nil, defaults: reloaded
+        )
+        guard NativeDetailedRefreshCadence.automaticMode(
+            now: attemptedAt.addingTimeInterval(1), defaults: reloaded
+        ) == .quick else { return 1 }
+        let quickJoin = LocalAnalysisAttempt(mode: .quick, startedAt: attemptedAt)
+        NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+            reservation, attempt: quickJoin, defaults: reloaded
+        )
+        guard reloaded.double(forKey: NativeDetailedRefreshCadence.defaultsKey)
+                == cadenceStart.timeIntervalSince1970,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: attemptedAt, defaults: reloaded
+              ) == .detailed
+        else { return 1 }
+        let earlier = NativeDetailedRefreshCadence.recordDetailedAttempt(
+            now: attemptedAt, defaults: reloaded
+        )
+        let later = NativeDetailedRefreshCadence.recordDetailedAttempt(
+            now: attemptedAt, defaults: reloaded
+        )
+        NativeDetailedRefreshCadence.restoreAfterQuickJoin(
+            earlier, attempt: quickJoin, defaults: reloaded
+        )
+        guard reloaded.string(forKey: NativeDetailedRefreshCadence.reservationKey)
+                == later?.token,
+              reloaded.double(forKey: NativeDetailedRefreshCadence.defaultsKey)
+                == attemptedAt.timeIntervalSince1970
+        else { return 1 }
+        NativeDetailedRefreshCadence.seedIfMissing(
+            now: cadenceStart.addingTimeInterval(9_000),
+            defaults: reloaded
+        )
+        guard reloaded.double(
+            forKey: NativeDetailedRefreshCadence.defaultsKey
+        ) == cadenceStart.addingTimeInterval(3_600).timeIntervalSince1970
+        else {
+            return 1
+        }
+        let externalStart = cadenceStart.addingTimeInterval(10_000)
+        let external = LocalAnalysisAttempt(mode: .detailed, startedAt: externalStart)
+        NativeDetailedRefreshCadence.observe(
+            external, now: externalStart.addingTimeInterval(5), defaults: reloaded
+        )
+        NativeDetailedRefreshCadence.observe(
+            external, now: externalStart.addingTimeInterval(3_599), defaults: reloaded
+        )
+        guard reloaded.double(forKey: NativeDetailedRefreshCadence.defaultsKey)
+                == externalStart.timeIntervalSince1970,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: externalStart.addingTimeInterval(3_599), defaults: reloaded
+              ) == .quick,
+              NativeDetailedRefreshCadence.automaticMode(
+                now: externalStart.addingTimeInterval(3_600), defaults: reloaded
+              ) == .detailed
+        else { return 1 }
+        var startFence = NativeRefreshStartFence()
+        startFence.begin()
+        let oldIdleRead = startFence.observation()
+        guard !startFence.allowsTerminal(oldIdleRead) else { return 1 }
+        // The delayed POST now returns 202/running. The earlier idle GET is
+        // still stale even if its callback arrives after this resolution.
+        startFence.resolve()
+        guard !startFence.allowsTerminal(oldIdleRead),
+              startFence.allowsTerminal(startFence.observation())
+        else { return 1 }
+        let previousRunRead = startFence.observation()
+        startFence.begin()
+        guard !startFence.allowsTerminal(previousRunRead) else { return 1 }
         print(
             "USAGE_MONITOR_MACOS_REFRESH_SETTINGS_CONTRACT "
                 + "default=300 persisted=900 reloaded=900 "
                 + "picker_action=true picker_persisted=true "
                 + "scheduler=300->900 "
+                + "detailed_attempt_cadence=3600 startup=quick "
+                + "quick_join=restored newer_attempt=preserved "
+                + "external_attempt=actual-start stale_idle=ignored "
                 + "invalid_ignored=true"
+        )
+        return 0
+    }
+}
+
+/// Exercises the shipped native approval state machine and the real NSAlert
+/// configuration with synthetic completion callbacks. It neither presents a
+/// system permission dialog nor constructs a companion or Keychain broker.
+@MainActor
+private enum NativeKeychainMigrationUIContractSmokeTest {
+    static func run() -> Int32 {
+        _ = NSApplication.shared
+        let explanation = NativeKeychainMigrationApproval.makeExplanation()
+        guard explanation.alertStyle == .informational,
+              explanation.buttons.count == 2,
+              explanation.buttons[0].title ==
+                TiboTattleLocalization.string(.commonCancel),
+              explanation.buttons[0].keyEquivalent == "\r",
+              explanation.buttons[1].title == TiboTattleLocalization.string(
+                .dialogApproveKeychainMigration
+              ),
+              explanation.buttons[1].keyEquivalent.isEmpty,
+              explanation.informativeText == TiboTattleLocalization.string(
+                .dialogKeychainMigrationDescription
+              )
+        else { return 1 }
+
+        var approvalCalls = 0
+        var refreshCalls = 0
+        var confirmationCalls = 0
+        var finishApproval: ((Bool) -> Void)?
+        let state = NativeKeychainMigrationApproval(
+            approve: { completion in
+                approvalCalls += 1
+                finishApproval = completion
+            },
+            onMigrationCompleted: { refreshCalls += 1 }
+        )
+        state.observe(.idle)
+        guard !state.showsSettings, !state.showsMenuItem,
+              !state.canReview, refreshCalls == 0
+        else { return 1 }
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: true, isApproving: false
+        ))
+        state.review { complete in
+            confirmationCalls += 1
+            complete(true)
+        }
+        guard state.showsSettings, !state.showsMenuItem,
+              !state.canReview, confirmationCalls == 0, approvalCalls == 0,
+              state.summaryKey == .settingsKeychainMigrationRetrying
+        else { return 1 }
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: false, isApproving: false
+        ))
+        guard state.showsMenuItem, state.canReview else { return 1 }
+
+        var cancelledReview: ((Bool) -> Void)?
+        state.review { complete in
+            confirmationCalls += 1
+            cancelledReview = complete
+            complete(false)
+            // A late/duplicate callback may not turn cancellation into approval.
+            complete(true)
+        }
+        guard approvalCalls == 0, refreshCalls == 0,
+              state.canReview, !state.lastApprovalDeferred
+        else { return 1 }
+
+        var staleReviewIgnored = false
+        state.review { complete in
+            cancelledReview?(true)
+            staleReviewIgnored = approvalCalls == 0 && state.isReviewing
+            complete(true)
+        }
+        state.review { complete in
+            confirmationCalls += 1
+            complete(true)
+        }
+        guard approvalCalls == 1, confirmationCalls == 1, staleReviewIgnored,
+              state.approvalInFlight, !state.canReview,
+              state.summaryKey == .settingsKeychainMigrationApproving
+        else { return 1 }
+        finishApproval?(false)
+        finishApproval?(true)
+        guard state.canReview, state.lastApprovalDeferred,
+              state.summaryKey == .settingsKeychainMigrationDeferred,
+              refreshCalls == 0
+        else { return 1 }
+
+        let staleApprovalCompletion = finishApproval
+        state.review { complete in complete(true) }
+        staleApprovalCompletion?(true)
+        guard state.approvalInFlight else { return 1 }
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: false, isApproving: true
+        ))
+        state.observe(.idle)
+        finishApproval?(true)
+        state.observe(.idle)
+        guard approvalCalls == 2, refreshCalls == 1,
+              !state.showsSettings, !state.showsMenuItem,
+              !state.canReview, !state.lastApprovalDeferred
+        else { return 1 }
+
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: true, isApproving: false
+        ))
+        state.observe(.idle)
+        state.observe(.idle)
+        guard refreshCalls == 2, approvalCalls == 2 else { return 1 }
+
+        var finishReview: ((Bool) -> Void)?
+        state.observe(KeychainMigrationStatus(
+            pendingCount: 1, isRetrying: false, isApproving: false
+        ))
+        state.review { finishReview = $0 }
+        state.observe(.idle)
+        finishReview?(true)
+        guard approvalCalls == 2, refreshCalls == 3,
+              !state.isReviewing, !state.approvalInFlight
+        else { return 1 }
+        print(
+            "USAGE_MONITOR_MACOS_KEYCHAIN_MIGRATION_UI_CONTRACT "
+                + "automatic_prompt=false retrying=quiet "
+                + "cancel=preserved denial=preserved "
+                + "approval=explicit duplicate_ignored=true "
+                + "refresh=transition_only keychain_access=false"
         )
         return 0
     }
@@ -8820,7 +10166,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             ("prospective", .prospective),
         ]
         for (rawPhase, expectedPhase) in phases {
-            guard case let .running(decodedRefreshID, progress) = decode(
+            guard case let .running(decodedRefreshID, progress, _) = decode(
                 progress: ["phase": rawPhase]
             ),
                 decodedRefreshID == refreshID,
@@ -8831,7 +10177,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             }
         }
 
-        guard case let .running(_, quickProgress) = decode(
+        guard case let .running(_, quickProgress, _) = decode(
             progress: ["phase": "quick_result"]
         ),
               quickProgress?.nativeToolbarTitle(
@@ -8859,7 +10205,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             TiboTattleLocalization.integerString(42),
             TiboTattleLocalization.integerString(180)
         )
-        guard case let .running(_, countedProgress) = counted,
+        guard case let .running(_, countedProgress, _) = counted,
               countedProgress == LocalAnalysisProgress(
                 phase: .rolloutIndex,
                 filesSelected: 180,
@@ -8879,7 +10225,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "filesProcessed": 42,
             "recordsWritten": 9_000,
         ])
-        guard case let .running(_, unifiedProgress) = unified,
+        guard case let .running(_, unifiedProgress, _) = unified,
               unifiedProgress == LocalAnalysisProgress(
                 phase: .rolloutIndex,
                 filesSelected: 180,
@@ -8894,7 +10240,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "kind": "accounting",
             "status": "calculating",
         ]
-        guard case let .running(_, accountingProgress) = decode(
+        guard case let .running(_, accountingProgress, _) = decode(
             progress: accountingMarker
         ),
               accountingProgress == LocalAnalysisProgress(
@@ -8921,7 +10267,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             ["phase": "accounting"],
         ]
         for invalid in invalidAccounting {
-            guard case let .running(_, progress) = decode(progress: invalid),
+            guard case let .running(_, progress, _) = decode(progress: invalid),
                   progress == nil
             else {
                 return failure("accounting exact-key boundary")
@@ -8945,7 +10291,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "filesProcessed": 0,
             "recordsWritten": 0,
         ])
-        guard case let .running(_, unifiedZeroProgress) = unifiedZero,
+        guard case let .running(_, unifiedZeroProgress, _) = unifiedZero,
               unifiedZeroProgress?.nativeToolbarTitle()
                 == TiboTattleLocalization.string(
                     .nativeDashboardProgressAnalyzing
@@ -8973,9 +10319,9 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "recordsWritten": 9_000,
             "path": "/Users/private/repository",
         ])
-        guard case let .running(_, invalidUnifiedProgress) = invalidUnified,
+        guard case let .running(_, invalidUnifiedProgress, _) = invalidUnified,
               invalidUnifiedProgress == nil,
-              case let .running(_, forgedUnifiedProgress) = forgedUnified,
+              case let .running(_, forgedUnifiedProgress, _) = forgedUnified,
               forgedUnifiedProgress == nil
         else {
             return failure("unified index closed contract")
@@ -8986,7 +10332,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "filesSelected": 1_000_000_001,
             "filesProcessed": -1,
         ])
-        guard case let .running(_, unsafeProgress) = unsafe,
+        guard case let .running(_, unsafeProgress, _) = unsafe,
               unsafeProgress?.filesSelected == nil,
               unsafeProgress?.filesProcessed == nil
         else {
@@ -8998,7 +10344,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "filesSelected": true,
             "filesProcessed": 4.5,
         ])
-        guard case let .running(_, malformedProgress) = malformed,
+        guard case let .running(_, malformedProgress, _) = malformed,
               malformedProgress?.filesSelected == nil,
               malformedProgress?.filesProcessed == nil
         else {
@@ -9010,7 +10356,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "filesSelected": 2,
             "filesProcessed": 3,
         ])
-        guard case let .running(_, contradictoryProgress) = contradictory,
+        guard case let .running(_, contradictoryProgress, _) = contradictory,
               contradictoryProgress?.nativeToolbarTitle()
                 == TiboTattleLocalization.string(
                     .nativeDashboardProgressAnalyzing
@@ -9023,7 +10369,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "kind": "archive_index",
             "status": "scanning",
         ])
-        guard case let .running(_, archiveProgress) = archive,
+        guard case let .running(_, archiveProgress, _) = archive,
               archiveProgress?.phase == .archiveIndex
         else {
             return failure("archive phase")
@@ -9033,7 +10379,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
             "phase": "server_supplied_unreviewed_phase",
             "message": "server supplied prose",
         ])
-        guard case let .running(_, unknownProgress) = unknown,
+        guard case let .running(_, unknownProgress, _) = unknown,
               unknownProgress == nil
         else {
             return failure("unknown phase")
@@ -9061,6 +10407,43 @@ private enum NativeAnalysisProgressContractSmokeTest {
             return failure("idle contract")
         }
 
+        let startedAt = "2026-09-01T12:00:00.000Z"
+        let receiptDate = Date(timeIntervalSince1970: 1_788_264_000)
+        for mode in ["quick", "detailed"] {
+            for status in ["running", "succeeded", "failed", "cancelled"] {
+                let payload: [String: Any] = ["refresh": [
+                    "status": status,
+                    "refreshId": refreshID,
+                    "mode": mode,
+                    "startedAt": startedAt,
+                ]]
+                guard let data = try? JSONSerialization.data(withJSONObject: payload),
+                      let activity = LocalCompanionEvidenceReader.decodeActivity(data),
+                      activity.attempt == LocalAnalysisAttempt(
+                        mode: LocalAnalysisMode(rawValue: mode)!,
+                        startedAt: receiptDate
+                      )
+                else { return failure("mode/start receipt") }
+            }
+        }
+        let invalidReceipts: [[String: Any]] = [
+            ["mode": "automatic", "startedAt": startedAt],
+            ["mode": true, "startedAt": startedAt],
+            ["mode": "detailed", "startedAt": "2026-09-01T12:00:00Z"],
+            ["mode": "detailed", "startedAt": "not a timestamp"],
+            ["mode": "detailed", "startedAt": 1_788_264_000],
+            ["mode": "detailed"],
+            ["startedAt": startedAt],
+        ]
+        for invalid in invalidReceipts {
+            var refresh: [String: Any] = ["status": "running", "refreshId": refreshID]
+            refresh.merge(invalid) { _, replacement in replacement }
+            guard let data = try? JSONSerialization.data(withJSONObject: ["refresh": refresh]),
+                  let activity = LocalCompanionEvidenceReader.decodeActivity(data),
+                  activity.attempt == nil
+            else { return failure("invalid mode/start receipt") }
+        }
+
         print(
             "USAGE_MONITOR_MACOS_ANALYSIS_PROGRESS_CONTRACT "
                 + "phases=allowlisted archive=scanning unified=scanning "
@@ -9068,6 +10451,7 @@ private enum NativeAnalysisProgressContractSmokeTest {
                 + "counts=bounded quick_result=evidence-gated "
                 + "contradictory=generic unknown=generic free_text=ignored "
                 + "idle=unchanged terminal=automatic-backoff "
+                + "attempt=mode-and-actual-start "
                 + "percent=false eta=false"
         )
         return 0
@@ -10251,6 +11635,41 @@ private enum MenuBarContractSmokeTest {
         )
         popup.update(snapshot: liveSnapshot, now: observedAt)
         let sevenDayPopup = popup.nativePresentationContract()
+        let overflowPopup = MenuBarPopoverViewController(
+            productName: BundledProduct.displayName,
+            brandImage: NSApp.applicationIconImage,
+            actions: MenuBarPopoverViewController.Actions(
+                openTiboTattle: {},
+                refresh: {},
+                showMore: { _ in }
+            )
+        )
+        var oneLaneSnapshot = liveSnapshot
+        oneLaneSnapshot.lanes = [weeklyLane]
+        let syntheticVisibleFrame = NSRect(
+            x: 0,
+            y: 40,
+            width: 1_440,
+            height: 800
+        )
+        let syntheticAnchorMinY: CGFloat = 428
+        overflowPopup.update(snapshot: oneLaneSnapshot, now: observedAt)
+        let oneLaneViewportCap = overflowPopup.prepareForPresentationForSmokeTest(
+            anchorMinY: syntheticAnchorMinY,
+            visibleFrame: syntheticVisibleFrame
+        )
+        let oneLaneOverflowAtTop = overflowPopup.nativePresentationContract()
+        overflowPopup.scrollToVerticalOffsetForSmokeTest(72)
+        let oneLaneOverflowScrolled = overflowPopup.nativePresentationContract()
+        overflowPopup.update(snapshot: liveSnapshot, now: observedAt)
+        let twoLaneOverflowPreserved = overflowPopup.nativePresentationContract()
+        overflowPopup.scrollToBottomForSmokeTest()
+        let twoLaneOverflowAtBottom = overflowPopup.nativePresentationContract()
+        let twoLaneViewportCap = overflowPopup.prepareForPresentationForSmokeTest(
+            anchorMinY: syntheticAnchorMinY,
+            visibleFrame: syntheticVisibleFrame
+        )
+        let twoLaneOverflowAtTop = overflowPopup.nativePresentationContract()
         popup.selectHistoryRangeForSmokeTest(.thirtyDays)
         let thirtyDayPopup = popup.nativePresentationContract()
         popup.update(snapshot: analyzingLiveSnapshot, now: observedAt)
@@ -10322,6 +11741,72 @@ private enum MenuBarContractSmokeTest {
         noCompanionSnapshot.phase = .unavailable
         popup.update(snapshot: noCompanionSnapshot, now: observedAt)
         let noCompanionPopup = popup.nativePresentationContract()
+        let overflowGeometryChecks: [(String, Bool)] = [
+            ("natural-two-lane-fits-without-cap", !sevenDayPopup.verticalScrollingRequired),
+            ("natural-two-lane-starts-at-top", sevenDayPopup.contentStartsAtTop),
+            ("one-lane-count", oneLaneOverflowAtTop.visibleAllowanceLaneCount == 1),
+            ("one-lane-overflows", oneLaneOverflowAtTop.verticalScrollingRequired),
+            ("one-lane-vertical-only", !oneLaneOverflowAtTop.horizontalScrollingEnabled),
+            ("one-lane-starts-at-top", oneLaneOverflowAtTop.contentStartsAtTop),
+            ("one-lane-header-visible", oneLaneOverflowAtTop.headerVisible),
+            ("synthetic-cap-exact", oneLaneViewportCap == 360),
+            (
+                "forced-viewport-height",
+                oneLaneOverflowAtTop.viewportHeight == oneLaneViewportCap
+            ),
+            (
+                "one-lane-document-exceeds-viewport",
+                oneLaneOverflowAtTop.documentHeight > oneLaneOverflowAtTop.viewportHeight
+            ),
+            ("smoke-scroll-moves", !oneLaneOverflowScrolled.contentStartsAtTop),
+            ("smoke-scroll-positive", oneLaneOverflowScrolled.verticalScrollOffset > 0),
+            ("two-lane-count", twoLaneOverflowPreserved.visibleAllowanceLaneCount == 2),
+            ("two-lane-overflows", twoLaneOverflowPreserved.verticalScrollingRequired),
+            ("two-lane-vertical-only", !twoLaneOverflowPreserved.horizontalScrollingEnabled),
+            (
+                "poll-preserves-scroll",
+                abs(
+                    twoLaneOverflowPreserved.verticalScrollOffset
+                        - oneLaneOverflowScrolled.verticalScrollOffset
+                ) <= 0.5
+            ),
+            (
+                "two-lanes-grow-document",
+                twoLaneOverflowPreserved.documentHeight
+                    > oneLaneOverflowAtTop.documentHeight
+            ),
+            (
+                "bottom-offset-reached",
+                abs(
+                    twoLaneOverflowAtBottom.verticalScrollOffset
+                        - twoLaneOverflowAtBottom.maximumVerticalScrollOffset
+                ) <= 0.5
+            ),
+            ("bottom-offset-positive", twoLaneOverflowAtBottom.maximumVerticalScrollOffset > 0),
+            ("bottom-footer-actions-visible", twoLaneOverflowAtBottom.footerActionsVisible),
+            ("bottom-header-hidden", !twoLaneOverflowAtBottom.headerVisible),
+            ("reopen-synthetic-cap-exact", twoLaneViewportCap == 360),
+            ("reopen-two-lane-count", twoLaneOverflowAtTop.visibleAllowanceLaneCount == 2),
+            ("reopen-two-lane-overflows", twoLaneOverflowAtTop.verticalScrollingRequired),
+            ("reopen-two-lane-vertical-only", !twoLaneOverflowAtTop.horizontalScrollingEnabled),
+            ("reopen-starts-at-top", twoLaneOverflowAtTop.contentStartsAtTop),
+            ("reopen-zero-offset", twoLaneOverflowAtTop.verticalScrollOffset == 0),
+            ("reopen-header-visible", twoLaneOverflowAtTop.headerVisible),
+            ("reopen-footer-actions-below-fold", !twoLaneOverflowAtTop.footerActionsVisible),
+        ]
+        if let failed = overflowGeometryChecks.first(where: { !$0.1 }) {
+            FileHandle.standardError.write(Data(
+                ("macOS menu bar overflow smoke failed: \(failed.0) "
+                    + "one_document=\(oneLaneOverflowAtTop.documentHeight) "
+                    + "two_document=\(twoLaneOverflowAtTop.documentHeight) "
+                    + "viewport=\(twoLaneOverflowAtTop.viewportHeight) "
+                    + "one_offset=\(oneLaneOverflowScrolled.verticalScrollOffset) "
+                    + "two_offset=\(twoLaneOverflowPreserved.verticalScrollOffset) "
+                    + "bottom_offset=\(twoLaneOverflowAtBottom.verticalScrollOffset) "
+                    + "maximum_offset=\(twoLaneOverflowAtBottom.maximumVerticalScrollOffset)\n").utf8
+            ))
+            return 1
+        }
         guard starting.informationRowsAreNative,
               starting.informationRowsHaveTitles,
               unavailable.informationRowsAreNative,
@@ -10333,7 +11818,7 @@ private enum MenuBarContractSmokeTest {
               starting.statusItemButtonRoutesClicks,
               starting.popoverIsTransient,
               starting.popoverContentWidth == 400,
-              !starting.popoverContainsScrollView,
+              starting.popoverContainsScrollView,
               starting.escapeDismissalMonitorInstalled,
               starting.sameAppClickAwayMonitorInstalled,
               starting.appDeactivationDismissalObserverInstalled,
@@ -10349,7 +11834,8 @@ private enum MenuBarContractSmokeTest {
               liveSummary == expectedLiveSummary,
               staleSummary == expectedStaleSummary,
               sevenDayPopup.contentWidth == 400,
-              !sevenDayPopup.containsScrollView,
+              sevenDayPopup.containsScrollView,
+              !sevenDayPopup.horizontalScrollingEnabled,
               sevenDayPopup.visibleAllowanceLaneCount == 2,
               sevenDayPopup.weeklyPaceVisible,
               sevenDayPopup.weeklyPaceState == .over,
@@ -10426,6 +11912,7 @@ private enum MenuBarContractSmokeTest {
                 + "pricing=complete,partial,unavailable model=dst,overlap,future,per-lane "
                 + "reset_credits=absent analysis_title=live-fallback "
                 + "history_retention=refresh,failure,source-reset"
+                + " overflow=screen-capped,vertical-only,top-reset,poll-preserved"
         )
         return 0
     }
@@ -11594,7 +13081,67 @@ private enum NativeSettingsLayoutSmokeTest {
 /// loopback server is healthy but WebKit receives no usable display frame.
 @MainActor
 private enum NativeDashboardLayoutSmokeTest {
+    /// Executes the same clock/generation policy used by the real WebKit host.
+    /// No sleeps, page loads, companion, credentials or user data are involved.
+    private static func readinessContract() -> Bool {
+        var state = NativeDashboardReadiness()
+        let initial = state.invalidate()
+        guard state.observe(generation: initial, at: 0, ready: true) == .ignored,
+              state.start(generation: initial, at: 0),
+              !state.start(generation: initial, at: 1),
+              state.observe(generation: initial, at: 0, ready: false) == .waiting(0.25),
+              state.observe(generation: initial, at: 19.9, ready: false) == .waiting(0.25),
+              state.observe(generation: initial, at: 20, ready: false) == .takingLonger,
+              state.observe(generation: initial, at: 21, ready: false) == .waiting(1),
+              state.observe(generation: initial, at: 35, ready: true) == .ready,
+              state.observe(generation: initial, at: 36, ready: true) == .ignored,
+              !state.isObserving(initial)
+        else { return false }
+
+        let replacement = state.invalidate()
+        guard replacement != initial,
+              state.start(generation: replacement, at: 40),
+              // Both a late success and the old deadline are inert.
+              state.observe(generation: initial, at: 45, ready: true) == .ignored,
+              state.observe(generation: initial, at: 125, ready: false) == .ignored,
+              state.observe(generation: replacement, at: 45, ready: false) == .waiting(0.25),
+              state.observe(generation: replacement, at: 60, ready: false) == .takingLonger,
+              // The watchdog still expires if JavaScript never answers.
+              state.observe(generation: replacement, at: 159.9, ready: false) == .waiting(1),
+              state.observe(generation: replacement, at: 160, ready: false) == .timedOut,
+              state.observe(generation: replacement, at: 161, ready: true) == .ignored,
+              !state.isObserving(replacement)
+        else { return false }
+
+        let stopped = state.invalidate()
+        guard state.start(generation: stopped, at: 200) else { return false }
+        let next = state.invalidate()
+        guard state.observe(generation: stopped, at: 201, ready: true) == .ignored,
+              !state.isObserving(next),
+              state.start(generation: next, at: 201),
+              state.observe(generation: next, at: 202, ready: true) == .ready,
+              state.observe(generation: next, at: 203, ready: true) == .ignored
+        else { return false }
+
+        let tooLate = state.invalidate()
+        guard state.start(generation: tooLate, at: 300),
+              state.observe(generation: tooLate, at: 420, ready: true) == .timedOut
+        else { return false }
+        return true
+    }
+
     static func run() -> Int32 {
+        guard readinessContract() else {
+            FileHandle.standardError.write(Data(
+                "macOS dashboard readiness lifecycle smoke failed\n".utf8
+            ))
+            return 1
+        }
+        print(
+            "USAGE_MONITOR_MACOS_DASHBOARD_READINESS "
+                + "early=true late=true once=true stale_callbacks=ignored "
+                + "cancelled=true hung_renderer=bounded hard_deadline=120"
+        )
         let application = NSApplication.shared
         application.setActivationPolicy(.accessory)
         let host = DashboardWebHost(
@@ -12324,8 +13871,17 @@ private struct UsageMonitorMain {
         if arguments.contains("--login-item-contract-smoke-test") {
             exit(LoginItemContractSmokeTest.run())
         }
+        if arguments.contains("--updater-architecture-contract-smoke-test") {
+            exit(MacOSUpdaterFeedPolicy.runContractSmokeTest())
+        }
         BundledProduct.validateRuntimeIdentity()
         if arguments.contains("--keychain-broker-contract-smoke-test") {
+            guard CompanionProcess.verifyKeychainLaunchContract() else { exit(1) }
+            print(
+                "USAGE_MONITOR_MACOS_KEYCHAIN_LAUNCH_CONTRACT "
+                    + "required=true failures=construction,endpoint "
+                    + "child_started=false stop_callbacks=once keychain_access=0"
+            )
             exit(ContributionDeviceKeychainBroker.runContractSmokeTest())
         }
         let semanticOpenTarget = SemanticOpenTarget(
@@ -12407,6 +13963,14 @@ private struct UsageMonitorMain {
         }
         if arguments.contains("--native-refresh-settings-contract-smoke-test") {
             exit(NativeRefreshSettingsContractSmokeTest.run())
+        }
+        if arguments.contains(
+            "--native-keychain-migration-ui-contract-smoke-test"
+        ) {
+            guard BundledProduct.buildChannel == "development" else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                NativeKeychainMigrationUIContractSmokeTest.run()
+            })
         }
         if arguments.contains(
             "--native-appearance-settings-contract-smoke-test"

@@ -33,6 +33,8 @@ import {
   recheckProductionPublicSurface,
 } from "./production-deploy.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
+import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
+import { workerDirectory as checkedInWorkerDirectory } from "./staging-test-fixtures.mjs";
 import {
   createPublicReleaseSourceProvenance,
   PUBLIC_RELEASE_MANIFEST_SCHEMA,
@@ -101,6 +103,12 @@ async function immutableSnapshotFixture() {
   }
 
   const generatedFiles = {
+    "styles.css": "body { color: green; }\n",
+    "ui-format.js": "export const format = true;\n",
+    "localization.js": "export const localization = true;\n",
+    "i18n.generated.js": "export const catalog = {};\n",
+    "community-data.js": "export const data = true;\n",
+    "community-view.js": "export const view = true;\n",
     "community.js": "console.log('snapshot community');\n",
     "index.html": '<script type="module" src="./community.js"></script>\n',
     "robots.txt": "User-agent: *\nAllow: /\nSitemap: https://example.test/sitemap.xml\n",
@@ -1061,6 +1069,56 @@ test("pending-migration discovery reads only the remote ledger and reports the e
   });
 });
 
+test("reconciled production ledger preserves the historical prefix and refuses alternate applied histories", async () => {
+  const expected = EXPECTED_STAGING_MIGRATIONS;
+  const ledgerRows = (names) => names.map((name, index) => ({ id: index + 1, name }));
+  const historicalPrefix = expected.USAGE_MONITOR_DB.slice(0, 41);
+  assert.equal(historicalPrefix.at(-1), "0041_community_model_composition_cache.sql");
+  const calls = [];
+  const inspect = (primary, spawnedArgs = []) => determinePendingProductionMigrations({
+    wrangler: "/fake/wrangler",
+    workerDirectory: checkedInWorkerDirectory,
+    spawn: ledgerSpawn({
+      USAGE_MONITOR_DB: ledgerRows(primary),
+      DELETION_LEDGER: ledgerRows(expected.DELETION_LEDGER),
+    }, spawnedArgs),
+  });
+  assert.deepEqual(await inspect(historicalPrefix, calls), {
+    ok: true,
+    code: null,
+    pending: [
+      "USAGE_MONITOR_DB:0042_community_model_composition.sql",
+      "USAGE_MONITOR_DB:0043_analytical_input_fencing.sql",
+      "USAGE_MONITOR_DB:0044_attribution_transport_staging.sql",
+      "USAGE_MONITOR_DB:0045_attribution_domain_activation.sql",
+    ],
+  });
+  assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB), { ok: true, code: null, pending: [] });
+  for (const applied of [
+    [...historicalPrefix.slice(0, 40), "0041_community_model_composition.sql"],
+    [...historicalPrefix.slice(0, 40), "0041_community_model_composition.sql",
+      "0042_analytical_input_fencing.sql", "0043_attribution_transport_staging.sql",
+      "0044_attribution_domain_activation.sql"],
+    [...historicalPrefix, "0041_community_model_composition.sql"],
+  ]) {
+    const result = await inspect(applied);
+    const index = applied[40] === historicalPrefix[40] ? 41 : 40;
+    assert.deepEqual(result, {
+      ok: false,
+      code: "PRODUCTION_MIGRATION_LEDGER_DRIFT",
+      detail: {
+        binding: "USAGE_MONITOR_DB",
+        appliedCount: applied.length,
+        localCount: 45,
+        firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
+      },
+    });
+  }
+  assert.equal(calls.length, 2);
+  assert.equal(calls.every((args) => args[0] === "d1" && args[1] === "execute"
+    && args.includes(PRODUCTION_MIGRATION_LEDGER_SQL) && !args.includes("apply")), true);
+});
+
 test("pending-migration discovery fails closed on unreadable, drifted, or undeterminable state", async (t) => {
   const workerDirectory = await migrationGateFixture();
   t.after(() => rm(workerDirectory, { recursive: true, force: true }));
@@ -1227,7 +1285,11 @@ test("production public-surface recheck requires a public root and real 404s for
   assert.equal(calls[2].url, PUBLIC_SITEMAP_URL);
   assert.equal(calls[3].url, PUBLIC_WWW_ROOT_URL);
   assert.equal(calls[3].request.redirect, "manual");
-  assert.equal(calls.length, 13);
+  assert.equal(calls.length, 14);
+  assert.equal(calls.some(({ url }) => url === new URL(
+    "/telemetry-shared.generated.js",
+    PUBLIC_ROOT_URL,
+  ).href), true);
   assert.equal(calls.some(({ url }) => url === new URL(
     "/api/v1/admin/community/allowance-preview",
     PUBLIC_ROOT_URL,

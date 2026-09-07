@@ -29,7 +29,16 @@ import { normalizeProviderTier } from "./tier-normalization.js";
 // Restated in src/local-unified-index-extract.js; keep the two identical.
 export const CUMULATIVE_DELTA_VS_LAST_TOLERANCE_TOKENS = 16;
 
-export function createCodexLogParser({ lineReader }) {
+export function createCodexLogParser({ lineReader, createSha256 }) {
+  function toolSnapshotKey(line) {
+    // Only retain an in-memory digest of the already-bounded source line.
+    // Inline fork prefixes copy whole records; a reused call id alone does
+    // not establish replay. Keep this domain separate from cumulative keys.
+    return `tool-line:v1:${createSha256()
+      .update("app-usagemonitor/scanner-tool-snapshot-line/v1\0")
+      .update(line, "utf8").digest("hex")}`;
+  }
+
   function boundedScannerLines(
     source,
     resourceGuard,
@@ -69,17 +78,26 @@ export function createCodexLogParser({ lineReader }) {
     )) {
       throwIfAborted(signal);
       if (line === null) continue;
-      if (!line.includes('"token_count"')) continue;
+      if (!line.includes('"token_count"') && !line.includes('"response_item"')) continue;
+      let record;
       try {
-        const record = JSON.parse(line);
-        if (record.type !== "event_msg" || record.payload?.type !== "token_count") continue;
-        const total = normalizeTokenUsage(record.payload?.info?.total_token_usage);
-        const last = normalizeTokenUsage(record.payload?.info?.last_token_usage);
-        const key = cumulativeSnapshotKey(total, last);
-        if (key) target.add(key);
+        record = JSON.parse(line);
       } catch {
         // Excluded rollouts support in-memory lineage only; their parse errors are not emitted.
+        continue;
       }
+      if (record.type === "response_item") {
+        if (typeof record.timestamp === "string" && Number.isFinite(Date.parse(record.timestamp))
+            && extractToolObservations(record.payload).length > 0) {
+          target.add(toolSnapshotKey(line));
+        }
+        continue;
+      }
+      if (record.type !== "event_msg" || record.payload?.type !== "token_count") continue;
+      const total = normalizeTokenUsage(record.payload?.info?.total_token_usage);
+      const last = normalizeTokenUsage(record.payload?.info?.last_token_usage);
+      const key = cumulativeSnapshotKey(total, last);
+      if (key) target.add(key);
     }
   }
 
@@ -195,6 +213,12 @@ export function createCodexLogParser({ lineReader }) {
         }
         continue;
       }
+      if (record.type === "response_item") {
+        if (snapshots !== null && extractToolObservations(record.payload).length > 0) {
+          snapshots.add(toolSnapshotKey(line));
+        }
+        continue;
+      }
       if (record.type !== "event_msg") continue;
       if (record.payload?.type === "thread_settings_applied") {
         const settings = record.payload?.thread_settings;
@@ -242,6 +266,7 @@ export function createCodexLogParser({ lineReader }) {
     forked,
     inheritedSnapshots,
     rolloutSnapshots,
+    collectOwnSnapshots = false,
     startMs,
     endMs,
     seenEvents,
@@ -256,6 +281,7 @@ export function createCodexLogParser({ lineReader }) {
     serverBillableUnits,
     surfaceClassification,
     sourceScopeId,
+    sourceOccurrenceScopeId = null,
     sourceDedupeScope,
     resourceGuard,
     maximumTotalBytes = Number.POSITIVE_INFINITY,
@@ -394,6 +420,14 @@ export function createCodexLogParser({ lineReader }) {
         const observations = extractToolObservations(record.payload);
         if (observations.length > 0) {
           if (timestampMs < startMs || timestampMs > endMs) continue;
+          if (collectOwnSnapshots || forked) {
+            const lineageKey = toolSnapshotKey(line);
+            rolloutSnapshots.add(lineageKey);
+            if (forked && inheritedSnapshots.has(lineageKey)) {
+              diagnostics.replayedToolCallsSkipped += 1;
+              continue;
+            }
+          }
           const stableId = record.payload?.call_id ?? record.payload?.id;
           const toolKey = [sourceDedupeScope, sourceRecordOrdinal, stableId ?? "no-provider-id", record.payload?.type].join("|");
           if (seenToolCalls.has(toolKey)) {
@@ -409,6 +443,7 @@ export function createCodexLogParser({ lineReader }) {
               model: currentModel ?? "unknown",
               surfaceClassification,
               ...(sourceScopeId ? { sourceScopeId } : {}),
+              ...(sourceOccurrenceScopeId ? { sourceOccurrenceScopeId } : {}),
               sourceRecordOrdinal,
               ...observation,
             });
@@ -463,6 +498,7 @@ export function createCodexLogParser({ lineReader }) {
           window,
           surfaceClassification,
           ...(sourceScopeId ? { sourceScopeId } : {}),
+          ...(sourceOccurrenceScopeId ? { sourceOccurrenceScopeId } : {}),
           sourceRecordOrdinal,
         }));
       }
@@ -552,6 +588,7 @@ export function createCodexLogParser({ lineReader }) {
         surfaceClassification,
         sourceRolloutOrdinal,
         ...(sourceScopeId ? { sourceScopeId } : {}),
+        ...(sourceOccurrenceScopeId ? { sourceOccurrenceScopeId } : {}),
         sourceRecordOrdinal,
       });
     }

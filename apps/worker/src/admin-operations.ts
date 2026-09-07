@@ -561,6 +561,10 @@ export async function readAdminOverview(
                   SELECT 1 FROM telemetry_v1_chunks
                    WHERE r2_key = pending.r2_key
                 )
+                OR EXISTS (
+                  SELECT 1 FROM telemetry_v11_chunks
+                   WHERE r2_key = pending.r2_key
+                )
               ) THEN 1 ELSE 0 END) AS due_referenced,
               SUM(CASE WHEN registered_at <= ?1
                 AND NOT EXISTS (
@@ -572,6 +576,10 @@ export async function readAdminOverview(
                 )
                 AND NOT EXISTS (
                   SELECT 1 FROM telemetry_v1_chunks
+                   WHERE r2_key = pending.r2_key
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM telemetry_v11_chunks
                    WHERE r2_key = pending.r2_key
                 )
                 THEN 1 ELSE 0 END) AS due_unreferenced,

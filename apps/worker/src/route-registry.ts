@@ -175,6 +175,36 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     authority: "device",
   },
   {
+    pathname: "/api/v1/device/sync-capabilities",
+    id: "device_sync_capabilities",
+    methods: ["GET"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/me/device-telemetry-consents",
+    id: "telemetry_v11_consent",
+    methods: ["POST"],
+    authority: "session",
+  },
+  {
+    pathname: "/api/v1/device/telemetry/v1.1/day-manifests",
+    id: "telemetry_v11_day_manifests",
+    methods: ["GET", "POST"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/me/telemetry-v11/domain-predecessor",
+    id: "telemetry_v11_domain_predecessor",
+    methods: ["POST"],
+    authority: "device",
+  },
+  {
+    pathname: "/api/v1/me/telemetry-v11/domain-activate",
+    id: "telemetry_v11_domain_activate",
+    methods: ["POST"],
+    authority: "device",
+  },
+  {
     pathname: "/api/v1/device/sync/manifest",
     id: "device_sync_manifest",
     methods: ["GET"],
