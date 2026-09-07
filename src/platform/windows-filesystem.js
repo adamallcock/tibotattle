@@ -392,6 +392,13 @@ export function createWindowsFilesystemAdapter({
       && native.pathWalkRaceSafe === true,
     pathWalkRaceSafe: approvedPolicy?.pathWalkRaceSafe === true
       && native.pathWalkRaceSafe === true,
+    // These are the two narrow capability facts that the verified native
+    // sidecar actually publishes.  An injected source-test binding has no
+    // approved sidecar, so it cannot acquire either qualification fact.
+    credentialMutexSafe: approvedPolicy?.credentialMutexSafe === true
+      && native.credentialMutexSafe === true,
+    credentialAuditFileGuardSafe: approvedPolicy?.credentialAuditFileGuardSafe === true
+      && native.credentialAuditFileGuardSafe === true,
     // The binding source exports these root-bound child operations. Keep them
     // optional at this v1 manifest boundary until a native Windows build and
     // qualification record make the installed binary surface required. The

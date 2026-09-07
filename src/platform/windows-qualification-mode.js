@@ -607,9 +607,8 @@ function validateAdapter(adapter) {
     valid = isWindowsFilesystemAdapter(adapter)
       && adapter.productionSafe === false
       && adapter.pathWalkRaceSafe === false
-      && adapter.sqliteStateLeaseSafe === false
-      && adapter.preparedArtifactSafe === false
-      && adapter.companionInstanceMutexSafe === false;
+      && adapter.credentialMutexSafe === true
+      && adapter.credentialAuditFileGuardSafe === true;
   } catch {
     valid = false;
   }

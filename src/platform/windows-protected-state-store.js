@@ -137,7 +137,6 @@ function qualificationBindingFor({
       && windowsQualificationModeContext.qualificationOnly === true
       && windowsQualificationModeContext.productionSafe === false
       && adapter.productionSafe === false
-      && adapter.sqliteStateLeaseSafe === false
       && qualificationPathUnderRoot(rootPath, windowsQualificationModeContext.stateRoot);
   } catch {
     valid = false;

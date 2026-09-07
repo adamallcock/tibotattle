@@ -1,7 +1,21 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import {
+  mkdtemp,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
+import {
+  createDesktopFirstRunReceiptBackend,
+  DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+} from "../apps/electron/desktop-first-run.js";
+import {
+  createWindowsFilesystemBindingManifest,
+} from "../scripts/build-windows-filesystem-manifest.mjs";
 import {
   assertWindowsFilesystemProductionSafe,
   createWindowsFilesystemAdapter,
@@ -17,6 +31,10 @@ import {
   WINDOWS_PROTECTED_STATE_STORE_NATIVE_READ_BOUNDED,
   WINDOWS_PROTECTED_STATE_STORE_ROOT_BINDING_SAFE,
 } from "../src/platform/windows-protected-state-store.js";
+import {
+  createWindowsQualificationModeContext,
+  WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS,
+} from "../src/platform/windows-qualification-mode.js";
 
 const IDENTITY = Object.freeze({
   volumeSerialNumber: "0000000000000001",
@@ -87,6 +105,191 @@ function binding(overrides = {}) {
     releaseCredentialAuditFileGuard: () => {},
     ...overrides,
   };
+}
+
+function sameIdentity(left, right) {
+  return left?.volumeSerialNumber === right?.volumeSerialNumber
+    && left?.fileId === right?.fileId
+    && left?.linkCount === right?.linkCount;
+}
+
+function identityFor(sequence) {
+  return Object.freeze({
+    volumeSerialNumber: IDENTITY.volumeSerialNumber,
+    fileId: sequence.toString(16).padStart(32, "0"),
+    linkCount: 1,
+  });
+}
+
+function protectedMetadata(identity, directory) {
+  return Object.freeze({
+    identity,
+    isDirectory: directory,
+    isRegularFile: !directory,
+    isReparsePoint: false,
+    ownerMatches: true,
+    nullDacl: false,
+    daclProtected: true,
+    broadAccess: false,
+    nonOwnerAllow: false,
+    unrecognizedAce: false,
+    finalPathResolved: true,
+  });
+}
+
+function nativeFailure(code) {
+  const error = new Error("synthetic Windows native operation failed");
+  error.code = `WINDOWS_FILESYSTEM_${code}`;
+  return error;
+}
+
+/**
+ * This fixture is deliberately shaped like the native binding producer: it
+ * contains only the four published claim fields. The manifest is generated
+ * by the production-side builder below, so a qualification consumer cannot
+ * quietly depend on legacy fixture-only claims.
+ */
+function qualificationBinding() {
+  const children = new Map();
+  let nextSequence = 2;
+  const assertRoot = (identity) => {
+    if (!sameIdentity(identity, IDENTITY)) throw nativeFailure("IDENTITY_MISMATCH");
+  };
+  const record = (name) => {
+    const value = children.get(name);
+    if (!value) throw nativeFailure("NOT_FOUND");
+    return value;
+  };
+  const nextIdentity = () => identityFor(nextSequence++);
+
+  return binding({
+    inspectPath() {
+      return protectedMetadata(IDENTITY, true);
+    },
+    ensureDirectory() {
+      return IDENTITY;
+    },
+    inspectProtectedChild(_root, rootIdentity, name) {
+      assertRoot(rootIdentity);
+      return protectedMetadata(record(name).identity, false);
+    },
+    readProtectedChild(_root, rootIdentity, name, maximumBytes) {
+      assertRoot(rootIdentity);
+      const value = record(name);
+      if (!Number.isSafeInteger(maximumBytes) || value.data.byteLength > maximumBytes) {
+        throw nativeFailure("FILE_TOO_LARGE");
+      }
+      return Object.freeze({ data: Buffer.from(value.data), identity: value.identity });
+    },
+    createProtectedChild(_root, rootIdentity, name, data) {
+      assertRoot(rootIdentity);
+      if (children.has(name)) throw nativeFailure("ALREADY_EXISTS");
+      const identity = nextIdentity();
+      children.set(name, Object.freeze({ data: Buffer.from(data), identity }));
+      return identity;
+    },
+    deleteProtectedChild(_root, rootIdentity, name, expectedIdentity) {
+      assertRoot(rootIdentity);
+      const value = record(name);
+      if (!sameIdentity(value.identity, expectedIdentity)) {
+        throw nativeFailure("IDENTITY_MISMATCH");
+      }
+      children.delete(name);
+      return Object.freeze({ deleted: true, identity: value.identity });
+    },
+    replaceProtectedChild(_root, rootIdentity, name, expectedIdentity, data) {
+      assertRoot(rootIdentity);
+      const value = record(name);
+      if (!sameIdentity(value.identity, expectedIdentity)) {
+        throw nativeFailure("IDENTITY_MISMATCH");
+      }
+      const identity = nextIdentity();
+      children.set(name, Object.freeze({ data: Buffer.from(data), identity }));
+      return identity;
+    },
+  });
+}
+
+const QUALIFICATION_RESOURCE_BINDING =
+  "native/windows-filesystem/build/Release/windows_filesystem.node";
+const QUALIFICATION_RESOURCE_BINDING_MANIFEST =
+  `${QUALIFICATION_RESOURCE_BINDING}.manifest.json`;
+const QUALIFICATION_RESOURCE_KEYTAR =
+  "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node";
+
+function qualificationResourceKind(path) {
+  if (path === QUALIFICATION_RESOURCE_BINDING
+      || path === QUALIFICATION_RESOURCE_BINDING_MANIFEST) {
+    return "windows_native_binding";
+  }
+  if (path === QUALIFICATION_RESOURCE_KEYTAR) return "third_party_dependency";
+  if (path === "apps/local/server.js") return "companion_source";
+  if (path === "apps/web/public/index.html") return "dashboard_asset";
+  return "electron_shell";
+}
+
+function qualificationResourceManifest() {
+  const bytes = new Map([
+    [QUALIFICATION_RESOURCE_BINDING, BINDING_BYTES],
+    [QUALIFICATION_RESOURCE_BINDING_MANIFEST, Buffer.from("manifest", "utf8")],
+    [QUALIFICATION_RESOURCE_KEYTAR, Buffer.from("keytar", "utf8")],
+  ]);
+  const paths = new Set([
+    ...WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS,
+    QUALIFICATION_RESOURCE_BINDING,
+    QUALIFICATION_RESOURCE_BINDING_MANIFEST,
+    QUALIFICATION_RESOURCE_KEYTAR,
+  ]);
+  const files = [...paths].map((path) => {
+    const value = bytes.get(path) ?? Buffer.from(path, "utf8");
+    return Object.freeze({
+      bytes: value.byteLength,
+      kind: qualificationResourceKind(path),
+      path,
+      sha256: sha256(value),
+    });
+  }).sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
+  const payload = createHash("sha256");
+  let totalBytes = 0;
+  for (const row of files) {
+    totalBytes += row.bytes;
+    payload.update(`F\0${row.path}\0${row.bytes}\0${row.sha256}\0${row.kind}\0`);
+  }
+  const binding = files.find((row) => row.path === QUALIFICATION_RESOURCE_BINDING);
+  return Object.freeze({
+    schemaVersion: "usage-monitor-electron-runtime-v0.1",
+    target: "win32",
+    architecture: "x64",
+    releaseVersion: "0.1.0-test",
+    entrypoint: "apps/electron/main.js",
+    dashboardRoot: "apps/web/public",
+    files,
+    payload: Object.freeze({ bytes: totalBytes, sha256: payload.digest("hex") }),
+    windowsBinding: Object.freeze({
+      binding: Object.freeze({
+        bytes: binding.bytes,
+        path: QUALIFICATION_RESOURCE_BINDING,
+        sha256: binding.sha256,
+      }),
+      included: true,
+      manifest: Object.freeze({ path: QUALIFICATION_RESOURCE_BINDING_MANIFEST }),
+      status: "included_unverified",
+      verified: false,
+    }),
+  });
+}
+
+async function withQualificationResourceRoot(run) {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-qualification-producer-"));
+  try {
+    await writeFile(
+      join(root, "electron-runtime-manifest.json"),
+      `${JSON.stringify(qualificationResourceManifest())}\n`,
+    );
+    return await run(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 }
 
 test("Windows native loader is inert on non-Windows hosts", () => {
@@ -264,6 +467,68 @@ test("adapter production flags require the reviewed manifest policy as well as n
   });
   assert.equal(adapter.productionSafe, false);
   assert.equal(adapter.pathWalkRaceSafe, false);
+  assert.equal(adapter.credentialMutexSafe, true);
+  assert.equal(adapter.credentialAuditFileGuardSafe, true);
+});
+
+test("verified producer claims compose the qualification context and protected first-run receipt", async () => {
+  const native = qualificationBinding();
+  const sidecar = createWindowsFilesystemBindingManifest({
+    bytes: BINDING_BYTES,
+    binding: native,
+  });
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    bindingPath: "C:\\qualification\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node",
+    resolveBinding: (path) => path,
+    readManifest: () => JSON.stringify(sidecar),
+    readBindingBytes: () => BINDING_BYTES,
+    requireBinding: () => native,
+  });
+  assert.equal(adapter.productionSafe, false);
+  assert.equal(adapter.pathWalkRaceSafe, false);
+  assert.equal(adapter.credentialMutexSafe, true);
+  assert.equal(adapter.credentialAuditFileGuardSafe, true);
+  assert.equal(Object.hasOwn(adapter, "sqliteStateLeaseSafe"), false);
+  assert.equal(Object.hasOwn(adapter, "preparedArtifactSafe"), false);
+  assert.equal(Object.hasOwn(adapter, "companionInstanceMutexSafe"), false);
+
+  await withQualificationResourceRoot(async (resourceRoot) => {
+    const context = createWindowsQualificationModeContext({
+      platform: "win32",
+      architecture: "x64",
+      adapter,
+      resourceRoot,
+      environment: {
+        USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
+        USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
+        USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
+        TEMP: "C:\\qualification",
+        USERPROFILE: "C:\\qualification\\home",
+        HOME: "C:\\qualification\\home",
+        CODEX_HOME: "C:\\qualification\\codex",
+        CLAUDE_CONFIG_DIR: "C:\\qualification\\claude",
+        USAGE_MONITOR_STATE_ROOT: "C:\\qualification\\state",
+      },
+    });
+    const store = createWindowsProtectedStateStore({
+      adapter,
+      rootPath: "C:\\qualification\\state\\desktop-settings",
+      windowsQualificationModeContext: context,
+      resourceRoot,
+    });
+    const receiptBackend = createDesktopFirstRunReceiptBackend({
+      platform: "win32",
+      windowsProtectedStateStore: store,
+    });
+    const receipt = Object.freeze({
+      schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
+      acknowledged: true,
+    });
+    assert.deepEqual(await receiptBackend.save(receipt), receipt);
+    assert.deepEqual(await receiptBackend.load(), receipt);
+  });
 });
 
 test("adapter validates native identities and keeps operation errors fixed", () => {
