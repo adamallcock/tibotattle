@@ -609,6 +609,45 @@ The repaired package/runner suite passes 26 tests with two explicit optional
 artifact/host exclusions; 78 release-trust checks, architecture and tool inventory
 checks also pass. The failed closure check remains in its separate local log.
 
+The subsequent Windows diagnostic run `34167184722` preserved the same startup
+failure. The actual generator omitted the development binding provenance that
+the app's qualification context requires. The repaired producer and loader
+agree on a closed, explicitly unqualified provenance object. Run `34167627725`
+then exposed the independent artifact verifier's older exact-key list; that
+consumer is now repaired too. Both app-context and artifact-verifier tests
+consume the actual generator output and reject missing, broadened or falsely
+qualified provenance. The cross-boundary suite passes 82 tests with two optional
+artifact exclusions. These repairs are source evidence until a fresh packaged
+Windows smoke passes; prior failing runs remain preserved.
+
+The fresh `48a234f2` Mac app is also retained in a durable frozen source tree,
+with independently verified archive closure and the same ASAR hash above. A
+new copied profile preserves the earlier profile and disables hosted sharing.
+Its real-history qualification completed refresh, populated the product pages,
+advanced the timer and quit cleanly, but active control-plane p95 measurements
+of 261 ms and 305 ms fail the unchanged 250 ms limit. Those failures are retained.
+The QA harness now distinguishes this completed latency-budget failure from
+an unresponsive or incomplete run, and retains functional and clean-quit
+receipts before returning failure. All 33 owning QA/profile tests pass. The
+older 45-second, 180-sample `d5dc8025` result is not performance evidence for
+this candidate. The default user launcher still selects that previously
+qualified version while the new candidate's startup delay is investigated.
+
+The source now includes the two-capability Linux Secret Service FD4 broker and
+explicit export-identity/account-observation selectors. Main-owned conditional
+mutations retain the native lease boundary, while the companion receives no
+native binding or generic credential-store access. The three server consumers
+share one transport; malformed configuration refuses fallback. Forty-three
+focused broker/selector tests and the architecture gate pass (468 production
+files, 1,834 imports, no approved debt). Packaging inventories include both new
+broker modules. The integrated source also passes all 487 Electron tests, 329 local companion
+checks, 78 release-trust checks and 20 documentation preflight checks. The local
+companion suite requires permission to bind its disposable loopback servers;
+the earlier restricted-environment `listen EPERM` failures are retained, and no
+assertion was changed. Main-process native composition and actual Linux runtime
+smoke remain the next gate; no production capability is enabled by these source
+tests.
+
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
 retain the detailed design history. This document coordinates the remaining

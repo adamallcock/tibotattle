@@ -224,6 +224,8 @@ jobs:
           node scripts/stage-linux-credential-mutex-binding.mjs
           node scripts/build-linux-credential-mutex-manifest.mjs
           node scripts/qualify-linux-credential-mutex.mjs
+      - name: Validate private Linux credential channel and identity selection
+        run: node --test apps/electron/test/desktop-linux-secret-service-broker.test.mjs test/export-identity-production.test.js test/account-observation-secret.test.js
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
       - name: Build and verify development distributions

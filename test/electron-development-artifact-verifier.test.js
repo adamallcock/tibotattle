@@ -54,6 +54,7 @@ const SHELL_FILES = [
   "apps/electron/desktop-recovery-settings.js",
   "apps/electron/desktop-ipc.js",
   "apps/electron/desktop-keychain-broker.js",
+  "apps/electron/desktop-linux-secret-service-broker.js",
   "apps/electron/desktop-owned-downloads.js",
   "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
@@ -91,6 +92,7 @@ const SHELL_FILES = [
   "apps/electron/windows-qualification.js",
   "config/deployment-endpoints.js",
   "src/desktop-shell-status.js",
+  "src/platform/linux-secret-service-broker.js",
   "src/platform/windows-accountless-installation-credential.js",
   "src/platform/windows-credential-manager-probe.js",
 ];

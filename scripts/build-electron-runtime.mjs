@@ -185,6 +185,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/desktop-recovery-settings.js",
   "apps/electron/desktop-ipc.js",
   "apps/electron/desktop-keychain-broker.js",
+  "apps/electron/desktop-linux-secret-service-broker.js",
   "apps/electron/desktop-owned-downloads.js",
   "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
@@ -221,6 +222,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/windows-accountless-qualification-smoke.js",
   "apps/electron/windows-qualification.js",
   "src/desktop-shell-status.js",
+  "src/platform/linux-secret-service-broker.js",
   "src/platform/windows-accountless-installation-credential.js",
   "src/platform/windows-credential-manager-probe.js",
 ]);

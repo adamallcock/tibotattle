@@ -99,9 +99,9 @@ function startChild(mode, rootPath) {
   child.stderr.on("data", (chunk) => {
     stderr += chunk;
   });
-  // On Windows the child process can report close before Node has dispatched
-  // the final pipe data callback.  Wait for stdout's terminal event before
-  // snapshotting its fixed marker.
+  // Explicitly await terminal stdout delivery before snapshotting the fixed
+  // marker. A waiter must recheck this completed output before treating a
+  // concurrently completed child as an unexpected exit.
   const stdoutEnded = once(child.stdout, "end").catch(() => undefined);
   const closed = once(child, "close").then(async ([code, signal]) => {
     await stdoutEnded;

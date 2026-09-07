@@ -622,6 +622,24 @@ secret operations are exposed through renderer IPC or HTTP. The
 [adapter contract](../../native/macos-keychain/README.md) defines the source
 boundary; it is not installed or signed-candidate qualification.
 
+The Linux Electron companion now has a separate, source-only Secret Service
+broker at inherited FD4. Its main-owned factory must provide the existing
+native backend with a qualified cross-process mutation lease; the child never
+loads Secret Service or keytar. Protocol v1 admits only `export_identity` and
+`account_observation`, with `read`, `create_if_missing`, `replace_exact`, and
+`delete_exact`. Requests carry strictly increasing IDs and canonical 32-byte
+secrets, with a 4096-byte per-frame limit and at most 32 pending operations.
+Malformed replies or transport failure permanently refuse further requests.
+The Linux descriptor announcement is mutually exclusive with the Mac broker.
+The three local-server identity/observation entrypoints share one cached
+transport and preserve explicit development overrides. An absent or malformed
+broker cannot select a child-side credential fallback. Conditional mutations
+execute under the parent-owned lease; locked account observation stays
+unattributed with its fixed diagnostic. This does not change the private FD3
+upload-only authority, enable production selection, or establish installed
+Linux qualification. Abandoned mutations require recovery and the underlying
+backend still reports `crashRecoveryComplete: false` and `productionSafe: false`.
+
 The dormant Linux accountless adapter uses a separate owner-private XDG-state
 record, not the legacy provider or social credential store. Its
 [fixed native boundary](../../native/linux-credential-mutex/README.md) exposes
