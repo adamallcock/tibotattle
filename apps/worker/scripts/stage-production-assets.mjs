@@ -47,6 +47,7 @@ const PUBLIC_RELEASE_ASSET_BASENAMES = Object.freeze([
   "404.html",
   "apple.svg",
   "community-data.js",
+  "community-refresh.js",
   "community-view.js",
   "community.js",
   "community.html",

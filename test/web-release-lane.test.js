@@ -126,6 +126,10 @@ test("web-only scope accepts only committed public source and release controls",
   }]);
   assert.match(scope.sha256, /^[a-f0-9]{64}$/u);
   assert.equal(isAllowedWebReleasePath("apps/web/public/community.js"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/public/community-refresh.js"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/test/community-refresh.test.mjs"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/test/public-allowance-views.test.mjs"), true);
+  assert.equal(isAllowedWebReleasePath("apps/web/public/unreviewed.js"), false);
   assert.equal(isAllowedWebReleasePath("scripts/preview-public-release-site.js"), true);
   assert.equal(
     isAllowedWebReleasePath("docs/runbooks/2026-08-17-public-site-local-preview.md"),

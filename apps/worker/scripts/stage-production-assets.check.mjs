@@ -41,6 +41,7 @@ async function fixture() {
     "404.html": "<!doctype html><title>public fallback</title>\n",
     "apple.svg": "<svg></svg>\n",
     "community-data.js": "export const communityData = true;\n",
+    "community-refresh.js": "export const communityRefresh = true;\n",
     "community-view.js": "export const communityView = true;\n",
     "community.html": '<!doctype html><script type="module" src="./community.js"></script>\n',
     "community.js": 'import "./install-cta.js";\nconsole.log("community");\n',
@@ -204,6 +205,10 @@ test("stages only verified generated public assets and maps the community entry 
     destinationDirectory: value.destination,
   });
   assert.equal(result.files, Object.keys(value.generatedFiles).length + 1);
+  assert.equal(
+    await readFile(join(value.destination, "community-refresh.js"), "utf8"),
+    value.generatedFiles["community-refresh.js"],
+  );
   assert.equal(
     await readFile(join(value.destination, "index.html"), "utf8"),
     value.generatedFiles["index.html"],

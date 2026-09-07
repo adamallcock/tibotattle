@@ -17,6 +17,7 @@ export const WEB_RELEASE_MANIFEST_PATH =
 const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
   "apple.svg",
   "community-data.js",
+  "community-refresh.js",
   "community-view.js",
   "community.html",
   "community.js",
@@ -47,6 +48,8 @@ const WEB_RELEASE_TOOLING_PATHS = new Set([
   "apps/worker/scripts/stage-production-assets.check.mjs",
   "apps/worker/scripts/stage-production-assets.mjs",
   "apps/web/test/community-site.test.mjs",
+  "apps/web/test/community-refresh.test.mjs",
+  "apps/web/test/public-allowance-views.test.mjs",
   "docs/runbooks/2026-08-17-web-only-release.md",
   "docs/runbooks/2026-08-17-public-site-local-preview.md",
   "docs/runbooks/macos-stable-release-runbook.md",
