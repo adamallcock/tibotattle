@@ -290,6 +290,11 @@ test("production builder source config binds app identity, target-specific build
 test("production macOS builder resolves the isolated signing-order hook before signing", async () => {
   const config = loadProductionBuilderConfig("darwin-arm64");
   const { resolveFunction } = ELECTRON_BUILDER_REQUIRE("app-builder-lib/out/util/resolve");
+  const appBuilderRequire = createRequire(ELECTRON_BUILDER_REQUIRE.resolve("app-builder-lib/package.json"));
+  const osxSignRequire = createRequire(appBuilderRequire.resolve("@electron/osx-sign/package.json"));
+  assert.equal(ELECTRON_BUILDER_REQUIRE("./package.json").version, "26.15.7");
+  assert.equal(appBuilderRequire("./package.json").version, "26.15.7");
+  assert.equal(osxSignRequire("./package.json").version, "1.3.3");
   const hook = await resolveFunction("module", config.mac.sign, "sign", resolve("."));
   assert.equal(typeof hook, "function");
   await assert.rejects(

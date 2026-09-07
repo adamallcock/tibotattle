@@ -19,6 +19,8 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
+const EXPECTED_ELECTRON_BUILDER_VERSION = "26.15.7";
+const EXPECTED_APP_BUILDER_VERSION = "26.15.7";
 const EXPECTED_OSX_SIGN_VERSION = "1.3.3";
 const MAXIMUM_EXECUTABLE_NAME_LENGTH = 255;
 
@@ -165,10 +167,14 @@ function loadPinnedElectronBuilderSigningRuntime() {
     const appBuilderRequire = createRequire(appBuilderPackagePath);
     const osxSignPackagePath = appBuilderRequire.resolve("@electron/osx-sign/package.json");
     const osxSignRequire = createRequire(osxSignPackagePath);
+    const electronBuilderManifest = electronBuilderRequire("./package.json");
+    const appBuilderManifest = appBuilderRequire("./package.json");
     const osxSignManifest = osxSignRequire("./package.json");
     const macCodeSign = appBuilderRequire("./out/codeSign/macCodeSign");
     const osxSignUtil = osxSignRequire("./dist/cjs/util");
-    if (osxSignManifest?.version !== EXPECTED_OSX_SIGN_VERSION
+    if (electronBuilderManifest?.version !== EXPECTED_ELECTRON_BUILDER_VERSION
+        || appBuilderManifest?.version !== EXPECTED_APP_BUILDER_VERSION
+        || osxSignManifest?.version !== EXPECTED_OSX_SIGN_VERSION
         || typeof macCodeSign?.sign !== "function"
         || typeof osxSignUtil?.walkAsync !== "function") {
       fail("RUNTIME_INVALID");

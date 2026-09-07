@@ -16,6 +16,14 @@ function executableReader(entries) {
   return async (bundlePath) => entries.get(bundlePath);
 }
 
+function deferred() {
+  let resolveDeferred;
+  const promise = new Promise((resolvePromise) => {
+    resolveDeferred = resolvePromise;
+  });
+  return { promise, resolve: resolveDeferred };
+}
+
 test("orders a same-directory helper before the actual CFBundleExecutable", async () => {
   const main = join(ROOT_APP, "Contents", "MacOS", "TiboTattle");
   const helper = join(ROOT_APP, "Contents", "MacOS", "TiboTattleNativeHandover");
@@ -109,6 +117,81 @@ test("restores the pinned walk function when bundle metadata is refused", async 
     (error) => error?.code === "ELECTRON_MACOS_SIGN_ORDER_BUNDLE_EXECUTABLE_INVALID",
   );
   assert.equal(runtime.util.walkAsync, originalWalk);
+});
+
+test("serializes simultaneous signing hooks and restores the walker between callers", async () => {
+  const firstApp = "/synthetic/TiboTattle-first.app";
+  const secondApp = "/synthetic/TiboTattle-second.app";
+  const firstMain = join(firstApp, "Contents", "MacOS", "TiboTattleFirst");
+  const firstHelper = join(firstApp, "Contents", "MacOS", "TiboTattleFirstHelper");
+  const secondMain = join(secondApp, "Contents", "MacOS", "TiboTattleSecond");
+  const secondHelper = join(secondApp, "Contents", "MacOS", "TiboTattleSecondHelper");
+  const firstStarted = deferred();
+  const releaseFirst = deferred();
+  const changes = [];
+  const observed = [];
+  const firstFailure = new Error("synthetic first signer failure");
+  const originalWalk = async (contentsPath) => {
+    if (contentsPath === join(firstApp, "Contents")) return [firstMain, firstHelper];
+    if (contentsPath === join(secondApp, "Contents")) return [secondMain, secondHelper];
+    throw new Error("unexpected synthetic contents path");
+  };
+  const utilityTarget = { walkAsync: originalWalk };
+  const utility = new Proxy(utilityTarget, {
+    defineProperty(target, key, descriptor) {
+      if (key === "walkAsync") changes.push(descriptor.value);
+      return Reflect.defineProperty(target, key, descriptor);
+    },
+    set(target, key, value) {
+      if (key === "walkAsync") changes.push(value);
+      target[key] = value;
+      return true;
+    },
+  });
+  let secondStarted = false;
+  const runtime = {
+    readBundleExecutable: executableReader(new Map([
+      [firstApp, "TiboTattleFirst"],
+      [secondApp, "TiboTattleSecond"],
+    ])),
+    util: utility,
+    sign: async (signOptions) => {
+      if (signOptions.app === firstApp) {
+        assert.equal(signOptions.identity, "first-identity");
+        observed.push(await runtime.util.walkAsync(join(firstApp, "Contents")));
+        firstStarted.resolve();
+        await releaseFirst.promise;
+        throw firstFailure;
+      }
+      assert.equal(signOptions.app, secondApp);
+      assert.equal(signOptions.identity, "second-identity");
+      secondStarted = true;
+      observed.push(await runtime.util.walkAsync(join(secondApp, "Contents")));
+      return "second-signed";
+    },
+  };
+  const first = signWithCFBundleExecutableOrder({
+    app: firstApp,
+    identity: "first-identity",
+  }, runtime);
+  await firstStarted.promise;
+  const second = signWithCFBundleExecutableOrder({
+    app: secondApp,
+    identity: "second-identity",
+  }, runtime);
+  await new Promise((resolveTurn) => setImmediate(resolveTurn));
+  assert.equal(secondStarted, false, "the second hook must not patch the shared walker yet");
+  releaseFirst.resolve();
+  await assert.rejects(first, (error) => error === firstFailure);
+  assert.equal(await second, "second-signed");
+  assert.deepEqual(observed, [[firstHelper, firstMain], [secondHelper, secondMain]]);
+  assert.equal(runtime.util.walkAsync, originalWalk);
+  assert.equal(changes.length, 4);
+  assert.notEqual(changes[0], originalWalk);
+  assert.equal(changes[1], originalWalk);
+  assert.notEqual(changes[2], originalWalk);
+  assert.notEqual(changes[0], changes[2]);
+  assert.equal(changes[3], originalWalk);
 });
 
 test("reads a regular CFBundleExecutable plist without signing", {
