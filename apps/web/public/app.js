@@ -5818,6 +5818,55 @@ function renderResidualInspectionTable() {
 // panel has a stable target for its toggle's `aria-controls`.
 let nextDivergenceBreakdownId = 0;
 
+// Display-only state for the detector's bounded set of visible windows. Index
+// revisions refresh details without changing a window's identity; a changed
+// population or contributor mix cannot inherit another window's answer.
+const divergenceDetails = new Map();
+const MAX_DIVERGENCE_DETAILS = 20;
+
+function divergenceDetailScope(data) {
+  const scope = data?.timeline?.planScoped?.planScope;
+  return JSON.stringify([
+    data?.mode,
+    data?.allowancePlanSelection?.planType ?? null,
+    scope?.planType ?? null,
+    scope?.methodVersion ?? null,
+    scope?.basisFamilyId ?? null,
+    scope?.cohortId ?? null,
+  ]);
+}
+
+function divergenceDetailKey(period, scope) {
+  return JSON.stringify([scope, period.startMs, period.endMs, period.contributors]);
+}
+
+function prepareDivergenceDetails(data, periods) {
+  const scope = divergenceDetailScope(data);
+  const generation = data?.accounting?.generation;
+  const planScope = data?.timeline?.planScoped?.planScope;
+  const revision = generation == null && !planScope?.sourceGeneration
+    ? data
+    : JSON.stringify([generation, data?.accounting?.generationFingerprint,
+      planScope?.sourceGeneration, planScope?.sourceGenerationFingerprint]);
+  const retained = new Set();
+  for (const period of periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
+    const key = divergenceDetailKey(period, scope);
+    retained.add(key);
+    let state = divergenceDetails.get(key);
+    if (!state) {
+      state = { key, expanded: false, breakdown: null, loadedRevision: null,
+        pending: false, render: null, load: null };
+      divergenceDetails.set(key, state);
+    }
+    state.revision = revision;
+    state.local = ["local", "real_local_evidence"].includes(data?.mode);
+  }
+  for (const key of divergenceDetails.keys()) {
+    if (!retained.has(key)) divergenceDetails.delete(key);
+  }
+  return scope;
+}
+
 function divergenceRangeContext(data) {
   const accounting = accountingPeriod(data);
   if (!accounting) return null;
@@ -5858,7 +5907,7 @@ function divergenceSpeedLabel(key) {
  * magnitude, and the contributor mix (exact per-period totals plus range-level
  * model/speed context).
  */
-function divergencePeriodItem(period, rangeContext) {
+function divergencePeriodItem(period, rangeContext, state) {
   const item = node(
     "li",
     `divergence-period ${period.direction === "under_costed"
@@ -5935,27 +5984,49 @@ function divergencePeriodItem(period, rangeContext) {
   panel.id = breakdownId;
   panel.hidden = true;
 
-  let loadState = "idle";
+  const renderBreakdown = () => {
+    if (state.breakdown !== null || !state.pending) {
+      renderDivergenceBreakdown(panel, state.breakdown, rangeContext);
+    } else {
+      clear(panel);
+      panel.append(localizedNode(
+        "p",
+        "divergence-breakdown-status",
+        "divergence.breakdown.loading",
+      ));
+    }
+  };
+  state.render = renderBreakdown;
   const loadBreakdown = async () => {
-    if (loadState === "loaded" || loadState === "loading") return;
-    loadState = "loading";
-    clear(panel);
-    panel.append(localizedNode(
-      "p",
-      "divergence-breakdown-status",
-      "divergence.breakdown.loading",
-    ));
+    if (!state.local || state.pending
+        || state.loadedRevision === state.revision) return;
+    const revision = state.revision;
+    state.pending = true;
+    renderBreakdown();
     let breakdown = null;
     try {
       breakdown = await localClient.windowBreakdown(period.startMs, period.endMs);
     } catch {
       breakdown = null;
     }
-    loadState = "loaded";
-    renderDivergenceBreakdown(panel, breakdown, rangeContext);
+    state.pending = false;
+    if (divergenceDetails.get(state.key) !== state) return;
+    if (state.revision !== revision) {
+      if (state.expanded) state.load();
+      return;
+    }
+    if (breakdown?.status === "available") {
+      state.breakdown = breakdown;
+      state.loadedRevision = revision;
+    }
+    // Failed refreshes never erase a successful answer or mark failure as
+    // loaded. Reopening or the next dashboard refresh can try again.
+    state.render();
   };
+  state.load = loadBreakdown;
   toggle.addEventListener("click", () => {
     const open = toggle.getAttribute("aria-expanded") === "true";
+    state.expanded = !open;
     toggle.setAttribute("aria-expanded", open ? "false" : "true");
     setLocalizedText(
       toggle,
@@ -5964,7 +6035,14 @@ function divergencePeriodItem(period, rangeContext) {
     panel.hidden = open;
     if (!open) loadBreakdown();
   });
+  toggle.setAttribute("aria-expanded", String(state.expanded));
+  setLocalizedText(toggle, state.expanded
+    ? "divergence.breakdown.hide" : "divergence.breakdown.show");
+  panel.hidden = !state.expanded;
+  renderBreakdown();
+  if (state.expanded) loadBreakdown();
 
+  state.toggle = toggle;
   item.append(toggle, panel);
   return item;
 }
@@ -6079,11 +6157,14 @@ function renderDivergencePeriods(data, points) {
   const summary = $("#divergence-summary");
   const caveat = $("#divergence-caveat");
   if (!list || !empty || !summary) return;
+  const focusedKey = [...divergenceDetails.values()]
+    .find((state) => state.toggle === document.activeElement)?.key;
   clear(list);
 
   const result = detectDeviationPeriods(points, {
     usageBuckets: data?.timeline?.usage ?? [],
   });
+  const detailScope = prepareDivergenceDetails(data, result.periods);
 
   if (!result.periods.length) {
     list.hidden = true;
@@ -6130,8 +6211,11 @@ function renderDivergencePeriods(data, points) {
   }
 
   const rangeContext = divergenceRangeContext(data);
-  for (const period of result.periods) {
-    list.append(divergencePeriodItem(period, rangeContext));
+  for (const period of result.periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
+    const key = divergenceDetailKey(period, detailScope);
+    const state = divergenceDetails.get(key);
+    list.append(divergencePeriodItem(period, rangeContext, state));
+    if (key === focusedKey) state.toggle.focus({ preventScroll: true });
   }
 }
 
