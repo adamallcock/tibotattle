@@ -66,8 +66,8 @@ directory, and performs exact pinned readback. Delete compares the exact
 the pinned identity and bytes, unlinks that verified quarantine, fsyncs, and
 checks that the fixed name is absent. A failure before a temporary inode or
 rename can occur settles `normal` after rechecking that no record changed.
-After any possible record mutation, interruption, malformed record, unsafe
-path, or failed readback, the durable journal remains `active` and later calls
+After any possible record mutation, interruption, malformed or unsafe fixed
+record, or failed readback, the durable journal remains `active` and later calls
 return `recovery_required`; it is never silently cleared.
 
 This owner-private file is an operating-system file-permission boundary, not a

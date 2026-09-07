@@ -15,9 +15,13 @@ fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
 The latest four-target successful development build is
-`d5dc802575b6b6a0ad0faee26c05fd50778b77e1`. Its unsigned packages passed
-[CI run 34151603489](https://github.com/adamallcock/tibotattle/actions/runs/34151603489),
-including native Windows protected-child binding tests. It includes upstream
+`a3458668af58e46931e2ccd5b90e01d7eb1c4871`. Its unsigned packages passed
+[CI run 34157482667](https://github.com/adamallcock/tibotattle/actions/runs/34157482667),
+including Linux native lock/crash-recovery qualification and the Windows
+protected-child binding lane. The separately approved Mac signing source remains
+`d5dc802575b6b6a0ad0faee26c05fd50778b77e1`, whose four development jobs passed
+[run 34151603489](https://github.com/adamallcock/tibotattle/actions/runs/34151603489).
+The integrated source includes upstream
 changes through `11276bb84793b273276a3026029d3a8efb99467e` and the new Mac
 credential-broker, renewable accountless upload leases, closed Mac update
 rehearsal and production-disclosure source. The inspected local Mac
@@ -313,8 +317,62 @@ the ZIP is `8682be7aa39497fa93431a4cf52be824ed9a0ea87685fd72b53997149c305c07`.
 Both finalization receipts and independent artifact digests are retained under
 the frozen source's private build tree. The Intel builder has failed during
 signing, despite a valid configured identity and successful signing of a
-disposable bundle copy. Exact-command diagnosis is in progress; no Intel
-installer or Apple acceptance is claimed yet.
+disposable bundle copy. The exact failure is now reproduced and repaired on a
+disposable app: the pinned signer visits the real `CFBundleExecutable` before
+the unsigned handover helper in the same `Contents/MacOS` directory. Signing
+that helper first lets the full pinned signer finish its strict verification.
+The upstream [inside-out signing order](https://github.com/electron/osx-sign/blob/main/src/sign.ts)
+explains the bundle-sealing constraint; this app needs the actual plist-named
+main executable distinguished from its same-directory helper. Intel finalization uses isolated signing orchestration with the frozen
+source/dependencies unchanged. The first Intel `.1` installer subsequently
+passed all app/DMG signing, notarization, staple, strict Gatekeeper, enclosed-app
+and final-byte metadata checks. All 18 native objects are thin `x86_64`; the
+private verifier was corrected to map the target label `x64` to that canonical
+Mach-O name. Its DMG SHA-256 is
+`de4267bd04a657c875036242e101cc4fca8b9439c1b88cc8d5d0563164fc01d2`;
+the ZIP is `0d45e15ea386137cb9ad40e2c6018b64d67b87946a4f819615dde7341e7f42e2`.
+The second Intel `.2` candidate passed the same signing, notarization, staple,
+Gatekeeper, architecture, enclosed-app and final-metadata checks. Its DMG SHA-256
+is `bdabc861c6496f3a3501770627f39cc1e77b29ec6b929eb931e78d838c8c3397`;
+the ZIP is `074e549649329eb98e9f5fc1abaea8fc05a21d3540fc1676b4337bb959953365`.
+Independent final verification checked all four finalization receipts and all
+eight installer/archive sizes and SHA-256 digests. The private receipt
+`approved-four-mac-installers-verification.json` records the complete approved
+signing stage. No candidate has been installed and no update feed was published.
+The signing-order repair and final-byte updater metadata generation are now
+being incorporated into maintained packaging tooling; those source changes do
+not alter the four sealed `d5dc8025` candidates.
+
+The maintained metadata finalizer is now integrated at `a0ac852c`. It accepts
+only the fixed rehearsal source receipt through
+`node scripts/finalize-electron-macos-update-metadata.mjs --candidate-receipt <candidate>/production-source-candidate.json`.
+After separately authorized signing, notarization and stapling finish, it
+preserves the original manifest and DMG blockmap without clobbering, verifies
+the unchanged ZIP, regenerates the DMG blockmap, and binds the fixed transport
+manifest to the final files. Its receipt explicitly proves metadata binding
+only; it does not prove signing, notarization, installation or publication.
+Root verification passed 22 focused metadata/distribution tests and ran the
+CLI on disposable mirrors of the real sealed ARM `.1` and Intel `.2` payloads,
+then rehashed those payloads against the untouched sealed originals. That
+real-artifact check found and fixed a mismatch between the planned receipt and
+the native-helper statuses added by actual source staging. Failed pre-fix
+runs and the successful corrected receipts are retained separately.
+
+The maintained signing hook is integrated at `040f8c7d` with concurrency and
+dependency-pin checks at `f4acabc7`. The production builder resolves its
+`mac.sign` hook without invoking signing in tests. It temporarily orders the
+pinned signer's child list using each app's actual `CFBundleExecutable`, then
+uses the same builder signing options and retry route. Concurrent hook calls
+serialize the temporary change and restore the original function on success
+or failure. A disposable copy of the sealed Intel `.2` bundle reproduced the
+original main-before-helper order across 727 discovered code objects; the
+maintained comparator preserved that complete set and repaired the order.
+The 30 focused signing/metadata/distribution tests pass. Both Mac development
+jobs and production-source preparation jobs now include the credential-free
+signing-order and metadata regressions. No workflow token, signing authority,
+publication permission or automatic release action was added. Release trust
+checks pass 78 tests, and the tooling inventory now covers these entrypoints
+and the earlier source-preparation/native-build helpers.
 
 Accountless synthetic enrollment/upload/deduplication/disconnect tests have
 run against disposable Worker databases. Independent review identified two
@@ -375,17 +433,54 @@ staging without relaxing the loader contract; the manifest, loader and qualifier
 share its fixed path. The staging regression uses an actual hard link and proves
 identical bytes in a separate single-link file. Routine node-gyp rebuild removes
 the old build tree before staging. Foundation tests pass 111 cases with two
-expected native-host skips; actual Ubuntu execution is pending the next CI run.
+expected native-host skips on macOS; the actual Ubuntu execution subsequently
+passed in run 34157482667 as detailed below.
 Commit `68bd5695` also requires a main-owned Linux native accountless factory,
 keeps the companion credential channel separate, and rejects an existing or
 unreadable legacy encrypted record before native access. Its focused runtime
-and credential tests pass 45 cases. The production identity adapter and the
-actual accountless fifth credential backend remain source work. The installed keytar
+and credential tests pass 45 cases. The production identity adapter remains
+separate source work; the accountless backend is now implemented as recorded
+below. The installed keytar
 wrapper's synchronous libsecret calls supply no cancellation object; upstream
 documents that [password lookup may block indefinitely](https://gnome.pages.gitlab.gnome.org/libsecret/func.password_lookup_sync.html).
-A production backend therefore still needs bounded, noninteractive handling
-for locked, denied and unavailable storage. Local containers are ARM or emulated x64 at older source
-revisions, so neither qualifies the proposed Ubuntu 24.04/GNOME target.
+Keytar is not selected for the new Linux accountless credential. The engineering
+decision on 2026-09-07 is a separate owner-private XDG-state file for this
+upload-only secret, with fd-pinned access, private ownership/modes, atomic
+no-clobber publication, durable readback, exact deletion and an independent
+mutation journal. It must never reuse a telemetry/provider secret or enter the
+legacy four-capability FD4 map; only the existing main-owned FD3 bridge may
+serve it to the companion. Existing ciphertext still requires recovery rather
+than identity rotation. No production selector changes until native validation.
+
+This choice follows the [accepted sharing decision](../decisions/2026-09-04-accountless-sharing-policy.md),
+which requires protected state and identity continuity without prescribing a
+Linux store. The selected filesystem threat boundary does not claim encryption
+at rest or protection from same-user malware,
+manual access or copied home backups. It remains available to an authorized
+process while the screen is locked; it does not emulate a locked keyring.
+Revocation remains server-authoritative, and local deletion cannot remove
+copies from backups. Known failures before mutation may retry; an uncertain
+write/delete must preserve recovery state. This engineering choice is distinct
+from an explicit user statement selecting the storage mechanism. The legacy
+Linux identity/credential production composition and physical Ubuntu 24.04/GNOME
+qualification still remain separate work.
+
+The fixed Linux accountless backend is now implemented at `06bd987c`, with
+production selection still disabled. It stores only the new 32-byte upload
+credential in an owner-private file, exposes no caller-selected path or generic
+capability, and preserves the separate FD3/FD4 boundary. Independent source
+review corrected a failed-cleanup dangling pointer, nonblocking refusal of
+FIFO records, serialization of reads, and durable recovery after an invalid
+record is observed. A read of an already-normal journal now verifies and
+closes it without creating a new truncate/fsync crash window. The integrated
+adapter/API/architecture checks pass 79 tests; the Linux foundation suite
+passes 111 with two expected native-host skips on macOS. Actual Ubuntu x64
+compilation and native fixed-record qualification are required in the next
+authorized development run. These tests use disposable synthetic credentials;
+no production credential or runtime selector was changed.
+All 453 Electron tests also pass with owned companion IPC available. The
+restricted-sandbox run's three companion-startup failures remain retained;
+no timeout or assertion was weakened.
 
 The earlier source-only migration approval request is superseded by the user's
 explicit request to complete every stage. Source implementation and disposable
@@ -404,7 +499,31 @@ currently private and excluded from public figures. The proposed common sample
 would use contribution sources as its unit and retain suppression, bounded
 influence, deduplication and revocation controls; it requires an explicit
 versioned public-use policy and consistent eligibility across all aggregate
-paths before activation.
+paths before activation. Controls must remain metric-specific: daily activity
+currently publishes accepted totals without a per-day suppression threshold,
+whereas weekly cohort snapshots apply maturity, suppression and clipping.
+Do not silently clip all-token/API-equivalent activity totals when limiting
+per-source influence on statistical estimates. An installation credential proves
+continuity and authenticated retries, not a unique person or measurement truth;
+independent reinstallations are not automatically cross-source deduplicated.
+
+The integrated `a3458668` source passes all 450 Electron tests, 111 Linux
+foundation tests with two expected native-host skips, and architecture checks
+(457 production files, 1,804 imports, no approved debt). The 55 focused
+Linux/runtime/packaging tests also pass with the owned local companion IPC
+available. The earlier restricted-environment failures remain in their separate
+log; no assertion was weakened. The new four-target run is
+[34157482667](https://github.com/adamallcock/tibotattle/actions/runs/34157482667),
+completed successfully on all four targets with retained unexpired artifacts.
+The Ubuntu qualifier runs the actual native SIGKILL/fresh-runtime/persisted-marker
+recovery test and emits success only after that test subprocess exits zero. Its
+receipt establishes cooperating-process exclusion in the same Linux network
+namespace and durable abandonment detection; `productionSafe` remains false.
+All four target archives/installers and their testing handoffs are also retained
+in the private durable build directory. Source/version/target metadata and all
+16 listed installer/handoff checksums were independently verified after download.
+These remain unsigned development packages with hosted contributions and
+updating disabled, not installed-production qualification.
 
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)

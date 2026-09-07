@@ -622,6 +622,22 @@ secret operations are exposed through renderer IPC or HTTP. The
 [adapter contract](../../native/macos-keychain/README.md) defines the source
 boundary; it is not installed or signed-candidate qualification.
 
+The dormant Linux accountless adapter uses a separate owner-private XDG-state
+record, not the legacy provider or social credential store. Its
+[fixed native boundary](../../native/linux-credential-mutex/README.md) exposes
+only `readAccountlessInstallationCredential`,
+`createAccountlessInstallationCredentialIfMissing`, and
+`deleteAccountlessInstallationCredentialExact`, with no caller-supplied path
+or capability number. The record is exactly 32 bytes under owner-only file
+permissions; it is not encrypted at rest and remains accessible to an
+authorized process while the desktop is locked. The native-private slot `4`
+does not expand the generic `0..3` lease API or the legacy FD4 protocol. Only
+the main-owned adapter can compose this record into the existing private FD3
+accountless channel. Invalid fixed records and uncertain mutations preserve
+recovery state instead of permitting silent identity replacement. The source
+keeps `productionSafe: false` and leaves runtime selection disabled; native
+qualification, installed lifecycle and release remain separate gates.
+
 ### Codex app-server subprocess protocol
 
 **Sources of truth:**

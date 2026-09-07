@@ -1985,6 +1985,150 @@
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
       "provenanceReason": null,
       "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-electron-macos-keychain-adapter.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Compile the fixed unsigned macOS adapter for a prepared source candidate; signing remains separate.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/package-electron-production.mjs",
+        "test/electron-macos-keychain-adapter.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-electron-native-handover-helper.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Compile the fixed unsigned native handover helper without installing or replacing an application.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/package-electron-production.mjs",
+        "test/electron-native-handover-helper.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/build-linux-credential-mutex-manifest.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Bind Linux development qualification metadata to exact staged native bytes without enabling production policy.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-development-packages.yml",
+        "test/linux-credential-mutex-manifest.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/package-electron-production.mjs",
+      "stableAlias": "package:electron:production:prepare",
+      "stableAliasReason": null,
+      "additionalAliases": [],
+      "callers": [
+        "package.json#scripts.package:electron:production:prepare",
+        ".github/workflows/electron-production-source-preparation.yml",
+        "test/electron-production-distribution.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/plan-macos-native-electron-guided-handover.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Inspect and plan the guided native-to-Electron handover without mutating the installed application.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-native-handover-bundle-context.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/qualify-linux-credential-mutex.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Run native Linux lease qualification and preserve the disabled production-safety boundary.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-development-packages.yml",
+        "test/linux-credential-mutex-qualification.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/stage-linux-credential-mutex-binding.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Copy compiled native bytes into the fixed single-link development binding path without weakening the loader.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-development-packages.yml",
+        "test/linux-credential-mutex-staging.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/finalize-electron-macos-update-metadata.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Bind the fixed rehearsal update manifest and blockmaps to separately finalized installer bytes; no signing or publication.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-macos-production-finalization.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/electron-macos-sign-order.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "An electron-builder mac.sign hook preserves the pinned signer and changes only helper-before-main ordering; invocation requires the separate signing operation.",
+      "additionalAliases": [],
+      "callers": [
+        "apps/electron/electron-builder.production.config.cjs",
+        "test/electron-macos-sign-order.test.mjs",
+        "test/electron-production-distribution.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
     }
   ]
 }
