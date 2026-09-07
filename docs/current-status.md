@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-07
 type: status
 status: current
-source_commit: a4f4da50edf35d29ef06bb2bd629e9dcd7c4a7f3
+source_commit: 3f82d9aca1c5de73b63f929b61a3f0b5fa842cad
 observation_date: 2026-09-07
 ---
 
@@ -44,16 +44,25 @@ substitutes for SLSA build provenance. Follow
 ### Verified public graph state
 
 On 2026-09-07 the guarded deployment published
-`a4f4da50edf35d29ef06bb2bd629e9dcd7c4a7f3`. Independent health, public response
+`3f82d9aca1c5de73b63f929b61a3f0b5fa842cad`. Independent health, public response
 validation and rendered Chrome checks confirm Aggregate, By plan, and By model
 views on [the public website](https://tibotattle.com/), including Astra. Expanded
 and inline selections stay synchronized; all comparisons use the same Pro 20x
-weekly reference basis. See the
-[deployment receipt](./receipts/2026-09-07-public-allowance-views-deployment.md).
+weekly reference basis. Cards are ordered Astra, Sol, Terra, Luna, GPT-5.5 with
+compact shared-unit captions and matching restrained model themes. All-history
+dates fit the selected view's actual evidence, while dollar scales stay shared;
+dense markers are thinned without discarding inspection points and legends can
+focus one series. See the [presentation receipt](./receipts/2026-09-07-public-graph-polish.md)
+and the [original view deployment](./receipts/2026-09-07-public-allowance-views-deployment.md).
 
 The inspected public cache supplied 69 closed-date breakdown rows. Identified
 GPT-5.5 and GPT-5.6 history covered September 2–6; Astra covered September 5–6.
-Earlier missing/unstable model estimates remain gaps. This establishes real
+Read-only metadata confirms September 1 completed at 13:21:16 UTC, after the
+13:05:41 public snapshot; August 31 is next. Automatic backfill targets the
+rolling 70-day preview, not unlimited history; on September 7 the closed target
+is June 30–September 6. It runs behind current work, and refresh throttling and
+public caching can delay visibility. Missing/unstable model estimates remain
+gaps. This establishes real
 public history and working views, not unlimited retrospective coverage or a
 provider-authoritative allowance. The owner explicitly approved small-sample
 dollar estimates and counts, including one account; the page explains the
