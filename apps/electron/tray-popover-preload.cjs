@@ -11,6 +11,8 @@ const ACTIONS = new Set([
   "accounting",
   "refresh",
   "settings",
+  "customize",
+  "usage",
   "more",
   "quit",
 ]);
@@ -22,6 +24,25 @@ function requestAction(action) {
   } catch {
     // A closing transient window cannot surface a renderer exception.
   }
+}
+
+let historyPending = false;
+function setHistoryRange(range) {
+  if (!["7d", "30d"].includes(range) || historyPending || typeof ipcRenderer?.send !== "function") return Promise.reject(new Error("Tray history preference rejected"));
+  historyPending = true;
+  return new Promise((resolve, reject) => {
+    const channel = `${ACTION_CHANNEL}:saved`;
+    const finish = (saved) => {
+      clearTimeout(timer);
+      historyPending = false;
+      ipcRenderer.removeListener?.(channel, listener);
+      if (saved === true) resolve(true); else reject(new Error("Tray history preference could not be saved"));
+    };
+    const listener = (_event, saved) => finish(saved);
+    const timer = setTimeout(() => finish(false), 15_000);
+    ipcRenderer.on(channel, listener);
+    try { ipcRenderer.send(ACTION_CHANNEL, `history-${range}`); } catch { finish(false); }
+  });
 }
 
 function reportContentHeight(height) {
@@ -81,6 +102,7 @@ if (typeof contextBridge?.exposeInMainWorld === "function") {
   contextBridge.exposeInMainWorld("tibotattleTrayPopover", Object.freeze({
     version: "v1",
     requestAction,
+    setHistoryRange,
     reportContentHeight,
     onModel: subscribe,
     getVisibility,

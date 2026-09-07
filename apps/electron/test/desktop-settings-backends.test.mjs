@@ -291,7 +291,7 @@ test("POSIX backend returns missing for a fresh root and persists valid snapshot
   });
 });
 
-test("POSIX backend marks legacy decode and the store atomically rewrites v2", {
+test("POSIX backend marks legacy decode and the store atomically rewrites v3", {
   skip: POSIX_TEST_SKIP,
 }, async () => {
   await temporaryRoot(async (parent) => {
@@ -302,15 +302,15 @@ test("POSIX backend marks legacy decode and the store atomically rewrites v2", {
 
     const backend = createPosixDesktopSettingsBackend({ rootPath: root });
     const decoded = await backend.load();
-    assert.equal(decoded.schemaVersion, "tibotattle-desktop-settings-v2");
+    assert.equal(decoded.schemaVersion, "tibotattle-desktop-settings-v3");
     assert.equal(decoded[DESKTOP_SETTINGS_LEGACY_MIGRATION_MARKER], true);
     assert.equal(Object.keys(decoded).includes("codexHome"), false);
 
     const store = createDesktopSettingsStore({ backend });
     const projection = await store.getSettings();
-    assert.equal(projection.schemaVersion, "tibotattle-desktop-settings-v2");
+    assert.equal(projection.schemaVersion, "tibotattle-desktop-settings-v3");
     const persisted = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(persisted.schemaVersion, "tibotattle-desktop-settings-v2");
+    assert.equal(persisted.schemaVersion, "tibotattle-desktop-settings-v3");
     assert.equal(Object.hasOwn(persisted, "codexHomes"), true);
     assert.equal(Object.hasOwn(persisted, "codexHome"), false);
   });

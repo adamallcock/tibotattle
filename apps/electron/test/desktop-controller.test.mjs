@@ -219,6 +219,9 @@ test("controller initializes persisted cadence and projects truthful settings st
         refreshIntervalSeconds: 300,
         startAtLogin: { status: "disabled", canSet: true, detail: "disabled" },
         sidebarCollapsed: false,
+        tray: DESKTOP_DEFAULT_SETTINGS.tray,
+        traySettingsStatus: "current",
+        trayCapabilities: { title: process.platform === "darwin" },
       notifications: {
         enabled: false,
         threshold: "off",
@@ -1022,4 +1025,25 @@ test("legacy add fallback does not deadlock inside the serialized controller que
   } finally {
     clearTimeout(timeout);
   }
+});
+
+test("tray customization applies only after persistence and leaves collection, notifications and cadence unchanged", async (t) => {
+  let fail = false; const applied = [];
+  const value = fixture({ settingsSave: async () => { if (fail) throw new Error("synthetic write failure"); }, lifecycleOverrides: { setDesktopTrayPreferences: (next) => applied.push(next) } });
+  t.after(() => value.controller.dispose());
+  await value.controller.initialize();
+  const before = await value.controller.snapshot();
+  const commandCount = value.commands.length; const timerCount = value.timers.length;
+  const choice = { ...DESKTOP_DEFAULT_SETTINGS.tray, preset: "both", sections: ["usage", "cache"] };
+  const selected = await value.controller.handlers.setTrayPreferences({ value: choice });
+  assert.deepEqual(selected.settings.tray, choice); assert.deepEqual(applied, [choice]);
+  assert.deepEqual(selected.settings.notifications, before.settings.notifications);
+  assert.equal(value.commands.length, commandCount); assert.equal(value.timers.length, timerCount);
+  fail = true;
+  await assert.rejects(value.controller.handlers.restoreTrayDefaults(), { code: "desktop_settings_persistence_failed" });
+  assert.equal(applied.length, 1); assert.deepEqual((await value.controller.snapshot()).settings.tray, choice);
+  fail = false;
+  const restored = await value.controller.handlers.restoreTrayDefaults();
+  assert.deepEqual(restored.settings.tray, DESKTOP_DEFAULT_SETTINGS.tray);
+  await value.controller.handlers.openTraySettings(); assert.equal(value.settingsWindows.at(-1), "tray");
 });

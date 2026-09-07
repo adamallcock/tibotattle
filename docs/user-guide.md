@@ -90,6 +90,54 @@ uses a shortened thread ID. If attribution cannot be proven, it stays unlinked.
 Names are looked up locally and are not included in reports, share cards,
 diagnostics, or community contributions.
 
+## Customize the menu bar and popup
+
+Tray customization is implemented in the development source; the published
+0.1.18 app does not gain these controls until an update containing them ships.
+Open **Customize menu bar…** from the native popup's More menu or General
+Settings. Electron's Settings includes the corresponding **Menu bar** or
+**Tray** controls and the popup opens the same page.
+
+Choose 5-hour remaining, 7-day remaining, both, or icon only. The `5h` and `7d`
+labels keep the windows distinguishable. Single-window meters follow that
+window; both and icon-only modes let you choose the meter's window. A plain
+app icon and a two-meter option are also available. With two meters, the top
+is 5-hour and the bottom is 7-day. Unknown evidence is outlined, not zero.
+
+For one window, you can show remaining allowance, reset time, or both. Reset
+format is shared with the popup: countdown or local clock time. Both-window
+mode keeps just the two remaining percentages to limit width. Windows and
+Linux use their supported icon, tooltip and popup surfaces rather than macOS
+text beside the icon; this does not change their platform qualification status.
+
+Show, hide and reorder Allowances, Weekly pace, Local usage and Cache reuse.
+Select a 7-day or 30-day popup history range, comfortable or compact spacing,
+and which totals to display: tokens, API-equivalent cost and usage changes.
+You can hide the usage chart; keep either a chart or a total when Local usage
+is enabled. The header, status and essential actions always remain available.
+
+Cache reuse uses the dashboard's comparable-follow-up denominator: the share
+that reused more than half of the previous cached input. It is not the share
+of all tokens that were cached. No comparable follow-ups produces an explicit
+empty state. Incomplete coverage and retained historical data remain labeled.
+API-equivalent cost is a reference estimate, not a subscription charge.
+
+**Emphasize low allowance** is an optional visual cue, off by default. It starts
+at 10% remaining, clears after recovery to 12%, and never sends a notification
+or changes the selected metric. Stale or reset evidence clears that cue.
+
+Changes apply immediately and survive relaunch. The preview uses labeled
+example data, including missing and stale states. **Undo** reverses the last
+customization; **Restore defaults** resets only tray preferences. Existing
+users retain their prior primary-window behavior until they choose a preset.
+New installations default to 7-day remaining with a 7-day meter.
+
+Refreshing preserves valid values while they remain current. An unavailable
+window shows a dash in its own slot and never borrows the other window's value.
+Changing presentation does not change collection, notifications, contribution,
+or dashboard filters. A save failure leaves the previous selection in use;
+settings written by a newer app are preserved rather than overwritten.
+
 ## Refresh, progress, and recovery
 
 Use **Refresh** (or Cmd-R in the native app) to update quota, retained history,

@@ -149,6 +149,7 @@ function fixture({
     createNavigationPolicy: () => ({}),
     installNavigationPolicy: () => ({ remove() {} }),
     onDesktopStatus,
+    trayClock: () => Date.parse("2026-08-22T12:04:00.000Z"),
     platform,
     desktopStatusMonitorOptions: {
       fetchImpl,
@@ -191,17 +192,17 @@ test("lifecycle projects monitor status into a dynamic localized tray and observ
   await fixtureValue.lifecycle.start();
   const tray = fixtureValue.trays[0];
   assert.equal(tray.menu.template[1].label, "Starting");
-  await waitFor(() => tray.menu.template[0].label === "TiboTattle · 74% allowance");
+  await waitFor(() => tray.menu.template[0].label === "TiboTattle · Five-hour allowance: 74% remaining");
   assert.equal(requested[0], "http://127.0.0.1:4801/api/local/desktop-status");
-  assert.equal(tray.menu.template[0].label, "TiboTattle · 74% allowance");
+  assert.equal(tray.menu.template[0].label, "TiboTattle · Five-hour allowance: 74% remaining");
   assert.match(tray.menu.template[1].label, /^Observed /u);
   assert.match(tray.menu.template[2].label, /^Five-hour allowance: 74% remaining/u);
-  assert.equal(tray.titles.at(-1), "74%");
+  assert.equal(tray.titles.at(-1), "5h 74%");
   assert.deepEqual(observed.map((value) => value.state), ["starting", "fresh"]);
   assert.equal(JSON.stringify(observed).includes("/private"), false);
 
   assert.equal(fixtureValue.lifecycle.setDesktopLanguage("zh-Hans"), true);
-  assert.equal(tray.menu.template[0].label, "TiboTattle · 剩余 74%");
+  assert.equal(tray.menu.template[0].label, "TiboTattle · 五小时配额：剩余 74%");
   await fixtureValue.lifecycle.dispose();
 });
 
@@ -217,10 +218,10 @@ test("lifecycle forwards a current analyzing overview allowance without notifica
 
   await fixtureValue.lifecycle.start();
   const tray = fixtureValue.trays[0];
-  await waitFor(() => tray.menu.template[0].label === "TiboTattle · 0% allowance");
-  assert.equal(tray.menu.template[0].label, "TiboTattle · 0% allowance");
+  await waitFor(() => tray.menu.template[0].label === "TiboTattle · Seven-day allowance: 0% remaining");
+  assert.equal(tray.menu.template[0].label, "TiboTattle · Seven-day allowance: 0% remaining");
   assert.equal(tray.menu.template[1].label, "Analyzing");
-  assert.equal(tray.titles.at(-1), "0%");
+  assert.equal(tray.titles.at(-1), "7d 0%");
   assert.deepEqual(observed.map((value) => value.state), ["starting", "analyzing"]);
   assert.equal(observed.at(-1).notificationEvidence, null);
   await fixtureValue.lifecycle.dispose();
@@ -242,7 +243,7 @@ test("lifecycle updates the macOS image only when a dynamic tray state changes",
 
   await fixtureValue.lifecycle.start();
   const tray = fixtureValue.trays[0];
-  await waitFor(() => tray.menu.template[0].label === "TiboTattle · 74% allowance");
+  await waitFor(() => tray.menu.template[0].label === "TiboTattle · Five-hour allowance: 74% remaining");
   assert.equal(tray.initialIcon, icons.starting);
   assert.deepEqual(tray.images, [icons.fresh]);
   assert.ok(resolved.includes("fresh"));
@@ -262,7 +263,7 @@ test("lifecycle stops status polling at recovery and restarts it for bounded ret
     },
   });
   await fixtureValue.lifecycle.start();
-  await waitFor(() => fixtureValue.trays[0].menu.template[0].label === "TiboTattle · 74% allowance");
+  await waitFor(() => fixtureValue.trays[0].menu.template[0].label === "TiboTattle · Five-hour allowance: 74% remaining");
 
   fixtureValue.supervisor.exitHandler({ kind: "companion_exit" });
   assert.equal(fixtureValue.trays[0].menu.template[1].label, "Status unavailable");
@@ -283,7 +284,7 @@ test("lifecycle keeps the compact title Darwin-only", async () => {
       fetchImpl: async (url) => jsonResponse(status(), url),
     });
     await fixtureValue.lifecycle.start();
-    await waitFor(() => fixtureValue.trays[0].menu.template[0].label === "TiboTattle · 74% allowance");
+    await waitFor(() => fixtureValue.trays[0].menu.template[0].label === "TiboTattle · Five-hour allowance: 74% remaining");
     // Non-Darwin platforms receive only the existing empty-title clear. They
     // must never receive the numeric compact title intended for macOS.
     assert.ok(fixtureValue.trays[0].titles.length > 0);
