@@ -40,6 +40,9 @@ function binding() {
     acquireCredentialMutex: () => ({ lease: Object.create(null), abandoned: false }),
     releaseCredentialMutex: () => {},
     abandonCredentialMutex: () => {},
+    readAccountlessInstallationCredential: () => null,
+    createAccountlessInstallationCredentialIfMissing: () => "created",
+    deleteAccountlessInstallationCredentialExact: () => "deleted",
   };
 }
 

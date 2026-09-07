@@ -6,8 +6,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <linux/openat2.h>
 #include <pwd.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -33,13 +35,22 @@ namespace {
 
 constexpr int kFirstCapabilityId = 0;
 constexpr int kLastCapabilityId = 3;
+// The accountless installation credential intentionally has no generic
+// capability handle. Slot four is consumed only by the fixed methods below;
+// `acquireCredentialMutex` remains limited to the inherited 0..3 FD4 set.
+constexpr int kAccountlessInstallationCredentialSlot = 4;
 constexpr char kApplicationDirectory[] = "app-usagemonitor";
 constexpr char kMutexDirectory[] = "linux-credential-mutex-v1";
+constexpr char kAccountlessCredentialDirectory[] =
+    "linux-accountless-installation-credential-v1";
+constexpr char kAccountlessCredentialFile[] =
+    "accountless-installation-credential-v1";
 constexpr char kSocketNamespace[] = "app-usagemonitor/linux-credential-mutex-v1";
 constexpr char kJournalActiveText[] = "linux-credential-mutex-journal-v1:active\n";
 constexpr char kJournalNormalText[] = "linux-credential-mutex-journal-v1:normal\n";
 constexpr std::size_t kMaximumPathBytes = 4096;
 constexpr std::size_t kMaximumPasswordRecordBytes = 1024 * 1024;
+constexpr std::size_t kAccountlessCredentialBytes = 32;
 
 static_assert(
     sizeof(kJournalActiveText) == sizeof(kJournalNormalText),
@@ -56,6 +67,12 @@ constexpr char kCodeStateUnavailable[] =
     "LINUX_CREDENTIAL_MUTEX_STATE_UNAVAILABLE";
 constexpr char kCodeStateInvalid[] =
     "LINUX_CREDENTIAL_MUTEX_STATE_INVALID";
+constexpr char kCodeAccountlessUnavailable[] =
+    "LINUX_ACCOUNTLESS_CREDENTIAL_UNAVAILABLE";
+constexpr char kCodeAccountlessRecoveryRequired[] =
+    "LINUX_ACCOUNTLESS_CREDENTIAL_RECOVERY_REQUIRED";
+constexpr char kCodeAccountlessInvalidValue[] =
+    "LINUX_ACCOUNTLESS_CREDENTIAL_INVALID_VALUE";
 
 struct FileIdentity {
   dev_t device = 0;
@@ -70,6 +87,11 @@ struct NativeLease {
   int capability_id = -1;
   bool abandoned = false;
   bool active = true;
+  // Private accountless operations hold the socket while they preflight. The
+  // durable marker is written immediately before their first credential
+  // mutation or when an unsafe record must be latched for recovery. Generic
+  // FD4 leases retain their existing eager-marker behavior.
+  bool accountless_active_marker_written = false;
 };
 
 enum class JournalState {
@@ -84,8 +106,23 @@ enum class JournalOpenOutcome {
   kFailure,
 };
 
+enum class AccountlessRecordState {
+  kAbsent,
+  kPresent,
+  kInvalid,
+  kUnavailable,
+};
+
 std::mutex g_issued_leases_mutex;
 std::unordered_set<NativeLease*> g_issued_leases;
+
+bool FinishLease(NativeLease* lease, bool preserve_active);
+bool CloseDescriptor(int* fd);
+void CloseUnissuedLeaseDescriptors(
+    int* socket_fd,
+    int* persistent_state_fd,
+    int* journal_fd);
+bool AcquireKernelLeaseSocket(int capability_id, int* socket_fd, bool* contended);
 
 uid_t OwnerUid() {
   return geteuid();
@@ -117,6 +154,10 @@ napi_value ThrowFixed(napi_env env, const char* code) {
 
 bool IsCapabilityId(int value) {
   return value >= kFirstCapabilityId && value <= kLastCapabilityId;
+}
+
+bool IsInternalCredentialSlot(int value) {
+  return IsCapabilityId(value) || value == kAccountlessInstallationCredentialSlot;
 }
 
 bool IsNormalizedAbsolutePath(const char* path) {
@@ -166,6 +207,10 @@ bool CaptureRegularFileIdentity(int fd, FileIdentity* identity) {
 
 bool MatchesIdentity(const struct stat& metadata, const FileIdentity& identity) {
   return metadata.st_dev == identity.device && metadata.st_ino == identity.inode;
+}
+
+bool SameFileIdentity(const FileIdentity& first, const FileIdentity& second) {
+  return first.device == second.device && first.inode == second.inode;
 }
 
 int OpenNoSymlinkDirectory(const std::string& path) {
@@ -277,8 +322,30 @@ int OpenPersistentStateDirectory() {
   return mutex_fd;
 }
 
+// The upload-only accountless record has its own fixed owner-private state
+// directory. It is deliberately separate from the mutex journal directory
+// and from all legacy four-capability data.
+int OpenAccountlessCredentialDirectory() {
+  std::string state_base;
+  if (!StateBaseDirectory(&state_base)) return -1;
+  const int base_fd = OpenVerifiedDirectoryPath(state_base, false);
+  if (base_fd < 0) return -1;
+  const int application_fd = EnsurePrivateDirectoryAt(
+      base_fd,
+      kApplicationDirectory,
+      true);
+  close(base_fd);
+  if (application_fd < 0) return -1;
+  const int credential_fd = EnsurePrivateDirectoryAt(
+      application_fd,
+      kAccountlessCredentialDirectory,
+      true);
+  close(application_fd);
+  return credential_fd;
+}
+
 bool CapabilityFileName(int capability_id, const char* prefix, char* output, std::size_t length) {
-  if (!IsCapabilityId(capability_id) || length < 32) return false;
+  if (!IsInternalCredentialSlot(capability_id) || length < 32) return false;
   const int written = snprintf(output, length, "%s-%d-v1", prefix, capability_id);
   return written > 0 && static_cast<std::size_t>(written) < length;
 }
@@ -414,6 +481,393 @@ JournalOpenOutcome OpenJournal(
   return JournalOpenOutcome::kCreated;
 }
 
+// This is used only by the accountless lease while it still knows it created
+// this journal and has not reached a credential mutation boundary. It never
+// clears an existing or potentially active journal: continuity must prove the
+// exact freshly-created inode is still named before unlinking it.
+bool RemoveFreshAccountlessJournal(
+    int state_fd,
+    int journal_fd,
+    const FileIdentity& identity) {
+  char name[48] {};
+  return JournalFileName(
+             kAccountlessInstallationCredentialSlot,
+             name,
+             sizeof(name))
+      && VerifyJournalContinuity(
+          state_fd,
+          journal_fd,
+          kAccountlessInstallationCredentialSlot,
+          identity)
+      && unlinkat(state_fd, name, 0) == 0
+      && fsync(state_fd) == 0;
+}
+
+bool VerifyNamedRegularFileContinuity(
+    int directory_fd,
+    const char* name,
+    int file_fd,
+    const FileIdentity& identity) {
+  struct stat opened {};
+  struct stat named {};
+  return fstat(file_fd, &opened) == 0
+      && IsOwnerRegularFile(opened)
+      && MatchesIdentity(opened, identity)
+      && fstatat(directory_fd, name, &named, AT_SYMLINK_NOFOLLOW) == 0
+      && IsOwnerRegularFile(named)
+      && MatchesIdentity(named, identity);
+}
+
+struct AccountlessRecord {
+  std::array<unsigned char, kAccountlessCredentialBytes> bytes {};
+  FileIdentity identity {};
+};
+
+bool EqualAccountlessCredential(
+    const std::array<unsigned char, kAccountlessCredentialBytes>& first,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& second) {
+  unsigned char difference = 0;
+  for (std::size_t index = 0; index < first.size(); ++index) {
+    difference |= static_cast<unsigned char>(first[index] ^ second[index]);
+  }
+  return difference == 0;
+}
+
+AccountlessRecordState ReadAccountlessRecordNamed(
+    int credential_directory_fd,
+    const char* name,
+    AccountlessRecord* result) {
+  if (credential_directory_fd < 0 || name == nullptr || result == nullptr) {
+    return AccountlessRecordState::kUnavailable;
+  }
+  result->bytes.fill(0);
+  result->identity = FileIdentity {};
+  int record_fd = openat(
+      credential_directory_fd,
+      name,
+      // A hostile or corrupted fixed name may be a FIFO. Open it
+      // nonblocking before the regular-file check so a credential read never
+      // waits for a peer to attach to that FIFO.
+      O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (record_fd < 0) {
+    return errno == ENOENT ? AccountlessRecordState::kAbsent
+        : AccountlessRecordState::kInvalid;
+  }
+  bool valid = false;
+  FileIdentity identity {};
+  do {
+    if (!CaptureRegularFileIdentity(record_fd, &identity)
+        || !VerifyNamedRegularFileContinuity(
+            credential_directory_fd,
+            name,
+            record_fd,
+            identity)) {
+      break;
+    }
+    struct stat metadata {};
+    if (fstat(record_fd, &metadata) != 0
+        || metadata.st_size != static_cast<off_t>(kAccountlessCredentialBytes)
+        || lseek(record_fd, 0, SEEK_SET) < 0
+        || !ReadAll(
+            record_fd,
+            reinterpret_cast<char*>(result->bytes.data()),
+            result->bytes.size())
+        || !VerifyNamedRegularFileContinuity(
+            credential_directory_fd,
+            name,
+            record_fd,
+            identity)) {
+      break;
+    }
+    valid = true;
+  } while (false);
+  const bool closed = close(record_fd) == 0;
+  if (!valid || !closed) {
+    result->bytes.fill(0);
+    result->identity = FileIdentity {};
+    return AccountlessRecordState::kInvalid;
+  }
+  result->identity = identity;
+  return AccountlessRecordState::kPresent;
+}
+
+AccountlessRecordState ReadAccountlessRecord(
+    int credential_directory_fd,
+    AccountlessRecord* result) {
+  return ReadAccountlessRecordNamed(
+      credential_directory_fd,
+      kAccountlessCredentialFile,
+      result);
+}
+
+bool NamedRecordMatches(
+    int credential_directory_fd,
+    const char* name,
+    const FileIdentity& identity) {
+  struct stat named {};
+  return fstatat(
+             credential_directory_fd,
+             name,
+             &named,
+             AT_SYMLINK_NOFOLLOW) == 0
+      && IsOwnerRegularFile(named)
+      && MatchesIdentity(named, identity);
+}
+
+bool FillRandomBytes(unsigned char* bytes, std::size_t length) {
+  if (bytes == nullptr || length == 0) return false;
+  std::size_t offset = 0;
+  while (offset < length) {
+    const ssize_t count = getrandom(
+        bytes + offset,
+        length - offset,
+        GRND_NONBLOCK);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) return false;
+    offset += static_cast<std::size_t>(count);
+  }
+  return true;
+}
+
+bool TransientRecordName(
+    const char* operation,
+    char* output,
+    std::size_t length) {
+  if (operation == nullptr || output == nullptr || length < 64) return false;
+  std::array<unsigned char, 12> random {};
+  if (!FillRandomBytes(random.data(), random.size())) return false;
+  const int written = snprintf(
+      output,
+      length,
+      ".accountless-%s-%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x-v1",
+      operation,
+      random[0], random[1], random[2], random[3], random[4], random[5],
+      random[6], random[7], random[8], random[9], random[10], random[11]);
+  random.fill(0);
+  return written > 0 && static_cast<std::size_t>(written) < length;
+}
+
+// Return a pinned, newly-created temporary record, `-1` if the O_EXCL call
+// did not create anything, and `-2` after the inode exists but could not be
+// normalized. The caller generates the opaque name before it marks its
+// journal active, so entropy and name-generation failures remain retryable.
+int CreateTransientRecord(
+    int credential_directory_fd,
+    const char* name) {
+  if (credential_directory_fd < 0 || name == nullptr) return -1;
+  const int fd = openat(
+      credential_directory_fd,
+      name,
+      O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+      0600);
+  if (fd < 0) return -1;
+  if (fchmod(fd, 0600) != 0) {
+    close(fd);
+    return -2;
+  }
+  return fd;
+}
+
+bool WriteTransientAccountlessRecord(
+    int credential_directory_fd,
+    const char* name,
+    int record_fd,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& value) {
+  FileIdentity identity {};
+  return CaptureRegularFileIdentity(record_fd, &identity)
+      && VerifyNamedRegularFileContinuity(
+          credential_directory_fd,
+          name,
+          record_fd,
+          identity)
+      && WriteAll(
+          record_fd,
+          reinterpret_cast<const char*>(value.data()),
+          value.size())
+      && fsync(record_fd) == 0
+      && VerifyNamedRegularFileContinuity(
+          credential_directory_fd,
+          name,
+          record_fd,
+          identity);
+}
+
+bool RenameNoReplace(
+    int directory_fd,
+    const char* source,
+    const char* destination) {
+#if defined(SYS_renameat2)
+  return syscall(
+             SYS_renameat2,
+             directory_fd,
+             source,
+             directory_fd,
+             destination,
+             RENAME_NOREPLACE) == 0;
+#else
+  errno = ENOSYS;
+  return false;
+#endif
+}
+
+enum class AccountlessLeaseOutcome {
+  kAcquired,
+  kUnavailable,
+  kRecoveryRequired,
+};
+
+AccountlessLeaseOutcome AcquireAccountlessLease(NativeLease** result) {
+  if (result == nullptr) return AccountlessLeaseOutcome::kUnavailable;
+  *result = nullptr;
+  int socket_fd = -1;
+  bool contended = false;
+  if (!AcquireKernelLeaseSocket(
+          kAccountlessInstallationCredentialSlot,
+          &socket_fd,
+          &contended)) {
+    return AccountlessLeaseOutcome::kUnavailable;
+  }
+  int persistent_state_fd = OpenPersistentStateDirectory();
+  if (persistent_state_fd < 0) {
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, nullptr);
+    return AccountlessLeaseOutcome::kUnavailable;
+  }
+  int journal_fd = -1;
+  FileIdentity journal_identity {};
+  const JournalOpenOutcome journal = OpenJournal(
+      persistent_state_fd,
+      kAccountlessInstallationCredentialSlot,
+      &journal_fd,
+      &journal_identity);
+  if (journal == JournalOpenOutcome::kFailure) {
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return AccountlessLeaseOutcome::kRecoveryRequired;
+  }
+  // Normalise a fresh journal before any later allocation or preflight can
+  // fail. That keeps known pre-mutation failures retryable instead of leaving
+  // a zero-length fresh journal that a later caller would treat as recovery.
+  const bool initialized = journal != JournalOpenOutcome::kCreated
+      || WriteJournalState(
+          persistent_state_fd,
+          journal_fd,
+          kAccountlessInstallationCredentialSlot,
+          journal_identity,
+          JournalState::kNormal);
+  const JournalState prior = journal == JournalOpenOutcome::kCreated
+      ? JournalState::kNormal
+      : ReadJournalState(journal_fd);
+  if (!initialized) {
+    const bool removed = RemoveFreshAccountlessJournal(
+        persistent_state_fd,
+        journal_fd,
+        journal_identity);
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return removed
+        ? AccountlessLeaseOutcome::kUnavailable
+        : AccountlessLeaseOutcome::kRecoveryRequired;
+  }
+  if (prior != JournalState::kNormal) {
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return AccountlessLeaseOutcome::kRecoveryRequired;
+  }
+  auto* lease = new (std::nothrow) NativeLease {
+    socket_fd,
+    persistent_state_fd,
+    journal_fd,
+    journal_identity,
+    kAccountlessInstallationCredentialSlot,
+    false,
+    true,
+  };
+  if (lease == nullptr) {
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return AccountlessLeaseOutcome::kUnavailable;
+  }
+  *result = lease;
+  return AccountlessLeaseOutcome::kAcquired;
+}
+
+bool BeginAccountlessMutation(NativeLease* lease) {
+  if (lease == nullptr
+      || lease->capability_id != kAccountlessInstallationCredentialSlot
+      || !lease->active
+      || lease->accountless_active_marker_written) {
+    return false;
+  }
+  if (!WriteJournalState(
+          lease->persistent_state_fd,
+          lease->journal_fd,
+          lease->capability_id,
+          lease->journal_identity,
+          JournalState::kActive)) {
+    return false;
+  }
+  lease->accountless_active_marker_written = true;
+  return true;
+}
+
+// A malformed or unsafe fixed record is not a retryable pre-mutation error:
+// even though no syscall changed that record in this call, removal of it later
+// must not permit silent identity minting. Latch the same private journal
+// before releasing the socket. If a prior mutation already wrote `active`,
+// verify that exact pinned journal rather than attempting to overwrite it.
+bool LatchAccountlessRecovery(NativeLease* lease) {
+  if (lease == nullptr
+      || lease->capability_id != kAccountlessInstallationCredentialSlot
+      || !lease->active) {
+    return false;
+  }
+  if (lease->accountless_active_marker_written) {
+    return VerifyJournalContinuity(
+        lease->persistent_state_fd,
+        lease->journal_fd,
+        lease->capability_id,
+        lease->journal_identity);
+  }
+  if (!WriteJournalState(
+          lease->persistent_state_fd,
+          lease->journal_fd,
+          lease->capability_id,
+          lease->journal_identity,
+          JournalState::kActive)) {
+    return false;
+  }
+  lease->accountless_active_marker_written = true;
+  return true;
+}
+
+bool FinishAccountlessLease(NativeLease* lease, bool preserve_active) {
+  if (lease == nullptr) return false;
+  // A read, an existing-record result, or a known pre-mutation failure has
+  // only observed an already-normal private journal. Rewriting that normal
+  // record would add an unnecessary ftruncate/fsync crash window. Verify the
+  // pinned normal state and close it instead. A marker written for a mutation
+  // or recovery latch still uses the ordinary active->normal/preserve path.
+  bool finished = false;
+  if (!preserve_active && !lease->accountless_active_marker_written) {
+    const bool journal_normal = VerifyJournalContinuity(
+            lease->persistent_state_fd,
+            lease->journal_fd,
+            lease->capability_id,
+            lease->journal_identity)
+        && ReadJournalState(lease->journal_fd) == JournalState::kNormal
+        && VerifyJournalContinuity(
+            lease->persistent_state_fd,
+            lease->journal_fd,
+            lease->capability_id,
+            lease->journal_identity);
+    const bool journal_closed = CloseDescriptor(&lease->journal_fd);
+    const bool state_closed = CloseDescriptor(&lease->persistent_state_fd);
+    const bool socket_closed = CloseDescriptor(&lease->socket_fd);
+    finished = journal_normal && journal_closed && state_closed && socket_closed;
+  } else {
+    finished = FinishLease(lease, preserve_active);
+  }
+  lease->active = false;
+  delete lease;
+  return finished;
+}
+
 bool CloseDescriptor(int* fd) {
   if (fd == nullptr || *fd < 0) return true;
   const int current = *fd;
@@ -451,7 +905,7 @@ bool FinishLease(NativeLease* lease, bool preserve_active) {
 }
 
 bool AcquireKernelLeaseSocket(int capability_id, int* socket_fd, bool* contended) {
-  if (socket_fd == nullptr || contended == nullptr || !IsCapabilityId(capability_id)) {
+  if (socket_fd == nullptr || contended == nullptr || !IsInternalCredentialSlot(capability_id)) {
     return false;
   }
   *socket_fd = -1;
@@ -698,6 +1152,433 @@ napi_value AbandonCredentialMutex(napi_env env, napi_callback_info info) {
   return FinishIssuedLease(env, info, true);
 }
 
+bool AccountlessCredentialArgument(
+    napi_env env,
+    napi_callback_info info,
+    std::array<unsigned char, kAccountlessCredentialBytes>* value) {
+  if (value == nullptr) return false;
+  std::array<napi_value, 1> arguments {};
+  std::size_t argument_count = arguments.size();
+  bool is_buffer = false;
+  void* bytes = nullptr;
+  std::size_t length = 0;
+  if (napi_get_cb_info(
+          env,
+          info,
+          &argument_count,
+          arguments.data(),
+          nullptr,
+          nullptr) != napi_ok
+      || argument_count != 1
+      || napi_is_buffer(env, arguments[0], &is_buffer) != napi_ok
+      || !is_buffer
+      || napi_get_buffer_info(env, arguments[0], &bytes, &length) != napi_ok
+      || bytes == nullptr
+      || length != value->size()) {
+    return false;
+  }
+  std::memcpy(value->data(), bytes, value->size());
+  return true;
+}
+
+napi_value AccountlessStatus(napi_env env, const char* status) {
+  napi_value value = nullptr;
+  if (napi_create_string_utf8(env, status, NAPI_AUTO_LENGTH, &value) != napi_ok) {
+    return ThrowFixed(env, kCodeAccountlessUnavailable);
+  }
+  return value;
+}
+
+napi_value AccountlessValue(
+    napi_env env,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& bytes) {
+  napi_value value = nullptr;
+  void* copied = nullptr;
+  if (napi_create_buffer_copy(
+          env,
+          bytes.size(),
+          bytes.data(),
+          &copied,
+          &value) != napi_ok) {
+    return nullptr;
+  }
+  return value;
+}
+
+napi_value FailAccountlessRecovery(napi_env env, NativeLease* lease);
+napi_value FailAccountlessKnownNonMutation(napi_env env, NativeLease* lease);
+
+napi_value ReadAccountlessInstallationCredential(
+    napi_env env,
+    napi_callback_info info) {
+  std::array<napi_value, 1> arguments {};
+  std::size_t argument_count = arguments.size();
+  if (napi_get_cb_info(
+          env,
+          info,
+          &argument_count,
+          arguments.data(),
+          nullptr,
+          nullptr) != napi_ok
+      || argument_count != 0) {
+    return ThrowFixed(env, kCodeAccountlessInvalidValue);
+  }
+  NativeLease* lease = nullptr;
+  const AccountlessLeaseOutcome acquired = AcquireAccountlessLease(&lease);
+  if (acquired == AccountlessLeaseOutcome::kRecoveryRequired) {
+    return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+  }
+  if (acquired != AccountlessLeaseOutcome::kAcquired) {
+    return ThrowFixed(env, kCodeAccountlessUnavailable);
+  }
+  const int credential_directory_fd = OpenAccountlessCredentialDirectory();
+  if (credential_directory_fd < 0) {
+    return FailAccountlessKnownNonMutation(env, lease);
+  }
+  AccountlessRecord record {};
+  const AccountlessRecordState state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &record);
+  const bool closed = close(credential_directory_fd) == 0;
+  if (state == AccountlessRecordState::kInvalid || !closed) {
+    record.bytes.fill(0);
+    return FailAccountlessRecovery(env, lease);
+  }
+  if (state == AccountlessRecordState::kUnavailable) {
+    record.bytes.fill(0);
+    return FailAccountlessKnownNonMutation(env, lease);
+  }
+  napi_value result = nullptr;
+  if (state == AccountlessRecordState::kAbsent) {
+    napi_get_null(env, &result);
+  } else {
+    result = AccountlessValue(env, record.bytes);
+  }
+  record.bytes.fill(0);
+  if (result == nullptr) {
+    napi_value ignored = nullptr;
+    napi_get_and_clear_last_exception(env, &ignored);
+    const bool settled = FinishAccountlessLease(lease, false);
+    return ThrowFixed(
+        env,
+        settled ? kCodeAccountlessUnavailable : kCodeAccountlessRecoveryRequired);
+  }
+  if (!FinishAccountlessLease(lease, false)) {
+    return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+  }
+  return result;
+}
+
+napi_value FailAccountlessKnownNonMutation(napi_env env, NativeLease* lease) {
+  if (lease == nullptr || lease->accountless_active_marker_written) {
+    return FailAccountlessRecovery(env, lease);
+  }
+  return ThrowFixed(
+      env,
+      FinishAccountlessLease(lease, false)
+          ? kCodeAccountlessUnavailable
+          : kCodeAccountlessRecoveryRequired);
+}
+
+napi_value FailAccountlessRecovery(napi_env env, NativeLease* lease) {
+  // Once an O_EXCL temporary inode, rename, unlink, or malformed/unsafe fixed
+  // record was observed, retain the active marker. A later startup must not
+  // silently mint or erase an installation identity through an ambiguous
+  // local state.
+  LatchAccountlessRecovery(lease);
+  FinishAccountlessLease(lease, true);
+  return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+}
+
+napi_value CreateAccountlessInstallationCredentialIfMissing(
+    napi_env env,
+    napi_callback_info info) {
+  std::array<unsigned char, kAccountlessCredentialBytes> value {};
+  if (!AccountlessCredentialArgument(env, info, &value)) {
+    value.fill(0);
+    return ThrowFixed(env, kCodeAccountlessInvalidValue);
+  }
+  int credential_directory_fd = OpenAccountlessCredentialDirectory();
+  if (credential_directory_fd < 0) {
+    value.fill(0);
+    return ThrowFixed(env, kCodeAccountlessUnavailable);
+  }
+  NativeLease* lease = nullptr;
+  const AccountlessLeaseOutcome acquired = AcquireAccountlessLease(&lease);
+  if (acquired != AccountlessLeaseOutcome::kAcquired) {
+    close(credential_directory_fd);
+    value.fill(0);
+    return ThrowFixed(
+        env,
+        acquired == AccountlessLeaseOutcome::kRecoveryRequired
+            ? kCodeAccountlessRecoveryRequired
+            : kCodeAccountlessUnavailable);
+  }
+
+  AccountlessRecord existing {};
+  const AccountlessRecordState before = ReadAccountlessRecord(
+      credential_directory_fd,
+      &existing);
+  if (before == AccountlessRecordState::kPresent) {
+    existing.bytes.fill(0);
+    const bool directory_closed = close(credential_directory_fd) == 0;
+    value.fill(0);
+    if (!directory_closed) return FailAccountlessRecovery(env, lease);
+    if (!FinishAccountlessLease(lease, false)) {
+      return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+    }
+    return AccountlessStatus(env, "existing");
+  }
+  existing.bytes.fill(0);
+  if (before == AccountlessRecordState::kInvalid) {
+    close(credential_directory_fd);
+    value.fill(0);
+    return FailAccountlessRecovery(env, lease);
+  }
+  if (before != AccountlessRecordState::kAbsent) {
+    close(credential_directory_fd);
+    value.fill(0);
+    return FailAccountlessKnownNonMutation(env, lease);
+  }
+
+  char temporary_name[96] {};
+  if (!TransientRecordName("create", temporary_name, sizeof(temporary_name))) {
+    close(credential_directory_fd);
+    value.fill(0);
+    return FailAccountlessKnownNonMutation(env, lease);
+  }
+  // The active journal precedes only the O_EXCL call that can create durable
+  // record residue. Discovery, validation, and entropy acquisition above can
+  // fail or crash without poisoning a known unchanged installation identity.
+  if (!BeginAccountlessMutation(lease)) {
+    close(credential_directory_fd);
+    value.fill(0);
+    return FailAccountlessRecovery(env, lease);
+  }
+  int temporary_fd = CreateTransientRecord(
+      credential_directory_fd,
+      temporary_name);
+  if (temporary_fd < 0) {
+    // An O_EXCL failure can be settled only after rechecking both the fixed
+    // record and the generated temporary name. A collision or any residue is
+    // a recovery boundary; an absent temp plus absent record proves this
+    // particular create did not publish or leave an inode behind.
+    AccountlessRecord rechecked {};
+    const AccountlessRecordState rechecked_state = ReadAccountlessRecord(
+        credential_directory_fd,
+        &rechecked);
+    rechecked.bytes.fill(0);
+    struct stat temporary_metadata {};
+    const bool temporary_absent = fstatat(
+            credential_directory_fd,
+            temporary_name,
+            &temporary_metadata,
+            AT_SYMLINK_NOFOLLOW) != 0
+        && errno == ENOENT;
+    const bool no_record_mutation = temporary_fd == -1
+        && temporary_absent
+        && rechecked_state == AccountlessRecordState::kAbsent;
+    close(credential_directory_fd);
+    value.fill(0);
+    if (no_record_mutation) {
+      const bool settled = FinishAccountlessLease(lease, false);
+      return ThrowFixed(
+          env,
+          settled ? kCodeAccountlessUnavailable : kCodeAccountlessRecoveryRequired);
+    }
+    return FailAccountlessRecovery(env, lease);
+  }
+  const bool written = WriteTransientAccountlessRecord(
+      credential_directory_fd,
+      temporary_name,
+      temporary_fd,
+      value);
+  const bool temporary_closed = CloseDescriptor(&temporary_fd);
+  if (!written || !temporary_closed) {
+    close(credential_directory_fd);
+    value.fill(0);
+    return FailAccountlessRecovery(env, lease);
+  }
+  if (!RenameNoReplace(
+          credential_directory_fd,
+          temporary_name,
+          kAccountlessCredentialFile)
+      || fsync(credential_directory_fd) != 0) {
+    close(credential_directory_fd);
+    value.fill(0);
+    return FailAccountlessRecovery(env, lease);
+  }
+
+  AccountlessRecord readback {};
+  const AccountlessRecordState after = ReadAccountlessRecord(
+      credential_directory_fd,
+      &readback);
+  const bool exact = after == AccountlessRecordState::kPresent
+      && EqualAccountlessCredential(readback.bytes, value);
+  readback.bytes.fill(0);
+  const bool directory_closed = close(credential_directory_fd) == 0;
+  value.fill(0);
+  if (!exact || !directory_closed) return FailAccountlessRecovery(env, lease);
+  // Allocate the JavaScript result before settling the durable mutation. If
+  // N-API cannot allocate it, retain active rather than reporting a retryable
+  // pre-mutation failure after a record was already published.
+  napi_value result = AccountlessStatus(env, "created");
+  if (result == nullptr) {
+    napi_value ignored = nullptr;
+    napi_get_and_clear_last_exception(env, &ignored);
+    FinishAccountlessLease(lease, true);
+    return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+  }
+  if (!FinishAccountlessLease(lease, false)) {
+    return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+  }
+  return result;
+}
+
+napi_value DeleteAccountlessInstallationCredentialExact(
+    napi_env env,
+    napi_callback_info info) {
+  std::array<unsigned char, kAccountlessCredentialBytes> expected {};
+  if (!AccountlessCredentialArgument(env, info, &expected)) {
+    expected.fill(0);
+    return ThrowFixed(env, kCodeAccountlessInvalidValue);
+  }
+  int credential_directory_fd = OpenAccountlessCredentialDirectory();
+  if (credential_directory_fd < 0) {
+    expected.fill(0);
+    return ThrowFixed(env, kCodeAccountlessUnavailable);
+  }
+  NativeLease* lease = nullptr;
+  const AccountlessLeaseOutcome acquired = AcquireAccountlessLease(&lease);
+  if (acquired != AccountlessLeaseOutcome::kAcquired) {
+    close(credential_directory_fd);
+    expected.fill(0);
+    return ThrowFixed(
+        env,
+        acquired == AccountlessLeaseOutcome::kRecoveryRequired
+            ? kCodeAccountlessRecoveryRequired
+            : kCodeAccountlessUnavailable);
+  }
+
+  AccountlessRecord current {};
+  const AccountlessRecordState before = ReadAccountlessRecord(
+      credential_directory_fd,
+      &current);
+  if (before == AccountlessRecordState::kAbsent) {
+    const bool directory_closed = close(credential_directory_fd) == 0;
+    expected.fill(0);
+    if (!directory_closed) return FailAccountlessRecovery(env, lease);
+    if (!FinishAccountlessLease(lease, false)) {
+      return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+    }
+    return AccountlessStatus(env, "missing");
+  }
+  if (before != AccountlessRecordState::kPresent) {
+    current.bytes.fill(0);
+    close(credential_directory_fd);
+    expected.fill(0);
+    return before == AccountlessRecordState::kInvalid
+        ? FailAccountlessRecovery(env, lease)
+        : FailAccountlessKnownNonMutation(env, lease);
+  }
+  if (!EqualAccountlessCredential(current.bytes, expected)) {
+    current.bytes.fill(0);
+    const bool directory_closed = close(credential_directory_fd) == 0;
+    expected.fill(0);
+    if (!directory_closed) return FailAccountlessRecovery(env, lease);
+    if (!FinishAccountlessLease(lease, false)) {
+      return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+    }
+    return AccountlessStatus(env, "mismatch");
+  }
+
+  char quarantine_name[96] {};
+  if (!TransientRecordName("delete", quarantine_name, sizeof(quarantine_name))) {
+    current.bytes.fill(0);
+    close(credential_directory_fd);
+    expected.fill(0);
+    return FailAccountlessKnownNonMutation(env, lease);
+  }
+  if (!NamedRecordMatches(
+          credential_directory_fd,
+          kAccountlessCredentialFile,
+          current.identity)) {
+    current.bytes.fill(0);
+    close(credential_directory_fd);
+    expected.fill(0);
+    return FailAccountlessRecovery(env, lease);
+  }
+  // All non-mutating work, including entropy acquisition and exact source
+  // validation, completes before the durable active marker. The marker
+  // immediately precedes the only syscall that can move the record.
+  if (!BeginAccountlessMutation(lease)) {
+    current.bytes.fill(0);
+    close(credential_directory_fd);
+    expected.fill(0);
+    return FailAccountlessRecovery(env, lease);
+  }
+  if (!RenameNoReplace(
+          credential_directory_fd,
+          kAccountlessCredentialFile,
+          quarantine_name)) {
+    current.bytes.fill(0);
+    close(credential_directory_fd);
+    expected.fill(0);
+    return FailAccountlessRecovery(env, lease);
+  }
+  if (fsync(credential_directory_fd) != 0) {
+    current.bytes.fill(0);
+    close(credential_directory_fd);
+    expected.fill(0);
+    return FailAccountlessRecovery(env, lease);
+  }
+  AccountlessRecord quarantined {};
+  const AccountlessRecordState quarantine_state = ReadAccountlessRecordNamed(
+      credential_directory_fd,
+      quarantine_name,
+      &quarantined);
+  const bool exact = quarantine_state == AccountlessRecordState::kPresent
+      && SameFileIdentity(quarantined.identity, current.identity)
+      && EqualAccountlessCredential(quarantined.bytes, expected)
+      && NamedRecordMatches(
+          credential_directory_fd,
+          quarantine_name,
+          current.identity);
+  quarantined.bytes.fill(0);
+  if (!exact
+      || unlinkat(credential_directory_fd, quarantine_name, 0) != 0
+      || fsync(credential_directory_fd) != 0) {
+    current.bytes.fill(0);
+    close(credential_directory_fd);
+    expected.fill(0);
+    return FailAccountlessRecovery(env, lease);
+  }
+  AccountlessRecord final_record {};
+  const AccountlessRecordState final_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &final_record);
+  final_record.bytes.fill(0);
+  current.bytes.fill(0);
+  const bool directory_closed = close(credential_directory_fd) == 0;
+  expected.fill(0);
+  if (final_state != AccountlessRecordState::kAbsent || !directory_closed) {
+    return FailAccountlessRecovery(env, lease);
+  }
+  // As with create, do not settle a successful deletion before its fixed
+  // result object exists in JavaScript.
+  napi_value result = AccountlessStatus(env, "deleted");
+  if (result == nullptr) {
+    napi_value ignored = nullptr;
+    napi_get_and_clear_last_exception(env, &ignored);
+    FinishAccountlessLease(lease, true);
+    return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+  }
+  if (!FinishAccountlessLease(lease, false)) {
+    return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+  }
+  return result;
+}
+
 bool DefineMethod(
     napi_env env,
     napi_value exports,
@@ -728,6 +1609,21 @@ napi_value Initialize(napi_env env, napi_value exports) {
   if (!DefineMethod(env, exports, "acquireCredentialMutex", AcquireCredentialMutex)
       || !DefineMethod(env, exports, "releaseCredentialMutex", ReleaseCredentialMutex)
       || !DefineMethod(env, exports, "abandonCredentialMutex", AbandonCredentialMutex)
+      || !DefineMethod(
+          env,
+          exports,
+          "readAccountlessInstallationCredential",
+          ReadAccountlessInstallationCredential)
+      || !DefineMethod(
+          env,
+          exports,
+          "createAccountlessInstallationCredentialIfMissing",
+          CreateAccountlessInstallationCredentialIfMissing)
+      || !DefineMethod(
+          env,
+          exports,
+          "deleteAccountlessInstallationCredentialExact",
+          DeleteAccountlessInstallationCredentialExact)
       || !DefineString(
           env,
           exports,

@@ -33,6 +33,9 @@ function binding(overrides = {}) {
     acquireCredentialMutex: () => ({ lease: Object.create(null), abandoned: false }),
     releaseCredentialMutex: () => {},
     abandonCredentialMutex: () => {},
+    readAccountlessInstallationCredential: () => null,
+    createAccountlessInstallationCredentialIfMissing: () => "created",
+    deleteAccountlessInstallationCredentialExact: () => "deleted",
     ...overrides,
   };
 }
@@ -50,6 +53,9 @@ function manifest(bytes = BYTES, overrides = {}) {
       "acquireCredentialMutex",
       "releaseCredentialMutex",
       "abandonCredentialMutex",
+      "readAccountlessInstallationCredential",
+      "createAccountlessInstallationCredentialIfMissing",
+      "deleteAccountlessInstallationCredentialExact",
     ],
     nativeClaims: {
       credentialMutexCrossProcessSafe: true,

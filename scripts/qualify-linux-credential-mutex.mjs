@@ -2,8 +2,10 @@
 
 /**
  * Execute the narrow native Linux x64 mutex qualification after its binding
- * and sidecar have been built. This creates no credential, selects no
- * production backend, and carries no Linux support or packaging claim.
+ * and sidecar have been built. Its disposable native test exercises the
+ * fixed accountless record only under a temporary owner-only state root; it
+ * accesses no production credential, selects no production backend, and
+ * carries no Linux support or packaging claim.
  */
 
 import { spawnSync as nodeSpawnSync } from "node:child_process";
@@ -28,8 +30,9 @@ function fail(code) {
 }
 
 /**
- * Run only the explicit native mutex test. Its child process uses disposable
- * owner-only state roots, including a fresh runtime namespace after a crash.
+ * Run only the explicit native mutex test. It uses disposable owner-only
+ * state roots, including synthetic fixed accountless records and a fresh
+ * runtime namespace after a crash.
  */
 export function qualifyLinuxCredentialMutex({
   platform = process.platform,
@@ -92,6 +95,8 @@ export function qualifyLinuxCredentialMutex({
     schemaVersion: "linux-credential-mutex-qualification-v1",
     status: "passed",
     scope: "native_mutex_only",
+    syntheticAccountlessInstallationRecordTested: true,
+    productionCredentialAccessed: false,
     platform: "linux",
     architecture: "x64",
     contractVersion: "linux-credential-mutex-v1",

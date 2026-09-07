@@ -40,6 +40,31 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /bind\(fd/u);
   assert.match(source, /kJournalActiveText/u);
   assert.match(source, /kJournalNormalText/u);
+  assert.match(source, /kAccountlessInstallationCredentialSlot = 4/u);
+  assert.match(source, /IsCapabilityId\(\*capability_id\)/u);
+  assert.match(source, /readAccountlessInstallationCredential/u);
+  assert.match(source, /createAccountlessInstallationCredentialIfMissing/u);
+  assert.match(source, /deleteAccountlessInstallationCredentialExact/u);
+  assert.match(source, /kAccountlessCredentialBytes = 32/u);
+  assert.match(source, /OpenAccountlessCredentialDirectory/u);
+  assert.match(source, /O_CREAT \| O_EXCL/u);
+  assert.match(source, /O_RDONLY \| O_CLOEXEC \| O_NOFOLLOW \| O_NONBLOCK/u);
+  assert.match(source, /RENAME_NOREPLACE/u);
+  assert.match(source, /BeginAccountlessMutation/u);
+  assert.match(source, /LatchAccountlessRecovery/u);
+  assert.match(source, /accountless_active_marker_written/u);
+  assert.match(
+    source,
+    /if \(!preserve_active && !lease->accountless_active_marker_written\) \{/u,
+  );
+  assert.match(source, /ReadJournalState\(lease->journal_fd\) == JournalState::kNormal/u);
+  assert.match(source, /FailAccountlessRecovery/u);
+  assert.match(
+    source,
+    /if \(no_record_mutation\) \{\s+const bool settled = FinishAccountlessLease\(lease, false\);\s+return ThrowFixed\(/u,
+  );
+  assert.doesNotMatch(source, /no_record_mutation && FinishAccountlessLease/u);
+  assert.match(source, /unlinkat\(credential_directory_fd, quarantine_name, 0\)/u);
   assert.match(source, /WriteJournalState/u);
   assert.match(source, /VerifyJournalContinuity/u);
   assert.match(source, /fstatat\(state_fd/u);
@@ -56,10 +81,10 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /"productionSafe", false/u);
   assert.doesNotMatch(source, /flock\(/u);
   assert.doesNotMatch(source, /XDG_RUNTIME_DIR/u);
-  assert.doesNotMatch(source, /unlinkat\(/u);
+  assert.doesNotMatch(source, /safeStorage/u);
   assert.doesNotMatch(source, /productionSafe", true/u);
   assert.match(readme, /persistent XDG state\s+tree/u);
   assert.match(readme, /same Linux network namespace/u);
   assert.match(readme, /recovery_required/u);
-  assert.match(readme, /not a\s+selected credential backend/u);
+  assert.match(readme, /not a\s+selected credential\s+backend/u);
 });

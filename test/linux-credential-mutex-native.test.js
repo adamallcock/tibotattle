@@ -172,6 +172,158 @@ test("native Linux mutex uses a socket primary lease, preserves crash state, and
   assert.equal(normalAgain.abandoned, false);
   binding.releaseCredentialMutex(normalAgain.lease);
 
+  // Slot four is private to the fixed accountless methods. The inherited
+  // generic lease surface remains exactly the four legacy FD4 capabilities.
+  assert.throws(
+    () => binding.acquireCredentialMutex(4),
+    (error) => error?.code === "LINUX_CREDENTIAL_MUTEX_INVALID_CAPABILITY",
+  );
+  const accountlessDirectory = join(
+    stateBase,
+    "app-usagemonitor",
+    "linux-accountless-installation-credential-v1",
+  );
+  // This failure occurs before the accountless mutation marker. Restoring the
+  // owner-only directory must leave the installation eligible to create its
+  // first identity rather than pinning a recovery state.
+  assert.equal(binding.readAccountlessInstallationCredential(), null);
+  await chmod(accountlessDirectory, 0o500);
+  assert.throws(
+    () => binding.createAccountlessInstallationCredentialIfMissing(Buffer.alloc(32, 90)),
+    (error) => error?.code === "LINUX_ACCOUNTLESS_CREDENTIAL_UNAVAILABLE",
+  );
+  await chmod(accountlessDirectory, 0o700);
+  const accountless = Buffer.alloc(32, 91);
+  assert.equal(
+    binding.createAccountlessInstallationCredentialIfMissing(accountless),
+    "created",
+  );
+  const storedAccountless = binding.readAccountlessInstallationCredential();
+  assert.deepEqual(storedAccountless, accountless);
+  storedAccountless.fill(0);
+  assert.equal(
+    binding.createAccountlessInstallationCredentialIfMissing(Buffer.alloc(32, 92)),
+    "existing",
+  );
+  assert.equal(
+    binding.deleteAccountlessInstallationCredentialExact(Buffer.alloc(32, 93)),
+    "mismatch",
+  );
+  assert.equal(
+    binding.deleteAccountlessInstallationCredentialExact(accountless),
+    "deleted",
+  );
+  assert.equal(binding.readAccountlessInstallationCredential(), null);
+  accountless.fill(0);
+
+  const accountlessRecordPath = join(
+    stateBase,
+    "app-usagemonitor",
+    "linux-accountless-installation-credential-v1",
+    "accountless-installation-credential-v1",
+  );
+  // Opening an attacker-controlled FIFO for read must not block the main
+  // process before its fixed-file validation. Keep this unsafe fixture under
+  // a separate state root because its expected recovery latch must persist.
+  const fifoStateBase = join(root, "fifo-state");
+  const fifoAccountlessDirectory = join(
+    fifoStateBase,
+    "app-usagemonitor",
+    "linux-accountless-installation-credential-v1",
+  );
+  const fifoRecordPath = join(
+    fifoAccountlessDirectory,
+    "accountless-installation-credential-v1",
+  );
+  await ownerOnlyDirectory(fifoStateBase);
+  await ownerOnlyDirectory(join(fifoStateBase, "app-usagemonitor"));
+  await ownerOnlyDirectory(fifoAccountlessDirectory);
+  const madeFifo = spawnSync("mkfifo", [fifoRecordPath], {
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+  assert.equal(madeFifo.status, 0);
+  assert.equal(madeFifo.signal, null);
+  assert.equal(madeFifo.stderr, "");
+  await chmod(fifoRecordPath, 0o600);
+  const fifoRecovery = runChild("accountless-read", 0, {
+    ...process.env,
+    XDG_STATE_HOME: fifoStateBase,
+  });
+  assert.equal(fifoRecovery.error, undefined);
+  assert.equal(fifoRecovery.signal, null);
+  assert.equal(fifoRecovery.status, 0);
+  assert.equal(
+    fifoRecovery.stdout,
+    "LINUX_ACCOUNTLESS_CREDENTIAL_CHILD_READ_RECOVERY_REQUIRED\n",
+  );
+  assert.equal(fifoRecovery.stderr, "");
+
+  await writeFile(accountlessRecordPath, Buffer.alloc(31, 4), { mode: 0o600 });
+  await chmod(accountlessRecordPath, 0o600);
+  assert.throws(
+    () => binding.readAccountlessInstallationCredential(),
+    (error) => error?.code === "LINUX_ACCOUNTLESS_CREDENTIAL_RECOVERY_REQUIRED",
+  );
+  await rm(accountlessRecordPath);
+
+  // An unsafe fixed record latches recovery before the socket is released.
+  // Removing that record outside an explicit recovery workflow cannot reopen
+  // create or read in a fresh process.
+  const removedRecordRead = runChild("accountless-read", 0, process.env);
+  assert.equal(removedRecordRead.error, undefined);
+  assert.equal(removedRecordRead.signal, null);
+  assert.equal(removedRecordRead.status, 0);
+  assert.equal(
+    removedRecordRead.stdout,
+    "LINUX_ACCOUNTLESS_CREDENTIAL_CHILD_READ_RECOVERY_REQUIRED\n",
+  );
+  assert.equal(removedRecordRead.stderr, "");
+  const removedRecordCreate = runChild("accountless-create", 0, process.env);
+  assert.equal(removedRecordCreate.error, undefined);
+  assert.equal(removedRecordCreate.signal, null);
+  assert.equal(removedRecordCreate.status, 0);
+  assert.equal(
+    removedRecordCreate.stdout,
+    "LINUX_ACCOUNTLESS_CREDENTIAL_CHILD_CREATE_RECOVERY_REQUIRED\n",
+  );
+  assert.equal(removedRecordCreate.stderr, "");
+
+  // Simulate an interrupted private operation after its durable marker. The
+  // next process must preserve the fixed recovery path rather than silently
+  // minting a new upload identity.
+  const interruptedStateBase = join(root, "interrupted-state");
+  const interruptedJournalDirectory = join(
+    interruptedStateBase,
+    "app-usagemonitor",
+    "linux-credential-mutex-v1",
+  );
+  const accountlessJournalPath = join(
+    interruptedJournalDirectory,
+    "journal-4-v1",
+  );
+  await ownerOnlyDirectory(interruptedStateBase);
+  await ownerOnlyDirectory(join(interruptedStateBase, "app-usagemonitor"));
+  await ownerOnlyDirectory(interruptedJournalDirectory);
+  await writeFile(
+    accountlessJournalPath,
+    "linux-credential-mutex-journal-v1:active\n",
+    { mode: 0o600 },
+  );
+  await chmod(accountlessJournalPath, 0o600);
+  const interruptedRecovery = runChild("accountless-read", 0, {
+    ...process.env,
+    XDG_STATE_HOME: interruptedStateBase,
+  });
+  assert.equal(interruptedRecovery.error, undefined);
+  assert.equal(interruptedRecovery.signal, null);
+  assert.equal(interruptedRecovery.status, 0);
+  assert.equal(
+    interruptedRecovery.stdout,
+    "LINUX_ACCOUNTLESS_CREDENTIAL_CHILD_READ_RECOVERY_REQUIRED\n",
+  );
+  assert.equal(interruptedRecovery.stderr, "");
+
   const leaseContext = createLinuxCredentialMutationLeaseContext({
     mutexContext: createLinuxCredentialMutationMutexContext(),
   });

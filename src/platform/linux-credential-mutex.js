@@ -38,6 +38,9 @@ export const LINUX_CREDENTIAL_MUTEX_BINDING_REQUIRED_METHODS = Object.freeze([
   "acquireCredentialMutex",
   "releaseCredentialMutex",
   "abandonCredentialMutex",
+  "readAccountlessInstallationCredential",
+  "createAccountlessInstallationCredentialIfMissing",
+  "deleteAccountlessInstallationCredentialExact",
 ]);
 
 const NATIVE_BINDING_PATH = resolve(
@@ -317,6 +320,9 @@ function snapshotBinding(binding) {
   let acquireCredentialMutex;
   let releaseCredentialMutex;
   let abandonCredentialMutex;
+  let readAccountlessInstallationCredential;
+  let createAccountlessInstallationCredentialIfMissing;
+  let deleteAccountlessInstallationCredentialExact;
   let contractVersion;
   let crossProcessSafe;
   let sameNetworkNamespaceOnly;
@@ -326,6 +332,11 @@ function snapshotBinding(binding) {
     acquireCredentialMutex = binding?.acquireCredentialMutex;
     releaseCredentialMutex = binding?.releaseCredentialMutex;
     abandonCredentialMutex = binding?.abandonCredentialMutex;
+    readAccountlessInstallationCredential = binding?.readAccountlessInstallationCredential;
+    createAccountlessInstallationCredentialIfMissing =
+      binding?.createAccountlessInstallationCredentialIfMissing;
+    deleteAccountlessInstallationCredentialExact =
+      binding?.deleteAccountlessInstallationCredentialExact;
     contractVersion = binding?.credentialMutexContractVersion;
     crossProcessSafe = binding?.credentialMutexCrossProcessSafe;
     sameNetworkNamespaceOnly = binding?.credentialMutexSameNetworkNamespaceOnly;
@@ -337,6 +348,9 @@ function snapshotBinding(binding) {
   if (typeof acquireCredentialMutex !== "function"
       || typeof releaseCredentialMutex !== "function"
       || typeof abandonCredentialMutex !== "function"
+      || typeof readAccountlessInstallationCredential !== "function"
+      || typeof createAccountlessInstallationCredentialIfMissing !== "function"
+      || typeof deleteAccountlessInstallationCredentialExact !== "function"
       || contractVersion !== "linux-credential-mutex-v1"
       || crossProcessSafe !== true
       || sameNetworkNamespaceOnly !== true
@@ -349,6 +363,12 @@ function snapshotBinding(binding) {
       acquireCredentialMutex: acquireCredentialMutex.bind(binding),
       releaseCredentialMutex: releaseCredentialMutex.bind(binding),
       abandonCredentialMutex: abandonCredentialMutex.bind(binding),
+      readAccountlessInstallationCredential:
+        readAccountlessInstallationCredential.bind(binding),
+      createAccountlessInstallationCredentialIfMissing:
+        createAccountlessInstallationCredentialIfMissing.bind(binding),
+      deleteAccountlessInstallationCredentialExact:
+        deleteAccountlessInstallationCredentialExact.bind(binding),
       credentialMutexContractVersion: contractVersion,
       credentialMutexCrossProcessSafe: crossProcessSafe,
       credentialMutexSameNetworkNamespaceOnly: sameNetworkNamespaceOnly,
