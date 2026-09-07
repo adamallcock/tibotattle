@@ -47,6 +47,7 @@ import {
 } from "../platform-gate.js";
 import {
   assertWindowsElectronQualificationContext,
+  createWindowsElectronQualificationAccountlessCredentialBackend,
   createWindowsElectronQualificationContext,
   runWindowsElectronQualificationCredentialCommandForTest,
 } from "../windows-qualification.js";
@@ -1114,6 +1115,28 @@ test("Windows qualification context is branded, content-free, and accepted only 
   });
 });
 
+test("Windows accountless smoke bridge accepts no caller-selected root or credential input", async () => {
+  await withWindowsQualificationFixture(async ({ context, environment }) => {
+    await assert.rejects(
+      createWindowsElectronQualificationAccountlessCredentialBackend({
+        context,
+        environment,
+        runId: "not-a-qualified-run-id",
+      }),
+      /Windows Electron qualification is unavailable/u,
+    );
+    await assert.rejects(
+      createWindowsElectronQualificationAccountlessCredentialBackend({
+        context,
+        environment,
+        runId: "550e8400-e29b-41d4-a716-446655440000",
+        rootPath: "C:\\caller-controlled",
+      }),
+      /Windows Electron qualification is unavailable/u,
+    );
+  });
+});
+
 test("Windows smoke control is qualification-only Node IPC with bounded cleanup", async () => {
   await withWindowsQualificationFixture(async ({ context, environment }) => {
     const source = new EventEmitter();
@@ -1270,6 +1293,11 @@ test("Windows smoke IPC maps every credential operation to a fixed result", asyn
         assert.equal(runId, qualifiedEnvironment.USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID);
         operations.push(command);
       },
+      accountlessStorage({ context: receivedContext, environment: receivedEnvironment }) {
+        assert.equal(receivedContext, context);
+        assert.equal(receivedEnvironment, qualifiedEnvironment);
+        operations.push("accountless-storage-v1");
+      },
       qualificationContext: context,
     });
     for (const [command, operation] of [
@@ -1295,7 +1323,27 @@ test("Windows smoke IPC maps every credential operation to a fixed result", asyn
       // returning false for backpressure. The control handler must consume it.
       callbacks.at(-1)(new Error("ERR_IPC_CHANNEL_CLOSED"));
     }
-    assert.deepEqual(operations, ["probe-v1", "create-v1", "read-v1", "delete-v1"]);
+    source.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "accountless-storage-v1",
+    });
+    await nextTick();
+    assert.equal(typeof callbacks.at(-1), "function");
+    assert.deepEqual(sent.at(-1), {
+      type: "windows-electron-smoke-v1",
+      message: "credential-v1",
+      operation: "accountless-storage-v1",
+      status: "passed-v1",
+    });
+    callbacks.at(-1)(new Error("ERR_IPC_CHANNEL_CLOSED"));
+    assert.deepEqual(operations, [
+      "probe-v1",
+      "create-v1",
+      "read-v1",
+      "delete-v1",
+      "accountless-storage-v1",
+    ]);
     cleanup();
     assert.equal(source.listenerCount("message"), 0);
     assert.equal(source.listenerCount("disconnect"), 0);

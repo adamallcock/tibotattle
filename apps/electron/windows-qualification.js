@@ -1,10 +1,12 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, resolve, win32 } from "node:path";
 
 import {
   assertWindowsQualificationResourceAuthority,
+  createWindowsFilesystemAdapter,
+  createWindowsQualificationModeContext,
 } from "../../src/platform/index.js";
 import {
   KEYTAR_WIN32_X64_SHA256,
@@ -599,6 +601,60 @@ export async function runWindowsElectronQualificationCredentialCommandForTest({
   binding,
 } = {}) {
   return runCredentialCommandWithBinding({ context, command, runId, binding });
+}
+
+/**
+ * Compose the qualification-only FD3 storage backend from both independent
+ * Windows context brands. The Electron context authenticates this packaged
+ * runtime; the platform context separately binds the native adapter and the
+ * launcher-created disposable state hierarchy. Nothing here selects a
+ * production credential route or accepts a caller-controlled root, secret,
+ * binding, capability, or origin.
+ */
+export async function createWindowsElectronQualificationAccountlessCredentialBackend(options = {}) {
+  try {
+    if (!exactObjectKeys(options, ["context", "environment", "runId"])) {
+      fail("ACCOUNTLESS_BACKEND_INVALID");
+    }
+    const { context, environment, runId } = options;
+    assertWindowsElectronQualificationContext({
+      context,
+      platform: WINDOWS_BINDING_PLATFORM,
+      architecture: WINDOWS_BINDING_ARCHITECTURE,
+    });
+    const selectedRunId = validateWindowsElectronQualificationRunId(runId);
+    const adapter = createWindowsFilesystemAdapter({
+      platform: WINDOWS_BINDING_PLATFORM,
+      architecture: WINDOWS_BINDING_ARCHITECTURE,
+    });
+    const windowsQualificationModeContext = createWindowsQualificationModeContext({
+      platform: WINDOWS_BINDING_PLATFORM,
+      architecture: WINDOWS_BINDING_ARCHITECTURE,
+      adapter,
+      environment,
+      resourceRoot: context.resourceRoot,
+    });
+    const { createDesktopWindowsAccountlessCredentialBackend } = await import(
+      "./desktop-windows-accountless-credential.js"
+    );
+    if (typeof createDesktopWindowsAccountlessCredentialBackend !== "function") {
+      fail("ACCOUNTLESS_BACKEND_INVALID");
+    }
+    return createDesktopWindowsAccountlessCredentialBackend({
+      platform: WINDOWS_BINDING_PLATFORM,
+      architecture: WINDOWS_BINDING_ARCHITECTURE,
+      adapter,
+      rootPath: win32.join(
+        windowsQualificationModeContext.stateRoot,
+        "accountless-fd3-smoke-v1",
+        selectedRunId,
+      ),
+      resourceRoot: context.resourceRoot,
+      windowsQualificationModeContext,
+    });
+  } catch {
+    fail("ACCOUNTLESS_BACKEND_UNAVAILABLE");
+  }
 }
 
 /** Run the existing random-namespace probe against the exact packaged keytar. */

@@ -67,6 +67,7 @@ const SHELL_FILES = [
   "apps/electron/desktop-tray-popover.js",
   "apps/electron/desktop-status-monitor.js",
   "apps/electron/desktop-tray-status.js",
+  "apps/electron/desktop-windows-accountless-credential.js",
   "apps/electron/desktop-update-preferences.js",
   "apps/electron/desktop-updater.js",
   "apps/electron/errors.js",
@@ -78,9 +79,12 @@ const SHELL_FILES = [
   "apps/electron/tray-popover-preload.cjs",
   "apps/electron/recovery-window.js",
   "apps/electron/ready-line.js",
+  "apps/electron/windows-accountless-qualification-smoke-child.mjs",
+  "apps/electron/windows-accountless-qualification-smoke.js",
   "apps/electron/windows-qualification.js",
   "config/deployment-endpoints.js",
   "src/desktop-shell-status.js",
+  "src/platform/windows-accountless-installation-credential.js",
   "src/platform/windows-credential-manager-probe.js",
 ];
 const KEYTAR = Object.freeze({
