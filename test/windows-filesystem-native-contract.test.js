@@ -179,6 +179,30 @@ test("native source contract keeps sensitive opens handle-relative and replaceme
   assert.match(source, /Local\\\\TiboTattle-CredentialMutation-v1-/u);
   assert.match(source, /DefineMethod\(env, exports, "acquireCredentialMutex",/u);
   assert.match(source, /DefineMethod\(env, exports, "releaseCredentialMutex",/u);
+  assert.match(source, /enum class CredentialMutexLeaseKind/u);
+  assert.match(source, /kAccountlessInstallationCredential/u);
+  assert.match(source, /bool AccountlessInstallationCredentialMutexName\(std::wstring\* name\)/u);
+  assert.match(source, /Local\\\\TiboTattle-AccountlessInstallationCredential-v1-/u);
+  assert.match(
+    source,
+    /AcquireAccountlessInstallationCredentialMutexCallback[\s\S]*?GetArguments\(env, info, &arguments, 0\)/u,
+  );
+  assert.match(source, /AccountlessInstallationCredentialMutexContended\(\)/u);
+  assert.match(source, /AccountlessInstallationCredentialMutexForeign\(\)/u);
+  assert.match(source, /DefineMethod\([\s\S]*?"acquireAccountlessInstallationCredentialMutex"/u);
+  assert.match(source, /DefineMethod\([\s\S]*?"releaseAccountlessInstallationCredentialMutex"/u);
+  const legacyMutexStart = source.indexOf("bool CredentialMutexName(");
+  const accountlessMutexComment = source.indexOf(
+    "// This fixed name deliberately does not accept a caller capability ID.",
+  );
+  const legacyMutexName = legacyMutexStart >= 0 && accountlessMutexComment >= legacyMutexStart
+    ? source.slice(legacyMutexStart, accountlessMutexComment)
+    : "";
+  assert.match(legacyMutexName, /case 0:/u);
+  assert.match(legacyMutexName, /case 1:/u);
+  assert.match(legacyMutexName, /case 2:/u);
+  assert.match(legacyMutexName, /case 3:/u);
+  assert.doesNotMatch(legacyMutexName, /case 4:/u);
   assert.match(source, /protectedAncestorDepth = 2/u);
   assert.match(source, /protectedAncestorShareMode = FILE_SHARE_READ \| FILE_SHARE_WRITE/u);
   assert.match(source, /std::mutex gCredentialAuditFileGuardsMutex/u);

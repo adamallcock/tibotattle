@@ -155,6 +155,8 @@ function bindingManifest(bytes) {
       "releaseCredentialAuditFileGuard",
       "acquireCredentialMutex",
       "releaseCredentialMutex",
+      "acquireAccountlessInstallationCredentialMutex",
+      "releaseAccountlessInstallationCredentialMutex",
     ],
     nativeClaims: {
       productionSafe: false,

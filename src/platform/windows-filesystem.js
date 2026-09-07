@@ -42,6 +42,8 @@ const REQUIRED_METHODS = Object.freeze([
   "releaseCredentialAuditFileGuard",
   "acquireCredentialMutex",
   "releaseCredentialMutex",
+  "acquireAccountlessInstallationCredentialMutex",
+  "releaseAccountlessInstallationCredentialMutex",
 ]);
 const WINDOWS_FILESYSTEM_ADAPTERS = new WeakSet();
 const MANIFEST_KEYS = Object.freeze([
@@ -446,6 +448,37 @@ export function createWindowsFilesystemAdapter({
         },
       }
       : {}),
+    // This mutex has no capability argument. It is reserved for the fixed,
+    // main-process accountless-installation record and deliberately does not
+    // extend the four legacy Credential Manager capability IDs.
+    acquireAccountlessInstallationCredentialMutex() {
+      try {
+        const result = call(native, "acquireAccountlessInstallationCredentialMutex", []);
+        let valid = false;
+        try {
+          valid = result !== null
+            && typeof result === "object"
+            && !Array.isArray(result)
+            && Object.keys(result).sort().join("\0") === "abandoned\0lease"
+            && typeof result.abandoned === "boolean"
+            && result.lease !== null
+            && (typeof result.lease === "object" || typeof result.lease === "function");
+        } catch {
+          valid = false;
+        }
+        if (!valid) throw failure("INVALID_RESULT");
+        return Object.freeze({ abandoned: result.abandoned, lease: result.lease });
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
+    releaseAccountlessInstallationCredentialMutex(lease) {
+      try {
+        return call(native, "releaseAccountlessInstallationCredentialMutex", [lease]);
+      } catch (error) {
+        throw normalizeNativeError(error);
+      }
+    },
     inspectPath(path) {
       try {
         const result = call(native, "inspectPath", [path]);

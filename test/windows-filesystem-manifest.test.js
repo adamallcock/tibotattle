@@ -39,6 +39,8 @@ function binding(overrides = {}) {
     replaceFile: () => IDENTITY,
     acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
     releaseCredentialMutex: () => {},
+    acquireAccountlessInstallationCredentialMutex: () => ({ lease: {}, abandoned: false }),
+    releaseAccountlessInstallationCredentialMutex: () => {},
     acquireCredentialAuditFileGuard: () => ({ lease: {} }),
     releaseCredentialAuditFileGuard: () => {},
     ...overrides,
@@ -72,6 +74,8 @@ test("binding manifest is deterministic, content-free, and policy-disabled", () 
       "releaseCredentialAuditFileGuard",
       "acquireCredentialMutex",
       "releaseCredentialMutex",
+      "acquireAccountlessInstallationCredentialMutex",
+      "releaseAccountlessInstallationCredentialMutex",
     ],
     nativeClaims: {
       productionSafe: false,

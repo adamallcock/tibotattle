@@ -188,6 +188,15 @@ Failure CredentialMutexContended() { return {"CREDENTIAL_MUTEX_CONTENDED"}; }
 Failure CredentialMutexAbandoned() { return {"CREDENTIAL_MUTEX_ABANDONED"}; }
 Failure CredentialMutexReleaseFailed() { return {"CREDENTIAL_MUTEX_RELEASE_FAILED"}; }
 Failure CredentialMutexForeign() { return {"CREDENTIAL_MUTEX_FOREIGN"}; }
+Failure AccountlessInstallationCredentialMutexContended() {
+  return {"ACCOUNTLESS_INSTALLATION_CREDENTIAL_MUTEX_CONTENDED"};
+}
+Failure AccountlessInstallationCredentialMutexReleaseFailed() {
+  return {"ACCOUNTLESS_INSTALLATION_CREDENTIAL_MUTEX_RELEASE_FAILED"};
+}
+Failure AccountlessInstallationCredentialMutexForeign() {
+  return {"ACCOUNTLESS_INSTALLATION_CREDENTIAL_MUTEX_FOREIGN"};
+}
 Failure CredentialAuditGuardReleaseFailed() {
   return {"CREDENTIAL_AUDIT_GUARD_RELEASE_FAILED"};
 }
@@ -2492,10 +2501,16 @@ napi_value ReleaseCredentialAuditFileGuardCallback(
   return undefined;
 }
 
+enum class CredentialMutexLeaseKind {
+  kLegacyCapability,
+  kAccountlessInstallationCredential,
+};
+
 struct CredentialMutexLease {
   HANDLE handle = nullptr;
   DWORD ownerThreadId = 0;
   bool active = false;
+  CredentialMutexLeaseKind kind = CredentialMutexLeaseKind::kLegacyCapability;
 };
 
 std::array<CredentialMutexLease*, 256> gCredentialMutexLeases{};
@@ -2581,6 +2596,22 @@ bool CredentialMutexName(std::uint32_t capabilityId, std::wstring* name) {
   return true;
 }
 
+// This fixed name deliberately does not accept a caller capability ID. It
+// protects only the separately-owned accountless installation credential and
+// must never become a fifth route through the legacy FD4 capability map.
+bool AccountlessInstallationCredentialMutexName(std::wstring* name) {
+  std::vector<BYTE> ownerSid;
+  if (!GetCurrentUserSid(&ownerSid)) return false;
+  LPWSTR sidText = nullptr;
+  if (!ConvertSidToStringSidW(ownerSid.data(), &sidText) || sidText == nullptr) {
+    return false;
+  }
+  *name = L"Local\\TiboTattle-AccountlessInstallationCredential-v1-";
+  name->append(sidText);
+  LocalFree(sidText);
+  return true;
+}
+
 napi_value AcquireCredentialMutexCallback(napi_env env, napi_callback_info info) {
   std::vector<napi_value> arguments;
   if (!GetArguments(env, info, &arguments, 1)) {
@@ -2639,6 +2670,7 @@ napi_value AcquireCredentialMutexCallback(napi_env env, napi_callback_info info)
       handle,
       GetCurrentThreadId(),
       true,
+      CredentialMutexLeaseKind::kLegacyCapability,
   };
   if (lease == nullptr) {
     ReleaseMutex(handle);
@@ -2691,7 +2723,8 @@ napi_value ReleaseCredentialMutexCallback(napi_env env, napi_callback_info info)
   if (!IsIssuedCredentialMutexLease(lease)) {
     return ThrowFailure(env, CredentialMutexForeign());
   }
-  if (!lease->active
+  if (lease->kind != CredentialMutexLeaseKind::kLegacyCapability
+      || !lease->active
       || lease->handle == nullptr
       || lease->ownerThreadId != GetCurrentThreadId()) {
     return ThrowFailure(env, CredentialMutexForeign());
@@ -2702,6 +2735,135 @@ napi_value ReleaseCredentialMutexCallback(napi_env env, napi_callback_info info)
     lease->handle = nullptr;
     lease->active = false;
     return ThrowFailure(env, CredentialMutexReleaseFailed());
+  }
+  UnregisterCredentialMutexLease(lease);
+  CloseHandle(lease->handle);
+  lease->handle = nullptr;
+  lease->active = false;
+  napi_value undefined;
+  napi_get_undefined(env, &undefined);
+  return undefined;
+}
+
+napi_value AcquireAccountlessInstallationCredentialMutexCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 0)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  std::wstring name;
+  if (!AccountlessInstallationCredentialMutexName(&name)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+
+  std::vector<BYTE> ownerSid;
+  PACL acl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  SECURITY_ATTRIBUTES attributes{};
+  if (!BuildOwnerOnlyObjectSecurity(
+          kCredentialMutexAccess,
+          &ownerSid,
+          &acl,
+          &descriptor,
+          &attributes)) {
+    return ThrowFailure(env, OperationFailed());
+  }
+  HANDLE handle = CreateMutexExW(
+      &attributes,
+      name.c_str(),
+      0,
+      kCredentialMutexAccess);
+  FreeOwnerOnlySecurity(acl, descriptor);
+  if (handle == nullptr) return ThrowFailure(env, FromLastError());
+
+  SecuritySnapshot security;
+  if (!ReadObjectSecurity(handle, SE_KERNEL_OBJECT, &security)
+      || !IsOwnerOnlySecurity(security)) {
+    CloseHandle(handle);
+    return ThrowFailure(env, SecurityPolicy("accountless_installation_mutex_security"));
+  }
+
+  const DWORD waitResult = WaitForSingleObject(handle, 0);
+  if (waitResult == WAIT_TIMEOUT) {
+    CloseHandle(handle);
+    return ThrowFailure(env, AccountlessInstallationCredentialMutexContended());
+  }
+  const bool abandoned = waitResult == WAIT_ABANDONED_0;
+  if (!abandoned && waitResult != WAIT_OBJECT_0) {
+    CloseHandle(handle);
+    return ThrowFailure(env, OperationFailed());
+  }
+
+  auto* lease = new (std::nothrow) CredentialMutexLease{
+      handle,
+      GetCurrentThreadId(),
+      true,
+      CredentialMutexLeaseKind::kAccountlessInstallationCredential,
+  };
+  if (lease == nullptr) {
+    ReleaseMutex(handle);
+    CloseHandle(handle);
+    return ThrowFailure(env, OperationFailed());
+  }
+  {
+    const std::lock_guard<std::mutex> lock(gCredentialMutexLeasesMutex);
+    if (!RegisterCredentialMutexLease(lease)) {
+      ReleaseMutex(handle);
+      CloseHandle(handle);
+      delete lease;
+      return ThrowFailure(env, OperationFailed());
+    }
+  }
+  napi_value external;
+  if (napi_create_external(
+          env,
+          lease,
+          FinalizeCredentialMutexLease,
+          nullptr,
+          &external) != napi_ok) {
+    FinalizeCredentialMutexLease(env, lease, nullptr);
+    return ThrowFailure(env, OperationFailed());
+  }
+  napi_value result;
+  napi_value abandonedValue;
+  napi_create_object(env, &result);
+  napi_get_boolean(env, abandoned, &abandonedValue);
+  napi_set_named_property(env, result, "lease", external);
+  napi_set_named_property(env, result, "abandoned", abandonedValue);
+  return result;
+}
+
+napi_value ReleaseAccountlessInstallationCredentialMutexCallback(
+    napi_env env,
+    napi_callback_info info) {
+  std::vector<napi_value> arguments;
+  if (!GetArguments(env, info, &arguments, 1)) {
+    return ThrowFailure(env, InvalidConfiguration());
+  }
+  napi_valuetype type = napi_undefined;
+  if (napi_typeof(env, arguments[0], &type) != napi_ok || type != napi_external) {
+    return ThrowFailure(env, AccountlessInstallationCredentialMutexForeign());
+  }
+  void* data = nullptr;
+  if (napi_get_value_external(env, arguments[0], &data) != napi_ok || data == nullptr) {
+    return ThrowFailure(env, AccountlessInstallationCredentialMutexForeign());
+  }
+  auto* lease = static_cast<CredentialMutexLease*>(data);
+  const std::lock_guard<std::mutex> lock(gCredentialMutexLeasesMutex);
+  if (!IsIssuedCredentialMutexLease(lease)
+      || lease->kind != CredentialMutexLeaseKind::kAccountlessInstallationCredential
+      || !lease->active
+      || lease->handle == nullptr
+      || lease->ownerThreadId != GetCurrentThreadId()) {
+    return ThrowFailure(env, AccountlessInstallationCredentialMutexForeign());
+  }
+  if (!ReleaseMutex(lease->handle)) {
+    UnregisterCredentialMutexLease(lease);
+    CloseHandle(lease->handle);
+    lease->handle = nullptr;
+    lease->active = false;
+    return ThrowFailure(env, AccountlessInstallationCredentialMutexReleaseFailed());
   }
   UnregisterCredentialMutexLease(lease);
   CloseHandle(lease->handle);
@@ -2744,6 +2906,16 @@ NAPI_MODULE_INIT() {
       ReleaseCredentialAuditFileGuardCallback);
   DefineMethod(env, exports, "acquireCredentialMutex", AcquireCredentialMutexCallback);
   DefineMethod(env, exports, "releaseCredentialMutex", ReleaseCredentialMutexCallback);
+  DefineMethod(
+      env,
+      exports,
+      "acquireAccountlessInstallationCredentialMutex",
+      AcquireAccountlessInstallationCredentialMutexCallback);
+  DefineMethod(
+      env,
+      exports,
+      "releaseAccountlessInstallationCredentialMutex",
+      ReleaseAccountlessInstallationCredentialMutexCallback);
   napi_value version;
   napi_create_string_utf8(env, "windows-filesystem-v1", NAPI_AUTO_LENGTH, &version);
   napi_set_named_property(env, exports, "contractVersion", version);

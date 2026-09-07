@@ -76,6 +76,8 @@ function binding(overrides = {}) {
     replaceFile: () => IDENTITY,
     acquireCredentialMutex: () => ({ lease: {}, abandoned: false }),
     releaseCredentialMutex: () => {},
+    acquireAccountlessInstallationCredentialMutex: () => ({ lease: {}, abandoned: false }),
+    releaseAccountlessInstallationCredentialMutex: () => {},
     acquireCredentialAuditFileGuard: () => ({ lease: {} }),
     releaseCredentialAuditFileGuard: () => {},
     ...overrides,
@@ -330,6 +332,32 @@ test("adapter forwards every root-bound protected-child operation", () => {
     ["create", root, IDENTITY, child, first],
     ["delete", root, IDENTITY, child, IDENTITY],
     ["replace", root, IDENTITY, child, IDENTITY, second],
+  ]);
+});
+
+test("adapter exposes the fixed private accountless mutex without a legacy capability ID", () => {
+  const calls = [];
+  const nativeLease = Object.freeze({ native: true });
+  const adapter = createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    binding: binding({
+      acquireAccountlessInstallationCredentialMutex(...arguments_) {
+        calls.push(["acquire", ...arguments_]);
+        return Object.freeze({ abandoned: true, lease: nativeLease });
+      },
+      releaseAccountlessInstallationCredentialMutex(...arguments_) {
+        calls.push(["release", ...arguments_]);
+      },
+    }),
+  });
+  const acquired = adapter.acquireAccountlessInstallationCredentialMutex();
+  assert.equal(acquired.abandoned, true);
+  assert.equal(acquired.lease, nativeLease);
+  adapter.releaseAccountlessInstallationCredentialMutex(acquired.lease);
+  assert.deepEqual(calls, [
+    ["acquire"],
+    ["release", nativeLease],
   ]);
 });
 

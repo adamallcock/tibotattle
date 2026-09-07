@@ -257,6 +257,10 @@ function createWindowsStoreFixture() {
       return { lease: {}, abandoned: false };
     },
     releaseCredentialMutex() {},
+    acquireAccountlessInstallationCredentialMutex() {
+      return { lease: {}, abandoned: false };
+    },
+    releaseAccountlessInstallationCredentialMutex() {},
     acquireCompanionInstanceMutex() {
       return { lease: {}, abandoned: false };
     },
