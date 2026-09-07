@@ -137,14 +137,6 @@ SELECT * FROM same_time UNION ALL SELECT * FROM later ORDER BY observed_at, id`;
 export const V1_PLAN_QUOTA_PAGE_SQL = planQuotaPageSql(false);
 export const V1_HISTORY_PLAN_QUOTA_PAGE_SQL = planQuotaPageSql(true);
 
-const FIT_QUOTA_PAGE_RESULT_SQL = `SELECT p.record_id AS id, p.resets_at AS projection_resets_at,
-  p.observed_at AS projection_observed_at, r.participant_id AS source_participant_id,
-  r.observed_at, r.observed_day, r.device_id, r.provider, r.limit_id,
-  r.plan_type, r.plan_variant, r.occurrence_id, r.slot, r.used_percent,
-  r.window_duration_minutes, r.resets_at
-FROM page p LEFT JOIN telemetry_v1_records r ON r.id = p.record_id
-ORDER BY p.resets_at, p.observed_at, p.record_id`;
-
 export const V1_FIT_QUOTA_PAGE_SQL = `WITH same_key AS MATERIALIZED (
   SELECT p.record_id, p.resets_at, p.observed_at FROM telemetry_v1_quota_fit_rows p
     INDEXED BY telemetry_v1_quota_fit_rows_cursor
@@ -158,20 +150,13 @@ export const V1_FIT_QUOTA_PAGE_SQL = `WITH same_key AS MATERIALIZED (
 ), page AS MATERIALIZED (
   SELECT * FROM same_key UNION ALL SELECT * FROM later
 )
-${FIT_QUOTA_PAGE_RESULT_SQL}`;
-
-// After a historical cursor reaches the exclusive observed-time upper bound,
-// index order proves the rest of THAT reset group is also future-only. Seek
-// the next reset directly, still physically LIMITing before the source join.
-// Do not infer a global reset cutoff: later reset groups can contain older
-// observations that must still participate in the historical fit.
-export const V1_HISTORY_FIT_QUOTA_NEXT_RESET_PAGE_SQL = `WITH page AS MATERIALIZED (
-  SELECT p.record_id, p.resets_at, p.observed_at FROM telemetry_v1_quota_fit_rows p
-    INDEXED BY telemetry_v1_quota_fit_rows_cursor
-  WHERE p.participant_id = ?1 AND p.resets_at > ?2
-  ORDER BY p.resets_at, p.observed_at, p.record_id LIMIT ?3
-)
-${FIT_QUOTA_PAGE_RESULT_SQL}`;
+SELECT p.record_id AS id, p.resets_at AS projection_resets_at,
+  p.observed_at AS projection_observed_at, r.participant_id AS source_participant_id,
+  r.observed_at, r.observed_day, r.device_id, r.provider, r.limit_id,
+  r.plan_type, r.plan_variant, r.occurrence_id, r.slot, r.used_percent,
+  r.window_duration_minutes, r.resets_at
+FROM page p LEFT JOIN telemetry_v1_records r ON r.id = p.record_id
+ORDER BY p.resets_at, p.observed_at, p.record_id`;
 
 function validatePage(cursor: V1TimeCursor, limit: number): void {
   if (typeof cursor.observedAt !== "string" || !Number.isSafeInteger(cursor.id) || cursor.id < 0
@@ -206,15 +191,15 @@ export async function createV1QuotaPageReader(db: D1Database, participantId: str
       return result.results;
     },
     async readFitPage(cursor: V1ResetCursor, limit) {
-      // A future-only page still advances rather than pretending to be EOF.
-      // Only its remaining same-reset tail can be skipped; the closed winner
-      // map remains responsible for filtering future rows in subsequent groups.
+      // The reset-first index cannot seek an observed-time upper bound across
+      // reset groups. Keep its physical LIMIT before residual filtering. The
+      // acquisition's closed day-winner map excludes all future rows; even a
+      // future-only page advances the cursor rather than pretending to be EOF.
       validatePage(cursor, limit);
       if (typeof cursor.resetsAt !== "string") throw new TypeError("reset cursor required");
-      const statement = observedAtBefore !== undefined && cursor.observedAt >= observedAtBefore
-        ? db.prepare(V1_HISTORY_FIT_QUOTA_NEXT_RESET_PAGE_SQL).bind(participantId, cursor.resetsAt, limit)
-        : db.prepare(V1_FIT_QUOTA_PAGE_SQL).bind(participantId, cursor.resetsAt, cursor.observedAt, cursor.id, limit);
-      const result = await statement.all<V1FitSourceRow & { projection_resets_at: string; projection_observed_at: string;
+      const result = await db.prepare(V1_FIT_QUOTA_PAGE_SQL)
+        .bind(participantId, cursor.resetsAt, cursor.observedAt, cursor.id, limit)
+        .all<V1FitSourceRow & { projection_resets_at: string; projection_observed_at: string;
           source_participant_id: string | null }>();
       return result.results.map(({ projection_resets_at, projection_observed_at, source_participant_id, ...row }) => {
         if (source_participant_id !== participantId || row.resets_at !== projection_resets_at

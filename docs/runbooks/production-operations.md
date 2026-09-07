@@ -60,10 +60,6 @@ lookback and never fills missing evidence with today's fit. Publish only a
 complete eligible cohort; unsupported or unidentified history remains absent.
 Content-free `scheduled_model_history` events report this separate backfill;
 the existing admin reconstruction counters do not measure its completion.
-Historical reset-ordered quota reads skip the remainder of a reset group once
-its cursor reaches the exclusive historical observation boundary. The seek
-remains physically page-limited and still visits later reset groups containing
-older observations; it does not infer a reset-time cutoff or alter saved work.
 Up to sixteen account attempts may use available resources in one run. Rotate
 the first account by three-minute priority round so large accounts cannot alias
 with the schedule. When the last account finishes, re-read the same complete

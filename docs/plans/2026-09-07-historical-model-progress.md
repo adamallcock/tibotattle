@@ -32,10 +32,11 @@ but no older date published. Historical work currently receives leftover budget.
 
 - Implemented fair three-slot scheduling, sixteen bounded account attempts,
   same-run complete-cohort revalidation and prompt atomic preview refresh.
-- Added indexed historical future-tail skipping within a reset group. A
-  synthetic interrupted/resumed fixture preserves exact evidence while reducing
-  fit-page reads from 34 to 6; later reset groups remain included. This is not
-  a production throughput benchmark. No schema or checkpoint-shape changes.
+- A tested indexed future-tail-skipping prototype was deferred: changing a
+  physical page can conflict with pre-upgrade staged-page replay. Shipping this
+  optimization requires an explicit compatible replay policy, not just an
+  unchanged completed result. The deployment retains the original page reader
+  and checkpoint format, with no schema changes.
 - Local integrated regression pass: 113 tests in six Worker runtime suites.
   Earlier full Worker pass: 860 tests in 63 suites, plus 207 script tests.
   Docs/preflight (20 tests), architecture and TypeScript passed. The composite

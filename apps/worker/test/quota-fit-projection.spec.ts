@@ -4,12 +4,8 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   backfillV1QuotaFitProjection, createV1QuotaPageReader,
   V1QuotaFitProjectionUnavailableError, V1_PLAN_QUOTA_PAGE_SQL, V1_FIT_QUOTA_PAGE_SQL,
-  V1_HISTORY_FIT_QUOTA_NEXT_RESET_PAGE_SQL,
   V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL, V1_QUOTA_PROJECTION_BACKFILL_ADVANCE_SQL,
 } from "../src/quota-fit-projection";
-import { advanceV1QuotaAcquisition, decodeV1QuotaWorkCheckpoint, encodeV1QuotaWorkCheckpoint,
-  type V1QuotaAcquisitionCheckpoint, type V1QuotaAcquisitionIdentity,
-  type V1QuotaPageReader } from "../src/quota-analysis-v1-reader";
 
 const db = (): D1Database => env.USAGE_MONITOR_DB;
 const migrations = (): D1Migration[] => (env as Env & { TEST_MIGRATIONS: D1Migration[] }).TEST_MIGRATIONS;
@@ -159,93 +155,6 @@ describe("lossless bounded quota fit projection",()=>{
     await expect(reader.readFitPage(cursor,0)).rejects.toThrow("page bound invalid");
     await fixtureStatements("UPDATE participants SET state='inactive' WHERE id='synthetic-p';");
     await expect(createV1QuotaPageReader(db(),"synthetic-p")).rejects.toBeInstanceOf(V1QuotaFitProjectionUnavailableError);
-  });
-
-  it("skips only a future same-reset tail, preserving exact resumed evidence while reducing physical pages",async()=>{
-    await sourceFixture();await migrate();
-    const upper="2026-08-02T00:00:00.000Z";
-    // Each early reset has eight full pages of future rows at the EXACT upper
-    // bound, including arbitrary id ties. A later reset still has old, valid
-    // observations: stopping globally when the first future row appears loses it.
-    for(let group=0;group<3;group++){
-      const resetAt=new Date(Date.parse(RESET)+group*86400000).toISOString();
-      await db().prepare(`WITH RECURSIVE s(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM s WHERE n<8)
-        INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,stream,observed_at,observed_day,
-          device_id,occurrence_id,provider,plan_type,plan_variant,limit_id,slot,used_percent,window_duration_minutes,resets_at)
-        SELECT 'chunk-one','synthetic-p','quota',strftime('%Y-%m-%dT%H:%M:%fZ',?,'+'||n||' seconds'),'2026-08-01',
-          'winning-device',?||n,'openai_codex','pro','default','codex','primary',n*10,10080,? FROM s`)
-        .bind(new Date(Date.parse(TIME)+group*3600000).toISOString(),`historical-${group}-`,resetAt).run();
-      if(group===2)continue;
-      await db().prepare(`WITH RECURSIVE s(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM s WHERE n<8192)
-        INSERT INTO telemetry_v1_records(chunk_row_id,participant_id,stream,observed_at,observed_day,
-          device_id,occurrence_id,provider,plan_type,plan_variant,limit_id,slot,used_percent,window_duration_minutes,resets_at)
-        SELECT 'chunk-two','synthetic-p','quota',?,'2026-08-02','future-device',?||n,
-          'openai_codex','plus','default','codex','primary',n%100,10080,? FROM s`)
-        .bind(upper,`future-${group}-`,resetAt).run();
-    }
-    const historical=await createV1QuotaPageReader(db(),"synthetic-p",upper);
-    const unbounded=await createV1QuotaPageReader(db(),"synthetic-p");
-    const identity:V1QuotaAcquisitionIdentity={participantId:"synthetic-p",inputFingerprint:"a".repeat(64),
-      sourceMethodVersion:"synthetic-historical-pinned-source",observedAtCutoff:TIME,
-      resetsAtCutoff:RESET,windowMinutes:10080,maxQuotaRows:60000};
-    const finish=async(reader:V1QuotaPageReader)=>{
-      let state:V1QuotaAcquisitionCheckpoint|undefined,planPages=0,fitPages=0;
-      const counted:V1QuotaPageReader={
-        async readPlanPage(cursor,limit){planPages++;return historical.readPlanPage(cursor,limit);},
-        async readFitPage(cursor,limit){fitPages++;return reader.readFitPage(cursor,limit);},
-      };
-      for(let invocation=0;invocation<100;invocation++){
-        const budget={remainingQueries:1,deadlineMs:1,now:()=>0};
-        const result=await advanceV1QuotaAcquisition(counted,identity,
-          new Map([["2026-08-01","winning-device"]]),budget,state);
-        expect(budget.remainingQueries).toBe(0);
-        if(result.status!=="deferred")return {result,planPages,fitPages};
-        const encoded=JSON.parse(JSON.stringify(encodeV1QuotaWorkCheckpoint(result.checkpoint)));
-        state=decodeV1QuotaWorkCheckpoint(identity,encoded.control,encoded.components);
-      }
-      throw new Error("synthetic historical acquisition did not finish");
-    };
-    const reference=await finish(unbounded),optimized=await finish(historical);
-    expect(optimized.result).toEqual(reference.result);
-    expect(optimized.result.status).toBe("complete");
-    if(optimized.result.status!=="complete")throw new Error("expected complete acquisition");
-    expect(optimized.result.quotaRows).toHaveLength(27);
-    expect(new Set(optimized.result.quotaRows.map(row=>row.resets_at)).size).toBe(3);
-    expect(optimized.result.quotaRows.every(row=>row.occurrence_id.startsWith("historical-"))).toBe(true);
-    expect(reference).toMatchObject({planPages:1,fitPages:34});
-    expect(optimized).toMatchObject({planPages:1,fitPages:6});
-    const resumed=await historical.readFitPage({resetsAt:RESET,observedAt:upper,id:10},3);
-    expect(resumed.map(row=>row.occurrence_id)).toEqual(["historical-1-0","historical-1-1","historical-1-2"]);
-    // The current, unbounded reader keeps the same-time tail and never uses
-    // historical pruning merely because the caller has a future timestamp.
-    expect((await unbounded.readFitPage({resetsAt:RESET,observedAt:upper,id:10},3))
-      .every(row=>row.resets_at===RESET&&row.observed_at===upper)).toBe(true);
-  });
-
-  it("uses a bounded indexed next-reset seek and preserves projection validation after skipping",async()=>{
-    await sourceFixture();await migrate();await seed(8);
-    const upper="2026-08-02T00:00:00.000Z";
-    await fixtureStatements(`UPDATE telemetry_v1_records SET observed_at='${upper}',observed_day='2026-08-02' WHERE id<=4;
-      UPDATE telemetry_v1_records SET resets_at='2026-08-09T00:00:00.000Z' WHERE id>4;`);
-    const plan=(await db().prepare(`EXPLAIN QUERY PLAN ${V1_HISTORY_FIT_QUOTA_NEXT_RESET_PAGE_SQL}`)
-      .bind("synthetic-p",RESET,3).all<{detail:string}>()).results.map(row=>row.detail).join("\n");
-    expect(plan).toContain("telemetry_v1_quota_fit_rows_cursor");
-    expect(plan).toMatch(/participant_id=\? AND resets_at>\?/u);
-    let prepares=0;
-    const counted=new Proxy(db(),{get(target,key){
-      if(key==="prepare")return (sql:string)=>{prepares++;return target.prepare(sql);};
-      const value=Reflect.get(target,key);return typeof value==="function"?value.bind(target):value;
-    }});
-    const reader=await createV1QuotaPageReader(counted,"synthetic-p",upper);
-    const cursor={resetsAt:RESET,observedAt:upper,id:1};
-    expect(prepares).toBe(1);
-    expect((await reader.readFitPage(cursor,3)).map(row=>row.id)).toEqual([5,6,7]);
-    expect(prepares).toBe(2);
-    await fixtureStatements("UPDATE telemetry_v1_quota_fit_rows SET observed_at='2026-07-31T00:00:00.000Z' WHERE record_id=5;");
-    await expect(reader.readFitPage(cursor,3)).rejects.toBeInstanceOf(V1QuotaFitProjectionUnavailableError);
-    expect(prepares).toBe(3);
-    await expect(reader.readFitPage(cursor,1025)).rejects.toThrow("page bound invalid");
-    expect(prepares).toBe(3);
   });
 
   it("requires indexed key seeks for raw acquisition and rejects invalid backfill budgets before writes",async()=>{
