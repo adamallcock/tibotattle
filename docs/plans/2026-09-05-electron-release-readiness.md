@@ -305,7 +305,16 @@ transport channel is `native-to-electron-handover`, distinct from the logical
 product rehearsal channel. Read-only comparison with installed native 0.1.18
 build 1026 confirms matching designated requirements, signing team and bundle
 identity; candidate build 2026090701 is higher. Installed handover approval is
-pending. The other three approved signed candidates are still in progress.
+pending. The Apple Silicon `.2` successor is also signed, notarized and stapled,
+with the same final signature, Gatekeeper, enclosed-app and metadata checks.
+Its DMG SHA-256 is
+`002136a5b826b24bbf9cff34993e10017e9b79dd50f7d0479a456518419faa5f`;
+the ZIP is `8682be7aa39497fa93431a4cf52be824ed9a0ea87685fd72b53997149c305c07`.
+Both finalization receipts and independent artifact digests are retained under
+the frozen source's private build tree. The Intel builder has failed during
+signing, despite a valid configured identity and successful signing of a
+disposable bundle copy. Exact-command diagnosis is in progress; no Intel
+installer or Apple acceptance is claimed yet.
 
 Accountless synthetic enrollment/upload/deduplication/disconnect tests have
 run against disposable Worker databases. Independent review identified two
@@ -356,9 +365,26 @@ Linux review found a production-entry bypass: valid stable metadata could start
 credential, upload and updater composition despite the unqualified platform.
 The entrypoint now refuses that selection before composing these services,
 while preserving the existing development launch. Its entry-level regression
-is included in the 445-test Electron pass. Linux still needs an OS-held
-credential mutation lease, abandoned-operation recovery and the production
-identity adapter. Local containers are ARM or emulated x64 at older source
+is included in the 445-test Electron pass. The OS-held Linux credential lease
+and abandoned-operation refusal are now implemented and independently reviewed
+at `8b616616`, with 108 foundation tests passing and two expected native-host
+skips on macOS. [Run 34155547489](https://github.com/adamallcock/tibotattle/actions/runs/34155547489)
+compiled the Ubuntu x64 addon but its loader rejected node-gyp's hardlinked
+output before native recovery tests. Commit `d531d478` adds explicit single-link
+staging without relaxing the loader contract; the manifest, loader and qualifier
+share its fixed path. The staging regression uses an actual hard link and proves
+identical bytes in a separate single-link file. Routine node-gyp rebuild removes
+the old build tree before staging. Foundation tests pass 111 cases with two
+expected native-host skips; actual Ubuntu execution is pending the next CI run.
+Commit `68bd5695` also requires a main-owned Linux native accountless factory,
+keeps the companion credential channel separate, and rejects an existing or
+unreadable legacy encrypted record before native access. Its focused runtime
+and credential tests pass 45 cases. The production identity adapter and the
+actual accountless fifth credential backend remain source work. The installed keytar
+wrapper's synchronous libsecret calls supply no cancellation object; upstream
+documents that [password lookup may block indefinitely](https://gnome.pages.gitlab.gnome.org/libsecret/func.password_lookup_sync.html).
+A production backend therefore still needs bounded, noninteractive handling
+for locked, denied and unavailable storage. Local containers are ARM or emulated x64 at older source
 revisions, so neither qualifies the proposed Ubuntu 24.04/GNOME target.
 
 The earlier source-only migration approval request is superseded by the user's
