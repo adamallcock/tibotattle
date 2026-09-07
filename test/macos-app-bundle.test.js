@@ -7300,6 +7300,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/macos/Sources/NativeBrandPalette.swift",
     "apps/macos/Sources/QuotaNotifications.swift",
     "apps/macos/Sources/SemanticOpenTarget.swift",
+    "apps/macos/Sources/TrayCustomization.swift",
     "apps/macos/UsageMonitorApp.swift",
   ]);
   const localizationResources = await collectMacOSLocalizationResources();
@@ -8462,6 +8463,13 @@ macOSArtifactTest("reproducible ad-hoc-signed app passes orderly and launcher-SI
     assert.equal(migrationUISmoke.status, 0, migrationUISmoke.stderr || migrationUISmoke.stdout);
     assert.match(migrationUISmoke.stdout,
       /^USAGE_MONITOR_MACOS_KEYCHAIN_MIGRATION_UI_CONTRACT automatic_prompt=false retrying=quiet cancel=preserved denial=preserved approval=explicit duplicate_ignored=true refresh=transition_only keychain_access=false$/mu);
+    const trayCustomizationSmoke = spawnSync(
+      join(outputA, "Contents", "MacOS", "TiboTattle"),
+      ["--tray-customization-smoke-test"],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    assert.equal(trayCustomizationSmoke.status, 0, trayCustomizationSmoke.stderr || trayCustomizationSmoke.stdout);
+    assert.match(trayCustomizationSmoke.stdout, /TIBOTATTLE_TRAY_CUSTOMIZATION preferences=closed,migrated,future-protected,atomic,undo/u);
     const menuBarSmoke = spawnSync(
       join(outputA, "Contents", "MacOS", "TiboTattle"),
       ["--menu-bar-contract-smoke-test"],

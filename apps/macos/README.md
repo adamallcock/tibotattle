@@ -806,3 +806,43 @@ The repository implements and tests the fail-closed updater build boundary.
 Current source, signed candidate, notarization, publication, feed availability,
 installed upgrade, and rollback rehearsal remain separate gates recorded in
 the [current status matrix](../../docs/current-status.md).
+
+## Menu bar customization
+
+**Settings → General → Menu bar → Customize menu bar…** and **More →
+Customize menu bar…** open the same native presentation settings. Changes apply
+immediately and persist locally in the existing state root's
+`tray-preferences-v1.json`. The file contains no allowance observations.
+Unreadable and newer schemas are preserved, with a visible save warning.
+
+Choose labeled 5-hour, 7-day, both, or icon-only contents; a plain app icon,
+single meter, or fixed top 5-hour/bottom 7-day meters; and remaining allowance,
+reset time, or both for a single window. Reset times use a minute countdown or
+the local clock, including a date outside today. Optional low-allowance emphasis
+enters at 10% and clears at 12% within a verified observation; stale/unavailable
+evidence, reset changes, and replacement observations clear it. The compact DTO
+has no account identity, so an 11% replacement observation cannot inherit a prior
+source's low state. This changes presentation only and sends no notifications.
+
+Show, hide, and reorder Allowances, Weekly pace, Local usage, and Cache reuse.
+Choose 7 or 30 days, chart visibility, tokens/API-equivalent cost/usage-change
+totals, and compact or detailed density. Cache reuse uses the existing dashboard
+projection and its coverage, never a separate accounting calculation. The cache
+action opens Usage and costs. Partial pricing, retained history, missing evidence,
+and permanent header/actions stay explicit. Hiding sections does not stop collection.
+
+New installations default to 7-day remaining with a 7-day meter and the three
+original popup sections. Existing installations keep the current automatic
+primary-window choice; community PR #73 selections migrate from
+`tibotattle.menu-bar-allowance.v1`, including icon-only for `off`. Initial choices
+are materialized so later upgrades retain them. Undo reverses the last saved
+customization; Restore tray defaults deliberately selects new-install defaults.
+Synthetic Example states and an example popup preview changes without fetching
+account data. UI preferences never change refresh cadence or dashboard filters.
+
+The compiled `--tray-customization-smoke-test` exercises the closed preference
+contract, legacy mapping, persistence, failed writes, future-schema preservation,
+pinned/missing/zero lanes, retained refresh, reset expiry and low-allowance
+hysteresis. Development-only `--tray-customization-render-smoke-test <directory>`
+renders synthetic Settings and popup states; it does not qualify an installed
+signed application or physical secondary-display behavior.

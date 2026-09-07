@@ -164,6 +164,14 @@ is never an arbitrary local proxy.
 | `POST` | `/api/local/contribution/incremental-approve` | Dashboard | Loopback mutation | Records current consent after exact local review and schedules the first due pass. | Contribution sync |
 | `POST` | `/api/local/contribution/incremental-run` | Dashboard | Loopback mutation | Resets bounded retry backoff and asks the consent-gated controller to run now. | Contribution sync |
 
+The overview includes `accounting.trayCacheSummary` (schema version 1): exactly
+one `7d` and one `30d` entry with availability, comparable follow-up count,
+follow-ups reusing more than half, reuse percentage and coverage status. It is a
+bounded projection of the existing cache-continuity calculation. A zero
+comparable count has a null percentage; unavailable evidence has null counts.
+Consumers retain the parent accounting scope and freshness. This adds no
+collection, transcript access or independent retention authority.
+
 ## Fixed report pages
 
 These are GET-only, fixed-path HTML resources. They resolve only to files under
