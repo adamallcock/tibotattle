@@ -307,32 +307,28 @@ describe("accountless enrollment ledger", () => {
     expect(state).toEqual({ rows: 1, daily_issued: 1, lifetime_issued: 1 });
   });
 
-  it("rejects malformed or overlong stored leases on replay", async () => {
+  it("keeps malformed or overlong stored leases out of ordinary storage", async () => {
     const db = bindings().USAGE_MONITOR_DB;
     const { body } = await enrollmentBody();
     const request = parseAccountlessEnrollmentJson(JSON.stringify(body));
     const issuedAt = Date.parse("2026-09-04T00:00:00.000Z");
     await expect(enrollAccountlessDevice(db, request, issuedAt))
       .resolves.toMatchObject({ status: 201 });
-    await db.prepare(
+    await expect(db.prepare(
       "UPDATE accountless_enrollment_ledger SET expires_at = ? WHERE device_id = ?",
-    ).bind("not-an-instant", body.deviceId).run();
-    await expect(enrollAccountlessDevice(db, request, issuedAt))
-      .rejects.toMatchObject({
-        status: 503,
-        code: "BACKEND_STORAGE_UNAVAILABLE",
-      });
-    await db.prepare(
+    ).bind("not-an-instant", body.deviceId).run()).rejects.toThrow(
+      /accountless_enrollment_lease_shape|CHECK constraint failed/u,
+    );
+    await expect(db.prepare(
       "UPDATE accountless_enrollment_ledger SET expires_at = ? WHERE device_id = ?",
     ).bind(
       new Date(issuedAt + 2 * ACCOUNTLESS_ENROLLMENT_LEASE_MILLISECONDS).toISOString(),
       body.deviceId,
-    ).run();
+    ).run()).rejects.toThrow(
+      /accountless_enrollment_lease_shape|CHECK constraint failed/u,
+    );
     await expect(enrollAccountlessDevice(db, request, issuedAt))
-      .rejects.toMatchObject({
-        status: 503,
-        code: "BACKEND_STORAGE_UNAVAILABLE",
-      });
+      .resolves.toMatchObject({ status: 200, response: { state: "existing" } });
   });
 
   it("keeps a revocation tombstone and never silently re-enrolls", async () => {

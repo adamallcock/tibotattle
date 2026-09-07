@@ -20,6 +20,8 @@ export const ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS = "accountless-policy-v1
 // an arbitrarily long-lived receipt.
 export const ACCOUNTLESS_ENROLLMENT_LEASE_MILLISECONDS =
   30 * 24 * 60 * 60 * 1000;
+export const ACCOUNTLESS_RENEWAL_SCHEMA_VERSION = "accountless-renewal-v0.1";
+export const ACCOUNTLESS_RENEWAL_WINDOW_MILLISECONDS = 7 * 24 * 60 * 60 * 1000;
 export const ACCOUNTLESS_ENROLLMENT_CLOCK_SKEW_MILLISECONDS = 5 * 60 * 1000;
 
 const MAXIMUM_RESPONSE_BYTES = 16_384;
@@ -32,6 +34,8 @@ const RECEIPT_KEYS =
   "authorizationBasis\0deviceId\0expiresAt\0policyVersion\0schemaVersion\0scope\0state";
 const OWNERSHIP_RECEIPT_KEYS =
   "authorizationBasis\0deviceId\0expiresAt\0policyVersion\0schemaVersion\0scope\0state\0telemetrySchemaVersion";
+const RENEWAL_RECEIPT_KEYS =
+  "authorizationBasis\0deviceId\0expiresAt\0policyVersion\0renewalGeneration\0schemaVersion\0scope\0state\0telemetrySchemaVersion";
 const REVOKED_CODES = new Set([
   "DEVICE_AUTH_INVALID",
   "DEVICE_REVOKED",
@@ -54,11 +58,14 @@ const ERROR_CODES = new Set([
   "invalid_configuration",
   "preference_unavailable",
   "preference_ineligible",
+  "credential_recovery_required",
   "credential_unavailable",
   "service_unavailable",
   "device_unavailable",
   "enrollment_rejected",
+  "enrollment_expired",
   "ownership_rejected",
+  "ownership_expired",
   "response_invalid",
   "interrupted",
 ]);
@@ -94,10 +101,19 @@ function fail(code, options = {}) {
 // private-channel availability from malformed, missing, conflicting, or revoked
 // local state. Only the former may ask the scheduler for a later bounded pass.
 function credentialAccessFailure(error) {
+  let code;
+  try {
+    code = error?.code;
+  } catch {
+    code = undefined;
+  }
+  if (code === "contribution_device_credential_recovery_required") {
+    fail("credential_recovery_required");
+  }
   let retryable = false;
   try {
     retryable = error?.retryable === true
-      && RETRYABLE_CREDENTIAL_AVAILABILITY_CODES.has(error?.code);
+      && RETRYABLE_CREDENTIAL_AVAILABILITY_CODES.has(code);
   } catch {
     retryable = false;
   }
@@ -296,6 +312,7 @@ function accountlessRevocationCode(value) {
 async function readJsonResponse(response, signal, {
   rejectionCode = "enrollment_rejected",
   ownership = false,
+  enrollment = false,
   now = Date.now,
 } = {}) {
   const validHeaders = response instanceof Response
@@ -328,6 +345,14 @@ async function readJsonResponse(response, signal, {
       });
     }
     const backendCode = payload?.error?.code;
+    if (enrollment && response.status === 410
+        && backendCode === "ACCOUNTLESS_ENROLLMENT_EXPIRED") {
+      fail("enrollment_expired");
+    }
+    if (ownership && response.status === 410
+        && backendCode === "ACCOUNTLESS_OWNERSHIP_EXPIRED") {
+      fail("ownership_expired");
+    }
     // A version or body mismatch remains a terminal contract error even if
     // its machine code happens to share the accountless namespace.
     if (ownership && response.status === 409) fail("ownership_rejected");
@@ -484,14 +509,16 @@ function assertLeasedDevice(value, origin) {
   return Object.freeze({ origin, deviceId: value.deviceId });
 }
 
-function parseOwnershipReceipt(value, device, origin, now) {
-  if (!exactKeys(value, OWNERSHIP_RECEIPT_KEYS)
-      || value.schemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION
+function parseOwnershipReceipt(value, device, origin, now, renewal = false) {
+  if (!exactKeys(value, renewal ? RENEWAL_RECEIPT_KEYS : OWNERSHIP_RECEIPT_KEYS)
+      || value.schemaVersion !== (renewal ? ACCOUNTLESS_RENEWAL_SCHEMA_VERSION : ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION)
+      || (renewal && (!Number.isSafeInteger(value.renewalGeneration)
+        || value.renewalGeneration < 0 || value.renewalGeneration > 2_147_483_647))
       || value.policyVersion !== ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION
       || value.authorizationBasis !== ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS
       || value.telemetrySchemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION
       || value.scope !== ACCOUNTLESS_UPLOAD_OWNER_SCOPE
-      || !["created", "existing"].includes(value.state)
+      || !(renewal ? ["renewed", "existing"] : ["created", "existing"]).includes(value.state)
       || value.deviceId !== device.deviceId
       || typeof value.expiresAt !== "string"
       || !Number.isFinite(Date.parse(value.expiresAt))
@@ -517,6 +544,7 @@ function parseOwnershipReceipt(value, device, origin, now) {
     origin,
     deviceId: device.deviceId,
     scope: ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
+    ...(renewal ? { renewalGeneration: value.renewalGeneration } : {}),
     expiresAt: new Date(value.expiresAt).toISOString(),
   });
 }
@@ -637,6 +665,7 @@ export async function enrollAccountlessContribution({
     requestTimeoutMilliseconds,
     setTimeoutImpl,
     clearTimeoutImpl,
+    responseOptions: { enrollment: true, now },
   });
   assertSignalActive(signal);
   const receipt = parseReceipt(response, capability, selectedOrigin, now);
@@ -650,7 +679,7 @@ export async function enrollAccountlessContribution({
  * Ownership registration for an explicitly selected laboratory or production
  * destination. Enrollment remains a separate, non-upload-capable operation.
  */
-export async function claimAccountlessContributionOwnership({
+async function requestAccountlessAuthority({
   laboratory = false,
   production = false,
   origin,
@@ -664,7 +693,7 @@ export async function claimAccountlessContributionOwnership({
   now = () => Date.now(),
   setTimeoutImpl = globalThis.setTimeout,
   clearTimeoutImpl = globalThis.clearTimeout,
-} = {}) {
+} = {}, renewal = false) {
   assertOwnershipRequestOptions({
     fetchImpl,
     readPreference,
@@ -697,7 +726,7 @@ export async function claimAccountlessContributionOwnership({
           assertSignalActive(signal);
           const response = await requestJsonWithDeadline({
             fetchImpl,
-            url: new URL("/api/v1/accountless/ownership", selectedOrigin),
+            url: new URL(renewal ? "/api/v1/accountless/renewal" : "/api/v1/accountless/ownership", selectedOrigin),
             options: {
               method: "POST",
               headers: {
@@ -705,7 +734,9 @@ export async function claimAccountlessContributionOwnership({
                 "Content-Type": "application/json",
                 Authorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
               },
-              body: JSON.stringify(ACCOUNTLESS_RUN_AUTHORIZATION),
+              body: JSON.stringify(renewal
+                ? { ...ACCOUNTLESS_RUN_AUTHORIZATION, schemaVersion: ACCOUNTLESS_RENEWAL_SCHEMA_VERSION }
+                : ACCOUNTLESS_RUN_AUTHORIZATION),
             },
             signal,
             requestTimeoutMilliseconds,
@@ -718,7 +749,7 @@ export async function claimAccountlessContributionOwnership({
             },
           });
           assertSignalActive(signal);
-          const receipt = parseOwnershipReceipt(response, device, selectedOrigin, now);
+          const receipt = parseOwnershipReceipt(response, device, selectedOrigin, now, renewal);
           assertSignalActive(signal);
           await readEligiblePreference(readPreference, selectedOrigin);
           assertSignalActive(signal);
@@ -755,6 +786,15 @@ export async function claimAccountlessContributionOwnership({
   });
 }
 
+export function claimAccountlessContributionOwnership(options = {}) {
+  return requestAccountlessAuthority(options);
+}
+
+/** Renew only the held installation graph; never enroll or rotate a secret. */
+export function renewAccountlessContributionOwnership(options = {}) {
+  return requestAccountlessAuthority(options, true);
+}
+
 function configuredAccountlessSync(options) {
   if (!options || typeof options !== "object" || Array.isArray(options)
       || ["consent", "authorization", "approve", "approval"].some((key) => Object.hasOwn(options, key))) {
@@ -773,6 +813,7 @@ function configuredAccountlessSync(options) {
     withDeviceSecret = withContributionDeviceSecret,
     enroll = enrollAccountlessContribution,
     claimOwnership = claimAccountlessContributionOwnership,
+    renewOwnership = renewAccountlessContributionOwnership,
     runIncrementalSync = runIncrementalContributionSyncOnce,
     signal = undefined,
     requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
@@ -790,7 +831,7 @@ function configuredAccountlessSync(options) {
   if (typeof readPreference !== "function" || !backend || typeof backend !== "object"
       || Array.isArray(backend) || typeof indexFile !== "string" || !indexFile
       || (stateFile !== undefined && (typeof stateFile !== "string" || !stateFile))
-      || [fetchImpl, ensureCapability, withDeviceSecret, enroll, claimOwnership,
+      || [fetchImpl, ensureCapability, withDeviceSecret, enroll, claimOwnership, renewOwnership,
         runIncrementalSync, now, setTimeoutImpl, clearTimeoutImpl, readAccountMarkers,
         loadExistingAccountObservationSecret].some((value) => typeof value !== "function")
       || (onAttributionBinding !== null && typeof onAttributionBinding !== "function")
@@ -821,6 +862,7 @@ function configuredAccountlessSync(options) {
     withDeviceSecret,
     enroll,
     claimOwnership,
+    renewOwnership,
     runIncrementalSync,
     signal,
     requestTimeoutMilliseconds,
@@ -896,6 +938,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
     withDeviceSecret,
     enroll,
     claimOwnership,
+    renewOwnership,
     runIncrementalSync,
     signal,
     requestTimeoutMilliseconds,
@@ -924,39 +967,57 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
     assertSignalActive(signal);
     await readEligiblePreference(readPreference, origin);
     assertSignalActive(signal);
-    await enroll({
-      origin,
-      readPreference,
-      fetchImpl: guardedFetch,
-      ensureCapability,
-      capabilityOptions: {
-        backend,
-        ...(stateFile === undefined ? {} : { stateFile }),
-      },
-      signal,
-      requestTimeoutMilliseconds,
-      now,
-      setTimeoutImpl,
-      clearTimeoutImpl,
-    });
+    const authorityOptions = {
+      laboratory, production, origin, readPreference, backend,
+      ...(stateFile === undefined ? {} : { stateFile }),
+      fetchImpl: guardedFetch, withDeviceSecret, signal,
+      requestTimeoutMilliseconds, now, setTimeoutImpl, clearTimeoutImpl,
+    };
+    let renewedAfterExpiry = false;
+    try {
+      await enroll({
+        origin,
+        readPreference,
+        fetchImpl: guardedFetch,
+        ensureCapability,
+        capabilityOptions: {
+          backend,
+          ...(stateFile === undefined ? {} : { stateFile }),
+        },
+        signal,
+        requestTimeoutMilliseconds,
+        now,
+        setTimeoutImpl,
+        clearTimeoutImpl,
+      });
+    } catch (error) {
+      // Expiry stops uploads but does not destroy an active installation.
+      // Only this exact enrollment failure enters authenticated renewal.
+      if (!(error instanceof ContributionAccountlessClientError)
+          || error.code !== "contribution_accountless_client_enrollment_expired") throw error;
+      await renewOwnership(authorityOptions);
+      renewedAfterExpiry = true;
+    }
     assertSignalActive(signal);
     await readEligiblePreference(readPreference, origin);
     assertSignalActive(signal);
-    await claimOwnership({
-      laboratory,
-      production,
-      origin,
-      readPreference,
-      backend,
-      ...(stateFile === undefined ? {} : { stateFile }),
-      fetchImpl: guardedFetch,
-      withDeviceSecret,
-      signal,
-      requestTimeoutMilliseconds,
-      now,
-      setTimeoutImpl,
-      clearTimeoutImpl,
-    });
+    let ownership;
+    try {
+      ownership = await claimOwnership(authorityOptions);
+    } catch (error) {
+      // The lease can expire between enrollment and owner verification.
+      // Recover once through the same authenticated route; never loop.
+      if (renewedAfterExpiry || !(error instanceof ContributionAccountlessClientError)
+          || error.code !== "contribution_accountless_client_ownership_expired") throw error;
+      await renewOwnership(authorityOptions);
+      renewedAfterExpiry = true;
+      ownership = await claimOwnership(authorityOptions);
+    }
+    if (!renewedAfterExpiry && typeof ownership?.expiresAt === "string"
+        && Date.parse(ownership.expiresAt) - epochMilliseconds(now())
+          <= ACCOUNTLESS_RENEWAL_WINDOW_MILLISECONDS) {
+      await renewOwnership(authorityOptions);
+    }
     assertSignalActive(signal);
     await readEligiblePreference(readPreference, origin);
     assertSignalActive(signal);

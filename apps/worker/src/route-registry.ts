@@ -62,6 +62,14 @@ const EXACT_WORKER_ROUTE_DEFINITIONS = [
     authority: "accountless_ownership",
   },
   {
+    // This is separate from enrollment replay: only the existing device
+    // bearer can extend the same accountless owner graph after its lease.
+    pathname: "/api/v1/accountless/renewal",
+    id: "accountless_renewal",
+    methods: ["POST"],
+    authority: "accountless_ownership",
+  },
+  {
     pathname: "/api/v1/internal/release/appcast",
     id: "sparkle_appcast_guard",
     methods: ["POST"],

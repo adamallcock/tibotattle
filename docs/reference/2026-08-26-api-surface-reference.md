@@ -43,7 +43,7 @@ Those remain separate verification gates in the relevant runbooks.
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 37 API paths, 38 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 38 API paths, 39 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
@@ -333,6 +333,7 @@ Authority vocabulary:
 | `POST` | `/api/v1/enroll` | Handoff / reattachment | Consume a one-use identity proof and create a participant or reattach the identity's existing participant; recovery codes are not accepted |
 | `POST` | `/api/v1/accountless/enrollment` | Accountless enrollment | Record one bounded, versioned enrollment-only installation row when the separately configured enrollment gate is enabled; exact replays are idempotent and no participant, session, pairing, device credential, upload authority, or community eligibility is created |
 | `POST` | `/api/v1/accountless/ownership` | Accountless ownership | Prove the active enrolled device secret, then atomically create one installation owner, credential and versioned v1.1 upload authorization, or return the same existing receipt when accountless ownership is enabled; reject ambient sessions and revoked/expired enrollment without creating social consent or public-fit eligibility |
+| `POST` | `/api/v1/accountless/renewal` | Accountless ownership | Renew the same authenticated installation graph within seven days of expiry or after an offline period; preserve identity and accepted receipts, and refuse revoked, erased, policy-mismatched or inconsistent state |
 | `POST` | `/api/v1/internal/release/appcast` | Operator | Validate and atomically publish the exact Sparkle appcast object |
 | `POST` | `/api/v1/identity/google/start` | Handoff | Create state, binding, PKCE material, and a Google authorization URL |
 | `GET` | `/api/v1/identity/google/callback` | Handoff | State-bound Google OAuth callback and server-side token exchange |
@@ -608,6 +609,18 @@ compatibility. Invalid or uncorrelatable frames close the channel; ordinary
 operation failures return a fixed error code and matching `id`. Native smoke
 modes use process-memory storage and never inspect or migrate the developer's
 login Keychain.
+
+The Electron macOS production adapter has a fifth native capability,
+`accountless_installation`, distinct from the four-capability broker. Only its
+main-process accountless backend can select that capability; `store` and
+`remove` reject it, leaving `createIfMissing` and `deleteExact` as the permitted
+mutations. The separate inherited FD3 accountless channel carries closed
+preference, credential and status operations for the owned companion. Its
+`credential_recovery_required` marker contains no path, secret or native
+error detail and pauses the scheduler. Neither native capability names nor
+secret operations are exposed through renderer IPC or HTTP. The
+[adapter contract](../../native/macos-keychain/README.md) defines the source
+boundary; it is not installed or signed-candidate qualification.
 
 ### Codex app-server subprocess protocol
 

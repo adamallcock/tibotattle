@@ -37,6 +37,12 @@ import {
   type AccountlessOwnershipRequest,
 } from "./accountless-ownership";
 import {
+  ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+  parseAccountlessRenewalJson,
+  renewAccountlessUploadOwner,
+  type AccountlessRenewalRequest,
+} from "./accountless-renewal";
+import {
   assertAccountScopedLocalPreview,
   configuredAccountScopedIngestMode,
 } from "./account-scoped-ingest";
@@ -420,6 +426,38 @@ async function readBoundedAccountlessOwnershipJson(
   }
 }
 
+async function readBoundedAccountlessRenewalJson(
+  request: Request,
+): Promise<AccountlessRenewalRequest> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  try {
+    return parseAccountlessRenewalJson(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined),
+    );
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
 const DEVICE_UPLOAD_AUTHORIZATION_HEADER =
   /^Upload um_device_upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 
@@ -567,6 +605,35 @@ async function handleAccountlessOwnership(
     body,
   );
   return jsonResponse(result.response, result.status);
+}
+
+async function handleAccountlessRenewal(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  if (configuredAccountlessEnrollmentMode(env) !== "enabled") {
+    throw new ApiError(503, "ACCOUNTLESS_ENROLLMENT_DISABLED");
+  }
+  assertAccountlessOwnershipEnabled(env);
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "accountless_renewal",
+  );
+  const body = await readBoundedAccountlessRenewalJson(request);
+  return jsonResponse(await renewAccountlessUploadOwner(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+    body,
+  ));
 }
 
 function allowedHeader(error: ApiError): HeadersInit | undefined {
@@ -3519,6 +3586,8 @@ async function routeApi(
       return handleAccountlessEnrollment(request, env);
     case "accountless_ownership":
       return handleAccountlessOwnership(request, env);
+    case "accountless_renewal":
+      return handleAccountlessRenewal(request, env);
     case "sparkle_appcast_guard":
       return handleSparkleAppcastGuard(request, env);
     case "identity_google_start":

@@ -96,9 +96,12 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0045_attribution_domain_activation.sql",
     // Enrollment remains separate from direct upload ownership. Both modes
     // are disabled by default; the successor adds an explicitly accountless
-    // authority graph without social sessions or public eligibility.
+    // authority graph without social sessions or public eligibility. Its
+    // lease renewal keeps that same graph private and does not create a new
+    // installation identity.
     "0046_accountless_enrollment_ledger.sql",
     "0047_accountless_upload_ownership.sql",
+    "0048_accountless_upload_renewal.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",

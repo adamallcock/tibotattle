@@ -55,6 +55,8 @@ function db(): D1Database {
 const DAY = "2026-08-01";
 const SEED_AT = "2026-08-01T00:00:00.000Z";
 const FUTURE = "2027-01-01T00:00:00.000Z";
+const ACCOUNTLESS_LEASE_ISSUED_AT = "2099-01-01T00:00:00.000Z";
+const ACCOUNTLESS_LEASE_EXPIRES_AT = "2099-01-31T00:00:00.000Z";
 
 function hash(fill: number): Uint8Array {
   return new Uint8Array(32).fill(fill);
@@ -139,23 +141,24 @@ async function seedOversizedAccountlessSourceJournal(): Promise<string> {
         ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
         ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
         ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
-        SEED_AT,
-        FUTURE,
+        ACCOUNTLESS_LEASE_ISSUED_AT,
+        ACCOUNTLESS_LEASE_EXPIRES_AT,
       ),
     db().prepare(`INSERT INTO participants (
       id, owner_kind, access_token_id, access_token_hash, recovery_token_id,
       recovery_token_hash, state, consent_version, consented_at, created_at,
       deletion_session_id, identity_link_key, identity_cooldown_digest
     ) VALUES (?, 'accountless', NULL, NULL, NULL, NULL, 'active', NULL,
-      NULL, ?, NULL, NULL, NULL)`).bind(participantId, SEED_AT),
+      NULL, ?, NULL, NULL, NULL)`).bind(participantId, ACCOUNTLESS_LEASE_ISSUED_AT),
     db().prepare(`INSERT INTO device_credentials (
       id, participant_id, authority_kind, paired_via_pairing_id,
       accountless_enrollment_device_id, secret_hash, state, issued_at,
       expires_at, last_used_at, revoked_at, social_verified_at,
       credential_generation
     ) VALUES (?, ?, 'accountless', NULL, ?, ?, 'active', ?, ?, ?, NULL,
-      NULL, 1)`).bind(deviceId, participantId, deviceId, hash(8), SEED_AT,
-      FUTURE, SEED_AT),
+      NULL, 1)`).bind(deviceId, participantId, deviceId, hash(8),
+      ACCOUNTLESS_LEASE_ISSUED_AT, ACCOUNTLESS_LEASE_EXPIRES_AT,
+      ACCOUNTLESS_LEASE_ISSUED_AT),
     db().prepare(`INSERT INTO accountless_upload_owners (
       enrollment_device_id, participant_id, device_credential_id,
       policy_version, authorization_basis, authorized_at, expires_at, state
@@ -165,8 +168,8 @@ async function seedOversizedAccountlessSourceJournal(): Promise<string> {
       deviceId,
       ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
       ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
-      SEED_AT,
-      FUTURE,
+      ACCOUNTLESS_LEASE_ISSUED_AT,
+      ACCOUNTLESS_LEASE_EXPIRES_AT,
     ),
     db().prepare(`INSERT INTO accountless_v11_device_authorizations (
       enrollment_device_id, participant_id, device_credential_id,
@@ -174,7 +177,8 @@ async function seedOversizedAccountlessSourceJournal(): Promise<string> {
       privacy_contract_version, authorized_at, expires_at, state
     ) VALUES (?, ?, ?, 'telemetry-contribution-v1.1', ?, ?, ?, ?, 'active')`)
       .bind(deviceId, participantId, deviceId, required.fieldDictionaryVersion,
-        required.privacyContractVersion, SEED_AT, FUTURE),
+        required.privacyContractVersion, ACCOUNTLESS_LEASE_ISSUED_AT,
+        ACCOUNTLESS_LEASE_EXPIRES_AT),
   ]);
 
   // The social-owner and v1 transport guards correctly reject this synthetic

@@ -52,11 +52,12 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-4), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-5), [
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
     "0046_accountless_enrollment_ledger.sql",
     "0047_accountless_upload_ownership.sql",
+    "0048_accountless_upload_renewal.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -94,8 +95,8 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
   // the unchanged SQL from the pre-reconciliation release source a9220795,
   // except the owner-approved 0043 repair and expression-parentheses-only
   // remote-parser compatibility repair of unapplied 0044/0045. The
-  // unpublished accountless ledger and direct ownership are appended at
-  // 0046 and 0047. Never change
+  // unpublished accountless ledger, direct ownership, and same-graph renewal
+  // are appended at 0046 through 0048. Never change
   // already-applied SQL or silently update these historical pins.
   const expectedDigests = {
     "0041_community_model_composition_cache.sql": "52ff5ff182023bd504c5d584e4c96494c04db7f29a70661dd5713c4a8770d12d",
@@ -105,12 +106,13 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0045_attribution_domain_activation.sql": "89f0df9e95eb98fa7ae8cb00dc82fe19f8933689a8002e647e638fdc870990fe",
     "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",
     "0047_accountless_upload_ownership.sql": "5b203e09948edae4f66d3e28a9a47e24e6dd1af7a9757aa4e0d648a2b05794da",
+    "0048_accountless_upload_renewal.sql": "82297298f937489275756da93d9b116a7b83b280482000b0df51abd5c598d9b7",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 47);
-  assert.deepEqual(names.slice(-7), Object.keys(expectedDigests));
+  assert.equal(names.length, 48);
+  assert.deepEqual(names.slice(-8), Object.keys(expectedDigests));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 47 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 48 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));

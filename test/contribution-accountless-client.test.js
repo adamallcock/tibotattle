@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  ACCOUNTLESS_RENEWAL_SCHEMA_VERSION,
+  renewAccountlessContributionOwnership,
   ACCOUNTLESS_ENROLLMENT_AUTHORIZATION_BASIS,
   ACCOUNTLESS_ENROLLMENT_POLICY_VERSION,
   ACCOUNTLESS_ENROLLMENT_SCHEMA_VERSION,
@@ -22,7 +24,7 @@ const ORIGIN = "https://usage.example";
 const LABORATORY_ORIGIN = "http://127.0.0.1:8787";
 const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
 const DEVICE_SECRET_HASH = "a".repeat(64);
-const EXPIRES_AT = "2026-09-10T00:00:00.000Z";
+const EXPIRES_AT = "2026-09-28T00:00:00.000Z";
 const NOW = Date.parse("2026-09-04T00:00:00.000Z");
 
 function preference(overrides = {}) {
@@ -498,6 +500,26 @@ test("missing secure capability state fails once without an enrollment attempt",
   assert.equal(networkCalls, 0);
 });
 
+test("a fixed credential recovery requirement blocks enrollment without transport", async () => {
+  let networkCalls = 0;
+  await assert.rejects(
+    enrollAccountlessContribution({
+      origin: ORIGIN,
+      readPreference: async () => preference(),
+      now: () => NOW,
+      ensureCapability: async () => {
+        throw Object.assign(new Error("private legacy record"), {
+          code: "contribution_device_credential_recovery_required",
+          retryable: false,
+        });
+      },
+      fetchImpl: async () => { networkCalls += 1; return jsonResponse(enrollmentReceipt()); },
+    }),
+    isClientError("credential_recovery_required", { retryable: false }),
+  );
+  assert.equal(networkCalls, 0);
+});
+
 test("the accountless runner retries only explicit temporary credential availability", async () => {
   let networkCalls = 0;
   const transient = Object.assign(new Error("temporary protected credential unavailable"), {
@@ -863,4 +885,172 @@ test("production selection survives the accountless runner into the existing v1.
   });
   assert.equal(result.status, "complete");
   assert.deepEqual(order, ["enroll", "ownership", "sync"]);
+});
+
+function renewalReceipt(overrides = {}) {
+  return { ...ownershipReceipt(), schemaVersion: ACCOUNTLESS_RENEWAL_SCHEMA_VERSION,
+    state: "renewed", renewalGeneration: 1, ...overrides };
+}
+
+function renewalRunnerOptions(overrides = {}) {
+  return {
+    laboratory: true, origin: LABORATORY_ORIGIN,
+    indexFile: "/synthetic/index.sqlite", backend: { laboratory: true },
+    now: () => NOW,
+    readPreference: async () => preference({ destinationOrigin: LABORATORY_ORIGIN }),
+    ensureCapability: async () => capability({ origin: LABORATORY_ORIGIN }),
+    withDeviceSecret: laboratoryLease(),
+    runIncrementalSync: async () => Object.freeze({ status: "complete", chunksUploaded: 0 }),
+    ...overrides,
+  };
+}
+
+test("renewal proves the same held secret with a closed body and zeroizes the lease", async () => {
+  let observedSecret;
+  let calls = 0;
+  const result = await renewAccountlessContributionOwnership(renewalRunnerOptions({
+    withDeviceSecret: laboratoryLease({ onSecret: (value) => { observedSecret = value; } }),
+    fetchImpl: async (url, options) => {
+      calls += 1;
+      assert.equal(String(url), `${LABORATORY_ORIGIN}/api/v1/accountless/renewal`);
+      assert.equal(options.credentials, "omit");
+      assert.equal(options.redirect, "error");
+      assert.equal(options.headers.Authorization,
+        `Device um_device_${DEVICE_ID}.${Buffer.alloc(32, 7).toString("base64url")}`);
+      assert.deepEqual(JSON.parse(options.body), {
+        schemaVersion: ACCOUNTLESS_RENEWAL_SCHEMA_VERSION,
+        policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+        authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+        telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+      });
+      return jsonResponse(renewalReceipt());
+    },
+  }));
+  assert.equal(calls, 1);
+  assert.equal(result.deviceId, DEVICE_ID);
+  assert.equal(result.renewalGeneration, 1);
+  assert.equal(result.expiresAt, EXPIRES_AT);
+  assert.ok(observedSecret.every((value) => value === 0));
+});
+
+test("renewal rejects foreign, expired, overlong and malformed generation receipts", async () => {
+  for (const changes of [
+    { deviceId: "22222222-2222-4222-8222-222222222222" },
+    { expiresAt: new Date(NOW - 1).toISOString() },
+    { expiresAt: new Date(NOW + 31 * 86_400_000).toISOString() },
+    { renewalGeneration: -1 }, { renewalGeneration: 2_147_483_648 },
+    { renewalGeneration: 1.5 }, { renewalGeneration: "1" },
+    { state: "created" }, { extra: true }, { policyVersion: "obsolete" },
+  ]) {
+    await assert.rejects(renewAccountlessContributionOwnership(renewalRunnerOptions({
+      fetchImpl: async () => jsonResponse(renewalReceipt(changes)),
+    })), isClientError("response_invalid"));
+  }
+});
+
+test("an active installation renews within seven days without re-enrollment or identity rotation", async () => {
+  const requests = [];
+  let ensured = 0;
+  const result = await runAccountlessContributionSyncOnce(renewalRunnerOptions({
+    ensureCapability: async () => { ensured += 1; return capability({ origin: LABORATORY_ORIGIN }); },
+    fetchImpl: async (url) => {
+      const pathname = new URL(url).pathname;
+      requests.push(pathname);
+      if (pathname.endsWith("/enrollment")) return jsonResponse(enrollmentReceipt());
+      if (pathname.endsWith("/ownership")) return jsonResponse(ownershipReceipt({
+        expiresAt: new Date(NOW + 7 * 86_400_000).toISOString(), state: "existing",
+      }));
+      assert.ok(pathname.endsWith("/renewal"));
+      return jsonResponse(renewalReceipt());
+    },
+    runIncrementalSync: async () => { requests.push("sync"); return { status: "complete", chunksUploaded: 0 }; },
+  }));
+  assert.equal(result.status, "complete");
+  assert.equal(ensured, 1);
+  assert.deepEqual(requests, ["/api/v1/accountless/enrollment", "/api/v1/accountless/ownership",
+    "/api/v1/accountless/renewal", "sync"]);
+});
+
+test("an expired enrollment renews the held owner once before ownership and upload", async () => {
+  const requests = [];
+  let ensured = 0;
+  const result = await runAccountlessContributionSyncOnce(renewalRunnerOptions({
+    ensureCapability: async () => { ensured += 1; return capability({ origin: LABORATORY_ORIGIN }); },
+    fetchImpl: async (url) => {
+      const pathname = new URL(url).pathname;
+      requests.push(pathname);
+      if (pathname.endsWith("/enrollment")) return jsonResponse({ error: { code: "ACCOUNTLESS_ENROLLMENT_EXPIRED" } }, 410);
+      if (pathname.endsWith("/renewal")) return jsonResponse(renewalReceipt());
+      assert.ok(pathname.endsWith("/ownership"));
+      return jsonResponse(ownershipReceipt({ state: "existing" }));
+    },
+    runIncrementalSync: async () => { requests.push("sync"); return { status: "complete", chunksUploaded: 0 }; },
+  }));
+  assert.equal(result.status, "complete");
+  assert.equal(ensured, 1);
+  assert.deepEqual(requests, ["/api/v1/accountless/enrollment", "/api/v1/accountless/renewal",
+    "/api/v1/accountless/ownership", "sync"]);
+});
+
+test("revocation and non-expiry failures never invoke renewal or upload", async () => {
+  for (const [status, code] of [[401, "ACCOUNTLESS_ENROLLMENT_REVOKED"],
+    [410, "ACCOUNTLESS_OWNERSHIP_EXPIRED"], [403, "ACCOUNTLESS_ENROLLMENT_EXPIRED"],
+    [409, "BODY_INVALID"], [503, "BACKEND_STORAGE_UNAVAILABLE"]]) {
+    let requests = 0;
+    const result = await runAccountlessContributionSyncOnce(renewalRunnerOptions({
+      fetchImpl: async (url) => {
+        requests += 1;
+        assert.ok(String(url).endsWith("/enrollment"));
+        return jsonResponse({ error: { code } }, status);
+      },
+      renewOwnership: async () => assert.fail("Only exact enrollment expiry can reach renewal"),
+      runIncrementalSync: async () => assert.fail("A failed enrollment cannot upload"),
+    }));
+    assert.equal(result.status, "failed");
+    assert.equal(requests, 1);
+  }
+});
+
+test("opt-out after renewal fences ownership and upload without another request", async () => {
+  let enabled = true;
+  let calls = 0;
+  const result = await runAccountlessContributionSyncOnce(renewalRunnerOptions({
+    readPreference: async () => preference({ destinationOrigin: LABORATORY_ORIGIN, enabled }),
+    fetchImpl: async (url) => {
+      calls += 1;
+      if (String(url).endsWith("/enrollment")) return jsonResponse({ error: { code: "ACCOUNTLESS_ENROLLMENT_EXPIRED" } }, 410);
+      assert.ok(String(url).endsWith("/renewal"));
+      enabled = false;
+      return jsonResponse(renewalReceipt());
+    },
+    runIncrementalSync: async () => assert.fail("Opt-out during renewal cannot upload"),
+  }));
+  assert.equal(result.status, "failed");
+  assert.equal(result.failure.code, "preference_ineligible");
+  assert.equal(calls, 2);
+});
+
+test("expiry between enrollment and ownership gets one authenticated recovery attempt", async () => {
+  for (const recover of [true, false]) {
+    const requests = [];
+    let ownershipCalls = 0;
+    const result = await runAccountlessContributionSyncOnce(renewalRunnerOptions({
+      fetchImpl: async (url) => {
+        const pathname = new URL(url).pathname;
+        requests.push(pathname);
+        if (pathname.endsWith("/enrollment")) return jsonResponse(enrollmentReceipt());
+        if (pathname.endsWith("/renewal")) return jsonResponse(renewalReceipt());
+        assert.ok(pathname.endsWith("/ownership"));
+        ownershipCalls += 1;
+        return recover && ownershipCalls > 1
+          ? jsonResponse(ownershipReceipt({ state: "existing" }))
+          : jsonResponse({ error: { code: "ACCOUNTLESS_OWNERSHIP_EXPIRED" } }, 410);
+      },
+      runIncrementalSync: async () => { requests.push("sync"); return { status: "complete", chunksUploaded: 0 }; },
+    }));
+    assert.equal(result.status, recover ? "complete" : "failed");
+    assert.equal(ownershipCalls, 2);
+    assert.deepEqual(requests, ["/api/v1/accountless/enrollment", "/api/v1/accountless/ownership",
+      "/api/v1/accountless/renewal", "/api/v1/accountless/ownership", ...(recover ? ["sync"] : [])]);
+  }
 });

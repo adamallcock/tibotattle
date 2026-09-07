@@ -41,7 +41,8 @@ type AttemptPurpose =
   | "device_disconnect"
   | "device_credential_renew"
   | "device_sync"
-  | "accountless_ownership";
+  | "accountless_ownership"
+  | "accountless_renewal";
 type RateLimitPurpose = AttemptPurpose
   | "public_aggregate_read"
   | "upload_authorization"

@@ -55,6 +55,22 @@ Policy or destination changes require a reviewed migration contract; do not
 silently reuse a choice for another destination. Preserve existing identity,
 account-track and accepted-history continuity where it can be verified.
 
+## Installation continuity and lease renewal
+
+The 2026-09-07 implementation separates durable installation ownership from the
+30-day upload lease. Expiry stops uploads; it does not prove that a different
+installation now owns the local data. The explicit authenticated renewal route
+requires the same secret, active installation/owner/device/authorization graph,
+and unchanged policy. It renews within the final seven days or after an offline
+period, keeping the same identities and accepted upload history. Ordinary
+enrollment replay does not renew. Lost responses converge on the existing
+renewed lease, without consuming another installation slot.
+
+Revocation, erasure, containment, conflicting identities and policy mismatches
+remain terminal. Renewal never clears a local opt-out, recreates an erased
+owner, invents consent, or grants public-aggregate eligibility. This implements
+the automatic-sharing lifecycle; it does not activate a hosted environment.
+
 ## Data and release boundary
 
 Sharing remains allowlisted and content-free. Prompts, responses, credentials,

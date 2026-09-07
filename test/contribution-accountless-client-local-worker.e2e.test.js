@@ -7,7 +7,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { runAccountlessContributionSyncOnce } from "../src/contribution-accountless-client.js";
+import { runAccountlessContributionSyncOnce, renewAccountlessContributionOwnership } from "../src/contribution-accountless-client.js";
 import { withContributionDeviceSecret } from "../src/contribution-device-capability.js";
 import {
   ATTRIBUTION_FIXTURE_DEVICE_ID,
@@ -250,7 +250,7 @@ async function writePreference(file, origin, enabled) {
 
 const runLocalWorkerE2E = process.env.TIBOTATTLE_RUN_LOCAL_WORKER_E2E === "1";
 
-test("accountless client reaches a migrated local Worker and fences retry, disconnect, and opt-out", {
+test("accountless client reaches a migrated local Worker with renewal, replay, disconnect, and opt-out", {
   timeout: 180_000,
   skip: runLocalWorkerE2E ? false : "set TIBOTATTLE_RUN_LOCAL_WORKER_E2E=1 to run the disposable loopback Worker proof",
 }, async () => {
@@ -348,6 +348,12 @@ test("accountless client reaches a migrated local Worker and fences retry, disco
       },
     );
     assert.ok(requests.some(({ path }) => path === "/api/v1/contributions"));
+    const renewalOptions = { laboratory: true, origin, readPreference, backend, stateFile, fetchImpl };
+    const renewal = await renewAccountlessContributionOwnership(renewalOptions);
+    assert.equal(renewal.status, "existing");
+    assert.equal(renewal.deviceId, ATTRIBUTION_FIXTURE_DEVICE_ID);
+    assert.equal(renewal.renewalGeneration, 0);
+    assert.equal(requests.filter(({ path }) => path === "/api/v1/accountless/renewal").length, 1);
 
     await stopWorker(worker);
     worker = null;
@@ -417,6 +423,10 @@ test("accountless client reaches a migrated local Worker and fences retry, disco
       },
     });
 
+    await assert.rejects(renewAccountlessContributionOwnership(renewalOptions), {
+      code: "contribution_accountless_client_device_unavailable",
+      retryable: false,
+    });
     requests.length = 0;
     const stale = await run();
     assert.equal(stale.status, "failed");

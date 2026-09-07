@@ -68,6 +68,8 @@ interface AccountlessEnrollmentRow {
   state: "active" | "revoked";
   issued_at: string;
   expires_at: string;
+  renewal_generation: number;
+  renewed_at: string | null;
   revoked_at: string | null;
   revocation_reason: string | null;
 }
@@ -181,6 +183,8 @@ async function readEnrollment(
              state,
              issued_at,
              expires_at,
+             renewal_generation,
+             renewed_at,
              revoked_at,
              revocation_reason
         FROM accountless_enrollment_ledger
@@ -211,11 +215,24 @@ function assertReplayable(
   }
   const issuedEpoch = Date.parse(row.issued_at);
   const expiryEpoch = Date.parse(row.expires_at);
+  const renewedEpoch = row.renewed_at === null ? null : Date.parse(row.renewed_at);
   if (!Number.isFinite(issuedEpoch)
       || new Date(issuedEpoch).toISOString() !== row.issued_at
       || !Number.isFinite(expiryEpoch)
       || new Date(expiryEpoch).toISOString() !== row.expires_at
-      || expiryEpoch !== issuedEpoch + ACCOUNTLESS_ENROLLMENT_LEASE_MILLISECONDS) {
+      || !Number.isSafeInteger(row.renewal_generation)
+      || row.renewal_generation < 0
+      || row.renewal_generation > 2_147_483_647
+      || (row.renewal_generation === 0 && row.renewed_at !== null)
+      || (row.renewal_generation > 0 && (
+        renewedEpoch === null
+        || !Number.isFinite(renewedEpoch)
+        || new Date(renewedEpoch).toISOString() !== row.renewed_at
+        || renewedEpoch < issuedEpoch
+      ))
+      || expiryEpoch !== (
+        row.renewal_generation === 0 ? issuedEpoch : renewedEpoch!
+      ) + ACCOUNTLESS_ENROLLMENT_LEASE_MILLISECONDS) {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }
   if (expiryEpoch <= nowEpoch) {
