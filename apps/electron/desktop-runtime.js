@@ -40,7 +40,11 @@ import { createDesktopFirstRunLoginRegistrar } from "./desktop-first-run-login.j
 import { createDesktopRecoverySettingsAction } from "./desktop-recovery-settings.js";
 import { createDesktopOwnedDownloadRegistry } from "./desktop-owned-downloads.js";
 import { createDesktopSharingBackend, createDesktopSharingCoordinator } from "./desktop-sharing.js";
-import { createDesktopContributionCredentialBackend } from "./desktop-contribution-credential.js";
+import {
+  createDesktopContributionCredentialBackend,
+  createDesktopContributionCredentialLegacyProbe,
+  createDesktopContributionCredentialLegacyRecoveryBackend,
+} from "./desktop-contribution-credential.js";
 import { classifyDesktopSharingInstallation } from "./desktop-sharing-installation.js";
 import { attachAccountlessParentChannel } from "../../src/platform/index.js";
 import {
@@ -50,7 +54,11 @@ import {
 } from "./desktop-notification-coordinator.js";
 import { createDesktopNotificationDelivery } from "./desktop-notification-delivery.js";
 import { shellError } from "./errors.js";
-import { createProductionDesktopUpdater, validateProductionDistributionMetadata } from "./desktop-updater.js";
+import {
+  createProductionDesktopUpdater,
+  PRODUCTION_ELECTRON_CHANNEL,
+  validateProductionDistributionMetadata,
+} from "./desktop-updater.js";
 import { createDesktopUpdatePreferences, createDesktopUpdatePreferencesBackend } from "./desktop-update-preferences.js";
 import {
   createWindowsFilesystemAdapter,
@@ -429,10 +437,23 @@ export async function launchDesktopRuntime({
         || sharingBackend === undefined || sharingInstallationState === undefined
         || qualificationContext !== null) throw shellError("electron_configuration_invalid");
   }
+  const accountlessProductionUsesMacNativeCredential = accountlessProduction !== undefined
+    && platform === "darwin";
+  const accountlessProductionUsesLinuxNativeCredential = accountlessProduction !== undefined
+    && platform === "linux";
   if (accountlessProduction !== undefined && (
     accountlessProduction === null || typeof accountlessProduction !== "object"
       || Array.isArray(accountlessProduction)
-      || Object.keys(accountlessProduction).sort().join(",") !== "origin,policyVersion"
+      || Object.keys(accountlessProduction).sort().join(",") !== (
+        accountlessProductionUsesMacNativeCredential
+          ? "createMacOSCredentialBackend,origin,policyVersion"
+          : accountlessProductionUsesLinuxNativeCredential
+            ? "createLinuxCredentialBackend,origin,policyVersion"
+            : "origin,policyVersion")
+      || (accountlessProductionUsesMacNativeCredential
+        && typeof accountlessProduction.createMacOSCredentialBackend !== "function")
+      || (accountlessProductionUsesLinuxNativeCredential
+        && typeof accountlessProduction.createLinuxCredentialBackend !== "function")
       || accountlessProduction.origin !== DEPLOYMENT_ENDPOINTS.public.origin
       || accountlessProduction.policyVersion !== "accountless-opt-out-v1"
       || accountlessLaboratory !== undefined || app.isPackaged !== true
@@ -441,7 +462,14 @@ export async function launchDesktopRuntime({
       || qualificationContext !== null)) throw shellError("electron_configuration_invalid");
   const accountlessEnabled = accountlessLaboratory !== undefined || accountlessProduction !== undefined;
   if (productionDistribution !== undefined) {
-    validateProductionDistributionMetadata(productionDistribution, { platform, architecture });
+    const distribution = validateProductionDistributionMetadata(productionDistribution, {
+      platform,
+      architecture,
+    });
+    if (distribution.channel !== PRODUCTION_ELECTRON_CHANNEL
+        && accountlessProduction !== undefined) {
+      throw shellError("electron_configuration_invalid");
+    }
     if (app.isPackaged !== true || app.getName?.() !== "TiboTattle"
         || environment.USAGE_MONITOR_TEST_LANE !== undefined
         || qualificationContext !== null || platformServices !== undefined) {
@@ -660,16 +688,50 @@ export async function launchDesktopRuntime({
       rootPath: settingsRootPath,
     })
     : null;
-  // Native encryption must be ready before the owned companion can request
-  // the installation credential. Unavailable encryption cannot authorize a send.
+  // Production macOS and Linux composition uses a main-process native adapter.
+  // Do not call Electron safeStorage there: its asynchronous availability probe
+  // can initialize a platform credential provider. Existing encrypted records
+  // are inspected without decrypting or changing them so a prior installation
+  // stops for explicit recovery instead of rotating identity.
   if (accountlessEnabled) {
-    installationCredentialBackend = accountlessLaboratory?.backend
-      ?? createDesktopContributionCredentialBackend({
-        safeStorage: runtime.safeStorage,
+    if (accountlessProductionUsesMacNativeCredential
+        || accountlessProductionUsesLinuxNativeCredential) {
+      const legacyCredentialProbe = createDesktopContributionCredentialLegacyProbe({
         platform,
         rootPath: settingsRootPath,
-        windowsProtectedStateStore,
       });
+      const nativeBackend = accountlessProduction[
+        accountlessProductionUsesMacNativeCredential
+          ? "createMacOSCredentialBackend"
+          : "createLinuxCredentialBackend"
+      ]({
+        legacyCredentialProbe: legacyCredentialProbe.inspect,
+      });
+      if (!nativeBackend
+          || typeof nativeBackend !== "object"
+          || ["read", "createIfMissing", "deleteExact"].some(
+            (operation) => typeof nativeBackend[operation] !== "function",
+          )) {
+        throw shellError("electron_configuration_invalid");
+      }
+      // macOS owns this recovery check within its signed adapter. Linux keeps
+      // the equivalent boundary in this generic main-process wrapper until a
+      // reviewed native Linux accountless backend is selected by the entrypoint.
+      installationCredentialBackend = accountlessProductionUsesLinuxNativeCredential
+        ? createDesktopContributionCredentialLegacyRecoveryBackend({
+          backend: nativeBackend,
+          legacyCredentialProbe: legacyCredentialProbe.inspect,
+        })
+        : nativeBackend;
+    } else {
+      installationCredentialBackend = accountlessLaboratory?.backend
+        ?? createDesktopContributionCredentialBackend({
+          safeStorage: runtime.safeStorage,
+          platform,
+          rootPath: settingsRootPath,
+          windowsProtectedStateStore,
+        });
+    }
   }
   const firstRunBackend = firstRunReceiptBackend
     ?? createDesktopFirstRunReceiptBackend({

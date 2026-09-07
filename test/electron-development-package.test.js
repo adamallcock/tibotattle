@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -86,6 +87,19 @@ test("the development workflow builds each target on a static native runner with
   assert.equal((workflow.match(/persist-credentials: false/gu) ?? []).length, 4);
   assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 4);
   assert.match(workflow, /WINDOWS_BINDING_BUILD_FAILED/u);
+  assert.match(workflow, /LINUX_CREDENTIAL_MUTEX_NODE_GYP_UNAVAILABLE/u);
+  assert.match(workflow, /rebuild --directory native\/linux-credential-mutex/u);
+  assert.match(workflow, /stage-linux-credential-mutex-binding\.mjs/u);
+  assert.match(workflow, /build-linux-credential-mutex-manifest\.mjs/u);
+  assert.match(workflow, /qualify-linux-credential-mutex\.mjs/u);
+  assert.ok(
+    workflow.indexOf("stage-linux-credential-mutex-binding.mjs")
+      < workflow.indexOf("build-linux-credential-mutex-manifest.mjs"),
+  );
+  assert.ok(
+    workflow.indexOf("build-linux-credential-mutex-manifest.mjs")
+      < workflow.indexOf("qualify-linux-credential-mutex.mjs"),
+  );
 });
 
 test("common packaging assembles usable, hashed handoffs without a source checkout", async () => {
@@ -114,5 +128,34 @@ test("common packaging assembles usable, hashed handoffs without a source checko
       await assert.rejects(writeDevelopmentHandoff({ target, outputDirectory }), { code: "EEXIST" });
       assert.equal(await readFile(join(outputDirectory, "DEVELOPMENT-TESTING.txt"), "utf8"), readme);
     } finally { await rm(outputDirectory, { recursive: true, force: true }); }
+  }
+});
+
+test("Linux native qualification outputs leave the source inventory unchanged", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "electron-native-build-ignore-"));
+  const git = (...args) => execFileSync("git", args, { cwd: directory, encoding: "utf8" });
+  try {
+    git("init", "--quiet", "--template=");
+    await writeFile(join(directory, ".gitignore"), await readFile(new URL("../.gitignore", import.meta.url)));
+    const source = "native/linux-credential-mutex/linux-credential-mutex.cc";
+    await mkdir(join(directory, "native/linux-credential-mutex"), { recursive: true });
+    await writeFile(join(directory, source), "// synthetic qualification source\n");
+    const before = git("status", "--porcelain", "--untracked-files=all");
+    assert.ok(before.includes(source), "native source changes must remain visible to the clean-source gate");
+
+    for (const build of [
+      "native/linux-credential-mutex/build/Release",
+      "native/linux-credential-mutex/build/qualification",
+    ]) {
+      await mkdir(join(directory, build), { recursive: true });
+      for (const name of ["linux_credential_mutex.node", "linux_credential_mutex.node.manifest.json"]) {
+        await writeFile(join(directory, build, name), "synthetic build output\n");
+        assert.equal(git("check-ignore", "--", `${build}/${name}`).trim(), `${build}/${name}`);
+      }
+    }
+    assert.equal(git("status", "--porcelain", "--untracked-files=all"), before,
+      "building, staging, and manifesting the native binding must not dirty the packager's source inventory");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
   }
 });

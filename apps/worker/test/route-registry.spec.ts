@@ -39,6 +39,18 @@ const EXACT_ROUTES = [
     authority: "accountless_enrollment",
   },
   {
+    pathname: "/api/v1/accountless/ownership",
+    id: "accountless_ownership",
+    methods: ["POST"],
+    authority: "accountless_ownership",
+  },
+  {
+    pathname: "/api/v1/accountless/renewal",
+    id: "accountless_renewal",
+    methods: ["POST"],
+    authority: "accountless_ownership",
+  },
+  {
     pathname: "/api/v1/internal/release/appcast",
     id: "sparkle_appcast_guard",
     methods: ["POST"],
@@ -234,7 +246,7 @@ const EXACT_ROUTES = [
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(37);
+    expect(EXACT_ROUTES).toHaveLength(39);
     expect(WORKER_ROUTE_POLICY).toEqual(EXACT_ROUTES);
     expect(Object.isFrozen(WORKER_ROUTE_POLICY)).toBe(true);
     for (const definition of WORKER_ROUTE_POLICY) {

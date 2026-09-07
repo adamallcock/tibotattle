@@ -68,6 +68,8 @@ interface AccountlessEnrollmentRow {
   state: "active" | "revoked";
   issued_at: string;
   expires_at: string;
+  renewal_generation: number;
+  renewed_at: string | null;
   revoked_at: string | null;
   revocation_reason: string | null;
 }
@@ -181,6 +183,8 @@ async function readEnrollment(
              state,
              issued_at,
              expires_at,
+             renewal_generation,
+             renewed_at,
              revoked_at,
              revocation_reason
         FROM accountless_enrollment_ledger
@@ -211,11 +215,24 @@ function assertReplayable(
   }
   const issuedEpoch = Date.parse(row.issued_at);
   const expiryEpoch = Date.parse(row.expires_at);
+  const renewedEpoch = row.renewed_at === null ? null : Date.parse(row.renewed_at);
   if (!Number.isFinite(issuedEpoch)
       || new Date(issuedEpoch).toISOString() !== row.issued_at
       || !Number.isFinite(expiryEpoch)
       || new Date(expiryEpoch).toISOString() !== row.expires_at
-      || expiryEpoch !== issuedEpoch + ACCOUNTLESS_ENROLLMENT_LEASE_MILLISECONDS) {
+      || !Number.isSafeInteger(row.renewal_generation)
+      || row.renewal_generation < 0
+      || row.renewal_generation > 2_147_483_647
+      || (row.renewal_generation === 0 && row.renewed_at !== null)
+      || (row.renewal_generation > 0 && (
+        renewedEpoch === null
+        || !Number.isFinite(renewedEpoch)
+        || new Date(renewedEpoch).toISOString() !== row.renewed_at
+        || renewedEpoch < issuedEpoch
+      ))
+      || expiryEpoch !== (
+        row.renewal_generation === 0 ? issuedEpoch : renewedEpoch!
+      ) + ACCOUNTLESS_ENROLLMENT_LEASE_MILLISECONDS) {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }
   if (expiryEpoch <= nowEpoch) {
@@ -353,7 +370,12 @@ export type AccountlessRevocationReason =
   | "security_reset"
   | "operator_containment";
 
-/** Preserve a revocation tombstone for future lifecycle wiring. */
+/**
+ * Revoke the ledger first and every derived accountless authority in the same
+ * D1 transaction. Consumed receipts stay immutable, while unused/consuming
+ * upload grants lose authority immediately. The ledger remains the tombstone
+ * that prevents a later bearer retry from recreating the owner.
+ */
 export async function revokeAccountlessEnrollment(
   db: D1Database,
   deviceId: string,
@@ -365,14 +387,52 @@ export async function revokeAccountlessEnrollment(
     throw new ApiError(400, "BODY_INVALID");
   }
   try {
-    const result = await db.prepare(`
-      UPDATE accountless_enrollment_ledger
-         SET state = 'revoked',
-             revoked_at = ?,
-             revocation_reason = ?
-       WHERE device_id = ? AND state = 'active'
-    `).bind(new Date(nowEpoch).toISOString(), reason, deviceId).run();
-    return result.meta.changes === 1;
+    const now = new Date(nowEpoch).toISOString();
+    const results = await db.batch([
+      db.prepare(`
+        UPDATE accountless_enrollment_ledger
+           SET state = 'revoked', revoked_at = ?, revocation_reason = ?
+         WHERE device_id = ? AND state = 'active'
+      `).bind(now, reason, deviceId),
+      db.prepare(`
+        UPDATE accountless_upload_owners
+           SET state = 'revoked', revoked_at = ?, revocation_reason = ?
+         WHERE enrollment_device_id = ? AND state = 'active'
+           AND EXISTS (
+             SELECT 1 FROM accountless_enrollment_ledger ledger
+              WHERE ledger.device_id = accountless_upload_owners.enrollment_device_id
+                AND ledger.state = 'revoked'
+           )
+      `).bind(now, reason, deviceId),
+      db.prepare(`
+        UPDATE accountless_v11_device_authorizations
+           SET state = 'revoked', revoked_at = ?, revocation_reason = ?
+         WHERE enrollment_device_id = ? AND state = 'active'
+           AND EXISTS (
+             SELECT 1 FROM accountless_enrollment_ledger ledger
+              WHERE ledger.device_id = accountless_v11_device_authorizations.enrollment_device_id
+                AND ledger.state = 'revoked'
+           )
+      `).bind(now, reason, deviceId),
+      db.prepare(`
+        UPDATE device_credentials
+           SET state = 'revoked', revoked_at = COALESCE(revoked_at, ?)
+         WHERE accountless_enrollment_device_id = ?
+           AND authority_kind = 'accountless' AND state = 'active'
+      `).bind(now, deviceId),
+      db.prepare(`
+        UPDATE device_upload_authorizations
+           SET state = 'revoked', revoked_at = COALESCE(revoked_at, ?),
+               consume_lease_expires_at = NULL
+         WHERE issued_by_device_id IN (
+           SELECT id FROM device_credentials
+            WHERE accountless_enrollment_device_id = ?
+              AND authority_kind = 'accountless'
+         )
+           AND state IN ('unused', 'consuming')
+      `).bind(now, deviceId),
+    ]);
+    return results[0]?.meta.changes === 1;
   } catch {
     throw new ApiError(503, "BACKEND_STORAGE_UNAVAILABLE");
   }

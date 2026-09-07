@@ -30,6 +30,19 @@ import {
   type AccountlessEnrollmentRequest,
 } from "./accountless-enrollment";
 import {
+  ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+  assertAccountlessOwnershipEnabled,
+  createAccountlessUploadOwner,
+  parseAccountlessOwnershipJson,
+  type AccountlessOwnershipRequest,
+} from "./accountless-ownership";
+import {
+  ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+  parseAccountlessRenewalJson,
+  renewAccountlessUploadOwner,
+  type AccountlessRenewalRequest,
+} from "./accountless-renewal";
+import {
   assertAccountScopedLocalPreview,
   configuredAccountScopedIngestMode,
 } from "./account-scoped-ingest";
@@ -99,6 +112,7 @@ import {
   revokeParticipantDevice,
   rotateDeviceCredential,
   type DeviceTransportConsentVersion,
+  type DevicePrincipal,
 } from "./device-auth";
 import {
   ApiError,
@@ -380,6 +394,70 @@ async function readBoundedAccountlessJson(
   }
 }
 
+async function readBoundedAccountlessOwnershipJson(
+  request: Request,
+): Promise<AccountlessOwnershipRequest> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_UPLOAD_OWNER_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  try {
+    return parseAccountlessOwnershipJson(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined),
+    );
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
+async function readBoundedAccountlessRenewalJson(
+  request: Request,
+): Promise<AccountlessRenewalRequest> {
+  const contentType = request.headers.get("content-type")?.split(";", 1)[0]?.trim();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "CONTENT_TYPE_INVALID");
+  }
+  const declared = request.headers.get("content-length");
+  if (declared !== null) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) {
+      throw new ApiError(400, "BODY_INVALID");
+    }
+    if (length > ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES) {
+      throw new ApiError(413, "BODY_TOO_LARGE");
+    }
+  }
+  const combined = await readBoundedRequestBody(
+    request,
+    ACCOUNTLESS_RENEWAL_MAX_REQUEST_BYTES,
+    CONTROL_BODY_READ_POLICY,
+  );
+  try {
+    return parseAccountlessRenewalJson(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(combined),
+    );
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "BODY_INVALID");
+  }
+}
+
 const DEVICE_UPLOAD_AUTHORIZATION_HEADER =
   /^Upload um_device_upload_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.[A-Za-z0-9_-]{43}$/u;
 
@@ -500,6 +578,62 @@ async function handleAccountlessEnrollment(
     body,
   );
   return jsonResponse(result.response, result.status);
+}
+
+async function handleAccountlessOwnership(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  assertAccountlessOwnershipEnabled(env);
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "accountless_ownership",
+  );
+  const body = await readBoundedAccountlessOwnershipJson(request);
+  const result = await createAccountlessUploadOwner(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+    body,
+  );
+  return jsonResponse(result.response, result.status);
+}
+
+async function handleAccountlessRenewal(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  if (request.method !== "POST") methodNotAllowed(["POST"]);
+  if (hasSessionCookie(request.headers.get("cookie"))) {
+    throw new ApiError(401, "AUTH_INVALID");
+  }
+  if (configuredAccountlessEnrollmentMode(env) !== "enabled") {
+    throw new ApiError(503, "ACCOUNTLESS_ENROLLMENT_DISABLED");
+  }
+  assertAccountlessOwnershipEnabled(env);
+  assertAdmissionBindings(env);
+  await assertCollectionControl(env.USAGE_MONITOR_DB, "uploadRegistration");
+  await assertAttemptAllowed(
+    env.RECOVERY_RATE_LIMIT,
+    env.CLIENT_ATTEMPT_RATE_LIMIT,
+    request,
+    env,
+    "accountless_renewal",
+  );
+  const body = await readBoundedAccountlessRenewalJson(request);
+  return jsonResponse(await renewAccountlessUploadOwner(
+    env.USAGE_MONITOR_DB,
+    request.headers.get("authorization"),
+    body,
+  ));
 }
 
 function allowedHeader(error: ApiError): HeadersInit | undefined {
@@ -1943,7 +2077,7 @@ function handleEnvelopeKey(request: Request, env: Env): Response {
 
 async function handleSyntheticContribution(
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: { id: string; consentVersion: string | null },
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
@@ -2038,7 +2172,7 @@ async function handleSyntheticContribution(
 async function handleTelemetryContribution(
   request: Request,
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: { id: string; consentVersion: string | null },
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
@@ -2265,12 +2399,19 @@ async function telemetryV1ChunkReceipt(
 
 async function handleTelemetryV11Contribution(
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: {
+    id: string;
+    consentVersion: string | null;
+    ownerKind: "social" | "accountless";
+  },
   deviceId: string,
   authorizationId: string,
   env: Env,
 ): Promise<Response> {
-  if (participant.consentVersion !== TELEMETRY_CONSENT_VERSION) {
+  if ((participant.ownerKind === "social"
+      && participant.consentVersion !== TELEMETRY_CONSENT_VERSION)
+      || (participant.ownerKind === "accountless"
+        && participant.consentVersion !== null)) {
     throw new ApiError(400, "TELEMETRY_REQUIRED");
   }
   const principal = { participantId: participant.id, deviceId };
@@ -2341,7 +2482,7 @@ async function handleTelemetryV11Contribution(
  */
 async function handleTelemetryV1Contribution(
   body: { raw: string; value: unknown },
-  participant: { id: string; consentVersion: string },
+  participant: { id: string; consentVersion: string | null },
   uploadAuthorization: {
     authorizationId: string;
     authorizationKind: "session" | "device";
@@ -2540,7 +2681,7 @@ async function deviceSyncPrincipal(
   request: Request,
   env: Env,
   method: "GET" | "POST" = "GET",
-): Promise<{ participantId: string; deviceId: string }> {
+): Promise<DevicePrincipal> {
   if (request.method !== method) methodNotAllowed([method]);
   assertAdmissionBindings(env);
   await assertAttemptAllowed(
@@ -2560,7 +2701,7 @@ async function deviceSyncPrincipal(
   if (await hasDeletionTombstone(env.DELETION_LEDGER, device.participantId)) {
     throw new ApiError(401, "DEVICE_AUTH_INVALID");
   }
-  return { participantId: device.participantId, deviceId: device.deviceId };
+  return device;
 }
 
 async function handleDeviceSyncState(
@@ -2568,6 +2709,9 @@ async function handleDeviceSyncState(
   env: Env,
 ): Promise<Response> {
   const device = await deviceSyncPrincipal(request, env);
+  if (device.authorityKind !== "social") {
+    throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  }
   const [state, admission] = await Promise.all([
     telemetryV1SyncState(
       env.USAGE_MONITOR_DB,
@@ -2646,6 +2790,9 @@ async function handleDeviceSyncManifest(
   env: Env,
 ): Promise<Response> {
   const device = await deviceSyncPrincipal(request, env);
+  if (device.authorityKind !== "social") {
+    throw new ApiError(403, "TELEMETRY_TRANSPORT_BLOCKED");
+  }
   const url = new URL(request.url);
   const fromDay = url.searchParams.get("fromDay");
   const toDay = url.searchParams.get("toDay");
@@ -2718,9 +2865,13 @@ async function handleContribution(request: Request, env: Env): Promise<Response>
       throw new ApiError(400, "ENVELOPE_INVALID");
     }
     const participant = await env.USAGE_MONITOR_DB.prepare(
-      `SELECT id, consent_version AS consentVersion
+      `SELECT id, consent_version AS consentVersion, owner_kind AS ownerKind
          FROM participants WHERE id = ? AND state = 'active'`,
-    ).bind(claimed.participantId).first<{ id: string; consentVersion: string }>();
+    ).bind(claimed.participantId).first<{
+      id: string;
+      consentVersion: string | null;
+      ownerKind: "social" | "accountless";
+    }>();
     if (!participant) throw new ApiError(401, "UPLOAD_AUTH_INVALID");
     if (await hasDeletionTombstone(env.DELETION_LEDGER, participant.id)) {
       throw new ApiError(401, "UPLOAD_AUTH_INVALID");
@@ -3433,6 +3584,10 @@ async function routeApi(
       return handleEnroll(request, env);
     case "accountless_enrollment":
       return handleAccountlessEnrollment(request, env);
+    case "accountless_ownership":
+      return handleAccountlessOwnership(request, env);
+    case "accountless_renewal":
+      return handleAccountlessRenewal(request, env);
     case "sparkle_appcast_guard":
       return handleSparkleAppcastGuard(request, env);
     case "identity_google_start":

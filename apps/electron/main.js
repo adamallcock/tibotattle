@@ -5,10 +5,13 @@ import { fileURLToPath } from "node:url";
 import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
 import { launchDesktopRuntime } from "./desktop-runtime.js";
 import { createDesktopTrayIconFactory } from "./desktop-tray.js";
-import { validateProductionDistributionMetadata } from "./desktop-updater.js";
+import {
+  PRODUCTION_ELECTRON_CHANNEL,
+  validateProductionDistributionMetadata,
+} from "./desktop-updater.js";
 import { runProductionNativeMacHandover } from "./desktop-native-migration-macos.js";
 import { attachDesktopKeychainBroker } from "./desktop-keychain-broker.js";
-import { loadDesktopMacOSCredentialBackend } from "./desktop-macos-keychain.js";
+import { loadDesktopMacOSCredentialBackends } from "./desktop-macos-keychain.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
 import { assertElectronPlatformGate } from "./platform-gate.js";
 import {
@@ -82,10 +85,15 @@ export async function readProductionDistribution({
       throw new Error("Invalid packaged manifest");
     }
     const manifest = JSON.parse(bytes.toString("utf8"));
-    return validateProductionDistributionMetadata(manifest.tibotattleDistribution, {
+    const distribution = validateProductionDistributionMetadata(manifest.tibotattleDistribution, {
       platform,
       architecture,
     });
+    if (distribution.channel !== PRODUCTION_ELECTRON_CHANNEL
+        && manifest.version !== distribution.semanticVersion) {
+      throw new Error("Rehearsal manifest version does not match its distribution metadata");
+    }
+    return distribution;
   } catch {
     throw shellError("electron_configuration_invalid");
   }
@@ -473,23 +481,34 @@ export function installWindowsSmokeControlForTest(lifecycle, {
 export function createProductionMacCredentialHandover({
   app,
   resourcesPath,
-  loadBackend = loadDesktopMacOSCredentialBackend,
+  loadBackend = loadDesktopMacOSCredentialBackends,
   runHandover = runProductionNativeMacHandover,
 } = {}) {
-  let backend = null;
+  let brokerBackend = null;
+  let createAccountlessCredentialBackend = null;
   return Object.freeze({
     async prepareNativeHandover({ homeDirectory }) {
-      backend = null;
+      brokerBackend = null;
+      createAccountlessCredentialBackend = null;
       const selected = await loadBackend({ app, resourcesPath });
       const handover = await runHandover({ electronApp: app, resourcesPath, homeDirectory });
       if (["no_legacy_state", "migrated", "already_migrated"].includes(handover?.status)) {
-        backend = selected;
+        brokerBackend = selected?.broker ?? selected;
+        createAccountlessCredentialBackend = typeof selected?.createAccountlessCredentialBackend === "function"
+          ? selected.createAccountlessCredentialBackend.bind(selected)
+          : null;
       }
       return handover;
     },
     attachCredentialBroker(stream) {
-      if (backend === null) throw shellError("electron_configuration_invalid");
-      return attachDesktopKeychainBroker({ stream, backend });
+      if (brokerBackend === null) throw shellError("electron_configuration_invalid");
+      return attachDesktopKeychainBroker({ stream, backend: brokerBackend });
+    },
+    createAccountlessCredentialBackend(options) {
+      if (createAccountlessCredentialBackend === null) {
+        throw shellError("electron_configuration_invalid");
+      }
+      return createAccountlessCredentialBackend(options);
     },
   });
 }
@@ -534,21 +553,30 @@ export async function launchElectronShell({
       ownedDownloadsRegistry,
       notificationBackend,
     });
+    // Read and validate the packaged selection before constructing any
+    // companion or platform service. In particular, a Linux stable metadata
+    // record remains source-only until its real credential/identity and
+    // installed lifecycle gates are qualified.
+    const productionDistribution = await readProductionDistribution({ app });
+    assertElectronPlatformGate({
+      platform: process.platform,
+      architecture: process.arch,
+      qualificationContext,
+      productionDistribution,
+    });
     const paths = resolveCompanionLaunchPaths({
       app,
       companionScript,
       resourceRoot,
       resourcesPath,
     });
-    assertElectronPlatformGate({
-      platform: process.platform,
-      architecture: process.arch,
-      qualificationContext,
-    });
-    const productionDistribution = await readProductionDistribution({ app });
     // A local-QA launch must never inherit production sending or updating.
     const productionEnabled = productionDistribution !== null
       && environment.USAGE_MONITOR_TEST_LANE === undefined;
+    // A rehearsal candidate retains the signed native handover and FD4
+    // continuity path, but it never enables the accountless FD3/upload path.
+    const accountlessProductionEnabled = productionEnabled
+      && productionDistribution.channel === PRODUCTION_ELECTRON_CHANNEL;
     const macCredentialHandover = productionEnabled && process.platform === "darwin"
       ? createProductionMacCredentialHandover({
         app,
@@ -593,9 +621,13 @@ export async function launchElectronShell({
       architecture: process.arch,
       productionDistribution: productionEnabled ? productionDistribution : undefined,
       prepareNativeHandover: macCredentialHandover?.prepareNativeHandover,
-      accountlessProduction: productionEnabled ? {
+      accountlessProduction: accountlessProductionEnabled ? {
         origin: DEPLOYMENT_ENDPOINTS.public.origin,
         policyVersion: productionDistribution.contributionPolicy,
+        ...(macCredentialHandover === null ? {} : {
+          createMacOSCredentialBackend:
+            macCredentialHandover.createAccountlessCredentialBackend,
+        }),
       } : undefined,
     });
     installWindowsSmokeControl(desktop.lifecycle, {

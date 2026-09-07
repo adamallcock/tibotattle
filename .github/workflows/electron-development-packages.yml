@@ -47,6 +47,8 @@ jobs:
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
+      - name: Validate macOS signing-order and final metadata contracts without credentials
+        run: node --test test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target darwin-arm64 --format distribution --replace-staging
       - name: Retain verified development packages and receipts
@@ -90,6 +92,8 @@ jobs:
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
+      - name: Validate macOS signing-order and final metadata contracts without credentials
+        run: node --test test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target darwin-x64 --format distribution --replace-staging
       - name: Retain verified development packages and receipts
@@ -197,6 +201,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends libsecret-1-0 libarchive-tools libfuse2t64
+      - name: Build and qualify the native Linux credential mutex
+        run: |
+          set -euo pipefail
+          node_gyp_script="$(npm root --global)/npm/node_modules/node-gyp/bin/node-gyp.js"
+          if [ ! -f "$node_gyp_script" ]; then
+            echo "LINUX_CREDENTIAL_MUTEX_NODE_GYP_UNAVAILABLE" >&2
+            exit 1
+          fi
+          node "$node_gyp_script" rebuild --directory native/linux-credential-mutex
+          node scripts/stage-linux-credential-mutex-binding.mjs
+          node scripts/build-linux-credential-mutex-manifest.mjs
+          node scripts/qualify-linux-credential-mutex.mjs
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
       - name: Build and verify development distributions

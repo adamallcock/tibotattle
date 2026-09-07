@@ -55,7 +55,7 @@ jobs:
           node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='arm64')process.exit(1)"
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Validate the production source and enclosing-bundle helper contracts
-        run: node --test test/electron-production-distribution.test.js test/electron-native-handover-helper.test.js test/electron-native-handover-bundle-context.test.js test/electron-macos-keychain-adapter.test.js
+        run: node --test test/electron-production-distribution.test.js test/electron-native-handover-helper.test.js test/electron-native-handover-bundle-context.test.js test/electron-macos-keychain-adapter.test.js test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js
       - name: Prepare unsigned production source only
         run: |
           set -euo pipefail
@@ -107,7 +107,7 @@ jobs:
           node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='x64')process.exit(1)"
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Validate the production source and enclosing-bundle helper contracts
-        run: node --test test/electron-production-distribution.test.js test/electron-native-handover-helper.test.js test/electron-native-handover-bundle-context.test.js test/electron-macos-keychain-adapter.test.js
+        run: node --test test/electron-production-distribution.test.js test/electron-native-handover-helper.test.js test/electron-native-handover-bundle-context.test.js test/electron-macos-keychain-adapter.test.js test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js
       - name: Prepare unsigned production source only
         run: |
           set -euo pipefail

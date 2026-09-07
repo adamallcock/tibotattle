@@ -4,7 +4,11 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createDesktopContributionCredentialBackend } from "../desktop-contribution-credential.js";
+import {
+  createDesktopContributionCredentialBackend,
+  createDesktopContributionCredentialLegacyProbe,
+  createDesktopContributionCredentialLegacyRecoveryBackend,
+} from "../desktop-contribution-credential.js";
 
 function cryptoFixture() {
   const key = randomBytes(32);
@@ -31,6 +35,82 @@ function cryptoFixture() {
     },
   };
 }
+
+test("legacy POSIX ciphertext inspection never initializes or decrypts safeStorage", async () => {
+  const calls = [];
+  for (const platform of ["darwin", "linux"]) {
+    for (const [stored, expected] of [
+      [null, "absent"],
+      [{ schemaVersion: "accountless-encrypted-credential-v1", encrypted: "AAAA" }, "present"],
+      [{ schemaVersion: "unexpected", encrypted: null }, "unavailable"],
+    ]) {
+      const probe = createDesktopContributionCredentialLegacyProbe({
+        platform,
+        rootPath: "/synthetic/profile",
+        storage: {
+          load: async () => {
+            calls.push(platform);
+            return stored;
+          },
+        },
+      });
+      assert.equal(await probe.inspect(), expected);
+    }
+  }
+  assert.deepEqual(calls, ["darwin", "darwin", "darwin", "linux", "linux", "linux"]);
+  assert.throws(
+    () => createDesktopContributionCredentialLegacyProbe({
+      platform: "win32",
+      rootPath: "C:\\synthetic\\profile",
+    }),
+    /supported POSIX platform/u,
+  );
+});
+
+test("Linux legacy recovery blocks native accountless access without interpreting ciphertext", async () => {
+  const secret = randomBytes(32);
+  try {
+    for (const status of ["present", "unavailable"]) {
+      const calls = [];
+      const backend = {
+        async read() { calls.push("read"); return null; },
+        async createIfMissing() { calls.push("create"); return "created"; },
+        async deleteExact() { calls.push("delete"); return "missing"; },
+      };
+      const guarded = createDesktopContributionCredentialLegacyRecoveryBackend({
+        backend,
+        legacyCredentialProbe: async () => status,
+      });
+      for (const operation of [
+        () => guarded.read(),
+        () => guarded.createIfMissing(secret),
+        () => guarded.deleteExact(secret),
+      ]) {
+        await assert.rejects(operation(), (error) => error?.code
+          === "contribution_device_credential_recovery_required"
+          && error?.retryable === false);
+      }
+      assert.deepEqual(calls, [], `${status} legacy state must block native access`);
+    }
+
+    const calls = [];
+    const guarded = createDesktopContributionCredentialLegacyRecoveryBackend({
+      backend: {
+        async read() { calls.push("read"); return null; },
+        async createIfMissing() { calls.push("create"); return "created"; },
+        async deleteExact() { calls.push("delete"); return "missing"; },
+      },
+      legacyCredentialProbe: async () => "absent",
+    });
+    assert.equal(await guarded.read(), null);
+    assert.equal(await guarded.createIfMissing(secret), "created");
+    assert.equal(await guarded.deleteExact(secret), "missing");
+    assert.deepEqual(calls, ["read", "create", "delete"]);
+  } finally {
+    secret.fill(0);
+  }
+});
+
 test("installation credential persists encrypted and survives adapter restart", async (t) => {
   const rootPath = await mkdtemp(join(tmpdir(), "accountless-vault-"));
   t.after(() => rm(rootPath, { recursive: true, force: true }));

@@ -12,7 +12,7 @@
 
 namespace {
 
-constexpr char kContractVersion[] = "tibotattle-macos-keychain-v1";
+constexpr char kContractVersion[] = "tibotattle-macos-keychain-v2";
 constexpr char kBundleIdentifier[] = "com.usagemonitor.local";
 constexpr char kTeamIdentifier[] = "43RTH622SB";
 constexpr char kAccount[] = "installation";
@@ -25,7 +25,7 @@ struct CapabilitySpec {
   const char* legacy_service;
 };
 
-constexpr std::array<CapabilitySpec, 4> kCapabilities = {{
+constexpr std::array<CapabilitySpec, 5> kCapabilities = {{
     {"export_identity", "app-usagemonitor.export-identity.app.v1",
      "app-usagemonitor.export-identity.v1"},
     {"account_observation", "app-usagemonitor.account-observation.app.v1",
@@ -34,6 +34,8 @@ constexpr std::array<CapabilitySpec, 4> kCapabilities = {{
      "app-usagemonitor.claude-session-pseudonym.v1"},
     {"contribution_device", "app-usagemonitor.contribution-device.app.v1",
      "app-usagemonitor.contribution-device.v1"},
+    {"accountless_installation", "app-usagemonitor.accountless-installation.app.v1",
+     "app-usagemonitor.accountless-installation.v1"},
 }};
 
 enum class ItemStatus {
@@ -50,6 +52,20 @@ enum class Operation {
   kRead,
   kStore,
   kRemove,
+  kCreateIfMissing,
+  kDeleteExact,
+};
+
+enum class ConditionalStatus {
+  kCreated,
+  kExisting,
+  kDeleted,
+  kMissing,
+  kMismatch,
+  kLocked,
+  kDenied,
+  kMigrationRequired,
+  kUnknown,
 };
 
 // SecKeychainSetUserInteractionAllowed is process-wide. Keep the disabled
@@ -83,6 +99,30 @@ const char* StatusName(ItemStatus status) {
   return "unknown";
 }
 
+const char* ConditionalStatusName(ConditionalStatus status) {
+  switch (status) {
+    case ConditionalStatus::kCreated:
+      return "created";
+    case ConditionalStatus::kExisting:
+      return "existing";
+    case ConditionalStatus::kDeleted:
+      return "deleted";
+    case ConditionalStatus::kMissing:
+      return "missing";
+    case ConditionalStatus::kMismatch:
+      return "mismatch";
+    case ConditionalStatus::kLocked:
+      return "locked";
+    case ConditionalStatus::kDenied:
+      return "denied";
+    case ConditionalStatus::kMigrationRequired:
+      return "migration_required";
+    case ConditionalStatus::kUnknown:
+      return "unknown";
+  }
+  return "unknown";
+}
+
 ItemStatus StatusFromSecurity(OSStatus status) {
   if (status == errSecItemNotFound) return ItemStatus::kAbsent;
   if (status == errSecSuccess) return ItemStatus::kPresent;
@@ -91,6 +131,37 @@ ItemStatus StatusFromSecurity(OSStatus status) {
     return ItemStatus::kDenied;
   }
   return ItemStatus::kUnknown;
+}
+
+ConditionalStatus ConditionalStatusFromItemStatus(ItemStatus status) {
+  switch (status) {
+    case ItemStatus::kLocked:
+      return ConditionalStatus::kLocked;
+    case ItemStatus::kDenied:
+      return ConditionalStatus::kDenied;
+    case ItemStatus::kMigrationRequired:
+      return ConditionalStatus::kMigrationRequired;
+    case ItemStatus::kUnknown:
+      return ConditionalStatus::kUnknown;
+    case ItemStatus::kAbsent:
+    case ItemStatus::kPresent:
+      return ConditionalStatus::kUnknown;
+  }
+  return ConditionalStatus::kUnknown;
+}
+
+bool IsAccountlessInstallationCapability(const CapabilitySpec& capability) {
+  return std::strcmp(capability.name, "accountless_installation") == 0;
+}
+
+bool SecureEquals(
+    const std::array<unsigned char, kSecretBytes>& left,
+    const std::array<unsigned char, kSecretBytes>& right) {
+  unsigned char difference = 0;
+  for (std::size_t index = 0; index < left.size(); ++index) {
+    difference |= static_cast<unsigned char>(left[index] ^ right[index]);
+  }
+  return difference == 0;
 }
 
 template <typename OperationFunction>
@@ -708,6 +779,164 @@ ItemStatus RemoveModernSecret(const CapabilitySpec& capability) {
   return operation_ran ? result : StatusFromSecurity(operation_status);
 }
 
+// Accountless enrollment is deliberately create-only. A normal `store` can
+// update an existing legacy-broker credential, but it must never replace an
+// installation secret during an enrollment race.
+ConditionalStatus CreateModernSecretIfMissing(
+    const CapabilitySpec& capability,
+    const std::array<unsigned char, kSecretBytes>& secret) {
+  ConditionalStatus result = ConditionalStatus::kUnknown;
+  bool operation_ran = false;
+  const OSStatus operation_status = WithUserInteractionDisabled([&] {
+    operation_ran = true;
+    if (!IsAccountlessInstallationCapability(capability)) {
+      result = ConditionalStatus::kUnknown;
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    CapturedSearchScope search_scope;
+    const ItemStatus scope_status = CaptureSearchScopeNoInteraction(&search_scope);
+    if (scope_status != ItemStatus::kPresent) {
+      result = ConditionalStatusFromItemStatus(scope_status);
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    const ItemStatus existing_status = ItemPresenceNoInteraction(capability, search_scope);
+    if (existing_status == ItemStatus::kPresent) {
+      result = ConditionalStatus::kExisting;
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    if (existing_status != ItemStatus::kAbsent) {
+      result = ConditionalStatusFromItemStatus(existing_status);
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    const ItemStatus legacy_status =
+        ResultAfterLegacyPresenceProbeNoInteraction(capability, search_scope);
+    if (legacy_status != ItemStatus::kAbsent) {
+      result = ConditionalStatusFromItemStatus(legacy_status);
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    CapturedDefaultKeychain destination;
+    const ItemStatus destination_status =
+        CaptureDefaultKeychainForNewItemNoInteraction(search_scope, &destination);
+    if (destination_status != ItemStatus::kPresent) {
+      result = ConditionalStatusFromItemStatus(destination_status);
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    CFMutableDictionaryRef attributes = StoreAttributes(capability, secret, destination.value);
+    if (attributes == nullptr) {
+      result = ConditionalStatus::kUnknown;
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    const OSStatus add_status = SecItemAdd(attributes, nullptr);
+    CFRelease(attributes);
+    // A duplicate after the checked absence is an independent enrollment or a
+    // changed item ACL. It is preserved; the caller treats `existing` as a
+    // conflict and never assumes its proposed secret was stored.
+    result = add_status == errSecSuccess
+      ? ConditionalStatus::kCreated
+      : (add_status == errSecDuplicateItem ? ConditionalStatus::kExisting
+        : ConditionalStatusFromItemStatus(StatusFromSecurity(add_status)));
+    return add_status;
+  });
+  return operation_ran ? result
+    : ConditionalStatusFromItemStatus(StatusFromSecurity(operation_status));
+}
+
+// Delete only the exact persistent item whose bytes matched the caller's
+// expected secret. The persistent reference pins a delete/recreate race to
+// that item rather than selecting a fresh service/account match. It is not an
+// OS-wide compare-and-swap against an in-place update of that same item.
+ConditionalStatus DeleteModernSecretExact(
+    const CapabilitySpec& capability,
+    const std::array<unsigned char, kSecretBytes>& expected_secret) {
+  ConditionalStatus result = ConditionalStatus::kUnknown;
+  bool operation_ran = false;
+  const OSStatus operation_status = WithUserInteractionDisabled([&] {
+    operation_ran = true;
+    if (!IsAccountlessInstallationCapability(capability)) {
+      result = ConditionalStatus::kUnknown;
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    CapturedSearchScope search_scope;
+    const ItemStatus scope_status = CaptureSearchScopeNoInteraction(&search_scope);
+    if (scope_status != ItemStatus::kPresent) {
+      result = ConditionalStatusFromItemStatus(scope_status);
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    CFMutableDictionaryRef query = BaseQuery(capability, false, search_scope.value);
+    if (query == nullptr) {
+      result = ConditionalStatus::kUnknown;
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitOne);
+    CFDictionarySetValue(query, kSecReturnData, kCFBooleanTrue);
+    CFDictionarySetValue(query, kSecReturnPersistentRef, kCFBooleanTrue);
+    CFTypeRef item = nullptr;
+    const OSStatus read_status = SecItemCopyMatching(query, &item);
+    CFRelease(query);
+    if (read_status == errSecItemNotFound) {
+      const ItemStatus absence_scope = SearchScopeStatusForAbsenceNoInteraction(search_scope);
+      if (absence_scope != ItemStatus::kPresent) {
+        result = ConditionalStatusFromItemStatus(absence_scope);
+      } else {
+        const ItemStatus legacy_status =
+            ResultAfterLegacyPresenceProbeNoInteraction(capability, search_scope);
+        result = legacy_status == ItemStatus::kAbsent
+          ? ConditionalStatus::kMissing
+          : ConditionalStatusFromItemStatus(legacy_status);
+      }
+      return read_status;
+    }
+    if (read_status != errSecSuccess || item == nullptr
+        || CFGetTypeID(item) != CFDictionaryGetTypeID()) {
+      if (item != nullptr) CFRelease(item);
+      result = ConditionalStatusFromItemStatus(StatusFromSecurity(read_status));
+      return read_status;
+    }
+    const CFDictionaryRef attributes = static_cast<CFDictionaryRef>(item);
+    const CFTypeRef stored_data = CFDictionaryGetValue(attributes, kSecValueData);
+    const CFTypeRef persistent_ref = CFDictionaryGetValue(
+        attributes, kSecValuePersistentRef);
+    std::array<unsigned char, kSecretBytes> stored_secret{};
+    const bool valid = stored_data != nullptr
+      && CFGetTypeID(stored_data) == CFDataGetTypeID()
+      && persistent_ref != nullptr
+      && CFGetTypeID(persistent_ref) == CFDataGetTypeID()
+      && DecodeStoredSecret(static_cast<CFDataRef>(stored_data), &stored_secret);
+    if (!valid) {
+      SecureClear(stored_secret.data(), stored_secret.size());
+      CFRelease(item);
+      result = ConditionalStatus::kUnknown;
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    const bool matches = SecureEquals(stored_secret, expected_secret);
+    SecureClear(stored_secret.data(), stored_secret.size());
+    if (!matches) {
+      CFRelease(item);
+      result = ConditionalStatus::kMismatch;
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    CFMutableDictionaryRef delete_query = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    if (delete_query == nullptr) {
+      CFRelease(item);
+      result = ConditionalStatus::kUnknown;
+      return static_cast<OSStatus>(errSecSuccess);
+    }
+    CFDictionarySetValue(delete_query, kSecValuePersistentRef, persistent_ref);
+    const OSStatus delete_status = SecItemDelete(delete_query);
+    CFRelease(delete_query);
+    CFRelease(item);
+    result = delete_status == errSecSuccess
+      ? ConditionalStatus::kDeleted
+      : (delete_status == errSecItemNotFound ? ConditionalStatus::kMissing
+        : ConditionalStatusFromItemStatus(StatusFromSecurity(delete_status)));
+    return delete_status;
+  });
+  return operation_ran ? result
+    : ConditionalStatusFromItemStatus(StatusFromSecurity(operation_status));
+}
+
 struct OperationContext {
   napi_env env = nullptr;
   napi_async_work work = nullptr;
@@ -716,6 +945,7 @@ struct OperationContext {
   const CapabilitySpec* capability = nullptr;
   std::array<unsigned char, kSecretBytes> secret{};
   ItemStatus status = ItemStatus::kUnknown;
+  ConditionalStatus conditional_status = ConditionalStatus::kUnknown;
   ReadResult read_result;
 };
 
@@ -747,6 +977,9 @@ napi_value OperationResponse(napi_env env, const OperationContext& context) {
     case Operation::kRemove:
       return StringValue(
           env, context.status == ItemStatus::kPresent ? "deleted" : StatusName(context.status));
+    case Operation::kCreateIfMissing:
+    case Operation::kDeleteExact:
+      return StringValue(env, ConditionalStatusName(context.conditional_status));
   }
   return StringValue(env, "unknown");
 }
@@ -773,6 +1006,14 @@ void ExecuteOperation(napi_env, void* data) {
       break;
     case Operation::kRemove:
       context->status = RemoveModernSecret(*context->capability);
+      break;
+    case Operation::kCreateIfMissing:
+      context->conditional_status = CreateModernSecretIfMissing(
+          *context->capability, context->secret);
+      break;
+    case Operation::kDeleteExact:
+      context->conditional_status = DeleteModernSecretExact(
+          *context->capability, context->secret);
       break;
   }
 }
@@ -871,7 +1112,8 @@ napi_value StoreCallback(napi_env env, napi_callback_info info) {
   if (!CallbackArguments(env, info, 2, arguments)) return InvalidArguments(env);
   const CapabilitySpec* capability = CapabilityFromArgument(env, arguments[0]);
   std::array<unsigned char, kSecretBytes> secret{};
-  if (capability == nullptr || !SecretFromArgument(env, arguments[1], &secret)) {
+  if (capability == nullptr || IsAccountlessInstallationCapability(*capability)
+      || !SecretFromArgument(env, arguments[1], &secret)) {
     return InvalidArguments(env);
   }
   napi_value promise = QueueOperation(env, Operation::kStore, capability, &secret);
@@ -883,8 +1125,39 @@ napi_value RemoveCallback(napi_env env, napi_callback_info info) {
   napi_value arguments[1];
   if (!CallbackArguments(env, info, 1, arguments)) return InvalidArguments(env);
   const CapabilitySpec* capability = CapabilityFromArgument(env, arguments[0]);
-  if (capability == nullptr) return InvalidArguments(env);
+  if (capability == nullptr || IsAccountlessInstallationCapability(*capability)) {
+    return InvalidArguments(env);
+  }
   return QueueOperation(env, Operation::kRemove, capability);
+}
+
+napi_value CreateIfMissingCallback(napi_env env, napi_callback_info info) {
+  napi_value arguments[2];
+  if (!CallbackArguments(env, info, 2, arguments)) return InvalidArguments(env);
+  const CapabilitySpec* capability = CapabilityFromArgument(env, arguments[0]);
+  std::array<unsigned char, kSecretBytes> secret{};
+  if (capability == nullptr || !IsAccountlessInstallationCapability(*capability)
+      || !SecretFromArgument(env, arguments[1], &secret)) {
+    return InvalidArguments(env);
+  }
+  napi_value promise = QueueOperation(
+      env, Operation::kCreateIfMissing, capability, &secret);
+  SecureClear(secret.data(), secret.size());
+  return promise;
+}
+
+napi_value DeleteExactCallback(napi_env env, napi_callback_info info) {
+  napi_value arguments[2];
+  if (!CallbackArguments(env, info, 2, arguments)) return InvalidArguments(env);
+  const CapabilitySpec* capability = CapabilityFromArgument(env, arguments[0]);
+  std::array<unsigned char, kSecretBytes> secret{};
+  if (capability == nullptr || !IsAccountlessInstallationCapability(*capability)
+      || !SecretFromArgument(env, arguments[1], &secret)) {
+    return InvalidArguments(env);
+  }
+  napi_value promise = QueueOperation(env, Operation::kDeleteExact, capability, &secret);
+  SecureClear(secret.data(), secret.size());
+  return promise;
 }
 
 void DefineMethod(
@@ -905,6 +1178,8 @@ NAPI_MODULE_INIT() {
   DefineMethod(env, exports, "read", ReadCallback);
   DefineMethod(env, exports, "store", StoreCallback);
   DefineMethod(env, exports, "remove", RemoveCallback);
+  DefineMethod(env, exports, "createIfMissing", CreateIfMissingCallback);
+  DefineMethod(env, exports, "deleteExact", DeleteExactCallback);
 
   napi_value version = StringValue(env, kContractVersion);
   napi_set_named_property(env, exports, "contractVersion", version);

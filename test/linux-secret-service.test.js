@@ -439,12 +439,16 @@ test("Linux backend can carry a branded cross-process mutex without claiming cra
     binding: {
       credentialMutexContractVersion: "linux-credential-mutex-v1",
       credentialMutexCrossProcessSafe: true,
+      credentialMutexSameNetworkNamespaceOnly: true,
       acquireCredentialMutex(capabilityId) {
         const lease = { capabilityId };
         active.add(capabilityId);
         return { lease, abandoned: false };
       },
       releaseCredentialMutex(lease) {
+        active.delete(lease.capabilityId);
+      },
+      abandonCredentialMutex(lease) {
         active.delete(lease.capabilityId);
       },
     },

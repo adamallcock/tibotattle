@@ -43,7 +43,7 @@ Those remain separate verification gates in the relevant runbooks.
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 36 API paths, 37 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 38 API paths, 39 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
@@ -307,6 +307,9 @@ Authority vocabulary:
 - **Accountless enrollment** — a bounded native-installation request records a
   versioned enrollment-only ledger row keyed by the stable device ID and its
   256-bit secret hash. It does not create participant or upload authority.
+- **Accountless ownership** — device-secret proof against that active enrollment
+  creates or renews one installation owner and versioned upload authority. It
+  does not create social consent, a session, a pairing or public-fit eligibility.
 - **Session** — hardened hosted cookie; mutations also require same-origin
   CSRF authority.
 - **Pairing code** — an expiring, one-use claim minted under Session authority
@@ -328,7 +331,9 @@ Authority vocabulary:
 | `GET` | `/api/health` | Public | Service posture and declared capabilities; not dependency readiness |
 | `GET` | `/api/ready` | Public | D1, lifecycle, reconciliation, rebuild, and upload-budget readiness |
 | `POST` | `/api/v1/enroll` | Handoff / reattachment | Consume a one-use identity proof and create a participant or reattach the identity's existing participant; recovery codes are not accepted |
-| `POST` | `/api/v1/accountless/enrollment` | Accountless enrollment | Record one bounded, versioned enrollment-only installation row when the synthetic gate is enabled; exact replays are idempotent and no participant, session, pairing, device credential, upload authority, or community eligibility is created |
+| `POST` | `/api/v1/accountless/enrollment` | Accountless enrollment | Record one bounded, versioned enrollment-only installation row when the separately configured enrollment gate is enabled; exact replays are idempotent and no participant, session, pairing, device credential, upload authority, or community eligibility is created |
+| `POST` | `/api/v1/accountless/ownership` | Accountless ownership | Prove the active enrolled device secret, then atomically create one installation owner, credential and versioned v1.1 upload authorization, or return the same existing receipt when accountless ownership is enabled; reject ambient sessions and revoked/expired enrollment without creating social consent or public-fit eligibility |
+| `POST` | `/api/v1/accountless/renewal` | Accountless ownership | Renew the same authenticated installation graph within seven days of expiry or after an offline period; preserve identity and accepted receipts, and refuse revoked, erased, policy-mismatched or inconsistent state |
 | `POST` | `/api/v1/internal/release/appcast` | Operator | Validate and atomically publish the exact Sparkle appcast object |
 | `POST` | `/api/v1/identity/google/start` | Handoff | Create state, binding, PKCE material, and a Google authorization URL |
 | `GET` | `/api/v1/identity/google/callback` | Handoff | State-bound Google OAuth callback and server-side token exchange |
@@ -604,6 +609,34 @@ compatibility. Invalid or uncorrelatable frames close the channel; ordinary
 operation failures return a fixed error code and matching `id`. Native smoke
 modes use process-memory storage and never inspect or migrate the developer's
 login Keychain.
+
+The Electron macOS production adapter has a fifth native capability,
+`accountless_installation`, distinct from the four-capability broker. Only its
+main-process accountless backend can select that capability; `store` and
+`remove` reject it, leaving `createIfMissing` and `deleteExact` as the permitted
+mutations. The separate inherited FD3 accountless channel carries closed
+preference, credential and status operations for the owned companion. Its
+`credential_recovery_required` marker contains no path, secret or native
+error detail and pauses the scheduler. Neither native capability names nor
+secret operations are exposed through renderer IPC or HTTP. The
+[adapter contract](../../native/macos-keychain/README.md) defines the source
+boundary; it is not installed or signed-candidate qualification.
+
+The dormant Linux accountless adapter uses a separate owner-private XDG-state
+record, not the legacy provider or social credential store. Its
+[fixed native boundary](../../native/linux-credential-mutex/README.md) exposes
+only `readAccountlessInstallationCredential`,
+`createAccountlessInstallationCredentialIfMissing`, and
+`deleteAccountlessInstallationCredentialExact`, with no caller-supplied path
+or capability number. The record is exactly 32 bytes under owner-only file
+permissions; it is not encrypted at rest and remains accessible to an
+authorized process while the desktop is locked. The native-private slot `4`
+does not expand the generic `0..3` lease API or the legacy FD4 protocol. Only
+the main-owned adapter can compose this record into the existing private FD3
+accountless channel. Invalid fixed records and uncertain mutations preserve
+recovery state instead of permitting silent identity replacement. The source
+keeps `productionSafe: false` and leaves runtime selection disabled; native
+qualification, installed lifecycle and release remain separate gates.
 
 ### Codex app-server subprocess protocol
 

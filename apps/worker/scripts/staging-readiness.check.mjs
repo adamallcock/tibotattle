@@ -52,11 +52,12 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-4), [
-    "0043_analytical_input_fencing.sql",
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-5), [
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
     "0046_accountless_enrollment_ledger.sql",
+    "0047_accountless_upload_ownership.sql",
+    "0048_accountless_upload_renewal.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -94,7 +95,8 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
   // the unchanged SQL from the pre-reconciliation release source a9220795,
   // except the owner-approved 0043 repair and expression-parentheses-only
   // remote-parser compatibility repair of unapplied 0044/0045. The
-  // unpublished accountless ledger is appended at 0046. Never change
+  // unpublished accountless ledger, direct ownership, and same-graph renewal
+  // are appended at 0046 through 0048. Never change
   // already-applied SQL or silently update these historical pins.
   const expectedDigests = {
     "0041_community_model_composition_cache.sql": "52ff5ff182023bd504c5d584e4c96494c04db7f29a70661dd5713c4a8770d12d",
@@ -103,12 +105,14 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0044_attribution_transport_staging.sql": "9b2661a5052ca8a08e18098e960891a49e7f1c7516b2c1b8cacf32c6f294f5e4",
     "0045_attribution_domain_activation.sql": "89f0df9e95eb98fa7ae8cb00dc82fe19f8933689a8002e647e638fdc870990fe",
     "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",
+    "0047_accountless_upload_ownership.sql": "5b203e09948edae4f66d3e28a9a47e24e6dd1af7a9757aa4e0d648a2b05794da",
+    "0048_accountless_upload_renewal.sql": "82297298f937489275756da93d9b116a7b83b280482000b0df51abd5c598d9b7",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 46);
-  assert.deepEqual(names.slice(-6), Object.keys(expectedDigests));
+  assert.equal(names.length, 48);
+  assert.deepEqual(names.slice(-8), Object.keys(expectedDigests));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 46 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 48 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -142,7 +146,12 @@ test("remote trigger parser repair changes only complete CASE expression parenth
 
 test("historical production prefix upgrades forward without losing source rows or legacy schema", () => {
   const database = new DatabaseSync(":memory:");
-  const apply = (name) => database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+  const apply = (name) => {
+    const sql = readFileSync(join(workerDirectory, "migrations", name), "utf8");
+    // Wrangler/D1 applies each migration atomically. The graph rebuild needs
+    // that transaction for deferred foreign keys, unlike SQLite autocommit.
+    database.exec(name.startsWith("0047_") ? `BEGIN;\n${sql}\nCOMMIT;` : sql);
+  };
   const rows = (sql) => database.prepare(sql).all().map((row) => ({ ...row }));
   try {
     const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
@@ -195,7 +204,7 @@ test("historical production prefix upgrades forward without losing source rows o
       VALUES ('2026-08-29', '{}', '2026-08-29T02:00:00.000Z');
     `);
     for (const name of names.slice(42)) apply(name);
-    assert.deepEqual(rows("SELECT * FROM participants"), participantBefore);
+    assert.deepEqual(rows("SELECT * FROM participants"), participantBefore.map((row) => ({ ...row, owner_kind: "social" })));
     assert.deepEqual(rows("SELECT * FROM telemetry_contributions"), contributionBefore);
     assert.deepEqual(rows("SELECT * FROM admin_community_allowance_preview_refresh_state"), refreshBefore);
     assert.deepEqual(rows("SELECT * FROM pragma_table_info('community_allowance_fit_cache') WHERE name = 'model_observations_json'"), legacyColumnBefore);
@@ -248,8 +257,33 @@ test("fresh reconciled schema and attribution metadata probe cover every new gua
       .sort();
     assert.deepEqual(accountlessObjects, [
       "index:accountless_enrollment_ledger_state",
+      "index:accountless_upload_owners_active",
+      "index:accountless_v11_device_authorizations_active",
       "table:accountless_enrollment_issuance",
       "table:accountless_enrollment_ledger",
+      "table:accountless_upload_owners",
+      "table:accountless_v11_device_authorizations",
+      "trigger:accountless_device_credential_nonrenewable",
+      "trigger:accountless_device_upload_authorization_admission",
+      "trigger:accountless_device_upload_claim_admission",
+      "trigger:accountless_participant_requires_ledger_revocation",
+      "trigger:accountless_upload_owner_admission",
+      "trigger:accountless_upload_owner_immutable",
+      "trigger:accountless_v11_authorization_admission",
+      "trigger:accountless_v11_authorization_immutable",
+      "trigger:contributions_require_social_owner",
+      "trigger:device_credentials_authority_shape_update",
+      "trigger:device_credentials_require_valid_authority",
+      "trigger:device_pairings_require_social_owner",
+      "trigger:participant_community_eligibility_requires_social_owner",
+      "trigger:participants_owner_shape_insert",
+      "trigger:participants_owner_shape_update",
+      "trigger:telemetry_contributions_require_social_owner",
+      "trigger:telemetry_v11_predecessor_authority",
+      "trigger:telemetry_v1_chunks_require_social_owner",
+      "trigger:telemetry_v1_consent_requires_social_owner",
+      "trigger:upload_authorizations_require_social_owner",
+      "trigger:web_sessions_require_social_owner",
     ]);
     assert.deepEqual(objectNames()
       .filter((name) => !oldObjects.has(name) && !accountlessObjects.includes(name))

@@ -1,6 +1,9 @@
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "./export-identity-keychain.js";
+import {
+  loadLinuxCredentialMutexBinding,
+} from "./linux-credential-mutex.js";
 
 const OPERATIONS = new Set(["create", "replace", "delete"]);
 
@@ -51,6 +54,7 @@ const ERROR_CODES = new Set([
 const trustedErrors = new WeakSet();
 const trustedLeaseContexts = new WeakSet();
 const trustedMutexContexts = new WeakSet();
+const mutexAbandoners = new WeakMap();
 
 // This registry closes concurrency inside one process even before a reviewed
 // cross-process mutex is supplied. It is deliberately not represented as an
@@ -126,7 +130,7 @@ function leaseOptions(options) {
  *
  * The native binding must synchronously return `{ lease, abandoned }`. An
  * abandoned owner fails closed as `recovery_required`; this foundation has no
- * durable prepared-operation journal from which it could safely infer the
+ * durable mutation-result journal from which it could safely infer the
  * prior mutation's result.
  */
 export function createLinuxCredentialMutationMutexContext(options = {}) {
@@ -136,38 +140,58 @@ export function createLinuxCredentialMutationMutexContext(options = {}) {
   let platform;
   let architecture;
   let binding;
+  let loadBinding;
   try {
     ({
       platform = process.platform,
       architecture = process.arch,
-      binding,
+      binding = undefined,
+      loadBinding = loadLinuxCredentialMutexBinding,
     } = options);
   } catch {
     fail("invalid_configuration");
   }
   if (platform !== "linux") fail("unsupported_platform");
   if (architecture !== "x64") fail("unsupported_architecture");
+  if (typeof loadBinding !== "function") fail("invalid_configuration");
+
+  let selectedBinding = binding;
+  if (selectedBinding === undefined) {
+    try {
+      selectedBinding = loadBinding({ platform, architecture });
+    } catch {
+      fail("mutex_failed");
+    }
+  }
 
   let acquireCredentialMutex;
   let releaseCredentialMutex;
+  let abandonCredentialMutex;
   let contractVersion;
   let crossProcessSafe;
+  let sameNetworkNamespaceOnly;
   try {
-    acquireCredentialMutex = binding?.acquireCredentialMutex;
-    releaseCredentialMutex = binding?.releaseCredentialMutex;
-    contractVersion = binding?.credentialMutexContractVersion;
-    crossProcessSafe = binding?.credentialMutexCrossProcessSafe;
+    acquireCredentialMutex = selectedBinding?.acquireCredentialMutex;
+    releaseCredentialMutex = selectedBinding?.releaseCredentialMutex;
+    abandonCredentialMutex = selectedBinding?.abandonCredentialMutex;
+    contractVersion = selectedBinding?.credentialMutexContractVersion;
+    crossProcessSafe = selectedBinding?.credentialMutexCrossProcessSafe;
+    sameNetworkNamespaceOnly =
+      selectedBinding?.credentialMutexSameNetworkNamespaceOnly;
   } catch {
     fail("invalid_configuration");
   }
   if (contractVersion !== "linux-credential-mutex-v1"
       || crossProcessSafe !== true
+      || sameNetworkNamespaceOnly !== true
       || typeof acquireCredentialMutex !== "function"
-      || typeof releaseCredentialMutex !== "function") {
+      || typeof releaseCredentialMutex !== "function"
+      || typeof abandonCredentialMutex !== "function") {
     fail("invalid_configuration");
   }
-  const acquireNative = acquireCredentialMutex.bind(binding);
-  const releaseNative = releaseCredentialMutex.bind(binding);
+  const acquireNative = acquireCredentialMutex.bind(selectedBinding);
+  const releaseNative = releaseCredentialMutex.bind(selectedBinding);
+  const abandonNative = abandonCredentialMutex.bind(selectedBinding);
 
   function acquire(capabilityId) {
     let outcome;
@@ -205,7 +229,7 @@ export function createLinuxCredentialMutationMutexContext(options = {}) {
     }
     if (abandoned) {
       try {
-        release(lease);
+        abandon(lease);
       } catch {
         // The conservative recovery error remains authoritative.
       }
@@ -230,13 +254,31 @@ export function createLinuxCredentialMutationMutexContext(options = {}) {
     }
   }
 
+  function abandon(lease) {
+    let outcome;
+    try {
+      outcome = abandonNative(lease);
+      if (outcome !== null
+          && (typeof outcome === "object" || typeof outcome === "function")
+          && typeof outcome.then === "function") {
+        Promise.resolve(outcome).catch(() => {});
+        fail("invalid_configuration");
+      }
+    } catch (error) {
+      if (isLinuxCredentialMutationLeaseError(error)) throw error;
+      fail("mutex_failed");
+    }
+  }
+
   const context = Object.freeze({
     acquire,
     release,
     crossProcessSafe: true,
+    crossProcessScope: "same_linux_network_namespace",
     productionSafe: false,
   });
   trustedMutexContexts.add(context);
+  mutexAbandoners.set(context, abandon);
   return context;
 }
 
@@ -257,6 +299,12 @@ export function createLinuxCredentialMutationLeaseContext(options = {}) {
     fail("invalid_configuration");
   }
   if (mutexContext !== null && !trustedMutexContexts.has(mutexContext)) {
+    fail("invalid_configuration");
+  }
+  const abandonNativeLease = mutexContext === null
+    ? null
+    : mutexAbandoners.get(mutexContext);
+  if (mutexContext !== null && typeof abandonNativeLease !== "function") {
     fail("invalid_configuration");
   }
 
@@ -344,21 +392,45 @@ export function createLinuxCredentialMutationLeaseContext(options = {}) {
     }
   }
 
+  function abandon(lease) {
+    assertOpen();
+    let record;
+    try {
+      record = records.get(lease);
+    } catch {
+      fail("foreign");
+    }
+    if (!record) fail("foreign");
+    if (!record.active) fail("released");
+    if (record.nativeLease !== null) {
+      abandonNativeLease(record.nativeLease);
+    }
+    record.active = false;
+    activeLeaseCount -= 1;
+    if (ACTIVE_CAPABILITY_LEASES.get(record.registryKey) === record) {
+      ACTIVE_CAPABILITY_LEASES.delete(record.registryKey);
+    }
+  }
+
   async function withLease(capability, optionsForLease, callback) {
     if (typeof callback !== "function") fail("invalid_configuration");
     const lease = acquire(capability, optionsForLease);
-    let callbackError = null;
+    let callbackFailed = true;
     try {
-      return await callback(lease);
+      const result = await callback(lease);
+      callbackFailed = false;
+      release(lease);
+      return result;
     } catch (error) {
-      callbackError = error;
-      throw error;
-    } finally {
-      try {
-        release(lease);
-      } catch (error) {
-        if (callbackError === null) throw error;
+      if (callbackFailed) {
+        try {
+          abandon(lease);
+        } catch {
+          // Preserve the caller failure; a native abandonment failure leaves
+          // the local capability gate poisoned for this process.
+        }
       }
+      throw error;
     }
   }
 
@@ -375,6 +447,9 @@ export function createLinuxCredentialMutationLeaseContext(options = {}) {
     withLease,
     close,
     crossProcessSafe: mutexContext !== null,
+    crossProcessScope: mutexContext === null
+      ? null
+      : "same_linux_network_namespace",
     productionSafe: false,
   });
   trustedLeaseContexts.add(context);

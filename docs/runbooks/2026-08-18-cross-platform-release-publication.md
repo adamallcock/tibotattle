@@ -455,6 +455,65 @@ permissions above, pinned actions, protected environments, exact-tag checks,
 and a fresh draft-to-published verification rehearsal. Until then, do not
 claim GitHub source/build provenance for the local DMG.
 
+#### Private Electron native-handover rehearsal
+
+The Electron path uses
+[`scripts/package-electron-production.mjs`](../../scripts/package-electron-production.mjs)
+and its fixed production builder configuration; the native Sparkle finalizer
+above is not an Electron finalizer. This private rehearsal proves specific
+candidate operations, not stable release or platform support. Complete each
+step for both `darwin-arm64` and `darwin-x64` and for the explicitly approved
+ordered pair of prerelease versions. Never infer a build number or allocate a
+new version from an earlier receipt.
+
+1. Freeze and verify the selected source, locked dependencies and Node 26.2.0
+   runtime. Prepare the current/next source candidates with the approved
+   build numbers. Verify the resulting `production-source-candidate.json`
+   against that source and the staged package/runtime closure. The receipt
+   carries the exact builder configuration, argument list, environment and
+   target; it is a plan for signing, not a signing receipt.
+2. For an explicitly authorized signing/notarization operation, run the pinned
+   builder from that frozen repository with the receipt's exact environment,
+   configuration and arguments, including `--publish never`. Use only the
+   approved signing identity and pre-provisioned notary profile through the
+   existing local credential mechanism. Do not log their values or broaden
+   Keychain access. The maintained `mac.sign` hook orders helpers before each
+   app's plist-named main executable and retains the pinned builder's normal
+   signing options, timestamping, strict verification and retry path.
+3. Require app notarization and stapling **before** the builder seals its ZIP
+   and DMG. The pinned builder accepts the pre-provisioned notary profile via
+   its existing `APPLE_KEYCHAIN_PROFILE` input; it otherwise may warn and skip
+   notarization, so a successful builder exit alone cannot pass this gate.
+   Independently verify the app signature and staple. Preserve the original
+   updater manifest and blockmaps until final metadata binding below; the ZIP
+   must contain the already-finalized app and remain byte-for-byte unchanged.
+4. Sign, submit and staple the outer DMG under the same concrete approval.
+   Require strict signature verification and Gatekeeper's DMG assessment with
+   `--type open --context context:primary-signature`. Check the app inside a
+   read-only mounted DMG and extracted ZIP: exact bundle ID, semantic version,
+   numeric build, designated requirement, signature, staple and native
+   architecture. `x64` maps to the Mach-O architecture name `x86_64`.
+5. After every byte-changing trust operation completes, invoke
+   `node scripts/finalize-electron-macos-update-metadata.mjs --candidate-receipt <candidate>/production-source-candidate.json`.
+   It operates only on the receipt's sibling `artifacts` directory, keeps
+   no-clobber copies of the original manifest/DMG blockmap, regenerates the
+   final DMG blockmap and rebinds the fixed transport manifest. Rehash every
+   installer/archive against the returned metadata receipt. That receipt
+   proves final-byte metadata binding only; retain the separate signature,
+   notarization, Gatekeeper and enclosed-app checks alongside it.
+6. Keep the resulting private installers and content-free verification
+   receipts together. Installation/replacement, native credential continuity,
+   exact-next-version download and update, feed publication, and public release
+   each require their own concrete authorization and evidence. Neither these
+   local checks nor the unsigned development workflow establishes hosted build
+   provenance or permits a stable support claim.
+
+The logical channel `native-to-electron-handover-rehearsal-v1` uses the fixed
+transport manifest `native-to-electron-handover-mac.yml` under the target's
+isolated rehearsal feed. Do not substitute `latest-mac.yml` or a stable feed.
+The first candidate allows only a manual request for its exact named
+successor; hosted uploads remain disabled for both candidates.
+
 ### Windows
 
 Do not publish an EXE or MSIX merely because the Electron development

@@ -35,6 +35,7 @@ function mutexBinding({ abandoned = false } = {}) {
     calls,
     credentialMutexContractVersion: "linux-credential-mutex-v1",
     credentialMutexCrossProcessSafe: true,
+    credentialMutexSameNetworkNamespaceOnly: true,
     acquireCredentialMutex(capabilityId) {
       calls.push(["acquire", capabilityId]);
       if (active.has(capabilityId)) {
@@ -48,6 +49,10 @@ function mutexBinding({ abandoned = false } = {}) {
     },
     releaseCredentialMutex(lease) {
       calls.push(["release", lease.capabilityId]);
+      active.delete(lease.capabilityId);
+    },
+    abandonCredentialMutex(lease) {
+      calls.push(["abandon", lease.capabilityId]);
       active.delete(lease.capabilityId);
     },
   };
@@ -170,6 +175,7 @@ test("reviewed Linux mutex seam binds capability ids and reports cross-process s
   });
   const context = createLinuxCredentialMutationLeaseContext({ mutexContext });
   assert.equal(context.crossProcessSafe, true);
+  assert.equal(context.crossProcessScope, "same_linux_network_namespace");
   assert.equal(context.productionSafe, false);
   CAPABILITIES.forEach(([capability], capabilityId) => {
     const lease = context.acquire(capability, { operation: "replace" });
@@ -179,6 +185,41 @@ test("reviewed Linux mutex seam binds capability ids and reports cross-process s
       ["release", capabilityId],
     ]);
   });
+});
+
+test("Linux mutex seam loads only its reviewed default binding when no binding is injected", () => {
+  const binding = mutexBinding();
+  const calls = [];
+  const context = createLinuxCredentialMutationMutexContext({
+    platform: "linux",
+    architecture: "x64",
+    loadBinding(options) {
+      calls.push(options);
+      return binding;
+    },
+  });
+  const lease = context.acquire(0);
+  context.release(lease);
+  assert.deepEqual(calls, [{ platform: "linux", architecture: "x64" }]);
+
+  assert.throws(
+    () => createLinuxCredentialMutationMutexContext({
+      platform: "linux",
+      architecture: "x64",
+      loadBinding() {
+        throw new Error("unreviewed binding path must not escape");
+      },
+    }),
+    leaseError("mutex_failed"),
+  );
+  assert.throws(
+    () => createLinuxCredentialMutationMutexContext({
+      platform: "linux",
+      architecture: "x64",
+      loadBinding: null,
+    }),
+    leaseError("invalid_configuration"),
+  );
 });
 
 test("Linux mutex seam rejects wrong platforms, duck types, and abandoned owners", () => {
@@ -222,7 +263,30 @@ test("Linux mutex seam rejects wrong platforms, duck types, and abandoned owners
     () => context.acquire(CAPABILITIES[0][0], { operation: "replace" }),
     leaseError("recovery_required"),
   );
-  assert.deepEqual(abandonedBinding.calls, [["acquire", 0], ["release", 0]]);
+  assert.deepEqual(abandonedBinding.calls, [["acquire", 0], ["abandon", 0]]);
+});
+
+test("a callback failure preserves native recovery state instead of settling its lease", async () => {
+  const binding = mutexBinding();
+  const context = createLinuxCredentialMutationLeaseContext({
+    mutexContext: createLinuxCredentialMutationMutexContext({
+      platform: "linux",
+      architecture: "x64",
+      binding,
+    }),
+  });
+  await assert.rejects(
+    context.withLease(
+      CAPABILITIES[0][0],
+      { operation: "replace" },
+      async () => {
+        throw new Error("synthetic caller failure");
+      },
+    ),
+    /synthetic caller failure/u,
+  );
+  assert.deepEqual(binding.calls, [["acquire", 0], ["abandon", 0]]);
+  context.close();
 });
 
 test("Linux mutex failures use stable codes and never parse native messages", () => {

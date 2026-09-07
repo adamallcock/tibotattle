@@ -62,6 +62,19 @@ test("Electron sharing projection is bounded and fail-closed", () => {
   assert.equal(enabled.enabled, true);
   assert.equal(enabled.transportStatus, "unavailable");
   assert.equal(
+    normalizeElectronSharingPreference(validProjection({
+      enabled: true,
+      state: "enabled",
+      basis: "user_choice",
+      noticeDue: false,
+      nextNoticeIndex: null,
+      nextNoticeAt: null,
+      earliestActivationAt: null,
+      transportStatus: "recovery_required",
+    })).transportStatus,
+    "recovery_required",
+  );
+  assert.equal(
     normalizeElectronSharingPreference(validProjection({ nextNoticeAt: "not-a-date" })),
     null,
   );
@@ -91,6 +104,7 @@ test("Electron sharing UI uses the accountless bridge and visible receipt gate",
   assert.match(appSource, /getSharingPreference\(\)/u);
   assert.match(appSource, /setSharingEnabled\(enabled\)/u);
   assert.match(appSource, /sharingNoticePresented\(index\)/u);
+  assert.match(appSource, /case "recovery_required":/u);
   assert.match(appSource, /document\.visibilityState === "visible"/u);
   assert.match(appSource, /getBoundingClientRect\(\)/u);
   assert.match(appSource, /innerWidth/u);
@@ -107,6 +121,7 @@ test("Electron sharing UI uses the accountless bridge and visible receipt gate",
   assert.match(indexHtml, /id="electron-accountless-sharing-description"/u);
   assert.doesNotMatch(indexHtml, /id="electron-accountless-open-settings"/u);
   assert.match(settingsSource, /settingsSharingBridge\.getSharingPreference\(\)/u);
+  assert.match(settingsSource, /case "recovery_required":/u);
   assert.doesNotMatch(settingsSource, /settingsSharingBridge\.setSharingEnabled/u);
   assert.match(settingsSource, /function setOperationStatus\(documentRef, value, \{ error = false \} = \{\}\)/u);
   assert.match(settingsSource, /"is-success", hasMessage && !error/u);

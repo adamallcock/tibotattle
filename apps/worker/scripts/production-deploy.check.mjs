@@ -1092,6 +1092,8 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       "USAGE_MONITOR_DB:0044_attribution_transport_staging.sql",
       "USAGE_MONITOR_DB:0045_attribution_domain_activation.sql",
       "USAGE_MONITOR_DB:0046_accountless_enrollment_ledger.sql",
+      "USAGE_MONITOR_DB:0047_accountless_upload_ownership.sql",
+      "USAGE_MONITOR_DB:0048_accountless_upload_renewal.sql",
     ],
   });
   assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB), { ok: true, code: null, pending: [] });
@@ -1110,7 +1112,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 46,
+        localCount: 48,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });

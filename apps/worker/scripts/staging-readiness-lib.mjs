@@ -94,10 +94,14 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
-    // Accountless enrollment remains an enrollment-only ledger in this
-    // tranche. It creates no participant, upload authority, or eligibility
-    // rows and is disabled by default at the Worker route.
+    // Enrollment remains separate from direct upload ownership. Both modes
+    // are disabled by default; the successor adds an explicitly accountless
+    // authority graph without social sessions or public eligibility. Its
+    // lease renewal keeps that same graph private and does not create a new
+    // installation identity.
     "0046_accountless_enrollment_ledger.sql",
+    "0047_accountless_upload_ownership.sql",
+    "0048_accountless_upload_renewal.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",

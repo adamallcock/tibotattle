@@ -20,6 +20,9 @@ const TARGET_ENV = "TIBOTATTLE_ELECTRON_TARGET";
 const VERSION_ENV = "TIBOTATTLE_ELECTRON_VERSION";
 const SOURCE_REVISION_ENV = "TIBOTATTLE_ELECTRON_SOURCE_REVISION";
 const BUILD_NUMBER_ENV = "TIBOTATTLE_ELECTRON_BUILD_NUMBER";
+const REHEARSAL_CANDIDATE_ENV = "TIBOTATTLE_ELECTRON_REHEARSAL_CANDIDATE";
+const REHEARSAL_CURRENT_VERSION_ENV = "TIBOTATTLE_ELECTRON_REHEARSAL_CURRENT_VERSION";
+const REHEARSAL_NEXT_VERSION_ENV = "TIBOTATTLE_ELECTRON_REHEARSAL_NEXT_VERSION";
 const SOURCE_REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const VERSION_PATTERN = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 
@@ -45,7 +48,12 @@ function exactEnvironment(name) {
   return process.env[name];
 }
 
-function readPackageVersion() {
+function optionalExactEnvironment(name) {
+  if (!Object.hasOwn(process.env, name)) return undefined;
+  return exactEnvironment(name);
+}
+
+function readSourceReleaseVersion() {
   try {
     const manifest = JSON.parse(readFileSync(path.join(REPOSITORY_ROOT, "package.json"), "utf8"));
     if (manifest?.name !== "app-usagemonitor"
@@ -63,29 +71,56 @@ function readPackageVersion() {
 function readInputs() {
   const target = exactEnvironment(TARGET_ENV);
   const targetSpec = distribution.PRODUCTION_ELECTRON_TARGETS[target];
+  const rehearsal = optionalExactEnvironment(REHEARSAL_CANDIDATE_ENV) ?? null;
+  const rehearsalCurrentVersion = optionalExactEnvironment(REHEARSAL_CURRENT_VERSION_ENV);
+  const rehearsalNextVersion = optionalExactEnvironment(REHEARSAL_NEXT_VERSION_ENV);
+  const sourceReleaseVersion = readSourceReleaseVersion();
+  const distributionSelection = distribution.productionElectronDistributionForTarget({
+    target,
+    rehearsal,
+    rehearsalCurrentVersion,
+    rehearsalNextVersion,
+    minimumRehearsalVersion: rehearsal === null ? undefined : sourceReleaseVersion,
+  });
   const sourceRevision = exactEnvironment(SOURCE_REVISION_ENV);
   const buildNumber = exactEnvironment(BUILD_NUMBER_ENV);
-  const version = readPackageVersion();
-  if (!targetSpec
+  const version = distributionSelection?.semanticVersion ?? sourceReleaseVersion;
+  if (!targetSpec || distributionSelection === null
       || !SOURCE_REVISION_PATTERN.test(sourceRevision)
       || !distribution.PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN.test(buildNumber)
       || exactEnvironment(VERSION_ENV) !== version) {
     fail();
   }
-  return Object.freeze({ buildNumber, sourceRevision, target, targetSpec, version });
-}
-
-function distributionMetadata({ buildNumber, sourceRevision, target, targetSpec }) {
   return Object.freeze({
-    appId: distribution.PRODUCTION_ELECTRON_APP_ID,
     buildNumber,
-    channel: distribution.PRODUCTION_ELECTRON_CHANNEL,
-    contributionPolicy: distribution.PRODUCTION_ELECTRON_CONTRIBUTION_POLICY,
-    schemaVersion: distribution.PRODUCTION_ELECTRON_DISTRIBUTION_SCHEMA_VERSION,
+    distributionSelection,
+    rehearsal,
+    rehearsalCurrentVersion,
+    rehearsalNextVersion,
     sourceRevision,
     target,
-    updateFeed: targetSpec.feedURL,
+    targetSpec,
+    version,
   });
+}
+
+function distributionMetadata({ buildNumber, distributionSelection, sourceRevision, target }) {
+  const metadata = {
+    appId: distribution.PRODUCTION_ELECTRON_APP_ID,
+    buildNumber,
+    channel: distributionSelection.channel,
+    contributionPolicy: distributionSelection.contributionPolicy,
+    schemaVersion: distributionSelection.schemaVersion,
+    sourceRevision,
+    target,
+    updateFeed: distributionSelection.feedURL,
+  };
+  if (distributionSelection.semanticVersion !== null) {
+    metadata.semanticVersion = distributionSelection.semanticVersion;
+    metadata.rehearsalCurrentVersion = distributionSelection.rehearsalCurrentVersion;
+    metadata.rehearsalNextVersion = distributionSelection.rehearsalNextVersion;
+  }
+  return Object.freeze(metadata);
 }
 
 function stagingClosure() {
@@ -130,17 +165,30 @@ function asarUnpackFor(target) {
 
 const INPUTS = readInputs();
 const metadata = distributionMetadata(INPUTS);
+const stagingPathSegments = distribution.productionElectronStagingPathSegments({
+  target: INPUTS.target,
+  rehearsal: INPUTS.rehearsal,
+  rehearsalCurrentVersion: INPUTS.rehearsalCurrentVersion,
+  rehearsalNextVersion: INPUTS.rehearsalNextVersion,
+  minimumRehearsalVersion: INPUTS.rehearsal === null ? undefined : readSourceReleaseVersion(),
+});
+if (stagingPathSegments === null) fail();
 const targetDirectory = path.join(
   REPOSITORY_ROOT,
   ".release-build",
-  "electron-production",
-  INPUTS.target,
+  ...stagingPathSegments,
 );
 const targetBuildVersion = distribution.productionElectronBuildVersionForTarget({
   target: INPUTS.target,
   version: INPUTS.version,
   buildNumber: INPUTS.buildNumber,
 });
+const macBundleShortVersion = INPUTS.targetSpec.platform === "darwin"
+  ? distribution.productionElectronMacOSBundleShortVersionForTarget({
+    target: INPUTS.target,
+    version: INPUTS.version,
+  })
+  : null;
 const nativeHandoverHelperPath = path.join(
   targetDirectory,
   ...distribution.PRODUCTION_ELECTRON_NATIVE_HANDOVER_HELPER_RESOURCE_RELATIVE_PATH,
@@ -155,6 +203,19 @@ const nativeMacOSKeychainAdapterPath = path.join(
 );
 const nativeMacOSKeychainAdapterResourcesPath =
   distribution.PRODUCTION_ELECTRON_MACOS_KEYCHAIN_ADAPTER_RESOURCE_RELATIVE_PATH.join("/");
+
+function assertExactStagedManifest() {
+  let staged;
+  try {
+    staged = JSON.parse(readFileSync(path.join(targetDirectory, "app", "package.json"), "utf8"));
+  } catch {
+    fail();
+  }
+  if (staged?.version !== INPUTS.version
+      || JSON.stringify(staged.tibotattleDistribution) !== JSON.stringify(metadata)) {
+    fail();
+  }
+}
 
 const configuration = {
   appId: distribution.PRODUCTION_ELECTRON_APP_ID,
@@ -199,12 +260,16 @@ const configuration = {
     grantFileProtocolExtraPrivileges: false,
   },
   beforeBuild: () => false,
+  // The staging script and builder config independently derive the closed
+  // selection. Verify their package-level semantic version and distribution
+  // metadata match before electron-builder can turn it into an installer.
+  beforePack: () => assertExactStagedManifest(),
   npmRebuild: true,
   buildDependenciesFromSource: false,
   nodeGypRebuild: false,
   // The URL is fixed per target. The CLI publish policy remains `never` in
   // the source-candidate path, so generic hosting is a later explicit gate.
-  publish: [{ provider: "generic", url: INPUTS.targetSpec.feedURL }],
+  publish: [{ provider: "generic", url: INPUTS.distributionSelection.feedURL }],
 };
 
 if (INPUTS.targetSpec.platform === "darwin") {
@@ -224,11 +289,20 @@ if (INPUTS.targetSpec.platform === "darwin") {
     to: nativeMacOSKeychainAdapterResourcesPath,
   }];
   configuration.mac = {
+    // electron-updater uses the prerelease package version. The guided native
+    // handover reads the numeric plist fields, so tie both values to this one
+    // reviewed selection rather than letting electron-builder derive one from
+    // an ambient package version.
+    bundleShortVersion: macBundleShortVersion,
+    bundleVersion: targetBuildVersion,
     target: [
       { target: "dmg", arch: [INPUTS.targetSpec.architecture] },
       { target: "zip", arch: [INPUTS.targetSpec.architecture] },
     ],
     icon: path.join(REPOSITORY_ROOT, "apps/macos/Assets/AppIcon.icns"),
+    // osx-sign 1.3.3 must sign the extra Contents/MacOS helper before the
+    // actual CFBundleExecutable, which seals the enclosing app bundle.
+    sign: "./scripts/electron-macos-sign-order.mjs",
     hardenedRuntime: true,
     gatekeeperAssess: true,
   };

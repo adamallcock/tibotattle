@@ -24,6 +24,7 @@ const require = createRequire(import.meta.url);
 const POLICY = require("../config/electron-production-distribution.cjs");
 const ELECTRON_BUILDER_REQUIRE = createRequire(require.resolve("electron-builder/package.json"));
 const { AppInfo } = ELECTRON_BUILDER_REQUIRE("app-builder-lib/out/appInfo");
+const semver = ELECTRON_BUILDER_REQUIRE("semver");
 const BUILDER_CONFIG_PATH = resolve("apps/electron/electron-builder.production.config.cjs");
 const DEVELOPMENT_BUILDER_CONFIG_PATH = resolve("apps/electron/electron-builder.config.cjs");
 const PRODUCTION_SOURCE_WORKFLOW_PATH = resolve(
@@ -31,6 +32,8 @@ const PRODUCTION_SOURCE_WORKFLOW_PATH = resolve(
 );
 const SOURCE_REVISION = "a".repeat(40);
 const BUILD_NUMBER = "20260906";
+const REHEARSAL_CURRENT_VERSION = "0.1.19-native-to-electron-handover.1";
+const REHEARSAL_NEXT_VERSION = "0.1.19-native-to-electron-handover.2";
 
 async function withTemporaryDirectory(run) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-production-"));
@@ -41,7 +44,19 @@ async function withTemporaryDirectory(run) {
   }
 }
 
-function loadProductionBuilderConfig(target) {
+function loadProductionBuilderConfig(target, {
+  rehearsal = null,
+  rehearsalCurrentVersion = REHEARSAL_CURRENT_VERSION,
+  rehearsalNextVersion = REHEARSAL_NEXT_VERSION,
+  buildNumber = BUILD_NUMBER,
+} = {}) {
+  const version = rehearsal === null
+    ? RELEASE_VERSION
+    : rehearsal === "current"
+      ? rehearsalCurrentVersion
+      : rehearsal === "next"
+        ? rehearsalNextVersion
+        : "invalid";
   const source = [
     `const config = require(${JSON.stringify(BUILDER_CONFIG_PATH)});`,
     "process.stdout.write(JSON.stringify(config));",
@@ -49,12 +64,18 @@ function loadProductionBuilderConfig(target) {
   return JSON.parse(execFileSync(process.execPath, ["-e", source], {
     cwd: resolve("."),
     encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
     env: {
       ...process.env,
-      TIBOTATTLE_ELECTRON_BUILD_NUMBER: BUILD_NUMBER,
+      TIBOTATTLE_ELECTRON_BUILD_NUMBER: buildNumber,
       TIBOTATTLE_ELECTRON_SOURCE_REVISION: SOURCE_REVISION,
       TIBOTATTLE_ELECTRON_TARGET: target,
-      TIBOTATTLE_ELECTRON_VERSION: RELEASE_VERSION,
+      TIBOTATTLE_ELECTRON_VERSION: version,
+      ...(rehearsal === null ? {} : {
+        TIBOTATTLE_ELECTRON_REHEARSAL_CANDIDATE: rehearsal,
+        TIBOTATTLE_ELECTRON_REHEARSAL_CURRENT_VERSION: rehearsalCurrentVersion,
+        TIBOTATTLE_ELECTRON_REHEARSAL_NEXT_VERSION: rehearsalNextVersion,
+      }),
     },
   }));
 }
@@ -106,6 +127,116 @@ test("closed production policy declares exactly four final targets with fixed HT
   }
 });
 
+test("native-to-Electron rehearsal accepts only an ordered macOS prerelease pair on its fixed feed", () => {
+  const pair = POLICY.productionElectronNativeToElectronHandoverRehearsalPair({
+    currentVersion: REHEARSAL_CURRENT_VERSION,
+    nextVersion: REHEARSAL_NEXT_VERSION,
+    minimumVersion: RELEASE_VERSION,
+  });
+  assert.deepEqual(pair, {
+    currentVersion: REHEARSAL_CURRENT_VERSION,
+    nextVersion: REHEARSAL_NEXT_VERSION,
+  });
+  assert.equal(semver.valid(REHEARSAL_CURRENT_VERSION), REHEARSAL_CURRENT_VERSION);
+  assert.equal(semver.valid(REHEARSAL_NEXT_VERSION), REHEARSAL_NEXT_VERSION);
+  assert.equal(semver.gt(REHEARSAL_NEXT_VERSION, REHEARSAL_CURRENT_VERSION), true);
+  assert.equal(POLICY.productionElectronNativeToElectronHandoverRehearsalPair({
+    currentVersion: REHEARSAL_NEXT_VERSION,
+    nextVersion: REHEARSAL_CURRENT_VERSION,
+    minimumVersion: RELEASE_VERSION,
+  }), null);
+  assert.equal(POLICY.productionElectronNativeToElectronHandoverRehearsalPair({
+    currentVersion: "0.1.19-native-to-electron-handover.1",
+    nextVersion: "0.1.20-native-to-electron-handover.2",
+    minimumVersion: RELEASE_VERSION,
+  }), null);
+  assert.equal(POLICY.productionElectronNativeToElectronHandoverRehearsalPair({
+    currentVersion: "0.1.18-native-to-electron-handover.1",
+    nextVersion: "0.1.18-native-to-electron-handover.2",
+    minimumVersion: RELEASE_VERSION,
+  }), null);
+
+  for (const [candidate, version] of Object.entries({
+    current: REHEARSAL_CURRENT_VERSION,
+    next: REHEARSAL_NEXT_VERSION,
+  })) {
+    const selected = POLICY.productionElectronDistributionForTarget({
+      target: "darwin-arm64",
+      rehearsal: candidate,
+      rehearsalCurrentVersion: REHEARSAL_CURRENT_VERSION,
+      rehearsalNextVersion: REHEARSAL_NEXT_VERSION,
+      minimumRehearsalVersion: RELEASE_VERSION,
+      feedURL: "https://untrusted.example.invalid/feed",
+    });
+    assert.equal(selected.semanticVersion, version, candidate);
+    assert.equal(selected.channel,
+      "native-to-electron-handover-rehearsal-v1", candidate);
+    assert.equal(selected.contributionPolicy,
+      "disabled-for-native-to-electron-handover-rehearsal-v1", candidate);
+    assert.equal(selected.schemaVersion,
+      "tibotattle-electron-handover-rehearsal-v1", candidate);
+    assert.equal(selected.feedURL,
+      "https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/darwin-arm64",
+      candidate);
+    assert.deepEqual(POLICY.productionElectronStagingPathSegments({
+      target: "darwin-arm64",
+      rehearsal: candidate,
+      rehearsalCurrentVersion: REHEARSAL_CURRENT_VERSION,
+      rehearsalNextVersion: REHEARSAL_NEXT_VERSION,
+      minimumRehearsalVersion: RELEASE_VERSION,
+    }), [
+      "electron-production",
+      "rehearsal",
+      "native-to-electron-handover-v1",
+      candidate,
+      "darwin-arm64",
+    ], candidate);
+  }
+  assert.equal(POLICY.productionElectronDistributionForTarget({
+    target: "win32-x64",
+    rehearsal: "current",
+    rehearsalCurrentVersion: REHEARSAL_CURRENT_VERSION,
+    rehearsalNextVersion: REHEARSAL_NEXT_VERSION,
+    minimumRehearsalVersion: RELEASE_VERSION,
+  }), null);
+  const intel = POLICY.productionElectronDistributionForTarget({
+    target: "darwin-x64",
+    rehearsal: "current",
+    rehearsalCurrentVersion: REHEARSAL_CURRENT_VERSION,
+    rehearsalNextVersion: REHEARSAL_NEXT_VERSION,
+    minimumRehearsalVersion: RELEASE_VERSION,
+  });
+  assert.equal(intel.semanticVersion, REHEARSAL_CURRENT_VERSION);
+  assert.equal(intel.feedURL,
+    "https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/darwin-x64");
+  assert.deepEqual(POLICY.productionElectronStagingPathSegments({
+    target: "darwin-x64",
+    rehearsal: "current",
+    rehearsalCurrentVersion: REHEARSAL_CURRENT_VERSION,
+    rehearsalNextVersion: REHEARSAL_NEXT_VERSION,
+    minimumRehearsalVersion: RELEASE_VERSION,
+  }), [
+    "electron-production",
+    "rehearsal",
+    "native-to-electron-handover-v1",
+    "current",
+    "darwin-x64",
+  ]);
+  assert.equal(POLICY.productionElectronMacOSBundleShortVersionForTarget({
+    target: "darwin-arm64",
+    version: REHEARSAL_CURRENT_VERSION,
+  }), "0.1.19");
+  assert.throws(() => POLICY.productionElectronMacOSBundleShortVersionForTarget({
+    target: "darwin-arm64",
+    version: "0.1.19-preview.1",
+  }), /reviewed/u);
+  assert.throws(() => POLICY.productionElectronBuildVersionForTarget({
+    target: "darwin-arm64",
+    version: "0.1.19-preview.1",
+    buildNumber: "2026090701",
+  }), /required/u);
+});
+
 test("production builder source config binds app identity, target-specific build versions, feed and artifacts", () => {
   for (const [target, spec] of Object.entries(POLICY.PRODUCTION_ELECTRON_TARGETS)) {
     const config = loadProductionBuilderConfig(target);
@@ -123,6 +254,9 @@ test("production builder source config binds app identity, target-specific build
     assert.match(config.directories.app, new RegExp(`electron-production[\\\\/]${target}[\\\\/]app$`, "u"), target);
     assert.match(config.directories.output, new RegExp(`electron-production[\\\\/]${target}[\\\\/]artifacts$`, "u"), target);
     if (target.startsWith("darwin-")) {
+      assert.equal(config.mac.bundleShortVersion, RELEASE_VERSION, target);
+      assert.equal(config.mac.bundleVersion, config.buildVersion, target);
+      assert.equal(config.mac.sign, "./scripts/electron-macos-sign-order.mjs", target);
       assert.deepEqual(config.mac.target, [
         { target: "dmg", arch: [spec.architecture] },
         { target: "zip", arch: [spec.architecture] },
@@ -151,6 +285,75 @@ test("production builder source config binds app identity, target-specific build
       assert.equal(Object.hasOwn(config.extraMetadata, "shortVersion"), false);
     }
   }
+});
+
+test("production macOS builder resolves the isolated signing-order hook before signing", async () => {
+  const config = loadProductionBuilderConfig("darwin-arm64");
+  const { resolveFunction } = ELECTRON_BUILDER_REQUIRE("app-builder-lib/out/util/resolve");
+  const appBuilderRequire = createRequire(ELECTRON_BUILDER_REQUIRE.resolve("app-builder-lib/package.json"));
+  const osxSignRequire = createRequire(appBuilderRequire.resolve("@electron/osx-sign/package.json"));
+  assert.equal(ELECTRON_BUILDER_REQUIRE("./package.json").version, "26.15.7");
+  assert.equal(appBuilderRequire("./package.json").version, "26.15.7");
+  assert.equal(osxSignRequire("./package.json").version, "1.3.3");
+  const hook = await resolveFunction("module", config.mac.sign, "sign", resolve("."));
+  assert.equal(typeof hook, "function");
+  await assert.rejects(
+    () => hook({ app: "/synthetic/not-a-bundle" }),
+    (error) => error?.code === "ELECTRON_MACOS_SIGN_ORDER_INPUT_INVALID",
+  );
+});
+
+test("rehearsal builder config binds semantic updater versions to numeric macOS plist fields", () => {
+  const macPackagerSource = readFileSync(
+    ELECTRON_BUILDER_REQUIRE.resolve("app-builder-lib/out/macPackager"),
+    "utf8",
+  );
+  assert.match(macPackagerSource,
+    /CFBundleShortVersionString\s*=\s*activeOpts\.bundleShortVersion\s*\|\|\s*appInfo\.version/u);
+  assert.match(macPackagerSource,
+    /CFBundleVersion\s*=\s*activeOpts\.bundleVersion\s*\|\|\s*appInfo\.buildVersion/u);
+
+  for (const [candidate, version, buildNumber] of [
+    ["current", REHEARSAL_CURRENT_VERSION, "2026090701"],
+    ["next", REHEARSAL_NEXT_VERSION, "2026090702"],
+  ]) {
+    const config = loadProductionBuilderConfig("darwin-arm64", {
+      rehearsal: candidate,
+      buildNumber,
+    });
+    const metadata = createProductionDistributionMetadata({
+      buildNumber,
+      rehearsal: candidate,
+      rehearsalCurrentVersion: REHEARSAL_CURRENT_VERSION,
+      rehearsalNextVersion: REHEARSAL_NEXT_VERSION,
+      sourceRevision: SOURCE_REVISION,
+      target: "darwin-arm64",
+    });
+    assert.equal(config.extraMetadata.version, version, candidate);
+    assert.deepEqual(config.extraMetadata.tibotattleDistribution, metadata, candidate);
+    assert.equal(config.mac.bundleShortVersion, "0.1.19", candidate);
+    assert.equal(config.mac.bundleVersion, buildNumber, candidate);
+    assert.equal(config.buildVersion, buildNumber, candidate);
+    assert.deepEqual(config.publish, [{
+      provider: "generic",
+      url: "https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/darwin-arm64",
+    }], candidate);
+    assert.match(config.directories.app,
+      new RegExp(`electron-production[\\\\/]rehearsal[\\\\/]native-to-electron-handover-v1[\\\\/]${candidate}[\\\\/]darwin-arm64[\\\\/]app$`, "u"),
+      candidate);
+    const appInfo = new AppInfo({
+      config: { buildNumber: config.buildNumber, buildVersion: config.buildVersion },
+      metadata: { ...config.extraMetadata },
+    });
+    assert.equal(appInfo.version, version, candidate);
+    assert.equal(semver.prerelease(appInfo.version)?.at(-1), candidate === "current" ? 1 : 2,
+      candidate);
+  }
+  assert.throws(() => loadProductionBuilderConfig("win32-x64", { rehearsal: "current" }), /invalid/u);
+  assert.throws(() => loadProductionBuilderConfig("darwin-arm64", {
+    rehearsal: "current",
+    rehearsalCurrentVersion: "0.1.19-preview.1",
+  }), /invalid/u);
 });
 
 test("development builder retains the adapter contract but excludes the production native resource", () => {
@@ -236,6 +439,73 @@ test("production source candidate requires an explicit numeric build number and 
   ]), (error) => error?.code === "ELECTRON_PRODUCTION_ARGUMENT_INVALID");
 });
 
+test("rehearsal plans prepare two isolated source candidates without allocating a stable release", () => {
+  const createPlan = (candidate, buildNumber) => productionElectronCandidatePlan(
+    parseProductionCandidateArguments([
+      "--target", "darwin-arm64",
+      "--source-revision", SOURCE_REVISION,
+      "--build-number", buildNumber,
+      "--rehearsal-candidate", candidate,
+      "--rehearsal-current-version", REHEARSAL_CURRENT_VERSION,
+      "--rehearsal-next-version", REHEARSAL_NEXT_VERSION,
+    ]),
+  );
+  const current = createPlan("current", "2026090701");
+  const next = createPlan("next", "2026090702");
+  for (const [candidate, plan, version, buildNumber] of [
+    ["current", current, REHEARSAL_CURRENT_VERSION, "2026090701"],
+    ["next", next, REHEARSAL_NEXT_VERSION, "2026090702"],
+  ]) {
+    assert.equal(plan.version, version, candidate);
+    assert.equal(plan.updateFeed,
+      "https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/darwin-arm64",
+      candidate);
+    assert.equal(plan.stagingDirectory,
+      `.release-build/electron-production/rehearsal/native-to-electron-handover-v1/${candidate}/darwin-arm64/app`,
+      candidate);
+    assert.equal(plan.artifactDirectory,
+      `.release-build/electron-production/rehearsal/native-to-electron-handover-v1/${candidate}/darwin-arm64/artifacts`,
+      candidate);
+    assert.deepEqual(plan.rehearsal, {
+      candidate,
+      currentVersion: REHEARSAL_CURRENT_VERSION,
+      id: "native-to-electron-handover-v1",
+      nextVersion: REHEARSAL_NEXT_VERSION,
+      releaseStatus: "not_released",
+      hostedUploads: "disabled",
+    }, candidate);
+    assert.deepEqual(plan.builderEnvironment, {
+      TIBOTATTLE_ELECTRON_BUILD_NUMBER: buildNumber,
+      TIBOTATTLE_ELECTRON_SOURCE_REVISION: SOURCE_REVISION,
+      TIBOTATTLE_ELECTRON_TARGET: "darwin-arm64",
+      TIBOTATTLE_ELECTRON_VERSION: version,
+      TIBOTATTLE_ELECTRON_REHEARSAL_CANDIDATE: candidate,
+      TIBOTATTLE_ELECTRON_REHEARSAL_CURRENT_VERSION: REHEARSAL_CURRENT_VERSION,
+      TIBOTATTLE_ELECTRON_REHEARSAL_NEXT_VERSION: REHEARSAL_NEXT_VERSION,
+    }, candidate);
+    assert.equal(plan.signingPerformed, false, candidate);
+    assert.equal(plan.publishingPerformed, false, candidate);
+    assert.deepEqual(plan.builderArguments,
+      ["--mac", "dmg", "zip", "--arm64", "--publish", "never"], candidate);
+  }
+  assert.notEqual(current.stagingDirectory, next.stagingDirectory);
+  assert.notEqual(current.artifactDirectory, next.artifactDirectory);
+  assert.throws(() => parseProductionCandidateArguments([
+    "--target", "darwin-arm64",
+    "--source-revision", SOURCE_REVISION,
+    "--build-number", "2026090701",
+    "--rehearsal-candidate", "current",
+  ]), (error) => error?.code === "ELECTRON_PRODUCTION_ARGUMENT_INVALID");
+  assert.throws(() => parseProductionCandidateArguments([
+    "--target", "win32-x64",
+    "--source-revision", SOURCE_REVISION,
+    "--build-number", "2026090701",
+    "--rehearsal-candidate", "current",
+    "--rehearsal-current-version", REHEARSAL_CURRENT_VERSION,
+    "--rehearsal-next-version", REHEARSAL_NEXT_VERSION,
+  ]), (error) => error?.code === "ELECTRON_PRODUCTION_ARGUMENT_INVALID");
+});
+
 test("production source plans reserve a thin adapter for both macOS architectures only", () => {
   for (const [target, spec] of Object.entries(POLICY.PRODUCTION_ELECTRON_TARGETS)) {
     const plan = productionElectronCandidatePlan({
@@ -307,5 +577,61 @@ test("production staging carries the exact app metadata and updater closure whil
     assert.ok(closure.includes("apps/electron/desktop-updater.js"));
     const developmentClosure = await assertStagedElectronShellModuleLinkage(development.output);
     assert.ok(developmentClosure.includes("apps/electron/desktop-macos-keychain.js"));
+  });
+});
+
+test("rehearsal source staging binds each updater semantic version to its runtime manifest", async () => {
+  await withTemporaryDirectory(async (root) => {
+    const staged = [];
+    const metadataByCandidate = new Map();
+    for (const [candidate, version, buildNumber] of [
+      ["current", REHEARSAL_CURRENT_VERSION, "2026090701"],
+      ["next", REHEARSAL_NEXT_VERSION, "2026090702"],
+    ]) {
+      const metadata = createProductionDistributionMetadata({
+        buildNumber,
+        rehearsal: candidate,
+        rehearsalCurrentVersion: REHEARSAL_CURRENT_VERSION,
+        rehearsalNextVersion: REHEARSAL_NEXT_VERSION,
+        sourceRevision: SOURCE_REVISION,
+        target: "darwin-arm64",
+      });
+      metadataByCandidate.set(candidate, metadata);
+      const result = await buildElectronApp({
+        output: join(root, candidate, "app"),
+        target: "darwin-arm64",
+        packagingProfile: "production",
+        packageVersion: version,
+        distributionMetadata: metadata,
+      });
+      const packageJson = JSON.parse(await readFile(join(result.output, "package.json"), "utf8"));
+      const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
+      assert.equal(packageJson.version, version, candidate);
+      assert.deepEqual(packageJson.tibotattleDistribution, metadata, candidate);
+      assert.equal(manifest.releaseVersion, version, candidate);
+      assert.equal(manifest.target, "darwin", candidate);
+      assert.equal(manifest.architecture, "arm64", candidate);
+      staged.push(result.output);
+    }
+    assert.notEqual(staged[0], staged[1]);
+    await buildElectronApp({
+      output: staged[0],
+      replace: true,
+      target: "darwin-arm64",
+      packagingProfile: "production",
+      packageVersion: REHEARSAL_CURRENT_VERSION,
+      distributionMetadata: metadataByCandidate.get("current"),
+    });
+    await assert.rejects(
+      () => buildElectronApp({
+        output: staged[0],
+        replace: true,
+        target: "darwin-arm64",
+        packagingProfile: "production",
+        packageVersion: REHEARSAL_NEXT_VERSION,
+        distributionMetadata: metadataByCandidate.get("next"),
+      }),
+      (error) => error?.code === "ELECTRON_RUNTIME_EXISTING_OUTPUT_INVALID",
+    );
   });
 });

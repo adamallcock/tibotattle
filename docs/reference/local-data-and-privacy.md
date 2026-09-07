@@ -41,12 +41,21 @@ managed files, not their contents or provider histories. Removing every app
 state marker can make a reinstall indistinguishable from a fresh installation;
 an upgrade or ordinary reinstall preserving the profile preserves the choice.
 
-The current candidate implements local preferences and notices. Accountless
-upload ownership, renewal/revocation and scheduling remain unfinished, so the
-Electron host disables the older hosted transport and the UI reports uploads
-unavailable. The native and standalone review/consent path described below
-remains unchanged. Production privacy disclosures must change before a build
-that actually sends under the new policy is distributed.
+The integration source connects preferences, notices, protected installation
+credentials and while-open scheduling to the encrypted v1.1 upload transport.
+Enrollment alone grants no upload permission: the server separately binds an
+accountless owner and current versioned authorization to that installation.
+Usage and quota records retain the same owner, provider/account track and
+domain-generation boundaries. Revocation blocks future admission; it is
+separate from private owner erasure of previously accepted records. Accountless
+owners remain excluded from public fits under the current eligibility policy.
+
+Only a validated production distribution manifest enables the hosted client;
+development/QA packages keep it disabled. The server's separate ownership flag
+also defaults to disabled. Local synthetic end-to-end tests do not establish a
+deployed service or released client. The native and standalone review/consent
+path described below remains compatible. Production privacy disclosures must
+match the new policy before a build that sends automatically is distributed.
 
 ## Normal refresh sources
 
@@ -128,6 +137,22 @@ and waits for retiring companion writers before deletion. A failed deletion
 does not authorize a new identity or inferred success. Signed synthetic
 qualification is recorded in that decision; this source description does not
 qualify an installed upgrade.
+
+The Electron macOS production source serves the four legacy broker capabilities
+through its signed main process and the inherited FD4 channel. A fifth,
+separate installation credential supports accountless sharing. Its native
+capability cannot be selected through FD4: the main process exposes only the
+closed accountless operations over the owned companion's private FD3 channel.
+Secret bytes never enter renderer IPC, local HTTP responses or diagnostics.
+
+That accountless credential uses the noninteractive native Keychain adapter,
+with create-if-missing and exact-value deletion as its only mutations. Existing
+encrypted Electron credential files are inspected without decryption. A present
+legacy ciphertext requires explicit recovery and is preserved; an unreadable
+store never becomes permission to create a replacement identity. The sharing
+page reports recovery while local analysis remains available. These are source
+and synthetic-test contracts; signed installation continuity and prompt-free
+first use still require qualification on the actual candidate.
 
 **Reset identity and device** is a separate two-step action from local data
 erase. It removes the selected local Keychain capabilities and associated app
@@ -221,7 +246,8 @@ promise that every data class is deleted on the same schedule:
 | Web session | 30 minutes |
 | One-use upload authorization | 5 minutes |
 | Device pairing claim | 10 minutes |
-| Device credential | 30 days, silently renewable by the same valid device |
+| Paired social device credential | 30 days, silently renewable by the same valid device |
+| Accountless enrollment and derived upload authority | 30-day lease. Same-secret authenticated renewal extends the same active installation graph within seven days of expiry or after an offline period. Revoked or erased authority cannot renew; no replacement identity is created. |
 | Hosted identity authorization handoff | 10 minutes |
 | Completed identity-result delivery window | 5 minutes |
 | Sign-in admission rows | 24 hours |

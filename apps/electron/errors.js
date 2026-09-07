@@ -8,6 +8,7 @@ const SAFE_ERROR_CODES = new Set([
   "companion_busy",
   "companion_not_running",
   "invalid_loopback_origin",
+  "linux_readiness_unavailable",
   "windows_readiness_unavailable",
   "windows_qualification_launch_override_forbidden",
   "desktop_ipc_unavailable",

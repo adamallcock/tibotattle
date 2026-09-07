@@ -9,7 +9,9 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-export type V1SourceScope = { participantId: string; fromDay?: string } | { day: string };
+export type V1SourceScope =
+  | { participantId: string; fromDay?: string }
+  | { day: string; ownerKind?: "social" };
 
 export interface V1SourceChunk {
   readonly id: string;
@@ -94,15 +96,36 @@ export function selectV1WinningDevices(chunks: readonly V1SourceChunk[]): V1Winn
     || compareText(left.observed_day, right.observed_day));
 }
 
-function sourceScope(scope: V1SourceScope): { sql: string; bindings: string[] } {
+function sourceScope(scope: V1SourceScope): {
+  sql: string;
+  bindings: string[];
+  participantOwnerSql: string;
+} {
   if ("participantId" in scope) {
     if (!scope.participantId) throw new TypeError("v1 source participant scope required");
     return scope.fromDay === undefined
-      ? { sql: "c.participant_id = ?", bindings: [scope.participantId] }
-      : { sql: "c.participant_id = ? AND c.chunk_day >= ?", bindings: [scope.participantId, scope.fromDay] };
+      ? {
+        sql: "c.participant_id = ?",
+        bindings: [scope.participantId],
+        participantOwnerSql: "",
+      }
+      : {
+        sql: "c.participant_id = ? AND c.chunk_day >= ?",
+        bindings: [scope.participantId, scope.fromDay],
+        participantOwnerSql: "",
+      };
   }
   if (!/^\d{4}-\d{2}-\d{2}$/u.test(scope.day)) throw new TypeError("v1 source day scope required");
-  return { sql: "c.chunk_day = ?", bindings: [scope.day] };
+  if (scope.ownerKind !== undefined && scope.ownerKind !== "social") {
+    throw new TypeError("v1 source owner scope invalid");
+  }
+  return {
+    sql: "c.chunk_day = ?",
+    bindings: [scope.day],
+    // Public consumers must constrain the source vector before the bounded
+    // chunk read, rather than filtering winners or records afterwards.
+    participantOwnerSql: scope.ownerKind === "social" ? " AND p.owner_kind = 'social'" : "",
+  };
 }
 
 /**
@@ -137,6 +160,7 @@ export async function loadV1SourcePin(
       c.accepted_record_count, c.created_at
       FROM telemetry_analytical_chunks c
       JOIN participants p ON p.id = c.participant_id AND p.state = 'active'
+        ${where.participantOwnerSql}
       WHERE c.accepted_record_count > 0
         AND ${where.sql}
       ORDER BY c.participant_id, c.chunk_day, c.device_id, c.stream, c.id
