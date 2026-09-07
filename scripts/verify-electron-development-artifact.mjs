@@ -151,10 +151,19 @@ const WINDOWS_NATIVE_MANIFEST_KEYS = Object.freeze([
   "securityContractVersion",
   "credentialAuditFileGuardContractVersion",
   "credentialMutexContractVersion",
+  "bindingProvenance",
   "requiredMethods",
   "nativeClaims",
   "approvedPolicy",
 ]);
+const WINDOWS_UNQUALIFIED_BINDING_PROVENANCE = Object.freeze({
+  contractVersion: "windows-binding-provenance-v1",
+  status: "unqualified",
+  source: "unsigned-development-binding",
+});
+const WINDOWS_BINDING_PROVENANCE_KEYS = Object.freeze(
+  Object.keys(WINDOWS_UNQUALIFIED_BINDING_PROVENANCE),
+);
 const WINDOWS_REQUIRED_METHODS = WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS;
 const WINDOWS_NATIVE_CLAIM_KEYS = Object.freeze([
   "productionSafe",
@@ -584,6 +593,7 @@ function validateNativeManifestShape(value) {
   assertContentFree(value, FIXED_STATUS.bindingInvalid);
   const nativeClaims = value.nativeClaims;
   const approvedPolicy = value.approvedPolicy;
+  const bindingProvenance = value.bindingProvenance;
   const exactBooleanShape = (candidate, keys) =>
     exactObjectKeys(candidate, keys)
       && keys.every((key) => typeof candidate[key] === "boolean");
@@ -601,6 +611,9 @@ function validateNativeManifestShape(value) {
       || value.credentialAuditFileGuardContractVersion
         !== "windows-credential-audit-file-guard-v1"
       || value.credentialMutexContractVersion !== "windows-credential-mutex-v1"
+      || !exactObjectKeys(bindingProvenance, WINDOWS_BINDING_PROVENANCE_KEYS)
+      || WINDOWS_BINDING_PROVENANCE_KEYS.some((key) =>
+        bindingProvenance[key] !== WINDOWS_UNQUALIFIED_BINDING_PROVENANCE[key])
       || !Array.isArray(value.requiredMethods)
       || value.requiredMethods.length !== WINDOWS_REQUIRED_METHODS.length
       || value.requiredMethods.some((method, index) => method !== WINDOWS_REQUIRED_METHODS[index])

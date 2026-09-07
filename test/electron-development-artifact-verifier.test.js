@@ -26,6 +26,12 @@ import {
   parseFixedStatusOutput,
   verifyElectronDevelopmentArtifact,
 } from "../scripts/verify-electron-development-artifact.mjs";
+import {
+  createWindowsFilesystemBindingManifest,
+} from "../scripts/build-windows-filesystem-manifest.mjs";
+import {
+  WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
+} from "../src/platform/windows-filesystem.js";
 
 const require = createRequire(import.meta.url);
 const asar = createRequire(require.resolve("electron-builder"))("@electron/asar");
@@ -137,45 +143,27 @@ function archiveLookupPath(path) {
   return process.platform === "win32" ? path.replaceAll("/", "\\") : path;
 }
 
-function bindingManifest(bytes) {
+function syntheticWindowsFilesystemBinding() {
   return {
-    schemaVersion: "windows-filesystem-binding-manifest-v1",
-    bindingFile: "windows_filesystem.node",
-    platform: "win32",
-    architecture: "x64",
-    bytes: bytes.byteLength,
-    sha256: sha256(bytes),
     contractVersion: "windows-filesystem-v1",
     securityContractVersion: "windows-filesystem-security-v1",
     credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
     credentialMutexContractVersion: "windows-credential-mutex-v1",
-    requiredMethods: [
-      "inspectPath",
-      "ensureDirectory",
-      "readFile",
-      "createFile",
-      "deleteFile",
-      "replaceFile",
-      "acquireCredentialAuditFileGuard",
-      "releaseCredentialAuditFileGuard",
-      "acquireCredentialMutex",
-      "releaseCredentialMutex",
-      "acquireAccountlessInstallationCredentialMutex",
-      "releaseAccountlessInstallationCredentialMutex",
-    ],
-    nativeClaims: {
-      productionSafe: false,
-      pathWalkRaceSafe: false,
-      credentialMutexSafe: true,
-      credentialAuditFileGuardSafe: true,
-    },
-    approvedPolicy: {
-      productionSafe: false,
-      pathWalkRaceSafe: false,
-      credentialMutexSafe: true,
-      credentialAuditFileGuardSafe: true,
-    },
+    productionSafe: false,
+    pathWalkRaceSafe: false,
+    credentialMutexSafe: true,
+    credentialAuditFileGuardSafe: true,
+    ...Object.fromEntries(
+      WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS.map((method) => [method, () => undefined]),
+    ),
   };
+}
+
+function bindingManifest(bytes) {
+  return createWindowsFilesystemBindingManifest({
+    bytes,
+    binding: syntheticWindowsFilesystemBinding(),
+  });
 }
 
 async function writeRelative(root, path, bytes) {
@@ -226,9 +214,12 @@ async function makeFixture(
     : Buffer.from(keytarMutation(Buffer.from(keytar)));
   files.set(KEYTAR[target], fixtureKeytar);
   const binding = Buffer.from("reviewed Windows production binding\n");
+  let sidecar = null;
   if (target === "win32-x64") {
     files.set(WINDOWS_BINDING, binding);
-    const sidecar = bindingManifest(binding);
+    // Exercise the JSON value emitted by the real generator while keeping
+    // mutation cases independent from its frozen in-memory return value.
+    sidecar = JSON.parse(JSON.stringify(bindingManifest(binding)));
     bindingManifestMutation?.(sidecar);
     files.set(
       WINDOWS_BINDING_MANIFEST,
@@ -308,7 +299,7 @@ async function makeFixture(
   if (foreignUnpacked) {
     await writeRelative(unpackedPath, foreignUnpacked, Buffer.from("foreign native\n"));
   }
-  return { root, appPath, asarPath, unpackedPath, binding };
+  return { root, appPath, asarPath, unpackedPath, binding, bindingManifest: sidecar };
 }
 
 async function withFixture(target, options, run) {
@@ -380,6 +371,11 @@ test("verifies the rebuilt macOS arm64 Electron directory artifact when present"
 test("verifies Windows x64 binding and sidecar digests without promoting provenance", async () => {
   await withFixture("win32-x64", {}, async (fixture) => {
     const result = await verify(fixture, "win32-x64");
+    assert.deepEqual(fixture.bindingManifest.bindingProvenance, {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "unqualified",
+      source: "unsigned-development-binding",
+    });
     assert.equal(result.status, FIXED_STATUS.verified);
     assert.equal(result.nativeFileCount, 2);
     assert.equal(result.binding.status, "included_unverified");
@@ -452,6 +448,24 @@ test("requires the exact versioned Windows sidecar schema and policy consistency
       label: "missing credential mutex contract field",
       mutate: (sidecar) => {
         delete sidecar.credentialMutexContractVersion;
+      },
+    },
+    {
+      label: "missing binding provenance",
+      mutate: (sidecar) => {
+        delete sidecar.bindingProvenance;
+      },
+    },
+    {
+      label: "qualified binding provenance",
+      mutate: (sidecar) => {
+        sidecar.bindingProvenance.status = "qualified";
+      },
+    },
+    {
+      label: "extra binding provenance field",
+      mutate: (sidecar) => {
+        sidecar.bindingProvenance.extra = false;
       },
     },
     {
