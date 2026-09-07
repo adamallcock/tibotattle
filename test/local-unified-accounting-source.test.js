@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildReplaySafeAccountingCache } from "../src/replay-safe-accounting-cache.js";
 
 import {
   LOCAL_UNIFIED_ACCOUNTING_SOURCE_VERSION,
@@ -23,6 +24,8 @@ import {
   beginUnifiedIndexGeneration,
   createUnifiedIndexWriter,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
   openLocalUnifiedIndex,
   readUnifiedIndexGenerationDescriptor,
 } from "../src/local-unified-index.js";
@@ -32,7 +35,7 @@ const END_AT = "2026-08-02T00:00:00.000Z";
 const OBSERVED_MS = Date.parse("2026-08-01T12:00:00.000Z");
 const RESET_MS = Date.parse("2026-08-08T00:00:00.000Z");
 
-async function createIndex({ status = "complete", empty = false } = {}) {
+async function createIndex({ status = "complete", empty = false, inheritedModel = false } = {}) {
   const root = await mkdtemp(join(tmpdir(), "unified-accounting-source-"));
   const indexFile = join(root, "unified.sqlite");
   const database = openLocalUnifiedIndex(indexFile, { create: true });
@@ -111,6 +114,7 @@ async function createIndex({ status = "complete", empty = false } = {}) {
       tokensOutCombined: null,
       totalInputContext: null,
       partial: false,
+      modelInherited: inheritedModel && eventKeyByte === 1,
     });
     // Insert in reverse key order; the read contract must still be stable.
     writeUsage(2, 20, 2);
@@ -1250,6 +1254,61 @@ test("strict metadata validation rejects missing or stale required fields", asyn
     );
   } finally {
     await rm(stale.root, { recursive: true, force: true });
+  }
+});
+
+test("current inherited-model provenance remains generation-bound through accounting", async () => {
+  const { root, indexFile } = await createIndex({ inheritedModel: true });
+  try {
+    const database = openLocalUnifiedIndex(indexFile);
+    const generation = readUnifiedIndexGenerationDescriptor(database);
+    database.close();
+    const scan = createLocalUnifiedAccountingSource({
+      indexFile,
+      expectedGeneration: generation,
+      requireComplete: true,
+      verifyPublishedGeneration: true,
+    });
+    const result = await scan({ startAt: START_AT, endAt: END_AT });
+    assert.equal(result.parserVersion, null);
+    assert.equal(result.compatibility.status, "compatible");
+    assert.deepEqual(result.compatibility.parserVersions, [
+      LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+      LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+    ]);
+    assert.equal(result.coverage.generationProof, true);
+    const cache = await buildReplaySafeAccountingCache({
+      sourceMode: "unified",
+      scan,
+      expectedGeneration: generation,
+      now: () => Date.parse(END_AT),
+      codexHome: root,
+    });
+    assert.equal(cache.sourceDescriptor.generationMatched, true);
+    assert.equal(cache.sourceDescriptor.fallbackCount, 0);
+    assert.equal(cache.history.status, "available");
+    assert.equal(cache.history.period.events, 2);
+    assert.equal(cache.history.period.totalTokens, 36);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("partial inherited-model salvage is not promoted to compatible complete accounting", async () => {
+  const { root, indexFile } = await createIndex({ inheritedModel: true });
+  try {
+    const database = openLocalUnifiedIndex(indexFile);
+    database.prepare("UPDATE parser_version SET parser_version = ? WHERE parser_version = ?")
+      .run(LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
+        LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION);
+    database.close();
+    await assert.rejects(createLocalUnifiedAccountingSource({
+      indexFile, requireComplete: true,
+    })({ startAt: START_AT, endAt: END_AT }), {
+      code: "local_unified_index_accounting_coverage_incomplete",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
