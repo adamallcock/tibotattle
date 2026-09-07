@@ -662,6 +662,44 @@ passes 20 with the same two exclusions. Documentation, architecture, 78 release
 trust checks and 20 documentation preflight checks pass. These are package
 contract checks; native ABI and isolated Secret Service execution remain separate.
 
+Run [34169033358](https://github.com/adamallcock/tibotattle/actions/runs/34169033358)
+at `ee930083` builds and verifies Windows packaging, but its packaged storage
+smoke times out: the empty disposable profile waits at the normal first-run
+dialog before installing status IPC. The runner now writes and reads back the
+ordinary first-run acknowledgement using the exact verified staged native
+binding and a protected store bound to its disposable user-data root. The app's
+normal startup path is unchanged. This also exposed legacy qualification
+predicates absent from the real binding. Consumers now require the producer's
+actual four verified claims; production and path-walk claims remain false.
+The owning regression composes the real manifest producer through the adapter,
+qualification context, protected store and acknowledgement backend. The private
+writer uses the containing profile root for TEMP; the launched environment keeps
+its original separate temporary directory. Actual Windows execution is still
+required to close this gate.
+
+The measured Mac startup cause was a synchronous collector summary/projection:
+two read-only database traversals took about 2.7 seconds without letting a timer
+run. Collector projection now uses the same read-only worker on every platform,
+with a closed protocol marker, cancellation and bounded fixed-error settlement.
+The extracted reader preserves the previous calculation. Seventy owning tests
+pass, including 80,000-record heartbeat/parity and unrelated-worker IPC isolation.
+A bounded copied-history source probe at `998958e5` completes the collector in
+557 ms with a 12 ms maximum heartbeat gap; the complete quick-style snapshot
+takes 785 ms with a 100 ms maximum gap. Those are source-level observations,
+not a packaged-app performance pass. The 250 ms app qualification limit remains
+unchanged, and all previous failures and profiles are preserved.
+
+Linux qualification now composes the main-owned native lease/backend with the
+FD4 broker and a fixed two-capability synthetic storage child. Its smoke requires
+an authenticated isolated-store context, but the outer harness must independently
+prove disposable D-Bus/tmpfs containment before constructing that context. A
+child that exits before READY now settles immediately instead of waiting the
+shutdown timeout. No normal Linux production selector is enabled. Combined
+source validation passes 495 Electron tests, 329 local companion tests, 29 focused
+Windows/worker tests, 60 package checks with two optional artifact exclusions,
+78 release-trust checks, and architecture validation. Explicit runtime and
+independent verifier inventories include all new modules.
+
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
 retain the detailed design history. This document coordinates the remaining

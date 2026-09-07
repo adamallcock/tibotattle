@@ -63,6 +63,10 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
       "apps/web/test/cache-drop-thread-links-ui.test.mjs",
       "src/local-unified-accounting-source.js",
       "src/local-analysis-index.js",
+      "src/local-collector-projection.js",
+      "src/local-collector-projection-off-main.js",
+      "src/local-collector-projection-off-main-worker.js",
+      "src/platform/linux-secret-service-broker.js",
       "src/local-archive-accounting-index.js",
       "src/replay-safe-accounting-cache.js",
       "src/local-unified-contribution-attribution.js",
@@ -86,7 +90,7 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     );
     assert.match(
       osvWorkflow,
-      /google\/osv-scanner-action\/\.github\/workflows\/osv-scanner-reusable\.yml@8deb546fdb875b9996d27d4950be7312dac076a1/u,
+      /google\/osv-scanner-action\/\.github\/workflows\/osv-scanner-reusable\.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67/u,
     );
 
     // The pinned reusable workflow declares actions:read + contents:read +
