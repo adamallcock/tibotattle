@@ -44,8 +44,15 @@ separate protected operations; local validation is not live evidence.
   and atomic replacement are covered.
 - Worker package/endpoints/generated-type/TypeScript/generated-asset guards and
   all 207 script tests passed. The composite check reached its clean-commit
-  requirement before deployment dry-run; those remaining dry-run steps follow
-  the local commit, with no re-running of unchanged runtime tests required.
+  requirement before deployment dry-run. After committing, the remaining
+  development/staging dry-run steps and an additional production-configuration
+  dry run passed on `01611a76`. Runtime source was unchanged between these steps.
+- Deployment and future web-only asset inventories now explicitly include the
+  new refresh module and its regression test; all nine focused inventory tests
+  passed. The generated 23-file site preserves both published 0.1.18 installer
+  checksums and the existing 1200-by-630 social preview, using verified existing
+  artifacts rather than rebuilding desktop apps. Final site, export and
+  documentation gates passed after the inventory correction.
 - Migration guard suites: 144 tests passed, including real Wrangler application
   and repeat application against disposable local databases. No telemetry
   rewrite or production write was performed. Migration 0049 SHA-256 is
@@ -72,8 +79,10 @@ separate protected operations; local validation is not live evidence.
   while daily activity and its open table remained visible. The temporary
   browser tab and previews were closed after QA.
 
-## Remaining gates
+## Remaining production gates
 
-- Clean-commit deployment dry runs (remaining composite-gate steps).
 - Concrete production migration/deployment review and owner authorization.
+- Verify current production health, schema and recovery position, then apply
+  only migration 0049 and deploy this Worker/site source. Consent, retention,
+  activation settings, telemetry and desktop release artifacts remain unchanged.
 - Post-deployment API and rendered public/admin graph verification.
