@@ -242,6 +242,7 @@ test("staged Electron main links in isolated plain Node for every target", async
       assert.equal(manifest.windowsBinding.included, false, target);
       const shellClosure = await assertStagedElectronShellModuleLinkage(result.output);
       assert.ok(shellClosure.includes("apps/electron/desktop-contribution-credential.js"), target);
+      assert.ok(shellClosure.includes("apps/electron/desktop-tray-preferences.js"), target);
       // buildElectronRuntime runs the same isolated plain-Node linkage check
       // before publishing the staged tree for every target.
     }
