@@ -54,7 +54,10 @@ the diagnostic text is safe.
 
 ## Supported surface
 
-The published product currently supports macOS 14 or later on Apple silicon.
+The published product supports macOS 14 or later on Apple silicon and Intel.
+Both use the same [Homebrew command](README.md#install-macos-apple-silicon-or-intel),
+or their matching direct DMG. See [platform qualification](docs/reference/platform-support.md)
+for the release-specific Intel testing boundary.
 Windows and Linux work in this repository is preparation or experimental
 evidence, not a supported install. Local analysis works without the hosted
 service; a hosted outage should remain visibly unavailable rather than make the

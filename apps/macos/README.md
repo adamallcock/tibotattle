@@ -264,7 +264,9 @@ npm run product:macos:validate:development
 open ".release-build/macos/TiboTattle.app"
 ```
 
-An Intel target is available on the same builder; it is not yet publicly qualified:
+An Intel target is available on the same Apple silicon builder. The published
+0.1.18 Intel app is supported under its release-specific manual-qualification
+waiver; the command here creates only a development test build:
 
 ```bash
 node scripts/build-macos-app.js --architecture x64 \
@@ -284,7 +286,9 @@ x64`; native inspection checks all bundled executables against that target.
 Release construction also requires the verified `--node-runtime`. Preview and
 release modes retain their existing signing, source, identity and credential
 gates. Intel uses separate stable/dogfood/Preview feeds; it cannot consume the
-Apple silicon feed. No new Homebrew Intel support is claimed.
+Apple silicon feed. Published installers for both architectures are also
+available through the [same Homebrew cask](../../README.md#install-macos-apple-silicon-or-intel),
+which selects the matching DMG; it does not change the app's update feed.
 
 These source paths do not qualify real Intel hardware, final signed/notarized
 installers or updater installation. See the
