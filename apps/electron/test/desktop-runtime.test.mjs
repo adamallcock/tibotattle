@@ -3,7 +3,7 @@ import { EventEmitter } from "node:events";
 import test from "node:test";
 import { spawn } from "node:child_process";
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -308,6 +308,7 @@ async function launchFixture({
     save: async () => {},
   },
   platform = "darwin",
+  architecture = process.arch,
   argv = [],
   app: suppliedApp,
   runtimeOverrides = {},
@@ -319,6 +320,7 @@ async function launchFixture({
   sharingBackend,
   sharingInstallationState,
   ownedCompanionScript,
+  onSpawn = () => {},
   environment = {
     HOME: "/Users/adam",
     USAGE_MONITOR_RESOURCE_ROOT: "/repo",
@@ -344,6 +346,7 @@ async function launchFixture({
     notificationBackend,
     firstRunReceiptBackend,
     platform,
+    architecture,
     argv,
     lifecycleOptions,
     accountlessLaboratory,
@@ -356,6 +359,7 @@ async function launchFixture({
     supervisorOptions: {
       spawnChild(_command, args, options) {
         spawnCalls.push({ args: [...args], options });
+        onSpawn({ args: [...args], options });
         const child = ownedCompanionScript ? spawn(_command, args, options) : new FakeChild();
         children.push(child);
         if (productionDistribution && !ownedCompanionScript) queueMicrotask(() => {
@@ -671,6 +675,255 @@ test("macOS production fails closed when its main-only credential backend cannot
     },
   }), /native adapter unavailable/u);
   assert.equal(safeStorageCalls, 0);
+});
+
+test("Linux production accountless composition requires a main-only native factory before child startup", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let safeStorageCalls = 0;
+  let spawned = 0;
+  await assert.rejects(launchFixture({
+    app,
+    platform: "linux",
+    architecture: "x64",
+    load: async () => null,
+    runtimeOverrides: {
+      safeStorage: {
+        isAsyncEncryptionAvailable: async () => { safeStorageCalls += 1; return true; },
+      },
+    },
+    environment: { HOME: "/synthetic" },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+    },
+    onSpawn: () => { spawned += 1; },
+  }), { code: "electron_shell_electron_configuration_invalid" });
+  assert.equal(app.readyCalls, 0);
+  assert.equal(spawned, 0);
+  assert.equal(safeStorageCalls, 0);
+});
+
+test("Linux production accountless factory failure prevents child startup without safeStorage", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let safeStorageCalls = 0;
+  let factoryCalls = 0;
+  let spawned = 0;
+  await assert.rejects(launchFixture({
+    app,
+    platform: "linux",
+    architecture: "x64",
+    load: async () => null,
+    runtimeOverrides: {
+      safeStorage: {
+        isAsyncEncryptionAvailable: async () => { safeStorageCalls += 1; return true; },
+        encryptStringAsync: async () => { safeStorageCalls += 1; return Buffer.alloc(0); },
+        decryptStringAsync: async () => { safeStorageCalls += 1; return null; },
+      },
+    },
+    environment: { HOME: "/synthetic" },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createLinuxCredentialBackend() {
+        factoryCalls += 1;
+        throw new Error("Linux native credential backend is unavailable");
+      },
+    },
+    onSpawn: () => { spawned += 1; },
+  }), /Linux native credential backend is unavailable/u);
+  assert.equal(factoryCalls, 1);
+  assert.equal(spawned, 0);
+  assert.equal(safeStorageCalls, 0);
+});
+
+test("Linux production accountless startup uses only FD3 and never initializes safeStorage", async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "linux-accountless-runtime-"));
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  app.getPath = () => profile;
+  let fixture;
+  let nativeSecret = null;
+  let factoryCalls = 0;
+  let nativeCreates = 0;
+  let safeStorageCalls = 0;
+  t.after(async () => {
+    try { await fixture?.desktop.lifecycle.requestQuit(); }
+    finally {
+      nativeSecret?.fill(0);
+      await rm(profile, { recursive: true, force: true });
+    }
+  });
+  const safeStorage = {
+    isAsyncEncryptionAvailable: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
+    encryptStringAsync: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
+    decryptStringAsync: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
+  };
+  fixture = await launchFixture({
+    app,
+    platform: "linux",
+    architecture: "x64",
+    load: async () => null,
+    runtimeOverrides: { safeStorage },
+    environment: { HOME: profile },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createLinuxCredentialBackend(options) {
+        factoryCalls += 1;
+        assert.deepEqual(Object.keys(options), ["legacyCredentialProbe"]);
+        const { legacyCredentialProbe } = options;
+        assert.equal(typeof legacyCredentialProbe, "function");
+        return {
+          async read() {
+            assert.equal(await legacyCredentialProbe(), "absent");
+            return nativeSecret === null ? null : Buffer.from(nativeSecret);
+          },
+          async createIfMissing(value) {
+            assert.equal(await legacyCredentialProbe(), "absent");
+            if (nativeSecret !== null) return "existing";
+            nativeSecret = Buffer.from(value);
+            nativeCreates += 1;
+            return "created";
+          },
+          async deleteExact(value) {
+            assert.equal(await legacyCredentialProbe(), "absent");
+            if (nativeSecret === null) return "missing";
+            if (!nativeSecret.equals(value)) return "mismatch";
+            nativeSecret.fill(0);
+            nativeSecret = null;
+            return "deleted";
+          },
+        };
+      },
+    },
+    ownedCompanionScript: fileURLToPath(new URL("../../../test/fixtures/accountless-runtime-child.mjs", import.meta.url)),
+  });
+  assert.equal(factoryCalls, 1);
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  assert.equal(
+    Object.hasOwn(fixture.spawnCalls[0].options.env, "USAGE_MONITOR_KEYCHAIN_BROKER_FD"),
+    false,
+  );
+  const deadline = Date.now() + 5_000;
+  while ((await fixture.desktop.sharingCoordinator.inspect()).transportStatus !== "up_to_date") {
+    assert.ok(Date.now() < deadline, "owned Linux companion did not receive the FD3 credential capability");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(nativeCreates, 1);
+  assert.equal(safeStorageCalls, 0);
+  await assert.rejects(
+    readFile(join(profile, "desktop-settings", "accountless-installation-credential-v1.json")),
+    { code: "ENOENT" },
+  );
+});
+
+test("Linux legacy ciphertext becomes recovery over FD3 without native access or safeStorage", async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "linux-accountless-legacy-"));
+  const settingsRoot = join(profile, "desktop-settings");
+  const legacyPath = join(settingsRoot, "accountless-installation-credential-v1.json");
+  const recoveryChild = join(profile, "accountless-recovery-child.mjs");
+  const legacyRecord = `${JSON.stringify({
+    schemaVersion: "accountless-encrypted-credential-v1",
+    encrypted: "AAAA",
+  })}\n`;
+  await mkdir(settingsRoot, { recursive: true, mode: 0o700 });
+  await writeFile(legacyPath, legacyRecord, { mode: 0o600 });
+  await writeFile(recoveryChild, `
+import { join } from "node:path";
+import { createAccountlessContributionScheduler } from ${JSON.stringify(
+    new URL("../../../src/application/index.js", import.meta.url).href,
+  )};
+import { createAccountlessChildChannel } from ${JSON.stringify(
+    new URL("../../../src/platform/index.js", import.meta.url).href,
+  )};
+import { runAccountlessContributionSyncOnce } from ${JSON.stringify(
+    new URL("../../../src/contribution-accountless-client.js", import.meta.url).href,
+  )};
+
+let scheduler;
+const bridge = createAccountlessChildChannel({ channel: process,
+  onInvalidated: () => scheduler?.preferenceChanged() });
+scheduler = createAccountlessContributionScheduler({
+  origin: process.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN,
+  readPreference: bridge.readPreference,
+  runner: ({ signal }) => runAccountlessContributionSyncOnce({
+    production: true,
+    origin: process.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN,
+    readPreference: bridge.readPreference,
+    backend: bridge.backend,
+    stateFile: join(process.env.USAGE_MONITOR_STATE_ROOT, "accountless-device-binding-v1.json"),
+    indexFile: join(process.env.USAGE_MONITOR_STATE_ROOT, "unused-synthetic-index.sqlite"),
+    signal,
+  }),
+  onStatus: (value) => { void bridge.reportStatus(value).catch(() => {}); },
+});
+process.stdout.write("USAGE_MONITOR_READY http://127.0.0.1:4811/\\n");
+scheduler.start();
+process.once("SIGTERM", async () => { await scheduler.stop(); bridge.dispose(); process.exit(0); });
+`, { mode: 0o600 });
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  app.getPath = () => profile;
+  let fixture;
+  let nativeCalls = 0;
+  let safeStorageCalls = 0;
+  let legacyCredentialProbe;
+  t.after(async () => {
+    try { await fixture?.desktop.lifecycle.requestQuit(); }
+    finally { await rm(profile, { recursive: true, force: true }); }
+  });
+  fixture = await launchFixture({
+    app,
+    platform: "linux",
+    architecture: "x64",
+    load: async () => null,
+    runtimeOverrides: {
+      safeStorage: {
+        isAsyncEncryptionAvailable: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
+      },
+    },
+    environment: { HOME: profile },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createLinuxCredentialBackend({ legacyCredentialProbe: probe }) {
+        legacyCredentialProbe = probe;
+        return {
+          async read() { nativeCalls += 1; throw new Error("must not access native credential"); },
+          async createIfMissing() { nativeCalls += 1; throw new Error("must not access native credential"); },
+          async deleteExact() { nativeCalls += 1; throw new Error("must not access native credential"); },
+        };
+      },
+    },
+    ownedCompanionScript: recoveryChild,
+  });
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  assert.ok(["present", "unavailable"].includes(await legacyCredentialProbe()));
+  const deadline = Date.now() + 5_000;
+  let transportStatus;
+  while ((transportStatus = (await fixture.desktop.sharingCoordinator.inspect()).transportStatus)
+      !== "recovery_required") {
+    assert.ok(Date.now() < deadline,
+      `legacy ciphertext did not reach the fixed recovery state (last: ${transportStatus})`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(nativeCalls, 0);
+  assert.equal(safeStorageCalls, 0);
+  assert.equal(await readFile(legacyPath, "utf8"), legacyRecord);
 });
 
 for (const production of [false, true]) test(`desktop ${production ? "production" : "laboratory"} composes protected credentials with an owned companion and durable opt-out`, async (t) => {

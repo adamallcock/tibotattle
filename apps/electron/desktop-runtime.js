@@ -43,6 +43,7 @@ import { createDesktopSharingBackend, createDesktopSharingCoordinator } from "./
 import {
   createDesktopContributionCredentialBackend,
   createDesktopContributionCredentialLegacyProbe,
+  createDesktopContributionCredentialLegacyRecoveryBackend,
 } from "./desktop-contribution-credential.js";
 import { classifyDesktopSharingInstallation } from "./desktop-sharing-installation.js";
 import { attachAccountlessParentChannel } from "../../src/platform/index.js";
@@ -438,15 +439,21 @@ export async function launchDesktopRuntime({
   }
   const accountlessProductionUsesMacNativeCredential = accountlessProduction !== undefined
     && platform === "darwin";
+  const accountlessProductionUsesLinuxNativeCredential = accountlessProduction !== undefined
+    && platform === "linux";
   if (accountlessProduction !== undefined && (
     accountlessProduction === null || typeof accountlessProduction !== "object"
       || Array.isArray(accountlessProduction)
       || Object.keys(accountlessProduction).sort().join(",") !== (
         accountlessProductionUsesMacNativeCredential
           ? "createMacOSCredentialBackend,origin,policyVersion"
-          : "origin,policyVersion")
+          : accountlessProductionUsesLinuxNativeCredential
+            ? "createLinuxCredentialBackend,origin,policyVersion"
+            : "origin,policyVersion")
       || (accountlessProductionUsesMacNativeCredential
         && typeof accountlessProduction.createMacOSCredentialBackend !== "function")
+      || (accountlessProductionUsesLinuxNativeCredential
+        && typeof accountlessProduction.createLinuxCredentialBackend !== "function")
       || accountlessProduction.origin !== DEPLOYMENT_ENDPOINTS.public.origin
       || accountlessProduction.policyVersion !== "accountless-opt-out-v1"
       || accountlessLaboratory !== undefined || app.isPackaged !== true
@@ -681,28 +688,41 @@ export async function launchDesktopRuntime({
       rootPath: settingsRootPath,
     })
     : null;
-  // Production macOS installs use the signed, prompt-disabled native adapter.
+  // Production macOS and Linux composition uses a main-process native adapter.
   // Do not call Electron safeStorage there: its asynchronous availability probe
-  // may initialize a prompt-capable Chromium Keychain provider. Existing
-  // encrypted records are inspected without decrypting or changing them so a
-  // prior installation stops for explicit recovery instead of rotating identity.
+  // can initialize a platform credential provider. Existing encrypted records
+  // are inspected without decrypting or changing them so a prior installation
+  // stops for explicit recovery instead of rotating identity.
   if (accountlessEnabled) {
-    if (accountlessProductionUsesMacNativeCredential) {
+    if (accountlessProductionUsesMacNativeCredential
+        || accountlessProductionUsesLinuxNativeCredential) {
       const legacyCredentialProbe = createDesktopContributionCredentialLegacyProbe({
         platform,
         rootPath: settingsRootPath,
       });
-      installationCredentialBackend = accountlessProduction
-        .createMacOSCredentialBackend({
-          legacyCredentialProbe: legacyCredentialProbe.inspect,
-        });
-      if (!installationCredentialBackend
-          || typeof installationCredentialBackend !== "object"
+      const nativeBackend = accountlessProduction[
+        accountlessProductionUsesMacNativeCredential
+          ? "createMacOSCredentialBackend"
+          : "createLinuxCredentialBackend"
+      ]({
+        legacyCredentialProbe: legacyCredentialProbe.inspect,
+      });
+      if (!nativeBackend
+          || typeof nativeBackend !== "object"
           || ["read", "createIfMissing", "deleteExact"].some(
-            (operation) => typeof installationCredentialBackend[operation] !== "function",
+            (operation) => typeof nativeBackend[operation] !== "function",
           )) {
         throw shellError("electron_configuration_invalid");
       }
+      // macOS owns this recovery check within its signed adapter. Linux keeps
+      // the equivalent boundary in this generic main-process wrapper until a
+      // reviewed native Linux accountless backend is selected by the entrypoint.
+      installationCredentialBackend = accountlessProductionUsesLinuxNativeCredential
+        ? createDesktopContributionCredentialLegacyRecoveryBackend({
+          backend: nativeBackend,
+          legacyCredentialProbe: legacyCredentialProbe.inspect,
+        })
+        : nativeBackend;
     } else {
       installationCredentialBackend = accountlessLaboratory?.backend
         ?? createDesktopContributionCredentialBackend({
