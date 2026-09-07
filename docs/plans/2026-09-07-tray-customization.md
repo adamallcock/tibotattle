@@ -2,7 +2,7 @@
 title: Tray and menu bar customization
 date: 2026-09-07
 type: plan
-status: in-progress
+status: implemented
 ---
 
 # Tray and menu bar customization
@@ -32,7 +32,7 @@ set. Publication, installation and broader platform qualification remain separat
   The source observations above are pinned snapshots; reconcile against the
   implementation branch before coding.
 
-## Product decisions proposed
+## Accepted product decisions
 
 Treat the always-visible bar and the popup as separate surfaces. The bar answers
 one quick question; the popup provides the detail the user chooses. Changing
@@ -75,14 +75,14 @@ indication, tooltip, popup, Settings and Quit available. Hiding all optional pop
 sections leaves the header and actions, with a small Customize link. Status and
 failure explanations are not hideable widgets.
 
-## Next slice: additional information choices
+## Additional information choices
 
 | ID | Feature | Proposed scope | Why separate |
 |---|---|---|---|
 | TRAY-07 | Reset time and format | Optional reset time for one selected window, such as `5h resets 42m`; choose countdown or local clock time, shared with the popup | Needs width, timezone, sleep/wake and expired-reset handling; no per-second timer |
 | TRAY-08 | Choose usage totals | Popup checkboxes for total tokens, API-equivalent cost and usage changes, each bound to the displayed history period | Cost requires partial-pricing disclosure; usage changes must not be labeled requests or messages |
 | TRAY-09 | Cache summary | Optional popup summary of cache reuse for the selected history period, linking to Usage and costs | Must reuse the dashboard's denominator, coverage and scope; no second calculation path |
-| TRAY-10 | Compact or detailed popup | Compact shows headline values; detailed adds charts, reset detail and evidence explanation | Requires accessibility and small-screen checks after section customization settles |
+| TRAY-10 | Compact or detailed popup | Compact tightens spacing and hides secondary reset details; chart and totals remain independent choices; coverage and missing-data explanations stay visible | Requires accessibility and small-screen checks after section customization settles |
 | TRAY-11 | Low-allowance emphasis | One optional toggle adds a quiet visual emphasis when a selected window reaches 10% remaining | Display-only, off by default; no new notifications, animations or rule editor |
 | TRAY-12 | Two-meter icon exploration | Prototype a fixed top 5-hour / bottom 7-day meter as a space-saving alternative to two percentages | Adopt only if window identity and both states remain legible at actual tray sizes |
 
@@ -142,10 +142,10 @@ high contrast. If two readable meters cannot fit, retain the existing single
 meter and labeled two-number preset. Do not solve legibility by adding size
 and vertical-offset settings.
 
-These additions do not expand the first 0.1.19 candidate beyond visibility and
-accessibility acceptance. Reset formats follow TRAY-07; emphasis and two-meter
-exploration remain later work. The recommendations are product judgments,
-not an instruction to copy CodexBar's code or reproduce every option.
+The owner subsequently authorized the complete accepted set. Reset formats,
+low emphasis and the two-meter option are implemented together with the core
+controls. The recommendations remain product judgments; they do not require
+copying CodexBar's code or reproducing every option.
 
 ## Settings flow and preview examples
 
@@ -197,7 +197,7 @@ monospaced digits where available, and system appearance/high-contrast support.
 Never rely on color alone. Accessible names must include product, window,
 remaining/used meaning, status and freshness. Section reorder must preserve focus.
 
-## Implementation sequence
+## Original implementation sequence
 
 1. **Preference and display contract.** Define a closed, versioned tray preference
    object: preset, icon mode, meter window, ordered enabled sections, history
@@ -254,10 +254,75 @@ The tray consumes validated snapshots, not raw transcripts or renderer claims.
 
 ## Implementation verification
 
-- [x] Shared cache-reuse display projection and malformed/empty/duplicate boundary tests.
-- [ ] Native settings, persistence, bar and popup behavior with compiled smoke tests.
-- [ ] Electron settings, IPC, persistence, bar and popup behavior with regressions.
-- [ ] Source, documentation, localization and architecture checks.
-- [ ] Fresh development packages and rendered customization checks.
+All accepted TRAY-01 through TRAY-12 behavior is implemented. The two-meter
+option passed synthetic rendering at 16-point size and 1x/2x scales, with fixed
+5-hour/7-day order and outlined unknown states. Collection, notification policy
+and dashboard filters remain under their existing owners.
 
-No published release or installed stable app has been changed by this work.
+- [x] Shared cache projection; exact denominator, zero/empty distinction,
+  malformed/duplicate/future data and forged-percentage checks.
+- [x] Native preferences, legacy migration, undo/defaults, settings, bar and
+  popup; compiled regression and rendered checks.
+- [x] Electron settings v3 migration, closed IPC, independent display evidence,
+  bar/popup preferences and native-to-Electron preference transfer.
+- [x] Source, documentation, localization, architecture and public-site boundary
+  checks.
+- [x] Fresh ARM development packages; synthetic Settings/popup and actual
+  Electron process restart verification.
+
+### Verified source and artifacts
+
+| Implementation | Branch | Application source tested |
+| --- | --- | --- |
+| Native macOS | `codex/tray-customization` | `c000dd8ece326914f7ba9bff8bc0934bb11ab80f` |
+| Electron | `codex/electron-tray-customization` | `818984772924ed0a4b2dbd542413b5edb00c3985` |
+
+The native test-profile ARM bundle has payload SHA-256
+`843e94740de7d334705316f91aad3fca663eb55c43f5d46e319d309ac3bc390e`
+and source SHA-256
+`ace0e2c8a89f8fb52fce002ddb1e2995fe0b55e03f558a13a23482580d118757`.
+Its customization and existing menu-bar compiled smoke commands both passed.
+The full native smoke lane passed during implementation; final compiled checks
+include the additional cache-ratio and inactive-control regressions.
+
+The Electron ARM bundle has ASAR SHA-256
+`81b4838400f88058ae69f15c252ff25a4097b8996348550167d373a09ce6b26d`.
+Its source-pinned package receipt and actual packaged smoke both passed. The
+smoke verifies custom save, preview, undo, defaults, Settings reopen, full
+process relaunch, popup history persistence and clean shutdown. A fresh package
+was built and tested after the final compact-layout correction.
+
+Validation receipts include 98 native source tests, 470 Electron/core/initial
+smoke-contract tests, 563 full web UI tests, 34 focused popup/customization tests
+after final polish, 329 local integration tests, 36 public-release-site tests,
+27 final packaged-smoke contract tests and the four-target isolated module
+linkage check. These counts describe individual runs and overlap; they are not
+an additive total. Architecture, documentation and localization checks passed.
+
+Synthetic images and content-free receipts are retained locally under
+`.release-build/tray-customization-20260907/`. Visual checks cover native
+light/dark/high-contrast Settings, scrolling to recovery controls, missing lanes,
+cache-only and compact layouts, and the final actual Electron popup. Browser
+interaction checks additionally covered focus after reorder, range sync,
+visible save failure and undo. No real account data was used in these fixtures.
+
+### Decisions and qualification limits
+
+The display-only low cue enters at 10% or less. Hysteresis is retained only when
+its observation/reset identity remains valid, or Electron has an already-known
+safe continuity scope. A new unscoped observation clears prior emphasis before
+re-evaluating the threshold; cosmetic state must not cross an uncertain source
+boundary. No account identifier was added to the display contract.
+
+The Electron development packager explicitly disables unused Windows installer
+dependency scripts. This prevents the package manager from inserting an invalid
+approval placeholder while inspecting dependencies; no script permission was
+granted. The new preference module and both renderer assets are included in the
+reviewed packaging closure.
+
+macOS ARM has actual development-package and rendered evidence. Windows/Linux
+capability fallbacks have source tests and staged linkage evidence, but physical
+Windows/Linux, secondary-display, screen-reader and signed-release qualification
+remain separate. These development packages are not signed/notarized production
+releases, and no stable installation or public release was changed. Both feature
+branches are committed locally; they have not been pushed or merged by this task.
