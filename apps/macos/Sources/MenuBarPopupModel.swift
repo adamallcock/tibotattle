@@ -97,6 +97,7 @@ struct MenuBarHistorySnapshot: Equatable {
     let lastThirtyDays: MenuBarRollingPeriod?
     let sevenDayHistory: [MenuBarHistoryDay]
     let thirtyDayHistory: [MenuBarHistoryDay]
+    var trayCachePeriods: [TrayCachePeriod] = []
 
     /// Empty startup/failure value for owners that have not decoded an overview
     /// yet. A decoded unavailable overview still carries dated gap cells so the
@@ -138,7 +139,8 @@ struct MenuBarHistorySnapshot: Equatable {
             lastSevenDays: lastSevenDays,
             lastThirtyDays: lastThirtyDays,
             sevenDayHistory: sevenDayHistory,
-            thirtyDayHistory: thirtyDayHistory
+            thirtyDayHistory: thirtyDayHistory,
+            trayCachePeriods: trayCachePeriods
         )
     }
 }
@@ -197,7 +199,8 @@ enum MenuBarHistoryProjection {
             lastSevenDays: periods[.lastSevenDays],
             lastThirtyDays: periods[.lastThirtyDays],
             sevenDayHistory: history.sevenDays,
-            thirtyDayHistory: history.thirtyDays
+            thirtyDayHistory: history.thirtyDays,
+            trayCachePeriods: TrayCachePeriod.decode(root)
         )
     }
 
@@ -693,5 +696,53 @@ enum MenuBarHistoryProjection {
     private static func safeFiniteAdd(_ left: Double, _ right: Double) -> Double? {
         let sum = left + right
         return sum.isFinite && sum >= 0 ? sum : nil
+    }
+}
+
+struct TrayCachePeriod: Equatable {
+    let periodID: String
+    let reusePercent: Double?
+    let comparableReturns: Int
+    let coverage: String
+    static func decode(_ root: [String: Any]) -> [Self] {
+        guard let accounting = root["accounting"] as? [String: Any],
+              let dto = accounting["trayCacheSummary"] as? [String: Any],
+              Set(dto.keys) == ["schemaVersion", "periods"],
+              let version = dto["schemaVersion"] as? NSNumber,
+              CFGetTypeID(version) != CFBooleanGetTypeID(), version.doubleValue == 1,
+              let periods = dto["periods"] as? [[String: Any]], periods.count == 2 else { return [] }
+        var result: [Self] = []
+        var ids = Set<String>()
+        for period in periods {
+            guard Set(period.keys) == ["periodId", "status", "comparableReturns", "reusedMoreThanHalfReturns", "reusePercent", "coverageStatus"],
+                  let id = period["periodId"] as? String, ["7d", "30d"].contains(id), ids.insert(id).inserted,
+                  let status = period["status"] as? String, ["available", "unavailable"].contains(status),
+                  let coverage = period["coverageStatus"] as? String, ["complete", "incomplete", "unavailable"].contains(coverage) else { return [] }
+            if status == "unavailable" {
+                guard coverage == "unavailable",
+                      period["comparableReturns"] is NSNull,
+                      period["reusedMoreThanHalfReturns"] is NSNull,
+                      period["reusePercent"] is NSNull else { return [] }
+                continue
+            }
+            guard coverage != "unavailable",
+                  let count = period["comparableReturns"] as? NSNumber,
+                  CFGetTypeID(count) != CFBooleanGetTypeID(), count.doubleValue.isFinite,
+                  count.doubleValue >= 0, count.doubleValue <= 9_007_199_254_740_991, count.doubleValue.rounded() == count.doubleValue,
+                  let reused = period["reusedMoreThanHalfReturns"] as? NSNumber,
+                  CFGetTypeID(reused) != CFBooleanGetTypeID(), reused.doubleValue >= 0,
+                  reused.doubleValue <= count.doubleValue, reused.doubleValue.rounded() == reused.doubleValue else { return [] }
+            var percent: Double?
+            if count.intValue > 0 {
+                guard let number = period["reusePercent"] as? NSNumber,
+                      CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite,
+                      (0...100).contains(number.doubleValue) else { return [] }
+                let expected = reused.doubleValue / count.doubleValue * 100
+                guard abs(number.doubleValue - expected) <= 1e-9 else { return [] }
+                percent = expected
+            } else if !(period["reusePercent"] is NSNull) { return [] }
+            result.append(Self(periodID: id, reusePercent: percent, comparableReturns: count.intValue, coverage: coverage))
+        }
+        return result
     }
 }

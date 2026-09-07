@@ -723,6 +723,7 @@ final class MenuBarPopoverViewController: NSViewController {
         let openTiboTattle: () -> Void
         let refresh: () -> Void
         let showMore: (NSView) -> Void
+        var openUsageAndCosts: (() -> Void)? = nil
     }
 
     private let productName: String
@@ -764,8 +765,9 @@ final class MenuBarPopoverViewController: NSViewController {
 
     private var currentSnapshot = MenuBarStatusSnapshot()
     private var currentNow = Date()
-    private var selectedRange: MenuBarHistoryRange = .sevenDays
+    private var selectedRange = MenuBarHistoryRange(rawValue: TrayPreferenceStore.shared.value.historyRange) ?? .sevenDays
     private var visibleAllowanceLaneCount = 0
+    private var unavailableAllowanceDurations: [Int] = []
     private var historyState: MenuBarPopoverHistoryState = .unavailable
     private var partialPricingDisclosed = false
     private var pricingState: MenuBarPopoverPricingState = .unavailable
@@ -773,6 +775,13 @@ final class MenuBarPopoverViewController: NSViewController {
     private var naturalContentHeight: CGFloat = 1
     private var maximumViewportHeight: CGFloat?
     private var didLoadInterface = false
+    private var trayPreferences = TrayPreferenceStore.shared.value
+    private var preferencesOverrideForSmokeTest: TrayPreferences?
+    private var optionalSections: [String: NSView] = [:]
+    private let cacheLabel = NSTextField(wrappingLabelWithString: "")
+    private let cachePeriodLabel = NSTextField(labelWithString: "")
+    private let customizeButton = NSButton()
+    private var appliedSectionOrder: [String]?
 
     init(productName: String, brandImage: NSImage?, actions: Actions) {
         self.productName = productName
@@ -855,6 +864,12 @@ final class MenuBarPopoverViewController: NSViewController {
         let allowanceSection = makeAllowanceSection()
         let historySection = makeHistorySection()
         let footer = makeFooter()
+        let cacheButton = NSButton(title: trayText("cache"), target: self, action: #selector(openUsageAndCosts))
+        cachePeriodLabel.font = .systemFont(ofSize: 11, weight: .medium)
+        cachePeriodLabel.textColor = .secondaryLabelColor
+        let cacheSection = verticalStack([cacheButton, cachePeriodLabel, cacheLabel], spacing: 4)
+        cacheLabel.widthAnchor.constraint(equalTo: cacheSection.widthAnchor).isActive = true
+        optionalSections = ["allowances": allowanceSection, "pace": weeklySection, "usage": historySection, "cache": cacheSection]
 
         for arranged in [
             header,
@@ -883,11 +898,17 @@ final class MenuBarPopoverViewController: NSViewController {
     func update(snapshot: MenuBarStatusSnapshot, now: Date = Date()) {
         currentSnapshot = snapshot
         currentNow = now
+        let storedPreferences = preferencesOverrideForSmokeTest ?? TrayPreferenceStore.shared.value
+        if storedPreferences != trayPreferences {
+            trayPreferences = storedPreferences
+            selectedRange = MenuBarHistoryRange(rawValue: trayPreferences.historyRange) ?? .sevenDays
+        }
         loadViewIfNeeded()
         renderHeader(snapshot: snapshot, now: now)
         renderAllowance(snapshot: snapshot, now: now)
         renderHistory(snapshot.history)
         updateActionState(snapshot)
+        applyTrayPreferences()
         updatePreferredContentSize()
     }
 
@@ -1310,7 +1331,10 @@ final class MenuBarPopoverViewController: NSViewController {
         buttons.alignment = .centerY
         buttons.spacing = 8
 
-        let footer = verticalStack([buttons, disclaimerLabel], spacing: 8)
+        customizeButton.title = trayText("customize")
+        customizeButton.target = self; customizeButton.action = #selector(customizeTray)
+        customizeButton.isBordered = false
+        let footer = verticalStack([buttons, disclaimerLabel, customizeButton], spacing: 8)
         buttons.widthAnchor.constraint(equalTo: footer.widthAnchor).isActive = true
         disclaimerLabel.widthAnchor.constraint(equalTo: footer.widthAnchor).isActive = true
         return footer
@@ -1348,20 +1372,32 @@ final class MenuBarPopoverViewController: NSViewController {
 
         let lanes = renderableLanes(snapshot: snapshot, now: now)
         visibleAllowanceLaneCount = lanes.count
-        allowanceRows.isHidden = lanes.isEmpty
+        allowanceRows.isHidden = false
         allowanceStateStack.isHidden = !lanes.isEmpty
+        unavailableAllowanceDurations = []
 
-        for lane in lanes.sorted(by: { $0.durationMinutes < $1.durationMinutes }) {
+        let durations = Set([300, 10_080] + lanes.map(\.durationMinutes)).sorted()
+        for duration in durations {
+            guard let lane = lanes.first(where: { $0.durationMinutes == duration }) else {
+                unavailableAllowanceDurations.append(duration)
+                let label = TiboTattleLocalization.quotaWindowLabel(durationMinutes: duration)
+                let unavailable = NSTextField(wrappingLabelWithString: label + " —\n" + TiboTattleLocalization.string(.menuBarQuotaValuesUnavailable))
+                unavailable.font = .systemFont(ofSize: 12)
+                unavailable.textColor = .secondaryLabelColor
+                unavailable.setAccessibilityLabel(unavailable.stringValue)
+                allowanceRows.addArrangedSubview(unavailable)
+                unavailable.widthAnchor.constraint(equalTo: allowanceRows.widthAnchor).isActive = true
+                continue
+            }
             let row = MenuBarAllowanceTrackView()
             let laneTitle = TiboTattleLocalization.quotaWindowLabel(
                 durationMinutes: lane.durationMinutes
             )
             let resetText: String
-            if let reset = resetCountdown(lane.resetAt, now: now) {
-                resetText = TiboTattleLocalization.format(
-                    .menuBarPopupResets,
-                    reset
-                )
+            if let reset = TrayPresentation.reset(lane.resetAt, format: trayPreferences.resetFormat, now: now) {
+                resetText = trayPreferences.resetFormat == "clock"
+                    ? trayText("reset") + " " + trayText("at") + " " + reset
+                    : TiboTattleLocalization.format(.menuBarPopupResets, reset)
             } else {
                 resetText = TiboTattleLocalization.string(
                     .menuBarPopupResetUnavailable
@@ -1378,7 +1414,7 @@ final class MenuBarPopoverViewController: NSViewController {
             row.configure(
                 title: laneTitle,
                 remainingPercent: lane.roundedRemainingPercent,
-                detail: resetText,
+                detail: trayPreferences.density == "compact" ? "" : resetText,
                 accessibilityDescription: accessibilityDescription
             )
             allowanceRows.addArrangedSubview(row)
@@ -1592,7 +1628,11 @@ final class MenuBarPopoverViewController: NSViewController {
         snapshot: MenuBarStatusSnapshot,
         now: Date
     ) -> [ObservedQuotaLane] {
-        snapshot.currentLanes(now: now)
+        let grouped = Dictionary(grouping: snapshot.currentLanes(now: now), by: \.durationMinutes)
+        return grouped.values.compactMap { lanes in
+            guard let first = lanes.first, lanes.allSatisfy({ $0 == first }) else { return nil }
+            return first
+        }
     }
 
     private func allowanceUnavailableCopy(
@@ -1642,18 +1682,83 @@ final class MenuBarPopoverViewController: NSViewController {
         refreshButton.nextKeyView = moreButton
     }
 
+    func applyPreferencesForSmokeTest(_ preferences: TrayPreferences) {
+        preferencesOverrideForSmokeTest = preferences
+        update(snapshot: currentSnapshot, now: currentNow)
+    }
+
+    func cachePeriodLabelForSmokeTest() -> String { cachePeriodLabel.stringValue }
+
+    func unavailableAllowanceDurationsForSmokeTest() -> [Int] { unavailableAllowanceDurations }
+
+    func arrangedSectionIDsForSmokeTest() -> [String] {
+        contentStack.arrangedSubviews.compactMap { view in
+            optionalSections.first(where: { $0.value === view })?.key
+        }
+    }
+
+    private func applyTrayPreferences() {
+        let p = trayPreferences
+        customizeButton.isHidden = !p.sections.isEmpty
+        cachePeriodLabel.stringValue = TiboTattleLocalization.string(selectedRange == .sevenDays
+            ? .menuBarPopupPeriodLastSevenDays : .menuBarPopupPeriodLastThirtyDays)
+        cachePeriodLabel.setAccessibilityLabel(cachePeriodLabel.stringValue)
+        if appliedSectionOrder != p.sections {
+            for section in optionalSections.values {
+                // Disabled sections (including cache on initial launch) may
+                // never have been arranged. AppKit throws for removing one.
+                if contentStack.arrangedSubviews.contains(where: { $0 === section }) {
+                    contentStack.removeArrangedSubview(section)
+                }
+                section.removeFromSuperview()
+            }
+            // Remove legacy decoration between optional sections; the permanent
+            // header/footer remain independently available in an empty layout.
+            for view in contentStack.arrangedSubviews where view is MenuBarPopoverSeparator {
+                contentStack.removeArrangedSubview(view); view.removeFromSuperview()
+            }
+            for (offset, id) in p.sections.enumerated() {
+                if let section = optionalSections[id] {
+                    contentStack.insertArrangedSubview(section, at: 1 + offset)
+                    section.widthAnchor.constraint(equalTo: contentStack.widthAnchor).isActive = true
+                }
+            }
+            appliedSectionOrder = p.sections
+        }
+        contentStack.spacing = p.density == "compact" ? 7 : MenuBarPopoverMetrics.sectionSpacing
+        historyChart.isHidden = !p.showChart
+        historyTokenLabel.isHidden = !p.metrics.contains("tokens")
+        historyEventsLabel.isHidden = !p.metrics.contains("changes")
+        historyPriceLabel.isHidden = !p.metrics.contains("cost")
+        historyHeadlineLabel.isHidden = p.metrics.isEmpty
+        disclaimerLabel.isHidden = !p.metrics.contains("cost")
+        if currentSnapshot.history.accountingStatus != .unavailable,
+           let cache = currentSnapshot.history.trayCachePeriods.first(where: { $0.periodID == selectedRange.rawValue }) {
+            cacheLabel.stringValue = cache.reusePercent.map { TiboTattleLocalization.percentString(Int($0.rounded())) + " " + trayText("cacheCaption") } ?? trayText("cacheEmpty")
+            if cache.coverage != "complete" { cacheLabel.stringValue += "\n" + trayText("cacheIncomplete") }
+            if currentSnapshot.history.accountingStatus == .retained { cacheLabel.stringValue += "\n" + historyFreshnessLabel.stringValue }
+        } else { cacheLabel.stringValue = trayText("cacheUnavailable") }
+    }
+
     private func containsScrollView(_ candidate: NSView) -> Bool {
         if candidate is NSScrollView { return true }
         return candidate.subviews.contains(where: containsScrollView)
     }
 
     @objc private func historyRangeChanged() {
-        selectedRange = rangeControl.selectedSegment == 1
-            ? .thirtyDays
-            : .sevenDays
+        let newRange: MenuBarHistoryRange = rangeControl.selectedSegment == 1 ? .thirtyDays : .sevenDays
+        var preferences = TrayPreferenceStore.shared.value
+        preferences.historyRange = newRange.rawValue
+        if TrayPreferenceStore.shared.save(preferences) { selectedRange = newRange }
+        else { rangeControl.selectedSegment = selectedRange == .sevenDays ? 0 : 1 }
         renderHistory(currentSnapshot.history)
+        applyTrayPreferences()
         updatePreferredContentSize()
     }
+
+    @objc private func customizeTray() { TrayCustomizationController.shared.open() }
+
+    @objc private func openUsageAndCosts() { (actions.openUsageAndCosts ?? actions.openTiboTattle)() }
 
     @objc private func openTiboTattle() {
         actions.openTiboTattle()
