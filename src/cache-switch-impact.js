@@ -8,6 +8,8 @@ import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
 import {
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
   reasoningEffortName,
 } from "./local-unified-index.js";
 import {
@@ -255,7 +257,9 @@ function sameContinuityConfiguration(row) {
 
 function compactionAwareParser(value) {
   return value === LOCAL_UNIFIED_INDEX_PARSER_VERSION
-    || value === LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION;
+    || value === LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION
+    || value === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION
+    || value === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION;
 }
 
 function componentsFor(row) {
