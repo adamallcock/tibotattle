@@ -99,7 +99,10 @@ Trends compares the selected plan's compatible usage and quota history. Earlier
 history on another plan does not disable a usable current-plan fit, and it is
 not borrowed into that fit. Ambiguous intervals and plan transitions remain
 gaps. Unresolved speed uses the labelled Standard scenario, without pretending
-that Standard speed was observed.
+that Standard speed was observed. During refresh, its last compatible plan-specific
+history stays visible with the retained calibration. Expanded model/speed details
+for unchanged periods stay open and keep their last successful result while
+updated details load; temporary lookup failures do not erase that result.
 
 Do not repeatedly relaunch during a detailed pass; that can make progress appear
 to restart even when source data is intact.

@@ -3770,6 +3770,23 @@ const PROJECTION_SURFACES = Object.freeze([
     path: Object.freeze(["overview", "timeline", "allowanceCapacity"]),
     rows: availableStatusRows,
   },
+  {
+    path: Object.freeze(["overview", "timeline", "planScoped"]),
+    rows: availableStatusRows,
+    // Selected-plan Trends needs the scoped numerator and quota intervals as
+    // well as the fitted capacity. Retain them only with the exact matching
+    // capacity scope, after the capacity's own retention step above.
+    canRetain: (incoming, previous) => {
+      const scope = previous.planScoped?.planScope;
+      const capacity = incoming.allowanceCapacity;
+      return capacity?.status === "available"
+        && scope?.methodVersion === PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION
+        && scope.methodVersion === capacity.planScope?.methodVersion
+        && ["planType", "basisFamilyId", "cohortId", "sourceGeneration",
+          "sourceGenerationFingerprint"].every((key) => scope[key] != null
+            && scope[key] === capacity.planScope?.[key]);
+    },
+  },
 ]);
 
 // Resolve a registered path, or null if any segment is absent. Absence is not
@@ -4021,13 +4038,14 @@ export class LocalCompanionDataStore {
     const retained = this.#snapshot;
     if (retained === null) return next;
     let usageEvidenceRetained = false;
-    for (const { path, rows, preserveIncomingKeys = [], retainSiblingKeys = [] }
+    for (const { path, rows, preserveIncomingKeys = [], retainSiblingKeys = [], canRetain = null }
       of PROJECTION_SURFACES) {
       const key = path[path.length - 1];
       const nextParent = surfaceParent(next, path);
       const retainedParent = surfaceParent(retained, path);
       if (nextParent === null || retainedParent === null) continue;
-      if (rows(nextParent[key]) === 0 && rows(retainedParent[key]) > 0) {
+      if (rows(nextParent[key]) === 0 && rows(retainedParent[key]) > 0
+          && (canRetain === null || canRetain(nextParent, retainedParent))) {
         const incoming = nextParent[key];
         const replacement = structuredClone(retainedParent[key]);
         for (const incomingKey of preserveIncomingKeys) {
