@@ -449,7 +449,14 @@ function buildCommunityAllowanceSingleChartModel(series, {
   };
 }
 
-/** Presentation only: validated public series in, shared axes and gap-aware
+const MODEL_PRESENTATION_ORDER = Object.freeze([
+  "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+]);
+const MODEL_PRESENTATION_THEMES = Object.freeze([
+  "astra", "sol", "terra", "luna", "classic",
+]);
+
+/** Presentation only: validated public series in, shared dollar axes and gap-aware
  * geometry out. No owner data access, pricing, fitting, or inferred history. */
 export function buildCommunityAllowanceChartModel(series, options = {}) {
   const { view = "aggregate", rangeDays = null,
@@ -463,17 +470,22 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
   const anchor = series.days.at(-1).day;
   const cutoff = Number.isFinite(rangeDays) && rangeDays >= 1
     ? communityDayStartMs(anchor) - (rangeDays - 1) * MILLISECONDS_PER_DAY : -Infinity;
-  const days = series.days.filter(day => communityDayStartMs(day.day) >= cutoff);
-  if (days.length === 0) return null;
+  const rangeDaysWithActivity = series.days.filter(day => communityDayStartMs(day.day) >= cutoff);
+  if (rangeDaysWithActivity.length === 0) return null;
   const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
   const definitions = [
     { key: "aggregate", view: "aggregate", label: null, className: "" },
     ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
       key, label, view: "plans", className: `allowance-series-${index}`,
     })),
-    ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => ({
-      key: modelId, label, view: "models", className: `allowance-series-${index % 8}`,
-    })),
+    ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => {
+      const preferred = MODEL_PRESENTATION_ORDER.indexOf(modelId);
+      return { key: modelId, label, view: "models",
+        order: preferred < 0 ? MODEL_PRESENTATION_ORDER.length + index : preferred,
+        theme: preferred < 0 ? null : MODEL_PRESENTATION_THEMES[preferred],
+        className: preferred < 0 ? `allowance-series-${index % 8}`
+          : `allowance-model-${MODEL_PRESENTATION_THEMES[preferred]}` };
+    }).sort((left, right) => left.order - right.order),
   ];
   const summaryFor = (day, definition) => {
     if (definition.view === "aggregate") return day.allowance;
@@ -482,9 +494,20 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     const value = breakdown?.models.find(([id]) => id === definition.key);
     return value ? { centralUsd: value[1], participantCount: value[2], fitCount: null, band80Usd: null } : null;
   };
-  // The entire view family shares one scale, even when a tab is empty.
+  const viewDefinitions = definitions.filter(definition => definition.view === view);
+  // "All" means all estimates for this view, not the unrelated activity year.
+  // Keep real dates and interior gaps; never stretch each series independently.
+  let days = rangeDaysWithActivity;
+  if (cutoff === -Infinity) {
+    const hasEstimate = day => viewDefinitions.some(definition => summaryFor(day, definition)?.centralUsd != null);
+    const first = days.findIndex(hasEstimate);
+    if (first < 0) return null;
+    const last = days.findLastIndex(hasEstimate);
+    days = days.slice(first, last + 1);
+  }
+  // Dollar axes stay comparable across tabs, even when date coverage differs.
   let maximum = 0;
-  for (const day of days) for (const definition of definitions) {
+  for (const day of rangeDaysWithActivity) for (const definition of definitions) {
     const summary = summaryFor(day, definition);
     if (summary?.centralUsd != null) maximum = Math.max(maximum,
       summary.centralUsd, summary.band80Usd?.upperUsd ?? 0);
@@ -508,29 +531,37 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     }
     return segments;
   };
-  const visible = definitions.filter(definition => definition.view === view).map(definition => {
+  const daySpacing = (plot.right - plot.left) / Math.max(1, (endMs - startMs) / MILLISECONDS_PER_DAY);
+  const visible = viewDefinitions.map((definition, seriesOrder) => {
     const dots = days.flatMap(day => {
       const summary = summaryFor(day, definition);
       if (summary?.centralUsd == null) return [];
       return [{ ...summary, day: day.day, x: x(day.day), y: dollars.y(summary.centralUsd),
-        radius: Math.min(7, 2.6 + Math.sqrt(summary.fitCount ?? summary.participantCount)),
-        seriesKey: definition.key, seriesLabel: definition.label, seriesClass: definition.className }];
+        radius: Math.min(5, Math.max(1.6, daySpacing * .3), 2.6 + Math.sqrt(summary.fitCount ?? summary.participantCount)),
+        seriesKey: definition.key, seriesLabel: definition.label, seriesClass: definition.className,
+        seriesTheme: definition.theme ?? null, seriesOrder }];
     });
     const band = dots.filter(dot => dot.band80Usd !== null).map(dot => ({
       day: dot.day, x: dot.x, upperY: dollars.y(dot.band80Usd.upperUsd),
-      lowerY: dollars.y(dot.band80Usd.lowerUsd), seriesClass: dot.seriesClass,
+      lowerY: dollars.y(dot.band80Usd.lowerUsd), seriesClass: dot.seriesClass, seriesKey: dot.seriesKey,
     }));
-    return { ...definition, dots, centralSegments: split(dots), bandSegments: split(band), latest: dots.at(-1) ?? null };
+    const centralSegments = split(dots);
+    // Dense lines retain every observation for hover/keyboard inspection, but
+    // only segment endpoints need permanent markers to avoid a solid dot mass.
+    const markerDots = daySpacing < 14
+      ? centralSegments.flatMap(segment => segment.length === 1 ? segment : [segment[0], segment.at(-1)]) : dots;
+    return { ...definition, dots, markerDots, centralSegments, bandSegments: split(band), latest: dots.at(-1) ?? null };
   }).filter(definition => definition.dots.length > 0);
   if (visible.length === 0) return null;
   const dots = visible.flatMap(definition => definition.dots)
-    .sort((a, b) => a.day.localeCompare(b.day) || a.seriesKey.localeCompare(b.seriesKey));
+    .sort((a, b) => a.day.localeCompare(b.day) || a.seriesOrder - b.seriesOrder);
   const dayTicks = Array.from({ length: 6 }, (_, index) => {
     const day = new Date(startMs + Math.round((endMs - startMs) * index / 5 / MILLISECONDS_PER_DAY)
       * MILLISECONDS_PER_DAY).toISOString().slice(0, 10);
     return { day, x: x(day) };
   }).filter((tick, index, ticks) => index === 0 || tick.day !== ticks[index - 1].day);
   return { width, height, margin, plot, dots, view,
+    markerDots: visible.flatMap(definition => definition.markerDots),
     latest: dots.at(-1), legendSeries: view === "aggregate" ? null : visible,
     latestSummaries: visible.map(definition => definition.latest),
     spanDays: 1 + Math.round((endMs - startMs) / MILLISECONDS_PER_DAY),
@@ -550,6 +581,22 @@ function svgNode(documentRef, tag, className = "", attributes = {}) {
     element.setAttribute(name, String(value));
   }
   return element;
+}
+
+function modelThemeIcon(documentRef, theme) {
+  const paths = {
+    astra: "M12 3 14.5 9.5 21 12 14.5 14.5 12 21 9.5 14.5 3 12 9.5 9.5Z",
+    sol: "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8 M12 2v2 M12 20v2 M2 12h2 M20 12h2 M5 5l1.5 1.5 M17.5 17.5 19 19 M5 19l1.5-1.5 M17.5 6.5 19 5",
+    terra: "M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18 M4 8h5l2 4-3 2 1 6 M14 4l-1 4 4 2 3-1 M18 14l-3 1-1 5",
+    luna: "M19.5 15.5A9 9 0 0 1 8.5 4.5a9 9 0 1 0 11 11Z",
+    classic: "M5 6h14v12H5Z M9 6v12 M5 10h14",
+  };
+  if (!paths[theme]) return null;
+  const icon = svgNode(documentRef, "svg", "allowance-model-icon", {
+    viewBox: "0 0 24 24", "aria-hidden": "true", focusable: "false",
+  });
+  icon.append(svgNode(documentRef, "path", "", { d: paths[theme] }));
+  return icon;
 }
 
 function tickLabelFormatter(style) {
@@ -845,22 +892,29 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
   const dollars = usdFormatter();
 
   const figure = node("div", "community-daily-chart community-allowance-chart");
-  const legend = node("p", "community-daily-legend");
+  const legend = node("div", "community-daily-legend allowance-series-legend");
+  const legendButtons = [];
   const legendItems = model.legendSeries?.map(series => [
-    `daily-legend-swatch allowance-central ${series.className}`, series.label,
+    `daily-legend-swatch allowance-central ${series.className}`, series.label, series.key,
   ]) ?? [
     ["daily-legend-swatch allowance-central", "community.allowance.legendCentral"],
     ["daily-legend-swatch allowance-band", "community.allowance.legendBand"],
     ["daily-legend-swatch allowance-dot", "community.allowance.legendDots"],
   ].map(([className, key]) => [className, t(key)]);
-  for (const [swatchClass, label] of legendItems) {
-    const item = node("span");
+  for (const [swatchClass, label, seriesKey] of legendItems) {
+    const item = node(seriesKey ? "button" : "span", seriesKey ? "allowance-legend-button" : "");
+    if (seriesKey) {
+      item.setAttribute("type", "button");
+      item.setAttribute("aria-pressed", "false");
+      legendButtons.push({ item, seriesKey });
+    }
     const swatch = node("span", swatchClass);
     swatch.setAttribute("aria-hidden", "true");
     item.append(swatch, node("span", "", label));
     legend.append(item);
   }
   figure.append(legend);
+  if (legendButtons.length) figure.append(node("p", "allowance-legend-hint", t("community.allowance.legendFocus")));
 
   const svg = svgNode(documentRef, "svg", "", {
     viewBox: `0 0 ${model.width} ${model.height}`,
@@ -871,6 +925,11 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
       : model.view === "plans" ? "community.allowance.planChartDescription" : "community.allowance.chartDescription"),
   });
   svg.setAttribute("data-i18n-skip", "");
+  const seriesMarks = [];
+  const appendSeriesMark = (mark, seriesKey) => {
+    seriesMarks.push({ mark, seriesKey });
+    svg.append(mark);
+  };
 
   for (const tick of model.dollarTicks) {
     svg.append(svgNode(documentRef, "line", "chart-grid", {
@@ -906,26 +965,26 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
         .map((point) => `${point.x.toFixed(1)},${point.upperY.toFixed(1)}`);
       const backward = [...band].reverse()
         .map((point) => `${point.x.toFixed(1)},${point.lowerY.toFixed(1)}`);
-      svg.append(svgNode(documentRef, "path", `allowance-band-area ${band[0].seriesClass ?? ""}`.trim(), {
+      appendSeriesMark(svgNode(documentRef, "path", `allowance-band-area ${band[0].seriesClass ?? ""}`.trim(), {
         d: `M${[...forward, ...backward].join(" L")} Z`,
-      }));
+      }), band[0].seriesKey);
     } else {
-      svg.append(svgNode(documentRef, "line", `allowance-band-mark ${band[0].seriesClass ?? ""}`.trim(), {
+      appendSeriesMark(svgNode(documentRef, "line", `allowance-band-mark ${band[0].seriesClass ?? ""}`.trim(), {
         x1: band[0].x,
         x2: band[0].x,
         y1: band[0].upperY,
         y2: band[0].lowerY,
-      }));
+      }), band[0].seriesKey);
     }
   }
 
   for (const segment of model.centralSegments) {
     if (segment.length >= 2) {
-      svg.append(svgNode(documentRef, "polyline", `allowance-central-line ${segment[0].seriesClass ?? ""}`.trim(), {
+      appendSeriesMark(svgNode(documentRef, "polyline", `allowance-central-line ${segment[0].seriesClass ?? ""}`.trim(), {
         points: segment
           .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
           .join(" "),
-      }));
+      }), segment[0].seriesKey);
     }
   }
 
@@ -938,7 +997,7 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
   // Data dots. Each keeps a native <title> so the accessibility tree and any
   // no-JS fallback still name the point; the richer visual tooltip below layers
   // on top for pointer and keyboard users.
-  for (const dot of model.dots) {
+  for (const dot of model.markerDots ?? model.dots) {
     const circle = svgNode(documentRef, "circle", `allowance-fit-dot ${dot.seriesClass ?? ""}`.trim(), {
       cx: dot.x,
       cy: dot.y,
@@ -947,7 +1006,7 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
     const title = svgNode(documentRef, "title");
     title.textContent = `${dot.seriesLabel ? `${dot.seriesLabel} · ` : ""}${dot.day}: ${dollars.format(dot.centralUsd)} — ${pointEvidence(dot)}`;
     circle.append(title);
-    svg.append(circle);
+    appendSeriesMark(circle, dot.seriesKey);
   }
 
   // Hover furniture, painted above the dots but under a transparent capture
@@ -1083,15 +1142,34 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
     tooltip.setAttribute("data-visible", "false");
   };
 
+  let activeSeriesKey = null;
+  let inspectionDots = model.dots;
+  let selected = inspectionDots.length - 1;
+  for (const { item, seriesKey } of legendButtons) {
+    item.addEventListener("click", () => {
+      activeSeriesKey = activeSeriesKey === seriesKey ? null : seriesKey;
+      inspectionDots = activeSeriesKey === null ? model.dots
+        : model.dots.filter(dot => dot.seriesKey === activeSeriesKey);
+      selected = inspectionDots.length - 1;
+      for (const button of legendButtons) {
+        button.item.setAttribute("aria-pressed", String(button.seriesKey === activeSeriesKey));
+      }
+      for (const { mark, seriesKey: key } of seriesMarks) {
+        mark.setAttribute("data-muted", String(activeSeriesKey !== null && key !== activeSeriesKey));
+      }
+      hide();
+    });
+  }
+
   const nearestDot = (clientX, clientY) => {
     const rect = svg.getBoundingClientRect();
-    if (!rect || rect.width === 0) return model.dots[0];
+    if (!rect || rect.width === 0) return inspectionDots[0];
     const viewX = ((clientX - rect.left) / rect.width) * model.width;
     const viewY = ((clientY - rect.top) / rect.height) * model.height;
-    let best = model.dots[0];
+    let best = inspectionDots[0];
     let bestDistance = Infinity;
     let bestVerticalDistance = Infinity;
-    for (const dot of model.dots) {
+    for (const dot of inspectionDots) {
       const distance = Math.abs(dot.x - viewX);
       const vertical = Math.abs(dot.y - viewY);
       if (distance < bestDistance || (distance === bestDistance && vertical < bestVerticalDistance)) {
@@ -1119,7 +1197,6 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
   // events, which SVG graphics elements dispatch inconsistently across engines.
   // The tooltip is an aria-live region, so each step is announced.
   svg.setAttribute("tabindex", "0");
-  let selected = model.dots.length - 1;
   svg.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       hide();
@@ -1127,23 +1204,23 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
     }
     let moved = true;
     if (event.key === "ArrowRight") {
-      selected = Math.min(model.dots.length - 1, selected + 1);
+      selected = Math.min(inspectionDots.length - 1, selected + 1);
     } else if (event.key === "ArrowLeft") {
       selected = Math.max(0, selected - 1);
     } else if (event.key === "Home") {
       selected = 0;
     } else if (event.key === "End") {
-      selected = model.dots.length - 1;
+      selected = inspectionDots.length - 1;
     } else {
       moved = false;
     }
     if (!moved) return;
     event.preventDefault();
-    showDot(model.dots[selected]);
+    showDot(inspectionDots[selected]);
   });
   // Best effort: some engines do fire focus/blur on the SVG root even when they
   // skip its graphics children. When they do, the chart shows/hides on tab.
-  svg.addEventListener("focus", () => showDot(model.dots[selected]));
+  svg.addEventListener("focus", () => showDot(inspectionDots[selected]));
   svg.addEventListener("blur", hide);
 }
 
@@ -1223,13 +1300,17 @@ export function renderCommunityAllowanceSection({
   const dollars = usdFormatter();
   container.append(node("p", "snapshot-disclosure", t("community.allowance.smallSampleDisclosure")));
   if (view !== "aggregate") {
+    container.append(node("p", "allowance-summary-caption", t("community.allowance.cardsCaption")));
     const cards = node("div", "allowance-summary-cards");
     for (const latest of model.latestSummaries) {
-      const card = node("article", "allowance-summary-card");
-      card.append(node("h3", "", latest.seriesLabel),
+      const card = node("article", `allowance-summary-card ${latest.seriesClass}`.trim());
+      const heading = node("div", "allowance-summary-heading");
+      heading.append(node("h3", "", latest.seriesLabel));
+      const icon = modelThemeIcon(documentRef, latest.seriesTheme);
+      if (icon) heading.append(icon);
+      card.append(heading,
         node("strong", "allowance-summary-value", dollars.format(latest.centralUsd)),
-        node("p", "", t("community.allowance.perWindow")),
-        node("p", "allowance-headline-caveat", `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.accountCount", latest.participantCount)}`));
+        node("p", "allowance-headline-caveat", `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.shortAccountCount", latest.participantCount)}`));
       cards.append(card);
     }
     container.append(cards);

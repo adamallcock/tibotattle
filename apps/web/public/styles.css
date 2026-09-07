@@ -3739,18 +3739,28 @@ footer p { margin: 0; }
 .allowance-summary-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
-  gap: 12px;
-  margin-top: 16px;
+  gap: 10px;
+  margin-top: 8px;
 }
 .allowance-summary-card {
-  padding: 16px;
+  padding: 12px 14px;
   border: 1px solid var(--line);
+  border-top: 3px solid var(--allowance-color, var(--green));
   border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--allowance-color, var(--green)) 5%, var(--site-paper, #fffdf7));
   min-width: 0;
 }
-.allowance-summary-card h3 { font-size: 1rem; margin: 0 0 8px; }
-.allowance-summary-card p { font-size: .875rem; margin: 6px 0 0; }
-.allowance-summary-value { font-family: var(--serif); font-size: 2.4rem; }
+.allowance-summary-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 4px; }
+.allowance-summary-card h3 { font-size: .875rem; margin: 0; }
+.allowance-summary-card p { font-size: .72rem; line-height: 1.4; margin: 4px 0 0; }
+.allowance-summary-value { font-family: var(--serif); font-size: 2rem; line-height: 1.15; }
+.allowance-summary-caption { color: var(--muted); font-size: .72rem; font-weight: var(--weight-semibold); margin: 12px 0 0; }
+.allowance-model-icon { width: 24px; height: 24px; flex: 0 0 auto; fill: none; stroke: var(--allowance-color); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.allowance-model-astra { --allowance-color: #365f69; }
+.allowance-model-sol { --allowance-color: #a96719; }
+.allowance-model-terra { --allowance-color: #586a3b; }
+.allowance-model-luna { --allowance-color: #676b8c; }
+.allowance-model-classic { --allowance-color: #68665f; }
 .allowance-series-0 { --allowance-color: #42636c; }
 .allowance-series-1 { --allowance-color: #ac4b16; }
 .allowance-series-2 { --allowance-color: #7542a0; }
@@ -3764,6 +3774,16 @@ footer p { margin: 0; }
 .community-allowance-chart .allowance-band-mark { stroke: var(--allowance-color, var(--green)); }
 .community-allowance-chart .allowance-fit-dot,
 .community-allowance-chart .allowance-band-area { fill: var(--allowance-color, var(--green)); }
+.community-site .allowance-legend-button {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 36px;
+  padding: 4px 8px; border: 1px solid transparent; border-radius: var(--radius-xs);
+  font: inherit; color: var(--muted); background: transparent; cursor: pointer;
+}
+.community-site .allowance-legend-button:hover,
+.community-site .allowance-legend-button[aria-pressed="true"] { color: var(--ink); background: var(--surface-raised); border-color: var(--line-strong); }
+.community-site .allowance-legend-button:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.community-site .allowance-legend-hint { margin: 0 0 10px; font-size: .65rem; color: var(--muted); }
+.community-site .community-allowance-chart [data-muted="true"] { opacity: .07; }
 
 /*
  * The hero chart expands into a modal lightbox rather than taking over the
@@ -3802,7 +3822,7 @@ html.community-chart-modal-open body {
   justify-content: space-between;
   gap: 28px;
   align-items: flex-start;
-  padding: 24px clamp(20px, 3vw, 34px) 20px;
+  padding: 18px clamp(20px, 3vw, 34px) 16px;
   border-bottom: 1px solid var(--line);
   background: rgba(255, 253, 247, .96);
   backdrop-filter: blur(12px);
@@ -3819,7 +3839,7 @@ html.community-chart-modal-open body {
 .community-site .community-chart-dialog-header h2 {
   margin: 0;
   font-family: var(--serif);
-  font-size: clamp(2rem, 4vw, 3.25rem);
+  font-size: clamp(1.6rem, 3vw, 2.4rem);
   font-weight: var(--weight-display);
   letter-spacing: -.04em;
   line-height: .98;
@@ -4406,12 +4426,13 @@ html.community-chart-modal-open body {
     padding: 18px 16px 16px;
   }
   .community-site .community-chart-dialog-header h2 {
-    font-size: clamp(1.8rem, 9vw, 2.6rem);
+    font-size: clamp(1.5rem, 6vw, 2rem);
   }
   .community-site .community-chart-dialog-toolbar {
     justify-content: space-between;
     padding: 14px 16px 0;
   }
+  .community-site .community-chart-dialog-toolbar > span { display: none; }
   .community-site .community-chart-dialog-result {
     padding: 0 16px 20px;
   }
