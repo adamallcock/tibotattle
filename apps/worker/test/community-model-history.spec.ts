@@ -234,7 +234,7 @@ describe("historical model warmer and retrospective publication", () => {
     expect(await dayRow()).toMatchObject({ payload_json: '{"synthetic":"forward-snapshot"}', history_method_version: null });
   });
 
-  it("resumes an acquisition-only pass and publishes only after the finished result is reread", async () => {
+  it("resumes an acquisition-only pass and rereads the finished cohort for publication in the same invocation", async () => {
     const fixture = await seedModelHistoryFixture({ participantId: "history-resumable" });
     await seedCurrentCaches(fixture.participantId);
     const before = await currentCaches();
@@ -247,17 +247,70 @@ describe("historical model warmer and retrospective publication", () => {
     expect(await currentCaches()).toEqual(before);
     expect(await dayRow()).toBeNull();
     const second = await warm();
-    expect(second.progress).toMatchObject({ day: DAY, requiredAccounts: 1, resolvedAccounts: 1, publishedDays: 0 });
+    expect(second.progress).toMatchObject({ day: DAY, requiredAccounts: 1, resolvedAccounts: 1, publishedDays: 1 });
     expect(await db().prepare("SELECT run_id,phase FROM community_model_history_work").first())
       .toEqual({ run_id: saved!.run_id, phase: "complete" });
-    expect(await dayRow()).toBeNull();
-    const third = await warm(40);
-    expect(third.progress.publishedDays).toBe(1);
+    expect(second.observation.queries.filter(sql => sql === MODEL_HISTORY_CENSUS_SQL)).toHaveLength(2);
     const payload = JSON.parse((await dayRow())!.payload_json);
     expect(payload.fittedParticipantCount).toBe(1);
     expect(payload.values.map((value: [string, number, number]) => value[0])).toEqual(["gpt-5.6-sol", "gpt-5.6-terra"]);
     expect((await currentCaches()).slice(0, 2)).toEqual(before.slice(0, 2));
     expect(await db().prepare("SELECT count(*) AS n FROM community_analysis_work").first()).toEqual({ n: 0 });
+  });
+
+  it("uses available budget for more than two small accounts instead of idling until another cron", async () => {
+    for (let account = 0; account < 3; account++) await participant(`history-throughput-${account}`);
+    const run = await warm();
+    expect(run.progress).toMatchObject({ day: DAY, requiredAccounts: 3, resolvedAccounts: 3, publishedDays: 1 });
+    expect(await db().prepare("SELECT COUNT(*) AS n FROM community_model_history_results WHERE day=?").bind(DAY).first())
+      .toEqual({ n: 3 });
+    expect(JSON.parse((await dayRow())!.payload_json)).toMatchObject({ fittedParticipantCount: 0, refusedParticipantCount: 3 });
+    expect(run.meter.queriesUsed).toBeLessThanOrEqual(888);
+  });
+
+  it("rotates all accounts across three-minute history-priority slots under a tight budget", async () => {
+    for (let account = 0; account < 3; account++) {
+      await seedModelHistoryFixture({ participantId: `history-rotation-${account}` });
+    }
+    for (let round = 0; round < 3; round++) {
+      const run = await warm(100, observed(), NOW + round * 3 * 60_000);
+      expect(run.progress.publishedDays).toBe(0);
+      expect(await db().prepare("SELECT COUNT(*) AS n FROM community_model_history_work").first())
+        .toEqual({ n: round + 1 });
+    }
+  });
+
+  it("finishes real synthetic fits before September and then advances to the next older date", async () => {
+    await seedModelHistoryFixture({ participantId: "history-august", startDay: "2026-08-26" });
+    const now = Date.parse("2026-09-01T12:00:00.000Z");
+    const august31 = await warm(900, observed(), now);
+    expect(august31.progress).toMatchObject({ day: "2026-08-31", resolvedAccounts: 1, publishedDays: 1 });
+    const first = JSON.parse((await dayRow("2026-08-31"))!.payload_json);
+    expect(first.fittedParticipantCount).toBe(1);
+    expect(first.values.map((value: [string, number, number]) => value[0]))
+      .toEqual(["gpt-5.6-sol", "gpt-5.6-terra"]);
+    const august30 = await warm(900, observed(), now + 60_000);
+    expect(august30.progress).toMatchObject({ day: "2026-08-30", resolvedAccounts: 1, publishedDays: 1 });
+    expect(JSON.parse((await dayRow("2026-08-30"))!.payload_json).fittedParticipantCount).toBe(1);
+    expect(JSON.parse((await dayRow("2026-08-31"))!.payload_json)).toEqual(first);
+  });
+
+  it("revalidates a source correction after the last result without publishing or starting another acquisition", async () => {
+    const fixture = await seedModelHistoryFixture({ participantId: "history-finish-correction" });
+    let raced = false;
+    const observation = observed(async (sql, moment) => {
+      if (!raced && moment === "after" && sql.includes("INSERT INTO community_model_history_results")) {
+        raced = true;
+        await db().prepare("UPDATE telemetry_v1_chunks SET parser_version='synthetic-after-result' WHERE participant_id=?")
+          .bind(fixture.participantId).run();
+      }
+    });
+    const run = await warm(900, observation);
+    expect(raced).toBe(true);
+    expect(run.progress).toMatchObject({ day: DAY, requiredAccounts: 1, resolvedAccounts: 0, publishedDays: 0 });
+    expect(await dayRow()).toBeNull();
+    expect(observation.queries.filter(sql => sql.includes("INSERT INTO community_model_history_results"))).toHaveLength(1);
+    expect(observation.queries.filter(sql => sql === MODEL_HISTORY_CENSUS_SQL)).toHaveLength(2);
   });
 
   it.each(["source", "lease", "expiry"] as const)("fences a %s race before whole-day publication", async action => {

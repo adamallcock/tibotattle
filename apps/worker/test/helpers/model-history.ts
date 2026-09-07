@@ -82,19 +82,22 @@ export function pricedModelHistoryUsage(modelId: string, costUsd: number, observ
   return { record: { stream: "usage" as const, observedAt, modelId, recordJson }, costUsd: priced.costNanousd / 1e9 };
 }
 
-export async function seedModelHistoryFixture(options: { participantId?: string; binCount?: number } = {}) {
+export async function seedModelHistoryFixture(options: { participantId?: string; binCount?: number; startDay?: string } = {}) {
   const fixture = await createV11DeviceFixture(database(), { participantId: options.participantId ?? MODEL_HISTORY_TEST_PARTICIPANT });
-  const records: SyntheticModelHistoryRecord[] = [{ stream: "quota", observedAt: modelHistoryTestTime(0), usedPercent: 0 }];
+  const base = options.startDay ? Date.parse(`${options.startDay}T00:00:00.000Z`) : BASE;
+  const time = (hours: number) => new Date(base + hours * HOUR).toISOString();
+  const resetsAt = new Date(base + 7 * DAY_MS).toISOString();
+  const records: SyntheticModelHistoryRecord[] = [{ stream: "quota", observedAt: time(0), usedPercent: 0, resetsAt }];
   let usedPercent = 0;
   // Two independent cost columns, with the same known coefficients in both
   // interleaved halves. This must clear identification, not merely a fallback.
   for (let bin = 0; bin < (options.binCount ?? 60); bin++) {
     for (const [index, [model, capacity]] of Object.entries(MODEL_HISTORY_TEST_CAPACITIES).entries()) {
       const cost = (5 + ((bin * 7 + index * 11) % 17) / 4) * ((bin + index) % 3 === 0 ? 0.2 : 1);
-      const usage = pricedModelHistoryUsage(model, cost, modelHistoryTestTime(bin * 2 + 0.5));
+      const usage = pricedModelHistoryUsage(model, cost, time(bin * 2 + 0.5));
       records.push(usage.record); usedPercent += usage.costUsd * 100 / capacity;
     }
-    records.push({ stream: "quota", observedAt: modelHistoryTestTime(bin * 2 + 1), usedPercent });
+    records.push({ stream: "quota", observedAt: time(bin * 2 + 1), usedPercent, resetsAt });
   }
   if (usedPercent >= 100) throw new Error("synthetic history fixture must stay below its quota reset");
   await insertModelHistoryRecords(fixture, "original", records);

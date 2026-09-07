@@ -5,7 +5,7 @@ import type { D1InvocationBudget } from "../src/d1-invocation-budget";
 
 const inspection = vi.hoisted(() => ({
   limit: 900, meter: null as D1InvocationBudget | null,
-  rawFits: vi.fn(), rawModels: vi.fn(), backfill: vi.fn(),
+  rawFits: vi.fn(), rawModels: vi.fn(), backfill: vi.fn(), modelHistory: vi.fn(),
 }));
 vi.mock("../src/d1-invocation-budget", async original => {
   const actual = await original<typeof import("../src/d1-invocation-budget")>();
@@ -24,6 +24,13 @@ vi.mock("../src/quota-fit-projection", async original => {
   return { ...actual, backfillV1QuotaFitProjection: (...args: Parameters<typeof actual.backfillV1QuotaFitProjection>) => {
     inspection.backfill();
     return actual.backfillV1QuotaFitProjection(...args);
+  } };
+});
+vi.mock("../src/community-model-history", async original => {
+  const actual = await original<typeof import("../src/community-model-history")>();
+  return { ...actual, warmCommunityModelHistory: (...args: Parameters<typeof actual.warmCommunityModelHistory>) => {
+    inspection.modelHistory(...args);
+    return actual.warmCommunityModelHistory(...args);
   } };
 });
 
@@ -128,6 +135,7 @@ async function seedQuota(count = 1200) {
 beforeEach(async () => {
   await reset(); await migrations(); inspection.limit = 900; inspection.meter = null;
   vi.clearAllMocks();
+  inspection.backfill.mockReset(); inspection.modelHistory.mockReset();
   inspection.rawFits.mockImplementation(() => { throw new Error("raw graph fit analyzer forbidden"); });
   inspection.rawModels.mockImplementation(() => { throw new Error("raw graph model analyzer forbidden"); });
   vi.spyOn(console, "log").mockImplementation(() => {});
@@ -136,7 +144,7 @@ beforeEach(async () => {
 afterEach(() => { vi.restoreAllMocks(); });
 
 describe("actual scheduled resumable analysis recovery", () => {
-  it("finishes required device, identity and real R2 lifecycle work before optional reconstruction failure", async () => {
+  it.each([0, 120_000])("finishes required device, identity and real R2 lifecycle work before optional reconstruction failure at offset %i", async offset => {
     const fixture = await seedQuota(200);
     const principal = await authenticateDevice(db(), fixture.authorization);
     await createDeviceUploadAuthorization(db(), principal, "c".repeat(64), 1);
@@ -165,7 +173,7 @@ describe("actual scheduled resumable analysis recovery", () => {
       };
       throw new Error("synthetic optional projection failure");
     });
-    const result = await runScheduledMaintenance(bindings(observation), NOW);
+    const result = await runScheduledMaintenance(bindings(observation), NOW + offset);
     expect(optionalSeen).toBe(true);
     expect(lifecycleAtOptionalFailure).toEqual({ object: null, device: { state: "revoked" }, handoffs: { n: 0 }, cooldowns: { n: 0 } });
     expect(result).toMatchObject({ outcome: "success", lifecycleComplete: true, quarantineReconciliationComplete: true,
@@ -193,11 +201,114 @@ describe("actual scheduled resumable analysis recovery", () => {
     const result = await runScheduledMaintenance(bindings(observation, "paused"), NOW);
     expect(result).toMatchObject({ outcome: "success", lifecycleComplete: true, aggregateRebuildComplete: false });
     expect(inspection.backfill).not.toHaveBeenCalled();
+    expect(inspection.modelHistory).not.toHaveBeenCalled();
     expect(observation.queries.some(entry => /community_analysis_work|telemetry_v1_quota_fit_(?:backfill|rows)/u.test(entry.sql))).toBe(false);
     expect((await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds ORDER BY day").all()).results).toEqual(queued);
     for (const table of ["community_analysis_work", "community_allowance_fit_cache", "community_model_composition_cache"])
       expect(await db().prepare(`SELECT count(*) AS n FROM ${table}`).first()).toEqual({ n: 0 });
     expect(inspection.rawFits).not.toHaveBeenCalled(); expect(inspection.rawModels).not.toHaveBeenCalled();
+    assertMeter(observation); await released();
+  });
+
+  it.each([
+    { priority: "preview", offset: 0, phase: "after_publication" },
+    { priority: "current", offset: 60_000, phase: "after_publication" },
+    { priority: "history", offset: 120_000, phase: "before_analysis" },
+  ])("gives $priority the first optional slot and attempts history exactly once", async ({ priority, offset, phase }) => {
+    await seedQuota(200); await queue();
+    const started = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(started);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const order: string[] = [];
+    inspection.backfill.mockImplementation(() => { order.push("current"); });
+    inspection.modelHistory.mockImplementation(() => { order.push("history"); });
+    const observation = observe(async (entry, moment) => {
+      if (moment === "before" && entry.sql.includes("FROM admin_community_allowance_preview_cache")) order.push("preview");
+    });
+    expect(await runScheduledMaintenance(bindings(observation), NOW + offset))
+      .toMatchObject({ outcome: "success", lifecycleComplete: true });
+    expect(order[0]).toBe(priority);
+    expect(order).toContain("current"); expect(order).toContain("preview");
+    expect(inspection.modelHistory).toHaveBeenCalledExactlyOnceWith(expect.anything(), NOW + offset,
+      { meter: inspection.meter, deadlineMs: started + 40_000, maintenanceLease: expect.any(String) });
+    if (priority !== "history") {
+      expect(order.indexOf("history")).toBeGreaterThan(order.lastIndexOf("preview"));
+      expect(order.indexOf("history")).toBeGreaterThan(order.indexOf("current"));
+    }
+    const historyLogs = logSpy.mock.calls.map(([message]) => JSON.parse(String(message)) as { event: string })
+      .filter(log => log.event === "scheduled_model_history");
+    expect(historyLogs).toEqual([expect.objectContaining({ phase, code: "BOUNDED_MODEL_HISTORY_PROGRESS",
+      outcome: "deferred", phaseQueries: expect.any(Number), phaseElapsedMs: 0,
+      queriesUsed: expect.any(Number), elapsedMs: 0, deadlineRemainingMs: 40_000 })]);
+    expect(inspection.rawFits).not.toHaveBeenCalled(); expect(inspection.rawModels).not.toHaveBeenCalled();
+    assertMeter(observation); await released();
+  });
+
+  it("admits historical acquisition before a slow current-account probe consumes the deadline", async () => {
+    await seedQuota(200);
+    const setup = observe(); await runScheduledMaintenance(bindings(setup), NOW);
+    assertMeter(setup); await released();
+    inspection.modelHistory.mockClear();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    logSpy.mockClear();
+    const started = Date.now(); let crossed = false;
+    vi.spyOn(Date, "now").mockImplementation(() => started + (crossed ? 40_001 : 0));
+    const observation = observe(async (entry, moment) => {
+      if (crossed || moment !== "after" || !entry.sql.includes("FROM community_analysis_work w")
+          || !entry.sql.includes("c.composition_json")) return;
+      expect(inspection.modelHistory).toHaveBeenCalledTimes(1);
+      crossed = true;
+    });
+    expect(await runScheduledMaintenance(bindings(observation), NOW + 120_000))
+      .toMatchObject({ outcome: "success", lifecycleComplete: true });
+    expect(crossed).toBe(true);
+    expect(inspection.modelHistory).toHaveBeenCalledTimes(1);
+    const logs = logSpy.mock.calls.map(([message]) => JSON.parse(String(message)) as { event: string });
+    expect(logs.filter(log => log.event === "scheduled_model_history")).toEqual([
+      expect.objectContaining({ phase: "before_analysis", code: "BOUNDED_MODEL_HISTORY_PROGRESS",
+        elapsedMs: 0, deadlineRemainingMs: 40_000 }),
+    ]);
+    expect(logs).toContainEqual(expect.objectContaining({ event: "scheduled_allowance_reconstruction",
+      outcome: "complete", elapsedMs: 40_001, deadlineRemainingMs: 0 }));
+    assertMeter(observation); await released();
+  });
+
+  it("defers the dedicated history slot when mandatory work leaves insufficient query headroom", async () => {
+    await seedQuota(200); await queue(); inspection.limit = 90;
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const observation = observe();
+    expect(await runScheduledMaintenance(bindings(observation), NOW + 120_000))
+      .toMatchObject({ outcome: "success", lifecycleComplete: true });
+    expect(inspection.modelHistory).not.toHaveBeenCalled();
+    const logs = logSpy.mock.calls.map(([message]) => JSON.parse(String(message)) as { event: string });
+    expect(logs.filter(log => log.event === "scheduled_model_history")).toEqual([
+      expect.objectContaining({ phase: "before_analysis", outcome: "deferred",
+        code: "MODEL_HISTORY_BUDGET_DEFERRED", phaseQueries: 0 }),
+    ]);
+    assertMeter(observation); await released();
+  });
+
+  it("isolates an early history failure, continues current publication and never retries history late", async () => {
+    await seedQuota(200); await queue();
+    inspection.modelHistory.mockImplementation(() => { throw new Error("synthetic private historical detail"); });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const observation = observe();
+    expect(await runScheduledMaintenance(bindings(observation), NOW + 120_000))
+      .toMatchObject({ outcome: "success", lifecycleComplete: true });
+    expect(inspection.modelHistory).toHaveBeenCalledTimes(1);
+    expect(inspection.backfill).toHaveBeenCalled();
+    for (const table of ["community_allowance_fit_cache", "community_model_composition_cache"])
+      expect(await db().prepare(`SELECT count(*) AS n FROM ${table}`).first()).toEqual({ n: 1 });
+    expect(await db().prepare("SELECT count(*) AS n FROM community_daily_aggregate_rebuilds").first()).toEqual({ n: 0 });
+    const logs = [...logSpy.mock.calls, ...warnSpy.mock.calls]
+      .map(([message]) => JSON.parse(String(message)) as { event: string });
+    expect(logs.filter(log => log.event === "scheduled_model_history")).toEqual([
+      { level: "warn", event: "scheduled_model_history", phase: "before_analysis", outcome: "deferred",
+        code: "MODEL_HISTORY_UNAVAILABLE", phaseQueries: 0, phaseElapsedMs: expect.any(Number),
+        queriesUsed: expect.any(Number), elapsedMs: expect.any(Number), deadlineRemainingMs: expect.any(Number) },
+    ]);
+    expect(JSON.stringify(logs)).not.toContain("synthetic private historical detail");
     assertMeter(observation); await released();
   });
 
@@ -222,7 +333,7 @@ describe("actual scheduled resumable analysis recovery", () => {
     const setupReceipt = { fixedSetupQueries,
       primary: second.queries.slice(0, fixedSetupQueries).filter(entry => entry.binding === "primary").length,
       ledger: second.queries.slice(0, fixedSetupQueries).filter(entry => entry.binding === "ledger").length };
-    // Odd-minute reconstruction has no speculative preview/cohort scan. Keep
+    // The current-first slot has no speculative preview/cohort scan. Keep
     // the original setup budget even when the preview's inputs are incomplete.
     expect(second.queries.slice(0, payloadRead).some(entry => entry.sql.includes("FROM admin_community_allowance_preview_cache"))).toBe(false);
     expect(setupReceipt).toEqual({ fixedSetupQueries: 50, primary: 47, ledger: 3 });
@@ -234,9 +345,16 @@ describe("actual scheduled resumable analysis recovery", () => {
       .toMatchObject({ fixed_now: before!.fixed_now, run_id: before!.run_id, phase: "complete" });
     for (const table of ["community_allowance_fit_cache", "community_model_composition_cache"])
       expect(await db().prepare(`SELECT count(*) AS n FROM ${table}`).first()).toEqual({ n: 1 });
-    const third = observe(); await runScheduledMaintenance(bindings(third), NOW + 120_000);
+    const third = observe(); let currentStart = -1;
+    inspection.backfill.mockImplementation(() => {
+      if (currentStart < 0) currentStart = third.queries.length;
+    });
+    await runScheduledMaintenance(bindings(third), NOW + 120_000);
     assertMeter(third); await released();
-    expect(third.queries.filter(entry => entry.sql === V1_PLAN_QUOTA_PAGE_SQL || entry.sql === V1_FIT_QUOTA_PAGE_SQL)).toEqual([]);
+    // The history-first slot may acquire its separate closed-date window, but
+    // current caches must still skip all repeated source acquisition afterward.
+    expect(currentStart).toBeGreaterThan(0);
+    expect(third.queries.slice(currentStart).filter(entry => entry.sql === V1_PLAN_QUOTA_PAGE_SQL || entry.sql === V1_FIT_QUOTA_PAGE_SQL)).toEqual([]);
     expect(inspection.rawFits).not.toHaveBeenCalled(); expect(inspection.rawModels).not.toHaveBeenCalled();
   });
 
@@ -306,7 +424,11 @@ describe("actual scheduled resumable analysis recovery", () => {
       queriesUsed: expect.any(Number), phaseQueries: 13 }));
     expect(observation.queries.filter(entry => entry.sql.includes("FROM admin_community_allowance_preview_cache"))).toHaveLength(1);
     expect(warnSpy.mock.calls.some(([message]) => String(message).includes("admin_allowance_preview_cache"))).toBe(false);
-    expect(logs.some(log => log.event === "scheduled_model_history")).toBe(false);
+    expect(logs.filter(log => log.event === "scheduled_model_history")).toEqual([
+      expect.objectContaining({ phase: "after_publication", outcome: "deferred",
+        code: "MODEL_HISTORY_DEADLINE_DEFERRED", phaseQueries: 0,
+        elapsedMs: 40_001, deadlineRemainingMs: 0 }),
+    ]);
     expect(observation.queries.filter(entry => entry.sql === V1_PLAN_QUOTA_PAGE_SQL || entry.sql === V1_FIT_QUOTA_PAGE_SQL)).toEqual([]);
     expect(inspection.rawFits).not.toHaveBeenCalled(); expect(inspection.rawModels).not.toHaveBeenCalled();
     assertMeter(observation); await released();
@@ -351,9 +473,10 @@ describe("actual scheduled resumable analysis recovery", () => {
   });
 
   it.each([
-    { minute: "even", offset: 0, expectedReads: 2 },
-    { minute: "odd", offset: 60_000, expectedReads: 1 },
-  ])("publishes missing inputs after promotion on $minute minutes, before daily reconciliation", async ({ offset, expectedReads }) => {
+    { priority: "preview", offset: 0, expectedReads: 2 },
+    { priority: "current", offset: 60_000, expectedReads: 1 },
+    { priority: "history", offset: 120_000, expectedReads: 1 },
+  ])("publishes missing inputs after promotion on $priority-first minutes, before daily reconciliation", async ({ offset, expectedReads }) => {
     await seedQuota(200); await queue();
     expect(await db().prepare("SELECT count(*) AS n FROM community_allowance_fit_cache").first()).toEqual({ n: 0 });
     expect(await db().prepare("SELECT count(*) AS n FROM admin_community_allowance_preview_cache").first()).toEqual({ n: 0 });
@@ -398,15 +521,24 @@ describe("actual scheduled resumable analysis recovery", () => {
     assertMeter(observation); await released();
   });
 
-  it("does not start optional reconstruction once required maintenance has consumed the deadline", async () => {
+  it.each([0, 60_000, 120_000])("does not start optional reconstruction once required maintenance has consumed the deadline at offset %i", async offset => {
     await seedQuota(200); const queued = await queue();
     const started = Date.now(); let crossed = false;
     vi.spyOn(Date, "now").mockImplementation(() => started + (crossed ? 40_001 : 0));
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const observation = observe(async (entry, moment) => {
       if (moment === "after" && entry.sql.includes("FROM collection_controls")) crossed = true;
     });
-    expect(await runScheduledMaintenance(bindings(observation), NOW)).toMatchObject({ outcome: "success", lifecycleComplete: true, aggregateRebuildComplete: false });
+    expect(await runScheduledMaintenance(bindings(observation), NOW + offset)).toMatchObject({ outcome: "success", lifecycleComplete: true, aggregateRebuildComplete: false });
     expect(crossed).toBe(true); expect(inspection.backfill).not.toHaveBeenCalled();
+    expect(inspection.modelHistory).not.toHaveBeenCalled();
+    const historyLogs = logSpy.mock.calls.map(([message]) => JSON.parse(String(message)) as { event: string })
+      .filter(log => log.event === "scheduled_model_history");
+    expect(historyLogs).toEqual([expect.objectContaining({
+      phase: offset === 120_000 ? "before_analysis" : "after_publication",
+      outcome: "deferred", code: "MODEL_HISTORY_DEADLINE_DEFERRED", phaseQueries: 0,
+      elapsedMs: 40_001, deadlineRemainingMs: 0,
+    })]);
     expect(observation.queries.some(entry => entry.sql.includes("community_analysis_work"))).toBe(false);
     expect((await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds ORDER BY day").all()).results).toEqual(queued);
     assertMeter(observation); await released();

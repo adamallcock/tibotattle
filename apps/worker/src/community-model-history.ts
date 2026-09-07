@@ -16,8 +16,9 @@ import { assertV1SourcePinCurrent, loadV1SourcePin, type V1SourcePin } from "./t
 import type { D1InvocationBudget } from "./d1-invocation-budget";
 
 export const COMMUNITY_MODEL_HISTORY_METHOD = `${COMPOSITION_CACHE_KEY_SUFFIX}:${MODEL_HISTORY_METHOD_VERSION}`;
+export const COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES = 3;
 const PAGE_SIZE = 64, MAX_PAGES = 16, MAX_RESULT_BYTES = 16 * 1024;
-const FINAL_RESERVE = 12, MAX_ATTEMPTS = 2;
+const FINAL_RESERVE = 12, MAX_ATTEMPTS = 16;
 const encoder = new TextEncoder();
 
 export interface CommunityModelHistoryProgress {
@@ -97,8 +98,8 @@ async function publishResult(db: D1Database, day: string, sourcePin: V1SourcePin
       COMMUNITY_MODEL_HISTORY_METHOD, json, lease).run()).meta.changes === 1;
 }
 
-/** Low-priority, restartable backfill of missing closed UTC days. One date per
- * invocation and at most two account attempts; pages and all follow-on work
+/** Restartable backfill of missing closed UTC days. One date per
+ * invocation and at most sixteen account attempts; pages and all follow-on work
  * share the scheduler's actual query meter. Completed historical days are
  * separate from forward-recorded snapshots, and affected corrections enqueue
  * them again through 0048's bounded day invalidation triggers.
@@ -106,6 +107,24 @@ async function publishResult(db: D1Database, day: string, sourcePin: V1SourcePin
 export async function warmCommunityModelHistory(db: D1Database, nowMs: number, options: {
   meter: D1InvocationBudget; deadlineMs: number; maintenanceLease: string;
 }): Promise<CommunityModelHistoryProgress> {
+  let finishedCohort = false;
+  const progress = await advanceModelHistoryDay(db, nowMs, options, null, () => { finishedCohort = true; });
+  // A final result does not itself prove a complete, source-current cohort.
+  // Re-read that same date once, within the SAME budget, rather than waiting a
+  // cron interval. This second pass may publish, but cannot acquire more work
+  // or switch to another date if a concurrent writer has already published it.
+  if (finishedCohort && progress.day !== null && progress.requiredAccounts > 0
+      && progress.resolvedAccounts === progress.requiredAccounts
+      && progress.publishedDays === 0 && progress.status === "deferred"
+      && admitted(options, 4)) {
+    return advanceModelHistoryDay(db, nowMs, options, progress.day);
+  }
+  return progress;
+}
+
+async function advanceModelHistoryDay(db: D1Database, nowMs: number, options: {
+  meter: D1InvocationBudget; deadlineMs: number; maintenanceLease: string;
+}, publicationOnlyDay: string | null, onFinishedCohort?: () => void): Promise<CommunityModelHistoryProgress> {
   const progress: CommunityModelHistoryProgress = { status: "deferred", day: null,
     resolvedAccounts: 0, requiredAccounts: 0, publishedDays: 0 };
   if (!Number.isFinite(nowMs) || !Number.isFinite(options.deadlineMs) || !options.maintenanceLease || !admitted(options, 4)) return progress;
@@ -118,7 +137,7 @@ export async function warmCommunityModelHistory(db: D1Database, nowMs: number, o
   if (schema?.count !== 4) return { ...progress, status: "unavailable" };
   // Bound derived result retention to the displayed history horizon. This is
   // a small indexed page, never a source-record deletion or an unbounded purge.
-  if (admitted(options, 1)) await db.prepare(`DELETE FROM community_model_history_results
+  if (publicationOnlyDay === null && admitted(options, 1)) await db.prepare(`DELETE FROM community_model_history_results
     WHERE (day,participant_id) IN (SELECT day,participant_id FROM community_model_history_results
       WHERE day<date(?1,?2) ORDER BY day,participant_id LIMIT 64)
       AND EXISTS (SELECT 1 FROM retention_state WHERE singleton=1 AND maintenance_lease_token=?3
@@ -135,6 +154,7 @@ export async function warmCommunityModelHistory(db: D1Database, nowMs: number, o
     .bind(today, ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS - 1, COMMUNITY_ATTRIBUTION_METHOD_VERSION,
       COMMUNITY_MODEL_HISTORY_METHOD).first<{ day: string }>();
   if (!missing) return { ...progress, status: "complete" };
+  if (publicationOnlyDay !== null && missing.day !== publicationOnlyDay) return progress;
   progress.day = missing.day;
   const window = modelHistoryWindow(missing.day);
   const pending: Pick<Candidate, "participant_id" | "input_revision">[] = [];
@@ -172,6 +192,7 @@ export async function warmCommunityModelHistory(db: D1Database, nowMs: number, o
   progress.requiredAccounts = v1ParticipantCount;
   progress.resolvedAccounts = v1ParticipantCount - pending.length;
   if (!complete) return progress; // A page prefix is never a whole cohort.
+  if (publicationOnlyDay !== null && pending.length) return progress;
   if (!pending.length) {
     if (!admitted(options, 1)) return progress;
     const payload = buildCommunityModelCompositionDay({ compositions, v1ParticipantCount,
@@ -200,7 +221,10 @@ export async function warmCommunityModelHistory(db: D1Database, nowMs: number, o
   compositions.length = 0;
   // A troublesome account cannot monopolize every pass for this day. Current
   // caches/work are neither read nor changed, and v1.1 is never downgraded.
-  const start = Math.floor(nowMs / 60_000) % pending.length;
+  // Rotate by priority round, not minute. Otherwise a history-first slot every
+  // three minutes can repeatedly select only 1/3 of a three-divisible cohort
+  // when the first large account consumes the invocation's available time.
+  const start = Math.floor(nowMs / (60_000 * COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES)) % pending.length;
   for (let attempt = 0; attempt < Math.min(MAX_ATTEMPTS, pending.length); attempt++) {
     if (!admitted(options, 40)) break;
     const row = pending[(start + attempt) % pending.length]!;
@@ -227,5 +251,6 @@ export async function warmCommunityModelHistory(db: D1Database, nowMs: number, o
     } else continue;
     if (admitted(options, 3) && await publishResult(db, window.day, pin, result, options.maintenanceLease)) progress.resolvedAccounts++;
   }
-  return progress; // Reread the complete cohort on a subsequent invocation.
+  if (progress.resolvedAccounts === progress.requiredAccounts) onFinishedCohort?.();
+  return progress;
 }

@@ -27,8 +27,9 @@ const MINIMUM_FITS_FOR_BAND = 3;
 // 70 compact days across the reviewed catalog, including fully populated rows.
 // Enforced before writes and reads; tests cover the complete reviewed roster.
 export const PREVIEW_CACHE_JSON_LIMIT_BYTES = 256 * 1_024;
-// Unchanged epochs need no more than an hourly rebuild. Changed source epochs
-// or UTC days bypass this throttle; published snapshots have no age-only expiry.
+// Unchanged epochs need no more than an hourly rebuild. Changed source epochs,
+// UTC days or newly completed historical model days bypass this throttle.
+// Published snapshots have no age-only expiry.
 const PREVIEW_CACHE_MIN_INTERVAL_MILLISECONDS = 55 * 60 * 1_000;
 const PREVIEW_CACHE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 
@@ -916,7 +917,22 @@ export async function warmAdminCommunityAllowancePreviewCache(
             existing.generated_at,
             nowEpoch,
           )) {
-        return { code: "ALLOWANCE_PREVIEW_CACHE_CURRENT" };
+        // Historical reconstruction publishes date rows without changing the
+        // input epoch. Check only the bounded date index here; payloads still
+        // pass through the normal validated, atomic reconstruction below.
+        if (recovery && !reserveRecoveryStatements(recovery, 1)) return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
+        const { from, to } = previousPreview;
+        const knownDays = new Set(previousPreview.models.days.map(day => day.day));
+        const completed = await db.prepare(`SELECT day FROM community_model_composition_days
+          WHERE day >= ?1 AND day < ?2 AND attribution_method_version = ?3
+          ORDER BY day DESC LIMIT ?4`)
+          .bind(from, to, COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+            ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS).all<{ day: string }>();
+        if (!Array.isArray(completed.results) || completed.results.length > ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS
+            || completed.results.some(row => !validDay(row.day) || row.day < from || row.day >= to)) {
+          return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
+        }
+        if (completed.results.every(row => knownDays.has(row.day))) return { code: "ALLOWANCE_PREVIEW_CACHE_CURRENT" };
       }
     }
 

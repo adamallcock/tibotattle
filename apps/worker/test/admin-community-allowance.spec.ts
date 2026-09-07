@@ -709,7 +709,12 @@ describe("admin community allowance preview", () => {
       current.database,
       nowEpoch + 10 * 60 * 1_000,
     )).resolves.toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_CURRENT" });
-    expect(current.statements).toHaveLength(1);
+    expect(current.statements).toHaveLength(2);
+    expect(current.statements[1]).toMatch(/^SELECT day FROM community_model_composition_days\b/u);
+    expect(current.statements[1]).not.toMatch(/payload_json|telemetry_|\b(?:INSERT|UPDATE|DELETE)\b/u);
+    expect(current.statements[1]).toContain("ORDER BY day DESC LIMIT ?4");
+    expect(current.bindings[1]).toEqual(["2026-06-15", "2026-08-23",
+      COMMUNITY_ATTRIBUTION_METHOD_VERSION, ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS]);
   });
 
   it("reports scheduled source and write failures without throwing", async () => {

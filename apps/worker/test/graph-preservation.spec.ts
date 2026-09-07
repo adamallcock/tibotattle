@@ -145,15 +145,15 @@ function recovery() {
   return { mode: "cache-only" as const, budget: { remainingQueries: 800, deadlineMs: Date.now() + 30_000 } };
 }
 
-async function seedModelDay(options: { reconstructed?: boolean; terminalNoFit?: boolean } = {}) {
-  const prior = preview().models.days[0]!;
+async function seedModelDay(options: { reconstructed?: boolean; terminalNoFit?: boolean; day?: string } = {}) {
+  const prior = { ...preview().models.days[0]!, day: options.day ?? DAY };
   const value = options.terminalNoFit ? projectAdminModelHistoryDay({ ...prior,
     values: [], fittedParticipantCount: 0, refusedParticipantCount: 1 }) : prior;
   if (value === null) throw new Error("synthetic terminal model day missing");
   const source = await control();
   await db().prepare(`INSERT INTO community_model_composition_days
     (day,payload_json,computed_at,attribution_method_version,source_mutation_epoch,history_method_version)
-    VALUES(?,?,?,?,?,?)`).bind(DAY, JSON.stringify(value), new Date(NOW).toISOString(),
+    VALUES(?,?,?,?,?,?)`).bind(value.day, JSON.stringify(value), new Date(NOW).toISOString(),
       COMMUNITY_ATTRIBUTION_METHOD_VERSION, source.mutation_epoch,
       options.reconstructed ? MODEL_HISTORY_METHOD_VERSION : null).run();
   return value;
@@ -376,6 +376,75 @@ describe("preserved graph publication on local D1", () => {
 });
 
 describe("preserved graph successor publisher on local D1", () => {
+  it("publishes a newly completed older model day inside the 55-minute throttle without a source-epoch change", async () => {
+    await seedInput(); await seedPublication(); await seedModelDay(); await warmSource();
+    const source = await control();
+    expect(await warmAdminCommunityAllowancePreviewCache(db(), NOW + 1_000, recovery()))
+      .toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_CURRENT" });
+    const older = await seedModelDay({ day: "2026-09-05", reconstructed: true });
+    expect(await control()).toEqual(source);
+    const nextTime = NOW + 60_000;
+    expect(await warmAdminCommunityAllowancePreviewCache(db(), nextTime, recovery()))
+      .toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_REFRESHED" });
+    const next = await readCachedAdminCommunityAllowancePreview(db(), nextTime);
+    expect(next.models.days.map(day => day.day)).toEqual(["2026-09-05", DAY, "2026-09-07"]);
+    expect(next.models.days[0]).toEqual(older);
+    expect(await cache()).toMatchObject({ generated_at: new Date(nextTime).toISOString(), source_mutation_epoch: source.mutation_epoch });
+    expect(await warmAdminCommunityAllowancePreviewCache(db(), nextTime + 1_000, recovery()))
+      .toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_CURRENT" });
+    expect(await control()).toEqual(source);
+  });
+
+  it.each(["incomplete fit cohort", "missing previously published model day"])("keeps the preview if new historical dates encounter %s", async failure => {
+    await seedInput(); await seedPublication();
+    if (failure === "incomplete fit cohort") await seedModelDay();
+    else await warmSource();
+    await seedModelDay({ day: "2026-09-05", reconstructed: true });
+    const previous = await cache(), days = await modelRows(), source = await control(), graph = (await publicGraph()).graph;
+    expect(await warmAdminCommunityAllowancePreviewCache(db(), NOW + 60_000, recovery()))
+      .toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" });
+    expect(await cache()).toEqual(previous); expect(await modelRows()).toEqual(days); expect(await control()).toEqual(source);
+    expect((await publicGraph()).graph).toEqual(graph);
+  });
+
+  it.each([
+    ["outside the preview", "2026-06-01", COMMUNITY_ATTRIBUTION_METHOD_VERSION],
+    ["on the still-open day", "2026-09-07", COMMUNITY_ATTRIBUTION_METHOD_VERSION],
+    ["from an obsolete method", "2026-09-05", "synthetic-obsolete-attribution"],
+  ])("keeps unchanged publications throttled for a date %s without needing source caches", async (_label, day, method) => {
+    await seedInput(); await seedPublication(); await seedModelDay();
+    await seedModelDay({ day });
+    await db().prepare("UPDATE community_model_composition_days SET attribution_method_version=? WHERE day=?").bind(method, day).run();
+    const previous = await cache();
+    const meter = createD1InvocationBudget(2), options = recovery();
+    expect(await warmAdminCommunityAllowancePreviewCache(meter.wrap(db()), NOW + 60_000, options))
+      .toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_CURRENT" });
+    expect(meter.queriesUsed).toBe(2); expect(options.budget.remainingQueries).toBe(793);
+    expect(await cache()).toEqual(previous);
+  });
+
+  it("preserves the preview when the bounded date probe fails or cannot reserve its statement", async () => {
+    await seedInput(); await seedPublication(); const previous = await cache();
+    let probed = false;
+    const unavailable = new Proxy(db(), { get(target, property) {
+      if (property === "prepare") return (sql: string) => {
+        if (sql.startsWith("SELECT day FROM community_model_composition_days")) {
+          probed = true; throw new Error("synthetic model-day metadata unavailable");
+        }
+        return target.prepare(sql);
+      };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    expect(await warmAdminCommunityAllowancePreviewCache(unavailable, NOW + 60_000, recovery()))
+      .toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" });
+    expect(probed).toBe(true); expect(await cache()).toEqual(previous);
+    probed = false; const options = recovery(); options.budget.remainingQueries = 6;
+    expect(await warmAdminCommunityAllowancePreviewCache(unavailable, NOW + 60_000, options))
+      .toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" });
+    expect(probed).toBe(false); expect(options.budget.remainingQueries).toBe(0); expect(await cache()).toEqual(previous);
+  });
+
   it("throttles an unchanged epoch but refreshes immediately after a completed append calculation", async () => {
     const { fixture } = await seedInput(); const previous = await seedPublication(); await seedModelDay();
     await warmSource();

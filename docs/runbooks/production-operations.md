@@ -52,15 +52,24 @@ to conceal a source mismatch.
 Migration `0048` adds an isolated historical model acquisition/result namespace,
 an explicit retrospective day marker, and correction/withdrawal invalidation
 guards. It does not rewrite source telemetry or change the deletion ledger.
-Historical reconstruction works latest-first on missing closed UTC days, after
-current calculation, daily publication and admin preview work, using the same
-statement meter, lease and deadline. It retains the existing 100-day model
+Historical reconstruction works latest-first on missing closed UTC days, using
+the same statement meter, lease and deadline as current calculations. Every
+third minute it receives first use of the optional budget; other minutes offer
+remaining resources after daily publication. It retains the existing 100-day model
 lookback and never fills missing evidence with today's fit. Publish only a
 complete eligible cohort; unsupported or unidentified history remains absent.
 Content-free `scheduled_model_history` events report this separate backfill;
 the existing admin reconstruction counters do not measure its completion.
-Keep a healthy preview until its normal atomic refresh, rather than clearing
-the cache after each reconstructed day. See the
+Historical reset-ordered quota reads skip the remainder of a reset group once
+its cursor reaches the exclusive historical observation boundary. The seek
+remains physically page-limited and still visits later reset groups containing
+older observations; it does not infer a reset-time cutoff or alter saved work.
+Up to sixteen account attempts may use available resources in one run. Rotate
+the first account by three-minute priority round so large accounts cannot alias
+with the schedule. When the last account finishes, re-read the same complete
+cohort once for source-fenced publication within the same budget. Keep a healthy
+preview; a bounded date-index check lets newly completed model dates bypass the
+normal refresh throttle without clearing the cache. See the
 [allowance diagnosis runbook](2026-08-13-community-allowance-band-diagnosis.md)
 for historical interpretation and gap semantics.
 
@@ -85,9 +94,8 @@ usage-finishing reserve fit. Sustained required-work saturation may defer
 large accounts; it is not permission to lower evidence caps.
 
 Public and admin graph rebuilds consume only complete, source-current caches.
-The minute cron alternates optional priority: on even UTC minutes the shared
-preview gets a cache-only publication attempt before account reconstruction;
-on odd minutes reconstruction keeps its full budget before preview publication.
+The minute cron rotates optional priority over three UTC-minute slots: shared
+preview first, current-account reconstruction first, then historical models first.
 This gives ready graphs an early refresh opportunity without letting a large
 incomplete cohort repeatedly crowd out the calculations needed to repair it.
 An unavailable early preview retries after reconstruction and before daily
@@ -96,7 +104,8 @@ append-only v1 uploads without age-only expiration or altered timestamps. The
 hard-invalidation epoch still excludes withdrawals, corrections, device-source
 changes, policy changes and unknown mutations. New publications require the
 exact current input epoch. Same-epoch previews keep their normal refresh
-interval; changed epochs and UTC windows bypass that throttle. A replacement
+interval unless a newly completed model date is absent from the preview;
+changed epochs and UTC windows also bypass that throttle. A replacement
 cannot drop model dates still awaiting reconstruction. Public aggregate/plan/
 model charts use one snapshot, separate from immutable activity/spend revisions.
 
@@ -107,9 +116,9 @@ source-vector acquisition and calculation. Legacy/mixed/successor and unfinished
 work retain the exact-source path. Final medians still recombine compact cohort
 fits; this is not additive billing math or permission to parallelize unbounded
 database work. Migration and deployment are separate owner-authorized gates.
-Even-minute passes also admit owner gauge capture and growth-history cache
+Preview-first passes also admit owner gauge capture and growth-history cache
 refresh after the allowance preview but before reconstruction. Each retains its
-55-minute self-throttle and runs at most once per invocation; odd-minute passes
+55-minute self-throttle and runs at most once per invocation; other priority slots
 and other reconstruction modes retain the late fallback. GitHub synchronization
 remains late. Required lifecycle work still comes first, and every optional
 admission uses the same statement meter and deadline.

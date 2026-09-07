@@ -1,7 +1,7 @@
 import { allowanceReconstructionMode } from "./allowance-reconstruction";
 import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
 import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
-import { warmCommunityModelHistory } from "./community-model-history";
+import { COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES, warmCommunityModelHistory } from "./community-model-history";
 import { backfillV1QuotaFitProjection } from "./quota-fit-projection";
 import {
   assertAdmissionBindings,
@@ -4006,6 +4006,30 @@ export async function runScheduledMaintenance(
             // their conservative allocation within each phase, while this one
             // meter enforces the sum across both bindings and ALL phases.
             const phaseBudget = () => ({ remainingQueries: Math.max(0, queryMeter.remainingQueries), deadlineMs: optionalDeadlineMs });
+            const rebuildModelHistory = async (phase: "before_analysis" | "after_publication") => {
+              const startedQueries = queryMeter.queriesUsed, startedMs = Date.now();
+              const timing = () => ({phaseQueries:queryMeter.queriesUsed-startedQueries,
+                phaseElapsedMs:Math.max(0,Date.now()-startedMs),...phaseTiming()});
+              const deadlineReached = Date.now() >= optionalDeadlineMs;
+              if (deadlineReached || queryMeter.remainingQueries < 64) {
+                console.log(JSON.stringify({level:"info",event:"scheduled_model_history",phase,outcome:"deferred",
+                  code:deadlineReached ? "MODEL_HISTORY_DEADLINE_DEFERRED" : "MODEL_HISTORY_BUDGET_DEFERRED",
+                  ...timing()}));
+                return;
+              }
+              try {
+                const history = await warmCommunityModelHistory(env.USAGE_MONITOR_DB, scheduledTime,
+                  {meter:queryMeter,deadlineMs:optionalDeadlineMs,maintenanceLease:ownedMaintenanceLease});
+                console.log(JSON.stringify({level:"info",event:"scheduled_model_history",phase,outcome:history.status,
+                  code:"BOUNDED_MODEL_HISTORY_PROGRESS",day:history.day,
+                  resolvedAccounts:history.resolvedAccounts,requiredAccounts:history.requiredAccounts,
+                  publishedDays:history.publishedDays,...timing()}));
+              } catch (error) {
+                console.warn(JSON.stringify({level:"warn",event:"scheduled_model_history",phase,outcome:"deferred",
+                  code:error instanceof D1InvocationBudgetExceededError ? error.code : "MODEL_HISTORY_UNAVAILABLE",
+                  ...timing()}));
+              }
+            };
             const publishPreview = async (phase: "before_analysis" | "after_analysis") => {
               const startedQueries = queryMeter.queriesUsed;
               const result = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime,
@@ -4020,18 +4044,20 @@ export async function runScheduledMaintenance(
               }
               return result;
             };
-            // Alternate optional priority on the minute cron: ready previews
-            // get first use of the deadline on even UTC minutes; reconstruction
-            // keeps its full budget on odd minutes. Otherwise a large cohort
-            // with a late missing cache could repeatedly exhaust admission
-            // before the warmer can repair it. Neither path uses raw analysis
-            // for graphs or changes freshness/atomic source-epoch fences.
-            const priorPreview = Math.floor(scheduledTime / 60_000) % 2 === 0
+            // Rotate first use of the same optional budget across previews,
+            // current accounts and historical models. History must sometimes
+            // precede the current probes/daily publisher so its non-resumable
+            // finish can be admitted. Required lifecycle work stays above every
+            // slot; no lane gains a separate deadline or runs in parallel.
+            const optionalPriority = Math.floor(scheduledTime / 60_000) % COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES;
+            const historyFirst = optionalPriority === COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES - 1;
+            if (historyFirst) await rebuildModelHistory("before_analysis");
+            const priorPreview = optionalPriority === 0
               ? await publishPreview("before_analysis")
               : null;
             // The independent growth-history cache has the same expiry risk.
             // Give it an early chance only on preview-first passes, retaining
-            // the odd-minute reconstruction budget and the late fallback.
+            // the current/history-first budgets and the late fallback.
             if (priorPreview !== null) await warmOwnerMetricCaches("before_analysis");
             try {
               if (queryMeter.remainingQueries >= 249 && Date.now() < optionalDeadlineMs) {
@@ -4073,21 +4099,9 @@ export async function runScheduledMaintenance(
                 4, undefined, {mode:"activity-only",budget:phaseBudget()});
             }
             rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
-            // Historical model fits are optional and last: required lifecycle,
-            // current-account reconstruction and graph publication keep priority.
-            if (queryMeter.remainingQueries >= 64 && Date.now() < optionalDeadlineMs) {
-              try {
-                const history = await warmCommunityModelHistory(env.USAGE_MONITOR_DB, scheduledTime,
-                  {meter:queryMeter,deadlineMs:optionalDeadlineMs,maintenanceLease});
-                console.log(JSON.stringify({level:"info",event:"scheduled_model_history",outcome:history.status,
-                  day:history.day,resolvedAccounts:history.resolvedAccounts,requiredAccounts:history.requiredAccounts,
-                  publishedDays:history.publishedDays,queriesUsed:queryMeter.queriesUsed}));
-              } catch (error) {
-                console.warn(JSON.stringify({level:"warn",event:"scheduled_model_history",outcome:"deferred",
-                  code:error instanceof D1InvocationBudgetExceededError ? error.code : "MODEL_HISTORY_UNAVAILABLE",
-                  queriesUsed:queryMeter.queriesUsed}));
-              }
-            }
+            // Use spare resources in the other slots, but never retry an early
+            // history attempt in this invocation, including after a failure.
+            if (!historyFirst) await rebuildModelHistory("after_publication");
           } else {
             const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime);
             rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
