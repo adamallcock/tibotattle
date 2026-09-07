@@ -72,7 +72,7 @@ function disposeCredentialBroker(broker) {
   try { broker?.dispose?.(); } catch { /* Child teardown must still complete. */ }
 }
 
-function companionEnvironment(environment, parentPid, hasCredentialBroker = false) {
+function companionEnvironment(environment, parentPid, credentialBrokerKind = null) {
   const selected = {};
   for (const key of COMPANION_ENVIRONMENT_KEYS) {
     if (Object.hasOwn(environment, key) && typeof environment[key] === "string") {
@@ -100,7 +100,12 @@ function companionEnvironment(environment, parentPid, hasCredentialBroker = fals
   selected.USAGE_MONITOR_PARENT_PID = String(parentPid);
   // Only an explicitly composed parent broker can announce this descriptor.
   // An inherited native-app FD is never accepted from the launch environment.
-  if (hasCredentialBroker) selected.USAGE_MONITOR_KEYCHAIN_BROKER_FD = "4";
+  if (credentialBrokerKind === "macos_keychain") {
+    selected.USAGE_MONITOR_KEYCHAIN_BROKER_FD = "4";
+  }
+  if (credentialBrokerKind === "linux_secret_service") {
+    selected.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD = "4";
+  }
   return selected;
 }
 
@@ -122,6 +127,7 @@ export function createCompanionSupervisor({
   clearTimer = clearTimeout,
   attachPrivateChannel,
   attachCredentialBroker,
+  attachLinuxSecretServiceBroker,
 } = {}) {
   if (typeof spawnChild !== "function") throw new TypeError("spawnChild is required");
   if (typeof command !== "string" || command.length === 0) {
@@ -138,6 +144,13 @@ export function createCompanionSupervisor({
   }
   if (attachCredentialBroker !== undefined && typeof attachCredentialBroker !== "function") {
     throw new TypeError("credential broker factory is invalid");
+  }
+  if (attachLinuxSecretServiceBroker !== undefined
+      && typeof attachLinuxSecretServiceBroker !== "function") {
+    throw new TypeError("Linux Secret Service broker factory is invalid");
+  }
+  if (attachCredentialBroker !== undefined && attachLinuxSecretServiceBroker !== undefined) {
+    throw new TypeError("credential broker factories are mutually exclusive");
   }
   assertTimeout(startupTimeoutMs, "startupTimeoutMs");
   assertTimeout(shutdownTimeoutMs, "shutdownTimeoutMs");
@@ -157,6 +170,10 @@ export function createCompanionSupervisor({
   let unexpectedExitHandler = onUnexpectedExit;
   let privateChannel = null;
   let credentialBroker = null;
+  const selectedCredentialBroker = attachCredentialBroker ?? attachLinuxSecretServiceBroker;
+  const credentialBrokerKind = attachCredentialBroker === undefined
+    ? attachLinuxSecretServiceBroker === undefined ? null : "linux_secret_service"
+    : "macos_keychain";
 
   function stateSnapshot() {
     return Object.freeze({
@@ -279,8 +296,8 @@ export function createCompanionSupervisor({
       try {
         currentChild = spawnChild(command, [...args], {
           cwd,
-          env: companionEnvironment(environment, parentPid, Boolean(attachCredentialBroker)),
-          stdio: attachCredentialBroker
+          env: companionEnvironment(environment, parentPid, credentialBrokerKind),
+          stdio: selectedCredentialBroker
             ? ["ignore", "pipe", "pipe", attachPrivateChannel ? "ipc" : "ignore", "pipe"]
             : attachPrivateChannel ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
           windowsHide: true,
@@ -294,8 +311,8 @@ export function createCompanionSupervisor({
         return;
       }
       try {
-        if (attachCredentialBroker) {
-          currentCredentialBroker = attachCredentialBroker(currentChild.stdio?.[4]);
+        if (selectedCredentialBroker) {
+          currentCredentialBroker = selectedCredentialBroker(currentChild.stdio?.[4]);
           if (typeof currentCredentialBroker?.dispose !== "function") {
             throw new TypeError("credential broker is invalid");
           }
