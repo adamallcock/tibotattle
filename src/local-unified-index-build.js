@@ -18,6 +18,7 @@ import {
 } from "./local-unified-index-extract.js";
 import {
   createHistoryBaseSeedResolver,
+  createParentModelResolver,
   selectRolloutUsageSeed,
 } from "./local-unified-index-history.js";
 import { withStableRolloutSource } from "./rollout-source-snapshot.js";
@@ -714,6 +715,7 @@ export function createEventSink({
         tokensOutCombined: null,
         totalInputContext: null,
         partial: event.partial === true,
+        modelInherited: event.modelInherited === true,
       });
       add(source, "usageEvents");
       if (onCounts !== null && onCounts !== undefined
@@ -1249,6 +1251,7 @@ export async function rebuildLocalUnifiedIndex({
       seedTier: inheritedTierSeed(parentState.finalTier),
     };
   }
+  const parentModels = createParentModelResolver(infos, { maximumLineBytes, signal });
   const historySeeds = createHistoryBaseSeedResolver(infos, {
     maximumLineBytes,
     signal,
@@ -1309,6 +1312,8 @@ export async function rebuildLocalUnifiedIndex({
               deviceSalt,
               sessionLocalKey: state.sessionLocal,
             });
+            const parentModelAt = selectedSeed.seedModel === null
+              ? await parentModels.forSource(info) : null;
             const outcome = await withStableRolloutSource(info, (source) => (
               extractRolloutUsage(source, {
               size: Number(info.size ?? 0),
@@ -1323,6 +1328,7 @@ export async function rebuildLocalUnifiedIndex({
                 state.sessionLocal,
               ),
               ...selectedSeed,
+              parentModelAt,
               maximumLineBytes,
               signal,
               onEvent: (event) => sink.write(state, event),

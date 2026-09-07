@@ -5825,9 +5825,11 @@ function divergenceRangeContext(data) {
     ?? models[0]
     ?? null;
   const modelLabel = topModel === null ? null
-    : topModel.model === "unknown" || topModel.pricingStatus === "unrecognized"
-      ? t("accounting.model.unrecognized")
-      : formatModelName(topModel.model) || topModel.model;
+    : topModel.model === "unknown"
+      ? t("accounting.model.identityUnavailable")
+      : topModel.pricingStatus === "unrecognized"
+        ? t("accounting.model.unrecognized")
+        : formatModelName(topModel.model) || topModel.model;
   const bySpeed = accounting.bySpeed ?? {};
   const rankedSpeed = ["fast", "standard", "unknown"]
     .map((key) => [key, finite(bySpeed?.[key]?.events, 0)])
@@ -5971,7 +5973,7 @@ function divergencePeriodItem(period, rangeContext) {
 // exists to supply; an unavailable breakdown falls back to the range-level
 // context rather than pretending this window had none.
 function divergenceModelLabel(model) {
-  if (model === "unknown") return t("accounting.model.unrecognized");
+  if (model === "unknown") return t("accounting.model.identityUnavailable");
   return formatModelName(model) || model;
 }
 
@@ -10749,7 +10751,9 @@ function modelApiEquivalentCell(row) {
     // guessed one would be worse than none. Printing "$0.00" here read as a
     // priced zero, which is a different and untrue claim.
     setLocalizedText(cell, "accounting.model.notPricedUnknown");
-    cell.title = t("accounting.model.notPricedUnknownTitle");
+    cell.title = t(row.model === "unknown"
+      ? "accounting.model.identityUnavailableTitle"
+      : "accounting.model.notPricedUnknownTitle");
     return cell;
   }
   const amount = finite(row?.apiPriceEquivalentUsd);
@@ -10851,7 +10855,9 @@ function modelComponentRow(model, key, labelKey, totals) {
         : model.pricingStatus === "known_unpriced"
           ? "accounting.model.noPublishedPriceTitle"
           : model.pricingStatus === "unrecognized"
-            ? "accounting.model.notPricedUnknownTitle"
+            ? model.model === "unknown"
+              ? "accounting.model.identityUnavailableTitle"
+              : "accounting.model.notPricedUnknownTitle"
             : "accounting.model.componentCostWithheldTitle",
     );
     costShareCell = localizedNode(
@@ -10923,9 +10929,13 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
   for (const model of page.rows) {
     const row = node("tr");
     const identity = node("td", "model-identity");
-    // "Unrecognized model" now means exactly one thing: an identifier this
-    // build has never reviewed, so it is withheld rather than printed.
-    if (model.model === "unknown" || model.pricingStatus === "unrecognized") {
+    // The unknown aggregate combines missing attribution and unreviewed
+    // identifiers. Its label must not claim either cause as established.
+    if (model.model === "unknown") {
+      const label = localizedNode("span", "", "accounting.model.identityUnavailable");
+      label.title = t("accounting.model.identityUnavailableTitle");
+      identity.append(label);
+    } else if (model.pricingStatus === "unrecognized") {
       identity.append(localizedNode("span", "", "accounting.model.unrecognized"));
     } else {
       // The wire identifier is what the provider reported and what any
@@ -10983,7 +10993,11 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
             row.getAttribute("aria-expanded") === "true"
               ? "accounting.model.collapse"
               : "accounting.model.expand",
-            { model: formatModelName(model.model) },
+            { model: model.model === "unknown"
+              ? t("accounting.model.identityUnavailable")
+              : model.pricingStatus === "unrecognized"
+                ? t("accounting.model.unrecognized")
+                : formatModelName(model.model) },
           ),
         );
       };

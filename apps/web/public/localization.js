@@ -552,6 +552,8 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.sideChat.estimateRange": ["{point} ({lower}–{upper})", "{point}（{lower}–{upper}）", "{point} ({lower}–{upper})"],
   "accounting.model.noneInPeriod": ["No model usage in this period.", "此期间没有模型使用记录。", "No hay uso de modelos en este período."],
   "accounting.model.unavailable": ["Model usage accounting is unavailable; no zero usage is inferred.", "模型使用情况核算不可用；不会推断为零使用量。", "La contabilidad de uso por modelo no está disponible; no se infiere un uso cero."],
+  "accounting.model.identityUnavailable": ["Model unavailable", "模型不可用", "Modelo no disponible"],
+  "accounting.model.identityUnavailableTitle": ["The model was not recorded or was not recognized. No price is applied to this usage; it is not a zero.", "模型未记录或无法识别。此使用量不会应用价格；这不是零。", "El modelo no se registró o no se reconoció. No se aplica ningún precio a este uso; no es un cero."],
   "accounting.model.unrecognized": ["Unrecognized model", "无法识别的模型", "Modelo no reconocido"],
   "accounting.model.separateAllowanceChip": ["Separate allowance", "独立额度", "Cuota independiente"],
   // Deliberately a marker, not a figure. Spark is metered against its own

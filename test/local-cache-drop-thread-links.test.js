@@ -8,6 +8,8 @@ import {
 } from "../src/local-cache-drop-thread-links.js";
 import {
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
   openLocalUnifiedIndex,
   readUnifiedIndexGenerationDescriptor,
   reasoningEffortOrdinal,
@@ -589,5 +591,18 @@ test("switch rows preserve exact prior Max/Ultra labels rather than adopting con
   for (const row of rows) {
     assert.equal(result.entries.find((entry) => entry.key === cacheDropThreadLookupKey("switch", row))?.thread.id,
       row.previous.reasoningEffort === "max" ? ROOT : THIRD);
+  }
+});
+
+
+test("inherited-model provenance retains exact cache-drop thread links", async (t) => {
+  const f = await fixture(t);
+  for (const version of [LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+    LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION]) {
+    f.database.prepare("UPDATE parser_version SET parser_version = ? WHERE id = 1").run(version);
+    const result = await f.run();
+    assert.equal(result.status, "available");
+    assert.equal(result.entries.length, 2);
+    assert.deepEqual(result.entries.map((entry) => entry.thread.id), [ROOT, WORKER]);
   }
 });

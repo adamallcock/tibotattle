@@ -3,7 +3,6 @@ title: Unified Local Index Schema
 date: 2026-08-27
 type: reference
 status: maintained
-last_verified_commit: 52399658
 ---
 
 # Unified local index schema
@@ -28,7 +27,7 @@ one another:
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
 | SQLite `PRAGMA user_version` | `11` | Physical table/index/migration generation. |
-| Parser version | `unified-rollout-typed-v14` | Meaning and provenance of facts extracted from rollout sources, including ordinal-bearing compaction headers and settings pinned to paginated history boundaries. |
+| Parser version | `unified-rollout-typed-v15` | Meaning and provenance of facts extracted from rollout sources, including ordinal-bearing compaction headers and settings pinned to paginated history boundaries. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -75,8 +74,9 @@ alongside both legacy header orders. It validates the bounded unsigned ordinal
 without decoding replacement history. The version change reparses present
 sources so earlier missed compaction boundaries can be recovered safely.
 
-Parser v14 isolates paginated settings from logical-parent state. An independent
-reset starts with unknown model, effort and tier; an anchored continuation uses
+Parser v14 introduced isolation of paginated settings from logical-parent state.
+Before the v15 model-only fallback below, an independent reset started with
+unknown model, effort and tier; an anchored continuation uses
 only its exact physical history boundary, including unknown values at that
 boundary. A parent's later final settings cannot fill those gaps. Resume keeps
 the segment's own cursor observations; inherited tier provenance may be
@@ -89,6 +89,28 @@ sources remain accounting evidence but cannot overwrite that head's settings;
 ambiguous heads do not supply inherited state. Legacy noncanonical singleton
 sources remain unambiguous. This interpretation change reparses present sources without
 changing physical schema 11 or relabeling rotated-source facts.
+
+Parser v15 adds the owner-approved model-only assumption for paginated forks
+without an exact history base. It looks up reviewed parent declarations at or
+before each usage timestamp, capped at the child's creation time. Copied history
+can therefore use the parent's original model switches; a later parent switch
+cannot rewrite new child work. Explicit child `turn_context.model` or applied
+UI `thread_settings.model` overrides the inherited default. Sparse declarations
+keep the default; custom/unreviewed selections block a previously reviewed model.
+An exact history base, including an unknown model, retains its prior semantics.
+Tier, effort, cumulative counters and replay admission are unchanged.
+
+The per-event parser stamps `unified-rollout-typed-v15-parent-model` and
+`unified-rollout-typed-v15-parent-model-partial` record the inherited assumption;
+other records retain the base and `-partial` v15 stamps. These suffixes
+identify the new fallback; they do not reclassify legacy inline inheritance.
+These are local provenance variants, not new physical schemas or telemetry
+fields. Cursor/generation stamps remain the base v15 so warm refresh does not
+mistake an assumed-model row for an obsolete parser. Model lookup retains at
+most 128 timelines of 4,096 transitions and traverses at most 128 ancestors.
+Missing/ambiguous parents, invalid metadata, clock regression and exceeded
+bounds leave the model unavailable. The resolver caches only reviewed identities
+and timestamps during one physically guarded discovery pass.
 
 Parser v12 additionally preserves omitted or null usage counters as SQL NULL,
 including the cumulative cursor carried across refreshes. Explicit zero remains
@@ -120,7 +142,7 @@ effort. No effective-effort carry is inferred across compaction, fork or resume.
 Actual application/eligible-mode and installed-client evidence remains a
 qualification gate, separate from catalogue recognition.
 
-The foreground companion treats verified published v10/v11/v12/v13-to-v14 parser
+The foreground companion treats verified published v10/v11/v12/v13/v14-to-v15 parser
 upgrades as cold work even when the physical schema is already 11. The target
 and predecessor set are deliberately closed; current, unknown, malformed and
 future parser evidence cannot obtain a longer deadline. That run receives the

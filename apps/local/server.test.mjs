@@ -354,11 +354,11 @@ test("refresh timeout classifier grants the cold window only to missing or prove
   }
 });
 
-test("published v10 v11 v12 v13 upgrades to v14 receive a cold deadline without extending current or uncertain state", async () => {
+test("published v10 v11 v12 v13 v14 upgrades to v15 receive a cold deadline without extending current or uncertain state", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-timeout-parser-upgrade-"));
   // Deliberately pin the target: another parser release must review its
   // predecessor set, not silently keep passing a generic mismatch test.
-  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v14");
+  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v15");
   const fixtures = [
     { name: "complete", cold: true },
     { name: "quarantine-partial", cold: true, generation: {
@@ -370,7 +370,7 @@ test("published v10 v11 v12 v13 upgrades to v14 receive a cold deadline without 
     // Every fixture retains an older parser/generation row. Only publication
     // provenance may select the deadline, so this stays an ordinary refresh.
     { name: "current-with-old-history", parserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
-    { name: "future", parserVersion: "unified-rollout-typed-v15" },
+    { name: "future", parserVersion: "unified-rollout-typed-v16" },
     { name: "unknown", parserVersion: "unknown-parser" },
     { name: "empty", parserVersion: "" },
     { name: "malformed-version", parserVersion: "unified-rollout-typed-v011" },
@@ -378,8 +378,9 @@ test("published v10 v11 v12 v13 upgrades to v14 receive a cold deadline without 
     { name: "partial-parser", parserVersion: "unified-rollout-typed-v10-partial" },
     { name: "v11-partial-parser", parserVersion: "unified-rollout-typed-v11-partial" },
     { name: "v12-partial-parser", parserVersion: "unified-rollout-typed-v12-partial" },
+    { name: "v14-partial-parser", parserVersion: "unified-rollout-typed-v14-partial" },
     { name: "v13-partial-parser", parserVersion: "unified-rollout-typed-v13-partial" },
-    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v14-partial" },
+    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v15-partial" },
     { name: "unreviewed-predecessor", parserVersion: "unified-rollout-typed-v9" },
     { name: "missing-publication", metadata: { current_generation_id: undefined } },
     { name: "unknown-publication", metadata: { current_generation_id: "99" } },
@@ -410,7 +411,7 @@ test("published v10 v11 v12 v13 upgrades to v14 receive a cold deadline without 
       .map((key) => ({ name: `incomplete-${key}`, generation: { [key]: 0 } })),
   ];
   try {
-    for (const predecessor of [10, 11, 12, 13]) {
+    for (const predecessor of [10, 11, 12, 13, 14]) {
       for (const fixture of fixtures) {
         const name = `v${predecessor}-${fixture.name}`;
         const indexFile = join(root, `${name}.sqlite`);
