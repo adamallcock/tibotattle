@@ -43,6 +43,10 @@ const COMMUNITY_DAILY_COLUMN_KEYS = Object.freeze([
 // Header indexes that carry numbers; they right-align with tabular digits so
 // magnitudes line up down a column.
 const COMMUNITY_DAILY_NUMERIC_COLUMNS = Object.freeze(new Set([1, 2, 3, 4]));
+// Container-scoped interaction only: no response or point values are retained.
+// Replacing an unavailable view drops its state rather than reviving old data.
+const dailyDisclosureByContainer = new WeakMap();
+const allowanceInspectionByContainer = new WeakMap();
 
 /**
  * One unit for a whole column, chosen from the column maximum: mixing 44 and
@@ -479,10 +483,11 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     return view === "aggregate" ? buildCommunityAllowanceSingleChartModel(series, options) : null;
   }
   if (series.state !== "published" || series.days.length === 0) return null;
-  const anchor = series.days.at(-1).day;
+  const anchor = series.breakdowns.hasCombined
+    ? series.breakdowns.days.at(-1)?.day ?? series.days.at(-1).day : series.days.at(-1).day;
   const cutoff = Number.isFinite(rangeDays) && rangeDays >= 1
     ? communityDayStartMs(anchor) - (rangeDays - 1) * MILLISECONDS_PER_DAY : -Infinity;
-  const rangeDaysWithActivity = series.days.filter(day => communityDayStartMs(day.day) >= cutoff);
+  const rangeDaysWithActivity = series.days.filter(day => day.day <= anchor && communityDayStartMs(day.day) >= cutoff);
   if (rangeDaysWithActivity.length === 0) return null;
   const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
   const definitions = [
@@ -495,8 +500,8 @@ export function buildCommunityAllowanceChartModel(series, options = {}) {
     })).sort((left, right) => left.order - right.order),
   ];
   const summaryFor = (day, definition) => {
-    if (definition.view === "aggregate") return day.allowance;
     const breakdown = breakdownDays.get(day.day);
+    if (definition.view === "aggregate") return series.breakdowns.hasCombined ? breakdown?.combined : day.allowance;
     if (definition.view === "plans") return breakdown?.byPlanType[definition.key];
     const value = breakdown?.models.find(([id]) => id === definition.key);
     return value ? { centralUsd: value[1], participantCount: value[2], fitCount: null, band80Usd: null } : null;
@@ -737,6 +742,8 @@ export function renderCommunityDailySeries({
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
   const t = (key, values = {}) => translate(key, values, locale);
+  const wasOpen = dailyDisclosureByContainer.get(container)?.open === true;
+  dailyDisclosureByContainer.delete(container);
   clear(container);
   const series = normalizeCommunityDailySeries(payload);
   if (stateNode) {
@@ -801,6 +808,7 @@ export function renderCommunityDailySeries({
   appendCommunityDailyChart({ documentRef, container, series, t });
 
   const breakdown = node("details", "journey-disclosure snapshot-breakdown");
+  breakdown.open = wasOpen;
   const summary = node("summary");
   summary.append(node(
     "span",
@@ -871,6 +879,7 @@ export function renderCommunityDailySeries({
   wrap.append(table);
   breakdown.append(wrap);
   container.append(breakdown);
+  dailyDisclosureByContainer.set(container, breakdown);
   return series.state;
 }
 
@@ -894,7 +903,7 @@ function usdFormatter(maximumFractionDigits = 0) {
  * where days published one, the central line, and per-day dots sized by fit
  * count. Same CSP-strict plain-SVG construction as the daily chart.
  */
-function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
+function appendCommunityAllowanceChart({ documentRef, container, model, t, inspection = null }) {
   const { node } = createDomHelpers(documentRef);
   const dollars = usdFormatter();
 
@@ -1061,6 +1070,16 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
     && model.dots.length > 0;
   if (!interactive) return;
 
+  let activeSeriesKey = legendButtons.some(button => button.seriesKey === inspection?.activeSeriesKey)
+    ? inspection.activeSeriesKey : null;
+  let inspectionDots = activeSeriesKey === null ? model.dots
+    : model.dots.filter(dot => dot.seriesKey === activeSeriesKey);
+  const restoredIndex = inspectionDots.findIndex(dot => dot.day === inspection?.day
+    && dot.seriesKey === inspection?.seriesKey);
+  let selected = restoredIndex >= 0 ? restoredIndex : inspectionDots.length - 1;
+  let tooltipVisible = false;
+  let restoringFocus = false;
+
   const formatTipDate = dateTimeFormatter({
     timeZone: "UTC", year: "numeric", month: "short", day: "numeric",
   });
@@ -1131,6 +1150,8 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
   };
 
   const showDot = (dot) => {
+    selected = inspectionDots.indexOf(dot);
+    tooltipVisible = true;
     crosshair.setAttribute("x1", dot.x);
     crosshair.setAttribute("x2", dot.x);
     crosshair.setAttribute("data-visible", "true");
@@ -1144,26 +1165,28 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
   };
 
   const hide = () => {
+    tooltipVisible = false;
     crosshair.setAttribute("data-visible", "false");
     highlight.setAttribute("data-visible", "false");
     tooltip.setAttribute("data-visible", "false");
   };
 
-  let activeSeriesKey = null;
-  let inspectionDots = model.dots;
-  let selected = inspectionDots.length - 1;
+  const updateSeriesSelection = () => {
+    for (const button of legendButtons) {
+      button.item.setAttribute("aria-pressed", String(button.seriesKey === activeSeriesKey));
+    }
+    for (const { mark, seriesKey: key } of seriesMarks) {
+      mark.setAttribute("data-muted", String(activeSeriesKey !== null && key !== activeSeriesKey));
+    }
+  };
+  updateSeriesSelection();
   for (const { item, seriesKey } of legendButtons) {
     item.addEventListener("click", () => {
       activeSeriesKey = activeSeriesKey === seriesKey ? null : seriesKey;
       inspectionDots = activeSeriesKey === null ? model.dots
         : model.dots.filter(dot => dot.seriesKey === activeSeriesKey);
       selected = inspectionDots.length - 1;
-      for (const button of legendButtons) {
-        button.item.setAttribute("aria-pressed", String(button.seriesKey === activeSeriesKey));
-      }
-      for (const { mark, seriesKey: key } of seriesMarks) {
-        mark.setAttribute("data-muted", String(activeSeriesKey !== null && key !== activeSeriesKey));
-      }
+      updateSeriesSelection();
       hide();
     });
   }
@@ -1227,8 +1250,27 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
   });
   // Best effort: some engines do fire focus/blur on the SVG root even when they
   // skip its graphics children. When they do, the chart shows/hides on tab.
-  svg.addEventListener("focus", () => showDot(inspectionDots[selected]));
+  svg.addEventListener("focus", () => { if (!restoringFocus) showDot(inspectionDots[selected]); });
   svg.addEventListener("blur", hide);
+
+  allowanceInspectionByContainer.set(container, () => ({
+    view: model.view ?? "aggregate", activeSeriesKey,
+    day: inspectionDots[selected]?.day, seriesKey: inspectionDots[selected]?.seriesKey,
+    visible: tooltipVisible,
+    focusChart: documentRef.activeElement === svg || Boolean(svg.contains?.(documentRef.activeElement)),
+    focusedLegendKey: legendButtons.find(button => button.item === documentRef.activeElement)?.seriesKey,
+  }));
+  // Only reattach focus that the replaced chart owned, without scrolling a
+  // reader back from another control. Missing points never reuse old values.
+  if (inspection) {
+    const focusedLegend = legendButtons.find(button => button.seriesKey === inspection.focusedLegendKey)?.item;
+    const focusTarget = inspection.focusChart ? svg
+      : focusedLegend ?? (inspection.focusedLegendKey ? svg : null);
+    restoringFocus = true;
+    focusTarget?.focus?.({ preventScroll: true });
+    restoringFocus = false;
+    if (inspection.visible && restoredIndex >= 0) showDot(inspectionDots[selected]);
+  }
 }
 
 /**
@@ -1257,6 +1299,9 @@ export function renderCommunityAllowanceSection({
   const locale = documentRef?.documentElement?.lang ?? "en-US";
   const t = (key, values = {}) => translate(key, values, locale);
   const plural = (key, count) => translatePlural(key, count, {}, locale);
+  const previousInspection = allowanceInspectionByContainer.get(container)?.();
+  const inspection = previousInspection?.view === view ? previousInspection : null;
+  allowanceInspectionByContainer.delete(container);
   clear(container);
   const series = normalizeCommunityDailySeries(payload);
   const setChip = (labelKey, published) => {
@@ -1323,7 +1368,7 @@ export function renderCommunityAllowanceSection({
       cards.append(card);
     }
     container.append(cards);
-    appendCommunityAllowanceChart({ documentRef, container, model, t });
+    appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
     container.append(node("p", "snapshot-disclosure", t(view === "models"
       ? "community.allowance.modelMethod" : "community.allowance.planMethod")));
     return "published";
@@ -1363,7 +1408,7 @@ export function renderCommunityAllowanceSection({
   ));
   container.append(headline);
 
-  appendCommunityAllowanceChart({ documentRef, container, model, t });
+  appendCommunityAllowanceChart({ documentRef, container, model, t, inspection });
 
   container.append(node(
     "p",

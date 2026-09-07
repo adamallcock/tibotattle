@@ -1030,6 +1030,51 @@ export interface CommunityAnalysisCacheIdentity {
   compositionSupported: boolean;
 }
 
+/** Reuse a completed v1 calculation without re-reading its chunk vector.
+ * The durable acquisition head already pins that vector to the journal revision.
+ * Both payloads and their fingerprints are still checked, so corrupt caches are
+ * repaired instead of being hidden behind matching metadata. Other source kinds
+ * keep their existing exact-pin path; this does not invent a successor adapter.
+ */
+export async function completedCommunityAnalysisCachesCurrent(db: D1Database,
+  participantId: string, inputRevision: number, fromDay: string): Promise<boolean> {
+  if (!Number.isSafeInteger(inputRevision) || inputRevision < 0) return false;
+  const row = await db.prepare(`SELECT
+      CASE WHEN length(CAST(f.fits_json AS BLOB)) <= ?7 THEN f.fits_json END AS fits_json,
+      CASE WHEN length(CAST(c.composition_json AS BLOB)) <= ?8 THEN c.composition_json END AS composition_json,
+      CASE WHEN length(f.input_fingerprint) = 64 THEN f.input_fingerprint END AS fit_fingerprint,
+      CASE WHEN length(w.input_fingerprint) = 64 THEN w.input_fingerprint END AS input_fingerprint
+    FROM community_analysis_work w
+    JOIN participants p ON p.id = w.participant_id AND p.state = 'active'
+    JOIN community_analytical_input_versions v ON v.participant_id = w.participant_id AND v.revision = ?2
+    JOIN community_allowance_fit_cache f ON f.participant_id = w.participant_id
+      AND f.cache_key = ?3 AND f.source_method_version = ?5
+    JOIN community_model_composition_cache c ON c.participant_id = w.participant_id
+      AND c.cache_key = ?4 AND c.source_method_version = ?5 AND c.input_fingerprint = w.input_fingerprint
+    WHERE w.participant_id = ?1 AND w.input_revision = ?2 AND w.phase = 'complete'
+      AND w.source_kind = 'v1' AND w.source_method_version = ?6 AND w.observed_at_cutoff = ?9
+      AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads WHERE participant_id = ?1)
+      AND NOT EXISTS (SELECT 1 FROM telemetry_contributions
+        WHERE participant_id = ?1 AND status = 'accepted' AND transport_schema_version = 'telemetry-contribution-v0.2')
+    LIMIT 1`).bind(participantId, inputRevision,
+      `v1:${inputRevision}:${fromDay}:${V1_FIT_CACHE_KEY_SUFFIX}`,
+      `v1:${inputRevision}:${fromDay}:${COMPOSITION_CACHE_KEY_SUFFIX}`,
+      COMMUNITY_ATTRIBUTION_METHOD_VERSION, V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+      COMMUNITY_MODEL_CACHE_MAX_BYTES, COMPOSITION_CACHE_JSON_LIMIT_BYTES, `${fromDay}T00:00:00.000Z`)
+    .first<{ fits_json: string | null; composition_json: string | null;
+      fit_fingerprint: string | null; input_fingerprint: string | null }>();
+  if (typeof row?.input_fingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(row.input_fingerprint)
+      || typeof row.fits_json !== "string" || typeof row.composition_json !== "string") return false;
+  const expectedFitFingerprint = await sha256Hex(canonicalJson({
+    methodVersion: COMMUNITY_ATTRIBUTION_METHOD_VERSION, v1: row.input_fingerprint, legacy: [],
+  }));
+  if (row.fit_fingerprint !== expectedFitFingerprint || parsedCachedFits(row.fits_json, participantId) === null) return false;
+  try {
+    return validCompleteCachedComposition(JSON.parse(row.composition_json), row.input_fingerprint,
+      V1_PLAN_ATTRIBUTION_ADAPTER_VERSION);
+  } catch { return false; }
+}
+
 /** Small exact cache probe for one scheduled participant. A matching revision
  * alone does not hide malformed cached output; the warmer can repair it.
  */

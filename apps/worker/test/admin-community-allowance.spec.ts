@@ -7,6 +7,7 @@ import {
   ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS,
   ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS,
   ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION,
+  COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL,
   buildAdminCommunityAllowancePreview,
   buildAdminCommunityAllowancePreviewFromSource,
   readCachedAdminCommunityAllowancePreview,
@@ -156,11 +157,11 @@ function previewWarmDatabase(
       const handle = {
         async first() {
           if (statement === ACTIVE_V11_SOURCE_QUERY) return null;
+          if (statement.includes("admin_community_allowance_preview_cache")) {
+            return stored === null ? null : { ...stored, source_mutation_epoch: 1, mutation_epoch: 1 };
+          }
           if (statement.includes("community_snapshot_mutation_control")) {
             return { mutation_epoch: 1, input_revision: 1 };
-          }
-          if (statement.includes("admin_community_allowance_preview_cache")) {
-            return stored;
           }
           if (statement.includes("community_model_composition_cache")) {
             return null;
@@ -609,10 +610,9 @@ describe("admin community allowance preview", () => {
     );
     expect(cached).toEqual(preview);
     expect(statements).toHaveLength(1);
-    expect(statements[0]).toMatch(
-      /^\s*SELECT generated_at, payload_json\s+FROM admin_community_allowance_preview_cache/u,
-    );
-    expect(statements[0]).toContain("WHERE singleton = 1");
+    expect(statements[0]).toBe(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL);
+    expect(statements[0]).toContain("WHERE cache.singleton = 1");
+    expect(statements[0]).toContain("cache.source_mutation_epoch >= source.graph_invalidation_epoch");
     expect(statements[0]).toContain("LIMIT 1");
     expect(statements[0]).not.toMatch(
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu,
@@ -621,7 +621,7 @@ describe("admin community allowance preview", () => {
     expect(JSON.stringify(cached)).not.toContain("participant-1");
   });
 
-  it("fails closed for missing, stale, oversized, corrupt, or non-exact rows", async () => {
+  it("preserves old evidence dates but fails closed for missing, oversized, corrupt, or non-exact rows", async () => {
     const nowEpoch = Date.parse("2026-08-23T10:30:00.000Z");
     const preview = buildAdminCommunityAllowancePreview([], nowEpoch);
     const withIdentifier = JSON.parse(JSON.stringify(preview)) as Record<
@@ -631,14 +631,13 @@ describe("admin community allowance preview", () => {
     withIdentifier.participantId = "must-not-cross-the-cache-boundary";
     const cases = [
       null,
-      previewRow(buildAdminCommunityAllowancePreview(
-        [],
-        nowEpoch - 3 * 60 * 60 * 1_000,
-      )),
       { generated_at: preview.generatedAt, payload_json: "x".repeat(256 * 1_024 + 1) },
       { generated_at: preview.generatedAt, payload_json: "{" },
       { generated_at: preview.generatedAt, payload_json: JSON.stringify(withIdentifier) },
     ];
+    const previous = buildAdminCommunityAllowancePreview([], nowEpoch - 3 * 86_400_000);
+    await expect(readCachedAdminCommunityAllowancePreview(previewCacheDatabase(previewRow(previous)).database, nowEpoch))
+      .resolves.toEqual(previous);
     for (const row of cases) {
       const { database, statements } = previewCacheDatabase(row);
       await expect(readCachedAdminCommunityAllowancePreview(database, nowEpoch))
@@ -681,9 +680,7 @@ describe("admin community allowance preview", () => {
     expect(warmWrites[2]!.trimStart()).toMatch(
       /^INSERT INTO admin_community_allowance_preview_cache\b/u,
     );
-    expect(source.statements[0]).toMatch(
-      /^\s*SELECT generated_at, payload_json\s+FROM admin_community_allowance_preview_cache/u,
-    );
+    expect(source.statements[0]).toBe(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL);
     expect(source.statements[1]).toContain("community_snapshot_mutation_control");
     expect(source.statements[2]).toContain("community_snapshot_mutation_control");
     expect(source.statements[3]!.trimStart()).toMatch(/^WITH\b/u);

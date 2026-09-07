@@ -92,7 +92,7 @@ maintenance first. Check `BOUNDED_ANALYSIS_PROGRESS`, deferred reasons and
 defer a large completed checkpoint before loading it. New activity-only days
 retain their queue entry for a later complete allowance rebuild.
 
-For an expired preview despite current account caches, inspect the natural
+For a preview that is not advancing despite current account caches, inspect the natural
 invocation's wall time and `admin_allowance_preview_cache` phase timing, not
 only lifecycle `last_completed_at`. That stamp is written before optional
 analytics. Even UTC minutes attempt `before_analysis` publication; incomplete
@@ -100,11 +100,13 @@ inputs retry `after_analysis`. Odd minutes preserve reconstruction's full budget
 and only attempt `after_analysis` publication. Both run before daily
 reconciliation. Refreshed rows and
 deferrals log `queriesUsed`, `phaseQueries`, `elapsedMs` and
-`deadlineRemainingMs`. A current preview is quiet and retains the 55-minute
-refresh interval. Never extend freshness or edit generation timestamps to hide
-publication starvation.
+`deadlineRemainingMs`. An unchanged same-day preview is quiet and retains the
+55-minute refresh interval. Changed input epochs bypass the throttle. Migration
+0049 preserves published snapshots during append-only uploads; it never changes
+their generation timestamps or invents newer evidence. Corrections, withdrawals
+and other hard invalidations still clear the snapshot immediately.
 
-The separate admin growth-history cache has the same two-hour read limit.
+The separate admin growth-history cache retains its two-hour read limit.
 Inspect `admin_metrics_history_cache.generated_at` and the latest
 `admin_metric_snapshots.captured_at` independently of allowance availability.
 Even-minute passes give these self-throttled caches an early opportunity after
@@ -156,16 +158,24 @@ scheduled progress, the exact admin response and the rendered multi-day chart.
 The public chart uses only the daily API's optional closed
 [`allowanceBreakdowns`](../reference/api-surface.md#public-allowance-breakdowns),
 not an admin endpoint. View and date-range selection are client-side over that
-one read. All views share date and dollar axes; plan values are normalized to
+one periodically refreshed read. All views share date and dollar axes; plan values are normalized to
 Pro 20x and model values estimate a full weekly allowance on that model.
 
 If activity works but a breakdown does not, check publication state and the
-fresh, source-matched preview cache first. A cache older than two hours, epoch
-mismatch, invalid payload or unavailable optional table omits the breakdown
+source-fenced preview cache first. Age alone no longer removes the graph. A
+snapshot preceding the last hard invalidation, an invalid payload or unavailable
+optional schema omits the breakdown
 without failing activity. Only closed UTC dates present in the requested
 published range may appear. An open-day admin point can therefore be absent
 publicly. Model gaps remain gaps; do not copy today's vector backward or force
 an interactive reconstruction to make a graph appear populated.
+
+The v1.1 public graph projection includes the combined summary so all three
+views advance atomically without substituting values into immutable daily
+revisions. Visible pages refresh once a minute and preserve the display on
+transient errors, but clear it for authoritative invalidation. New inputs should
+not produce the global updating placeholder unless the input is a correction or
+another hard-invalidating source transition.
 
 Sample counts may be one account and must remain visibly disclosed. No
 account identifiers, private coverage diagnostics or plan-by-model cross-tabs

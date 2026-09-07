@@ -8,7 +8,7 @@ import {
   summarizeCommunityAllowanceDay,
 } from "./community-allowance";
 import type { CommunityAllowanceFit, CommunityModelCacheReadBudget } from "./community-allowance";
-import { PREVIEW_CACHE_JSON_LIMIT_BYTES } from "./admin-community-allowance";
+import { COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL, PREVIEW_CACHE_JSON_LIMIT_BYTES } from "./admin-community-allowance";
 import type { PublicAllowanceBreakdownsCacheRow } from "./public-allowance-breakdowns";
 import { sha256Hex } from "./crypto";
 import {
@@ -776,17 +776,8 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
   let queryRows: PublishedCommunityDailyQueryRow[];
   let allowanceBreakdownsCache: PublicAllowanceBreakdownsCacheRow | null = null;
   try {
-    const previewStatement = db.prepare(
-      `SELECT cache.generated_at, cache.payload_json
-         FROM admin_community_allowance_preview_cache cache
-         JOIN community_snapshot_mutation_control source
-           ON source.singleton_id = 1
-          AND cache.source_mutation_epoch = source.mutation_epoch
-        WHERE cache.singleton = 1
-          AND length(CAST(cache.payload_json AS BLOB)) <= ?1
-          AND cache.attribution_method_version = ?2
-        LIMIT 1`,
-    ).bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION);
+    const previewStatement = db.prepare(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL)
+      .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION);
     const results = await db.batch<PublishedCommunityDailyQueryRow | PublicAllowanceBreakdownsCacheRow>([
       dailyStatement,
       previewStatement,

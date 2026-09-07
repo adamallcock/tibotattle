@@ -263,19 +263,31 @@ describe("GET /api/v1/community/daily", () => {
     expect(statements).toHaveLength(2);
     expect(statements[0]).not.toContain("admin_community_allowance_preview_cache");
     expect(statements[1]).toContain("length(CAST(cache.payload_json AS BLOB)) <= ?1");
-    expect(statements[1]).toContain("cache.source_mutation_epoch = source.mutation_epoch");
+    expect(statements[1]).toContain("cache.source_mutation_epoch >= source.graph_invalidation_epoch");
+    expect(statements[1]).toContain("cache.source_mutation_epoch <= source.mutation_epoch");
     expect(statements[1]).toContain("LIMIT 1");
   });
 
-  it("omits all breakdowns when publication is rebuilding or the current source epoch changed", async () => {
+  it("preserves one complete graph while daily publication rebuilds, but refuses a hard-invalidated source epoch", async () => {
     const nowMs = Date.now(), day = utcDay(nowMs, -1);
     await seedDailyRevision({ day, revision: 1 });
     await seedBreakdownCache(nowMs);
     const path = `/api/v1/community/daily?from=${day}&to=${day}`;
     const updating = await api(path);
-    expect(await updating.json()).toMatchObject({ allowanceState: "updating", days: [{ day }] });
-    const absent = await api(path);
-    expect(await absent.json()).not.toHaveProperty("allowanceBreakdowns");
+    const published = await updating.json();
+    expect(published).toMatchObject({ allowanceState: "ready", days: [{ day }], allowanceBreakdowns: {
+      generatedAt: new Date(nowMs).toISOString(),
+      days: [{ day, combined: { centralUsd: 1200, participantCount: 1, fitCount: 1 } }],
+    } });
+    // Partially recomputed daily amounts cannot displace any graph mode.
+    await seedDailyRevision({ day, revision: 2, payload: { allowance: { centralUsd: 9999 } } });
+    expect(await (await api(path)).json()).toMatchObject({
+      days: [{ day, revision: 2 }],
+      allowanceBreakdowns: (published as Record<string, unknown>).allowanceBreakdowns,
+    });
+    const immutable = await db().prepare("SELECT payload_json FROM community_daily_aggregates WHERE day=? AND revision=2").bind(day)
+      .first<{ payload_json: string }>();
+    expect(JSON.parse(immutable!.payload_json).allowance.centralUsd).toBe(9999);
     await seedReadyAllowanceState(nowMs);
     // Move the source immediately before the atomic read. Existing mutation
     // triggers must invalidate readiness/cache before either SELECT observes it.
@@ -330,9 +342,11 @@ describe("GET /api/v1/community/daily", () => {
       await seedBreakdownCache(nowMs, options);
       await assertAbsent();
     }
-    const staleMs = nowMs - 2 * 60 * 60 * 1_000 - 1;
-    await seedBreakdownCache(staleMs);
-    await assertAbsent();
+    const previousMs = nowMs - 2 * 60 * 60 * 1_000 - 1;
+    await seedBreakdownCache(previousMs);
+    expect(await (await api(`/api/v1/community/daily?from=${day}&to=${day}`)).json()).toMatchObject({
+      allowanceBreakdowns: { generatedAt: new Date(previousMs).toISOString() },
+    });
     await seedBreakdownCache(nowMs + 5 * 60 * 1_000 + 5_000);
     await assertAbsent();
   });

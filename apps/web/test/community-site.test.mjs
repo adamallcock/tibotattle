@@ -1467,7 +1467,7 @@ test("the public daily client requests exactly the inclusive year window", async
   );
   assert.deepEqual(calls, [[
     `/api/v1/community/daily?from=${from}&to=${to}`,
-    { headers: { Accept: "application/json" } },
+    { headers: { Accept: "application/json" }, cache: "no-cache" },
   ]]);
 });
 
@@ -1661,6 +1661,22 @@ test("a published daily series renders friendly cumulative activity, latest-firs
   assert.equal(numericCells.length, 4);
 });
 
+test("daily detail disclosure keeps its open state across publication refreshes without reviving unavailable content", () => {
+  const documentRef = fakeDocument(), container = documentRef.createElement("div");
+  const render = (payload = publishedDailySeries()) => renderCommunityDailySeries({ documentRef, container, payload });
+  const disclosure = () => container.descendants().find(element => element.tag === "details");
+  render(); const first = disclosure();
+  assert.equal(first.open, false); first.open = true;
+  render(); assert.notEqual(disclosure(), first); assert.equal(disclosure().open, true);
+  disclosure().open = false; render(); assert.equal(disclosure().open, false);
+  disclosure().open = true;
+  const separate = documentRef.createElement("div");
+  renderCommunityDailySeries({ documentRef, container: separate, payload: publishedDailySeries() });
+  assert.equal(separate.descendants().find(element => element.tag === "details").open, false);
+  assert.equal(render(null), "service_unavailable"); assert.equal(disclosure(), undefined);
+  render(); assert.equal(disclosure().open, false);
+});
+
 test("community spend card sums only reported equivalents and qualifies incomplete history", () => {
   function spendBlock(knownCostUsd, overrides = {}) {
     return {
@@ -1780,7 +1796,8 @@ test("the public site hosts the daily series containers", async () => {
   assert.doesNotMatch(html, /latest published revision/u);
   const source = await readFile(SITE_SOURCE, "utf8");
   assert.match(source, /renderCommunityDailySeries/u);
-  assert.match(source, /communityDaily\(\)/u);
+  assert.match(source, /communityDaily\(options\)/u);
+  assert.match(source, /createCommunityRefresh/u);
   assert.doesNotMatch(source, /communityStats|renderCommunitySnapshot/u);
 });
 

@@ -2,7 +2,7 @@ import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
 import { advanceCommunityAnalysisRun } from "./community-analysis-runner";
 import type { CommunityAnalysisWorkIdentity } from "./community-analysis-work";
 import {
-  COMMUNITY_PARTICIPANT_PAGE_CTE, communityAnalysisCachesCurrent,
+  COMMUNITY_PARTICIPANT_PAGE_CTE, communityAnalysisCachesCurrent, completedCommunityAnalysisCachesCurrent,
   loadCommunitySourcePin, publishCommunityAnalysisCaches,
   type CommunityAnalysisCacheIdentity, type CommunityModelCacheReadBudget,
 } from "./community-allowance";
@@ -26,6 +26,7 @@ interface Candidate {
   has_v11: number;
   has_legacy: number;
   legacy_overlap: number;
+  input_revision: number | null;
 }
 export interface CommunityAnalysisWarmResult {
   status: "complete" | "deferred" | "unavailable";
@@ -35,7 +36,7 @@ export interface CommunityAnalysisWarmResult {
 }
 
 const CANDIDATE_PAGE_SQL = `${COMMUNITY_PARTICIPANT_PAGE_CTE}
-SELECT s.id AS participant_id, s.has_v1, s.has_v11, s.has_legacy,
+SELECT s.id AS participant_id, s.has_v1, s.has_v11, s.has_legacy, versions.revision AS input_revision,
   CASE WHEN s.has_v11=0 AND s.has_v1=1 AND s.has_legacy=1 THEN EXISTS (
     SELECT 1 FROM telemetry_records r INDEXED BY telemetry_records_participant_time
     WHERE r.participant_id=s.id AND r.observed_at>=?3 AND r.record_kind='quota'
@@ -48,7 +49,9 @@ SELECT s.id AS participant_id, s.has_v1, s.has_v11, s.has_legacy,
           AND c.transport_schema_version='telemetry-contribution-v0.2'
       )
   ) ELSE 0 END AS legacy_overlap
-FROM sources s ORDER BY s.id`;
+FROM sources s
+LEFT JOIN community_analytical_input_versions versions ON versions.participant_id = s.id
+ORDER BY s.id`;
 
 function validBudget(budget: CommunityModelCacheReadBudget, required: number): boolean {
   const now=(budget.now??Date.now)();
@@ -101,10 +104,12 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
     if(options.meter.remainingQueries<FINAL_RESERVE+20 || Date.now()>=options.deadlineMs) {deferred=true;break;}
     const candidate=candidates[(start+index)%candidates.length]!;
     const source=candidate.has_v11?"v1.1":candidate.has_v1?candidate.has_legacy?"mixed":"v1":"v0.2";
+    result.visited++;
+    if (source === "v1" && candidate.input_revision !== null
+        && await completedCommunityAnalysisCachesCurrent(db, candidate.participant_id, candidate.input_revision, fromDay)) continue;
     const {sourcePin,fingerprint}=await loadCommunitySourcePin(db,candidate.participant_id,fromDay,source);
     const identity: CommunityAnalysisCacheIdentity = {participantId:candidate.participant_id,source,sourcePin,
       fitFingerprint:fingerprint,fromDay,compositionSupported:source!=="v0.2"&&!candidate.legacy_overlap};
-    result.visited++;
     if(await communityAnalysisCachesCurrent(db,identity)) continue;
     attempted++;
     const allocation: CommunityModelCacheReadBudget = {remainingQueries:Math.max(0,options.meter.remainingQueries-FINAL_RESERVE),deadlineMs:options.deadlineMs};

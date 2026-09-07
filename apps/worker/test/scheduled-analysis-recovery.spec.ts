@@ -82,7 +82,7 @@ function bindings(observation = observe(), mode = "resumable"): Env {
     return Reflect.get(target, key);
   } });
 }
-async function migrations(max = 47) {
+async function migrations(max = 49) {
   await applyD1Migrations(db(), runtime.TEST_MIGRATIONS.filter(migration => Number(migration.name.slice(0, 4)) <= max));
   await applyD1Migrations(runtime.DELETION_LEDGER, runtime.TEST_DELETION_LEDGER_MIGRATIONS);
 }
@@ -225,7 +225,7 @@ describe("actual scheduled resumable analysis recovery", () => {
     // Odd-minute reconstruction has no speculative preview/cohort scan. Keep
     // the original setup budget even when the preview's inputs are incomplete.
     expect(second.queries.slice(0, payloadRead).some(entry => entry.sql.includes("FROM admin_community_allowance_preview_cache"))).toBe(false);
-    expect(setupReceipt).toEqual({ fixedSetupQueries: 49, primary: 46, ledger: 3 });
+    expect(setupReceipt).toEqual({ fixedSetupQueries: 50, primary: 47, ledger: 3 });
     // Worst legal 1024-part head:384 reads,3 final pin/head checks,407 finish
     // reserve,24 combined warmer/scheduler headroom. Heavy sustained required
     // housekeeping can exceed the remaining33 queries and safely defer finish.
@@ -281,8 +281,8 @@ describe("actual scheduled resumable analysis recovery", () => {
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
     logSpy.mockClear(); warnSpy.mockClear();
     const observation = observe(async (entry, moment) => {
-      if (crossed || moment !== "after" || !entry.sql.includes("FROM community_model_composition_cache")
-          || !entry.sql.includes("WHERE participant_id=?1")) return;
+      if (crossed || moment !== "after" || !entry.sql.includes("FROM community_analysis_work w")
+          || !entry.sql.includes("c.composition_json")) return;
       // This is the per-account full-body current probe, not the earlier
       // bounded composition-corpus read, which uses LEFT JOIN and paging.
       deadlineObservation.preview = await readPreview();
@@ -329,8 +329,8 @@ describe("actual scheduled resumable analysis recovery", () => {
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const metricsAtProbe: { generatedAt?: string; capturedAt?: string } = {};
     const observation = observe(async (entry, moment) => {
-      if (metricsAtProbe.generatedAt || moment !== "after" || !entry.sql.includes("FROM community_model_composition_cache")
-          || !entry.sql.includes("WHERE participant_id=?1")) return;
+      if (metricsAtProbe.generatedAt || moment !== "after" || !entry.sql.includes("FROM community_analysis_work w")
+          || !entry.sql.includes("c.composition_json")) return;
       metricsAtProbe.generatedAt = (await readCachedAdminMetricsHistory(db(), refreshedAt)).generatedAt;
       metricsAtProbe.capturedAt = (await db().prepare("SELECT MAX(captured_at) AS captured_at FROM admin_metric_snapshots")
         .first<{ captured_at: string }>())!.captured_at;

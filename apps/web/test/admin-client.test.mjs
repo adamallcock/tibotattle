@@ -880,3 +880,16 @@ test("admin action failures retain a verified diagnostic reference for display",
     "HTTP_503",
   );
 });
+
+test("admin response errors retain only the bounded transport status, never a body-supplied status", () => {
+  const error = adminResponseError(403, {
+    error: { code: "ADMIN_REQUIRED", httpStatus: 503, status: 503 },
+  });
+  assert.equal(error.httpStatus, 403);
+  assert.equal(error.code, "ADMIN_REQUIRED");
+  assert.equal(adminResponseError(503, { error: { code: "BACKEND_STORAGE_UNAVAILABLE" } }).httpStatus, 503);
+  for (const status of [null, undefined, "503", 99, 600, 500.5, Infinity, NaN, {}]) {
+    assert.equal(adminResponseError(status, { error: { code: "INTERNAL_ERROR" } }).httpStatus, null);
+  }
+  assert.equal(new AdminResponseError("ADMIN_ALLOWANCE_PREVIEW_INVALID").httpStatus, null);
+});

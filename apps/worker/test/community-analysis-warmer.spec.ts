@@ -158,6 +158,23 @@ async function warm(queries=900,nowMs=NOW,observation=observer()) {
 }
 
 describe("scheduled analysis warmer and atomic cache promotion",()=>{
+  it("uses one indexed probe per unchanged account and rebuilds only the changed account",async()=>{
+    for (let n=0;n<5;n++) await seed(`incremental-${n}`,9);
+    await warm();await warm();
+    const before=await cacheRows();
+    const idle=await warm();
+    expect(idle.result).toEqual({status:"complete",visited:5,published:0,resumed:0});
+    expect(idle.meter.queriesUsed).toBe(6); // One census plus five validated cache reads.
+    expect(idle.observation.queries.some(sql=>sql.includes("FROM telemetry_analytical_chunks"))).toBe(false);
+    expect(await cacheRows()).toEqual(before);
+    await db().prepare("UPDATE telemetry_v1_chunks SET chunk_digest=? WHERE participant_id='incremental-2'")
+      .bind("f".repeat(64)).run();
+    const changed=await warm();
+    expect(changed.result).toEqual({status:"complete",visited:5,published:1,resumed:1});
+    const unchanged=(rows:Awaited<ReturnType<typeof cacheRows>>)=>rows.map(table=>table.filter(row=>row.participant_id!=="incremental-2"));
+    expect(unchanged(await cacheRows())).toEqual(unchanged(before));
+  });
+
   it("fills both caches from fresh real D1 acquisition and feeds cache-only graph consumers",async()=>{
     await seedPricedReset();const run=await warm();
     expect(run.result).toMatchObject({status:"complete",visited:1,published:1,resumed:1});

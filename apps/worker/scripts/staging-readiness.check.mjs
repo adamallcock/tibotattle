@@ -10,6 +10,7 @@ import {
   ATTRIBUTION_SCHEMA_OBJECTS,
   ATTRIBUTION_SCHEMA_PROBE_SQL,
   COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL,
+  COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
   COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL,
   attributionSchemaComplete,
   EXPECTED_STAGING_MIGRATIONS,
@@ -41,8 +42,8 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
   assert.equal(result.checks.assetsClosed, true);
   assert.equal(result.checks.migrationInventorySafe, true);
   assert.deepEqual(
-    result.migrationInventory.USAGE_MONITOR_DB.slice(-6),
-    EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-6),
+    result.migrationInventory.USAGE_MONITOR_DB.slice(-7),
+    EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-7),
   );
   assert.deepEqual(
     result.migrationInventory.DELETION_LEDGER,
@@ -56,13 +57,14 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-6), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-7), [
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
     "0046_v1_quota_fit_projection.sql",
     "0047_community_analysis_work.sql",
     "0048_community_model_history.sql",
+    "0049_preserve_published_graph.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -79,6 +81,13 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
   const alteredHistory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   alteredHistory.USAGE_MONITOR_DB[47] = "0048_unreviewed_model_history.sql";
   assert.deepEqual(validateStagingMigrationInventory(alteredHistory), {
+    ok: false,
+    code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
+  });
+
+  const alteredPreservation = structuredClone(EXPECTED_STAGING_MIGRATIONS);
+  alteredPreservation.USAGE_MONITOR_DB[48] = "0049_unreviewed_graph_preservation.sql";
+  assert.deepEqual(validateStagingMigrationInventory(alteredPreservation), {
     ok: false,
     code: "LOCAL_MIGRATION_INVENTORY_DRIFT",
   });
@@ -116,10 +125,10 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0045_attribution_domain_activation.sql": "89f0df9e95eb98fa7ae8cb00dc82fe19f8933689a8002e647e638fdc870990fe",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 48);
+  assert.equal(names.length, 49);
   assert.deepEqual(names.slice(40, 45), Object.keys(expectedDigests));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 48 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 49 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -172,6 +181,24 @@ test("the historical-model migration is pinned independently of its derived sche
   assert.equal(ATTRIBUTION_SCHEMA_OBJECTS.filter(([type, name]) =>
     type === "table" && name.startsWith("community_model_history_")).length, 4);
   assert.equal(ATTRIBUTION_SCHEMA_COLUMNS.community_model_composition_days.includes("history_method_version"), true);
+});
+
+test("graph preservation migration is independently byte-pinned with the D1 CASE parser guard", () => {
+  // The schema probe cannot prove a one-time data statement was not changed.
+  // Pin this reviewed forward migration separately, including its fence seed.
+  const bytes = readFileSync(join(workerDirectory, "migrations", "0049_preserve_published_graph.sql"));
+  assert.equal(createHash("sha256").update(bytes).digest("hex"),
+    "2de001ced4ee2a9f8fe4f8d0789ac0362699ca8c7e4942bc06f3d78645164ec8");
+  const sql = bytes.toString("utf8");
+  assert.equal((sql.match(/\bCASE\b/gu) ?? []).length, 1);
+  assert.equal(sql.includes("graph_append_epoch = (CASE WHEN"), true);
+  assert.equal(sql.includes("THEN mutation_epoch + 1 ELSE -1 END)"), true);
+  // Wrangler strips inline SQL comments when splitting migration statements.
+  // Keep explanatory comments outside the exact stored trigger contracts so
+  // direct SQLite and Wrangler produce identical, independently pinned SQL.
+  const triggers = [...sql.matchAll(/CREATE TRIGGER\b[\s\S]*?END;/gu)].map(match => match[0]);
+  assert.equal(triggers.length, 2);
+  assert.equal(triggers.some(trigger => /--|\/\*/u.test(trigger)), false);
 });
 
 test("historical production prefix upgrades forward without losing source rows or legacy schema", () => {
@@ -325,6 +352,8 @@ test("fresh reconciled schema and attribution metadata probe cover every new gua
       ["community_model_history_work_stage", "replay_json"],
       ["community_model_history_results", "input_fingerprint"],
       ["community_model_composition_days", "history_method_version"],
+      ["community_snapshot_mutation_control", "graph_append_epoch"],
+      ["community_snapshot_mutation_control", "graph_invalidation_epoch"],
     ]) {
       assert.equal(ATTRIBUTION_SCHEMA_COLUMNS[table].includes(column), true);
       database.exec(`SAVEPOINT missing_column; ALTER TABLE ${table} RENAME COLUMN ${column} TO omitted_column;`);
@@ -372,7 +401,7 @@ test("v1 cursor prerequisite requires id to be the rowid alias, not merely an in
   }
 });
 
-test("quota projection readiness retains 0046/0047 gates and requires the separate 0048 schema", () => {
+test("quota projection readiness retains 0046/0047/0048 gates and requires the separate 0049 schema", () => {
   const database = new DatabaseSync(":memory:");
   const indexName = "telemetry_v1_quota_fit_rows_cursor";
   const apply = (name) => database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
@@ -384,6 +413,7 @@ test("quota projection readiness retains 0046/0047 gates and requires the separa
     assert.equal(names[45], "0046_v1_quota_fit_projection.sql");
     assert.equal(names[46], "0047_community_analysis_work.sql");
     assert.equal(names[47], "0048_community_model_history.sql");
+    assert.equal(names[48], "0049_preserve_published_graph.sql");
     assert.equal(probe(), 0);
     assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
     apply(names[45]);
@@ -394,6 +424,11 @@ test("quota projection readiness retains 0046/0047 gates and requires the separa
     assert.equal(database.prepare(COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL).get().community_model_history_schema, 0);
     assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
     apply(names[47]);
+    assert.equal(database.prepare(COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL).get().community_model_history_schema, 1);
+    assert.equal(database.prepare(COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL).get().community_graph_preservation_schema, 0);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    apply(names[48]);
+    assert.equal(database.prepare(COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL).get().community_graph_preservation_schema, 1);
     assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
     const original = database.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(indexName).sql;
     const variants = [
@@ -440,6 +475,161 @@ function assertMigrationSchemaVariants(migrationName, probeSql, field, variants)
     }
   }
 }
+
+test("graph preservation schema rejects missing fences and altered append or hard-invalidation contracts", () => {
+  const inTrigger = (name, change) => sql => {
+    const pattern = new RegExp(`CREATE TRIGGER ${name}\\b[\\s\\S]*?END;`, "u");
+    assert.equal(pattern.test(sql), true, name);
+    return sql.replace(pattern, change);
+  };
+  const inMutation = change => inTrigger("community_allowance_input_mutated", change);
+  const inAppend = change => inTrigger("community_analytical_input_v1_insert", change);
+  assertMigrationSchemaVariants("0049_preserve_published_graph.sql",
+    COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL, "community_graph_preservation_schema", [
+      ["missing append fence", sql => sql.replace("ALTER TABLE community_snapshot_mutation_control ADD COLUMN graph_append_epoch INTEGER NOT NULL DEFAULT -1;", "")],
+      ["missing invalidation fence", sql => sql.replace("ALTER TABLE community_snapshot_mutation_control ADD COLUMN graph_invalidation_epoch INTEGER NOT NULL DEFAULT 0;", "")
+        .replace("UPDATE community_snapshot_mutation_control SET graph_invalidation_epoch = mutation_epoch WHERE singleton_id = 1;", "")],
+      ...["graph_append_epoch", "graph_invalidation_epoch"].flatMap(column => [
+        [`${column} nullable`, sql => sql.replace(`ADD COLUMN ${column} INTEGER NOT NULL`, `ADD COLUMN ${column} INTEGER`)],
+        [`${column} wrong affinity`, sql => sql.replace(`ADD COLUMN ${column} INTEGER`, `ADD COLUMN ${column} TEXT`)],
+        [`${column} wrong default`, sql => sql.replace(`ADD COLUMN ${column} INTEGER NOT NULL DEFAULT ${column === "graph_append_epoch" ? -1 : 0}`, `ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 1`)],
+      ]),
+      ["missing invalidation trigger", inMutation(() => "")],
+      ["missing append classifier", inAppend(() => "")],
+      ["invalidation no-op", inMutation(sql => sql.replace(/BEGIN[\s\S]*END;/u, "BEGIN SELECT 1; END;"))],
+      ["append classifier no-op", inAppend(sql => sql.replace(/BEGIN[\s\S]*END;/u, "BEGIN SELECT 1; END;"))],
+      ["wrong mutation event", inMutation(sql => sql.replace("UPDATE OF mutation_epoch", "UPDATE OF graph_append_epoch"))],
+      ["unchanged epoch treated as mutation", inMutation(sql => sql.replace("OLD.mutation_epoch IS NOT NEW.mutation_epoch", "OLD.mutation_epoch IS NEW.mutation_epoch"))],
+      ["publication falsely ready", inMutation(sql => sql.replace("publication_state = 'updating'", "publication_state = 'ready'"))],
+      ["hard fence not advanced", inMutation(sql => sql.replace("graph_invalidation_epoch = NEW.mutation_epoch", "graph_invalidation_epoch = OLD.mutation_epoch"))],
+      ["hard fence scope omitted", inMutation(sql => sql.replace("singleton_id = 1 AND NOT", "NOT"))],
+      ["nonconsecutive append admitted", inMutation(sql => sql.replaceAll("NEW.mutation_epoch = OLD.mutation_epoch + 1", "NEW.mutation_epoch > OLD.mutation_epoch"))],
+      ["append epoch mismatch admitted", inMutation(sql => sql.replaceAll("AND NEW.graph_append_epoch = NEW.mutation_epoch", ""))],
+      ["reused append marker admitted", inMutation(sql => sql.replaceAll("AND NEW.graph_append_epoch IS NOT OLD.graph_append_epoch", ""))],
+      ["hard mutation retains preview", inMutation(sql => sql.replace("DELETE FROM admin_community_allowance_preview_cache WHERE NOT", "DELETE FROM admin_community_allowance_preview_cache WHERE"))],
+      ["superseded chunks classified", inAppend(sql => sql.replace("NEW.superseded_at IS NULL", "NEW.superseded_at IS NOT NULL"))],
+      ["participant revision unchanged", inAppend(sql => sql.replace("DO UPDATE SET revision = revision + 1", "DO UPDATE SET revision = revision"))],
+      ["global epoch unchanged", inAppend(sql => sql.replace("mutation_epoch = mutation_epoch + 1", "mutation_epoch = mutation_epoch"))],
+      ["unwrapped D1 CASE expression", inAppend(sql => sql.replace("= (CASE WHEN", "= CASE WHEN").replace("ELSE -1 END)", "ELSE -1 END"))],
+      ["replacement revision classified append", inAppend(sql => sql.replace("NEW.revision = 1", "NEW.revision >= 1"))],
+      ["inactive owner classified append", inAppend(sql => sql.replace("state = 'active'", "state = 'deleting'"))],
+      ["successor evidence ignored", inAppend(sql => sql.replace("      AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads WHERE participant_id = NEW.participant_id)\n", ""))],
+      ["accepted legacy evidence ignored", inAppend(sql => sql.replace("status = 'accepted'", "status = 'withdrawn'"))],
+      ["previous chunk identity ignored", inAppend(sql => sql.replace("AND c.id <> NEW.id", "AND c.id = NEW.id"))],
+      ["other participant competitor used", inAppend(sql => sql.replace("d.participant_id = NEW.participant_id", "d.participant_id <> NEW.participant_id"))],
+      ["other device competitor ignored", inAppend(sql => sql.replace("d.id <> NEW.device_id", "d.id = NEW.device_id"))],
+      ["competitor day ignored", inAppend(sql => sql.replace("AND c.chunk_day = NEW.chunk_day AND c.superseded_at IS NULL", "AND c.superseded_at IS NULL"))],
+      ["competitor active rows ignored", inAppend(sql => sql.replace("c.accepted_record_count > 0", "c.accepted_record_count > 1"))],
+      ["bounded competitor seek removed", inAppend(sql => sql.replace(" INDEXED BY telemetry_v1_chunks_device_day", ""))],
+      ["failed classification marked append", inAppend(sql => sql.replace("ELSE -1 END)", "ELSE mutation_epoch + 1 END)"))],
+    ]);
+});
+
+test("graph preservation requires its historical bounded seek indexes, not only their names", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
+      database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+    }
+    for (const name of ["device_credentials_participant_state", "telemetry_v1_chunks_device_day"]) {
+      const original = database.prepare("SELECT sql FROM sqlite_master WHERE name = ?").get(name).sql;
+      for (const replacement of ["", original.replace("participant_id,", "participant_id COLLATE NOCASE,")]) {
+        database.exec(`SAVEPOINT graph_index; DROP INDEX ${name}; ${replacement};`);
+        assert.equal(database.prepare(COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL).get().community_graph_preservation_schema, 0, name);
+        assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false, name);
+        database.exec("ROLLBACK TO graph_index; RELEASE graph_index;");
+      }
+    }
+  } finally {
+    database.close();
+  }
+});
+
+test("0049 rehearses forward and rollback while preserving publication bytes and seeding the hard fence", () => {
+  const database = new DatabaseSync(":memory:");
+  const apply = name => database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+  const rows = sql => database.prepare(sql).all().map(row => ({ ...row }));
+  try {
+    const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
+    for (const name of names.slice(0, 48)) apply(name);
+    database.exec(`UPDATE community_snapshot_mutation_control SET mutation_epoch = 137 WHERE singleton_id = 1;
+      INSERT INTO admin_community_allowance_preview_cache
+        (singleton, generated_at, payload_json, attribution_method_version, source_mutation_epoch)
+        VALUES (1, '2026-09-07T12:00:00.000Z', '{"fixture":"published"}', 'fixture-method', 137);
+      UPDATE community_allowance_publication_state SET publication_state = 'ready' WHERE singleton = 1;`);
+    const preservedTables = ["admin_community_allowance_preview_cache", "community_allowance_publication_state",
+      "participants", "community_analytical_input_versions", "collection_controls", "telemetry_transport_formats",
+      "telemetry_transport_participant_floors", "telemetry_v11_device_consents", "telemetry_v11_domain_heads"];
+    const before = Object.fromEntries(preservedTables.map(table => [table, rows(`SELECT * FROM ${table}`)]));
+    const schemaBefore = rows("SELECT type, name, sql FROM sqlite_master ORDER BY type, name");
+    const mutationBefore = rows("SELECT * FROM community_snapshot_mutation_control");
+    assert.equal(database.prepare(COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL).get().community_graph_preservation_schema, 0);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
+    database.exec("SAVEPOINT preserve_publication;");
+    apply(names[48]);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.throws(() => database.exec("SELECT * FROM fixture_deliberate_migration_failure;"), /no such table/u);
+    database.exec("ROLLBACK TO preserve_publication; RELEASE preserve_publication;");
+    assert.deepEqual(rows("SELECT type, name, sql FROM sqlite_master ORDER BY type, name"), schemaBefore);
+    assert.deepEqual(rows("SELECT * FROM community_snapshot_mutation_control"), mutationBefore);
+    for (const table of preservedTables) assert.deepEqual(rows(`SELECT * FROM ${table}`), before[table], table);
+    apply(names[48]);
+    assert.deepEqual(rows("SELECT * FROM community_snapshot_mutation_control"), [{
+      singleton_id: 1, mutation_epoch: 137, graph_append_epoch: -1, graph_invalidation_epoch: 137,
+    }]);
+    for (const table of preservedTables) assert.deepEqual(rows(`SELECT * FROM ${table}`), before[table], table);
+    const changesBeforeProbe = database.prepare("SELECT total_changes() AS n").get().n;
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(database.prepare("SELECT total_changes() AS n").get().n, changesBeforeProbe);
+    assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("0049 only preserves a preview for a fresh single-step append marker and invalidates unknown mutations", () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
+      database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+    }
+    const control = () => ({ ...database.prepare("SELECT * FROM community_snapshot_mutation_control").get() });
+    const seedPreview = () => database.exec(`INSERT INTO admin_community_allowance_preview_cache
+      (singleton, generated_at, payload_json, attribution_method_version, source_mutation_epoch)
+      SELECT 1, '2026-09-07T12:00:00.000Z', '{"fixture":"published"}', 'fixture-method', mutation_epoch
+        FROM community_snapshot_mutation_control;
+      UPDATE community_allowance_publication_state SET publication_state = 'ready' WHERE singleton = 1;`);
+    const before = control();
+    seedPreview();
+    const preview = { ...database.prepare("SELECT * FROM admin_community_allowance_preview_cache").get() };
+    database.exec(`UPDATE community_snapshot_mutation_control SET mutation_epoch = mutation_epoch + 1,
+      graph_append_epoch = mutation_epoch + 1 WHERE singleton_id = 1;`);
+    assert.deepEqual({ ...database.prepare("SELECT * FROM admin_community_allowance_preview_cache").get() }, preview);
+    assert.deepEqual(control(), {
+      singleton_id: 1, mutation_epoch: before.mutation_epoch + 1,
+      graph_append_epoch: before.mutation_epoch + 1, graph_invalidation_epoch: before.graph_invalidation_epoch,
+    });
+    assert.equal(database.prepare("SELECT publication_state FROM community_allowance_publication_state").get().publication_state, "updating");
+    database.exec("UPDATE community_snapshot_mutation_control SET mutation_epoch = mutation_epoch + 1 WHERE singleton_id = 1;");
+    assert.equal(database.prepare("SELECT count(*) AS n FROM admin_community_allowance_preview_cache").get().n, 0);
+    assert.equal(control().graph_invalidation_epoch, control().mutation_epoch);
+    for (const sql of [
+      // A separately pre-set marker must not authorize the following mutation.
+      `UPDATE community_snapshot_mutation_control SET graph_append_epoch = mutation_epoch + 1 WHERE singleton_id = 1;
+       UPDATE community_snapshot_mutation_control SET mutation_epoch = mutation_epoch + 1 WHERE singleton_id = 1;`,
+      `UPDATE community_snapshot_mutation_control SET mutation_epoch = mutation_epoch + 2,
+        graph_append_epoch = mutation_epoch + 2 WHERE singleton_id = 1;`,
+    ]) {
+      seedPreview();
+      database.exec(sql);
+      assert.equal(database.prepare("SELECT count(*) AS n FROM admin_community_allowance_preview_cache").get().n, 0);
+      assert.equal(control().graph_invalidation_epoch, control().mutation_epoch);
+      assert.equal(database.prepare("SELECT publication_state FROM community_allowance_publication_state").get().publication_state, "updating");
+    }
+  } finally {
+    database.close();
+  }
+});
 
 test("projection schema rejects altered table/FK/cursor guards and literal-sensitive maintenance triggers", () => {
   assertMigrationSchemaVariants("0046_v1_quota_fit_projection.sql",
@@ -681,7 +871,8 @@ test("0048 rollback preserves the existing schema and checkpoints, and owner cle
 
     database.exec("SAVEPOINT historical_migration;");
     apply(names[47]);
-    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(database.prepare(COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL).get().community_model_history_schema, 1);
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
     assert.throws(() => database.exec("SELECT * FROM fixture_deliberate_migration_failure;"), /no such table/u);
     database.exec("ROLLBACK TO historical_migration; RELEASE historical_migration;");
     assert.deepEqual(rows("SELECT type, name, sql FROM sqlite_master ORDER BY type, name"), schemaBefore);
@@ -883,7 +1074,7 @@ test("staging requires pending attribution migrations before its schema probe", 
   assert.equal(calls.some((args) => args.includes("apply")), false);
 });
 
-test("staging blocks incomplete 0045/0046/0047 prefixes and unreviewed 0046/0047/0048 before schema probing", () => {
+test("staging blocks incomplete 0045–0048 prefixes and unreviewed 0046–0049 before schema probing", () => {
   const config = provisionedConfig();
   const through45 = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 45);
   assert.equal(through45.at(-1), "0045_attribution_domain_activation.sql");
@@ -891,10 +1082,12 @@ test("staging blocks incomplete 0045/0046/0047 prefixes and unreviewed 0046/0047
     [through45, "REMOTE_MIGRATIONS_PENDING"],
     [[...through45, "0046_v1_quota_fit_projection.sql"], "REMOTE_MIGRATIONS_PENDING"],
     [EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 47), "REMOTE_MIGRATIONS_PENDING"],
+    [EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 48), "REMOTE_MIGRATIONS_PENDING"],
     [[...through45, "0046_unreviewed_quota_index.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
     [[...through45, "0046_v1_quota_fit_cursor.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
     [[...through45, "0046_v1_quota_fit_projection.sql", "0047_unreviewed_work.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
     [[...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 47), "0048_unreviewed_model_history.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
+    [[...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 48), "0049_unreviewed_graph_preservation.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
   ]) {
     const calls = [];
     const baseSpawn = successSpawn(config, calls);

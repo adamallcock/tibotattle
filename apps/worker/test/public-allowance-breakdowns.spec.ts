@@ -57,7 +57,7 @@ describe("public allowance breakdown allowlist", () => {
   it("publishes approved single-account dollars/counts without private admin diagnostics", () => {
     const projected = projectPublicAllowanceBreakdowns(cacheRow(), OPTIONS);
     expect(projected).toEqual({
-      schemaVersion: "community-allowance-breakdowns-v1.0",
+      schemaVersion: "community-allowance-breakdowns-v1.1",
       basis: COMMUNITY_ALLOWANCE_BASIS,
       referencePlanType: "pro",
       normalization: "pro_x1_prolite_x4_plus_x20",
@@ -66,6 +66,7 @@ describe("public allowance breakdown allowlist", () => {
       generatedAt: new Date(NOW).toISOString(),
       days: [{
         day: YESTERDAY,
+        combined: { centralUsd: 1_200, participantCount: 2, fitCount: 2, band80Usd: null },
         byPlanType: {
           pro: { centralUsd: 1_200, participantCount: 1, fitCount: 1, band80Usd: null },
           prolite: { centralUsd: null, participantCount: 0, fitCount: 0, band80Usd: null },
@@ -77,7 +78,7 @@ describe("public allowance breakdown allowlist", () => {
     const wire = JSON.stringify(projected);
     for (const field of ["synthetic-private", "coverage", "modelConfig", "catalogVersion",
       "refusedParticipantCount", "unsupportedSourceParticipantCount", "fittedParticipantCount",
-      "combined", "qualification", "byModel"]) expect(wire).not.toContain(field);
+      "qualification", "byModel"]) expect(wire).not.toContain(field);
   });
 
   it("intersects the requested published closed dates and never carries a model estimate backward", () => {
@@ -125,14 +126,15 @@ describe("public allowance breakdown allowlist", () => {
     expect(projected?.days[0]?.byPlanType.pro.band80Usd).not.toBe(value.days.at(-2)?.byPlanType.pro.band80Usd);
   });
 
-  it("fails closed on missing, malformed, oversized, stale, future, and mismatched cache generations", () => {
+  it("preserves published evidence dates but rejects missing, malformed, oversized, future, and mismatched generations", () => {
     const row = cacheRow();
     for (const candidate of [null, { ...row, payload_json: "{" },
       { ...row, payload_json: `${row.payload_json}${" ".repeat(PREVIEW_CACHE_JSON_LIMIT_BYTES)}` },
       { ...row, generated_at: "2026-09-07T11:59:00.000Z" }]) {
       expect(projectPublicAllowanceBreakdowns(candidate, OPTIONS)).toBeNull();
     }
-    expect(projectPublicAllowanceBreakdowns(row, { ...OPTIONS, nowMs: NOW + 2 * 60 * 60 * 1_000 + 1 })).toBeNull();
+    expect(projectPublicAllowanceBreakdowns(row, { ...OPTIONS, nowMs: NOW + 3 * 86_400_000 }))
+      .toEqual(projectPublicAllowanceBreakdowns(row, OPTIONS));
     expect(projectPublicAllowanceBreakdowns(row, { ...OPTIONS, nowMs: NOW - 5 * 60 * 1_000 - 1 })).toBeNull();
     expect(projectPublicAllowanceBreakdowns(row, { ...OPTIONS, nowMs: NaN })).toBeNull();
     expect(projectPublicAllowanceBreakdowns(row, { ...OPTIONS, allowanceState: "updating" })).toBeNull();

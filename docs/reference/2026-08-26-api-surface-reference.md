@@ -361,8 +361,8 @@ Authority vocabulary:
 ### Lifecycle review
 
 The existing daily route also supports the closed optional
-[`community-allowance-breakdowns-v1.0` projection](./api-surface.md#public-allowance-breakdowns).
-It adds bounded, source-fenced plan/model summaries without adding a route or
+[`community-allowance-breakdowns-v1.1` projection](./api-surface.md#public-allowance-breakdowns).
+It adds bounded, source-fenced combined/plan/model summaries without adding a route or
 making the private admin preview public. Single-account estimates and visible
 counts are an explicitly approved disclosure, not a minimum-cohort guarantee.
 

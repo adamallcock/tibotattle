@@ -282,6 +282,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
 export const CLIENT_WEB_FILES = Object.freeze([
   "apps/web/public/app.js",
   "apps/web/public/community-data.js",
+  "apps/web/public/community-refresh.js",
   "apps/web/public/community-view.js",
   "apps/web/public/community.html",
   "apps/web/public/community.js",
@@ -400,6 +401,7 @@ export const CLIENT_TEST_FILES = Object.freeze([
   "apps/web/test/cache-switch-impact.test.mjs",
   "apps/web/test/side-chat-estimates.test.mjs",
   "apps/web/test/community-site.test.mjs",
+  "apps/web/test/community-refresh.test.mjs",
   "apps/web/test/lib.test.mjs",
   "apps/web/test/navigation.test.mjs",
   "apps/web/test/i18n-browser-parity.test.mjs",

@@ -91,8 +91,22 @@ on odd minutes reconstruction keeps its full budget before preview publication.
 This gives ready graphs an early refresh opportunity without letting a large
 incomplete cohort repeatedly crowd out the calculations needed to repair it.
 An unavailable early preview retries after reconstruction and before daily
-reconciliation. A current preview keeps its normal refresh interval;
-neither a browser read nor a scheduler deadline extends its two-hour validity.
+reconciliation. With migration 0049, a published preview survives genuine
+append-only v1 uploads without age-only expiration or altered timestamps. The
+hard-invalidation epoch still excludes withdrawals, corrections, device-source
+changes, policy changes and unknown mutations. New publications require the
+exact current input epoch. Same-epoch previews keep their normal refresh
+interval; changed epochs and UTC windows bypass that throttle. A replacement
+cannot drop model dates still awaiting reconstruction. Public aggregate/plan/
+model charts use one snapshot, separate from immutable activity/spend revisions.
+
+Completed pure-v1 account caches are checked through one indexed joined read
+per account, using the existing work fingerprint, current journal revision,
+method/window keys and strict payload validation. Only changed accounts enter
+source-vector acquisition and calculation. Legacy/mixed/successor and unfinished
+work retain the exact-source path. Final medians still recombine compact cohort
+fits; this is not additive billing math or permission to parallelize unbounded
+database work. Migration and deployment are separate owner-authorized gates.
 Even-minute passes also admit owner gauge capture and growth-history cache
 refresh after the allowance preview but before reconstruction. Each retains its
 55-minute self-throttle and runs at most once per invocation; odd-minute passes

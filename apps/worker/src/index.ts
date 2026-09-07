@@ -282,7 +282,7 @@ import {
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
 import { isCurrentCommunityDailySpend } from "./community-daily-spend";
-import { projectPublicAllowanceBreakdowns } from "./public-allowance-breakdowns";
+import { projectPublicAllowanceGraph } from "./public-allowance-breakdowns";
 import {
   COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
@@ -3171,7 +3171,7 @@ async function handleCommunityDaily(
     throw new ApiError(400, "BODY_INVALID");
   }
   // Two SELECTs in one snapshot read this precomputed range/readiness plus one
-  // bounded current-epoch cache. Interactive requests never analyze history,
+  // bounded published cache. Interactive requests never analyze history,
   // duplicate the preview JSON across daily rows, or write readiness state.
   const nowMs = Date.now();
   const read = await readPublishedCommunityDailyAggregatesWithAllowanceState(
@@ -3186,14 +3186,16 @@ async function handleCommunityDaily(
       - (COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS - 1)
         * MILLISECONDS_PER_DAY,
   ).toISOString().slice(0, 10);
-  const allowanceState = isCurrentCommunityAllowancePublication(read.allowancePublicationState, todayStartMs)
+  // The read has already fenced the snapshot against hard invalidation. New
+  // append-only inputs can leave it visible while the next calculation runs.
+  const graph = projectPublicAllowanceGraph(read.allowanceBreakdownsCache, {
+    publishedDays: read.rows.map((row) => row.day), nowMs,
+  });
+  const dailyAllowanceReady = isCurrentCommunityAllowancePublication(read.allowancePublicationState, todayStartMs);
+  const allowanceState = graph !== null || dailyAllowanceReady
     ? "ready"
     : "updating";
-  const allowanceBreakdowns = projectPublicAllowanceBreakdowns(read.allowanceBreakdownsCache, {
-    allowanceState,
-    publishedDays: read.rows.map((row) => row.day),
-    nowMs,
-  });
+  const allowanceBreakdowns = graph?.breakdowns ?? null;
   const days = read.rows.map((row) => {
     let payload: unknown;
     try {
@@ -3231,7 +3233,7 @@ async function handleCommunityDaily(
         && !Array.isArray(allowance)
       ? (allowance as Record<string, unknown>).basis
       : null;
-    if (allowanceState !== "ready"
+    if (!dailyAllowanceReady
         || allowanceBasis !== COMMUNITY_ALLOWANCE_BASIS) {
       delete publicPayload.allowance;
     }

@@ -11,6 +11,7 @@
 // the community view are the same modules the in-app dashboard entry uses.
 
 import { PublicCommunityClient } from "./community-data.js";
+import { createCommunityRefresh } from "./community-refresh.js";
 import {
   renderCommunityAllowanceSection,
   renderCommunityDailySeries,
@@ -577,14 +578,9 @@ function renderCommunityDailyResult({ payload, failure = null }) {
   return state;
 }
 
-async function loadCommunityDailySeries() {
-  let payload = null;
-  let failure = null;
-  try {
-    payload = await communityClient.communityDaily();
-  } catch (error) {
-    failure = error;
-  }
+function publishCommunityDailySeries({ payload, failure }) {
+  if (communityDailySettled && failure === null && lastCommunityDailyFailure === null
+      && JSON.stringify(payload) === JSON.stringify(lastCommunityDailyPayload)) return;
   // A null payload renders the fixed "service unavailable" state, which is
   // separate from a service that answered and has published nothing yet. Keep
   // the settled failure too so a language switch rerenders its safe copy.
@@ -603,7 +599,15 @@ if (typeof document !== "undefined") {
   wireInstallerChecksumCopy("intel-");
   wireAllowanceRangeControls();
   wireAllowanceDialog();
-  void loadCommunityDailySeries();
+  const refresh = createCommunityRefresh({
+    read: options => communityClient.communityDaily(options),
+    publish: publishCommunityDailySeries,
+    visible: () => document.visibilityState !== "hidden",
+  });
+  refresh.start();
+  document.addEventListener("visibilitychange", () => refresh.visibilityChanged());
+  window.addEventListener("pagehide", () => refresh.stop());
+  window.addEventListener("pageshow", () => refresh.start());
   window.addEventListener("tibotattle:locale-change", (event) => {
     setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());
     setMessageLocale(event.detail?.locale ?? localization.locale());

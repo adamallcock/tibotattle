@@ -87,11 +87,12 @@ are not part of the API registry.
 ### Public allowance breakdowns
 
 `GET /api/v1/community/daily` may add `allowanceBreakdowns` with schema
-`community-allowance-breakdowns-v1.0`. Its only fields are schema version,
+`community-allowance-breakdowns-v1.1`. Its only fields are schema version,
 aggregate basis, reference plan, normalization, model basis/gate, generation
-timestamp and up to 70 date rows. Each row contains the day, the three reviewed
+timestamp and up to 70 date rows. Each row contains the day, the combined
+summary, the three reviewed
 personal-plan summaries and reviewed model tuples `[modelId, usd, accountCount]`.
-Plan summaries contain only median dollars, account/fit counts and an optional
+Combined and plan summaries contain only median dollars, account/fit counts and an optional
 middle-80%-of-fits band. Model estimates have no band or reset-fit count.
 
 All comparisons use the same Pro 20x-equivalent weekly basis: Pro ×1,
@@ -100,13 +101,31 @@ excluded. Model values require the existing composition identification gate;
 historical values are never carried backward from today's fit.
 
 The daily range/state and cached preview are read in one two-statement
-transaction. The optional cache is limited to 256 KiB and two hours, must
-match the current source epoch/method, and is projected into a new closed
+transaction. The optional cache is limited to 256 KiB, must match the current
+method and fall between the last hard-invalidation epoch and current input
+epoch, and is projected into a new closed
 object. Only requested, actually published days before both the current and
-generation UTC dates are included. Updating publication, stale/missing/invalid
-cache or an unavailable optional cache table omits the breakdown, preserving
+generation UTC dates are included. A genuine append-only v1 upload preserves
+the published graph while changed accounts and affected days are processed.
+Corrections, source-device changes, withdrawal, policy changes and unknown
+mutations hard-invalidate it. Missing/invalidated/invalid
+cache or an unavailable optional cache schema omits the breakdown, preserving
 the independent daily activity response. No public request invokes analysis,
 writes state, accepts cohort filters or exposes the private admin response.
+
+All three graph views use the same published snapshot; immutable daily rows
+are not rewritten or relabelled to achieve this. Generation/evidence dates are
+preserved, with no additional "last good" label or age-only expiration. New
+publications still require the exact current epoch and complete cached inputs.
+The browser continues to understand v1.0 breakdowns, refreshes visible pages
+once a minute with non-overlapping, timed requests, and backs off on failures.
+Transient failures preserve the displayed result; authoritative invalidation or
+publication-disabled responses clear it. No hidden-tab polling or client-side
+analytical reconstruction occurs. Refresh preserves the open daily disclosure,
+selected legend and keyboard inspection position without retaining old values.
+The owner page likewise keeps its graph through classified network/storage
+failures, but clears it for access/policy refusals, invalid payloads or an
+authoritative unavailable-cache response.
 
 The owner explicitly approved dollar estimates and sample counts even when
 based on one account. This can reveal that contributor's estimated capacity;

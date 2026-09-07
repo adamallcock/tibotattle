@@ -99,6 +99,9 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     // Separate, bounded historical-model checkpoints and terminal results.
     // This does not activate telemetry v1.1 or rewrite accepted source rows.
     "0048_community_model_history.sql",
+    // Preserve published graphs only across explicitly classified append-only
+    // inputs. Unknown mutations and corrections still invalidate atomically.
+    "0049_preserve_published_graph.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
@@ -239,6 +242,7 @@ export const ATTRIBUTION_SCHEMA_COLUMNS = Object.freeze(Object.fromEntries(
     community_model_history_work_stage: ["participant_id", "run_id", "stage_id", "base_progress_revision", "stage_revision", "mode", "target_phase", "target_control_json", "target_manifest_json", "write_manifest_json", "target_state_sha256", "replay_json", "write_offset", "verified_offset", "gc_component", "gc_sha256", "discard_input_revision", "state_sha256"],
     community_model_history_results: ["participant_id", "day", "input_revision", "input_fingerprint", "method_version", "result_json", "computed_at"],
     community_analytical_input_versions: ["participant_id", "revision"],
+    community_snapshot_mutation_control: ["graph_append_epoch", "graph_invalidation_epoch"],
     community_allowance_publication_state: ["attribution_method_version"],
     admin_community_allowance_preview_cache: ["attribution_method_version", "source_mutation_epoch"],
     community_allowance_fit_cache: ["input_fingerprint", "source_method_version"],
@@ -488,6 +492,71 @@ BEGIN
 END`,
 });
 
+// Independently reviewed preservation policy. In particular, the append marker
+// is single-use and first-revision, active-owner, unmixed, single-device input
+// only. Every other mutation advances the hard fence and removes the preview.
+// Do not derive these expectations from 0049 or normalize its guard literals.
+const COMMUNITY_GRAPH_PRESERVATION_SCHEMA_SQL = Object.freeze({
+  // Historical seek indexes now explicitly required by the append classifier.
+  // Their names alone do not prove the bounded participant/device/day path.
+  device_credentials_participant_state: `CREATE INDEX device_credentials_participant_state
+  ON device_credentials(participant_id, state, expires_at)`,
+  telemetry_v1_chunks_device_day: `CREATE INDEX telemetry_v1_chunks_device_day
+  ON telemetry_v1_chunks(participant_id, device_id, chunk_day, stream,
+    chunk_seq)
+  WHERE superseded_at IS NULL`,
+  community_snapshot_mutation_control: `CREATE TABLE community_snapshot_mutation_control (
+  singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+  mutation_epoch INTEGER NOT NULL DEFAULT 0 CHECK (mutation_epoch >= 0)
+, graph_append_epoch INTEGER NOT NULL DEFAULT -1, graph_invalidation_epoch INTEGER NOT NULL DEFAULT 0) STRICT`,
+  community_allowance_input_mutated: `CREATE TRIGGER community_allowance_input_mutated
+AFTER UPDATE OF mutation_epoch ON community_snapshot_mutation_control
+FOR EACH ROW WHEN OLD.mutation_epoch IS NOT NEW.mutation_epoch
+BEGIN
+  UPDATE community_allowance_publication_state
+     SET publication_state = 'updating', changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   WHERE singleton = 1;
+  UPDATE community_snapshot_mutation_control SET graph_invalidation_epoch = NEW.mutation_epoch
+   WHERE singleton_id = 1 AND NOT (
+     NEW.mutation_epoch = OLD.mutation_epoch + 1
+     AND NEW.graph_append_epoch = NEW.mutation_epoch
+     AND NEW.graph_append_epoch IS NOT OLD.graph_append_epoch
+   );
+  DELETE FROM admin_community_allowance_preview_cache WHERE NOT (
+    NEW.mutation_epoch = OLD.mutation_epoch + 1
+    AND NEW.graph_append_epoch = NEW.mutation_epoch
+    AND NEW.graph_append_epoch IS NOT OLD.graph_append_epoch
+  );
+END`,
+  community_analytical_input_v1_insert: `CREATE TRIGGER community_analytical_input_v1_insert
+AFTER INSERT ON telemetry_v1_chunks
+FOR EACH ROW WHEN NEW.superseded_at IS NULL
+BEGIN
+  INSERT INTO community_analytical_input_versions (participant_id, revision)
+    SELECT id, 1 FROM participants WHERE id = NEW.participant_id
+    ON CONFLICT(participant_id) DO UPDATE SET revision = revision + 1;
+  UPDATE community_snapshot_mutation_control SET
+    mutation_epoch = mutation_epoch + 1,
+    graph_append_epoch = (CASE WHEN
+      NEW.revision = 1
+      AND EXISTS (SELECT 1 FROM participants WHERE id = NEW.participant_id AND state = 'active')
+      AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads WHERE participant_id = NEW.participant_id)
+      AND NOT EXISTS (SELECT 1 FROM telemetry_contributions
+        WHERE participant_id = NEW.participant_id AND status = 'accepted')
+      AND NOT EXISTS (SELECT 1 FROM telemetry_v1_chunks c
+        WHERE c.participant_id = NEW.participant_id AND c.device_id = NEW.device_id
+          AND c.stream = NEW.stream AND c.chunk_day = NEW.chunk_day AND c.chunk_seq = NEW.chunk_seq
+          AND c.id <> NEW.id)
+      AND NOT EXISTS (SELECT 1 FROM device_credentials d
+        WHERE d.participant_id = NEW.participant_id AND d.id <> NEW.device_id
+          AND EXISTS (SELECT 1 FROM telemetry_v1_chunks c INDEXED BY telemetry_v1_chunks_device_day
+            WHERE c.participant_id = NEW.participant_id AND c.device_id = d.id
+              AND c.chunk_day = NEW.chunk_day AND c.superseded_at IS NULL AND c.accepted_record_count > 0))
+    THEN mutation_epoch + 1 ELSE -1 END)
+  WHERE singleton_id = 1;
+END`,
+});
+
 function exactStoredSchemaProbe(objects) {
   return Object.entries(objects).map(([name, sql]) => `EXISTS (
   SELECT 1 FROM sqlite_master WHERE name = ${sqlStringLiteral(name)}
@@ -531,6 +600,9 @@ SELECT ${exactStoredSchemaProbe(COMMUNITY_ANALYSIS_WORK_SCHEMA_SQL)} AS communit
 export const COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL = `
 SELECT ${exactStoredSchemaProbe(COMMUNITY_MODEL_HISTORY_SCHEMA_SQL)} AS community_model_history_schema
 `;
+export const COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(COMMUNITY_GRAPH_PRESERVATION_SCHEMA_SQL)} AS community_graph_preservation_schema
+`;
 
 // One bounded metadata query: no contribution, identity, token or policy-state
 // values leave the database, and no table-per-column remote round trips.
@@ -550,7 +622,8 @@ SELECT NOT EXISTS (
 ) AND (${V1_USAGE_CURSOR_INDEX_PROBE_SQL})
 AND (${V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL})
 AND (${COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL})
-AND (${COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL}) AS attribution_objects,
+AND (${COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL})
+AND (${COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL}) AS attribution_objects,
 NOT EXISTS (
   SELECT 1 FROM required_columns expected
    WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual

@@ -27,10 +27,9 @@ const MINIMUM_FITS_FOR_BAND = 3;
 // 70 compact days across the reviewed catalog, including fully populated rows.
 // Enforced before writes and reads; tests cover the complete reviewed roster.
 export const PREVIEW_CACHE_JSON_LIMIT_BYTES = 256 * 1_024;
-// Scheduled maintenance runs every minute but only rebuilds this aggregate
-// about hourly. Two hours tolerates one missed Cron without serving it forever.
+// Unchanged epochs need no more than an hourly rebuild. Changed source epochs
+// or UTC days bypass this throttle; published snapshots have no age-only expiry.
 const PREVIEW_CACHE_MIN_INTERVAL_MILLISECONDS = 55 * 60 * 1_000;
-const PREVIEW_CACHE_MAX_AGE_MILLISECONDS = 2 * 60 * 60 * 1_000;
 const PREVIEW_CACHE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
@@ -275,8 +274,9 @@ export function validCachedAdminCommunityAllowancePreview(
     return false;
   }
   const generatedEpoch = Date.parse(preview.generatedAt);
-  if (generatedEpoch > nowEpoch + PREVIEW_CACHE_MAX_FUTURE_SKEW_MILLISECONDS
-      || nowEpoch - generatedEpoch > PREVIEW_CACHE_MAX_AGE_MILLISECONDS) {
+  // Publication is durable, not a TTL cache: preserve its real evidence dates
+  // until a replacement is ready. Source/method/withdrawal fences apply at read.
+  if (generatedEpoch > nowEpoch + PREVIEW_CACHE_MAX_FUTURE_SKEW_MILLISECONDS) {
     return false;
   }
 
@@ -815,9 +815,22 @@ function previewCacheUnavailable(): never {
   throw new ApiError(503, "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE");
 }
 
+/** Same bounded, hard-invalidation-fenced snapshot for public and owner reads.
+ * Source epochs stay internal; only exact-current epochs may publish a successor.
+ */
+export const COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL = `SELECT cache.generated_at, cache.payload_json,
+    cache.source_mutation_epoch, source.mutation_epoch
+  FROM admin_community_allowance_preview_cache cache
+  JOIN community_snapshot_mutation_control source ON source.singleton_id = 1
+    AND cache.source_mutation_epoch >= source.graph_invalidation_epoch
+    AND cache.source_mutation_epoch <= source.mutation_epoch
+  WHERE cache.singleton = 1 AND length(CAST(cache.payload_json AS BLOB)) <= ?1
+    AND cache.attribution_method_version = ?2
+  LIMIT 1`;
+
 /**
  * The interactive owner route's entire post-authentication data path: one
- * bounded SELECT from a singleton aggregate cache. Missing, stale, oversized,
+ * bounded SELECT from a singleton aggregate cache. Missing, invalidated, oversized,
  * or malformed content fails closed; it never falls through to fit evidence.
  */
 export async function readCachedAdminCommunityAllowancePreview(
@@ -826,13 +839,8 @@ export async function readCachedAdminCommunityAllowancePreview(
 ): Promise<AdminCommunityAllowancePreview> {
   let row: { generated_at: string; payload_json: string } | null;
   try {
-    row = await db.prepare(
-      `SELECT generated_at, payload_json
-         FROM admin_community_allowance_preview_cache
-        WHERE singleton = 1 AND length(payload_json) <= ?1
-          AND attribution_method_version = ?2
-        LIMIT 1`,
-    ).bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
+    row = await db.prepare(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL)
+      .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
       .first<{ generated_at: string; payload_json: string }>();
   } catch {
     return previewCacheUnavailable();
@@ -881,14 +889,10 @@ export async function warmAdminCommunityAllowancePreviewCache(
 ): Promise<AdminCommunityAllowancePreviewCacheResult> {
   try {
     if (recovery && !reserveRecoveryStatements(recovery, 6)) return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
-    const existing = await db.prepare(
-      `SELECT generated_at, payload_json
-         FROM admin_community_allowance_preview_cache
-        WHERE singleton = 1 AND length(payload_json) <= ?1
-          AND attribution_method_version = ?2
-        LIMIT 1`,
-    ).bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
-      .first<{ generated_at: string; payload_json: string }>();
+    const existing = await db.prepare(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL)
+      .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
+      .first<{ generated_at: string; payload_json: string; source_mutation_epoch: number; mutation_epoch: number }>();
+    let previousPreview: AdminCommunityAllowancePreview | null = null;
     if (existing !== null
         && typeof existing.generated_at === "string"
         && typeof existing.payload_json === "string"
@@ -902,7 +906,10 @@ export async function warmAdminCommunityAllowancePreviewCache(
         // until its timestamp ages past the refresh interval.
       }
       const existingEpoch = Date.parse(existing.generated_at);
-      if (Number.isFinite(existingEpoch)
+      if (validCachedAdminCommunityAllowancePreview(parsed, existing.generated_at, nowEpoch)) previousPreview = parsed;
+      if (previousPreview !== null && existing.source_mutation_epoch === existing.mutation_epoch
+          && existing.generated_at.slice(0, 10) === new Date(nowEpoch).toISOString().slice(0, 10)
+          && Number.isFinite(existingEpoch)
           && nowEpoch - existingEpoch < PREVIEW_CACHE_MIN_INTERVAL_MILLISECONDS
           && validCachedAdminCommunityAllowancePreview(
             parsed,
@@ -929,6 +936,12 @@ export async function warmAdminCommunityAllowancePreviewCache(
     if (preview === null) {
       return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
     }
+    // An append can invalidate affected reconstructed model days. Do not replace
+    // a complete displayed snapshot with holes while those days are rebuilding.
+    // A terminal no-fit day is present with empty values and may replace a fit.
+    const replacementModelDays = new Set(preview.models.days.map(day => day.day));
+    if (previousPreview?.models.days.some(day => day.day >= preview.from && day.day < preview.to
+        && !replacementModelDays.has(day.day))) return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
     const payloadJson = JSON.stringify(preview);
     if (new TextEncoder().encode(payloadJson).byteLength
           > PREVIEW_CACHE_JSON_LIMIT_BYTES

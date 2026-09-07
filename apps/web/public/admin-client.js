@@ -57,11 +57,13 @@ const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,79}$/u;
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 export class AdminResponseError extends Error {
-  constructor(code, requestId = null) {
+  constructor(code, requestId = null, httpStatus = null) {
     super(code);
     this.name = "AdminResponseError";
     this.code = code;
     this.requestId = requestId;
+    this.httpStatus = Number.isSafeInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599
+      ? httpStatus : null;
   }
 }
 
@@ -1368,7 +1370,7 @@ export function adminResponseError(status, value) {
       && REQUEST_ID_PATTERN.test(details.requestId)
     ? details.requestId
     : null;
-  return new AdminResponseError(code, requestId);
+  return new AdminResponseError(code, requestId, status);
 }
 
 export function adminActionErrorMessage(error) {

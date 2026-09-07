@@ -1,4 +1,5 @@
 import {
+  AdminResponseError,
   adminActionErrorMessage,
   adminResponseError,
   projectAdminAllowancePreview,
@@ -637,6 +638,9 @@ async function request(path, init = {}) {
       // reach the API. Always sent on the same-origin admin page (no preflight).
       "x-usage-monitor-admin": "1",
     },
+  }).catch(() => {
+    // Retain only a fixed transport classification, never browser error text.
+    throw new AdminResponseError("ADMIN_NETWORK_ERROR");
   });
   const body = await response.json().catch(() => null);
   if (!response.ok) {
@@ -2970,6 +2974,16 @@ function renderAdminCommunityAllowance(preview) {
   renderAdminAllowanceControls();
 }
 
+function isTransientAdminReadError(error) {
+  if (!(error instanceof AdminResponseError)) return false;
+  if (error.httpStatus === null) return error.code === "ADMIN_NETWORK_ERROR";
+  // Missing caches, policy refusals and unknown service codes are authoritative
+  // even when returned as 503; only transport/storage failures preserve a graph.
+  return error.httpStatus >= 500 && error.httpStatus <= 599 && [
+    "INTERNAL_ERROR", "BACKEND_STORAGE_UNAVAILABLE", `HTTP_${error.httpStatus}`,
+  ].includes(error.code);
+}
+
 async function loadAdminCommunityAllowance(loadGeneration) {
   if (!isAdminPage) return;
   let preview;
@@ -2977,7 +2991,8 @@ async function loadAdminCommunityAllowance(loadGeneration) {
     preview = projectAdminAllowancePreview(await request(
       "/api/v1/admin/community/allowance-preview",
     ));
-  } catch {
+  } catch (error) {
+    if (isTransientAdminReadError(error) && state.allowancePreview !== null) return;
     preview = null;
   }
   if (!isCurrentLoadGeneration(loadGeneration, state.loadGeneration)) return;
@@ -3125,6 +3140,10 @@ async function load() {
     void loadAdminCommunityAllowance(loadGeneration);
     void loadGrowthHistory(loadGeneration);
   } catch (error) {
+    if (!isTransientAdminReadError(error)) {
+      state.allowancePreview = null;
+      renderAdminCommunityAllowance(null);
+    }
     renderOverviewUnavailable();
     showNotice(`Operations view unavailable: ${error.message}.`);
     state.retryDelayMilliseconds = Math.min(

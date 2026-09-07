@@ -1027,6 +1027,144 @@ function allowanceNodes(documentRef, selector) {
   return documentRef.byId.get("admin-community-allowance-result").querySelectorAll(selector);
 }
 
+test("admin refresh preserves the exact allowance DOM on transport failures and replaces it on recovery", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  let nextPreview = async () => response(preview);
+  let previewRequests = 0;
+  await withAdminPage(async (path, options) => {
+    assert.equal(options.method ?? "GET", "GET");
+    if (path === "/api/v1/admin/overview") return response(overview);
+    if (path === "/api/v1/admin/community/allowance-preview") {
+      previewRequests += 1;
+      return nextPreview();
+    }
+    assert.equal(path, "/api/v1/admin/metrics/history");
+    return unavailableResponse();
+  }, async documentRef => {
+    const badge = documentRef.byId.get("admin-community-status");
+    await waitFor(() => badge.textContent === "Admin preview available");
+    selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const plan = container.querySelector('button[data-allowance-plan="prolite"]');
+    container.listeners.get("click")({ target: plan });
+    const focused = documentRef.activeElement;
+    const graph = container.querySelector('svg[role="img"]');
+    const children = [...container.children];
+    const text = descendantNodes(container).map(node => node.textContent).join(" ");
+    let expectedRequests = 1;
+    for (const failure of [
+      async () => { throw new TypeError("fixture-private-transport-detail"); },
+      async () => unavailableResponse(),
+      async () => ({ ok: false, status: 503, json: async () => ({ error: { code: "BACKEND_STORAGE_UNAVAILABLE" } }) }),
+      async () => ({ ok: false, status: 502, json: async () => { throw new SyntaxError("fixture-proxy-html"); } }),
+      async () => ({ ok: false, status: 504, json: async () => null }),
+    ]) {
+      nextPreview = failure;
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(previewRequests, ++expectedRequests);
+      assert.equal(badge.textContent, "Admin preview available");
+      assert.equal(container.querySelector('svg[role="img"]'), graph);
+      assert.deepEqual(container.children, children);
+      assert.equal(documentRef.activeElement, focused);
+      assert.equal(focused.getAttribute("aria-pressed"), "true");
+      assert.equal(descendantNodes(container).map(node => node.textContent).join(" "), text);
+      assert.doesNotMatch(text, /last good|updating|fixture-private-transport-detail|fixture-proxy-html/iu);
+    }
+    const recovered = structuredClone(preview);
+    recovered.days.at(-1).byPlanType.pro.centralUsd += 10;
+    nextPreview = async () => response(recovered);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => container.querySelector('svg[role="img"]') !== graph);
+    assert.equal(badge.textContent, "Admin preview available");
+    assert.equal(container.querySelector('button[data-allowance-plan="prolite"]').getAttribute("aria-pressed"), "true");
+    assert.equal(container.querySelector(".allowance-summary-value").textContent, "$2,129");
+  });
+});
+
+test("admin refresh removes allowance graphs on authoritative refusals, unavailable states and malformed payloads", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  let nextPreview = async () => response(preview);
+  await withAdminPage(async path => {
+    if (path === "/api/v1/admin/overview") return response(overview);
+    if (path === "/api/v1/admin/community/allowance-preview") return nextPreview();
+    assert.equal(path, "/api/v1/admin/metrics/history");
+    return unavailableResponse();
+  }, async documentRef => {
+    const badge = documentRef.byId.get("admin-community-status");
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const refresh = async () => {
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      await new Promise(resolve => setImmediate(resolve));
+    };
+    await waitFor(() => badge.textContent === "Admin preview available");
+    const errorResponse = (status, code) => async () => ({
+      ok: false, status, json: async () => ({ error: { code, httpStatus: 503 } }),
+    });
+    for (const refusal of [
+      errorResponse(401, "AUTH_REQUIRED"),
+      errorResponse(403, "INTERNAL_ERROR"),
+      errorResponse(404, "NOT_FOUND"),
+      errorResponse(503, "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE"),
+      errorResponse(503, "PUBLICATION_DISABLED"),
+      errorResponse(503, "ADMIN_NOT_CONFIGURED"),
+      errorResponse(503, "UNREVIEWED_SERVER_REFUSAL"),
+      async () => response({ status: "updating" }),
+      async () => response({ status: "unavailable" }),
+      async () => response({ ...preview, days: "malformed" }),
+      async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("fixture-malformed-payload"); } }),
+    ]) {
+      assert.equal(badge.textContent, "Admin preview available");
+      assert.equal(container.querySelectorAll('svg[role="img"]').length, 1);
+      nextPreview = refusal;
+      await refresh();
+      assert.equal(badge.textContent, "Preview unavailable");
+      assert.equal(container.querySelectorAll('svg[role="img"]').length, 0);
+      nextPreview = async () => unavailableResponse();
+      await refresh();
+      assert.equal(badge.textContent, "Preview unavailable", "a later transport failure cannot resurrect invalidated data");
+      nextPreview = async () => response(preview);
+      await refresh();
+    }
+  });
+});
+
+test("overview access refusal clears the allowance graph and a delayed older preview cannot restore it", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  let nextOverview = async () => response(overview);
+  let nextPreview = async () => response(preview);
+  let resolveOlderPreview;
+  await withAdminPage(async path => {
+    if (path === "/api/v1/admin/overview") return nextOverview();
+    if (path === "/api/v1/admin/community/allowance-preview") return nextPreview();
+    assert.equal(path, "/api/v1/admin/metrics/history");
+    return unavailableResponse();
+  }, async documentRef => {
+    const badge = documentRef.byId.get("admin-community-status");
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    await waitFor(() => badge.textContent === "Admin preview available");
+    const graph = container.querySelector('svg[role="img"]');
+    nextOverview = async () => unavailableResponse();
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(container.querySelector('svg[role="img"]'), graph, "temporary overview failures preserve the graph too");
+    nextOverview = async () => response(overview);
+    nextPreview = () => new Promise(resolve => { resolveOlderPreview = resolve; });
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => typeof resolveOlderPreview === "function");
+    nextOverview = async () => ({ ok: false, status: 403, json: async () => ({ error: { code: "ADMIN_REQUIRED" } }) });
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(badge.textContent, "Preview unavailable");
+    assert.equal(container.querySelectorAll('svg[role="img"]').length, 0);
+    resolveOlderPreview(response(preview));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(badge.textContent, "Preview unavailable");
+    assert.equal(container.querySelectorAll('svg[role="img"]').length, 0);
+  });
+});
+
 test("rendered plan cards keep normalized headlines and show correctly rounded actual-plan weeks", async () => {
   await withAllowancePage(createAdminAllowancePreviewPayload(), async (documentRef) => {
     selectAllowanceControl(documentRef, "admin-community-mode-controls", 'button[data-allowance-mode="plans"]');

@@ -336,7 +336,7 @@ function publicAllowanceSummary(value) {
 export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs = Date.now()) {
   if (!exactObject(value, ["schemaVersion", "basis", "referencePlanType", "normalization",
     "modelBasis", "modelGate", "generatedAt", "days"])
-      || value.schemaVersion !== "community-allowance-breakdowns-v1.0"
+      || !["community-allowance-breakdowns-v1.0", "community-allowance-breakdowns-v1.1"].includes(value.schemaVersion)
       || value.basis !== COMMUNITY_ALLOWANCE_BASIS || value.referencePlanType !== "pro"
       || value.normalization !== COMMUNITY_ALLOWANCE_NORMALIZATION
       || value.modelBasis !== "seven_day_codex_pro20x_equivalent_per_model_composition"
@@ -344,17 +344,19 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
       || typeof value.generatedAt !== "string" || !Number.isFinite(nowMs)
       || !Array.isArray(value.days) || value.days.length > 70) return null;
   const generatedMs = Date.parse(value.generatedAt);
-  // Match server freshness, allowing its five-minute HTTP cache lifetime.
+  // Keep the publication's actual dates; only the server can invalidate its
+  // source. An ordinary refresh does not expire a previously published graph.
   if (!Number.isFinite(generatedMs) || new Date(generatedMs).toISOString() !== value.generatedAt
-      || generatedMs > nowMs + 5 * 60 * 1000 || nowMs - generatedMs > 125 * 60 * 1000) return null;
+      || generatedMs > nowMs + 5 * 60 * 1000) return null;
   const today = new Date(nowMs).toISOString().slice(0, 10);
   const generatedDay = value.generatedAt.slice(0, 10);
   const earliestDay = new Date(Date.parse(`${generatedDay}T00:00:00.000Z`)
     - 69 * MILLISECONDS_PER_DAY).toISOString().slice(0, 10);
   const allowedDays = new Set(publishedDays);
   const days = [];
+  const hasCombined = value.schemaVersion === "community-allowance-breakdowns-v1.1";
   for (const row of value.days) {
-    if (!exactObject(row, ["day", "byPlanType", "models"]) || !publicDay(row.day)
+    if (!exactObject(row, hasCombined ? ["day", "combined", "byPlanType", "models"] : ["day", "byPlanType", "models"]) || !publicDay(row.day)
         || !allowedDays.has(row.day) || row.day < earliestDay || row.day >= today || row.day >= generatedDay
         || (days.length > 0 && row.day <= days.at(-1).day)
         || !exactObject(row.byPlanType, PUBLIC_ALLOWANCE_PLAN_IDS)
@@ -374,9 +376,11 @@ export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs =
       seen.add(tuple[0]);
       models.push([tuple[0], tuple[1], tuple[2]]);
     }
-    days.push({ day: row.day, byPlanType, models });
+    const combined = hasCombined ? publicAllowanceSummary(row.combined) : null;
+    if (hasCombined && combined === null) return null;
+    days.push({ day: row.day, ...(hasCombined ? { combined } : {}), byPlanType, models });
   }
-  return { generatedAt: value.generatedAt, modelConfig: PUBLIC_ALLOWANCE_MODEL_CONFIG, days };
+  return { generatedAt: value.generatedAt, hasCombined, modelConfig: PUBLIC_ALLOWANCE_MODEL_CONFIG, days };
 }
 
 function normalizedDailyAllowance(candidate) {
@@ -551,9 +555,11 @@ export function normalizeCommunityDailySeries(payload, { nowMs = Date.now() } = 
   };
 }
 
-async function readPublicJson(fetchImpl, path) {
+async function readPublicJson(fetchImpl, path, signal) {
   const response = await fetchImpl(path, {
     headers: { Accept: "application/json" },
+    cache: "no-cache",
+    ...(signal === undefined ? {} : { signal }),
   });
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
@@ -573,11 +579,12 @@ async function readPublicJson(fetchImpl, path) {
   return response.status === 204 ? null : response.json();
 }
 
-function fetchCommunityDaily(fetchImpl, nowMs) {
+function fetchCommunityDaily(fetchImpl, nowMs, signal) {
   const { from, to } = communityDailyWindow(nowMs);
   return readPublicJson(
     fetchImpl,
     `${COMMUNITY_ROOT}/community/daily?from=${from}&to=${to}`,
+    signal,
   );
 }
 
@@ -589,8 +596,8 @@ export class PublicCommunityClient {
     this.fetchImpl = fetchImpl;
   }
 
-  communityDaily({ nowMs = Date.now() } = {}) {
+  communityDaily({ nowMs = Date.now(), signal } = {}) {
     const fetchImpl = this.fetchImpl;
-    return fetchCommunityDaily(fetchImpl, nowMs);
+    return fetchCommunityDaily(fetchImpl, nowMs, signal);
   }
 }

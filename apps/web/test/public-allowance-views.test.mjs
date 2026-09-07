@@ -167,6 +167,26 @@ test("the closed public wire survives normalization into all three chart views",
   assert.equal(normalized.breakdowns.days[0].byPlanType.pro.centralUsd, 2000, "fresh copied allowlist");
 });
 
+test("v1.1 keeps all graph views on one publication while daily revisions update independently", () => {
+  const payload = publicAllowanceFixture(NOW);
+  payload.allowanceBreakdowns.schemaVersion = "community-allowance-breakdowns-v1.1";
+  for (const [index, day] of payload.allowanceBreakdowns.days.entries()) {
+    const { centralUsd, participantCount, fitCount, band80Usd } = payload.days[index].payload.allowance;
+    day.combined = { centralUsd, participantCount, fitCount, band80Usd };
+    delete payload.days[index].payload.allowance;
+  }
+  const normalized = normalizeCommunityDailySeries(payload, { nowMs: NOW });
+  assert.equal(normalized.breakdowns.hasCombined, true);
+  const oldChart = buildCommunityAllowanceChartModel(normalized, { view: "aggregate" });
+  assert.equal(oldChart.latest.centralUsd, 1908);
+  payload.days.at(-1).payload.allowance = { ...publicAllowanceFixture(NOW).days.at(-1).payload.allowance, centralUsd: 9999 };
+  const later = normalizeCommunityDailySeries(payload, { nowMs: NOW + 3 * 86400000 });
+  assert.deepEqual(buildCommunityAllowanceChartModel(later, { view: "aggregate" }), oldChart);
+  for (const view of ["plans", "models"]) assert.ok(buildCommunityAllowanceChartModel(later, { view }));
+  delete payload.allowanceBreakdowns.days[0].combined;
+  assert.equal(normalizeCommunityDailySeries(payload, { nowMs: NOW }).breakdowns, null);
+});
+
 test("optional public breakdown rejects private extras and invalid evidence without hiding activity", () => {
   const invalid = [
     value => { value.participant_id = "PRIVATE_CANARY"; },
@@ -201,13 +221,13 @@ test("optional public breakdown rejects private extras and invalid evidence with
   }
 });
 
-test("public breakdown dates, freshness, publication and clock boundaries fail closed", () => {
+test("public breakdown dates persist while publication and clock boundaries fail closed", () => {
   const payload = publicAllowanceFixture(NOW);
   const decode = (value, days = payload.days.map(day => day.day), nowMs = NOW) =>
     normalizePublicAllowanceBreakdowns(value, days, nowMs);
   assert.ok(decode(payload.allowanceBreakdowns));
   assert.equal(decode(payload.allowanceBreakdowns, []), null);
-  assert.equal(decode(payload.allowanceBreakdowns, undefined, NOW + 125 * 60000 + 1), null);
+  assert.deepEqual(decode(payload.allowanceBreakdowns, undefined, NOW + 3 * 86400000), decode(payload.allowanceBreakdowns));
   assert.ok(decode(payload.allowanceBreakdowns, undefined, NOW + 125 * 60000));
   assert.equal(decode(payload.allowanceBreakdowns, undefined, NOW - 5 * 60000 - 1), null);
   assert.equal(decode(payload.allowanceBreakdowns, undefined, NaN), null);
@@ -231,6 +251,38 @@ class Element {
   setAttribute(key, value) { this.attributes.set(key, value); }
   descendants() { return this.children.flatMap(child => [child, ...child.descendants()]); }
   get text() { return [this.textContent, ...this.children.map(child => child.text)].join(" "); }
+}
+
+function interactiveDocument() {
+  const documentRef = { documentElement: { lang: "en-US" }, activeElement: null };
+  class InteractiveElement extends Element {
+    constructor(tag) { super(tag); this.listeners = new Map(); this.style = { setProperty() {} }; }
+    addEventListener(type, callback) { this.listeners.set(type, callback); }
+    getBoundingClientRect() { return { left: 0, top: 0, width: 640, height: 260 }; }
+    fire(type, fields = {}) { this.listeners.get(type)?.({ preventDefault() {}, ...fields }); }
+    contains(element) { return element === this || this.descendants().includes(element); }
+    replaceChildren() {
+      if (this.descendants().includes(documentRef.activeElement)) documentRef.activeElement = null;
+      super.replaceChildren();
+    }
+    focus(options) {
+      documentRef.activeElement?.fire("blur");
+      documentRef.activeElement = this;
+      this.focusOptions = options;
+      this.fire("focus");
+    }
+  }
+  documentRef.createElement = tag => new InteractiveElement(tag);
+  documentRef.createElementNS = (_, tag) => new InteractiveElement(tag);
+  return documentRef;
+}
+
+function chartParts(container) {
+  const all = container.descendants();
+  return { buttons: all.filter(element => element.tag === "button"),
+    astra: all.find(element => element.tag === "button" && element.text.includes("Astra")),
+    svg: all.find(element => element.tag === "svg" && element.attributes.has("aria-label")),
+    tooltip: all.find(element => element.className === "allowance-tooltip") };
 }
 test("real public render shows model sample semantics, per-view labels and disclosure", () => {
   const documentRef = { documentElement: { lang: "en-US" }, createElement: tag => new Element(tag),
@@ -280,15 +332,8 @@ test("real public render shows model sample semantics, per-view labels and discl
 });
 
 test("legend focus dims other series without discarding data and limits keyboard inspection to that series", () => {
-  class InteractiveElement extends Element {
-    constructor(tag) { super(tag); this.listeners = new Map(); this.style = { setProperty() {} }; }
-    addEventListener(type, callback) { this.listeners.set(type, callback); }
-    getBoundingClientRect() { return { left: 0, top: 0, width: 640, height: 260 }; }
-    fire(type, fields = {}) { this.listeners.get(type)?.({ preventDefault() {}, ...fields }); }
-  }
-  const documentRef = { documentElement: { lang: "en-US" }, createElement: tag => new InteractiveElement(tag),
-    createElementNS: (_, tag) => new InteractiveElement(tag) };
-  const container = new InteractiveElement("div");
+  const documentRef = interactiveDocument();
+  const container = documentRef.createElement("div");
   renderCommunityAllowanceSection({ documentRef, container, payload: publicAllowanceFixture(), view: "models" });
   const all = container.descendants();
   const buttons = all.filter(element => element.tag === "button");
@@ -310,4 +355,115 @@ test("legend focus dims other series without discarding data and limits keyboard
   assert.ok(svg.descendants().every(element => element.attributes.get("data-muted") !== "true"));
   svg.fire("keydown", { key: "End" });
   assert.match(tooltip.text, /GPT-5.5/u);
+});
+
+test("a changed publication preserves selected legend, inspected date and chart focus using only new point values", () => {
+  const documentRef = interactiveDocument(), container = documentRef.createElement("div");
+  const payload = publicAllowanceFixture(NOW);
+  const render = () => renderCommunityAllowanceSection({ documentRef, container, payload, view: "models" });
+  render(); const before = chartParts(container);
+  before.astra.fire("click"); before.svg.focus(); before.svg.fire("keydown", { key: "Home" });
+  before.svg.fire("keydown", { key: "ArrowRight" });
+  const date = before.tooltip.descendants().find(element => element.className === "allowance-tooltip-date").text;
+  const points = buildCommunityAllowanceChartModel(normalizeCommunityDailySeries(payload), { view: "models" })
+    .dots.filter(dot => dot.seriesKey === "gpt-6-astra");
+  for (const day of payload.allowanceBreakdowns.days) for (const row of day.models) {
+    if (row[0] === "gpt-6-astra") row[1] += 1000;
+  }
+  render(); const after = chartParts(container);
+  assert.notEqual(after.svg, before.svg);
+  assert.equal(documentRef.activeElement, after.svg);
+  assert.deepEqual(after.svg.focusOptions, { preventScroll: true });
+  assert.equal(after.astra.attributes.get("aria-pressed"), "true");
+  assert.ok(after.svg.descendants().some(element => element.attributes.get("data-muted") === "true"));
+  assert.equal(after.tooltip.attributes.get("data-visible"), "true");
+  assert.equal(after.tooltip.descendants().find(element => element.className === "allowance-tooltip-date").text, date);
+  const dollars = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 0 });
+  assert.ok(after.tooltip.text.includes(dollars.format(points[1].centralUsd + 1000)));
+  assert.ok(!after.tooltip.text.includes(dollars.format(points[1].centralUsd)));
+  after.svg.fire("keydown", { key: "ArrowRight" });
+  assert.ok(after.tooltip.text.includes(dollars.format(points[2].centralUsd + 1000)));
+});
+
+test("refresh restores a focused legend but never steals focus from another control or another chart", () => {
+  const documentRef = interactiveDocument(), container = documentRef.createElement("div");
+  const payload = publicAllowanceFixture(NOW);
+  const render = () => renderCommunityAllowanceSection({ documentRef, container, payload, view: "models" });
+  render(); let chart = chartParts(container);
+  chart.astra.focus(); chart.astra.fire("click"); render(); chart = chartParts(container);
+  assert.equal(documentRef.activeElement, chart.astra);
+  assert.equal(chart.astra.attributes.get("aria-pressed"), "true");
+  const outside = documentRef.createElement("button"); outside.focus();
+  render(); chart = chartParts(container);
+  assert.equal(documentRef.activeElement, outside);
+  assert.equal(chart.astra.attributes.get("aria-pressed"), "true");
+  assert.equal(chart.tooltip.attributes.get("data-visible"), "false");
+  const other = documentRef.createElement("div");
+  renderCommunityAllowanceSection({ documentRef, container: other, payload, view: "models" });
+  assert.equal(chartParts(other).astra.attributes.get("aria-pressed"), "false");
+  assert.equal(documentRef.activeElement, outside);
+});
+
+test("refresh retains keyboard position and an Escape-dismissed tooltip without reopening it", () => {
+  const documentRef = interactiveDocument(), container = documentRef.createElement("div");
+  const payload = publicAllowanceFixture(NOW);
+  const render = () => renderCommunityAllowanceSection({ documentRef, container, payload, view: "models" });
+  render(); const before = chartParts(container);
+  before.astra.fire("click"); before.svg.focus(); before.svg.fire("keydown", { key: "Home" });
+  before.svg.fire("keydown", { key: "Escape" }); render(); const after = chartParts(container);
+  assert.equal(documentRef.activeElement, after.svg);
+  assert.equal(after.tooltip.attributes.get("data-visible"), "false");
+  after.svg.fire("keydown", { key: "ArrowRight" });
+  assert.match(after.tooltip.text, /GPT-6 Astra/u);
+  const points = buildCommunityAllowanceChartModel(normalizeCommunityDailySeries(payload), { view: "models" })
+    .dots.filter(dot => dot.seriesKey === "gpt-6-astra");
+  assert.ok(after.tooltip.text.includes(new Intl.NumberFormat("en-US", {
+    style: "currency", currency: "USD", maximumFractionDigits: 0,
+  }).format(points[1].centralUsd)));
+});
+
+test("removed series or invalidated graph state cannot carry old inspection evidence into a replacement", () => {
+  const documentRef = interactiveDocument(), container = documentRef.createElement("div");
+  const payload = publicAllowanceFixture(NOW);
+  const render = data => renderCommunityAllowanceSection({ documentRef, container, payload: data, view: "models" });
+  render(payload); let chart = chartParts(container);
+  chart.astra.fire("click"); chart.svg.focus(); chart.svg.fire("keydown", { key: "Home" });
+  chart.astra.focus();
+  const withoutAstra = structuredClone(payload);
+  withoutAstra.allowanceBreakdowns.days.forEach(day => { day.models = day.models.filter(row => row[0] !== "gpt-6-astra"); });
+  render(withoutAstra); chart = chartParts(container);
+  assert.equal(chart.astra, undefined);
+  assert.ok(chart.buttons.every(button => button.attributes.get("aria-pressed") === "false"));
+  assert.equal(chart.tooltip.attributes.get("data-visible"), "false");
+  assert.doesNotMatch(chart.tooltip.text, /Astra/u);
+  assert.equal(documentRef.activeElement, chart.svg);
+  render(payload); chart = chartParts(container);
+  chart.astra.fire("click"); chart.svg.focus(); chart.svg.fire("keydown", { key: "Home" });
+  assert.equal(render({ ...payload, allowanceState: "updating" }), "allowance_updating");
+  assert.equal(chartParts(container).svg, undefined);
+  assert.equal(documentRef.activeElement, null);
+  render(payload); chart = chartParts(container);
+  assert.equal(chart.astra.attributes.get("aria-pressed"), "false");
+  assert.equal(chart.tooltip.attributes.get("data-visible"), "false");
+  assert.equal(documentRef.activeElement, null);
+});
+
+test("a removed inspected day clears its tooltip without dropping a still-supported legend selection", () => {
+  const documentRef = interactiveDocument(), container = documentRef.createElement("div");
+  const payload = publicAllowanceFixture(NOW);
+  const render = () => renderCommunityAllowanceSection({ documentRef, container, payload, view: "models" });
+  render(); const before = chartParts(container);
+  before.astra.fire("click"); before.svg.focus(); before.svg.fire("keydown", { key: "Home" });
+  const removedDay = payload.allowanceBreakdowns.days.find(day => day.models.some(row => row[0] === "gpt-6-astra"));
+  removedDay.models = removedDay.models.filter(row => row[0] !== "gpt-6-astra");
+  render(); const after = chartParts(container);
+  assert.equal(after.astra.attributes.get("aria-pressed"), "true");
+  assert.equal(after.tooltip.attributes.get("data-visible"), "false");
+  assert.equal(after.tooltip.text.trim(), "");
+  assert.equal(documentRef.activeElement, after.svg);
+  after.svg.fire("keydown", { key: "Home" });
+  assert.match(after.tooltip.text, /GPT-6 Astra/u);
+  assert.equal(after.tooltip.attributes.get("data-visible"), "true");
+  assert.notEqual(after.tooltip.descendants().find(element => element.className === "allowance-tooltip-date").text,
+    before.tooltip.descendants().find(element => element.className === "allowance-tooltip-date").text);
 });

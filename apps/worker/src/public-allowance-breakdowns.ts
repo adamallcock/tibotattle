@@ -8,7 +8,7 @@ import type { AdminCommunityAllowanceSummary } from "./admin-community-allowance
 import { COMMUNITY_ALLOWANCE_BASIS } from "./community-allowance";
 
 export const PUBLIC_ALLOWANCE_BREAKDOWNS_SCHEMA_VERSION =
-  "community-allowance-breakdowns-v1.0";
+  "community-allowance-breakdowns-v1.1";
 
 /** Internal storage projection only. Never serialize this cache row itself. */
 export interface PublicAllowanceBreakdownsCacheRow {
@@ -18,6 +18,7 @@ export interface PublicAllowanceBreakdownsCacheRow {
 
 export interface PublicAllowanceBreakdownDay {
   readonly day: string;
+  readonly combined: AdminCommunityAllowanceSummary;
   readonly byPlanType: Readonly<Record<"pro" | "prolite" | "plus", {
     readonly centralUsd: number | null;
     readonly participantCount: number;
@@ -61,15 +62,14 @@ function publicSummary(summary: AdminCommunityAllowanceSummary) {
  * diagnostics, source identities, and plan/model cross-tabs never cross this
  * boundary. This is a bounded cache read, not permission to analyze evidence.
  */
-export function projectPublicAllowanceBreakdowns(
+export function projectPublicAllowanceGraph(
   row: PublicAllowanceBreakdownsCacheRow | null,
   options: {
-    allowanceState: "ready" | "updating";
     publishedDays: readonly string[];
     nowMs: number;
   },
-): PublicAllowanceBreakdowns | null {
-  if (options.allowanceState !== "ready" || !Number.isFinite(options.nowMs)
+): { breakdowns: PublicAllowanceBreakdowns } | null {
+  if (!Number.isFinite(options.nowMs)
       || row === null || typeof row.generated_at !== "string"
       || typeof row.payload_json !== "string"
       || row.payload_json.length > PREVIEW_CACHE_JSON_LIMIT_BYTES
@@ -88,10 +88,12 @@ export function projectPublicAllowanceBreakdowns(
   const today = new Date(options.nowMs).toISOString().slice(0, 10);
   const publishedDays = new Set(options.publishedDays);
   const modelDays = new Map(preview.models.days.map((day) => [day.day, day.values]));
-  const days = preview.days.filter((day) => day.day < today && day.day < preview.to
-      && publishedDays.has(day.day))
+  const closedDays = preview.days.filter((day) => day.day < today && day.day < preview.to
+      && publishedDays.has(day.day));
+  const days = closedDays
     .map((day): PublicAllowanceBreakdownDay => ({
       day: day.day,
+      combined: publicSummary(day.combined),
       byPlanType: {
         pro: publicSummary(day.byPlanType.pro),
         prolite: publicSummary(day.byPlanType.prolite),
@@ -102,7 +104,7 @@ export function projectPublicAllowanceBreakdowns(
         [modelId, dollars, accounts] as const),
     }));
   if (days.length === 0) return null;
-  return {
+  const breakdowns: PublicAllowanceBreakdowns = {
     schemaVersion: PUBLIC_ALLOWANCE_BREAKDOWNS_SCHEMA_VERSION,
     basis: COMMUNITY_ALLOWANCE_BASIS,
     referencePlanType: "pro",
@@ -112,4 +114,14 @@ export function projectPublicAllowanceBreakdowns(
     generatedAt: preview.generatedAt,
     days,
   };
+  // Keep graph publication separate from immutable daily revisions. All three
+  // views advance together; activity/spend revisions keep their original values.
+  return { breakdowns };
+}
+
+export function projectPublicAllowanceBreakdowns(
+  row: PublicAllowanceBreakdownsCacheRow | null,
+  options: { allowanceState: "ready" | "updating"; publishedDays: readonly string[]; nowMs: number },
+): PublicAllowanceBreakdowns | null {
+  return options.allowanceState === "ready" ? projectPublicAllowanceGraph(row, options)?.breakdowns ?? null : null;
 }
