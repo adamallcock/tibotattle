@@ -15,6 +15,9 @@ struct TrayPreferences: Codable, Equatable {
     var metrics = ["tokens", "cost", "changes"]
     var density = "comfortable"
     var emphasizeLow = false
+    var canChooseMeterWindow: Bool {
+        iconMode == "meter" && ["both", "icon-only"].contains(preset)
+    }
     static let defaults = TrayPreferences()
     static var upgrade: Self { var p = defaults; p.preset = "automatic"; return p }
     var valid: Bool {
@@ -291,6 +294,7 @@ final class TrayCustomizationController: NSWindowController {
         }
         // Both percentages already consume the two permitted compact fields.
         pickers["barMetric"]?.isEnabled = p.preset != "both" && p.preset != "icon-only"
+        pickers["meterWindow"]?.isEnabled = p.canChooseMeterWindow
         updatePreview(); errorLabel.stringValue = TrayPreferenceStore.shared.error ?? ""
     }
     @objc private func changed(_ sender: NSControl) {
@@ -597,6 +601,38 @@ enum TrayCustomizationSmoke {
             layout.sections = []
             initiallyEmpty.applyPreferencesForSmokeTest(layout)
             guard initiallyEmpty.arrangedSectionIDsForSmokeTest().isEmpty else { return 29 }
+            var meterPreference = TrayPreferences.defaults
+            guard !meterPreference.canChooseMeterWindow else { return 42 }
+            meterPreference.preset = "both"
+            guard meterPreference.canChooseMeterWindow else { return 43 }
+            meterPreference.preset = "icon-only"
+            guard meterPreference.canChooseMeterWindow else { return 44 }
+            for icon in ["app", "dual-meter"] {
+                meterPreference.iconMode = icon
+                guard !meterPreference.canChooseMeterWindow else { return 45 }
+            }
+            meterPreference.iconMode = "meter"; meterPreference.preset = "automatic"
+            guard !meterPreference.canChooseMeterWindow else { return 46 }
+            let availableCache: [String: Any] = ["periodId": "7d", "status": "available", "comparableReturns": 10,
+                "reusedMoreThanHalfReturns": 6, "reusePercent": 60, "coverageStatus": "complete"]
+            let unavailableCache: [String: Any] = ["periodId": "30d", "status": "unavailable", "comparableReturns": NSNull(),
+                "reusedMoreThanHalfReturns": NSNull(), "reusePercent": NSNull(), "coverageStatus": "unavailable"]
+            func cacheDTO(_ first: [String: Any], _ second: [String: Any]? = nil) -> [String: Any] {
+                ["accounting": ["trayCacheSummary": ["schemaVersion": 1, "periods": [first, second ?? unavailableCache]]]]
+            }
+            guard TrayCachePeriod.decode(cacheDTO(availableCache)).first?.reusePercent == 60 else { return 35 }
+            var forged = availableCache; forged["reusePercent"] = 61
+            guard TrayCachePeriod.decode(cacheDTO(forged)).isEmpty else { return 36 }
+            forged = availableCache; forged["coverageStatus"] = "unavailable"
+            guard TrayCachePeriod.decode(cacheDTO(forged)).isEmpty else { return 37 }
+            forged = unavailableCache; forged["comparableReturns"] = 0
+            guard TrayCachePeriod.decode(cacheDTO(availableCache, forged)).isEmpty else { return 38 }
+            forged = unavailableCache; forged["coverageStatus"] = "complete"
+            guard TrayCachePeriod.decode(cacheDTO(availableCache, forged)).isEmpty else { return 39 }
+            forged = availableCache; forged["comparableReturns"] = 9_007_199_254_740_992.0
+            guard TrayCachePeriod.decode(cacheDTO(forged)).isEmpty else { return 40 }
+            forged = availableCache; forged["comparableReturns"] = 0; forged["reusedMoreThanHalfReturns"] = 0; forged["reusePercent"] = NSNull()
+            guard TrayCachePeriod.decode(cacheDTO(forged)).first?.comparableReturns == 0 else { return 41 }
             print("TIBOTATTLE_TRAY_CUSTOMIZATION preferences=closed,migrated,future-protected,atomic,undo presets=pinned,dual,unknown,zero refresh=retained low=hysteresis,stale-cleared reset=bounded")
             return 0
         } catch { return 19 }

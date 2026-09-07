@@ -718,10 +718,17 @@ struct TrayCachePeriod: Equatable {
                   let id = period["periodId"] as? String, ["7d", "30d"].contains(id), ids.insert(id).inserted,
                   let status = period["status"] as? String, ["available", "unavailable"].contains(status),
                   let coverage = period["coverageStatus"] as? String, ["complete", "incomplete", "unavailable"].contains(coverage) else { return [] }
-            if status == "unavailable" { continue }
-            guard let count = period["comparableReturns"] as? NSNumber,
+            if status == "unavailable" {
+                guard coverage == "unavailable",
+                      period["comparableReturns"] is NSNull,
+                      period["reusedMoreThanHalfReturns"] is NSNull,
+                      period["reusePercent"] is NSNull else { return [] }
+                continue
+            }
+            guard coverage != "unavailable",
+                  let count = period["comparableReturns"] as? NSNumber,
                   CFGetTypeID(count) != CFBooleanGetTypeID(), count.doubleValue.isFinite,
-                  count.doubleValue >= 0, count.doubleValue < Double(Int.max), count.doubleValue.rounded() == count.doubleValue,
+                  count.doubleValue >= 0, count.doubleValue <= 9_007_199_254_740_991, count.doubleValue.rounded() == count.doubleValue,
                   let reused = period["reusedMoreThanHalfReturns"] as? NSNumber,
                   CFGetTypeID(reused) != CFBooleanGetTypeID(), reused.doubleValue >= 0,
                   reused.doubleValue <= count.doubleValue, reused.doubleValue.rounded() == reused.doubleValue else { return [] }
@@ -730,7 +737,9 @@ struct TrayCachePeriod: Equatable {
                 guard let number = period["reusePercent"] as? NSNumber,
                       CFGetTypeID(number) != CFBooleanGetTypeID(), number.doubleValue.isFinite,
                       (0...100).contains(number.doubleValue) else { return [] }
-                percent = number.doubleValue
+                let expected = reused.doubleValue / count.doubleValue * 100
+                guard abs(number.doubleValue - expected) <= 1e-9 else { return [] }
+                percent = expected
             } else if !(period["reusePercent"] is NSNull) { return [] }
             result.append(Self(periodID: id, reusePercent: percent, comparableReturns: count.intValue, coverage: coverage))
         }
