@@ -256,6 +256,7 @@ test("production builder source config binds app identity, target-specific build
     if (target.startsWith("darwin-")) {
       assert.equal(config.mac.bundleShortVersion, RELEASE_VERSION, target);
       assert.equal(config.mac.bundleVersion, config.buildVersion, target);
+      assert.equal(config.mac.sign, "./scripts/electron-macos-sign-order.mjs", target);
       assert.deepEqual(config.mac.target, [
         { target: "dmg", arch: [spec.architecture] },
         { target: "zip", arch: [spec.architecture] },
@@ -284,6 +285,17 @@ test("production builder source config binds app identity, target-specific build
       assert.equal(Object.hasOwn(config.extraMetadata, "shortVersion"), false);
     }
   }
+});
+
+test("production macOS builder resolves the isolated signing-order hook before signing", async () => {
+  const config = loadProductionBuilderConfig("darwin-arm64");
+  const { resolveFunction } = ELECTRON_BUILDER_REQUIRE("app-builder-lib/out/util/resolve");
+  const hook = await resolveFunction("module", config.mac.sign, "sign", resolve("."));
+  assert.equal(typeof hook, "function");
+  await assert.rejects(
+    () => hook({ app: "/synthetic/not-a-bundle" }),
+    (error) => error?.code === "ELECTRON_MACOS_SIGN_ORDER_INPUT_INVALID",
+  );
 });
 
 test("rehearsal builder config binds semantic updater versions to numeric macOS plist fields", () => {
