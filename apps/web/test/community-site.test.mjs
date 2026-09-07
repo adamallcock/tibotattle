@@ -307,6 +307,8 @@ test("the public site presents only the install call to action and the community
   assert.match(html, /id="installer-unavailable"/u);
   assert.match(html, /id="homebrew-install"[^>]*hidden/u);
   assert.match(html, /id="homebrew-copy-button"/u);
+  assert.match(html, /id="intel-homebrew-install"[^>]*hidden/u);
+  assert.match(html, /id="intel-homebrew-copy-button"/u);
   assert.doesNotMatch(html, /open-installed-app|usage-monitor-semantic-open-target|usagemonitor:\/\//u);
   assert.match(html, /id="community-daily-result"/u);
   assert.match(html, /id="community-daily-state"/u);
@@ -584,6 +586,9 @@ test("platform tabs keep the live macOS release separate from honest unavailable
   assert.match(macosPanel, /id="homebrew-install"/u);
   assert.match(macosPanel, /id="installer-sha256-copy"/u);
   assert.match(macosPanel, /Developer ID signed and Apple notarized\./u);
+  assert.match(intelPanel, /id="intel-homebrew-install"/u);
+  assert.match(intelPanel, /id="intel-homebrew-install-command"[^>]*>brew install --cask adamallcock\/tap\/tibotattle<\/code>/u);
+  assert.match(intelPanel, /id="intel-homebrew-copy-button"[\s\S]*?aria-describedby="intel-homebrew-copy-status"/u);
 
   for (const [platform, panel] of [
     ["macOS Intel", intelPanel.slice(intelPanel.indexOf('id="intel-installer-unavailable"'))],
@@ -1144,6 +1149,9 @@ test("the public guidance pages are useful stubs without app-only controls", asy
   const verifyRelease = await readFile(VERIFY_RELEASE, "utf8");
   const privacy = await readFile(PRIVACY_HTML, "utf8");
   assert.match(docs, /<title>TiboTattle Docs<\/title>/u);
+  assert.match(docs, /macOS 14 or later on Apple silicon and Intel/u);
+  assert.match(docs, /<code data-i18n-skip>brew install --cask adamallcock\/tap\/tibotattle<\/code>/u);
+  assert.match(docs, /installing it does not require Node\.js, pnpm, or Xcode/u);
   assert.match(
     docs,
     /Estimated API-equivalent value of the observed seven-day allowance\./u,
@@ -2189,7 +2197,14 @@ test("Intel download rendering stays independent and refuses partial or ARM meta
   assert.equal(documentRef.byId.get("installer-sha256-copy").dataset.checksum, "a".repeat(64));
   assert.equal(documentRef.byId.get("intel-installer-version").textContent, "Version 1.2.3");
   assert.equal(documentRef.byId.get("intel-installer-compatibility").textContent, "macOS 14 or later · Intel");
-  assert.equal(documentRef.byId.has("intel-homebrew-install"), false);
+  assert.equal(documentRef.byId.get("homebrew-install").hidden, false);
+  assert.equal(documentRef.byId.get("intel-homebrew-install").hidden, false);
+
+  // The existing release contract requires a verified, same-version pair.
+  const missingPrimary = fakeDocument({ ...metadata, "usage-monitor-installer-url": "", ...intel });
+  renderPublicInstallerJourney(missingPrimary);
+  assert.equal(missingPrimary.byId.get("homebrew-install").hidden, true);
+  assert.equal(missingPrimary.byId.get("intel-homebrew-install").hidden, true);
 
   for (const invalid of [
     {},
@@ -2200,6 +2215,8 @@ test("Intel download rendering stays independent and refuses partial or ARM meta
     const unavailable = fakeDocument({ ...metadata, ...invalid });
     renderPublicInstallerJourney(unavailable);
     assert.equal(unavailable.byId.get("installer-link").hidden, false);
+    assert.equal(unavailable.byId.get("homebrew-install").hidden, false);
+    assert.equal(unavailable.byId.get("intel-homebrew-install").hidden, true);
     assert.equal(unavailable.byId.get("intel-installation").hidden, true);
     assert.equal(unavailable.byId.get("intel-installer-link").hidden, true);
     assert.equal(Object.hasOwn(unavailable.byId.get("intel-installer-link"), "href"), false);
