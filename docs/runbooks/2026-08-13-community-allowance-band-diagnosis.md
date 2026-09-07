@@ -92,6 +92,16 @@ maintenance first. Check `BOUNDED_ANALYSIS_PROGRESS`, deferred reasons and
 defer a large completed checkpoint before loading it. New activity-only days
 retain their queue entry for a later complete allowance rebuild.
 
+For an expired preview despite current account caches, inspect the natural
+invocation's wall time and `admin_allowance_preview_cache` phase timing, not
+only lifecycle `last_completed_at`. That stamp is written before optional
+analytics. Preview publication attempts run `before_analysis`; incomplete
+inputs retry `after_analysis`, before daily reconciliation. Refreshed rows and
+deferrals log `queriesUsed`, `phaseQueries`, `elapsedMs` and
+`deadlineRemainingMs`. A current preview is quiet and retains the 55-minute
+refresh interval. Never extend freshness or edit generation timestamps to hide
+publication starvation.
+
 ### Only one day in the admin "By model" chart
 
 The original per-model view recorded forward daily snapshots, whereas the
@@ -186,8 +196,9 @@ deployment or health response does not by itself prove graph recovery.
 ## See also
 
 - D1 queries used during this diagnosis must respect the approximate 100-bind
-  cap. Use `--file` for multi-statement input and `--command` for a bounded
-  direct query; remote cost profiling reads `meta.rows_read` rather than
+  cap. Use `--command` for bounded SELECT-only inspection; remote `--file`
+  uses the import path and does not return the selected diagnostic rows.
+  Remote cost profiling reads `meta.rows_read` rather than
   inferring query cost from returned rows.
 - Production deploy gate (migrations, not intake):
   [`the 2026-08-07 governance decision`](../governance/2026-08-07-production-deploy-migration-gate.md).

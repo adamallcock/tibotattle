@@ -85,6 +85,14 @@ usage-finishing reserve fit. Sustained required-work saturation may defer
 large accounts; it is not permission to lower evidence caps.
 
 Public and admin graph rebuilds consume only complete, source-current caches.
+The shared preview gets a cache-only publication attempt before optional
+account reconstruction, so repeated current-account checks cannot starve its
+hourly refresh. An unavailable preview retries after reconstruction and before
+daily reconciliation. A current preview keeps its normal refresh interval;
+neither a browser read nor a scheduler deadline extends its two-hour validity.
+Content-free preview/analysis phase logs include elapsed time, remaining time
+and actual statement counts. The lifecycle `last_completed_at` stamp precedes
+optional work and must not be mistaken for the whole invocation duration.
 A cache miss, stale source, deadline or malformed value defers the whole
 cohort. New unpublished activity days may publish token/spend totals without
 an allowance; their rebuild queue stays pending, and existing published

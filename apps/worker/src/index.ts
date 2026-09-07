@@ -3802,7 +3802,8 @@ export async function runScheduledMaintenance(
     if (property === "DELETION_LEDGER") return queryMeter.wrap(target.DELETION_LEDGER);
     return Reflect.get(target, property);
   } });
-  const optionalDeadlineMs = Date.now() + 40_000;
+  const maintenanceStartedMs = Date.now();
+  const optionalDeadlineMs = maintenanceStartedMs + 40_000;
   let lifecycleComplete = false;
   let quarantineRetentionComplete = false;
   let restoreReplayComplete = false;
@@ -3969,6 +3970,32 @@ export async function runScheduledMaintenance(
             // their conservative allocation within each phase, while this one
             // meter enforces the sum across both bindings and ALL phases.
             const phaseBudget = () => ({ remainingQueries: Math.max(0, queryMeter.remainingQueries), deadlineMs: optionalDeadlineMs });
+            const phaseTiming = () => {
+              const nowMs = Date.now();
+              return { queriesUsed: queryMeter.queriesUsed,
+                elapsedMs: Math.max(0, nowMs - maintenanceStartedMs),
+                deadlineRemainingMs: Math.max(0, optionalDeadlineMs - nowMs) };
+            };
+            const publishPreview = async (phase: "before_analysis" | "after_analysis") => {
+              const startedQueries = queryMeter.queriesUsed;
+              const result = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime,
+                {mode:"cache-only",budget:phaseBudget()});
+              if (result.code !== "ALLOWANCE_PREVIEW_CACHE_CURRENT") {
+                const unavailable = result.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE";
+                const log = {level:unavailable ? "warn" : "info",event:"admin_allowance_preview_cache",phase,
+                  outcome:unavailable ? phase === "before_analysis" ? "deferred" : "failure" : "success",
+                  code:result.code,phaseQueries:queryMeter.queriesUsed-startedQueries,...phaseTiming()};
+                if (unavailable) console.warn(JSON.stringify(log));
+                else console.log(JSON.stringify(log));
+              }
+              return result;
+            };
+            // Publish a complete, source-current cached cohort before repeated
+            // account probes can consume the optional deadline. The publisher
+            // retains its freshness interval and atomic source-epoch fences.
+            // Missing inputs get one retry after reconstruction, before daily
+            // reconciliation; neither path falls back to a raw graph analysis.
+            const priorPreview = await publishPreview("before_analysis");
             try {
               if (queryMeter.remainingQueries >= 249 && Date.now() < optionalDeadlineMs) {
               let backfill = await backfillV1QuotaFitProjection(env.USAGE_MONITOR_DB);
@@ -3984,7 +4011,7 @@ export async function runScheduledMaintenance(
                   {meter:queryMeter,deadlineMs:optionalDeadlineMs,maintenanceLease});
                 console.log(JSON.stringify({level:"info",event:"scheduled_allowance_reconstruction",outcome:warming.status,
                   code:"BOUNDED_ANALYSIS_PROGRESS",visited:warming.visited,published:warming.published,
-                  resumed:warming.resumed,queriesUsed:queryMeter.queriesUsed}));
+                  resumed:warming.resumed,...phaseTiming()}));
               }
               }
             } catch (error) {
@@ -3992,20 +4019,23 @@ export async function runScheduledMaintenance(
               // publishing other already-complete evidence or new activity.
               console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
                 stage:"analysis",code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
-                queriesUsed:queryMeter.queriesUsed}));
+                ...phaseTiming()}));
             }
+            if (priorPreview.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
+              await publishPreview("after_analysis");
+            }
+            const dailyStartedQueries = queryMeter.queriesUsed;
             const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
               24, undefined, {mode:"cache-only",budget:phaseBudget()});
+            console.log(JSON.stringify({level:"info",event:"scheduled_daily_publication",
+              outcome:dailyRebuild.deferred ? "deferred" : "complete",code:"BOUNDED_DAILY_PUBLICATION_PROGRESS",
+              processed:dailyRebuild.processed,remaining:dailyRebuild.remaining,
+              phaseQueries:queryMeter.queriesUsed-dailyStartedQueries,...phaseTiming()}));
             if (dailyRebuild.deferred && queryMeter.remainingQueries >= 100 && Date.now() < optionalDeadlineMs) {
               await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
                 4, undefined, {mode:"activity-only",budget:phaseBudget()});
             }
             rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
-            const allowanceCache = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime,
-              {mode:"cache-only",budget:phaseBudget()});
-            if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
-              console.warn(JSON.stringify({level:"warn",event:"admin_allowance_preview_cache",outcome:"failure",code:allowanceCache.code}));
-            }
             // Historical model fits are optional and last: required lifecycle,
             // current-account reconstruction and graph publication keep priority.
             if (queryMeter.remainingQueries >= 64 && Date.now() < optionalDeadlineMs) {
