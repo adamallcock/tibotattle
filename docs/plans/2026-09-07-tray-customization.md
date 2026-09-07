@@ -324,5 +324,6 @@ macOS ARM has actual development-package and rendered evidence. Windows/Linux
 capability fallbacks have source tests and staged linkage evidence, but physical
 Windows/Linux, secondary-display, screen-reader and signed-release qualification
 remain separate. These development packages are not signed/notarized production
-releases, and no stable installation or public release was changed. Both feature
-branches are committed locally; they have not been pushed or merged by this task.
+releases, and no stable installation or public release was changed. Source integration is tracked by the native main-branch PR and the Electron
+PR into `codex/unified-desktop-accountless`; it does not publish or install a
+new app version.
