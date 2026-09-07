@@ -7,6 +7,8 @@ import {
   REASONING_EFFORTS,
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
 } from "./local-unified-index.js";
 import { readCodexLocalThreadMetadata } from "./platform/index.js";
 
@@ -22,6 +24,8 @@ const PERIODS = new Set(["24h", "7d", "30d", "all"]);
 const KINDS = new Set(["switch", "continuity"]);
 const CURRENT_PARSERS = new Set([
   LOCAL_UNIFIED_INDEX_PARSER_VERSION, LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
 ]);
 const EFFORTS = new Set(REASONING_EFFORTS.filter((value) => value !== "unknown"));
 const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
