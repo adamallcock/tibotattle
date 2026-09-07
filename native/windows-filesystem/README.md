@@ -43,9 +43,10 @@ binding still advertises `productionSafe: false` and
 use it on a real Windows host. The path walker now uses `NtCreateFile` with a
 held `RootDirectory` handle for every component; it no longer performs a
 path-based validation pass followed by a second path-based open. The flag is
-kept false until the native Windows qualification proves the exact OS/build
-matrix and the remaining replacement and binding-integrity gates. This is an
-intentional fail-closed gate, not a Windows support claim.
+kept false until native Windows qualification proves the exact OS/build and
+adversarial filesystem matrix, resolves the cross-session scope, and supplies
+the remaining protected-state, audit, and binding-integrity evidence. This is
+an intentional fail-closed gate, not a Windows support claim.
 
 Intermediate components are opened as existing directories with
 directory-safe access/share flags and `FILE_OPEN`; final-object access and
@@ -73,10 +74,13 @@ step fails.
   the replacement handle identity, canonical final path, and bytes before
   returning. Expected paths are normalized through `GetLongPathNameW`, so a
   valid 8.3 short-name spelling can be compared with the normalized handle
-  path. The operation
-  protects ordinary application races; a same-user process can still swap the
-  destination name in the final kernel operation, so callers must retain the
-  production gate until a stronger conditional-replacement proof is accepted.
+  path. This is a qualification-only primitive; no production selector uses
+  it today. Its ordinary race guarantee applies only to cooperating writers
+  holding the opaque per-capability mutation lease across the operation. That
+  lease is a `Local\` named mutex, so the guarantee is limited to one
+  interactive Windows session. A deliberate same-UID process can bypass that
+  lease and replace a name; that hostile case is outside this cooperation
+  contract and is not a generic conditional-replacement/CAS gate.
 - `inspectProtectedChild(root, rootIdentity, child)`,
   `readProtectedChild(root, rootIdentity, child, maximumBytes)`,
   `createProtectedChild(root, rootIdentity, child, bytes)`,
@@ -93,7 +97,9 @@ step fails.
   a non-blocking wait. It returns an opaque native lease only after a normal
   acquisition. An abandoned-owner result is released and closed, then surfaced
   as a fixed error so the JavaScript lease layer can retry once before any
-  credential mutation begins.
+  credential mutation begins. It serializes cooperating processes per
+  capability in one interactive session only; the current manager deliberately
+  reports `crossSessionSafe: false`.
 - `releaseCredentialMutex(lease)` accepts only that opaque lease, verifies
   same-thread ownership and active state, releases exactly once, and closes the
   non-inheritable handle. The native issued-token registry is protected against
@@ -117,5 +123,9 @@ The protected-child operations are real binding exports, but the v1 manifest
 does not yet require them and the public protected-state readiness facts remain
 false. Native Windows x64 CI must build this source, execute the protected-child
 security tests, and retain its receipt before an installed Electron path can
-rely on root-binding or bounded-read claims. The residual same-user replacement
-race and installer/signing provenance remain separate production gates.
+rely on root-binding or bounded-read claims. A same-UID process that deliberately
+bypasses the cooperation contract is not a conditional-replacement gate. The
+disabled production flags, native Windows x64 physical and adversarial
+qualification, cross-session decision, protected-state and audit lifecycle,
+and authenticated installer/binding provenance remain separate production
+gates.

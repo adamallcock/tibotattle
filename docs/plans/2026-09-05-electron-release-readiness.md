@@ -240,8 +240,9 @@ constants are loaded, without accessing real Keychain items. Independent review
 also tightened absence checks to the exact readable, unlocked Keychain search
 list, while preserving successful reads from available stores. Signed prompt-free continuity
 still requires actual qualification. Linux's
-account-observation/identity adapter and Windows's remaining filesystem race
-qualification remain explicit gates. A successful installer build does not
+account-observation/identity adapter and Windows's production composition,
+binding provenance and actual desktop qualification remain explicit gates.
+A successful installer build does not
 activate those production selectors.
 
 First-launch disclosure now selects production copy from the validated
@@ -327,6 +328,16 @@ identity. The repository-level GitHub Actions secret list is empty; environment
 secrets and Windows signing access are not yet established. Windows production
 startup still needs its actual storage/binding qualification and entry wiring;
 its development CI receipts cannot satisfy that gate.
+
+A bounded Windows review separated the qualification-only file replacement
+primitive from credential writes, which already hold a per-capability native
+mutex throughout their mutation callback. The normal concurrency contract is
+cooperating processes in one interactive Windows session; the `Local` mutex
+does not establish cross-session exclusion. A hostile same-user final-name swap
+is not an achievable expected-file-identity guarantee of the current rename
+API and is not a generic prerequisite for every production consumer. The
+readiness flags remain false pending actual applicable composition, audit,
+binding trust and native desktop tests; no Windows support claim is enabled.
 
 Linux review found a production-entry bypass: valid stable metadata could start
 credential, upload and updater composition despite the unqualified platform.
