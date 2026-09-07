@@ -1083,13 +1083,13 @@ function renderAllowances(documentRef, projection, t, numberFormatter, preferenc
     const allowance = projection.allowances.find((item) => item.durationMinutes === duration);
     if (!allowance) {
       const missing = documentRef.createElement("article");
-      missing.className = "electron-tray-popup-allowance";
+      missing.className = "electron-tray-popup-allowance is-unavailable";
       const labelKey = duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
         ? "dashboard.quota.windowFiveHour" : "dashboard.quota.windowSevenDay";
       const heading = textNode(documentRef, `${t(labelKey)} —`);
       heading.className = "electron-tray-popup-allowance-title";
       const detail = textNode(documentRef, allowanceUnavailableCopy(projection.freshness, t));
-      detail.className = "electron-tray-popup-muted";
+      detail.className = "electron-tray-popup-muted electron-tray-popup-allowance-missing-detail";
       missing.append(heading, detail);
       list.append(missing);
       continue;

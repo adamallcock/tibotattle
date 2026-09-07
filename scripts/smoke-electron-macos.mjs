@@ -1861,7 +1861,7 @@ export function isMacTrayPopoverTarget(target, dashboardOrigin, debugPort) {
   }
 }
 
-async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath, sourceRevision, artifactSha256 }) {
+async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath, sourceRevision, artifactSha256, settingsPath }) {
   if (!child.kill("SIGUSR1")) fail("ELECTRON_MACOS_SMOKE_TRAY_SHOW_FAILED", "dashboard");
   let popup = null;
   try {
@@ -1900,10 +1900,11 @@ async function captureTrayPopover({ child, port, dashboardOrigin, screenshotPath
         && value.width > 0 && value.width <= 480
         && value.height > 0 && !value.horizontalOverflow ? value : null;
     }, MAX_OPERATION_MS, "tray popup renderer");
-    for (const range of ["30d", "7d"]) {
+    for (const range of ["7d", "30d", "7d"]) {
       await popup.evaluate(`document.querySelector('[data-history-range="${range}"]').click()`);
-      await waitFor(() => popup.evaluate(`document.querySelector('[data-history-range="${range}"]')?.getAttribute("aria-pressed") === "true"`),
-        MAX_OPERATION_MS, "tray history range selection");
+      await waitFor(async () => (await readMacSyntheticFixtureTray(settingsPath)).historyRange === range
+        && await popup.evaluate(`document.querySelector('[data-history-range="${range}"]')?.getAttribute("aria-pressed") === "true"`),
+        MAX_OPERATION_MS, "tray history range persistence");
     }
     const capture = await popup.request("Page.captureScreenshot", {
       format: "png", captureBeyondViewport: false,
@@ -2043,6 +2044,130 @@ async function closeMacSettingsWindow(settingsCdp, port, dashboardOrigin, child)
   }
 }
 
+export const MACOS_SMOKE_TRAY_EVIDENCE_KEYS = Object.freeze([
+  "customSaved", "previewRendered", "undoRestored", "defaultsRestored", "reopened", "relaunched",
+]);
+
+export function classifyMacTraySettingsEvidence(evidence = {}) {
+  const fields = Object.fromEntries(MACOS_SMOKE_TRAY_EVIDENCE_KEYS.map((key) => [key, evidence?.[key] === true]));
+  return Object.freeze({ status: Object.values(fields).every(Boolean) ? "passed" : "failed", ...fields });
+}
+
+export async function readMacSyntheticFixtureTray(settingsPath) {
+  const text = await readFile(settingsPath, "utf8");
+  if (Buffer.byteLength(text) > 64 * 1024) throw new TypeError("Synthetic settings are too large");
+  return validateDesktopSettingsSnapshot(JSON.parse(text)).tray;
+}
+
+async function assertTraySettingsChoice(cdp, expected) {
+  return waitFor(async () => cdp.evaluate(`(async () => {
+    const snapshot = await globalThis.tibotattleDesktop?.getSettings?.();
+    return JSON.stringify(snapshot?.settings?.tray) === ${JSON.stringify(JSON.stringify(expected))}
+      && document.querySelector("#tray-preset")?.disabled === false;
+  })()`), MAX_OPERATION_MS, "tray preference bridge and renderer");
+}
+
+async function exerciseTraySettings(cdp, settingsPath) {
+  let choice = { ...DESKTOP_DEFAULT_SETTINGS.tray };
+  const click = async (selector, next) => {
+    const accepted = await cdp.evaluate(`(() => { const item = document.querySelector(${JSON.stringify(selector)}); if (!item || item.disabled) return false; item.click(); return true; })()`);
+    if (!accepted) fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
+    await assertTraySettingsChoice(cdp, next); choice = next;
+  };
+  const select = async (key, value, extra = {}) => {
+    const accepted = await cdp.evaluate(`(() => { const item = document.querySelector(${JSON.stringify(`#tray-${key}`)}); if (!item || item.disabled) return false; item.value = ${JSON.stringify(value)}; item.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+    if (!accepted) fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
+    choice = { ...choice, [key]: value, ...extra };
+    await assertTraySettingsChoice(cdp, choice);
+  };
+  await cdp.evaluate(`document.querySelector('[data-settings-tab="tray"]').click()`);
+  await assertTraySettingsChoice(cdp, choice);
+  await select("preset", "five-hour");
+  await select("barMetric", "remaining-reset");
+  await select("resetFormat", "clock");
+  await select("preset", "both", { barMetric: "remaining" });
+  await select("meterWindow", "five-hour");
+  await select("iconMode", "dual-meter");
+  await select("historyRange", "30d");
+  await select("density", "compact");
+  await click('[data-tray-section="pace"]', { ...choice, sections: ["allowances", "usage"] });
+  await click('[data-tray-section="cache"]', { ...choice, sections: ["allowances", "usage", "cache"] });
+  await click('[data-tray-move="usage-up"]', { ...choice, sections: ["usage", "allowances", "cache"] });
+  await click('.settings-tray-group:first-child input[type="checkbox"]', { ...choice, emphasizeLow: true });
+  await click('.settings-tray-group:nth-child(2) input[type="checkbox"]:not([data-tray-section]):not([data-tray-metric])', { ...choice, showChart: false });
+  await click('[data-tray-metric="tokens"]', { ...choice, metrics: ["cost", "changes"] });
+  const beforeFinal = choice;
+  await click('[data-tray-metric="changes"]', { ...choice, metrics: ["cost"] });
+  const customized = choice;
+  const saved = await readMacSyntheticFixtureTray(settingsPath);
+  const previewRendered = await cdp.evaluate(`(() => {
+    const preview = document.querySelector(".settings-tray-preview-bar");
+    const popup = document.querySelector(".settings-tray-preview-popup");
+    return preview?.textContent.includes("5h") && preview?.textContent.includes("7d")
+      && preview.querySelectorAll(".settings-tray-preview-meter").length === 2
+      && popup?.dataset.density === "compact" && popup.querySelectorAll("section").length === 3
+      && document.querySelector('[data-tray-move="usage-up"]')?.disabled === true;
+  })()`);
+  await click('.settings-tray-actions button:first-child', beforeFinal);
+  await click('[data-tray-metric="changes"]', customized);
+  await click('.settings-tray-actions button:last-child', { ...DESKTOP_DEFAULT_SETTINGS.tray });
+  const restored = await readMacSyntheticFixtureTray(settingsPath);
+  // Undo a reset through the same visible control, leaving a non-default choice
+  // to verify after this Settings window and the whole application restart.
+  await click('.settings-tray-actions button:first-child', customized);
+  return { choice: customized, evidence: {
+    customSaved: JSON.stringify(saved) === JSON.stringify(customized),
+    previewRendered: previewRendered === true, undoRestored: true,
+    defaultsRestored: JSON.stringify(restored) === JSON.stringify(DESKTOP_DEFAULT_SETTINGS.tray),
+  } };
+}
+
+async function assertTrayProcessRelaunch({ executable, appPath, environment, fixture, expected }) {
+  const port = await freeTcpPort();
+  const child = spawn(executable, [
+    `--user-data-dir=${fixture.userData}`, `--remote-debugging-port=${port}`,
+    "--remote-debugging-address=127.0.0.1", "--disable-gpu",
+  ], { cwd: join(appPath, "Contents", "Resources"),
+    env: Object.fromEntries(Object.entries(environment).filter(([, value]) => value !== undefined)),
+    stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  child.on("error", () => {});
+  let dashboard = null; let settings = null;
+  try {
+    if (!child.pid) fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
+    const target = await waitFor(async () => selectMacDashboardTarget(
+      await jsonFetch(`http://127.0.0.1:${port}/json`), port,
+    ), MAX_STARTUP_MS, "relaunch dashboard target");
+    dashboard = await connectCdp(target);
+    await waitFor(() => dashboard.evaluate('typeof globalThis.tibotattleDesktop?.openTraySettings === "function"'), MAX_STARTUP_MS, "relaunch settings bridge");
+    await dashboard.evaluate('globalThis.tibotattleDesktop.openTraySettings()');
+    const origin = new URL(target.url).origin;
+    const settingsTarget = await waitFor(() => findSettingsTarget(port, origin), MAX_STARTUP_MS, "relaunch tray settings target");
+    settings = await connectCdp(settingsTarget);
+    await assertTraySettingsChoice(settings, expected);
+    const rendered = await settings.evaluate(`(() => {
+      const panel = document.querySelector('[data-settings-panel="tray"]');
+      return panel?.hidden === false && document.querySelector("#tray-preset")?.value === ${JSON.stringify(expected.preset)}
+        && document.querySelector("#tray-historyRange")?.value === ${JSON.stringify(expected.historyRange)}
+        && document.querySelector("#tray-density")?.value === ${JSON.stringify(expected.density)};
+    })()`);
+    if (rendered !== true || JSON.stringify(await readMacSyntheticFixtureTray(fixture.settingsPath)) !== JSON.stringify(expected)) {
+      fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
+    }
+    settings.close(); settings = null; dashboard.close(); dashboard = null;
+    if (!child.kill("SIGUSR2")) fail("ELECTRON_MACOS_SMOKE_QUIT_SIGNAL_FAILED", "quit");
+    await withTimeout(once(child, "exit"), MAX_SHUTDOWN_MS, "relaunch clean quit");
+    await waitFor(() => descendantsOf(child.pid).length === 0, MAX_SHUTDOWN_MS, "relaunch companion cleanup");
+    if (child.signalCode !== null || child.exitCode !== 0) fail("ELECTRON_MACOS_SMOKE_CLEAN_QUIT_INVALID", "quit");
+    return true;
+  } finally {
+    dashboard?.close(); settings?.close();
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+      await Promise.race([once(child, "exit").catch(() => null), wait(2_000)]);
+    }
+  }
+}
+
 async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, child) {
   const initialRefreshInterval = await readMacSyntheticFixtureRefreshInterval(settingsPath)
     .catch(() => null);
@@ -2080,9 +2205,9 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
     })()`);
       return snapshot?.title === "TiboTattle Settings"
         && snapshot?.connected === true
-        && snapshot?.tabCount === 4
-        && snapshot?.panelCount === 4
-        && JSON.stringify(snapshot?.tabNames) === JSON.stringify(["general", "data", "notifications", "about"])
+        && snapshot?.tabCount === 5
+        && snapshot?.panelCount === 5
+        && JSON.stringify(snapshot?.tabNames) === JSON.stringify(["general", "data", "notifications", "about", "tray"])
         && snapshot?.generalVisible === true
         && snapshot?.generalLanguageVisible === true
         && snapshot?.generalLanguageEnabled === true
@@ -2091,9 +2216,9 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
     }, MAX_STARTUP_MS, "Electron Settings render");
     if (state?.title !== "TiboTattle Settings"
         || state?.connected !== true
-        || state?.tabCount !== 4
-        || state?.panelCount !== 4
-        || JSON.stringify(state?.tabNames) !== JSON.stringify(["general", "data", "notifications", "about"])
+        || state?.tabCount !== 5
+        || state?.panelCount !== 5
+        || JSON.stringify(state?.tabNames) !== JSON.stringify(["general", "data", "notifications", "about", "tray"])
         || state?.generalVisible !== true
         || state?.generalLanguageVisible !== true
         || state?.generalLanguageEnabled !== true) {
@@ -2134,7 +2259,7 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_TABS_INVALID", "settings");
     }
     const tabs = await settingsCdp.evaluate(`(() => {
-      const expected = ["general", "data", "notifications", "about"];
+      const expected = ["general", "data", "notifications", "about", "tray"];
       const activeState = () => {
         const activeTabs = [...document.querySelectorAll('[data-settings-tab][aria-selected="true"]')];
         const activePanels = [...document.querySelectorAll('[data-settings-panel]')]
@@ -2165,11 +2290,11 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
       && JSON.stringify(value.activeTabs) === JSON.stringify([name])
       && JSON.stringify(value.activePanels) === JSON.stringify([name]);
     if (!Array.isArray(tabs?.clicks)
-        || !["general", "data", "notifications", "about"].every(
+        || !["general", "data", "notifications", "about", "tray"].every(
           (name, index) => expectedTabState(tabs.clicks[index], name),
         )
         || !expectedTabState(tabs?.keyboardData, "data")
-        || !expectedTabState(tabs?.keyboardAbout, "about")) {
+        || !expectedTabState(tabs?.keyboardAbout, "tray")) {
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_TABS_INVALID", "settings");
     }
     await settingsCdp.evaluate(
@@ -2215,6 +2340,8 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
       fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
     }
 
+    const trayCustomization = await exerciseTraySettings(settingsCdp, settingsPath);
+    if (!Object.values(trayCustomization.evidence).every(Boolean)) fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
     const closeObserved = await closeMacSettingsWindow(settingsCdp, port, dashboardOrigin, child);
     settingsCdp.close();
     settingsCdp = null;
@@ -2243,6 +2370,9 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
         ? { ...snapshot, visibility: "visible" }
         : null;
     }, MAX_STARTUP_MS, "Electron Settings reopen render");
+    await settingsCdp.evaluate(`document.querySelector('[data-settings-tab="tray"]').click()`);
+    await assertTraySettingsChoice(settingsCdp, trayCustomization.choice);
+    trayCustomization.evidence.reopened = true;
     const reopenedRefreshInterval = await waitFor(async () => {
       const actual = await readRefreshInterval();
       return actual === 900 ? actual : null;
@@ -2505,7 +2635,7 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
     }
     return Object.freeze({
       connected: true,
-      tabCount: 4,
+      tabCount: 5,
       tabs: true,
       rootCount: settingsEvidence.rootCount,
       renderedRootCount: settingsEvidence.renderedRootCount,
@@ -2519,6 +2649,7 @@ async function assertSettingsFlow(cdp, port, dashboardOrigin, settingsPath, chil
       pathfulRead: settingsEvidence.pathfulRead,
       refreshIntervalPersisted: persistence.status === "passed",
       sharingPreferencePersisted: reopenedSharingStatus !== null,
+      trayCustomization: trayCustomization.evidence,
     });
   } finally {
     settingsCdp?.close?.();
@@ -2718,6 +2849,7 @@ export function buildClosedReceipt({
       pathfulRead: settings.pathfulRead === true,
       refreshIntervalPersisted: settings.refreshIntervalPersisted === true,
       sharingPreferencePersisted: settings.sharingPreferencePersisted === true,
+      trayCustomization: classifyMacTraySettingsEvidence(settings.trayCustomization),
     }),
     share: Object.freeze({
       route: share.route === "#weekly" ? "#weekly" : "unknown",
@@ -3004,8 +3136,9 @@ async function runSmoke(appPath, progress = {}, {
     if (trayScreenshotPath !== null) {
       stage = "dashboard";
       await captureTrayPopover({ child, port, dashboardOrigin: dashboardUrl.origin, screenshotPath: trayScreenshotPath,
-        sourceRevision, artifactSha256 });
+        sourceRevision, artifactSha256, settingsPath: fixture.settingsPath });
     }
+    const trayBeforeRelaunch = await readMacSyntheticFixtureTray(fixture.settingsPath);
     cdp.close();
     cdp = null;
     stage = "quit";
@@ -3023,6 +3156,11 @@ async function runSmoke(appPath, progress = {}, {
       fail("ELECTRON_MACOS_SMOKE_CLEAN_QUIT_INVALID", "quit");
     }
     cleanQuit = true;
+    stage = "settings";
+    const relaunched = await assertTrayProcessRelaunch({ executable, appPath, environment, fixture, expected: trayBeforeRelaunch });
+    settingsReceipt = Object.freeze({ ...settingsReceipt, trayCustomization: { ...settingsReceipt.trayCustomization, relaunched } });
+    if (classifyMacTraySettingsEvidence(settingsReceipt.trayCustomization).status !== "passed") fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
+    recordSmokeProgress(progressRecord, "settings", settingsReceipt);
     void version;
     return buildClosedReceipt({
       status: "passed",
