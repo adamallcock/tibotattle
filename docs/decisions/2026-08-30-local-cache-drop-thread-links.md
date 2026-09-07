@@ -58,6 +58,26 @@ and export exclusion. Exercise both tables and pagination at desktop and narrow
 widths. Validate native URL policy separately from browser rendering and report
 any native or installed-artifact gate that has not been exercised.
 
+## Refresh retention clarification — 2026-09-07
+
+The owner clarified that previously resolved names and links belong to the
+unchanged cache-drop rows and should follow the dashboard's existing reuse
+behavior. Replacing the accounting generation must not blank those details.
+
+Keep resolved details in transient page memory for exact event-pair keys still
+present in any selectable period of the current local snapshot (at most 160
+keys). Retain them during indexing, unavailable enrichment, partial lookup
+responses, and failed dashboard reads that leave the prior rows visible.
+Successful lookups update names and identities in place; absent optional name
+metadata does not erase previously resolved names for the same UUID. A changed
+UUID replaces its prior metadata. Removed or changed rows and leaving the local
+dashboard clear the corresponding entries. A fresh page load resolves anew.
+
+New lookup results still require the current generation and dashboard request;
+stale responses cannot overwrite newer results. Failed lookups may retry on a
+later render. This changes UI reuse only, with no persistence or new identity
+inference and no change to the companion's generation-bound lookup contract.
+
 ## Initial development verification on 2026-08-30
 
 These checks used the development tree based on `b7112217`, before the feature
