@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-07
 type: status
 status: current
-source_commit: 14af4ed160e618751c20a4a33a3c9ff0d8a5af6d
+source_commit: 7f541517a79b2746596d4a2e70754eec8716aa8f
 observation_date: 2026-09-07
 ---
 
@@ -43,33 +43,31 @@ substitutes for SLSA build provenance. Follow
 
 ### Current presentation and live-data availability
 
-On 2026-09-07 the guarded deployment published combined source
-`14af4ed160e618751c20a4a33a3c9ff0d8a5af6d`, independently verified at 16:41 UTC.
-Public and admin allowance/plan/model charts, including Astra, are available;
-the separate admin Growth & activity history also renders. Public plan cards
-show the smaller actual-plan values (Pro 5x `$479`, Plus `$113` for September 6)
-beneath the normalized Pro 20x figures. Admin's September 7 cards use the same
-conversion and presentation. Both Mac download tabs retain 0.1.18; Intel now
-also shows the shared Homebrew install command and updated setup guidance.
+On 2026-09-07 the owner-authorized migration 0049 and guarded deployment
+published source `7f541517a79b2746596d4a2e70754eec8716aa8f`, independently
+verified at 20:31 UTC. Public and admin aggregate/plan/model graphs, including
+Astra, render. Ordinary append-only v1 contributions preserve the published
+snapshot without age-only expiration or a new "last good" label; corrections,
+withdrawals and policy changes still invalidate it. All public allowance views
+now use one complete snapshot, separate from daily activity publication.
 
-The outage was scheduled publication starvation, not a proven database failure:
-current-account checks and reconciliation consumed the 40-second optional
-deadline before the shared preview could refresh. The independent admin history
-cache was also skipped and expired. Even-minute passes now give ready graph and
-owner-history caches an early opportunity; odd minutes preserve reconstruction's
-full budget. Natural allowance publication at 16:18:35 and owner-history refresh
-at 16:38:46 restored both views without changing freshness, telemetry, schema,
-pricing or consent. A concurrent website deployment was reconciled into this
-baseline, preserving both updates. All 806 Worker, 545 web, 202 operations and
-36 release-site tests passed, alongside preflight/type/architecture/deployment
-checks. See the [recovery receipt](./receipts/2026-09-07-cache-publisher-repair.md)
-and the preserved [earlier presentation receipt](./receipts/2026-09-07-plan-values-admin-graph-parity.md).
+Unchanged pure-v1 accounts reuse a strictly validated joined cache read before
+loading source vectors. Only changed accounts re-enter acquisition/calculation;
+compact cohort fits must still be recombined for medians. Existing bounded
+scheduler priorities remain. Open public pages refresh automatically and retain
+the graph across transient request failure. The 839 Worker, 562 web and 207
+operations tests, real-D1 migration rehearsal and live source/assets/browser
+checks are recorded in the
+[deployment receipt](./receipts/2026-09-07-incremental-graph-publication.md).
 
-This verifies current graph availability, not unlimited historical recovery.
-Public model history currently begins September 1 (Astra September 5); backfill
-remains low priority. The daily rebuild queue is empty. Activity still counts
-all tokens, and spend remains explicitly partial: USD 100,671.8 across 279 of
-318 days at the latest rendered check. Both desktop artifacts remain unchanged.
+The public snapshot has 69 closed allowance dates through September 6; admin
+also includes September 7. Model history begins September 1 (Astra September 5)
+and historical backfill remains separate. Activity has 318 published days, 279
+with price data that can still be partial. This is not proof of complete
+historical recovery or a production throughput benchmark. Both 0.1.18 downloads,
+Intel Homebrew guidance, consent, retention and v1.1 staging remain unchanged.
+The earlier scheduler-starvation repair and owner-history recovery remain
+documented in the [prior recovery receipt](./receipts/2026-09-07-cache-publisher-repair.md).
 
 ### Earlier verified public graph state
 

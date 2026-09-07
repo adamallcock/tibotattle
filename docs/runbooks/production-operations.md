@@ -22,7 +22,7 @@ the [macOS stable release runbook](./macos-stable-release-runbook.md).
 |---|---|
 | Public and `www` hosts | One production Worker and manifest-verified static release-site assets |
 | Admin host | Same Worker, but admin routes exist only on `admin.tibotattle.com`, behind Cloudflare Access and a Worker-side owner check |
-| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0048_community_model_history.sql`; this is a source inventory, not proof of remote application |
+| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0049_preserve_published_graph.sql`; this is a source inventory, not proof of remote application |
 | Deletion ledger | Separate `DELETION_LEDGER` D1 binding and migration ledger |
 | Encrypted/quarantined objects | Production `QUARANTINE` R2 binding with explicit deletion/reconciliation and deletion-safe restore rules; automatic age-based deletion is disabled in this source snapshot |
 | Upload admission | `UPLOAD_INGRESS_BUDGET` Durable Object plus explicit rate-limit bindings |
@@ -463,6 +463,10 @@ and read-back; never treat “contain” as permission to “restore.”
   so concurrent maintenance cannot finish an owner's in-flight erasure.
 - A Worker rollback must still understand the live schemas and current durable
   state. If it cannot, contain the affected path and deploy a forward repair.
+  After migration 0049, preserve its ledger entry, columns, triggers and schema
+  inventory when preparing a rollback repair; an untouched older checkout's
+  migration gate rejects the newer ledger. Do not reverse the schema to make
+  that old checkout deployable.
 - Do not roll back appcast bytes by ordinary R2 overwrite. The signed feed,
   immutable enclosure, version ordering, and atomic guard are one release
   contract.
