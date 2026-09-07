@@ -13,6 +13,23 @@ function exactStringLiterals(source) {
     .map(([, value]) => value);
 }
 
+test("Mac installation guidance separates both supported cask targets from the pinned build host", async () => {
+  const readme = await text("README.md");
+  const guide = await text("docs/user-guide.md");
+  const webDocs = await text("apps/web/public/docs.html");
+  for (const [name, content] of [["README", readme], ["user guide", guide], ["website docs", webDocs]]) {
+    assert.match(content, /Apple silicon[\s\S]*Intel/u, `${name} includes both Mac targets`);
+    assert.ok(content.includes("brew install --cask adamallcock/tap/tibotattle"), `${name} retains the qualified tap command`);
+    assert.match(content, /macOS 14 or later/u, `${name} preserves the support floor`);
+  }
+  assert.match(readme, /## Build from source \(developers\)/u);
+  assert.match(readme, /exactly Node v26\.2\.0 on macOS arm64/u);
+  assert.match(readme, /A native\s+Intel build host is not currently supported/u);
+  assert.doesNotMatch(readme, /## Quick start \(macOS, Apple Silicon\)/u);
+  assert.match(await text("CONTRIBUTING.md"), /## Developer setup/u);
+  assert.match(await text("SUPPORT.md"), /macOS 14 or later on Apple silicon and Intel/u);
+});
+
 test("maintained Markdown retires self-service promises without implying history loss", async () => {
   const paths = [
     "README.md",
