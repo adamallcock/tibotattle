@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-07
 type: status
 status: current
-source_commit: df5599707df189678079c15e683c18a7e0a5da1f
+source_commit: 14af4ed160e618751c20a4a33a3c9ff0d8a5af6d
 observation_date: 2026-09-07
 ---
 
@@ -43,25 +43,33 @@ substitutes for SLSA build provenance. Follow
 
 ### Current presentation and live-data availability
 
-On 2026-09-07 the guarded deployment published
-`df5599707df189678079c15e683c18a7e0a5da1f`. Public and admin plan cards now
-include the actual plan's weekly API-equivalent value beneath the normalized
-Pro 20x figure (divide by 1, 4 or 20). Admin also shares the compact model
-themes/order, fitted All-history dates, legend focus and responsive chart
-labels. All 545 web and 802 Worker runtime tests passed, alongside deployment
-and release checks. Exact live source/assets, private-route isolation and the
-authenticated admin module graph are verified; both existing 0.1.18 installers
-remain unchanged. See the [deployment receipt](./receipts/2026-09-07-plan-values-admin-graph-parity.md).
+On 2026-09-07 the guarded deployment published combined source
+`14af4ed160e618751c20a4a33a3c9ff0d8a5af6d`, independently verified at 16:41 UTC.
+Public and admin allowance/plan/model charts, including Astra, are available;
+the separate admin Growth & activity history also renders. Public plan cards
+show the smaller actual-plan values (Pro 5x `$479`, Plus `$113` for September 6)
+beneath the normalized Pro 20x figures. Admin's September 7 cards use the same
+conversion and presentation. Both Mac download tabs retain 0.1.18; Intel now
+also shows the shared Homebrew install command and updated setup guidance.
 
-Live plan/model rendering is currently blocked independently of that update.
-Before deployment at 15:09 UTC, the shared preview cache was already unavailable:
-its 13:05:41 UTC snapshot exceeded the two-hour freshness limit. Public plan/model
-views and the admin allowance preview therefore withhold values. The aggregate
-allowance and activity views remain available. Bounded metadata and a natural
-scheduled log confirm current account caches and healthy maintenance, followed
-by aggregate cache-publication failure; the deeper cause is not established.
-No freshness bypass, manual rebuild or telemetry rewrite was performed. This
-supersedes the availability claims below, not their point-in-time evidence.
+The outage was scheduled publication starvation, not a proven database failure:
+current-account checks and reconciliation consumed the 40-second optional
+deadline before the shared preview could refresh. The independent admin history
+cache was also skipped and expired. Even-minute passes now give ready graph and
+owner-history caches an early opportunity; odd minutes preserve reconstruction's
+full budget. Natural allowance publication at 16:18:35 and owner-history refresh
+at 16:38:46 restored both views without changing freshness, telemetry, schema,
+pricing or consent. A concurrent website deployment was reconciled into this
+baseline, preserving both updates. All 806 Worker, 545 web, 202 operations and
+36 release-site tests passed, alongside preflight/type/architecture/deployment
+checks. See the [recovery receipt](./receipts/2026-09-07-cache-publisher-repair.md)
+and the preserved [earlier presentation receipt](./receipts/2026-09-07-plan-values-admin-graph-parity.md).
+
+This verifies current graph availability, not unlimited historical recovery.
+Public model history currently begins September 1 (Astra September 5); backfill
+remains low priority. The daily rebuild queue is empty. Activity still counts
+all tokens, and spend remains explicitly partial: USD 100,671.8 across 279 of
+318 days at the latest rendered check. Both desktop artifacts remain unchanged.
 
 ### Earlier verified public graph state
 
