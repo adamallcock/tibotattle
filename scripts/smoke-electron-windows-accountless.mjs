@@ -20,6 +20,7 @@ const PREFIX = "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_";
 const SHA = /^[0-9a-f]{64}$/u;
 const REVISION = /^[0-9a-f]{40}$/u;
 const COMMANDS = new Set(["status-v1", "accountless-storage-v1", "quit-v1"]);
+const SEND_ERROR_CODES = new Set(["EPIPE", "ECONNRESET", "ERR_IPC_CHANNEL_CLOSED", "ERR_IPC_DISCONNECTED"]);
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
 function fail(code) { throw Object.assign(new Error(`${PREFIX}${code}`), { code: `${PREFIX}${code}` }); }
 function fixedCode(error) { return new RegExp(`^${PREFIX}[A-Z_]+$`, "u").test(error?.code ?? "") ? error.code : `${PREFIX}FAILED`; }
@@ -85,7 +86,7 @@ export async function verifyWindowsAccountlessSmokePackage(options) {
 
 // Install listeners before sending. No credential bytes or caller-selected
 // operation can enter this protocol, even when the packaged app misbehaves.
-export function createWindowsAccountlessSmokeProtocol(child, { timeoutMs = 60000 } = {}) {
+export function createWindowsAccountlessSmokeProtocol(child, { timeoutMs = 60000, observations = null } = {}) {
   let closed = false;
   let pending = null;
   const finish = (error, value) => {
@@ -103,6 +104,7 @@ export function createWindowsAccountlessSmokeProtocol(child, { timeoutMs = 60000
     const command = pending.command;
     if (command === "status-v1" && value.message === "state-v1") {
       if (Object.keys(value).length !== 7 || ["started", "primary", "window", "visible", "tray"].some((key) => typeof value[key] !== "boolean")) return finish(failure("RESPONSE_INVALID"));
+      if (observations) observations.statusResponseObserved = true;
       return finish(null, value);
     }
     if (command === "accountless-storage-v1" && value.message === "credential-v1") {
@@ -126,8 +128,18 @@ export function createWindowsAccountlessSmokeProtocol(child, { timeoutMs = 60000
         const send = () => {
           if (pending !== request) return;
           try {
-            child.send({ type: TYPE, message: "command-v1", command }, (error) => { if (error && pending === request) finish(failure("SEND_FAILED")); });
-          } catch { if (pending === request) finish(failure("SEND_FAILED")); }
+            child.send({ type: TYPE, message: "command-v1", command }, (error) => {
+              if (error && pending === request) {
+                if (observations) observations.sendFailureCode = SEND_ERROR_CODES.has(error.code) ? error.code : "unclassified";
+                finish(failure("SEND_FAILED"));
+              }
+            });
+          } catch (error) {
+            if (pending === request) {
+              if (observations) observations.sendFailureCode = SEND_ERROR_CODES.has(error?.code) ? error.code : "unclassified";
+              finish(failure("SEND_FAILED"));
+            }
+          }
         };
         // Startup can precede installation of the app's observation listener.
         // Only the read-only status request is repeatable; never replay storage.
@@ -152,8 +164,8 @@ async function waitForChildExit(child, timeoutMs) {
   });
 }
 
-export async function exerciseWindowsAccountlessSmoke(child, { timeoutMs = 60000 } = {}) {
-  const protocol = createWindowsAccountlessSmokeProtocol(child, { timeoutMs });
+export async function exerciseWindowsAccountlessSmoke(child, { timeoutMs = 60000, observations = null } = {}) {
+  const protocol = createWindowsAccountlessSmokeProtocol(child, { timeoutMs, observations });
   try {
     const deadline = Date.now() + timeoutMs;
     while (true) {
@@ -162,11 +174,33 @@ export async function exerciseWindowsAccountlessSmoke(child, { timeoutMs = 60000
       if (Date.now() >= deadline) fail("STARTUP_TIMEOUT");
       await delay(250);
     }
+    if (observations) observations.storageRequested = true;
     await protocol.request("accountless-storage-v1");
+    if (observations) observations.storagePassed = true;
     await protocol.request("quit-v1");
+    if (observations) observations.quitAcknowledged = true;
     if (!await waitForChildExit(child, 10000)) fail("QUIT_TIMEOUT");
     if (child.exitCode !== 0) fail("CHILD_FAILED");
   } finally { protocol.close(); }
+}
+
+// Keep at most one short line internally and expose one exact known marker.
+// Native/Electron stderr can contain private paths; never retain or print it.
+export function observeWindowsSmokeStderr(stream, observations) {
+  let line = "";
+  let discarded = false;
+  stream?.setEncoding("utf8");
+  stream?.on("data", (chunk) => {
+    for (const character of chunk) {
+      if (character === "\n") {
+        if (!discarded && line.replace(/\r$/u, "") === "electron_shell_entry_failed") observations.entryFailureObserved = true;
+        line = ""; discarded = false;
+      } else if (!discarded) {
+        if (line.length >= 128) { line = ""; discarded = true; }
+        else line += character;
+      }
+    }
+  });
 }
 
 async function stopOwnedChild(child) {
@@ -188,6 +222,8 @@ export async function runWindowsAccountlessSmoke(options) {
   let identity = null;
   let errorCode = null;
   let stopped = true;
+  const observations = { entryFailureObserved: false, statusResponseObserved: false,
+    storageRequested: false, storagePassed: false, quitAcknowledged: false, sendFailureCode: null };
   try {
     identity = await verifyWindowsAccountlessSmokePackage(options);
     profileRoot = await mkdtemp(join(tmpdir(), "tibotattle-windows-accountless-smoke-"));
@@ -196,9 +232,10 @@ export async function runWindowsAccountlessSmoke(options) {
     child = spawn(spec.command, spec.args, { ...spec.options,
       env: { ...spec.options.env, USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
         USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: randomUUID() },
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      stdio: ["ignore", "ignore", "pipe", "ipc"],
     });
-    await exerciseWindowsAccountlessSmoke(child);
+    observeWindowsSmokeStderr(child.stderr, observations);
+    await exerciseWindowsAccountlessSmoke(child, { observations });
   } catch (error) { errorCode = fixedCode(error); }
   finally {
     stopped = await stopOwnedChild(child);
@@ -217,6 +254,8 @@ export async function runWindowsAccountlessSmoke(options) {
       fullApplicationRestartVerified: false, hostedUploadPerformed: false,
       installationPerformed: false, productionReady: false,
       ownedProcessStopped: stopped,
+      observations: { ...observations, exitCode: Number.isInteger(child?.exitCode) ? child.exitCode : null,
+        terminatedBySignal: child?.signalCode != null },
     };
     try { await receiptHandle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`); await receiptHandle.sync(); }
     finally { await receiptHandle.close(); }

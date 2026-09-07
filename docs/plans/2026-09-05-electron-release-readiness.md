@@ -585,7 +585,22 @@ credential or upload request, exposes no run identifier or record bytes, and
 does not claim a full app restart, installation or production readiness.
 The existing four-target workflow now compiles and runs the native Windows
 accountless tests and this packaged IPC journey, retaining its content-free
-receipt even on failure. Actual Windows execution is pending the next build.
+receipt even on failure. [Run 34166503438](https://github.com/adamallcock/tibotattle/actions/runs/34166503438)
+at `48a234f2` passes the Windows native binding/record tests and package build,
+but the packaged IPC journey fails before its first status reply with
+`ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_SEND_FAILED`. The failed receipt is retained;
+this does not qualify Windows runtime storage. The outer runner now records
+only allowlisted IPC error classes, a fixed startup-failure marker and numeric
+exit status to distinguish startup failure from channel failure on the retry.
+It never retains arbitrary Electron/native stderr.
+
+The same `48a234f2` source produced a fresh ARM development package with ASAR
+`a82c0c4271e8303f80b70b77017c3e1a31de1a92b979afee263e36cbd2e5292a`.
+Its identity-bound rendered smoke passes startup refresh, usage and Community,
+sharing/settings persistence, tray save/preview/undo/defaults/reopen/relaunch,
+and clean quit. Dashboard and tray screenshots were inspected. This is
+disposable synthetic-profile evidence; uploads, signing and updating remain
+disabled and the original `d5dc8025` user-test profile is preserved.
 
 Combining the tray and Windows changes exposed a missing tray-preferences entry
 in the independent packaging verifier. The reviewed file list and its separate

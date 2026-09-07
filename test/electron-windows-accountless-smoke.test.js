@@ -7,6 +7,7 @@ import {
   assertWindowsAccountlessPackageIdentity,
   createWindowsAccountlessSmokeProtocol,
   exerciseWindowsAccountlessSmoke,
+  observeWindowsSmokeStderr,
 } from "../scripts/smoke-electron-windows-accountless.mjs";
 
 const type = "windows-electron-smoke-v1";
@@ -96,5 +97,21 @@ test("startup observation can be retried while a storage request is never replay
   await assert.rejects(protocol.request("accountless-storage-v1"), /TIMEOUT/u);
   assert.equal(child.commands.filter(({ command }) => command === "status-v1").length, 2);
   assert.equal(child.commands.filter(({ command }) => command === "accountless-storage-v1").length, 1);
+  protocol.close();
+});
+
+test("failure observations expose only a fixed startup marker and allowlisted IPC class", async () => {
+  const stream = new EventEmitter(); stream.setEncoding = () => {};
+  const observations = { entryFailureObserved: false, sendFailureCode: null };
+  observeWindowsSmokeStderr(stream, observations);
+  stream.emit("data", "private path and credential\n" + "x".repeat(500) + "electron_shell_entry_failed\n");
+  assert.equal(observations.entryFailureObserved, false);
+  stream.emit("data", "electron_shell_"); stream.emit("data", "entry_failed\r\n");
+  assert.equal(observations.entryFailureObserved, true);
+  const child = fakeChild(() => {});
+  child.send = (_message, callback) => callback(Object.assign(new Error("private detail"), { code: "EPIPE" }));
+  const protocol = createWindowsAccountlessSmokeProtocol(child, { observations });
+  await assert.rejects(protocol.request("status-v1"), /SEND_FAILED/u);
+  assert.deepEqual(observations, { entryFailureObserved: true, sendFailureCode: "EPIPE" });
   protocol.close();
 });
