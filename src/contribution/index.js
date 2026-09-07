@@ -12,6 +12,7 @@ export {
 export {
   accountlessDeviceUnavailableCode,
   accountlessLocalLaboratoryOrigin,
+  accountlessTransportOrigin,
   ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
   ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,

@@ -23,7 +23,7 @@ import {
 } from "./platform/index.js";
 import {
   accountlessDeviceUnavailableCode,
-  accountlessLocalLaboratoryOrigin,
+  accountlessTransportOrigin,
   ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
   ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
@@ -383,8 +383,8 @@ function explicitV11Consent(consent, origin) {
   return required;
 }
 
-function accountlessV11Authorization(authorization, origin, laboratory) {
-  if (accountlessLocalLaboratoryOrigin(laboratory, origin) === null
+function accountlessV11Authorization(authorization, origin, laboratory, production) {
+  if (accountlessTransportOrigin({ laboratory, production, origin }) === null
       || !exactKeys(authorization, [
     "authorizationBasis",
     "policyVersion",
@@ -581,7 +581,7 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
     return runTelemetryV1SyncOnce(options);
   }
   const {
-    indexFile, origin, backend, stateFile, consent, authorization = undefined, laboratory = undefined, signal, fetchImpl = globalThis.fetch,
+    indexFile, origin, backend, stateFile, consent, authorization = undefined, laboratory = undefined, production = false, signal, fetchImpl = globalThis.fetch,
     cryptoImpl = globalThis.crypto, withDeviceSecret = withContributionDeviceSecret,
     openIndex = openLocalUnifiedIndex, maximumChunks = DEFAULT_MAXIMUM_CHUNKS_PER_PASS,
     requestTimeoutMilliseconds = DEFAULT_REQUEST_TIMEOUT_MILLISECONDS,
@@ -595,7 +595,7 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
   const selectedOrigin = canonicalOrigin(origin);
   const selectedConsent = hasAccountlessAuthorization ? null : explicitV11Consent(consent, selectedOrigin);
   const selectedAuthorization = hasAccountlessAuthorization
-    ? accountlessV11Authorization(authorization, selectedOrigin, laboratory)
+    ? accountlessV11Authorization(authorization, selectedOrigin, laboratory, production)
     : null;
   if (hasAccountlessAuthorization && consent !== undefined) fail("authorization_invalid");
   if (typeof indexFile !== "string" || !indexFile || !backend || typeof backend !== "object"
@@ -639,7 +639,7 @@ export async function runIncrementalContributionSyncOnce(options = {}) {
             deviceAuthorization: `Device um_device_${device.deviceId}.${secret.toString("base64url")}`,
             ...(selectedAuthorization === null
               ? { consent: selectedConsent }
-              : { authorization: selectedAuthorization, laboratory }),
+              : { authorization: selectedAuthorization, laboratory, production }),
             days: preparation.days, fetchImpl: fetch, signal, clock: now,
             sourcePublication: preparation.sourcePublication,
             progressStore: progress,

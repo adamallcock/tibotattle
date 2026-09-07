@@ -20,6 +20,7 @@ export {
   createLocalContributionPreference,
 } from "./local-contribution-preference.js";
 export { createAccountlessContributionScheduler } from "./accountless-contribution-scheduler.js";
+export { accountlessTransportOrigin } from "../contribution/index.js";
 export {
   createLocalMetadataBundleVerificationContext,
 } from "./local-metadata-bundle-verification.js";

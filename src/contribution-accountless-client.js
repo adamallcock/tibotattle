@@ -3,7 +3,7 @@ import {
   withContributionDeviceSecret,
 } from "./contribution-device-capability.js";
 import {
-  accountlessLocalLaboratoryOrigin,
+  accountlessTransportOrigin,
   ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
   ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
@@ -469,8 +469,8 @@ function exactKeys(value, keys) {
     && Object.keys(value).sort().join("\0") === keys;
 }
 
-function assertLocalLaboratory(laboratory, origin) {
-  const selected = accountlessLocalLaboratoryOrigin(laboratory, origin);
+function assertTransportDestination(laboratory, production, origin) {
+  const selected = accountlessTransportOrigin({ laboratory, production, origin });
   if (selected === null) fail("invalid_configuration");
   return selected;
 }
@@ -647,13 +647,12 @@ export async function enrollAccountlessContribution({
 }
 
 /**
- * Synthetic-laboratory ownership registration. This entrypoint is deliberately
- * loopback-only: distributed/hosted accountless upload activation needs its
- * own reviewed release authorization. Enrollment remains a separate,
- * non-upload-capable operation.
+ * Ownership registration for an explicitly selected laboratory or production
+ * destination. Enrollment remains a separate, non-upload-capable operation.
  */
 export async function claimAccountlessContributionOwnership({
   laboratory = false,
+  production = false,
   origin,
   readPreference,
   backend,
@@ -679,7 +678,7 @@ export async function claimAccountlessContributionOwnership({
     clearTimeoutImpl,
   });
   const selectedOrigin = canonicalOrigin(origin);
-  assertLocalLaboratory(laboratory, selectedOrigin);
+  assertTransportDestination(laboratory, production, selectedOrigin);
   assertSignalActive(signal);
   await readEligiblePreference(readPreference, selectedOrigin);
   assertSignalActive(signal);
@@ -763,6 +762,7 @@ function configuredAccountlessSync(options) {
   }
   const {
     laboratory = false,
+    production = false,
     origin,
     readPreference,
     backend,
@@ -807,9 +807,10 @@ function configuredAccountlessSync(options) {
     fail("invalid_configuration");
   }
   const selectedOrigin = canonicalOrigin(origin);
-  assertLocalLaboratory(laboratory, selectedOrigin);
+  assertTransportDestination(laboratory, production, selectedOrigin);
   return Object.freeze({
     laboratory,
+    production,
     origin: selectedOrigin,
     readPreference,
     backend,
@@ -875,8 +876,8 @@ function accountlessRunFailure(error, { networkActivity = false, signal = undefi
 }
 
 /**
- * Run one bounded, synthetic accountless pass against the explicit local
- * laboratory. It is unavailable for hosted origins. Each actual request is
+ * Run one bounded accountless pass against an explicitly selected destination.
+ * Each actual request is
  * fenced by a fresh protected preference read; Electron additionally aborts
  * the signal on opt-out, so a stale pass cannot proceed to a later request.
  */
@@ -884,6 +885,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
   const configured = configuredAccountlessSync(options);
   const {
     laboratory,
+    production,
     origin,
     readPreference,
     backend,
@@ -942,6 +944,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
     assertSignalActive(signal);
     await claimOwnership({
       laboratory,
+      production,
       origin,
       readPreference,
       backend,
@@ -959,6 +962,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
     assertSignalActive(signal);
     const result = await runIncrementalSync({
       laboratory,
+      production,
       origin,
       backend,
       ...(stateFile === undefined ? {} : { stateFile }),

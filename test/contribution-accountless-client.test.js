@@ -803,3 +803,64 @@ test("the accountless runner cancels after enrollment and preserves the durable 
     retryAfterMilliseconds: null,
   });
 });
+
+test("production accountless ownership requires the exact reviewed origin and explicit mode", async () => {
+  const origin = "https://tibotattle.com";
+  let reads = 0;
+  let calls = 0;
+  const options = {
+    origin, production: true, backend: {}, now: () => NOW,
+    readPreference: async () => { reads++; return preference({ destinationOrigin: origin }); },
+    withDeviceSecret: async ({ expectedOrigin, operation }) => {
+      assert.equal(expectedOrigin, origin);
+      const secret = Buffer.alloc(32, 7);
+      try { return await operation(secret, { origin, deviceId: DEVICE_ID }); }
+      finally { secret.fill(0); }
+    },
+    fetchImpl: async (url, request) => {
+      calls++;
+      assert.equal(String(url), `${origin}/api/v1/accountless/ownership`);
+      assert.equal(request.redirect, "error");
+      assert.equal(request.credentials, "omit");
+      return jsonResponse(ownershipReceipt());
+    },
+  };
+  for (const override of [
+    { production: false }, { laboratory: true }, { production: "true" },
+    { origin: "https://other.example" }, { origin: "http://127.0.0.1:8787" },
+  ]) await assert.rejects(claimAccountlessContributionOwnership({ ...options, ...override }),
+    isClientError("invalid_configuration"));
+  assert.equal(reads, 0);
+  assert.equal(calls, 0);
+  const receipt = await claimAccountlessContributionOwnership(options);
+  assert.equal(receipt.deviceId, DEVICE_ID);
+  assert.equal(calls, 1);
+  await assert.rejects(claimAccountlessContributionOwnership({ ...options,
+    readPreference: async () => preference({ destinationOrigin: origin, enabled: false }),
+  }), isClientError("preference_ineligible"));
+  assert.equal(calls, 1, "persistent opt-out prevents production network work");
+});
+
+test("production selection survives the accountless runner into the existing v1.1 pipeline", async () => {
+  const origin = "https://tibotattle.com";
+  const order = [];
+  const result = await runAccountlessContributionSyncOnce({
+    origin, production: true, backend: {}, indexFile: "/synthetic/index.sqlite",
+    readPreference: async () => preference({ destinationOrigin: origin }),
+    enroll: async () => { order.push("enroll"); },
+    claimOwnership: async (options) => {
+      order.push("ownership");
+      assert.equal(options.production, true);
+      assert.equal(options.laboratory, false);
+    },
+    runIncrementalSync: async (options) => {
+      order.push("sync");
+      assert.equal(options.production, true);
+      assert.equal(options.laboratory, false);
+      assert.equal(Object.hasOwn(options, "consent"), false);
+      return { status: "complete", chunksUploaded: 1 };
+    },
+  });
+  assert.equal(result.status, "complete");
+  assert.deepEqual(order, ["enroll", "ownership", "sync"]);
+});

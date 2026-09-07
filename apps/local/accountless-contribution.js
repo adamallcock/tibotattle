@@ -1,12 +1,13 @@
 import { join } from "node:path";
 import {
+  accountlessTransportOrigin,
   createAccountlessContributionScheduler,
 } from "../../src/application/index.js";
 import { createAccountlessChildChannel } from "../../src/platform/index.js";
 import { runAccountlessContributionSyncOnce } from "../../src/contribution-accountless-client.js";
 
-// Deliberately limited to the disposable local laboratory. The normal desktop
-// launcher supplies neither this lane nor its private inherited IPC channel.
+// Both modes require the private inherited channel. Only Electron can supply
+// the protected preference and credential; environment values grant neither.
 export function createLocalAccountlessContribution({
   environment, stateRoot, indexFile, channel = process,
   readAccountMarkers, loadExistingAccountObservationSecret,
@@ -14,14 +15,14 @@ export function createLocalAccountlessContribution({
 } = {}) {
   if (environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN === undefined) return null;
   const origin = environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN;
-  let url;
-  try { url = new URL(origin); } catch { throw new TypeError("Invalid accountless laboratory configuration"); }
-  if (environment.USAGE_MONITOR_TEST_LANE !== "accountless-local-lab-v1"
+  const laboratory = environment.USAGE_MONITOR_TEST_LANE === "accountless-local-lab-v1";
+  const production = environment.USAGE_MONITOR_ACCOUNTLESS_MODE === "production-v1"
+    && environment.USAGE_MONITOR_TEST_LANE === undefined;
+  if (accountlessTransportOrigin({ laboratory, production, origin }) === null
       || environment.USAGE_MONITOR_CENTRAL_ORIGIN !== undefined
-      || url.origin !== origin || url.hostname !== "127.0.0.1"
-      || url.protocol !== "http:" || !url.port || url.username || url.password
+      || (laboratory && environment.USAGE_MONITOR_ACCOUNTLESS_MODE !== undefined)
       || typeof channel.send !== "function" || channel.connected !== true) {
-    throw new TypeError("Invalid accountless laboratory configuration");
+    throw new TypeError("Invalid accountless contribution configuration");
   }
   let scheduler;
   const bridge = createAccountlessChildChannel({ channel,
@@ -29,7 +30,7 @@ export function createLocalAccountlessContribution({
   scheduler = createAccountlessContributionScheduler({
     ...schedulerOptions, origin,
     readPreference: bridge.readPreference,
-    runner: ({ signal }) => runner({ laboratory: true, origin, indexFile,
+    runner: ({ signal }) => runner({ laboratory, production, origin, indexFile,
       stateFile: join(stateRoot, "accountless-device-binding-v1.json"),
       progressFile: join(stateRoot, "private", "accountless-upload-progress-v1.json"),
       backend: bridge.backend, readPreference: bridge.readPreference, signal,

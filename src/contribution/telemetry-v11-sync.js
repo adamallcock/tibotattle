@@ -18,7 +18,7 @@ import {
 import { sanitizeTelemetryAttributionBinding } from "./account-track.js";
 import {
   accountlessDeviceUnavailableCode,
-  accountlessLocalLaboratoryOrigin,
+  accountlessTransportOrigin,
   ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
   ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
   ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
@@ -233,8 +233,13 @@ function transport(options, maxDurationMs) {
 }
 
 function capabilities(value, origin) {
-  if (!exact(value, ["schemaVersion", "destinationOrigin", "enrollmentNamespace", "identityVersion",
-    "minimumWriteRank", "policyRevision", "requiredConsent", "consentCurrent", "formats"])
+  const accountless = value?.authorityKind === "accountless";
+  const keys = ["schemaVersion", "destinationOrigin", "enrollmentNamespace", "identityVersion",
+    "minimumWriteRank", "policyRevision", "requiredConsent", "consentCurrent", "formats"];
+  if (accountless) keys.push("authorityKind", "authorizationCurrent");
+  if (!exact(value, keys)
+      || (accountless && (value.consentCurrent !== false
+        || typeof value.authorizationCurrent !== "boolean"))
       || value.schemaVersion !== "device-sync-capabilities-v1.1" || value.destinationOrigin !== origin
       || value.identityVersion !== "account-track-v2" || !Object.values(FORMATS).includes(value.minimumWriteRank)
       || !integer(value.policyRevision) || typeof value.consentCurrent !== "boolean"
@@ -252,14 +257,17 @@ function capabilities(value, origin) {
   }
   return freeze(JSON.parse(JSON.stringify(value)));
 }
-function requireTransportAdmission(capability) {
+function requireTransportAdmission(capability, accountless) {
   const format = capability.formats.find((item) => item.schemaVersion === TELEMETRY_V11_CONTRIBUTION_SCHEMA_VERSION);
-  if (!capability.consentCurrent || format.lifecycle !== "accepted"
+  const authorized = accountless
+    ? capability.authorityKind === "accountless" && capability.authorizationCurrent === true
+    : capability.authorityKind === undefined && capability.consentCurrent === true;
+  if (!authorized || format.lifecycle !== "accepted"
       || format.rank < capability.minimumWriteRank) stop("consent_rejected");
 }
 
-function accountlessAuthorization(value, laboratory, serverBaseUrl) {
-  if (accountlessLocalLaboratoryOrigin(laboratory, serverBaseUrl) === null
+function accountlessAuthorization(value, laboratory, production, serverBaseUrl) {
+  if (accountlessTransportOrigin({ laboratory, production, origin: serverBaseUrl }) === null
       || !exact(value, ["authorizationBasis", "policyVersion", "schemaVersion", "telemetrySchemaVersion"])
       || value.schemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION
       || value.policyVersion !== ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION
@@ -276,14 +284,14 @@ function accountlessAuthorization(value, laboratory, serverBaseUrl) {
 // accountless mode it describes the content contract only: authorization is
 // the separately versioned policy record checked by the service, never a
 // fabricated local consent event.
-function transportAuthorization({ consent, authorization, laboratory, serverBaseUrl }) {
+function transportAuthorization({ consent, authorization, laboratory, production, serverBaseUrl }) {
   if (authorization !== undefined) {
     if (consent !== undefined) {
       const error = new TypeError("Accountless contribution authorization is invalid");
       error.code = "contribution_incremental_sync_authorization_invalid";
       throw error;
     }
-    const accountless = accountlessAuthorization(authorization, laboratory, serverBaseUrl);
+    const accountless = accountlessAuthorization(authorization, laboratory, production, serverBaseUrl);
     return Object.freeze({ journalBinding: Object.freeze({ mode: "accountless_policy", accountless }) });
   }
   if (!isTelemetryV11ConsentCurrent(consent)) {
@@ -454,13 +462,13 @@ function progressSnapshot(value, expected, revalidateProgress) {
 
 /** A closed explicit consent or accountless policy authorization is required. */
 export async function runTelemetryV11Sync({
-  serverBaseUrl, deviceAuthorization, consent, authorization = undefined, laboratory = undefined, days, readDay, createEnvelope,
+  serverBaseUrl, deviceAuthorization, consent, authorization = undefined, laboratory = undefined, production = false, days, readDay, createEnvelope,
   fetchImpl = globalThis.fetch, signal, clock = Date.now,
   maxChunks = 500, maxDurationMs = 60_000, requestTimeoutMs = 30_000,
   maxDays = MAX_TELEMETRY_V11_DOMAIN_DAYS,
   progressStore = null, sourcePublication = null, revalidateProgress = false,
 } = {}) {
-  const selectedAuthorization = transportAuthorization({ consent, authorization, laboratory, serverBaseUrl });
+  const selectedAuthorization = transportAuthorization({ consent, authorization, laboratory, production, serverBaseUrl });
   if (!integer(maxChunks, 2_000) || maxChunks < 1 || !integer(maxDurationMs, 300_000) || maxDurationMs < 1
       || !integer(maxDays, MAX_TELEMETRY_V11_DOMAIN_DAYS) || maxDays < 1
       || !Array.isArray(days) || days.length > maxDays || typeof readDay !== "function" || typeof createEnvelope !== "function"
@@ -499,7 +507,7 @@ export async function runTelemetryV11Sync({
   }
   try {
     const capability = capabilities(await client.request("/api/v1/device/sync-capabilities"), client.origin);
-    requireTransportAdmission(capability);
+    requireTransportAdmission(capability, authorization !== undefined);
     const binding = Object.freeze({ destinationOrigin: capability.destinationOrigin, enrollmentNamespace: capability.enrollmentNamespace });
     let before = predecessor(await client.request("/api/v1/me/telemetry-v11/domain-predecessor", { body: {} }), clock);
     const fromDay = localDays.length ? [before.fromDay, localDays[0]].sort()[0] : before.fromDay;
@@ -609,7 +617,7 @@ export async function runTelemetryV11Sync({
       await client.bounded(() => new Promise((resolve) => setImmediate(resolve)));
     }
     const after = capabilities(await client.request("/api/v1/device/sync-capabilities"), client.origin);
-    requireTransportAdmission(after);
+    requireTransportAdmission(after, authorization !== undefined);
     if (after.enrollmentNamespace !== capability.enrollmentNamespace
         || after.policyRevision !== capability.policyRevision) stop("revision_conflict", { retryable: true });
     // A resumed prefix is trusted only for the pinned predecessor, not merely

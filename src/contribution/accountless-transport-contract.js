@@ -1,3 +1,5 @@
+import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
+
 // The accountless installation policy is a transport authorization, not a
 // consent event. These identifiers are deliberately separate from the legacy
 // consent dictionary, and both sides must reject a version they do not know.
@@ -41,4 +43,14 @@ export function accountlessLocalLaboratoryOrigin(laboratory, origin) {
       || parsed.pathname !== "/" || parsed.search || parsed.hash
       || parsed.origin !== origin) return null;
   return parsed.origin;
+}
+
+/** Destination selection never grants upload authority. The caller still needs
+ * a current protected preference, installation credential and server grant.
+ * Production is explicit and restricted to the reviewed deployment origin. */
+export function accountlessTransportOrigin({ laboratory = false, production = false, origin } = {}) {
+  if (typeof laboratory !== "boolean" || typeof production !== "boolean"
+      || (laboratory && production)) return null;
+  if (laboratory) return accountlessLocalLaboratoryOrigin(true, origin);
+  return production && origin === DEPLOYMENT_ENDPOINTS.public.origin ? origin : null;
 }

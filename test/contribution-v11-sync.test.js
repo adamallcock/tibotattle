@@ -215,7 +215,7 @@ test("missing, old, broadened and malformed local consent fail before any networ
   }
 });
 
-test("accountless policy authorization is laboratory-only and never becomes a consent event", async () => {
+test("accountless policy authorization requires an explicit destination and never becomes a consent event", async () => {
   const laboratoryOrigin = "http://127.0.0.1:8787";
   const accountlessAuthorization = {
     schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
@@ -223,7 +223,9 @@ test("accountless policy authorization is laboratory-only and never becomes a co
     authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
     telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
   };
-  const fixture = server({ destinationOrigin: laboratoryOrigin });
+  const fixture = server({ destinationOrigin: laboratoryOrigin, capabilitiesChange: {
+    consentCurrent: false, authorityKind: "accountless", authorizationCurrent: true,
+  } });
   const { consent: ignoredConsent, ...options } = fixture.options;
   void ignoredConsent;
   const result = await runTelemetryV11Sync({
@@ -617,7 +619,9 @@ test("a lost committed usage or quota receipt resumes from the day manifest with
     recordsByStream: { usage: [usage(1)], quota: [quota(1)] },
   });
   for (const stream of ["usage", "quota"]) {
-    const fixture = server({ destinationOrigin: laboratoryOrigin });
+    const fixture = server({ destinationOrigin: laboratoryOrigin, capabilitiesChange: {
+      consentCurrent: false, authorityKind: "accountless", authorizationCurrent: true,
+    } });
     const { consent: ignoredConsent, ...options } = fixture.options;
     void ignoredConsent;
     const contributionPosts = [];
@@ -812,5 +816,40 @@ test("changed authenticated enrollment/policy and mismatched activation receipt 
     assert.equal(result.acknowledgedThroughDay, null);
     assert.equal(result.daysSynced, 0);
     assert.equal(result.failure.code, kind === "digest" ? "response_invalid" : "revision_conflict");
+  }
+});
+
+
+test("accountless transport requires neutral authorization and cannot borrow social consent", async () => {
+  const authorization = {
+    schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+  };
+  for (const production of [false, true]) {
+    const destinationOrigin = production ? "https://tibotattle.com" : "http://127.0.0.1:8787";
+    for (const capabilitiesChange of [
+      {},
+      { consentCurrent: false, authorityKind: "accountless", authorizationCurrent: false },
+      { consentCurrent: true, authorityKind: "accountless", authorizationCurrent: true },
+      { consentCurrent: false, authorityKind: "social", authorizationCurrent: true },
+    ]) {
+      const fixture = server({ destinationOrigin, capabilitiesChange });
+      const { consent, ...options } = fixture.options;
+      const result = await runTelemetryV11Sync({ ...options, production,
+        laboratory: !production, authorization, readDay: () => assert.fail("unauthorized read") });
+      assert.equal(result.status, "failed");
+      assert.equal(fixture.calls.length, 1);
+      assert.ok(["consent_rejected", "response_invalid"].includes(result.failure.code));
+    }
+    const fixture = server({ destinationOrigin, capabilitiesChange: {
+      consentCurrent: false, authorityKind: "accountless", authorizationCurrent: true,
+    } });
+    const { consent, ...options } = fixture.options;
+    const result = await runTelemetryV11Sync({ ...options, production,
+      laboratory: !production, authorization });
+    assert.equal(result.status, "complete");
+    assert.equal(result.recordsUploaded, 1);
   }
 });
