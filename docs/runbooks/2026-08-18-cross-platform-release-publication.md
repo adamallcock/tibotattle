@@ -501,6 +501,17 @@ new version from an earlier receipt.
    installer/archive against the returned metadata receipt. That receipt
    proves final-byte metadata binding only; retain the separate signature,
    notarization, Gatekeeper and enclosed-app checks alongside it.
+   If the operation is interrupted after its durable journal was written,
+   invoke the separate recovery mode:
+   `node scripts/finalize-electron-macos-update-metadata.mjs --recover-pre-finalization --candidate-receipt <candidate>/production-source-candidate.json`.
+   Recovery requires the exact candidate, unchanged payloads and ZIP blockmap,
+   intact original sidecars, and current sidecars matching their recorded pre-
+   or post-finalization bytes. It restores the original sidecars before removing
+   the interrupted-operation journal; then rerun normal finalization. A live
+   owner, completed final receipt, missing or unverifiable journal, or uncertain
+   recovery claim is a refusal, not permission to delete locks or guess prior
+   state. A crash before the journal exists requires separate exact-target
+   investigation; this recovery mode intentionally cannot repair it.
 6. Keep the resulting private installers and content-free verification
    receipts together. Installation/replacement, native credential continuity,
    exact-next-version download and update, feed publication, and public release
