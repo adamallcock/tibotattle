@@ -15,8 +15,8 @@ fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
 The latest four-target successful development build is
-`677c5e2bfe987c98a01d44f39ee0d8057361a680`. Its unsigned packages passed
-[CI run 34162180263](https://github.com/adamallcock/tibotattle/actions/runs/34162180263),
+`ae8f5bb60f011d3d14300beb026560d417eb2370`. Its unsigned packages passed
+[CI run 34163441097](https://github.com/adamallcock/tibotattle/actions/runs/34163441097),
 including Linux native lock/crash-recovery and fixed accountless-record
 qualification, the maintained Mac packaging regressions, and the Windows
 protected-child binding lane. The separately approved Mac signing source remains
@@ -340,6 +340,13 @@ Independent final verification checked all four finalization receipts and all
 eight installer/archive sizes and SHA-256 digests. The private receipt
 `approved-four-mac-installers-verification.json` records the complete approved
 signing stage. No candidate has been installed and no update feed was published.
+The exact private feed bundle is also staged locally for both architectures:
+18 files spanning the two versions' installers/blockmaps and one `.2` transport
+manifest per architecture. Every copied payload matches its sealed finalization
+receipt, each manifest's size/SHA-512 binds the exact successor payloads, and the
+target directories contain only the expected files. The private
+`feed-staging-verification.json` records this local preparation; no hosting or
+publication request was made, and the stable feed remains untouched.
 The signing-order repair and final-byte updater metadata generation are now
 incorporated into maintained packaging tooling; those source changes do
 not alter the four sealed `d5dc8025` candidates.
@@ -554,6 +561,11 @@ and all 16 listed checksums independently verified after download. Its Linux
 native receipt adds `syntheticAccountlessInstallationRecordTested: true` while
 retaining `productionSafe: false`. This expands native test evidence without
 activating the backend or claiming physical desktop qualification.
+Run `34163441097` subsequently passes all four targets at `ae8f5bb6`, including
+the newly integrated Mac interruption/recovery tests. Its packages are separate
+from the previously retained `677c5e2b` development packages and the sealed
+`d5dc8025` signed Mac installers. Local recovery validation additionally passes
+74 release workflow/evidence tests and the 20-test documentation preflight.
 
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
