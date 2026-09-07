@@ -124,7 +124,9 @@ test("Windows smoke prepares and readbacks only the fixed first-run receipt in i
   assert.equal(calls[0][1].platform, "win32");
   assert.equal(calls[0][1].architecture, "x64");
   assert.equal(calls[1][1].resourceRoot, resourceRoot);
+  assert.equal(calls[1][1].environment.TEMP, profile.root);
   assert.equal(calls[1][1].environment.USAGE_MONITOR_STATE_ROOT, profile.userData);
+  assert.equal(environment.TEMP, profile.tmp);
   assert.equal(environment.USAGE_MONITOR_STATE_ROOT, profile.state);
   assert.equal(calls[2][1].rootPath, "C:\\smoke\\user-data\\desktop-settings");
   assert.equal(calls[2][1].windowsQualificationModeContext, context);

@@ -160,6 +160,10 @@ function firstRunQualificationEnvironment(environment, profile) {
   // profile environment and follows the returning-user path unchanged.
   return Object.freeze({
     ...environment,
+    // Windows qualification treats TEMP as the root that contains every
+    // disposable path. user-data is a sibling of the launched app's tmp
+    // directory, so bind this private writer context to the profile root.
+    TEMP: profile.root,
     USAGE_MONITOR_STATE_ROOT: profile.userData,
   });
 }
