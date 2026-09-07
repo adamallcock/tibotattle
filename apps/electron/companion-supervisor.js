@@ -204,8 +204,8 @@ export function createCompanionSupervisor({
         currentChild?.stdout?.off?.("data", onStdout);
       };
 
-      const terminateStartupChild = (target, done) => {
-        if (!target || typeof target.once !== "function") {
+      const terminateStartupChild = (target, done, { alreadyExited = false } = {}) => {
+        if (alreadyExited || !target || typeof target.once !== "function") {
           done();
           return;
         }
@@ -224,7 +224,7 @@ export function createCompanionSupervisor({
         timer?.unref?.();
       };
 
-      const fail = (error) => {
+      const fail = (error, { childAlreadyExited = false } = {}) => {
         if (settled) return;
         settled = true;
         cleanupStartup();
@@ -235,7 +235,11 @@ export function createCompanionSupervisor({
           child = null;
           ready = null;
         }
-        terminateStartupChild(currentChild, () => rejectStart(error));
+        terminateStartupChild(
+          currentChild,
+          () => rejectStart(error),
+          { alreadyExited: childAlreadyExited },
+        );
       };
 
       const succeed = (value) => {
@@ -275,7 +279,7 @@ export function createCompanionSupervisor({
         currentPrivateChannel?.dispose();
         if (privateChannel === currentPrivateChannel) privateChannel = null;
         if (!settled) {
-          fail(shellError("companion_exit_before_ready"));
+          fail(shellError("companion_exit_before_ready"), { childAlreadyExited: true });
           return;
         }
         currentChild?.off?.("error", onError);

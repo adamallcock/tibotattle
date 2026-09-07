@@ -1078,6 +1078,34 @@ test("companion supervisor fails closed on malformed readiness and bounded start
   assert.deepEqual(stubbornChild.kills, ["SIGTERM", "SIGKILL"]);
 });
 
+test("companion supervisor settles immediately when its child exits before ready", async () => {
+  const child = new FakeChild();
+  const supervisor = createCompanionSupervisor({
+    spawnChild: () => child,
+    startupTimeoutMs: 1_000,
+    shutdownTimeoutMs: 1_000,
+  });
+  const starting = supervisor.start();
+  child.emit("exit", 1, null);
+  let deadline = null;
+  try {
+    await Promise.race([
+      assert.rejects(starting, errorCode("companion_exit_before_ready")),
+      new Promise((_, reject) => {
+        deadline = setTimeout(() => reject(new Error("child exit did not settle promptly")), 100);
+      }),
+    ]);
+  } finally {
+    clearTimeout(deadline);
+  }
+  assert.deepEqual(child.kills, []);
+  assert.deepEqual(supervisor.state, {
+    state: "stopped",
+    hasChild: false,
+    origin: null,
+  });
+});
+
 test("platform gate leaves macOS/Linux available and refuses unqualified Windows readiness", () => {
   assert.deepEqual(assertElectronPlatformGate({ platform: "darwin", architecture: "arm64" }), {
     platform: "darwin",

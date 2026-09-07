@@ -12,6 +12,9 @@ import {
 import { runProductionNativeMacHandover } from "./desktop-native-migration-macos.js";
 import { attachDesktopKeychainBroker } from "./desktop-keychain-broker.js";
 import { loadDesktopMacOSCredentialBackends } from "./desktop-macos-keychain.js";
+import {
+  createLinuxQualificationSecretServiceHandover,
+} from "./desktop-linux-secret-service.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
 import { assertElectronPlatformGate } from "./platform-gate.js";
 import {
@@ -544,6 +547,31 @@ export function createProductionMacCredentialHandover({
 }
 
 /**
+ * Qualification-only main-process wiring.  Normal Electron entry never
+ * supplies this context; an external packaged credential smoke can instead
+ * import the dedicated handover module under ELECTRON_RUN_AS_NODE.
+ */
+export function createLinuxQualificationSupervisorOptions({
+  linuxQualificationContext = null,
+} = {}) {
+  if (linuxQualificationContext === null) return Object.freeze({});
+  let handover;
+  try {
+    handover = createLinuxQualificationSecretServiceHandover({
+      qualificationContext: linuxQualificationContext,
+    });
+  } catch {
+    throw shellError("electron_configuration_invalid");
+  }
+  if (!handover || typeof handover.attachLinuxSecretServiceBroker !== "function") {
+    throw shellError("electron_configuration_invalid");
+  }
+  return Object.freeze({
+    attachLinuxSecretServiceBroker: handover.attachLinuxSecretServiceBroker,
+  });
+}
+
+/**
  * Compose the real Electron runtime. The function is intentionally separate
  * from module evaluation so all policy/lifecycle code remains plain-Node
  * testable when Electron is not installed in the source checkout.
@@ -559,6 +587,7 @@ export async function launchElectronShell({
   firstRunReceiptBackend,
   ownedDownloadsRegistry,
   notificationBackend,
+  linuxQualificationContext = null,
   emitFailureDiagnostic = false,
   writeDiagnostic,
 } = {}) {
@@ -607,6 +636,8 @@ export async function launchElectronShell({
     // continuity path, but it never enables the accountless FD3/upload path.
     const accountlessProductionEnabled = productionEnabled
       && productionDistribution.channel === PRODUCTION_ELECTRON_CHANNEL;
+    const linuxQualificationSupervisorOptions =
+      createLinuxQualificationSupervisorOptions({ linuxQualificationContext });
     const macCredentialHandover = productionEnabled && process.platform === "darwin"
       ? createProductionMacCredentialHandover({
         app,
@@ -634,6 +665,7 @@ export async function launchElectronShell({
       },
       supervisorOptions: {
         ...supervisorOptions,
+        ...linuxQualificationSupervisorOptions,
         ...(macCredentialHandover === null ? {} : {
           attachCredentialBroker: macCredentialHandover.attachCredentialBroker,
         }),
