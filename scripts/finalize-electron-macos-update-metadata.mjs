@@ -44,18 +44,27 @@ const REQUIRE = createRequire(import.meta.url);
 
 const CANDIDATE_SCHEMA = "tibotattle-electron-production-source-candidate-v1";
 const FINALIZATION_SCHEMA = "tibotattle-electron-update-metadata-finalization-v1";
+const RECOVERY_SCHEMA = "tibotattle-electron-update-metadata-pre-finalization-recovery-v1";
+const FINALIZATION_LOCK_SCHEMA = "tibotattle-electron-update-metadata-finalization-lock-v1";
+const RECOVERY_CLAIM_SCHEMA = "tibotattle-electron-update-metadata-recovery-claim-v1";
 const SOURCE_STATUS = "native_to_electron_handover_rehearsal_source_staged";
 const FINALIZATION_STATUS = "final_updater_metadata_bound";
 const FINALIZATION_SCOPE = "final_artifact_metadata_only";
+const RECOVERY_STATUS = "pre_finalization_restored";
+const RECOVERY_SCOPE = "exact_pre_finalization_recovery_only";
 const TRANSPORT_CHANNEL = "native-to-electron-handover";
 const TRANSPORT_MANIFEST = `${TRANSPORT_CHANNEL}-mac.yml`;
 const FINALIZATION_RECEIPT = "electron-update-metadata-finalization-receipt.json";
+const FINALIZATION_OPERATION = "electron-update-metadata-finalization-operation.json";
+const FINALIZATION_LOCK = ".electron-update-metadata-finalization.lock";
+const RECOVERY_CLAIM = ".electron-update-metadata-recovery-claim";
 const EVIDENCE_DIRECTORY = Object.freeze(["evidence", "pre-finalization"]);
 const MAX_RECEIPT_BYTES = 128 * 1024;
 const MAX_MANIFEST_BYTES = 128 * 1024;
 const MAX_BLOCKMAP_BYTES = 32 * 1024 * 1024;
 const MAX_BLOCKMAP_DECOMPRESSED_BYTES = 128 * 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024 * 1024;
+const SHA256_HEX = /^[0-9a-f]{64}$/u;
 const SHA512_BASE64 = /^[A-Za-z0-9+/]{86}==$/u;
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 const BLOCKMAP_CHECKSUM = /^[A-Za-z0-9+/]{24}$/u;
@@ -90,6 +99,25 @@ function exactString(value, expected) {
 
 function validSha512(value) {
   return typeof value === "string" && SHA512_BASE64.test(value);
+}
+
+function validSha256(value) {
+  return typeof value === "string" && SHA256_HEX.test(value);
+}
+
+function validByteLength(value, maximumBytes) {
+  return Number.isSafeInteger(value) && value > 0 && value <= maximumBytes;
+}
+
+function fingerprintBytes(bytes) {
+  return Object.freeze({
+    bytes: bytes.length,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+}
+
+function sameSidecarFingerprint(left, right) {
+  return left.bytes === right.bytes && left.sha256 === right.sha256;
 }
 
 function validIsoUtc(value) {
@@ -511,9 +539,11 @@ function validateCandidateReceipt(value) {
   }
   const artifactStem = `${PRODUCT_BRAND.displayName}-${value.version}-mac-${targetSpec.architecture}`;
   return Object.freeze({
+    buildNumber: value.buildNumber,
     candidate: value.rehearsal.candidate,
     distributionMetadata,
     dmgFile: `${artifactStem}.dmg`,
+    sourceRevision: value.sourceRevision,
     target: value.target,
     version: value.version,
     zipFile: `${artifactStem}.zip`,
@@ -538,6 +568,154 @@ async function readCandidateReceipt(path) {
     artifactDirectory: join(candidateDirectory, "artifacts"),
     candidate,
     candidateReceipt: selected,
+  });
+}
+
+function operationCandidateBinding(candidate) {
+  return Object.freeze({
+    buildNumber: candidate.buildNumber,
+    dmgFile: candidate.dmgFile,
+    kind: candidate.candidate,
+    sourceRevision: candidate.sourceRevision,
+    target: candidate.target,
+    updateFeed: candidate.distributionMetadata.updateFeed,
+    version: candidate.version,
+    zipFile: candidate.zipFile,
+  });
+}
+
+function cloneArtifactFingerprint(value) {
+  return Object.freeze({
+    bytes: value.bytes,
+    sha256: value.sha256,
+    sha512: value.sha512,
+  });
+}
+
+function cloneSidecarFingerprint(value) {
+  return Object.freeze({
+    bytes: value.bytes,
+    sha256: value.sha256,
+  });
+}
+
+function validArtifactFingerprint(value) {
+  return hasExactKeys(value, ["bytes", "sha256", "sha512"])
+    && validByteLength(value.bytes, MAX_ARTIFACT_BYTES)
+    && validSha256(value.sha256)
+    && validSha512(value.sha512);
+}
+
+function validSidecarFingerprint(value, maximumBytes) {
+  return hasExactKeys(value, ["bytes", "sha256"])
+    && validByteLength(value.bytes, maximumBytes)
+    && validSha256(value.sha256);
+}
+
+function finalizationOperationPaths(artifactDirectory, candidate) {
+  const preFinalizationDirectory = join(artifactDirectory, ...EVIDENCE_DIRECTORY);
+  const dmgPath = join(artifactDirectory, candidate.dmgFile);
+  const zipPath = join(artifactDirectory, candidate.zipFile);
+  return Object.freeze({
+    dmgBlockmapPath: `${dmgPath}.blockmap`,
+    dmgPath,
+    finalReceiptPath: join(artifactDirectory, FINALIZATION_RECEIPT),
+    manifestPath: join(artifactDirectory, TRANSPORT_MANIFEST),
+    operationJournalPath: join(preFinalizationDirectory, FINALIZATION_OPERATION),
+    preFinalizationDirectory,
+    preFinalizationDmgBlockmapPath: join(preFinalizationDirectory, `${candidate.dmgFile}.blockmap`),
+    preFinalizationManifestPath: join(preFinalizationDirectory, TRANSPORT_MANIFEST),
+    zipBlockmapPath: `${zipPath}.blockmap`,
+    zipPath,
+  });
+}
+
+function createFinalizationOperationJournal({
+  candidate,
+  dmg,
+  dmgBlockmapFinal,
+  dmgBlockmapPre,
+  manifestFinal,
+  manifestPre,
+  zip,
+  zipBlockmap,
+} = {}) {
+  return Object.freeze({
+    schemaVersion: RECOVERY_SCHEMA,
+    scope: RECOVERY_SCOPE,
+    candidate: operationCandidateBinding(candidate),
+    artifacts: Object.freeze({
+      dmg: cloneArtifactFingerprint(dmg),
+      zip: cloneArtifactFingerprint(zip),
+      zipBlockmap: cloneSidecarFingerprint(zipBlockmap),
+    }),
+    sidecars: Object.freeze({
+      dmgBlockmap: Object.freeze({
+        final: cloneSidecarFingerprint(dmgBlockmapFinal),
+        pre: cloneSidecarFingerprint(dmgBlockmapPre),
+      }),
+      manifest: Object.freeze({
+        final: cloneSidecarFingerprint(manifestFinal),
+        pre: cloneSidecarFingerprint(manifestPre),
+      }),
+    }),
+  });
+}
+
+function validateFinalizationOperationJournal(value, candidate) {
+  if (!hasExactKeys(value, ["schemaVersion", "scope", "candidate", "artifacts", "sidecars"])
+      || value.schemaVersion !== RECOVERY_SCHEMA
+      || value.scope !== RECOVERY_SCOPE
+      || !hasExactKeys(value.artifacts, ["dmg", "zip", "zipBlockmap"])
+      || !validArtifactFingerprint(value.artifacts.dmg)
+      || !validArtifactFingerprint(value.artifacts.zip)
+      || !validSidecarFingerprint(value.artifacts.zipBlockmap, MAX_BLOCKMAP_BYTES)
+      || !hasExactKeys(value.sidecars, ["dmgBlockmap", "manifest"])
+      || !hasExactKeys(value.sidecars.dmgBlockmap, ["final", "pre"])
+      || !hasExactKeys(value.sidecars.manifest, ["final", "pre"])
+      || !validSidecarFingerprint(value.sidecars.dmgBlockmap.final, MAX_BLOCKMAP_BYTES)
+      || !validSidecarFingerprint(value.sidecars.dmgBlockmap.pre, MAX_BLOCKMAP_BYTES)
+      || !validSidecarFingerprint(value.sidecars.manifest.final, MAX_MANIFEST_BYTES)
+      || !validSidecarFingerprint(value.sidecars.manifest.pre, MAX_MANIFEST_BYTES)
+      || !isDeepStrictEqual(value.candidate, operationCandidateBinding(candidate))) {
+    fail("RECOVERY_JOURNAL_INVALID");
+  }
+  return Object.freeze({
+    schemaVersion: RECOVERY_SCHEMA,
+    scope: RECOVERY_SCOPE,
+    candidate: operationCandidateBinding(candidate),
+    artifacts: Object.freeze({
+      dmg: cloneArtifactFingerprint(value.artifacts.dmg),
+      zip: cloneArtifactFingerprint(value.artifacts.zip),
+      zipBlockmap: cloneSidecarFingerprint(value.artifacts.zipBlockmap),
+    }),
+    sidecars: Object.freeze({
+      dmgBlockmap: Object.freeze({
+        final: cloneSidecarFingerprint(value.sidecars.dmgBlockmap.final),
+        pre: cloneSidecarFingerprint(value.sidecars.dmgBlockmap.pre),
+      }),
+      manifest: Object.freeze({
+        final: cloneSidecarFingerprint(value.sidecars.manifest.final),
+        pre: cloneSidecarFingerprint(value.sidecars.manifest.pre),
+      }),
+    }),
+  });
+}
+
+async function readFinalizationOperationJournal(path, candidate) {
+  const raw = await readBoundedRegularFile(path, {
+    code: "RECOVERY_JOURNAL_INVALID",
+    maximumBytes: MAX_RECEIPT_BYTES,
+  });
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.bytes.toString("utf8"));
+  } catch {
+    fail("RECOVERY_JOURNAL_INVALID");
+  }
+  return Object.freeze({
+    bytes: raw.bytes,
+    journal: validateFinalizationOperationJournal(parsed, candidate),
   });
 }
 
@@ -693,57 +871,314 @@ async function preservePreFinalizationSidecars({
   });
 }
 
-async function acquireFinalizationLock(artifactDirectory) {
-  const lockPath = join(artifactDirectory, ".electron-update-metadata-finalization.lock");
-  let handle;
+function createFinalizationLockRecord(candidate) {
+  return Object.freeze({
+    schemaVersion: FINALIZATION_LOCK_SCHEMA,
+    pid: process.pid,
+    candidate: operationCandidateBinding(candidate),
+  });
+}
+
+function createRecoveryClaimRecord(candidate, journalBytes) {
+  return Object.freeze({
+    schemaVersion: RECOVERY_CLAIM_SCHEMA,
+    pid: process.pid,
+    candidate: operationCandidateBinding(candidate),
+    journalSha256: fingerprintBytes(journalBytes).sha256,
+  });
+}
+
+function validateFinalizationLockRecord(value, candidate) {
+  if (!hasExactKeys(value, ["schemaVersion", "pid", "candidate"])
+      || value.schemaVersion !== FINALIZATION_LOCK_SCHEMA
+      || !Number.isSafeInteger(value.pid)
+      || value.pid < 1
+      || !isDeepStrictEqual(value.candidate, operationCandidateBinding(candidate))) {
+    fail("RECOVERY_LOCK_INVALID");
+  }
+  return Object.freeze({
+    schemaVersion: FINALIZATION_LOCK_SCHEMA,
+    pid: value.pid,
+    candidate: operationCandidateBinding(candidate),
+  });
+}
+
+async function acquireRecoveryClaim(artifactDirectory, candidate, journalBytes) {
+  const claimPath = join(artifactDirectory, RECOVERY_CLAIM);
+  const content = Buffer.from(`${JSON.stringify(createRecoveryClaimRecord(candidate, journalBytes))}\n`, "utf8");
+  let handle = null;
+  try {
+    handle = await open(claimPath, "wx", 0o600);
+  } catch {
+    fail("RECOVERY_BUSY");
+  }
+  try {
+    await handle.writeFile(content);
+    await handle.sync();
+  } catch {
+    fail("RECOVERY_CLAIM_WRITE_FAILED");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+  await synchronizeRegularFile(claimPath, {
+    code: "RECOVERY_CLAIM_WRITE_FAILED",
+    maximumBytes: MAX_RECEIPT_BYTES,
+  });
+  await synchronizeDirectory(artifactDirectory, "RECOVERY_CLAIM_WRITE_FAILED");
+  return async () => {
+    const current = await readBoundedRegularFile(claimPath, {
+      code: "RECOVERY_CLAIM_INVALID",
+      maximumBytes: MAX_RECEIPT_BYTES,
+    });
+    if (!current.bytes.equals(content)) fail("RECOVERY_CLAIM_INVALID");
+    try {
+      await unlink(claimPath);
+    } catch {
+      fail("RECOVERY_CLAIM_REMOVE_FAILED");
+    }
+    await synchronizeDirectory(artifactDirectory, "RECOVERY_CLAIM_REMOVE_FAILED");
+  };
+}
+
+async function acquireFinalizationLock(artifactDirectory, candidate, {
+  allowRecoveryClaim = false,
+} = {}) {
+  if (!allowRecoveryClaim) {
+    await assertAbsent(join(artifactDirectory, RECOVERY_CLAIM), "RECOVERY_BUSY");
+  }
+  const lockPath = join(artifactDirectory, FINALIZATION_LOCK);
+  const content = Buffer.from(`${JSON.stringify(createFinalizationLockRecord(candidate))}\n`, "utf8");
+  let handle = null;
   try {
     handle = await open(lockPath, "wx", 0o600);
   } catch {
     fail("FINALIZATION_BUSY");
   }
+  try {
+    await handle.writeFile(content);
+    await handle.sync();
+  } catch {
+    fail("FINALIZATION_LOCK_WRITE_FAILED");
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+  await synchronizeRegularFile(lockPath, {
+    code: "FINALIZATION_LOCK_WRITE_FAILED",
+    maximumBytes: MAX_RECEIPT_BYTES,
+  });
+  await synchronizeDirectory(artifactDirectory, "FINALIZATION_LOCK_WRITE_FAILED");
   return async () => {
+    const current = await readBoundedRegularFile(lockPath, {
+      code: "FINALIZATION_LOCK_INVALID",
+      maximumBytes: MAX_RECEIPT_BYTES,
+    });
+    if (!current.bytes.equals(content)) fail("FINALIZATION_LOCK_INVALID");
     try {
-      await handle.close();
-    } finally {
-      await unlink(lockPath).catch(() => {});
+      await unlink(lockPath);
+    } catch {
+      fail("FINALIZATION_LOCK_REMOVE_FAILED");
     }
+    await synchronizeDirectory(artifactDirectory, "FINALIZATION_LOCK_REMOVE_FAILED");
   };
 }
 
-async function atomicallyReplace(path, temporaryPath, code) {
-  await requiredRegularFile(path, { code, maximumBytes: MAX_BLOCKMAP_BYTES });
-  await synchronizeRegularFile(temporaryPath, { code, maximumBytes: MAX_BLOCKMAP_BYTES });
+async function readFinalizationLock(path, candidate) {
+  const raw = await readBoundedRegularFile(path, {
+    code: "RECOVERY_LOCK_INVALID",
+    maximumBytes: MAX_RECEIPT_BYTES,
+  });
+  let parsed;
+  try {
+    parsed = JSON.parse(raw.bytes.toString("utf8"));
+  } catch {
+    fail("RECOVERY_LOCK_INVALID");
+  }
+  return Object.freeze({
+    bytes: raw.bytes,
+    lock: validateFinalizationLockRecord(parsed, candidate),
+  });
+}
+
+function assertProcessExited(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error?.code === "ESRCH") return;
+    fail("FINALIZATION_BUSY");
+  }
+  fail("FINALIZATION_BUSY");
+}
+
+async function acquireRecoveryFinalizationLock({
+  artifactDirectory,
+  candidate,
+  journalBytes,
+  operationJournalPath,
+} = {}) {
+  try {
+    return await acquireFinalizationLock(artifactDirectory, candidate);
+  } catch (error) {
+    if (error?.code === "ELECTRON_MACOS_METADATA_FINALIZATION_RECOVERY_BUSY") throw error;
+    if (error?.code !== "ELECTRON_MACOS_METADATA_FINALIZATION_FINALIZATION_BUSY") throw error;
+  }
+  const releaseClaim = await acquireRecoveryClaim(artifactDirectory, candidate, journalBytes);
+  try {
+    const lockPath = join(artifactDirectory, FINALIZATION_LOCK);
+    const existingLock = await readFinalizationLock(lockPath, candidate);
+    const currentJournal = await readBoundedRegularFile(operationJournalPath, {
+      code: "RECOVERY_JOURNAL_INVALID",
+      maximumBytes: MAX_RECEIPT_BYTES,
+    });
+    if (!currentJournal.bytes.equals(journalBytes)) fail("RECOVERY_JOURNAL_INVALID");
+    assertProcessExited(existingLock.lock.pid);
+    const unchangedLock = await readBoundedRegularFile(lockPath, {
+      code: "RECOVERY_LOCK_INVALID",
+      maximumBytes: MAX_RECEIPT_BYTES,
+    });
+    if (!unchangedLock.bytes.equals(existingLock.bytes)) fail("RECOVERY_LOCK_INVALID");
+    try {
+      await unlink(lockPath);
+    } catch {
+      fail("RECOVERY_LOCK_REMOVE_FAILED");
+    }
+    await synchronizeDirectory(artifactDirectory, "RECOVERY_LOCK_REMOVE_FAILED");
+    const releaseLock = await acquireFinalizationLock(artifactDirectory, candidate, {
+      allowRecoveryClaim: true,
+    });
+    try {
+      await releaseClaim();
+    } catch (error) {
+      await releaseLock().catch(() => {});
+      throw error;
+    }
+    return releaseLock;
+  } catch (error) {
+    const lockStillPresent = await optionalBoundedRegularFile(
+      join(artifactDirectory, FINALIZATION_LOCK),
+      {
+        code: "RECOVERY_LOCK_INVALID",
+        maximumBytes: MAX_RECEIPT_BYTES,
+      },
+    );
+    if (lockStillPresent !== null) await releaseClaim().catch(() => {});
+    throw error;
+  }
+}
+
+async function atomicallyReplace(path, temporaryPath, code, maximumBytes) {
+  await requiredRegularFile(path, { code, maximumBytes });
+  await synchronizeRegularFile(temporaryPath, { code, maximumBytes });
   try {
     await rename(temporaryPath, path);
   } catch {
     fail(code);
   }
   await synchronizeDirectory(dirname(path), code);
-  await requiredRegularFile(path, { code, maximumBytes: MAX_BLOCKMAP_BYTES });
+  await requiredRegularFile(path, { code, maximumBytes });
 }
 
-async function writeNoClobberReceipt(path, receipt, temporaryDirectory) {
-  const temporaryPath = join(temporaryDirectory, "metadata-receipt.json");
-  const content = Buffer.from(`${JSON.stringify(receipt, null, 2)}\n`, "utf8");
+async function writeNoClobberJson(path, value, temporaryDirectory, {
+  code,
+  existsCode,
+  maximumBytes,
+  temporaryName,
+} = {}) {
+  const temporaryPath = join(temporaryDirectory, temporaryName);
+  const content = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
   try {
     await writeSynchronizedFile(temporaryPath, content, {
-      code: "FINALIZATION_RECEIPT_WRITE_FAILED",
-      maximumBytes: MAX_RECEIPT_BYTES,
+      code,
+      maximumBytes,
       mode: 0o600,
     });
     await link(temporaryPath, path);
-    await synchronizeDirectory(dirname(path), "FINALIZATION_RECEIPT_WRITE_FAILED");
+    await synchronizeDirectory(dirname(path), code);
   } catch (error) {
-    if (error?.code === "EEXIST") fail("FINALIZATION_RECEIPT_EXISTS");
-    fail("FINALIZATION_RECEIPT_WRITE_FAILED");
+    if (error?.code === "EEXIST") fail(existsCode);
+    fail(code);
   } finally {
     await unlink(temporaryPath).catch(() => {});
   }
   const written = await readBoundedRegularFile(path, {
+    code,
+    maximumBytes,
+  });
+  if (!written.bytes.equals(content)) fail(code);
+  return content;
+}
+
+async function writeNoClobberOperationJournal(path, journal, temporaryDirectory) {
+  return writeNoClobberJson(path, journal, temporaryDirectory, {
+    code: "RECOVERY_JOURNAL_WRITE_FAILED",
+    existsCode: "RECOVERY_REQUIRED",
+    maximumBytes: MAX_RECEIPT_BYTES,
+    temporaryName: "metadata-operation.json",
+  });
+}
+
+async function writeNoClobberReceipt(path, receipt, temporaryDirectory) {
+  await writeNoClobberJson(path, receipt, temporaryDirectory, {
     code: "FINALIZATION_RECEIPT_WRITE_FAILED",
+    existsCode: "FINALIZATION_RECEIPT_EXISTS",
+    maximumBytes: MAX_RECEIPT_BYTES,
+    temporaryName: "metadata-receipt.json",
+  });
+}
+
+async function removeVerifiedOperationJournal(path, expectedBytes) {
+  const current = await readBoundedRegularFile(path, {
+    code: "RECOVERY_JOURNAL_INVALID",
     maximumBytes: MAX_RECEIPT_BYTES,
   });
-  if (!written.bytes.equals(content)) fail("FINALIZATION_RECEIPT_WRITE_FAILED");
+  if (!current.bytes.equals(expectedBytes)) fail("RECOVERY_JOURNAL_INVALID");
+  try {
+    await unlink(path);
+  } catch {
+    fail("RECOVERY_JOURNAL_REMOVE_FAILED");
+  }
+  await synchronizeDirectory(dirname(path), "RECOVERY_JOURNAL_REMOVE_FAILED");
+}
+
+async function restorePreFinalizationSidecar({
+  currentBytes,
+  path,
+  preBytes,
+  temporaryPath,
+  code,
+  maximumBytes,
+} = {}) {
+  if (currentBytes.equals(preBytes)) return;
+  await writeSynchronizedFile(temporaryPath, preBytes, {
+    code,
+    maximumBytes,
+    mode: 0o600,
+  });
+  await atomicallyReplace(path, temporaryPath, code, maximumBytes);
+  const restored = await readBoundedRegularFile(path, { code, maximumBytes });
+  if (!restored.bytes.equals(preBytes)) fail(code);
+}
+
+function validCandidateReceiptPath(value) {
+  return typeof value === "string" && value.length > 0 && !value.includes("\0");
+}
+
+function validFinalizationTestOnly(value) {
+  const permitted = new Set([
+    "afterBlockmapGeneration",
+    "afterDmgBlockmapCommit",
+    "afterManifestCommit",
+    "afterMetadataCommit",
+  ]);
+  return isPlainRecord(value)
+    && Reflect.ownKeys(value).every((key) => permitted.has(key)
+      && typeof value[key] === "function");
+}
+
+function validRecoveryTestOnly(value) {
+  return isPlainRecord(value)
+    && Reflect.ownKeys(value).length === 1
+    && Object.hasOwn(value, "afterDmgBlockmapRestore")
+    && typeof value.afterDmgBlockmapRestore === "function";
 }
 
 function createFinalizationReceipt({
@@ -823,19 +1258,10 @@ function createFinalizationReceipt({
 export async function finalizeElectronMacOSUpdateMetadata({
   candidateReceiptPath,
 } = {}, testOnly = undefined) {
-  if (typeof candidateReceiptPath !== "string"
-      || candidateReceiptPath.length === 0
-      || candidateReceiptPath.includes("\0")) {
+  if (!validCandidateReceiptPath(candidateReceiptPath)) {
     fail("ARGUMENT_INVALID");
   }
-  if (testOnly !== undefined
-      && (!isPlainRecord(testOnly)
-        || (testOnly.afterBlockmapGeneration !== undefined
-          && typeof testOnly.afterBlockmapGeneration !== "function")
-        || (testOnly.afterMetadataCommit !== undefined
-          && typeof testOnly.afterMetadataCommit !== "function")
-        || Reflect.ownKeys(testOnly).some((key) => key !== "afterBlockmapGeneration"
-          && key !== "afterMetadataCommit"))) {
+  if (testOnly !== undefined && !validFinalizationTestOnly(testOnly)) {
     fail("ARGUMENT_INVALID");
   }
   const resolvedCandidate = await readCandidateReceipt(candidateReceiptPath);
@@ -843,29 +1269,30 @@ export async function finalizeElectronMacOSUpdateMetadata({
     resolvedCandidate.artifactDirectory,
     "ARTIFACT_DIRECTORY_INVALID",
   );
-  const releaseLock = await acquireFinalizationLock(artifactDirectory);
+  const { candidate } = resolvedCandidate;
+  const releaseLock = await acquireFinalizationLock(artifactDirectory, candidate);
   let temporaryDirectory = null;
   try {
     const dependencies = loadPinnedBuilderDependencies();
     const selectedBuildBlockMap = dependencies.buildBlockMap;
 
-    const { candidate } = resolvedCandidate;
-    const manifestPath = join(artifactDirectory, TRANSPORT_MANIFEST);
+    const paths = finalizationOperationPaths(artifactDirectory, candidate);
+    const {
+      dmgBlockmapPath,
+      dmgPath,
+      finalReceiptPath,
+      manifestPath,
+      operationJournalPath,
+      preFinalizationDmgBlockmapPath,
+      preFinalizationManifestPath,
+      zipBlockmapPath,
+      zipPath,
+    } = paths;
     const legacyManifestPath = join(artifactDirectory, "latest-mac.yml");
-    const dmgPath = join(artifactDirectory, candidate.dmgFile);
-    const zipPath = join(artifactDirectory, candidate.zipFile);
-    const dmgBlockmapPath = `${dmgPath}.blockmap`;
-    const zipBlockmapPath = `${zipPath}.blockmap`;
-    const preFinalizationDirectory = join(artifactDirectory, ...EVIDENCE_DIRECTORY);
-    const preFinalizationManifestPath = join(preFinalizationDirectory, TRANSPORT_MANIFEST);
-    const preFinalizationDmgBlockmapPath = join(
-      preFinalizationDirectory,
-      `${candidate.dmgFile}.blockmap`,
-    );
-    const finalReceiptPath = join(artifactDirectory, FINALIZATION_RECEIPT);
 
     await assertAbsent(legacyManifestPath, "TRANSPORT_MANIFEST_CONFLICT");
     await assertAbsent(finalReceiptPath, "FINALIZATION_RECEIPT_EXISTS");
+    await assertAbsent(operationJournalPath, "RECOVERY_REQUIRED");
     const existingManifest = await readBoundedRegularFile(manifestPath, {
       code: "UPDATER_MANIFEST_INVALID",
       maximumBytes: MAX_MANIFEST_BYTES,
@@ -981,10 +1408,7 @@ export async function finalizeElectronMacOSUpdateMetadata({
     }
     const preFinalization = Object.freeze({
       dmgBlockmap: preFinalizationDmgBlockmap.fingerprint,
-      manifest: Object.freeze({
-        bytes: preFinalizationManifest.bytes.length,
-        sha256: createHash("sha256").update(preFinalizationManifest.bytes).digest("hex"),
-      }),
+      manifest: fingerprintBytes(preFinalizationManifest.bytes),
     });
     const finalManifestText = serializeUpdaterManifest({
       version: candidate.version,
@@ -1000,7 +1424,8 @@ export async function finalizeElectronMacOSUpdateMetadata({
       }),
       releaseDate: preManifest.releaseDate,
     });
-    const parsedFinalManifest = parseUpdaterManifest(Buffer.from(finalManifestText, "utf8"), {
+    const finalManifestBytes = Buffer.from(finalManifestText, "utf8");
+    const parsedFinalManifest = parseUpdaterManifest(finalManifestBytes, {
       expectedDmgFile: candidate.dmgFile,
       expectedVersion: candidate.version,
       expectedZipFile: candidate.zipFile,
@@ -1043,8 +1468,46 @@ export async function finalizeElectronMacOSUpdateMetadata({
       fail("ARTIFACT_CHANGED");
     }
 
-    await atomicallyReplace(dmgBlockmapPath, temporaryDmgBlockmapPath, "BLOCKMAP_WRITE_FAILED");
-    await atomicallyReplace(manifestPath, temporaryManifestPath, "UPDATER_MANIFEST_WRITE_FAILED");
+    const operationJournal = createFinalizationOperationJournal({
+      candidate,
+      dmg: initialDmg,
+      dmgBlockmapFinal: generatedDmgBlockmap.fingerprint,
+      dmgBlockmapPre: preFinalization.dmgBlockmap,
+      manifestFinal: fingerprintBytes(finalManifestBytes),
+      manifestPre: preFinalization.manifest,
+      zip: initialZip,
+      zipBlockmap: zipBlockmap.fingerprint,
+    });
+    await writeNoClobberOperationJournal(operationJournalPath, operationJournal, temporaryDirectory);
+
+    await atomicallyReplace(
+      dmgBlockmapPath,
+      temporaryDmgBlockmapPath,
+      "BLOCKMAP_WRITE_FAILED",
+      MAX_BLOCKMAP_BYTES,
+    );
+    await testOnly?.afterDmgBlockmapCommit?.({
+      artifactDirectory,
+      dmgBlockmapPath,
+      dmgPath,
+      manifestPath,
+      zipBlockmapPath,
+      zipPath,
+    });
+    await atomicallyReplace(
+      manifestPath,
+      temporaryManifestPath,
+      "UPDATER_MANIFEST_WRITE_FAILED",
+      MAX_MANIFEST_BYTES,
+    );
+    await testOnly?.afterManifestCommit?.({
+      artifactDirectory,
+      dmgBlockmapPath,
+      dmgPath,
+      manifestPath,
+      zipBlockmapPath,
+      zipPath,
+    });
     await testOnly?.afterMetadataCommit?.({
       artifactDirectory,
       dmgBlockmapPath,
@@ -1083,7 +1546,7 @@ export async function finalizeElectronMacOSUpdateMetadata({
         || parsedFinalizedManifest.dmg.bytes !== finalDmg.bytes) {
       fail("UPDATER_MANIFEST_INVALID");
     }
-    if (!finalizedManifest.bytes.equals(Buffer.from(finalManifestText, "utf8"))
+    if (!finalizedManifest.bytes.equals(finalManifestBytes)
         || !finalizedDmgBlockmap.raw.equals(generatedDmgBlockmap.raw)
         || !finalizedZipBlockmap.raw.equals(generatedZipBlockmap.raw)) {
       fail("FINALIZATION_OUTPUT_CHANGED");
@@ -1128,23 +1591,238 @@ export async function finalizeElectronMacOSUpdateMetadata({
   }
 }
 
+function matchesRecordedSidecarState(fingerprint, state) {
+  return sameSidecarFingerprint(fingerprint, state.pre)
+    || sameSidecarFingerprint(fingerprint, state.final);
+}
+
+function createRecoveryResult(journal) {
+  return Object.freeze({
+    schemaVersion: RECOVERY_SCHEMA,
+    status: RECOVERY_STATUS,
+    scope: RECOVERY_SCOPE,
+    candidate: journal.candidate,
+    artifacts: journal.artifacts,
+  });
+}
+
+/**
+ * Restore only the exact pre-finalization sidecars recorded by an interrupted
+ * finalization. This is intentionally an explicit local operation: it never
+ * resumes finalization, signs, notarizes, publishes, or accepts unrecorded
+ * artifact or metadata bytes.
+ */
+export async function recoverElectronMacOSPreFinalization({
+  candidateReceiptPath,
+} = {}, testOnly = undefined) {
+  if (!validCandidateReceiptPath(candidateReceiptPath)
+      || (testOnly !== undefined && !validRecoveryTestOnly(testOnly))) {
+    fail("ARGUMENT_INVALID");
+  }
+  const resolvedCandidate = await readCandidateReceipt(candidateReceiptPath);
+  const artifactDirectory = await requiredDirectory(
+    resolvedCandidate.artifactDirectory,
+    "ARTIFACT_DIRECTORY_INVALID",
+  );
+  const { candidate } = resolvedCandidate;
+  const paths = finalizationOperationPaths(artifactDirectory, candidate);
+  const resolvedPreFinalizationDirectory = await requiredDirectory(
+    paths.preFinalizationDirectory,
+    "RECOVERY_JOURNAL_INVALID",
+  );
+  if (resolvedPreFinalizationDirectory !== paths.preFinalizationDirectory) {
+    fail("RECOVERY_JOURNAL_INVALID");
+  }
+  await assertAbsent(paths.finalReceiptPath, "FINALIZATION_RECEIPT_EXISTS");
+  const initialJournal = await readFinalizationOperationJournal(
+    paths.operationJournalPath,
+    candidate,
+  );
+  const releaseLock = await acquireRecoveryFinalizationLock({
+    artifactDirectory,
+    candidate,
+    journalBytes: initialJournal.bytes,
+    operationJournalPath: paths.operationJournalPath,
+  });
+  let temporaryDirectory = null;
+  try {
+    await assertAbsent(paths.finalReceiptPath, "FINALIZATION_RECEIPT_EXISTS");
+    const currentJournal = await readFinalizationOperationJournal(
+      paths.operationJournalPath,
+      candidate,
+    );
+    if (!currentJournal.bytes.equals(initialJournal.bytes)) fail("RECOVERY_JOURNAL_INVALID");
+    const { journal } = currentJournal;
+
+    const initialDmg = await fingerprintRegularFile(paths.dmgPath, {
+      code: "RECOVERY_ARTIFACT_CHANGED",
+      maximumBytes: MAX_ARTIFACT_BYTES,
+    });
+    const initialZip = await fingerprintRegularFile(paths.zipPath, {
+      code: "RECOVERY_ARTIFACT_CHANGED",
+      maximumBytes: MAX_ARTIFACT_BYTES,
+    });
+    if (!sameFingerprint(initialDmg, journal.artifacts.dmg)
+        || !sameFingerprint(initialZip, journal.artifacts.zip)) {
+      fail("RECOVERY_ARTIFACT_CHANGED");
+    }
+    const zipBlockmap = await readBoundedRegularFile(paths.zipBlockmapPath, {
+      code: "RECOVERY_STATE_INVALID",
+      maximumBytes: MAX_BLOCKMAP_BYTES,
+    });
+    if (!sameSidecarFingerprint(fingerprintBytes(zipBlockmap.bytes), journal.artifacts.zipBlockmap)) {
+      fail("RECOVERY_STATE_INVALID");
+    }
+
+    const preManifest = await readBoundedRegularFile(paths.preFinalizationManifestPath, {
+      code: "RECOVERY_STATE_INVALID",
+      maximumBytes: MAX_MANIFEST_BYTES,
+    });
+    const preDmgBlockmap = await readBoundedRegularFile(paths.preFinalizationDmgBlockmapPath, {
+      code: "RECOVERY_STATE_INVALID",
+      maximumBytes: MAX_BLOCKMAP_BYTES,
+    });
+    if (!sameSidecarFingerprint(fingerprintBytes(preManifest.bytes), journal.sidecars.manifest.pre)
+        || !sameSidecarFingerprint(
+          fingerprintBytes(preDmgBlockmap.bytes),
+          journal.sidecars.dmgBlockmap.pre,
+        )) {
+      fail("RECOVERY_STATE_INVALID");
+    }
+
+    const currentManifest = await readBoundedRegularFile(paths.manifestPath, {
+      code: "RECOVERY_STATE_INVALID",
+      maximumBytes: MAX_MANIFEST_BYTES,
+    });
+    const currentDmgBlockmap = await readBoundedRegularFile(paths.dmgBlockmapPath, {
+      code: "RECOVERY_STATE_INVALID",
+      maximumBytes: MAX_BLOCKMAP_BYTES,
+    });
+    if (!matchesRecordedSidecarState(
+      fingerprintBytes(currentManifest.bytes),
+      journal.sidecars.manifest,
+    ) || !matchesRecordedSidecarState(
+      fingerprintBytes(currentDmgBlockmap.bytes),
+      journal.sidecars.dmgBlockmap,
+    )) {
+      fail("RECOVERY_STATE_INVALID");
+    }
+
+    temporaryDirectory = await mkdtemp(join(artifactDirectory, ".electron-update-metadata-recovery-"));
+    await restorePreFinalizationSidecar({
+      currentBytes: currentDmgBlockmap.bytes,
+      path: paths.dmgBlockmapPath,
+      preBytes: preDmgBlockmap.bytes,
+      temporaryPath: join(temporaryDirectory, `${candidate.dmgFile}.blockmap`),
+      code: "RECOVERY_RESTORE_FAILED",
+      maximumBytes: MAX_BLOCKMAP_BYTES,
+    });
+    await testOnly?.afterDmgBlockmapRestore?.({
+      artifactDirectory,
+      dmgBlockmapPath: paths.dmgBlockmapPath,
+      dmgPath: paths.dmgPath,
+      manifestPath: paths.manifestPath,
+      zipBlockmapPath: paths.zipBlockmapPath,
+      zipPath: paths.zipPath,
+    });
+    await restorePreFinalizationSidecar({
+      currentBytes: currentManifest.bytes,
+      path: paths.manifestPath,
+      preBytes: preManifest.bytes,
+      temporaryPath: join(temporaryDirectory, TRANSPORT_MANIFEST),
+      code: "RECOVERY_RESTORE_FAILED",
+      maximumBytes: MAX_MANIFEST_BYTES,
+    });
+
+    const restoredManifest = await readBoundedRegularFile(paths.manifestPath, {
+      code: "RECOVERY_RESTORE_FAILED",
+      maximumBytes: MAX_MANIFEST_BYTES,
+    });
+    const restoredDmgBlockmap = await readBoundedRegularFile(paths.dmgBlockmapPath, {
+      code: "RECOVERY_RESTORE_FAILED",
+      maximumBytes: MAX_BLOCKMAP_BYTES,
+    });
+    const verifiedPreManifest = await readBoundedRegularFile(paths.preFinalizationManifestPath, {
+      code: "RECOVERY_RESTORE_FAILED",
+      maximumBytes: MAX_MANIFEST_BYTES,
+    });
+    const verifiedPreDmgBlockmap = await readBoundedRegularFile(paths.preFinalizationDmgBlockmapPath, {
+      code: "RECOVERY_RESTORE_FAILED",
+      maximumBytes: MAX_BLOCKMAP_BYTES,
+    });
+    const verifiedZipBlockmap = await readBoundedRegularFile(paths.zipBlockmapPath, {
+      code: "RECOVERY_RESTORE_FAILED",
+      maximumBytes: MAX_BLOCKMAP_BYTES,
+    });
+    const finalDmg = await fingerprintRegularFile(paths.dmgPath, {
+      code: "RECOVERY_ARTIFACT_CHANGED",
+      maximumBytes: MAX_ARTIFACT_BYTES,
+    });
+    const finalZip = await fingerprintRegularFile(paths.zipPath, {
+      code: "RECOVERY_ARTIFACT_CHANGED",
+      maximumBytes: MAX_ARTIFACT_BYTES,
+    });
+    if (!restoredManifest.bytes.equals(preManifest.bytes)
+        || !restoredDmgBlockmap.bytes.equals(preDmgBlockmap.bytes)
+        || !sameSidecarFingerprint(
+          fingerprintBytes(verifiedPreManifest.bytes),
+          journal.sidecars.manifest.pre,
+        )
+        || !sameSidecarFingerprint(
+          fingerprintBytes(verifiedPreDmgBlockmap.bytes),
+          journal.sidecars.dmgBlockmap.pre,
+        )
+        || !sameSidecarFingerprint(
+          fingerprintBytes(verifiedZipBlockmap.bytes),
+          journal.artifacts.zipBlockmap,
+        )
+        || !sameFingerprint(finalDmg, journal.artifacts.dmg)
+        || !sameFingerprint(finalZip, journal.artifacts.zip)) {
+      fail("RECOVERY_RESTORE_FAILED");
+    }
+    await assertAbsent(paths.finalReceiptPath, "FINALIZATION_RECEIPT_EXISTS");
+    await removeVerifiedOperationJournal(paths.operationJournalPath, currentJournal.bytes);
+    return createRecoveryResult(journal);
+  } finally {
+    if (temporaryDirectory !== null) {
+      await rm(temporaryDirectory, { recursive: true, force: true }).catch(() => {});
+    }
+    await releaseLock();
+  }
+}
+
 export function parseElectronMacOSMetadataFinalizationArguments(argv) {
   if (!Array.isArray(argv)) fail("ARGUMENT_INVALID");
   if (argv.length !== 2 || argv[0] !== "--candidate-receipt"
-      || typeof argv[1] !== "string"
-      || argv[1].length === 0
-      || argv[1].startsWith("--")
-      || argv[1].includes("\0")) {
+      || !validCandidateReceiptPath(argv[1])
+      || argv[1].startsWith("--")) {
     fail("ARGUMENT_INVALID");
   }
   return Object.freeze({ candidateReceiptPath: argv[1] });
 }
 
+export function parseElectronMacOSMetadataRecoveryArguments(argv) {
+  if (!Array.isArray(argv)
+      || argv.length !== 3
+      || argv[0] !== "--recover-pre-finalization"
+      || argv[1] !== "--candidate-receipt"
+      || !validCandidateReceiptPath(argv[2])
+      || argv[2].startsWith("--")) {
+    fail("ARGUMENT_INVALID");
+  }
+  return Object.freeze({ candidateReceiptPath: argv[2] });
+}
+
 if (process.argv[1] && resolve(process.argv[1]) === SCRIPT_FILE) {
   try {
-    const receipt = await finalizeElectronMacOSUpdateMetadata(
-      parseElectronMacOSMetadataFinalizationArguments(process.argv.slice(2)),
-    );
+    const argv = process.argv.slice(2);
+    const receipt = argv[0] === "--recover-pre-finalization"
+      ? await recoverElectronMacOSPreFinalization(
+        parseElectronMacOSMetadataRecoveryArguments(argv),
+      )
+      : await finalizeElectronMacOSUpdateMetadata(
+        parseElectronMacOSMetadataFinalizationArguments(argv),
+      );
     process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
   } catch (error) {
     process.stderr.write(`${/^ELECTRON_MACOS_METADATA_FINALIZATION_[A-Z_]+$/u.test(error?.code ?? "")

@@ -15,9 +15,10 @@ fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
 The latest four-target successful development build is
-`a3458668af58e46931e2ccd5b90e01d7eb1c4871`. Its unsigned packages passed
-[CI run 34157482667](https://github.com/adamallcock/tibotattle/actions/runs/34157482667),
-including Linux native lock/crash-recovery qualification and the Windows
+`677c5e2bfe987c98a01d44f39ee0d8057361a680`. Its unsigned packages passed
+[CI run 34162180263](https://github.com/adamallcock/tibotattle/actions/runs/34162180263),
+including Linux native lock/crash-recovery and fixed accountless-record
+qualification, the maintained Mac packaging regressions, and the Windows
 protected-child binding lane. The separately approved Mac signing source remains
 `d5dc802575b6b6a0ad0faee26c05fd50778b77e1`, whose four development jobs passed
 [run 34151603489](https://github.com/adamallcock/tibotattle/actions/runs/34151603489).
@@ -340,7 +341,7 @@ eight installer/archive sizes and SHA-256 digests. The private receipt
 `approved-four-mac-installers-verification.json` records the complete approved
 signing stage. No candidate has been installed and no update feed was published.
 The signing-order repair and final-byte updater metadata generation are now
-being incorporated into maintained packaging tooling; those source changes do
+incorporated into maintained packaging tooling; those source changes do
 not alter the four sealed `d5dc8025` candidates.
 
 The maintained metadata finalizer is now integrated at `a0ac852c`. It accepts
@@ -357,6 +358,23 @@ then rehashed those payloads against the untouched sealed originals. That
 real-artifact check found and fixed a mismatch between the planned receipt and
 the native-helper statuses added by actual source staging. Failed pre-fix
 runs and the successful corrected receipts are retained separately.
+
+Commit `a84729bf` adds explicit, journal-bound recovery for interrupted metadata
+replacement. It preserves the exact candidate, payload and pre/final sidecar
+bindings before either replacement, serializes stale-lock recovery, and refuses
+live owners, changed payloads, damaged backups, unrecognized states and already
+completed finalization. Recovery restores the original sidecars and verifies
+them before removing the journal; normal finalization can then run again.
+The integrated metadata/signing/distribution suite passes all 37 tests.
+Pre-journal crashes and unverifiable recovery claims deliberately require
+separate investigation rather than guessed cleanup.
+Fresh disposable mirrors of the real sealed ARM `.1` and Intel `.2` installers
+also pass an actual process-termination rehearsal: kill after the first sidecar
+replacement, observe partial state and normal-retry refusal, run explicit CLI
+recovery, verify exact prior bytes, then complete normal finalization. All four
+copied payload hashes and their sealed originals remained unchanged. The
+private `real-artifact-recovery-verification.json` receipt records this check;
+the completed original installer directories were never recovery targets.
 
 The maintained signing hook is integrated at `040f8c7d` with concurrency and
 dependency-pin checks at `f4acabc7`. The production builder resolves its
@@ -475,8 +493,12 @@ record is observed. A read of an already-normal journal now verifies and
 closes it without creating a new truncate/fsync crash window. The integrated
 adapter/API/architecture checks pass 79 tests; the Linux foundation suite
 passes 111 with two expected native-host skips on macOS. Actual Ubuntu x64
-compilation and native fixed-record qualification are required in the next
-authorized development run. These tests use disposable synthetic credentials;
+compilation and native fixed-record qualification pass in run `34162180263` at
+`677c5e2b`. The retained receipt records synthetic installation-record tests and
+no production credential access. The generic lease test uses actual process
+termination; the accountless abandonment case injects a durable active marker,
+so it does not establish a kill-during-write accountless test. These tests use
+disposable synthetic credentials;
 no production credential or runtime selector was changed.
 All 453 Electron tests also pass with owned companion IPC available. The
 restricted-sandbox run's three companion-startup failures remain retained;
@@ -507,12 +529,12 @@ per-source influence on statistical estimates. An installation credential proves
 continuity and authenticated retries, not a unique person or measurement truth;
 independent reinstallations are not automatically cross-source deduplicated.
 
-The integrated `a3458668` source passes all 450 Electron tests, 111 Linux
+The earlier integrated `a3458668` source passed all 450 Electron tests, 111 Linux
 foundation tests with two expected native-host skips, and architecture checks
 (457 production files, 1,804 imports, no approved debt). The 55 focused
 Linux/runtime/packaging tests also pass with the owned local companion IPC
 available. The earlier restricted-environment failures remain in their separate
-log; no assertion was weakened. The new four-target run is
+log; no assertion was weakened. That earlier four-target run is
 [34157482667](https://github.com/adamallcock/tibotattle/actions/runs/34157482667),
 completed successfully on all four targets with retained unexpired artifacts.
 The Ubuntu qualifier runs the actual native SIGKILL/fresh-runtime/persisted-marker
@@ -524,6 +546,14 @@ in the private durable build directory. Source/version/target metadata and all
 16 listed installer/handoff checksums were independently verified after download.
 These remain unsigned development packages with hosted contributions and
 updating disabled, not installed-production qualification.
+
+The subsequent four-target run `34162180263` also completed successfully at
+`677c5e2b`; all four target packages and handoffs are privately retained, with
+their source/version/target identities, eight primary payload metadata entries
+and all 16 listed checksums independently verified after download. Its Linux
+native receipt adds `syntheticAccountlessInstallationRecordTested: true` while
+retaining `productionSafe: false`. This expands native test evidence without
+activating the backend or claiming physical desktop qualification.
 
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
