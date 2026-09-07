@@ -72,9 +72,14 @@
           tabindex="-1"
           data-settings-tab="about"
         data-i18n="electron.settings.tab.about">About</button>
+        <button class="settings-tab" id="settings-tab-tray" type="button" role="tab" aria-controls="settings-panel-tray" aria-selected="false" tabindex="-1" data-settings-tab="tray" data-i18n="electron.trayCustomization.title">Tray customization</button>
       </nav>
 
       <div class="settings-panels">
+        <section class="settings-panel" id="settings-panel-tray" role="tabpanel" aria-labelledby="settings-tab-tray" data-settings-panel="tray" hidden>
+          <div class="settings-panel-heading"><h2 id="settings-tray-heading" data-i18n="electron.trayCustomization.title">Tray customization</h2><p data-i18n="electron.trayCustomization.description">Choose what appears beside the icon and when you open it.</p></div>
+          <div id="settings-tray-controls"></div>
+        </section>
         <section
           class="settings-panel"
           id="settings-panel-general"

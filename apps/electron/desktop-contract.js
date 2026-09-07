@@ -1,3 +1,4 @@
+import { DESKTOP_TRAY_DEFAULTS, migrateDesktopTrayPreferences, validateDesktopTrayPreferences } from "./desktop-tray-preferences.js";
 import { validateHostedSignInAuthorizeUrl } from "./desktop-hosted-signin.js";
 import { parseCodexThreadURL } from "./loopback-policy.js";
 import {
@@ -21,7 +22,8 @@ import {
 
 export const DESKTOP_BRIDGE_VERSION = "v1";
 export const DESKTOP_IPC_CHANNEL = "tibotattle:desktop:v1";
-export const DESKTOP_SETTINGS_SCHEMA_VERSION = "tibotattle-desktop-settings-v2";
+export const DESKTOP_SETTINGS_SCHEMA_VERSION = "tibotattle-desktop-settings-v3";
+export const DESKTOP_PRE_TRAY_SETTINGS_SCHEMA_VERSION = "tibotattle-desktop-settings-v2";
 export const DESKTOP_LEGACY_SETTINGS_SCHEMA_VERSION = "tibotattle-desktop-settings-v1";
 export const DESKTOP_LEGACY_LAUNCHER_SETTINGS_SCHEMA_VERSION = "usage-monitor-launcher-settings-v1";
 // Internal, non-serialized marker used by the storage adapter to tell the
@@ -77,6 +79,9 @@ export const DESKTOP_ACTIONS = Object.freeze([
   "sharingNoticePresented",
   "getCodexHomesForSettings",
   "openSettings",
+  "openTraySettings",
+  "setTrayPreferences",
+  "restoreTrayDefaults",
   "openCommunity",
   "toggleSidebar",
   "chooseCodexHome",
@@ -114,6 +119,9 @@ const ACTION_ARGUMENT_KEYS = Object.freeze({
   sharingNoticePresented: Object.freeze(["index"]),
   getCodexHomesForSettings: Object.freeze([]),
   openSettings: Object.freeze([]),
+  openTraySettings: Object.freeze([]),
+  setTrayPreferences: Object.freeze(["value"]),
+  restoreTrayDefaults: Object.freeze([]),
   openCommunity: Object.freeze([]),
   toggleSidebar: Object.freeze([]),
   chooseCodexHome: Object.freeze([]),
@@ -158,6 +166,7 @@ export const DESKTOP_DEFAULT_SETTINGS = Object.freeze({
   startAtLogin: false,
   notifications: DEFAULT_NOTIFICATIONS,
   sidebarCollapsed: false,
+  tray: DESKTOP_TRAY_DEFAULTS,
 });
 
 function hasExactKeys(value, expectedKeys) {
@@ -246,6 +255,9 @@ export function validateDesktopRequest(request) {
   const args = assertExactKeys(request.args, expectedKeys, "args");
 
   switch (action) {
+    case "setTrayPreferences":
+      validateDesktopTrayPreferences(args.value);
+      break;
     case "setLanguage":
       assertEnum(args.value, DESKTOP_LANGUAGES, "value");
       break;
@@ -304,7 +316,7 @@ export function validateDesktopRequest(request) {
 
   return Object.freeze({
     action,
-    args: Object.freeze({ ...args }),
+    args: Object.freeze({ ...args, ...(action === "setTrayPreferences" ? { value: validateDesktopTrayPreferences(args.value) } : {}) }),
   });
 }
 
@@ -321,6 +333,7 @@ const SETTINGS_KEYS = Object.freeze([
   "startAtLogin",
   "notifications",
   "sidebarCollapsed",
+  "tray",
 ]);
 
 const LEGACY_SETTINGS_BASE_KEYS = Object.freeze([
@@ -351,15 +364,14 @@ function validateSettingsScalarFields(snapshot) {
 }
 
 /**
- * Validate the exact persisted v2 settings schema.  This does not resolve or
+ * Validate the persisted v3 settings schema with a versioned tray preference.  This does not resolve or
  * inspect paths; path policy belongs to the injected main-process picker and
  * platform validator.  A missing custom path therefore remains valid so its
  * configured root can report partial/LKG coverage after reload.
  */
 export function validateDesktopSettingsSnapshot(snapshot) {
   assertPlainRecord(snapshot, "settings");
-  const preSidebarKeys = SETTINGS_KEYS.slice(0, -1);
-  if (!hasExactKeys(snapshot, SETTINGS_KEYS) && !hasExactKeys(snapshot, preSidebarKeys)) {
+  if (!hasExactKeys(snapshot, SETTINGS_KEYS)) {
     throw new TypeError("settings has unexpected keys");
   }
   if (snapshot.schemaVersion !== DESKTOP_SETTINGS_SCHEMA_VERSION) {
@@ -376,14 +388,14 @@ export function validateDesktopSettingsSnapshot(snapshot) {
     startAtLogin: snapshot.startAtLogin,
     notifications: Object.freeze({ ...snapshot.notifications }),
     sidebarCollapsed,
+    tray: validateDesktopTrayPreferences(snapshot.tray),
   });
 }
 
 /** Validate the generic path-free settings projection returned to a dashboard. */
 export function validateDesktopSettingsProjection(snapshot) {
   assertPlainRecord(snapshot, "settings");
-  const preSidebarKeys = SETTINGS_KEYS.slice(0, -1);
-  if (!hasExactKeys(snapshot, SETTINGS_KEYS) && !hasExactKeys(snapshot, preSidebarKeys)) {
+  if (!hasExactKeys(snapshot, SETTINGS_KEYS)) {
     throw new TypeError("settings has unexpected keys");
   }
   if (snapshot.schemaVersion !== DESKTOP_SETTINGS_SCHEMA_VERSION) {
@@ -400,6 +412,7 @@ export function validateDesktopSettingsProjection(snapshot) {
     startAtLogin: snapshot.startAtLogin,
     notifications: Object.freeze({ ...snapshot.notifications }),
     sidebarCollapsed,
+    tray: validateDesktopTrayPreferences(snapshot.tray),
   });
 }
 
@@ -415,6 +428,7 @@ export function projectDesktopSettingsPathFree(snapshot) {
     startAtLogin: validated.startAtLogin,
     notifications: { ...validated.notifications },
     sidebarCollapsed: validated.sidebarCollapsed,
+    tray: validated.tray,
   });
 }
 
@@ -433,23 +447,30 @@ function isLegacySettingsShape(snapshot) {
   }
   const hasAppearance = Object.hasOwn(snapshot, "appearance");
   const hasSidebarCollapsed = Object.hasOwn(snapshot, "sidebarCollapsed");
+  const hasTray = Object.hasOwn(snapshot, "tray");
+  const hasMenuBar = Object.hasOwn(snapshot, "menuBarDisplayMode");
   const expected = [
     ...LEGACY_SETTINGS_BASE_KEYS,
     ...(hasAppearance ? ["appearance"] : []),
     ...(hasSidebarCollapsed ? ["sidebarCollapsed"] : []),
+    ...(hasTray ? ["tray"] : []),
+    ...(hasMenuBar ? ["menuBarDisplayMode"] : []),
   ];
   return actualKeys.length === expected.length
     && expected.every((key) => Object.hasOwn(snapshot, key));
 }
 
 /**
- * Migrate v1's singleton codexHome record to v2.  `idFactory` is injected by
+ * Migrate v1's singleton codexHome and v2 presentation defaults to v3.  `idFactory` is injected by
  * the main process so IDs are opaque and testable; successful store loading
  * persists the result, making the generated ID stable across later reloads.
  * Both the historic Electron object form and the native launcher's scalar
  * path form are accepted for a bounded compatibility window.
  */
 export function migrateDesktopSettingsSnapshot(snapshot, { idFactory } = {}) {
+  if (isPlainRecord(snapshot) && snapshot.schemaVersion === DESKTOP_PRE_TRAY_SETTINGS_SCHEMA_VERSION) {
+    return validateDesktopSettingsSnapshot({ ...snapshot, schemaVersion: DESKTOP_SETTINGS_SCHEMA_VERSION, sidebarCollapsed: snapshot.sidebarCollapsed ?? false, tray: migrateDesktopTrayPreferences(snapshot.tray) });
+  }
   if (!isLegacySettingsShape(snapshot)) return snapshot;
   const codexHomes = migrateLegacyCodexHome(snapshot.codexHome, { idFactory });
   const appearance = snapshot.appearance === undefined
@@ -475,6 +496,7 @@ export function migrateDesktopSettingsSnapshot(snapshot, { idFactory } = {}) {
       ? { ...DESKTOP_DEFAULT_SETTINGS.notifications }
       : { ...snapshot.notifications },
     sidebarCollapsed,
+    tray: migrateDesktopTrayPreferences(snapshot.tray ?? snapshot.menuBarDisplayMode),
   };
 }
 

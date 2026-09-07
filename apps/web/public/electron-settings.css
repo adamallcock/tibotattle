@@ -795,3 +795,30 @@
     transition: none;
   }
 }
+
+.settings-tray-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.settings-tray-group { display: flex; flex-direction: column; gap: 15px; min-width: 0; }
+.settings-tray-group legend { font-weight: 700; padding: 0 6px; }
+.settings-tray-checkbox { display: flex; align-items: center; gap: 9px; }
+.settings-tray-checkbox input { width: 18px; height: 18px; accent-color: #267466; }
+.settings-tray-section-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.settings-tray-section-row label { flex: 1; }
+.settings-tray-section-row button { padding: 6px 10px; }
+.settings-tray-totals { border: 0; padding: 0; display: grid; gap: 8px; }
+.settings-tray-note { font-size: .9rem; color: var(--muted, #626962); }
+.settings-tray-preview { display: block; margin-top: 20px; }
+.settings-tray-preview-bar { display: flex; align-items: center; gap: 10px; border: 1px solid currentColor; border-radius: 9px; padding: 9px 14px; width: fit-content; min-height: 40px; margin: 15px 0; font-variant-numeric: tabular-nums; }
+.settings-tray-preview-icon { display: inline-flex; align-items: center; gap: 3px; }
+.settings-tray-preview-meters { display: flex; flex-direction: column; gap: 3px; }
+.settings-tray-preview-meter { display: block; width: 18px; height: 5px; border: 1px solid currentColor; border-radius: 2px; }
+.settings-tray-preview-meter > span { display: block; height: 100%; background: currentColor; }
+.settings-tray-preview-meter.is-unknown { border-style: dashed; }
+.settings-tray-preview-bar .is-low { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 3px; }
+.settings-tray-preview-popup { border: 1px solid var(--line, #aaa); border-radius: 14px; max-width: 380px; padding: 18px; }
+.settings-tray-preview-popup section { border-top: 1px solid var(--line, #aaa); padding: 10px 0; }
+.settings-tray-preview-popup h4, .settings-tray-preview-popup p { margin: 5px 0; }
+.settings-tray-preview-popup[data-density="compact"] section { padding: 4px 0; }
+.settings-tray-example-chart { color: #267466; font-size: 24px; letter-spacing: 4px; }
+.settings-tray-actions { display: flex; gap: 10px; margin-top: 16px; }
+.settings-tray-notice { min-height: 1.5em; }
+@media (max-width: 680px) { .settings-tray-grid { grid-template-columns: 1fr; } }

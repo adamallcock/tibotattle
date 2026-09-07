@@ -43,6 +43,14 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "electron-settings.js",
     type: "text/javascript; charset=utf-8",
   }),
+  "/electron-tray-settings.js": Object.freeze({
+    file: "electron-tray-settings.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/electron-tray-preferences.js": Object.freeze({
+    file: "electron-tray-preferences.js",
+    type: "text/javascript; charset=utf-8",
+  }),
   "/electron-settings.css": Object.freeze({
     file: "electron-settings.css",
     type: "text/css; charset=utf-8",

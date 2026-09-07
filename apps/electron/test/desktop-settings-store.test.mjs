@@ -40,8 +40,8 @@ test("settings store uses exact defaults and a dependency-injected backend", asy
   assert.deepEqual(calls, ["load"]);
   const result = await store.setLanguage("es");
   assert.equal(result.language, "es");
-  assert.equal(calls.length, 2);
-  assert.deepEqual(calls[1].save, {
+  assert.equal(calls.length, 3);
+  assert.deepEqual(calls[2].save, {
     ...DESKTOP_DEFAULT_SETTINGS,
     language: "es",
   });
@@ -148,7 +148,7 @@ test("store migrates v1 once and retains the generated root ID", async () => {
   });
   assert.equal((await store.getCodexHomesForSettings()).activityRoots[0].rootId, ROOT_A);
   assert.equal(saves.length, 1);
-  assert.equal(saves[0].schemaVersion, "tibotattle-desktop-settings-v2");
+  assert.equal(saves[0].schemaVersion, "tibotattle-desktop-settings-v3");
   assert.equal(saves[0].codexHomes.activityRoots[0].path, "D:\\Codex");
   assert.equal(store.lastLoadFailed, false);
 });

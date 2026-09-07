@@ -48,6 +48,8 @@ import {
 } from "../apps/electron/desktop-codex-roots.js";
 import {
   DESKTOP_SETTINGS_SCHEMA_VERSION,
+  DESKTOP_DEFAULT_SETTINGS,
+  validateDesktopSettingsSnapshot,
 } from "../apps/electron/desktop-contract.js";
 import { loadOrCreateParticipantSecret } from "../src/export-identity.js";
 
@@ -441,6 +443,7 @@ export function assertMacSyntheticFixtureSettings(
       || typeof secondaryPath !== "string") {
     throw new TypeError("macOS synthetic settings are invalid");
   }
+  validateDesktopSettingsSnapshot(value);
   const expected = macSmokeCodexHomes(primaryPath, secondaryPath);
   const actual = value.codexHomes;
   const exactRoots = isMacPathfulCodexHomes(actual)
@@ -629,6 +632,7 @@ export async function createSyntheticFixture() {
       startAtLogin: false,
       notifications: { enabled: false, threshold: "off" },
       sidebarCollapsed: false,
+      tray: DESKTOP_DEFAULT_SETTINGS.tray,
     };
     await writeFile(
       settingsPath,

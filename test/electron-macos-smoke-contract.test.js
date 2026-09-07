@@ -345,7 +345,7 @@ test("macOS synthetic fixture exposes only a bounded refresh interval read", asy
     await writeFile(
       fixture.settingsPath,
       `${JSON.stringify({
-        schemaVersion: "tibotattle-desktop-settings-v2",
+        schemaVersion: "tibotattle-desktop-settings-v3",
         refreshIntervalSeconds: 900,
       })}\n`,
       { mode: 0o600 },
@@ -357,7 +357,7 @@ test("macOS synthetic fixture exposes only a bounded refresh interval read", asy
     await writeFile(
       fixture.settingsPath,
       `${JSON.stringify({
-        schemaVersion: "tibotattle-desktop-settings-v2",
+        schemaVersion: "tibotattle-desktop-settings-v3",
         refreshIntervalSeconds: 42,
       })}\n`,
       { mode: 0o600 },

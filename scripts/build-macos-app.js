@@ -266,6 +266,8 @@ export const MACOS_WEB_MODULE_ENTRYPOINTS = Object.freeze([
   "apps/web/public/desktop-shell.js",
   "apps/web/public/electron-tray-popup.js",
   "apps/web/public/electron-settings.js",
+  "apps/web/public/electron-tray-settings.js",
+  "apps/web/public/electron-tray-preferences.js",
 ]);
 
 export const MACOS_RUNTIME_STATIC_ASSETS = Object.freeze([

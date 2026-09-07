@@ -54,6 +54,8 @@ export function createDesktopTrayTemplate({
   appName = "TiboTattle",
   actions = createDesktopActionInterface(),
   trayStatus,
+  trayPreferences,
+  onCustomize,
   statusLabel,
   locale = "system",
   systemLocales = defaultSystemLocales(),
@@ -82,6 +84,7 @@ export function createDesktopTrayTemplate({
       {
         localize: (key, values) => desktopText(key, values, textOptions),
         now,
+        ...(trayPreferences === undefined ? {} : { preferences: trayPreferences, locale }),
       },
     );
   } else if (statusLabel !== undefined) {
@@ -108,6 +111,7 @@ export function createDesktopTrayTemplate({
       {
         localize: (key, values) => desktopText(key, values, textOptions),
         now,
+        ...(trayPreferences === undefined ? {} : { preferences: trayPreferences, locale }),
       },
     );
   }
@@ -146,9 +150,9 @@ export function createDesktopTrayTemplate({
   // on Windows/Linux where sublabel is not a supported native presentation.
   const template = [
     {
-      label: desktopText("electron.tray.allowanceTitle", {
+      label: projectedStatus.selectionLabel ? `${appName} · ${projectedStatus.selectionLabel}` : desktopText("electron.tray.allowanceTitle", {
         appName,
-        allowance: projectedStatus.compactTitle,
+        allowance: projectedStatus.selectionLabel ?? projectedStatus.compactTitle,
       }, textOptions),
       enabled: false,
       ...(macOS ? { sublabel: headerSubLabel } : {}),
@@ -209,6 +213,10 @@ export function createDesktopTrayTemplate({
       accelerator: "CmdOrCtrl+Q",
     },
   );
+  if (typeof onCustomize === "function") {
+    const index = template.findIndex((entry) => entry.accelerator === "CmdOrCtrl+,");
+    template.splice(index, 0, { label: desktopText("electron.tray.customize", {}, textOptions), click: onCustomize });
+  }
   if (projectedStatus.status === "stale") {
     const settingsIndex = template.findIndex((entry) => entry.accelerator === "CmdOrCtrl+,");
     template.splice(settingsIndex, 0, {
@@ -507,7 +515,11 @@ function paintCircle(bitmap, centerX, centerY, radius, alpha) {
   );
 }
 
-function trayGlyphDescriptor(trayStatus) {
+function trayGlyphDescriptor(trayStatus, options = {}) {
+  if (trayStatus !== undefined && options.preferences !== undefined) {
+    const projected = projectDesktopTrayStatus(trayStatus, options);
+    return { kind: projected.status, birdAlpha: 1, iconMode: projected.iconMode, meters: projected.meters };
+  }
   if (trayStatus === undefined) return { kind: "unavailable", birdAlpha: 0.42 };
   let status;
   try {
@@ -528,13 +540,28 @@ function trayGlyphDescriptor(trayStatus) {
 }
 
 function trayGlyphKey(descriptor) {
+  if (descriptor.meters) return JSON.stringify(descriptor);
   return descriptor.kind === "live"
     ? `live:${Object.is(descriptor.remainingPercent, -0) ? 0 : descriptor.remainingPercent}`
     : descriptor.kind;
 }
 
-function drawNativeTrayMeter(bitmap, descriptor) {
-  const rect = scaledNativeRect(NATIVE_TRAY_METER_RECT);
+function drawNativeTrayMeter(bitmap, descriptor, meterRect = NATIVE_TRAY_METER_RECT) {
+  if (descriptor.meters) {
+    if (descriptor.iconMode === "app") {
+      if (["starting", "analyzing", "stale", "unavailable"].includes(descriptor.kind)) paintCircle(bitmap, 56, 56, 5, 1);
+      else if (descriptor.meters.some((meter) => meter.low)) paintRoundedOutline(bitmap, { x: 50, y: 50, width: 12, height: 12 }, 3, 1);
+      return;
+    }
+    const dual = descriptor.iconMode === "dual-meter";
+    descriptor.meters.forEach((meter, index) => {
+      const rect = dual ? { x: 1.5, y: index === 0 ? 13 : 0.25, width: 13, height: 2.5 } : NATIVE_TRAY_METER_RECT;
+      drawNativeTrayMeter(bitmap, { kind: meter.remainingPercent === null ? "unavailable" : "live", remainingPercent: meter.remainingPercent }, rect);
+      if (meter.low) paintRoundedOutline(bitmap, scaledNativeRect(rect), 0.5 * TRAY_TEMPLATE_DRAW_SCALE, 1);
+    });
+    return;
+  }
+  const rect = scaledNativeRect(meterRect);
   const radius = rect.height / 2;
   if (descriptor.kind === "live") {
     paintRoundedRect(bitmap, rect, radius, 0.24);
@@ -573,7 +600,8 @@ function composeNativeTrayGlyph(baseSource, descriptor) {
   if (baseSource === null
       || typeof baseSource !== "object"
       || typeof baseSource.resize !== "function") return null;
-  const birdRect = scaledNativeRect(NATIVE_TRAY_BIRD_RECT);
+  const birdRect = scaledNativeRect(descriptor.iconMode === "dual-meter"
+    ? { x: 3, y: 3.5, width: 10, height: 9 } : NATIVE_TRAY_BIRD_RECT);
   let bird;
   try {
     bird = baseSource.resize({
@@ -612,12 +640,22 @@ function composeNativeTrayGlyph(baseSource, descriptor) {
   return output;
 }
 
-function dynamicTemplateImage(nativeImage, baseSource, descriptor) {
+function dynamicTemplateImage(nativeImage, baseSource, descriptor, platform) {
   const bitmap = composeNativeTrayGlyph(baseSource, descriptor);
   if (bitmap === null) return null;
+  if (platform !== "darwin") {
+    // A dark backing keeps the white glyph and meters readable on both light
+    // and dark system trays that do not support template-image recoloring.
+    for (let offset = 0; offset < bitmap.length; offset += 4) {
+      const alpha = bitmap[offset + 3] / 255;
+      for (let channel = 0; channel < 3; channel++) bitmap[offset + channel] = Math.round(36 + 219 * alpha);
+      bitmap[offset + 3] = 255;
+    }
+  }
   const source = templateSourceFromBitmap(nativeImage, bitmap);
   if (source === null) return null;
-  return markTemplateImage(finalizeTemplateSource(nativeImage, source));
+  const image = finalizeTemplateSource(nativeImage, source);
+  return platform === "darwin" ? markTemplateImage(image) : image;
 }
 
 function desktopTrayAsset({ nativeImage, resourceRoot, platform, icon }) {
@@ -645,8 +683,7 @@ function desktopTrayAsset({ nativeImage, resourceRoot, platform, icon }) {
   // Electron/nativeImage implementations still fail soft to the unprocessed
   // asset rather than losing the status item entirely.
   let workingSource = source;
-  if (platform === "darwin"
-      && typeof source.getSize === "function"
+  if (typeof source.getSize === "function"
       && typeof source.crop === "function") {
     try {
       const size = source.getSize();
@@ -673,7 +710,7 @@ function desktopTrayAsset({ nativeImage, resourceRoot, platform, icon }) {
 
   let resized;
   try {
-    const size = platform === "darwin" ? TRAY_TEMPLATE_WORK_SIZE : TRAY_ICON_SIZE;
+    const size = TRAY_TEMPLATE_WORK_SIZE;
     resized = workingSource.resize({
       width: size,
       height: size,
@@ -683,7 +720,6 @@ function desktopTrayAsset({ nativeImage, resourceRoot, platform, icon }) {
     return { baseSource: null, fallback: undefined };
   }
   if (!isNonEmptyNativeImage(resized)) return { baseSource: null, fallback: undefined };
-  if (platform !== "darwin") return { baseSource: null, fallback: resized };
 
   let baseSource = null;
   if (typeof resized.toBitmap === "function") {
@@ -722,7 +758,7 @@ export function createDesktopTrayIconFactory(options = {}) {
     if (!fallbackResolved) {
       fallbackResolved = true;
       if (platform !== "darwin") {
-        fallback = asset.fallback;
+        fallback = resizeTemplate(asset.fallback) ?? asset.fallback;
       } else {
         fallback = asset.baseSource === null
           ? markTemplateImage(asset.fallback)
@@ -733,12 +769,12 @@ export function createDesktopTrayIconFactory(options = {}) {
     return fallback;
   }
 
-  function resolve(trayStatus) {
-    if (platform !== "darwin" || asset.baseSource === null) return resolveFallback();
-    const descriptor = trayGlyphDescriptor(trayStatus);
+  function resolve(trayStatus, projectionOptions = {}) {
+    if (asset.baseSource === null || (platform !== "darwin" && projectionOptions.preferences === undefined)) return resolveFallback();
+    const descriptor = trayGlyphDescriptor(trayStatus, projectionOptions);
     const key = trayGlyphKey(descriptor);
     if (key === lastKey) return lastIcon;
-    const next = dynamicTemplateImage(nativeImage, asset.baseSource, descriptor)
+    const next = dynamicTemplateImage(nativeImage, asset.baseSource, descriptor, platform)
       ?? resolveFallback();
     lastKey = key;
     lastIcon = next;

@@ -1,3 +1,4 @@
+import { DESKTOP_TRAY_UPGRADE_DEFAULTS, validateDesktopTrayPreferences } from "./desktop-tray-preferences.js";
 import { dirname, resolve } from "node:path";
 import { existsSync } from "node:fs";
 
@@ -54,6 +55,7 @@ const SETTINGS_SECTIONS = Object.freeze([
   "general",
   "data",
   "notifications",
+  "tray",
   "about",
 ]);
 
@@ -90,6 +92,9 @@ export function createDesktopLifecycle({
   appName = "TiboTattle",
   platform = process.platform,
   desktopLocale = "system",
+  initialTrayPreferences = DESKTOP_TRAY_UPGRADE_DEFAULTS,
+  onTrayHistoryRange,
+  trayClock = () => Date.now(),
   desktopSystemLocales,
   desktopActions = {},
   settingsWindowOptions = {},
@@ -223,13 +228,22 @@ export function createDesktopLifecycle({
     return left.status === right.status
       && sameAllowance(left.allowance, right.allowance)
       && left.notificationEvidence?.continuityKey === right.notificationEvidence?.continuityKey
-      && left.notificationEvidence?.observedAt === right.notificationEvidence?.observedAt;
+      && left.notificationEvidence?.observedAt === right.notificationEvidence?.observedAt
+      && JSON.stringify(left.displayEvidence) === JSON.stringify(right.displayEvidence);
+  }
+
+  let trayPreferences = validateDesktopTrayPreferences(initialTrayPreferences);
+  let trayMinuteTimer = null;
+  const lowAllowanceState = {};
+
+  function projectConfiguredTray() {
+    return desktopTrayStatusReducer.project({ preferences: trayPreferences, lowState: lowAllowanceState, now: trayClock(), locale: activeDesktopLocale });
   }
 
   function resolveTrayIcon() {
     if (typeof createTrayIcon !== "function") return icon;
     try {
-      const resolved = createTrayIcon(desktopTrayStatus);
+      const resolved = createTrayIcon(desktopTrayStatus, { preferences: trayPreferences, lowState: lowAllowanceState, now: trayClock() });
       return resolved === undefined ? icon : resolved;
     } catch {
       // A tray image is presentation-only. Keep the last trusted fallback
@@ -239,7 +253,7 @@ export function createDesktopLifecycle({
   }
 
   function refreshTrayImage() {
-    if (platform !== "darwin" || tray === null || typeof tray.setImage !== "function") {
+    if (tray === null || typeof tray.setImage !== "function") {
       return false;
     }
     const next = resolveTrayIcon();
@@ -277,6 +291,7 @@ export function createDesktopLifecycle({
           type: validated.state,
           allowance: validated.allowance,
           notificationEvidence: validated.notificationEvidence,
+          ...(validated.displayEvidence ? { displayEvidence: validated.displayEvidence } : {}),
         }
         : { type: validated.state };
       dispatchDesktopTrayEvent(event);
@@ -664,6 +679,8 @@ export function createDesktopLifecycle({
     return createDesktopTrayPopoverModel({
       appName,
       trayStatus: desktopTrayStatus,
+      trayPreferences,
+      now: trayClock(),
       locale: activeDesktopLocale,
       systemLocales: desktopSystemLocales,
     });
@@ -672,11 +689,16 @@ export function createDesktopLifecycle({
   function invokeTrayPopoverAction(action) {
     const actions = getDesktopActionInterface();
     let selected = null;
+    if (action === "history-7d" || action === "history-30d") {
+      if (typeof onTrayHistoryRange !== "function") return Promise.reject(new Error("Tray history persistence unavailable"));
+      return onTrayHistoryRange(action.slice(8));
+    }
     if (action === "open") selected = actions.show;
     else if (action === "weekly") selected = actions.weekly;
     else if (action === "timeline") selected = actions.timeline;
-    else if (action === "accounting") selected = actions.accounting;
+    else if (action === "accounting" || action === "usage") selected = actions.accounting;
     else if (action === "settings") selected = actions.settings;
+    else if (action === "customize") selected = () => showSettingsWindow("tray");
     else if (action === "more") selected = showTrayContextMenu;
     else if (action === "quit") selected = actions.quit;
     else if (action === "refresh") {
@@ -1171,18 +1193,24 @@ export function createDesktopLifecycle({
     const initialIcon = resolveTrayIcon();
     if (initialIcon === undefined) throw shellError("electron_configuration_invalid");
     tray = new Tray(initialIcon);
+    trayMinuteTimer = setInterval(() => { if (!quitting && tray) refreshDesktopSurfaces(); }, 60_000);
+    trayMinuteTimer.unref?.();
     trayImage = initialIcon;
     tray.setToolTip?.(appName);
     const template = createDesktopTrayTemplate({
       appName,
       actions: getDesktopActionInterface(),
+      onCustomize: () => showSettingsWindow("tray"),
       trayStatus: desktopTrayStatus,
+      trayPreferences,
+      now: trayClock(),
       locale: activeDesktopLocale,
       systemLocales: desktopSystemLocales,
     });
     updateTrayContextMenu(template);
-    const projected = desktopTrayStatusReducer.project();
+    const projected = projectConfiguredTray();
     tray.setTitle?.(platform === "darwin" ? projected.compactTitle : "");
+    tray.setToolTip?.([appName, projected.label, projected.selectionLabel, projected.evidenceLabel].filter(Boolean).join(" · "));
     tray.on?.("click", (event, bounds) => {
       if (usesExplicitTrayContextMenu() && event?.ctrlKey === true) {
         showTrayContextMenu();
@@ -1229,15 +1257,26 @@ export function createDesktopLifecycle({
       const template = createDesktopTrayTemplate({
         appName,
         actions: getDesktopActionInterface(),
+        onCustomize: () => showSettingsWindow("tray"),
         trayStatus: desktopTrayStatus,
+      trayPreferences,
+      now: trayClock(),
         locale: activeDesktopLocale,
         systemLocales: desktopSystemLocales,
       });
       updateTrayContextMenu(template);
-      const projected = desktopTrayStatusReducer.project();
+      const projected = projectConfiguredTray();
       tray.setTitle?.(platform === "darwin" ? projected.compactTitle : "");
+    tray.setToolTip?.([appName, projected.label, projected.selectionLabel, projected.evidenceLabel].filter(Boolean).join(" · "));
       trayPopover?.setModel(currentTrayPopoverModel());
     }
+  }
+
+  function setDesktopTrayPreferences(value) {
+    trayPreferences = validateDesktopTrayPreferences(value);
+    for (const key of Object.keys(lowAllowanceState)) delete lowAllowanceState[key];
+    if (started && !quitting) refreshDesktopSurfaces();
+    return true;
   }
 
   function setDesktopLanguage(value) {
@@ -1562,6 +1601,8 @@ export function createDesktopLifecycle({
   async function requestQuit() {
     if (shutdownPromise !== null) return shutdownPromise;
     quitting = true;
+    clearInterval(trayMinuteTimer);
+    trayMinuteTimer = null;
     ++lifecycleEpoch;
     stopDesktopStatusMonitor();
     const pendingStartup = startupAttemptPromise;
@@ -1588,6 +1629,8 @@ export function createDesktopLifecycle({
 
   async function dispose() {
     quitting = true;
+    clearInterval(trayMinuteTimer);
+    trayMinuteTimer = null;
     updatePreparing = true;
     ++lifecycleEpoch;
     stopDesktopStatusMonitor();
@@ -1623,6 +1666,7 @@ export function createDesktopLifecycle({
     sendDashboardCommand,
     navigateDashboardSection,
     setDesktopLanguage,
+    setDesktopTrayPreferences,
     invokeTrayCommand,
     prepareForUpdate,
     cancelUpdatePreparation,

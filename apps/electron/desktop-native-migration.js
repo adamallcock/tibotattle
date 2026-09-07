@@ -1,3 +1,4 @@
+import { DESKTOP_TRAY_UPGRADE_DEFAULTS, validateDesktopTrayPreferences } from "./desktop-tray-preferences.js";
 import { createHash, randomUUID } from "node:crypto";
 import { constants as fileSystemConstants } from "node:fs";
 import * as nodeFs from "node:fs/promises";
@@ -616,6 +617,7 @@ async function stageSettings({ stageSettingsRoot, sourceStateRoot, preferences }
     schemaVersion: NATIVE_LAUNCHER_SETTINGS_SCHEMA,
     codexHome: null,
   };
+  const nativeTray = await readPrivateJson(join(sourceStateRoot, "tray-preferences-v1.json"), { missing: true });
   let snapshot;
   try {
     snapshot = source === null
@@ -623,6 +625,7 @@ async function stageSettings({ stageSettingsRoot, sourceStateRoot, preferences }
       : migrateDesktopSettingsSnapshot(legacy);
     snapshot = validateDesktopSettingsSnapshot({
       ...snapshot,
+      tray: nativeTray === null ? DESKTOP_TRAY_UPGRADE_DEFAULTS : validateDesktopTrayPreferences(nativeTray),
       language: preferences.language,
       appearance: preferences.appearance,
       refreshIntervalSeconds: preferences.refreshIntervalSeconds,

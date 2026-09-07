@@ -1404,6 +1404,41 @@ function cacheSwitchImpactProjection(
   };
 }
 
+/** A bounded display projection of the dashboard's existing reuse denominator.
+ * Its parent accounting projection owns generation, scope and retained authority.
+ * Opening or configuring a tray must never trigger a separate cache analysis.
+ */
+export function projectTrayCacheSummary(impact) {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0;
+  return {
+    schemaVersion: 1,
+    periods: ["7d", "30d"].map((periodId) => {
+      const unavailable = {
+        periodId, status: "unavailable", comparableReturns: null,
+        reusedMoreThanHalfReturns: null, reusePercent: null,
+        coverageStatus: "unavailable",
+      };
+      if (impact?.status !== "available" || !Array.isArray(impact.periods)
+          || impact.periods.length > 8) return unavailable;
+      const matches = impact.periods.filter((row) => row?.periodId === periodId);
+      if (matches.length !== 1) return unavailable;
+      const row = matches[0];
+      if (![row.comparableReturns, row.reusedMoreThanHalfReturns,
+        row.reusedHalfOrLessReturns].every(count)
+          || row.reusedMoreThanHalfReturns + row.reusedHalfOrLessReturns
+            !== row.comparableReturns
+          || !["complete", "incomplete"].includes(row.coverageStatus)) return unavailable;
+      return {
+        periodId, status: "available", comparableReturns: row.comparableReturns,
+        reusedMoreThanHalfReturns: row.reusedMoreThanHalfReturns,
+        reusePercent: row.comparableReturns === 0 ? null
+          : row.reusedMoreThanHalfReturns / row.comparableReturns * 100,
+        coverageStatus: row.coverageStatus,
+      };
+    }),
+  };
+}
+
 function cacheContinuityImpactProjection(
   impact,
   selectedPeriodId,
@@ -3392,6 +3427,7 @@ export async function buildLocalCompanionSnapshot({
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
         cacheSwitchImpact,
         cacheContinuityImpact,
+        trayCacheSummary: projectTrayCacheSummary(cacheContinuityImpact),
         ...(includeDevelopmentSideChatEstimates
           ? { sideChatEstimates }
           : {}),

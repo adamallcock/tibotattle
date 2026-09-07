@@ -140,7 +140,7 @@ is never an arbitrary local proxy.
 | Method | Path | Caller | Authority | Storage or network effect | Owner |
 | --- | --- | --- | --- | --- | --- |
 | `GET` | `/api/local/health` | Dashboard/native shell | Loopback read | Reports companion/snapshot readiness and enabled local capabilities. | Local companion |
-| `GET` | `/api/local/desktop-status` | Electron shell | Loopback read | Projects closed lifecycle, a current direct display allowance from bounded published-overview metadata, and receipt-only strict v2 notification evidence; no account identifiers or filesystem paths. Available before the first snapshot. | Local companion |
+| `GET` | `/api/local/desktop-status` | Electron shell | Loopback read | Projects closed lifecycle, schema-v2 current display lanes with observation/reset times from bounded published-overview metadata, and receipt-only strict v2 notification evidence; no account identifiers or filesystem paths. Available before the first snapshot. | Local companion |
 | `GET` | `/api/local/diagnostics/contribution` | Dashboard/native shell | Loopback read | Reads a content-free local support projection. | Diagnostics |
 | `POST` | `/api/local/diagnostics/note` | Native shell | Loopback mutation | Records a bounded, fixed-vocabulary diagnostic reference; no prompt or path content. | Diagnostics |
 | `GET`, `POST` | `/api/local/identity/hosted-signin-handoff` | Dashboard/native shell | Loopback mutation | Inspects, stores, or clears the bounded local OAuth restart handle. | Hosted identity |
@@ -166,6 +166,14 @@ is never an arbitrary local proxy.
 | `POST` | `/api/local/contribution/incremental-review-v11` | Dashboard | Loopback mutation | Capability-gated v1.1 field/sample review with a one-use token bound to the published index, consent triple and destination. Does not upload or grant hosted consent. | Contribution consent |
 | `POST` | `/api/local/contribution/incremental-approve` | Dashboard | Loopback mutation | Records current consent after exact local review and schedules the first due pass. | Contribution sync |
 | `POST` | `/api/local/contribution/incremental-run` | Dashboard | Loopback mutation | Resets bounded retry backoff and asks the consent-gated controller to run now. | Contribution sync |
+
+The overview includes `accounting.trayCacheSummary` (schema version 1): exactly
+one `7d` and one `30d` entry with availability, comparable follow-up count,
+follow-ups reusing more than half, reuse percentage and coverage status. It is a
+bounded projection of the existing cache-continuity calculation. A zero
+comparable count has a null percentage; unavailable evidence has null counts.
+Consumers retain the parent accounting scope and freshness. This adds no
+collection, transcript access or independent retention authority.
 
 ## Fixed report pages
 

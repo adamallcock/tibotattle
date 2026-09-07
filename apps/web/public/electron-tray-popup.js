@@ -27,13 +27,15 @@ import {
   USER_TIME_ZONE,
 } from "./ui-format.js";
 
+import { normalizeTrayPreferences } from "./electron-tray-preferences.js";
+
 export const TRAY_POPUP_SCHEMA_VERSION = "electron-tray-popup-v1";
 const PRODUCT_APP_NAME = "TiboTattle";
 export const TRAY_POPUP_HISTORY_RANGES = Object.freeze({
   "7d": 7,
   "30d": 30,
 });
-export const TRAY_POPUP_ACTIONS = Object.freeze(["open", "refresh", "more"]);
+export const TRAY_POPUP_ACTIONS = Object.freeze(["open", "refresh", "more", "customize", "usage"]);
 
 const MAX_TIMELINE_ROWS = 3_000;
 const MAX_HISTORY_DAYS = 30;
@@ -944,6 +946,7 @@ export function createTrayPopupProjection(data = {}, {
       ),
     }),
     history: buildHistory(data, selectedRange, nowMs, selectedTimeZone, accountingState),
+    cacheSummary: accountingState === "unavailable" ? null : (data?.accounting?.trayCacheSummary?.periods ?? []).find((row) => row.periodId === selectedRange) ?? null,
   });
 }
 
@@ -1072,13 +1075,28 @@ function allowanceUnavailableCopy(freshness, t) {
   return t("electron.trayPopover.staleTitle");
 }
 
-function renderAllowances(documentRef, projection, t, numberFormatter) {
+function renderAllowances(documentRef, projection, t, numberFormatter, preferences, localFormatter) {
   const list = documentRef.getElementById("allowance-lanes");
   if (!list) return;
   list.replaceChildren();
-  for (const allowance of projection.allowances) {
+  for (const duration of NORMAL_CODEX_ALLOWANCE_DURATIONS) {
+    const allowance = projection.allowances.find((item) => item.durationMinutes === duration);
+    if (!allowance) {
+      const missing = documentRef.createElement("article");
+      missing.className = "electron-tray-popup-allowance";
+      const labelKey = duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
+        ? "dashboard.quota.windowFiveHour" : "dashboard.quota.windowSevenDay";
+      const heading = textNode(documentRef, `${t(labelKey)} —`);
+      heading.className = "electron-tray-popup-allowance-title";
+      const detail = textNode(documentRef, allowanceUnavailableCopy(projection.freshness, t));
+      detail.className = "electron-tray-popup-muted";
+      missing.append(heading, detail);
+      list.append(missing);
+      continue;
+    }
     const article = documentRef.createElement("article");
     article.className = "electron-tray-popup-allowance";
+    if (preferences.emphasizeLow && allowance.remainingPercent <= 10) article.className += " is-low";
     const heading = documentRef.createElement("div");
     heading.className = "electron-tray-popup-allowance-heading";
     const title = textNode(documentRef, t(allowance.labelKey));
@@ -1100,14 +1118,15 @@ function renderAllowances(documentRef, projection, t, numberFormatter) {
     fill.className = "electron-tray-popup-progress-fill";
     fill.style.width = `${allowance.remainingPercent}%`;
     track.append(fill);
-    const detail = textNode(documentRef, t("electron.trayPopover.resets", {
-      time: resetCountdown(allowance.resetInSeconds, t, numberFormatter),
-    }));
+    const detail = textNode(documentRef, preferences.resetFormat === "clock"
+      ? t("electron.trayCustomization.resetAt", { time: localFormatter(allowance.resetAt) })
+      : t("electron.trayPopover.resets", { time: resetCountdown(allowance.resetInSeconds, t, numberFormatter) }));
     detail.className = "electron-tray-popup-muted electron-tray-popup-allowance-detail";
+    detail.title = localFormatter(allowance.resetAt);
     article.append(heading, detail, track);
     list.append(article);
   }
-  setHidden(documentRef, "allowance-unavailable", projection.allowances.length > 0);
+  setHidden(documentRef, "allowance-unavailable", true);
   if (projection.allowances.length === 0) {
     setElementText(
       documentRef,
@@ -1320,6 +1339,43 @@ function mainTrayPresentation(model) {
  * Render the popup with DOM APIs only. The renderer accepts injected formatters
  * so its closed projection and sparse/error states remain easy to test.
  */
+/** Applies saved composition after evidence rendering; controls stay outside it. */
+export function applyTrayPopupPreferences(documentRef, projection, preferences, t = defaultText, numberFormatter = formatNumber) {
+  const root = documentRef.getElementById("tray-popup");
+  if (root) root.dataset.density = preferences.density;
+  const sectionIds = { allowances: "allowances-section", pace: "pace-section", usage: "usage-section", cache: "cache-section" };
+  for (const [key, id] of Object.entries(sectionIds)) {
+    const section = documentRef.getElementById(id);
+    if (!section) continue;
+    // Pace's existing evidence gate still controls whether it has a visible card.
+    if (key !== "pace" || !preferences.sections.includes(key)) section.hidden = !preferences.sections.includes(key);
+    section.style.order = String(preferences.sections.indexOf(key));
+  }
+  const container = documentRef.getElementById("tray-popup-sections");
+  if (container?.insertBefore) {
+    const order = [...preferences.sections, ...Object.keys(sectionIds).filter((key) => !preferences.sections.includes(key))];
+    const focused = documentRef.activeElement;
+    for (const [index, key] of order.entries()) {
+      const section = documentRef.getElementById(sectionIds[key]);
+      if (section && container.children[index] !== section) container.insertBefore(section, container.children[index] ?? null);
+    }
+    if (focused?.isConnected && documentRef.activeElement !== focused) focused.focus?.();
+  }
+  for (const [metric, id] of [["tokens", "history-tokens"], ["changes", "history-events"], ["cost", "history-price"]]) {
+    setHidden(documentRef, id, !preferences.metrics.includes(metric));
+  }
+  setHidden(documentRef, "history-bars", !preferences.showChart);
+  setHidden(documentRef, "history-endpoints", !preferences.showChart);
+  const cache = projection.cacheSummary;
+  const available = cache?.status === "available";
+  setElementText(documentRef, "cache-period", t(preferences.historyRange === "30d" ? "electron.trayPopover.periodLastThirtyDays" : "electron.trayPopover.periodLastSevenDays"));
+  setElementText(documentRef, "cache-summary", !available ? t("electron.trayCustomization.cacheUnavailable")
+    : cache.comparableReturns === 0 ? t("electron.trayCustomization.cacheEmpty")
+      : t("electron.trayCustomization.cachePercent", { value: numberFormatter(cache.reusePercent, { maximumFractionDigits: 1 }) }));
+  setElementText(documentRef, "cache-coverage", available && cache.coverageStatus !== "complete" ? t("electron.trayCustomization.cachePartial") : "");
+  setElementText(documentRef, "cache-retained", projection.accounting.retained ? t("electron.trayCustomization.cacheRetained") : "");
+}
+
 export function renderTrayPopup(documentRef, projection, {
   t = defaultText,
   bridge = globalThis.window?.tibotattleTrayPopover,
@@ -1328,6 +1384,7 @@ export function renderTrayPopup(documentRef, projection, {
   numberFormatter = formatNumber,
   localFormatter = formatLocal,
   formattingLocale = DEFAULT_LOCALE,
+  preferences: rawPreferences = null,
 } = {}) {
   if (!documentRef || typeof documentRef.getElementById !== "function") {
     throw new TypeError("A document is required to render the tray popup.");
@@ -1336,9 +1393,14 @@ export function renderTrayPopup(documentRef, projection, {
   const formatNumberImpl = typeof numberFormatter === "function" ? numberFormatter : formatNumber;
   const formatLocalImpl = typeof localFormatter === "function" ? localFormatter : formatLocal;
   const presentation = mainTrayPresentation(mainModel);
-  renderAllowances(documentRef, projection, translated, formatNumberImpl);
+  const preferences = normalizeTrayPreferences(rawPreferences);
+  renderAllowances(documentRef, projection, translated, formatNumberImpl, preferences, formatLocalImpl);
   renderWeeklyPace(documentRef, projection, translated, formatNumberImpl, formatLocalImpl);
   renderHistory(documentRef, projection, translated, formatNumberImpl, formattingLocale);
+  applyTrayPopupPreferences(documentRef, projection, preferences, translated, formatNumberImpl);
+  if (preferences.resetFormat === "clock" && projection.weeklyPace.resetsAt) {
+    setElementText(documentRef, "pace-reset", translated("electron.trayCustomization.resetAt", { time: formatLocalImpl(projection.weeklyPace.resetsAt) }));
+  }
   const freshness = projection.freshness;
   const freshnessCopy = headerFreshnessCopy(freshness, translated, presentation?.status ?? null);
   setElementText(documentRef, "tray-popup-freshness", freshnessCopy);
@@ -1348,7 +1410,10 @@ export function renderTrayPopup(documentRef, projection, {
     const action = button.dataset.action;
     button.textContent = action === "open"
       ? translated("electron.tray.open", { appName: PRODUCT_APP_NAME })
-      : action === "more" ? "⋯" : translated("electron.trayPopover.refresh");
+      : action === "more" ? "⋯"
+        : action === "customize" ? translated("electron.tray.customize")
+          : action === "usage" ? translated("electron.trayCustomization.usageLink")
+            : translated("electron.trayPopover.refresh");
     if (action === "more") {
       button.setAttribute("aria-label", translated("electron.trayPopover.more"));
       button.setAttribute("title", translated("electron.trayPopover.more"));
@@ -1428,7 +1493,9 @@ export async function bootstrapTrayPopup({
   const bridge = windowRef.tibotattleTrayPopover;
   const requiresMainModel = typeof bridge?.onModel === "function";
   let mainModel = null;
-  let range = "7d";
+  let preferences = normalizeTrayPreferences(null);
+  let range = preferences.historyRange;
+  let rangeSaving = false;
   let data = null;
   let loadSequence = 0;
   let loadInFlight = null;
@@ -1457,6 +1524,7 @@ export async function bootstrapTrayPopup({
       mainModel,
       requiresMainModel,
       formattingLocale: localization.locale(),
+      preferences,
     });
   };
   const loadData = async () => {
@@ -1503,11 +1571,23 @@ export async function bootstrapTrayPopup({
   });
   windowRef.addEventListener?.("pagehide", stopContentHeightObserver, { once: true });
   for (const button of documentRef.querySelectorAll?.("[data-history-range]") ?? []) {
-    button.addEventListener("click", () => {
-      if (Object.hasOwn(TRAY_POPUP_HISTORY_RANGES, button.dataset.historyRange)) {
-        range = button.dataset.historyRange;
+    button.addEventListener("click", async () => {
+      if (rangeSaving || !Object.hasOwn(TRAY_POPUP_HISTORY_RANGES, button.dataset.historyRange)) return;
+      const prior = range;
+      setElementText(documentRef, "tray-popup-operation-error", "");
+      range = button.dataset.historyRange;
+      render();
+      if (typeof bridge?.setHistoryRange !== "function") return;
+      rangeSaving = true;
+      try {
+        await bridge.setHistoryRange(range);
+        preferences = { ...preferences, historyRange: range };
+      } catch {
+        range = prior;
         render();
-      }
+        setElementText(documentRef, "tray-popup-live", localization.t("electron.trayCustomization.saveFailed"));
+        setElementText(documentRef, "tray-popup-operation-error", localization.t("electron.trayCustomization.saveFailed"));
+      } finally { rangeSaving = false; }
     });
   }
   for (const button of documentRef.querySelectorAll?.("[data-action]") ?? []) {
@@ -1529,6 +1609,10 @@ export async function bootstrapTrayPopup({
       // This repaint is synchronous and presentation-only: lifecycle state
       // must disable Refresh before any companion read completes or begins.
       mainModel = mainTrayPresentation(nextModel);
+      if (nextModel?.trayPreferences) {
+        preferences = normalizeTrayPreferences(nextModel.trayPreferences);
+        if (!rangeSaving) range = preferences.historyRange;
+      }
       render();
       // The model is a lifecycle signal only. A hidden popup does not issue
       // requests; visibility/opening below coalesces one refresh instead.

@@ -14,7 +14,7 @@ import { isValidQuotaWindowDuration } from "@app-usagemonitor/quota-analysis";
  */
 
 export const DESKTOP_SHELL_STATUS_SCHEMA_VERSION =
-  "tibotattle-desktop-shell-status-v1";
+  "tibotattle-desktop-shell-status-v2";
 
 export const DESKTOP_SHELL_STATUS_STATES = Object.freeze([
   "starting",
@@ -226,7 +226,7 @@ function primaryAllowance(evidence) {
  * independently of the dashboard and must fail closed on a malformed accessor
  * result.
  */
-function displayAllowance(displayEvidence, { now }) {
+function displayWindows(displayEvidence, { now }) {
   if (!hasExactKeys(displayEvidence, DISPLAY_EVIDENCE_KEYS)
       || displayEvidence.evidenceStatus !== "available"
       || !hasExactKeys(displayEvidence.freshness, DISPLAY_FRESHNESS_KEYS)
@@ -277,21 +277,46 @@ function displayAllowance(displayEvidence, { now }) {
     }
     selected.set(candidate.durationMinutes, Object.freeze({
       durationMinutes: candidate.durationMinutes,
+      observedAt,
+      resetAt,
       remainingPercent: Object.is(candidate.remainingPercent, -0)
         ? 0
         : candidate.remainingPercent,
     }));
   }
 
-  // Native presentation gives the seven-day lane precedence when both are
-  // current; the five-hour lane is the normal fallback.
-  const primary = selected.get(10_080) ?? selected.get(300);
-  if (primary === undefined) return null;
-  return Object.freeze({
-    source: "direct",
-    window: primary.durationMinutes === 10_080 ? "seven_day" : "five_hour",
-    remainingPercent: primary.remainingPercent,
-  });
+  if (selected.size === 0) return null;
+  return Object.freeze({ schemaVersion: "tibotattle-display-evidence-v1", scopeKey: null,
+    staleAfterSeconds: displayEvidence.freshness.staleAfterSeconds,
+    windows: Object.freeze([...selected.values()]) });
+}
+
+/** Display-only authority; never accepted by notification evaluators. */
+export function projectDesktopShellDisplayEvidence(value, { now = Date.now() } = {}) {
+  if (!hasExactKeys(value, ["schemaVersion", "scopeKey", "staleAfterSeconds", "windows"])
+      || value.schemaVersion !== "tibotattle-display-evidence-v1"
+      || (value.scopeKey !== null && !validContinuityKey(value.scopeKey))
+      || !Number.isFinite(value.staleAfterSeconds) || value.staleAfterSeconds < 0
+      || !Array.isArray(value.windows) || value.windows.length < 1 || value.windows.length > 2) return null;
+  const seen = new Set(); const windows = [];
+  for (const item of value.windows) {
+    if (!hasExactKeys(item, ["durationMinutes", "remainingPercent", "observedAt", "resetAt"])
+        || !DISPLAY_WINDOW_DURATIONS.has(item.durationMinutes) || seen.has(item.durationMinutes)
+        || !Number.isFinite(item.remainingPercent) || item.remainingPercent < 0 || item.remainingPercent > 100
+        || canonicalInstant(item.observedAt) === null || canonicalInstant(item.resetAt) === null
+        || Date.parse(item.resetAt) <= Date.parse(item.observedAt)
+        || Date.parse(item.resetAt) - Date.parse(item.observedAt) > item.durationMinutes * 60_000) return null;
+    seen.add(item.durationMinutes);
+    if (now !== null && (!Number.isFinite(now) || now < Date.parse(item.observedAt)
+        || now - Date.parse(item.observedAt) > value.staleAfterSeconds * 1_000 || now >= Date.parse(item.resetAt))) continue;
+    windows.push(Object.freeze({ ...item }));
+  }
+  return windows.length === 0 ? null : Object.freeze({ ...value, windows: Object.freeze(windows) });
+}
+
+function displayAllowance(evidence) {
+  const primary = evidence?.windows.find((item) => item.durationMinutes === 10_080) ?? evidence?.windows[0];
+  return primary === undefined ? null : Object.freeze({ source: "direct", window: primary.durationMinutes === 300 ? "five_hour" : "seven_day", remainingPercent: primary.remainingPercent });
 }
 
 function cloneAllowance(value) {
@@ -315,11 +340,12 @@ function cloneAllowance(value) {
   });
 }
 
-function closedOutput(state, allowance = null, notificationEvidence = null) {
+function closedOutput(state, allowance = null, notificationEvidence = null, displayEvidence = null) {
   if (!STATUS_SET.has(state)) throw new TypeError("desktop shell state is invalid");
   if (!["fresh", "analyzing"].includes(state)) {
     allowance = null;
     notificationEvidence = null;
+    displayEvidence = null;
   } else {
     allowance = cloneAllowance(allowance);
   }
@@ -328,6 +354,7 @@ function closedOutput(state, allowance = null, notificationEvidence = null) {
     state,
     allowance,
     notificationEvidence,
+    ...(displayEvidence === null ? {} : { displayEvidence }),
   });
 }
 
@@ -390,7 +417,8 @@ export function projectDesktopShellStatus({
   if (snapshotStatus === "building") return closedOutput("starting");
   if (snapshotStatus === "failed") return closedOutput("unavailable");
 
-  const currentDisplayAllowance = displayAllowance(displayEvidence, { now });
+  const currentDisplayEvidence = displayWindows(displayEvidence, { now });
+  const currentDisplayAllowance = displayAllowance(currentDisplayEvidence);
   const refreshStatus = safeRefreshState(refresh);
   if (refreshStatus === "running" || refreshStatus === "cancelling") {
     // A refresh receipt may retain the last closed provider observation while
@@ -403,11 +431,12 @@ export function projectDesktopShellStatus({
       { now },
     );
     return retainedEvidence === null
-      ? closedOutput("analyzing", currentDisplayAllowance)
+      ? closedOutput("analyzing", currentDisplayAllowance, null, currentDisplayEvidence)
       : closedOutput(
         "analyzing",
         primaryAllowance(retainedEvidence) ?? currentDisplayAllowance,
         retainedEvidence,
+        currentDisplayEvidence,
       );
   }
   if (refreshStatus === "degraded"
@@ -417,7 +446,7 @@ export function projectDesktopShellStatus({
   if (refreshStatus === "idle") {
     return currentDisplayAllowance === null
       ? closedOutput("unavailable")
-      : closedOutput("fresh", currentDisplayAllowance);
+      : closedOutput("fresh", currentDisplayAllowance, null, currentDisplayEvidence);
   }
   if (refreshStatus !== "succeeded" && refreshStatus !== "degraded") {
     return closedOutput(
@@ -434,11 +463,12 @@ export function projectDesktopShellStatus({
       "fresh",
       primaryAllowance(evidence) ?? currentDisplayAllowance,
       evidence,
+      currentDisplayEvidence,
     );
   }
   return currentDisplayAllowance === null
     ? closedOutput("stale")
-    : closedOutput("fresh", currentDisplayAllowance);
+    : closedOutput("fresh", currentDisplayAllowance, null, currentDisplayEvidence);
 }
 
 export function validateDesktopShellStatus(value) {
@@ -447,11 +477,14 @@ export function validateDesktopShellStatus(value) {
     "notificationEvidence",
     "schemaVersion",
     "state",
+    ...(Object.hasOwn(value ?? {}, "displayEvidence") ? ["displayEvidence"] : []),
   ])
-      || value.schemaVersion !== DESKTOP_SHELL_STATUS_SCHEMA_VERSION
+      || ![DESKTOP_SHELL_STATUS_SCHEMA_VERSION, "tibotattle-desktop-shell-status-v1"].includes(value.schemaVersion)
       || !STATUS_SET.has(value.state)) {
     throw new TypeError("desktop shell status is invalid");
   }
+  const display = value.displayEvidence === undefined ? null : projectDesktopShellDisplayEvidence(value.displayEvidence, { now: null });
+  if (value.displayEvidence !== undefined && (display === null || value.schemaVersion !== DESKTOP_SHELL_STATUS_SCHEMA_VERSION || !["fresh", "analyzing"].includes(value.state))) throw new TypeError("desktop display evidence is invalid");
   const evidence = ["fresh", "analyzing"].includes(value.state)
     ? projectDesktopShellNotificationEvidence(
       value.notificationEvidence,
@@ -472,9 +505,10 @@ export function validateDesktopShellStatus(value) {
       && (value.allowance !== null || value.notificationEvidence !== null)) {
     throw new TypeError("desktop shell status is invalid");
   }
-  return closedOutput(
+  return Object.freeze({ ...closedOutput(
     value.state,
     ["fresh", "analyzing"].includes(value.state) ? value.allowance : null,
     evidence,
-  );
+    display,
+  ), schemaVersion: value.schemaVersion });
 }

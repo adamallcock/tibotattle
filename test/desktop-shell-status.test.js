@@ -42,13 +42,19 @@ function displayEvidence(overrides = {}) {
   };
 }
 
-function expected(state, allowance = null, notificationEvidence = null) {
+function expected(state, allowance = null, notificationEvidence = null, display = null) {
   return {
     schemaVersion: DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
     state,
     allowance,
     notificationEvidence,
+    ...(display === null ? {} : { displayEvidence: display }),
   };
+}
+
+function displaySummary(windows = displayEvidence().windows) {
+  return { schemaVersion: "tibotattle-display-evidence-v1", scopeKey: null, staleAfterSeconds: 1800,
+    windows: windows.map(({ durationMinutes, remainingPercent, observedAt, resetAt }) => ({ durationMinutes, remainingPercent, observedAt, resetAt })) };
 }
 
 test("published overview display evidence supplies a zero-percent native-primary allowance without notification authority", () => {
@@ -65,7 +71,7 @@ test("published overview display evidence supplies a zero-percent native-primary
     displayEvidence: evidence,
     now: NOW,
   });
-  assert.deepEqual(idle, expected("fresh", directAllowance));
+  assert.deepEqual(idle, expected("fresh", directAllowance, null, displaySummary()));
   assert.deepEqual(validateDesktopShellStatus(idle), idle);
 
   const analyzing = projectDesktopShellStatus({
@@ -74,7 +80,7 @@ test("published overview display evidence supplies a zero-percent native-primary
     displayEvidence: evidence,
     now: NOW,
   });
-  assert.deepEqual(analyzing, expected("analyzing", directAllowance));
+  assert.deepEqual(analyzing, expected("analyzing", directAllowance, null, displaySummary()));
   assert.deepEqual(validateDesktopShellStatus(analyzing), analyzing);
   assert.equal(JSON.stringify(analyzing).includes("continuity"), false);
   assert.equal(JSON.stringify(analyzing).includes("openai_codex"), false);
@@ -128,7 +134,7 @@ test("desktop shell display proof follows live current reset and primary-lane bo
     source: "direct",
     window: "five_hour",
     remainingPercent: 42,
-  }));
+  }, null, displaySummary([displayEvidence().windows[0]])));
 
   const expiredWeeklyFallback = projectDesktopShellStatus({
     snapshotStatus: "ready",
@@ -143,7 +149,7 @@ test("desktop shell display proof follows live current reset and primary-lane bo
     source: "direct",
     window: "five_hour",
     remainingPercent: 42,
-  }));
+  }, null, displaySummary([displayEvidence().windows[0]])));
 });
 
 test("strict v2 notification evidence remains the only notification-bearing path", () => {
