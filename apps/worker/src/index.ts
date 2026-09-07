@@ -3990,12 +3990,15 @@ export async function runScheduledMaintenance(
               }
               return result;
             };
-            // Publish a complete, source-current cached cohort before repeated
-            // account probes can consume the optional deadline. The publisher
-            // retains its freshness interval and atomic source-epoch fences.
-            // Missing inputs get one retry after reconstruction, before daily
-            // reconciliation; neither path falls back to a raw graph analysis.
-            const priorPreview = await publishPreview("before_analysis");
+            // Alternate optional priority on the minute cron: ready previews
+            // get first use of the deadline on even UTC minutes; reconstruction
+            // keeps its full budget on odd minutes. Otherwise a large cohort
+            // with a late missing cache could repeatedly exhaust admission
+            // before the warmer can repair it. Neither path uses raw analysis
+            // for graphs or changes freshness/atomic source-epoch fences.
+            const priorPreview = Math.floor(scheduledTime / 60_000) % 2 === 0
+              ? await publishPreview("before_analysis")
+              : null;
             try {
               if (queryMeter.remainingQueries >= 249 && Date.now() < optionalDeadlineMs) {
               let backfill = await backfillV1QuotaFitProjection(env.USAGE_MONITOR_DB);
@@ -4021,7 +4024,7 @@ export async function runScheduledMaintenance(
                 stage:"analysis",code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
                 ...phaseTiming()}));
             }
-            if (priorPreview.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
+            if (priorPreview === null || priorPreview.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
               await publishPreview("after_analysis");
             }
             const dailyStartedQueries = queryMeter.queriesUsed;

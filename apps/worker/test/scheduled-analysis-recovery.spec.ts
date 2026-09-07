@@ -221,11 +221,13 @@ describe("actual scheduled resumable analysis recovery", () => {
     const setupReceipt = { fixedSetupQueries,
       primary: second.queries.slice(0, fixedSetupQueries).filter(entry => entry.binding === "primary").length,
       ledger: second.queries.slice(0, fixedSetupQueries).filter(entry => entry.binding === "ledger").length };
-    // Four SELECTs reject the early preview's missing cohort without mutation.
-    expect(setupReceipt).toEqual({ fixedSetupQueries: 53, primary: 50, ledger: 3 });
+    // Odd-minute reconstruction has no speculative preview/cohort scan. Keep
+    // the original setup budget even when the preview's inputs are incomplete.
+    expect(second.queries.slice(0, payloadRead).some(entry => entry.sql.includes("FROM admin_community_allowance_preview_cache"))).toBe(false);
+    expect(setupReceipt).toEqual({ fixedSetupQueries: 49, primary: 46, ledger: 3 });
     // Worst legal 1024-part head:384 reads,3 final pin/head checks,407 finish
     // reserve,24 combined warmer/scheduler headroom. Heavy sustained required
-    // housekeeping can exceed the remaining29 queries and safely defer finish.
+    // housekeeping can exceed the remaining33 queries and safely defer finish.
     expect(fixedSetupQueries + 384 + 3 + 407 + 24).toBeLessThanOrEqual(900);
     expect(await db().prepare("SELECT fixed_now,run_id,phase FROM community_analysis_work WHERE participant_id=?").bind(PARTICIPANT).first())
       .toMatchObject({ fixed_now: before!.fixed_now, run_id: before!.run_id, phase: "complete" });
@@ -309,30 +311,35 @@ describe("actual scheduled resumable analysis recovery", () => {
     assertMeter(observation); await released();
   });
 
-  it("retries an initially unavailable preview only after current account caches are promoted", async () => {
+  it.each([
+    { minute: "even", offset: 0, expectedReads: 2 },
+    { minute: "odd", offset: 60_000, expectedReads: 1 },
+  ])("publishes missing inputs after promotion on $minute minutes, before daily reconciliation", async ({ offset, expectedReads }) => {
     await seedQuota(200); await queue();
     expect(await db().prepare("SELECT count(*) AS n FROM community_allowance_fit_cache").first()).toEqual({ n: 0 });
     expect(await db().prepare("SELECT count(*) AS n FROM admin_community_allowance_preview_cache").first()).toEqual({ n: 0 });
     const observation = observe();
-    expect(await runScheduledMaintenance(bindings(observation), NOW))
+    const scheduledAt = NOW + offset;
+    expect(await runScheduledMaintenance(bindings(observation), scheduledAt))
       .toMatchObject({ outcome: "success", lifecycleComplete: true });
     const queries = observation.queries.map(entry => entry.sql);
     const previewReads = queries.flatMap((sql, index) => sql.includes("FROM admin_community_allowance_preview_cache") ? [index] : []);
     const cachePromotion = queries.findIndex(sql => sql.includes("INSERT INTO community_allowance_fit_cache"));
     const previewWrites = queries.flatMap((sql, index) => sql.includes("INSERT INTO admin_community_allowance_preview_cache") ? [index] : []);
-    expect(previewReads).toHaveLength(2);
-    expect(cachePromotion).toBeGreaterThan(previewReads[0]!);
-    expect(previewReads[1]).toBeGreaterThan(cachePromotion);
+    expect(previewReads).toHaveLength(expectedReads);
+    expect(cachePromotion).toBeGreaterThan(0);
+    if (expectedReads === 2) expect(cachePromotion).toBeGreaterThan(previewReads[0]!);
+    expect(previewReads.at(-1)).toBeGreaterThan(cachePromotion);
     expect(previewWrites).toHaveLength(1);
-    expect(previewWrites[0]).toBeGreaterThan(previewReads[1]!);
+    expect(previewWrites[0]).toBeGreaterThan(previewReads.at(-1)!);
     const dailyWrite = queries.findIndex(sql => sql.includes("INSERT INTO community_daily_aggregates"));
     expect(dailyWrite).toBeGreaterThan(previewWrites[0]!);
     for (const table of ["community_allowance_fit_cache", "community_model_composition_cache"])
       expect(await db().prepare(`SELECT count(*) AS n FROM ${table}`).first()).toEqual({ n: 1 });
     const preview = await db().prepare("SELECT generated_at, payload_json FROM admin_community_allowance_preview_cache WHERE singleton=1")
       .first<{ generated_at: string; payload_json: string }>();
-    expect(preview?.generated_at).toBe(new Date(NOW).toISOString());
-    expect(validCachedAdminCommunityAllowancePreview(JSON.parse(preview!.payload_json), preview!.generated_at, NOW)).toBe(true);
+    expect(preview?.generated_at).toBe(new Date(scheduledAt).toISOString());
+    expect(validCachedAdminCommunityAllowancePreview(JSON.parse(preview!.payload_json), preview!.generated_at, scheduledAt)).toBe(true);
     expect(await db().prepare("SELECT count(*) AS n FROM community_daily_aggregate_rebuilds").first()).toEqual({ n: 0 });
     expect(inspection.rawFits).not.toHaveBeenCalled(); expect(inspection.rawModels).not.toHaveBeenCalled();
     assertMeter(observation); await released();

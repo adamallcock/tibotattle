@@ -85,10 +85,13 @@ usage-finishing reserve fit. Sustained required-work saturation may defer
 large accounts; it is not permission to lower evidence caps.
 
 Public and admin graph rebuilds consume only complete, source-current caches.
-The shared preview gets a cache-only publication attempt before optional
-account reconstruction, so repeated current-account checks cannot starve its
-hourly refresh. An unavailable preview retries after reconstruction and before
-daily reconciliation. A current preview keeps its normal refresh interval;
+The minute cron alternates optional priority: on even UTC minutes the shared
+preview gets a cache-only publication attempt before account reconstruction;
+on odd minutes reconstruction keeps its full budget before preview publication.
+This gives ready graphs an early refresh opportunity without letting a large
+incomplete cohort repeatedly crowd out the calculations needed to repair it.
+An unavailable early preview retries after reconstruction and before daily
+reconciliation. A current preview keeps its normal refresh interval;
 neither a browser read nor a scheduler deadline extends its two-hour validity.
 Content-free preview/analysis phase logs include elapsed time, remaining time
 and actual statement counts. The lifecycle `last_completed_at` stamp precedes

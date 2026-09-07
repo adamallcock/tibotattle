@@ -95,8 +95,10 @@ retain their queue entry for a later complete allowance rebuild.
 For an expired preview despite current account caches, inspect the natural
 invocation's wall time and `admin_allowance_preview_cache` phase timing, not
 only lifecycle `last_completed_at`. That stamp is written before optional
-analytics. Preview publication attempts run `before_analysis`; incomplete
-inputs retry `after_analysis`, before daily reconciliation. Refreshed rows and
+analytics. Even UTC minutes attempt `before_analysis` publication; incomplete
+inputs retry `after_analysis`. Odd minutes preserve reconstruction's full budget
+and only attempt `after_analysis` publication. Both run before daily
+reconciliation. Refreshed rows and
 deferrals log `queriesUsed`, `phaseQueries`, `elapsedMs` and
 `deadlineRemainingMs`. A current preview is quiet and retains the 55-minute
 refresh interval. Never extend freshness or edit generation timestamps to hide

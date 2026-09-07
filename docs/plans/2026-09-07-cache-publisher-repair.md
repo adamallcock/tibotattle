@@ -19,19 +19,24 @@ there was no historical-model stage. A separate metadata check confirmed zero
 queued daily rebuilds. Lifecycle's 5.3-second completion stamp precedes optional
 analytics and does not measure the whole invocation.
 
-Publish the same validated, complete cached cohort before optional account
-reconstruction. If unavailable, retry after reconstruction but before daily
-reconciliation. Preserve lifecycle priority, the single invocation budget,
+Alternate optional priority by UTC minute: publish the same validated, complete
+cached cohort before account reconstruction on even minutes; reserve odd minutes
+for reconstruction before preview publication. If an early preview is unavailable,
+retry after reconstruction but before daily reconciliation. This prevents a large
+cohort with a late missing input from repeatedly consuming reconstruction's
+admission budget. Preserve lifecycle priority, the single invocation budget,
 source-epoch fences, atomic writes and the existing 55-minute refresh interval.
 Record content-free phase timings/counters so deadline deferrals are visible.
 
 Local proof: the two regressions fail against the original ordering (expired
 preview retained; no early/retry read), then all 11 scheduler tests pass with
 the repair. All 68 cache, atomic publication, preview and account-warmer tests
-pass. The new early incomplete-cohort check adds exactly four SELECTs to the
-fixed setup receipt (53 total, 50 primary and 3 ledger); the unchanged 900-query
-ceiling still admits the maximum completed checkpoint. TypeScript, 20 preflight
-tests, documentation and architecture checks pass. Full Worker/deployment and
+pass. Full checks on `f934bee4` passed 804 Worker tests, 202 operations tests,
+TypeScript, staging/default/production dry deployments, 20 preflight tests,
+documentation and architecture checks. Independent review identified the
+large-cohort admission risk; the follow-up preserves the original odd-minute
+fixed setup receipt (49 statements, 46 primary and 3 ledger), keeps the unchanged
+900-query ceiling, and covers both priority paths. Final qualification and
 natural live recovery remain pending; no production repair is claimed yet.
 
 - Isolate the publisher refusal after successful account-cache validation,
