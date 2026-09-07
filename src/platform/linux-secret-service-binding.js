@@ -1,10 +1,18 @@
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, isAbsolute, sep } from "node:path";
+import { dirname, isAbsolute, resolve, sep } from "node:path";
 
 const require = createRequire(import.meta.url);
 const BINDING_SPECIFIER = "@github/keytar/prebuilds/linux-x64/keytar.node";
+const BINDING_PATH_TAIL = [
+  "node_modules",
+  "@github",
+  "keytar",
+  "prebuilds",
+  "linux-x64",
+  "keytar.node",
+].join(sep);
 
 export const LINUX_KEYTAR_BINDING_MANIFEST = Object.freeze({
   package: "@github/keytar",
@@ -61,6 +69,29 @@ function defaultResolveBinding(specifier) {
 
 function defaultReadBinding(path) {
   return readFileSync(path);
+}
+
+/**
+ * Electron's virtual app.asar path cannot execute a native .node module. Map
+ * only the exact reviewed Keytar path to its sibling unpacked file before the
+ * existing realpath, ownership, digest, and native-load checks run. A normal
+ * source/package path is retained unchanged.
+ */
+function normalizePackageNativeBindingPath(path) {
+  if (typeof path !== "string" || !isAbsolute(path)) return null;
+  let normalized;
+  try {
+    normalized = resolve(path);
+  } catch {
+    return null;
+  }
+  if (!normalized.endsWith(`${sep}${BINDING_PATH_TAIL}`)) return null;
+  const marker = `${sep}app.asar${sep}`;
+  const index = normalized.lastIndexOf(marker);
+  if (index === -1) return normalized;
+  const tail = normalized.slice(index + marker.length);
+  if (tail !== BINDING_PATH_TAIL) return null;
+  return `${normalized.slice(0, index)}${sep}app.asar.unpacked${sep}${tail}`;
 }
 
 /**
@@ -227,14 +258,13 @@ export function loadLinuxSecretServiceBinding(options = {}) {
 
   let bindingPath;
   try {
-    bindingPath = resolveBinding(BINDING_SPECIFIER);
+    bindingPath = normalizePackageNativeBindingPath(resolveBinding(BINDING_SPECIFIER));
   } catch {
     fail("binding_unavailable");
   }
-  const requiredSuffix = ["prebuilds", "linux-x64", "keytar.node"].join(sep);
   if (typeof bindingPath !== "string"
       || !isAbsolute(bindingPath)
-      || !bindingPath.endsWith(`${sep}${requiredSuffix}`)) {
+      || !bindingPath.endsWith(`${sep}${BINDING_PATH_TAIL}`)) {
     fail("binding_path_invalid");
   }
 

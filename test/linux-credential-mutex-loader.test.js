@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   chmod,
+  copyFile,
   link,
+  mkdir,
   mkdtemp,
   realpath,
   rm,
@@ -10,8 +12,9 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
 import {
   LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_SCHEMA_VERSION,
@@ -19,6 +22,7 @@ import {
   linuxCredentialMutexBindingEvidence,
   loadLinuxCredentialMutexBinding,
   readLinuxCredentialMutexManifestFile,
+  validateLinuxCredentialMutexBindingManifest,
 } from "../src/platform/linux-credential-mutex.js";
 
 const BYTES = Buffer.from("linux credential mutex native fixture", "utf8");
@@ -133,6 +137,112 @@ test("Linux credential mutex loader accepts only the fixed sidecar path and a sa
     })),
     bindingError("binding_path_unsafe"),
   );
+});
+
+test("Linux credential mutex sidecar validator is pure, closed, and freezes its copy", () => {
+  const candidate = manifest();
+  const validated = validateLinuxCredentialMutexBindingManifest(candidate);
+  assert.deepEqual(validated, candidate);
+  assert.notEqual(validated, candidate);
+  assert.equal(Object.isFrozen(validated), true);
+  assert.equal(Object.isFrozen(validated.requiredMethods), true);
+  assert.equal(Object.isFrozen(validated.nativeClaims), true);
+  assert.throws(
+    () => validateLinuxCredentialMutexBindingManifest(manifest(BYTES, {
+      sha256: "A".repeat(64),
+    })),
+    bindingError("manifest_invalid"),
+  );
+});
+
+test("Linux credential mutex loader maps only its module-owned app.asar binding to unpacked", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-linux-mutex-asar-"));
+  try {
+    const canonicalRoot = await realpath(root);
+    const virtualModulePath = join(
+      canonicalRoot,
+      "resources",
+      "app.asar",
+      "src",
+      "platform",
+      "linux-credential-mutex.js",
+    );
+    const virtualBindingPath = join(
+      canonicalRoot,
+      "resources",
+      "app.asar",
+      "native",
+      "linux-credential-mutex",
+      "build",
+      "qualification",
+      "linux_credential_mutex.node",
+    );
+    const unpackedBindingPath = join(
+      canonicalRoot,
+      "resources",
+      "app.asar.unpacked",
+      "native",
+      "linux-credential-mutex",
+      "build",
+      "qualification",
+      "linux_credential_mutex.node",
+    );
+    await mkdir(dirname(virtualModulePath), { recursive: true, mode: 0o700 });
+    await copyFile(
+      new URL("../src/platform/linux-credential-mutex.js", import.meta.url),
+      virtualModulePath,
+    );
+    const copied = await import(`${pathToFileURL(virtualModulePath).href}?test=${Date.now()}`);
+    const observed = [];
+    const loaded = copied.loadLinuxCredentialMutexBinding({
+      platform: "linux",
+      architecture: "x64",
+      resolveBinding(path) {
+        observed.push(["resolve", path]);
+        return path;
+      },
+      verifyBindingPath(path) {
+        observed.push(["verify", path]);
+        return path === unpackedBindingPath;
+      },
+      readManifest(path) {
+        observed.push(["manifest", path]);
+        return JSON.stringify(manifest());
+      },
+      readBindingBytes(path) {
+        observed.push(["bytes", path]);
+        return BYTES;
+      },
+      requireBinding(path) {
+        observed.push(["require", path]);
+        return binding();
+      },
+    });
+    assert.equal(typeof loaded.acquireCredentialMutex, "function");
+    assert.deepEqual(observed, [
+      ["resolve", virtualBindingPath],
+      ["verify", unpackedBindingPath],
+      ["manifest", `${unpackedBindingPath}.manifest.json`],
+      ["bytes", unpackedBindingPath],
+      ["require", unpackedBindingPath],
+      ["bytes", unpackedBindingPath],
+    ]);
+    assert.throws(
+      () => copied.loadLinuxCredentialMutexBinding({
+        ...syntheticLoader(),
+        resolveBinding: () => join(
+          canonicalRoot,
+          "resources",
+          "app.asar",
+          "foreign",
+          "linux_credential_mutex.node",
+        ),
+      }),
+      (error) => error?.code === "linux_credential_mutex_binding_binding_path_invalid",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Linux credential mutex loader snapshots the closed native surface without production credit", () => {

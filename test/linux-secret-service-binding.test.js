@@ -106,6 +106,67 @@ test("Linux binding loader accepts only the exact reviewed prebuild path", () =>
   }
 });
 
+test("Linux binding loader maps only the exact app.asar Keytar path before each native boundary", () => {
+  const virtualBindingPath = [
+    "",
+    "opt",
+    "TiboTattle",
+    "resources",
+    "app.asar",
+    "node_modules",
+    "@github",
+    "keytar",
+    "prebuilds",
+    "linux-x64",
+    "keytar.node",
+  ].join(sep);
+  const unpackedBindingPath = virtualBindingPath.replace(
+    `${sep}app.asar${sep}`,
+    `${sep}app.asar.unpacked${sep}`,
+  );
+  const observed = [];
+  const bytes = Buffer.alloc(LINUX_KEYTAR_BINDING_MANIFEST.bytes, 7);
+  const loaded = loadLinuxSecretServiceBinding({
+    platform: "linux",
+    architecture: "x64",
+    resolveBinding() {
+      return virtualBindingPath;
+    },
+    verifyImmutableBindingPath(path) {
+      observed.push(["verify", path]);
+      return false;
+    },
+    readBinding(path) {
+      observed.push(["read", path]);
+      return bytes;
+    },
+    requireBinding(path) {
+      observed.push(["require", path]);
+      return memoryBinding();
+    },
+    digestBinding() {
+      return LINUX_KEYTAR_BINDING_MANIFEST.sha256;
+    },
+  });
+  assert.equal(typeof loaded.getPassword, "function");
+  assert.deepEqual(observed, [
+    ["verify", unpackedBindingPath],
+    ["read", unpackedBindingPath],
+    ["require", unpackedBindingPath],
+    ["read", unpackedBindingPath],
+    ["verify", unpackedBindingPath],
+  ]);
+  assert.throws(
+    () => loadLinuxSecretServiceBinding(syntheticLoader({
+      resolveBinding: () => virtualBindingPath.replace(
+        `${sep}app.asar${sep}`,
+        `${sep}app.asar${sep}unexpected${sep}`,
+      ),
+    })),
+    bindingError("binding_path_invalid"),
+  );
+});
+
 test("Linux binding loader snapshots methods and keeps test digest overrides unverified", async () => {
   const original = memoryBinding();
   const options = syntheticLoader({ requireBinding: () => original });

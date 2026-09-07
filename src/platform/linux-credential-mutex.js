@@ -10,7 +10,7 @@ import {
   realpathSync,
 } from "node:fs";
 import { createRequire } from "node:module";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { dirname, isAbsolute, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
@@ -49,6 +49,9 @@ const NATIVE_BINDING_PATH = resolve(
   "..",
   LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH,
 );
+const NATIVE_BINDING_PATH_TAIL = LINUX_CREDENTIAL_MUTEX_BINDING_RELATIVE_PATH
+  .split("/")
+  .join(sep);
 const BINDING_FILE_NAME = "linux_credential_mutex.node";
 const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_MANIFEST_BYTES = 64 * 1024;
@@ -161,7 +164,12 @@ function parseManifest(value) {
   return manifest;
 }
 
-function assertManifest(manifest) {
+/**
+ * Validate the closed, content-free native sidecar shape. Packaging uses this
+ * same pure validator before it records the final unpacked pair; this function
+ * does not inspect paths, files, or a loaded native module.
+ */
+export function validateLinuxCredentialMutexBindingManifest(manifest) {
   let valid = exactKeys(manifest, MANIFEST_KEYS);
   try {
     valid = valid
@@ -194,6 +202,23 @@ function assertManifest(manifest) {
     approvedPolicy: Object.freeze({ ...manifest.approvedPolicy }),
   });
 }
+
+/**
+ * Electron exposes JavaScript under app.asar but native modules must reside
+ * beside it in app.asar.unpacked. Translate only a path derived from this
+ * module and only the exact fixed binding tail; no caller-selected path can
+ * reach this branch.
+ */
+function moduleOwnedUnpackedBindingPath(path) {
+  const marker = `${sep}app.asar${sep}`;
+  const index = path.lastIndexOf(marker);
+  if (index === -1) return path;
+  const tail = path.slice(index + marker.length);
+  if (tail !== NATIVE_BINDING_PATH_TAIL) return null;
+  return `${path.slice(0, index)}${sep}app.asar.unpacked${sep}${tail}`;
+}
+
+const MODULE_OWNED_BINDING_PATH = moduleOwnedUnpackedBindingPath(NATIVE_BINDING_PATH);
 
 function normalizeBindingBytes(bytes, code) {
   if (!(Buffer.isBuffer(bytes) || bytes instanceof Uint8Array)
@@ -310,10 +335,21 @@ export function readLinuxCredentialMutexManifestFile(path) {
 }
 
 function normalizeBindingPath(path) {
-  if (typeof path !== "string" || !isAbsolute(path) || resolve(path) !== NATIVE_BINDING_PATH) {
+  if (typeof path !== "string" || !isAbsolute(path)) {
     fail("binding_path_invalid");
   }
-  return path;
+  let normalized;
+  try {
+    normalized = resolve(path);
+  } catch {
+    fail("binding_path_invalid");
+  }
+  if (MODULE_OWNED_BINDING_PATH === null
+      || (normalized !== NATIVE_BINDING_PATH
+        && normalized !== MODULE_OWNED_BINDING_PATH)) {
+    fail("binding_path_invalid");
+  }
+  return MODULE_OWNED_BINDING_PATH;
 }
 
 function snapshotBinding(binding) {
@@ -453,7 +489,9 @@ export function loadLinuxCredentialMutexBinding(options = {}) {
 
   let manifest;
   try {
-    manifest = assertManifest(parseManifest(readManifest(`${resolved}.manifest.json`)));
+    manifest = validateLinuxCredentialMutexBindingManifest(
+      parseManifest(readManifest(`${resolved}.manifest.json`)),
+    );
   } catch (error) {
     if (isLinuxCredentialMutexBindingError(error)) throw error;
     fail("binding_unavailable");
