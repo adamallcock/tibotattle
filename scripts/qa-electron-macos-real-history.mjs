@@ -137,6 +137,7 @@ const FAILURE_REASONS = new Set([
   "quick_result_timeout",
   "timer_stalled",
   "control_plane_unresponsive",
+  "control_plane_latency_budget_exceeded",
   "control_plane_phase_coverage_invalid",
   "cancel_unavailable",
   "cancel_not_acknowledged",
@@ -1300,7 +1301,10 @@ function phaseInclusiveControlPlaneCoverageValid(coverage, warmupSampleCount, ac
       + coverage.active.atOrAfterQuickResultRounds >= 1;
 }
 
-function legacyControlPlaneSnapshotValid(snapshot) {
+function legacyControlPlaneSnapshotValid(
+  snapshot,
+  p95MaxLatencyMs = REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS,
+) {
   return snapshot?.active === true
     && Number.isSafeInteger(snapshot.sampleCount)
     && snapshot.sampleCount >= CONTROL_PLANE_LEGACY_MIN_SAMPLES
@@ -1315,11 +1319,14 @@ function legacyControlPlaneSnapshotValid(snapshot) {
     && snapshot.maxLatencyMs <= REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS
     && Number.isSafeInteger(snapshot.p95LatencyMs)
     && snapshot.p95LatencyMs >= 0
-    && snapshot.p95LatencyMs <= REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS
+    && snapshot.p95LatencyMs <= p95MaxLatencyMs
     && snapshot.p95LatencyMs <= snapshot.maxLatencyMs;
 }
 
-function endpointSeparatedControlPlaneSnapshotValid(snapshot) {
+function endpointSeparatedControlPlaneSnapshotValid(
+  snapshot,
+  p95MaxLatencyMs = REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS,
+) {
   const endpointLatency = snapshot?.endpointLatency;
   if (endpointLatency === null || typeof endpointLatency !== "object"
       || !CONTROL_PLANE_ENDPOINT_SAMPLING_VERSIONS.has(endpointLatency.samplingVersion)) {
@@ -1342,12 +1349,12 @@ function endpointSeparatedControlPlaneSnapshotValid(snapshot) {
       || !controlPlanePhaseSummaryValid(
         health.active,
         CONTROL_PLANE_ACTIVE_MIN_SAMPLES,
-        REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS,
+        p95MaxLatencyMs,
       )
       || !controlPlanePhaseSummaryValid(
         refreshStatus.active,
         CONTROL_PLANE_ACTIVE_MIN_SAMPLES,
-        REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS,
+        p95MaxLatencyMs,
       )) {
     return false;
   }
@@ -1378,10 +1385,26 @@ function endpointSeparatedControlPlaneSnapshotValid(snapshot) {
     );
 }
 
-export function controlPlaneSnapshotValid(snapshot) {
+export function controlPlaneSnapshotValid(
+  snapshot,
+  p95MaxLatencyMs = REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS,
+) {
   return snapshot?.endpointLatency === undefined
-    ? legacyControlPlaneSnapshotValid(snapshot)
-    : endpointSeparatedControlPlaneSnapshotValid(snapshot);
+    ? legacyControlPlaneSnapshotValid(snapshot, p95MaxLatencyMs)
+    : endpointSeparatedControlPlaneSnapshotValid(snapshot, p95MaxLatencyMs);
+}
+
+/**
+ * Distinguish a completed, structurally valid control-plane sample whose
+ * active p95 exceeds the qualification budget from an incomplete or
+ * unresponsive sample. The returned boolean never relaxes the 250ms pass
+ * criterion; it only lets the caller finish the remaining bounded functional
+ * checks and retain their content-free evidence before failing the receipt.
+ */
+export function controlPlaneP95BudgetExceeded(snapshot) {
+  return snapshot?.active === true
+    && !controlPlaneSnapshotValid(snapshot)
+    && controlPlaneSnapshotValid(snapshot, REAL_HISTORY_QA_CONTROL_PLANE_MAX_LATENCY_MS);
 }
 
 function createControlPlanePhaseSamples() {
@@ -1675,12 +1698,27 @@ async function sampleControlPlaneStatus(
     await wait(CONTROL_PLANE_SAMPLE_INTERVAL_MS);
   }
   const result = snapshot(true);
-  if (!controlPlaneSnapshotValid(result)) {
+  if (!controlPlaneSnapshotValid(result) && !controlPlaneP95BudgetExceeded(result)) {
     const error = failure();
     attachQaEvidence(error, { controlPlane: result });
     throw error;
   }
   return result;
+}
+
+function controlPlaneQualificationError(evidence) {
+  const budgetExceeded = controlPlaneP95BudgetExceeded(evidence?.controlPlane);
+  const error = qaError(
+    budgetExceeded
+      ? "REAL_HISTORY_QA_CONTROL_PLANE_LATENCY_BUDGET_EXCEEDED"
+      : "REAL_HISTORY_QA_CONTROL_PLANE_UNRESPONSIVE",
+    "refresh",
+    budgetExceeded
+      ? "control_plane_latency_budget_exceeded"
+      : "control_plane_unresponsive",
+  );
+  attachQaEvidence(error, evidence);
+  return error;
 }
 
 async function waitCancelHttpResponse(session) {
@@ -3076,6 +3114,22 @@ async function runQa(options) {
       cleanQuitReceipt = quit.clean;
       session = null;
     }
+    // A completed collection that only misses the aggregate p95 budget must
+    // still fail qualification, but only after the user-facing terminal,
+    // parity, network-boundary, and clean-quit checks have had a chance to
+    // produce their bounded receipt evidence.
+    if (!controlPlaneSnapshotValid(controlPlane)) {
+      throw controlPlaneQualificationError({
+        timer,
+        startup,
+        parity,
+        controlPlane,
+        cancel,
+        retry,
+        relaunch,
+        cleanQuit: cleanQuitReceipt,
+      });
+    }
     return buildRealHistoryReceipt({
       mode: options.mode,
       status: "passed",
@@ -3141,11 +3195,14 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
       status: "failed",
       failureStage: FAILURE_STAGES.has(error?.qaStage) ? error.qaStage : "input",
       failureReason: failureReason(error),
+      cleanQuit: evidence.cleanQuit,
       timer: evidence.timer,
       startup: evidence.startup,
+      parity: evidence.parity,
       controlPlane: evidence.controlPlane,
       cancel: evidence.cancel,
       retry: evidence.retry,
+      relaunch: evidence.relaunch,
       artifactSha256: error?.verifiedArtifactSha256 ?? null,
       artifactIdentityVerified: typeof error?.verifiedArtifactSha256 === "string",
       sourceRevision: options?.sourceRevision ?? null,

@@ -20,6 +20,7 @@ import {
   communityServiceConfigurationState,
   communityParitySnapshotValid,
   controlPlaneLatencyP95Ms,
+  controlPlaneP95BudgetExceeded,
   controlPlaneSnapshotValid,
   createControlPlaneObserver,
   createNetworkBoundaryObserver,
@@ -757,6 +758,65 @@ test("passed v4 receipts fail closed without exact source, artifact, or p95 proo
   assert.equal(lateQuickResult.failureReason, "quick_result_timeout");
   assert.equal(lateQuickResult.startupRefresh.quickResultDurationMs, null);
   assert.equal(lateQuickResult.startupRefresh.quickResultObserved, false);
+});
+
+test("completed p95 budget breaches retain functional evidence but still fail qualification", () => {
+  const controlPlane = qualifyingV2ControlPlane({ maxLatencyMs: 363, p95LatencyMs: 261 });
+  controlPlane.endpointLatency.samplingVersion = "endpoint-separated-v1";
+  delete controlPlane.endpointLatency.coverage;
+  assert.equal(controlPlaneSnapshotValid(controlPlane), false);
+  assert.equal(
+    controlPlaneSnapshotValid(controlPlane, REAL_HISTORY_QA_CONTROL_PLANE_OVER_LIMIT_LATENCY_MS - 1),
+    true,
+    "the classification path accepts only a completed sample under the existing 3s ceiling",
+  );
+  assert.equal(controlPlaneP95BudgetExceeded(controlPlane), true);
+  assert.equal(controlPlaneP95BudgetExceeded({
+    ...controlPlane,
+    maxLatencyMs: REAL_HISTORY_QA_CONTROL_PLANE_OVER_LIMIT_LATENCY_MS,
+    p95LatencyMs: REAL_HISTORY_QA_CONTROL_PLANE_OVER_LIMIT_LATENCY_MS,
+  }), false, "a per-request ceiling breach is not an aggregate p95-only result");
+
+  const receipt = buildRealHistoryReceipt({
+    status: "failed",
+    failureStage: "refresh",
+    failureReason: "control_plane_latency_budget_exceeded",
+    cleanQuit: true,
+    artifactSha256: "9".repeat(64),
+    artifactIdentityVerified: true,
+    sourceRevision: "6".repeat(40),
+    timer: { sampleCount: 5, uniqueCount: 5, advanced: true },
+    startup: {
+      requestCount: 1,
+      refreshIdChanged: true,
+      terminalStatus: "succeeded",
+      terminalEvaluated: true,
+      quickResultObserved: true,
+      quickResultDurationMs: 100,
+    },
+    parity: {
+      dashboard: { populated: true },
+      usage: { pageVisible: true, periodCount: 1, summaryCardCount: 1 },
+      community: { pageVisible: true, transportUnavailable: true },
+    },
+    controlPlane,
+  });
+  assert.equal(receipt.status, "failed");
+  assert.equal(receipt.failureStage, "refresh");
+  assert.equal(receipt.failureReason, "control_plane_latency_budget_exceeded");
+  assert.equal(receipt.cleanQuit, true);
+  assert.deepEqual(receipt.timer, { sampleCount: 5, uniqueCount: 5, advanced: true });
+  assert.equal(receipt.startupRefresh.requestCount, 1);
+  assert.equal(receipt.startupRefresh.terminalStatus, "succeeded");
+  assert.equal(receipt.parity.dashboardPopulated, true);
+  assert.equal(receipt.parity.usage.pageVisible, true);
+  assert.equal(receipt.parity.community.pageVisible, true);
+  assert.equal(receipt.controlPlane.active, false);
+  assert.equal(receipt.controlPlane.sampleCount, 20);
+  assert.equal(receipt.controlPlane.healthSuccessCount, 20);
+  assert.equal(receipt.controlPlane.refreshStatusSuccessCount, 20);
+  assert.equal(receipt.controlPlane.p95LatencyMs, 261);
+  assert.equal(receipt.controlPlane.maxLatencyMs, 363);
 });
 
 test("new successful cancel and snapshot receipts require phase-inclusive v2 coverage", () => {
@@ -1587,6 +1647,8 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /REAL_HISTORY_QA_CONTROL_PLANE_OVER_LIMIT_LATENCY_MS/u);
   assert.match(source, /REAL_HISTORY_QA_CONTROL_PLANE_P95_MAX_LATENCY_MS/u);
   assert.match(source, /controlPlaneLatencyP95Ms/u);
+  assert.match(source, /controlPlaneP95BudgetExceeded/u);
+  assert.match(source, /control_plane_latency_budget_exceeded/u);
   assert.match(source, /p95LatencyMs/u);
   assert.match(source, /REAL_HISTORY_QA_QUICK_RESULT_MAX_MS/u);
   assert.match(source, /quickResultDurationMs/u);
@@ -1607,8 +1669,10 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /attachQaEvidence\(completionError, \{/u);
   assert.match(source, /timer: timerResult \?\? samplerEvidence/u);
   assert.match(source, /Promise\.allSettled\(\[/u);
+  assert.match(source, /cleanQuit: evidence\.cleanQuit/u);
   assert.match(source, /timer: evidence\.timer/u);
   assert.match(source, /controlPlane: evidence\.controlPlane/u);
+  assert.match(source, /parity: evidence\.parity/u);
   assert.match(source, /cancel: evidence\.cancel/u);
   assert.match(source, /retry: evidence\.retry/u);
   assert.match(source, /options\?\.receiptPath/u);
@@ -1622,6 +1686,7 @@ test("source contract preserves the real profile and bounds every health poll", 
   assert.match(source, /sampleControlPlane/u);
   assert.match(source, /sampleControlPlane: true/u);
   assert.match(source, /controlPlane = startup.controlPlane/u);
+  assert.match(source, /throw controlPlaneQualificationError/u);
   assert.match(source, /remainingRefreshBudgetMs()/u);
   assert.match(source, /REAL_HISTORY_QA_REFRESH_TIMEOUT/u);
   assert.match(source, /cancelHttp/u);
