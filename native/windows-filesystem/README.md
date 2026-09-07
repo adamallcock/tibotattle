@@ -22,9 +22,10 @@ node ./scripts/build-windows-filesystem-manifest.mjs
 The resulting `build/Release/windows_filesystem.node` and its adjacent
 `windows_filesystem.node.manifest.json` are loaded only on native
 Windows x64 by `src/platform/windows-filesystem.js`. macOS, Linux, Windows
-ARM64, and missing/invalid bindings fail closed. The source is not a production
-credential backend: Credential Manager storage remains a separate capability
-boundary, while this binding supplies its cross-process mutation lock.
+ARM64, and missing/invalid bindings fail closed. The source contains a
+qualification-only accountless upload-credential backend, separate from the
+legacy Credential Manager capability boundary and its four logical IDs. It is
+not a selected production credential backend.
 
 The loader reads the fixed sidecar manifest, verifies the binary byte count and
 SHA-256 before loading it, and cross-checks the binding's contract and native
@@ -105,6 +106,52 @@ step fails.
   non-inheritable handle. The native issued-token registry is protected against
   concurrent Node worker-thread calls. JavaScript retains an in-process guard
   because Win32 mutex acquisition is recursive on one thread.
+
+## Fixed accountless installation credential
+
+The separate
+[`windows-accountless-installation-credential-v1`](../../src/platform/windows-accountless-installation-credential.js)
+backend owns one fixed, upload-only accountless installation secret. It is
+exactly 32 bytes and is neither a provider, social, participant, nor legacy
+Credential Manager credential. Its public backend surface has only `read`,
+`createIfMissing`, and `deleteExact`; callers cannot choose a capability, record
+name, or path. The fixed record
+`accountless-installation-credential-v1.bin` and its fixed
+`.accountless-installation-credential-v1.journal` live below the authenticated,
+owner-private protected-state root selected by the main-owned composition.
+
+The binding supplies
+`acquireAccountlessInstallationCredentialMutex()` and
+`releaseAccountlessInstallationCredentialMutex(lease)` for that record alone.
+They have no capability parameter and are separate from the four generic IDs
+`0..3` and the legacy FD4 broker. The native mutex is a per-current-owner
+`Local\` object: it serializes cooperating processes in one interactive Windows
+session, not every session for that owner.
+
+This is an owner-private filesystem-permission boundary, not encryption at
+rest. A backup policy can copy the plaintext secret, and a process acting as the
+same Windows owner can alter the protected state outside the cooperating-writer
+contract. The `Local\` mutex does not provide a cross-session guarantee. This
+backend makes no lock-screen availability guarantee: it is a filesystem record,
+not a Credential Manager lock-state boundary. These limits are deliberate
+source-boundary facts, not a shipping Windows credential-store claim.
+
+Before create or exact-delete can mutate the record, the backend durably writes
+the journal's `active` state. An uncertain mutation, unsafe/malformed fixed
+record, failed exact readback, failed release, or interrupted operation attempts
+to retain that state; after it is verified, later calls return the fixed
+`recovery_required` result rather than silently minting or replacing an
+installation identity. If the backend cannot retain and verify that marker, it
+returns a fixed operation failure without claiming restart-persistent recovery.
+A known pre-mutation failure does not poison a previously normal journal, so a
+later retry can safely proceed. Only the main-owned accountless adapter can
+compose this secret into the existing private FD3 companion channel; it is not
+exposed through FD4, renderer IPC, or HTTP.
+
+The binding and backend deliberately remain `productionSafe: false`, and runtime
+selection remains dormant. Native Windows x64 build, sidecar-manifest,
+protected-state/mutex security, physical runner, installed lifecycle, signing,
+and release qualification remain separate gates.
 
 The protected DACL is deliberately strict: only the current user
 SID is an allow principal. Inherited SYSTEM/Administrators/user-group allows

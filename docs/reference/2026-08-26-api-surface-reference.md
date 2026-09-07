@@ -638,6 +638,29 @@ recovery state instead of permitting silent identity replacement. The source
 keeps `productionSafe: false` and leaves runtime selection disabled; native
 qualification, installed lifecycle and release remain separate gates.
 
+The dormant Windows accountless adapter likewise owns a separate,
+owner-private protected-state record, not a fifth legacy Credential Manager
+capability. Its [fixed native boundary](../../native/windows-filesystem/README.md)
+exposes only `read`, `createIfMissing`, and `deleteExact` for an upload-only
+32-byte installation secret; callers cannot select a capability, record name,
+or path. The fixed record and `active`/`normal` journal are plaintext at rest.
+The two private native mutex methods,
+`acquireAccountlessInstallationCredentialMutex()` and
+`releaseAccountlessInstallationCredentialMutex(lease)`, have no capability
+argument and sit outside generic IDs `0..3` and FD4. They serialize cooperating
+processes only in the current owner's `Local\` Windows session: backup copies,
+same-owner processes that bypass the contract, and other sessions remain outside
+that protection. Before a create or exact delete, the backend writes `active`;
+an uncertain mutation, malformed record, failed release, or interruption retains
+it when the write can be verified and then returns fixed recovery rather than
+silently replacing identity. If it cannot retain that marker, it returns a
+content-free operation failure without a restart-persistence claim. The
+main-owned adapter may carry the secret only through the existing private FD3
+accountless channel, never renderer IPC or HTTP. `productionSafe` remains
+`false` and runtime selection remains disabled pending native Windows x64 build,
+manifest, security, physical-runner, installed-lifecycle, signing, and release
+evidence.
+
 ### Codex app-server subprocess protocol
 
 **Sources of truth:**
@@ -842,7 +865,7 @@ is not treated as permission for arbitrary cross-owner queries.
 
 | Store | Schema authority | Contract |
 |---|---|---|
-| Hosted primary D1 | [`apps/worker/migrations`](../../apps/worker/migrations) — 40 ordered SQL migrations | Participant/session/device state, contribution metadata, aggregate revisions, retention/reconciliation, controls, and admin caches |
+| Hosted primary D1 | [`apps/worker/migrations`](../../apps/worker/migrations) — 48 ordered SQL migrations | Participant/session/device state, contribution metadata, aggregate revisions, retention/reconciliation, controls, and admin caches |
 | Hosted deletion-ledger D1 | [`apps/worker/deletion-ledger-migrations`](../../apps/worker/deletion-ledger-migrations) — 2 ordered SQL migrations | Deletion tombstones and identity re-enrollment cooldowns, segregated from the primary store |
 | Dogfood guard D1 | [`apps/worker/dogfood-update-guard-migrations`](../../apps/worker/dogfood-update-guard-migrations) — 1 SQL migration | Appcast operator nonce replay ledger only |
 | Hosted `QUARANTINE` R2 | Worker quarantine/reconciliation owners | Encrypted contribution objects addressed by fixed stored keys and reconciled against accepted metadata |
