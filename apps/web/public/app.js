@@ -924,7 +924,8 @@ function hideConnectionNotice() {
 }
 
 function renderDashboardUnavailableState(kind) {
-  resetCacheDropThreadLinks();
+  // The last accounting rows remain visible during a failed refresh.
+  resetCacheDropThreadLinks(cacheDropThreadLinks.dashboard);
   const companionCopy = isLoopbackDashboard()
     ? "dashboard.unavailable.companionInAppCopy"
     : "dashboard.unavailable.companionCopy";
@@ -8297,7 +8298,29 @@ function updateCacheDropThreadCells() {
   }
 }
 
+function cacheDropThreadKeys(data) {
+  const keys = new Set();
+  if (!isCacheDropThreadDashboard(data) || !isLoopbackDashboard()) return keys;
+  for (const [kind, impact] of [
+    ["switch", data.accounting?.cacheSwitchImpact],
+    ["continuity", data.accounting?.cacheContinuityImpact],
+  ]) {
+    if (impact?.status !== "available") continue;
+    const periods = Array.isArray(impact.periods) ? impact.periods.slice(0, 4) : [];
+    for (const period of [impact, ...periods]) {
+      const recent = Array.isArray(period?.recent) ? period.recent.slice(0, 20) : [];
+      for (const row of recent) {
+        const key = cacheDropThreadLookupKey(kind, row);
+        if (key !== null) keys.add(key);
+        if (keys.size === 160) return keys;
+      }
+    }
+  }
+  return keys;
+}
+
 function resetCacheDropThreadLinks(data = null) {
+  const sameDashboard = cacheDropThreadLinks.dashboard === data;
   cacheDropThreadLinks.requestToken += 1;
   cacheDropThreadLinks.dashboard = data;
   cacheDropThreadLinks.generation = isCacheDropThreadDashboard(data)
@@ -8305,11 +8328,15 @@ function resetCacheDropThreadLinks(data = null) {
     ? data.accounting.generation
     : null;
   cacheDropThreadLinks.requested = false;
-  cacheDropThreadLinks.entries.clear();
-  // Remove old names even when a failed dashboard load leaves its previous
-  // accounting rows visible underneath the unavailable-state notice.
+  // A new accounting generation does not change an already resolved thread.
+  // Reuse only exact event-pair keys still present in the local snapshot, across
+  // all selectable periods. New/changed rows must resolve independently.
+  const retainedKeys = cacheDropThreadKeys(data);
+  for (const key of cacheDropThreadLinks.entries.keys()) {
+    if (!retainedKeys.has(key)) cacheDropThreadLinks.entries.delete(key);
+  }
   updateCacheDropThreadCells();
-  cacheDropThreadLinks.cells = { switch: [], continuity: [] };
+  if (!sameDashboard) cacheDropThreadLinks.cells = { switch: [], continuity: [] };
 }
 
 async function loadCacheDropThreadLinks(data) {
@@ -8323,6 +8350,7 @@ async function loadCacheDropThreadLinks(data) {
   cacheDropThreadLinks.requested = true;
   const token = ++cacheDropThreadLinks.requestToken;
   const loadToken = cacheDropThreadLinks.loadToken;
+  let completed = false;
   try {
     const result = await localClient.cacheDropThreadLinks();
     if (token !== cacheDropThreadLinks.requestToken
@@ -8333,13 +8361,31 @@ async function loadCacheDropThreadLinks(data) {
         || data.accounting?.generationMatched !== true
         || result?.status !== "available"
         || result.generation !== generation) return;
-    cacheDropThreadLinks.entries = new Map(
-      result.entries.map((entry) => [entry.key, entry.thread]),
-    );
+    const selectedKeys = cacheDropThreadKeys(data);
+    for (const { key, thread } of result.entries) {
+      if (!selectedKeys.has(key)) continue;
+      const previous = cacheDropThreadLinks.entries.get(key);
+      // Optional name-store failures must not erase details already known for
+      // this UUID. A newly resolved identity replaces the old entry outright.
+      cacheDropThreadLinks.entries.set(key, previous?.id === thread.id ? {
+        ...thread,
+        name: thread.name ?? previous.name,
+        nickname: thread.nickname ?? previous.nickname,
+        parent: thread.parent === null ? previous.parent : {
+          ...thread.parent,
+          name: thread.parent.name ?? (thread.parent.id === previous.parent?.id
+            ? previous.parent.name : null),
+        },
+      } : thread);
+    }
+    completed = true;
     updateCacheDropThreadCells();
   } catch {
-    // Older companions and unavailable local metadata are a normal, quiet
-    // fallback. Accounting remains usable and no private lookup error leaks.
+    // Keep resolved details usable through temporary local lookup failures.
+  } finally {
+    if (!completed && token === cacheDropThreadLinks.requestToken) {
+      cacheDropThreadLinks.requested = false;
+    }
   }
 }
 
