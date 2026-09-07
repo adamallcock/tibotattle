@@ -83,20 +83,20 @@ WHERE x.consumed_at IS NULL AND x.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'n
 CREATE TRIGGER telemetry_v11_domain_complete_before_insert
 BEFORE INSERT ON telemetry_v11_domains
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM telemetry_v11_current_predecessors x
     WHERE x.token_hash = NEW.predecessor_token_hash AND x.participant_id = NEW.participant_id
       AND x.device_id = NEW.device_id AND x.previous_generation_id IS NEW.previous_generation_id
       AND x.legacy_fingerprint = NEW.legacy_fingerprint AND x.input_revision = NEW.input_revision
       AND x.from_day >= NEW.from_day AND x.through_day <= NEW.through_day
-  ) THEN RAISE(ABORT, 'telemetry_domain_predecessor_changed') END;
+  ) THEN RAISE(ABORT, 'telemetry_domain_predecessor_changed') END);
   -- Journal-only bound before any record-level closure scan: at most 30,000
   -- chunks / 6,000,000 records, matching the legacy source-pin journal budget.
-  SELECT CASE WHEN (SELECT COALESCE(SUM(m.expected_chunk_count), 0)
+  SELECT (CASE WHEN (SELECT COALESCE(SUM(m.expected_chunk_count), 0)
     FROM json_each(NEW.days_json) e JOIN telemetry_v11_day_manifests m
       ON m.id = json_extract(e.value, '$.manifestId')) > 30000
-    THEN RAISE(ABORT, 'telemetry_domain_range_too_large') END;
-  SELECT CASE WHEN json_array_length(NEW.days_json) NOT BETWEEN 1 AND 4096
+    THEN RAISE(ABORT, 'telemetry_domain_range_too_large') END);
+  SELECT (CASE WHEN json_array_length(NEW.days_json) NOT BETWEEN 1 AND 4096
     OR json_array_length(NEW.days_json) != CAST(julianday(NEW.through_day) - julianday(NEW.from_day) + 1 AS INTEGER)
     OR EXISTS (
       SELECT 1 FROM json_each(NEW.days_json) e
@@ -108,15 +108,15 @@ BEGIN
         OR m.expected_chunk_count != (SELECT count(*) FROM telemetry_v11_chunks c WHERE c.manifest_id = m.id)
         OR EXISTS (SELECT 1 FROM telemetry_v11_chunks c WHERE c.manifest_id = m.id
           AND c.record_count != (SELECT count(*) FROM telemetry_v11_records r WHERE r.chunk_id = c.id))
-    ) THEN RAISE(ABORT, 'telemetry_domain_incomplete') END;
-  SELECT CASE WHEN EXISTS (
+    ) THEN RAISE(ABORT, 'telemetry_domain_incomplete') END);
+  SELECT (CASE WHEN EXISTS (
     SELECT r.stream, r.occurrence_id FROM json_each(NEW.days_json) e
     JOIN telemetry_v11_records r ON r.manifest_id = json_extract(e.value, '$.manifestId')
     GROUP BY r.stream, r.occurrence_id HAVING count(*) > 1
-  ) THEN RAISE(ABORT, 'telemetry_domain_occurrence_conflict') END;
+  ) THEN RAISE(ABORT, 'telemetry_domain_occurrence_conflict') END);
   -- Every legacy winning occurrence must survive with identical base semantics.
   -- A declared excluded count, equal row count, or same wire version is not proof.
-  SELECT CASE WHEN EXISTS (
+  SELECT (CASE WHEN EXISTS (
     WITH candidate_days AS MATERIALIZED (
       SELECT json_extract(e.value, '$.day') AS day,
         json_extract(e.value, '$.manifestId') AS manifest_id FROM json_each(NEW.days_json) e
@@ -132,8 +132,8 @@ BEGIN
           AND new_row.stream = old_row.stream AND new_row.legacy_occurrence_id = old_row.occurrence_id
           AND new_row.legacy_record_json = old_row.record_json
       ))
-  ) THEN RAISE(ABORT, 'telemetry_domain_compatibility_unproven') END;
-  SELECT CASE WHEN EXISTS (
+  ) THEN RAISE(ABORT, 'telemetry_domain_compatibility_unproven') END);
+  SELECT (CASE WHEN EXISTS (
     WITH candidate_days AS MATERIALIZED (
       SELECT json_extract(e.value, '$.day') AS day,
         json_extract(e.value, '$.manifestId') AS manifest_id FROM json_each(NEW.days_json) e
@@ -147,14 +147,14 @@ BEGIN
         AND json_remove(new_row.record_json, '$.accountPlanAttribution')
           = json_remove(old_row.record_json, '$.accountPlanAttribution')
     ))
-  ) THEN RAISE(ABORT, 'telemetry_domain_compatibility_unproven') END;
+  ) THEN RAISE(ABORT, 'telemetry_domain_compatibility_unproven') END);
   -- A domain head is participant-wide analytical authority, not a day-level
   -- overlay. Even disjoint v0.2 history would disappear at cutover without a
   -- reviewed semantic replacement proof. Preserve the old lane until then.
-  SELECT CASE WHEN EXISTS (SELECT 1 FROM telemetry_contributions legacy
+  SELECT (CASE WHEN EXISTS (SELECT 1 FROM telemetry_contributions legacy
     WHERE legacy.participant_id = NEW.participant_id AND legacy.status = 'accepted'
       AND legacy.transport_schema_version = 'telemetry-contribution-v0.2'
-  ) THEN RAISE(ABORT, 'telemetry_domain_compatibility_unproven') END;
+  ) THEN RAISE(ABORT, 'telemetry_domain_compatibility_unproven') END);
 END;
 
 CREATE TRIGGER telemetry_v11_domain_day_member BEFORE INSERT ON telemetry_v11_domain_days

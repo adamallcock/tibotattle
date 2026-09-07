@@ -66,7 +66,10 @@ export function selectProductionAccountObservationSecret({
       fail("ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE");
     }
   }
-  if (platform !== "darwin" || architecture !== "arm64") {
+  // Accept the packaged app's broker on Intel without widening the legacy
+  // native-binding policy or falling back when broker construction fails.
+  if (platform !== "darwin"
+      || (architecture !== "arm64" && architecture !== "x64")) {
     fail("ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE");
   }
   if (typeof createKeychainBackend !== "function"

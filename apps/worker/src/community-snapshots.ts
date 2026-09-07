@@ -735,7 +735,54 @@ async function buildCommunityWeeklySnapshotForPeriod(
   }
   const payloadJson = canonicalJson(payload);
   const payloadHash = await sha256Hex(payloadJson);
-  const results = await db.batch([
+  // Analytical ingest can advance the shared epoch without a privacy-triggered
+  // withdrawal. Replace that week's stale active revision in the same atomic
+  // batch as publication: retain its immutable payload, journal the withdrawal,
+  // and require the same owner/lease/source fences as the replacement INSERT.
+  const [, , inserted] = await db.batch([
+    db.prepare(
+      `INSERT INTO community_weekly_snapshot_rebuilds (
+        week_start, week_end, ingestion_cutoff_at, requested_epoch, requested_at
+      )
+      SELECT week_start, week_end, ingestion_cutoff_at, ?, ?
+        FROM community_weekly_snapshots
+       WHERE week_start = ? AND release_state IN ('published', 'suppressed')
+         AND source_mutation_epoch < ?
+         AND EXISTS (
+           SELECT 1 FROM community_snapshot_builders
+            WHERE week_start = ? AND owner_nonce = ? AND mutation_epoch = ?
+              AND lease_expires_at > ?
+         )
+         AND EXISTS (
+           SELECT 1 FROM community_snapshot_mutation_control
+            WHERE singleton_id = 1 AND mutation_epoch = ?
+         )
+      ON CONFLICT(week_start) DO UPDATE SET
+        requested_epoch = excluded.requested_epoch,
+        requested_at = excluded.requested_at
+      WHERE community_weekly_snapshot_rebuilds.requested_epoch < excluded.requested_epoch`,
+    ).bind(
+      mutationEpoch, now, startAt, mutationEpoch,
+      startAt, owner, mutationEpoch, now, mutationEpoch,
+    ),
+    db.prepare(
+      `UPDATE community_weekly_snapshots
+          SET release_state = 'withdrawn', withdrawn_at = ?, withdrawal_epoch = ?
+        WHERE week_start = ? AND release_state IN ('published', 'suppressed')
+          AND source_mutation_epoch < ?
+          AND EXISTS (
+            SELECT 1 FROM community_snapshot_builders
+             WHERE week_start = ? AND owner_nonce = ? AND mutation_epoch = ?
+               AND lease_expires_at > ?
+          )
+          AND EXISTS (
+            SELECT 1 FROM community_snapshot_mutation_control
+             WHERE singleton_id = 1 AND mutation_epoch = ?
+          )`,
+    ).bind(
+      now, mutationEpoch, startAt, mutationEpoch,
+      startAt, owner, mutationEpoch, now, mutationEpoch,
+    ),
     db.prepare(
       `INSERT INTO community_weekly_snapshots (
         snapshot_id, week_start, week_end, revision, source_mutation_epoch,
@@ -795,7 +842,7 @@ async function buildCommunityWeeklySnapshotForPeriod(
       mutationEpoch,
     ),
   ]);
-  if (results[0]?.meta.changes === 1) return { state: "built", snapshotId };
+  if (inserted?.meta.changes === 1) return { state: "built", snapshotId };
   const raced = await db.prepare(
     `SELECT snapshot_id, payload_sha256 FROM community_weekly_snapshots
       WHERE week_start = ? AND release_state IN ('published', 'suppressed')

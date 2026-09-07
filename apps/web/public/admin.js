@@ -20,6 +20,7 @@ const state = {
   allowancePreview: null,
   allowanceMode: "combined",
   allowancePlanFilter: null,
+  allowanceModelFilter: "observed",
   allowanceRangeDays: 30,
   notificationPreferences: null,
   metricsHistory: undefined,
@@ -2242,6 +2243,7 @@ function adminAllowanceSegments(points) {
 export function adminAllowanceChartModel(preview, {
   mode = "combined",
   planFilter = null,
+  modelFilter = "all",
   rangeDays = 30,
   width = ADMIN_ALLOWANCE_CHART_WIDTH,
   height = ADMIN_ALLOWANCE_CHART_HEIGHT,
@@ -2266,11 +2268,11 @@ export function adminAllowanceChartModel(preview, {
   const modelDayByDay = new Map(
     (preview.models?.days ?? []).map((day) => [day.day, day]),
   );
-  const modelSeries = (preview.models?.modelConfig ?? []).map((model) => ({
+  const modelSeries = (preview.models?.modelConfig ?? []).map((model, index) => ({
     key: model.modelId,
     label: model.label,
     className: ADMIN_ALLOWANCE_MODEL_STYLES[model.modelId]?.className
-      ?? "model-other",
+      ?? `model-catalog-${index % 8}`,
   }));
   const activePlanFilter = mode === "plans"
     && planSeries.some((plan) => plan.key === planFilter)
@@ -2279,7 +2281,10 @@ export function adminAllowanceChartModel(preview, {
   const legendSeries = mode === "combined"
     ? [{ key: "combined", label: "Combined", className: "combined" }]
     : mode === "models"
-      ? modelSeries
+      ? modelSeries.filter((model) => modelFilter === "all"
+        || (modelFilter === "observed" ? days.some((day) => (
+          modelDayByDay.get(day.day)?.byModel?.[model.key]?.capacityUsd != null
+        )) : model.key === modelFilter))
       : planSeries;
   const series = mode !== "plans" || activePlanFilter === null
     ? legendSeries
@@ -2521,6 +2526,7 @@ function appendAdminAllowanceChart(container, preview) {
   const model = adminAllowanceChartModel(preview, {
     mode: state.allowanceMode,
     planFilter: state.allowancePlanFilter,
+    modelFilter: state.allowanceModelFilter,
     rangeDays: state.allowanceRangeDays,
   });
   if (model === null) {
@@ -2745,6 +2751,29 @@ function renderAdminAllowanceControls() {
 
 function appendModelAllowanceSummaries(container, preview) {
   const models = preview.models;
+  const filterLabel = document.createElement("label");
+  filterLabel.className = "admin-allowance-model-filter";
+  filterLabel.textContent = "Model view ";
+  const filter = document.createElement("select");
+  filter.setAttribute("aria-label", "Model view");
+  for (const [value, text] of [
+    ["observed", "Models with identified fits"],
+    ["all", "All reviewed models"],
+    ...models.modelConfig.map((model) => [model.modelId, model.label]),
+  ]) {
+    const option = document.createElement("option");
+    option.value = value;
+    option.textContent = text;
+    filter.append(option);
+  }
+  filter.value = state.allowanceModelFilter;
+  filter.addEventListener("change", () => {
+    state.allowanceModelFilter = filter.value;
+    renderAdminCommunityAllowance(preview);
+    $(".admin-allowance-model-filter select")?.focus();
+  });
+  filterLabel.append(filter);
+  container.append(filterLabel);
   const latest = models.days.at(-1) ?? null;
   if (latest === null) {
     const empty = document.createElement("p");
@@ -2753,12 +2782,15 @@ function appendModelAllowanceSummaries(container, preview) {
       + " yet. The series accrues from the first day the composition kernel"
       + " accepts a fit.";
     container.append(empty);
-    return;
   }
   const grid = document.createElement("div");
-  grid.className = "admin-allowance-plans";
+  grid.className = "admin-allowance-plan-summaries";
   for (const model of models.modelConfig) {
-    const summary = latest.byModel[model.modelId];
+    const summary = latest?.byModel[model.modelId];
+    if (state.allowanceModelFilter === "observed"
+        ? summary?.capacityUsd == null
+        : state.allowanceModelFilter !== "all"
+          && state.allowanceModelFilter !== model.modelId) continue;
     const tile = document.createElement("div");
     tile.className = "admin-allowance-plan-summary";
     const label = document.createElement("p");
@@ -2766,18 +2798,27 @@ function appendModelAllowanceSummaries(container, preview) {
     label.textContent = model.label;
     const value = document.createElement("p");
     value.className = "admin-allowance-value";
-    value.textContent = summary.capacityUsd === null
+    value.textContent = summary?.capacityUsd == null
       ? "—"
       : allowanceUsd(summary.capacityUsd);
     const unit = document.createElement("p");
     unit.className = "admin-allowance-unit";
-    unit.textContent = "per 100pp weekly, Pro 20x equivalent";
+    unit.textContent = model.allowanceTrack === "spark"
+      ? "Separate Spark allowance track"
+      : "per 100pp weekly, Pro 20x equivalent";
     const meta = document.createElement("p");
     meta.className = "admin-allowance-meta";
-    meta.textContent = summary.capacityUsd === null
-      ? "No identification-passing fit carries this model"
+    meta.textContent = model.allowanceTrack === "spark"
+      ? "Not comparable with the primary allowance; API pricing unavailable"
+      : summary?.participantCount == null
+        ? "Not covered by this retained day’s model roster"
+        : summary.capacityUsd === null
+          ? "No identification-passing fit carries this model"
       : `${allowanceCountLabel(summary.participantCount, "account")}`
         + ` · ${latest.day}`;
+    if (model.pricingStatus === "assumed_alias") {
+      meta.textContent += " · Price alias assumption; identity kept separate";
+    }
     tile.append(label, value, unit, meta);
     grid.append(tile);
   }
@@ -2787,8 +2828,9 @@ function appendModelAllowanceSummaries(container, preview) {
   note.textContent = "Per-model capacities come from the shared NNLS"
     + " composition kernel and display only when its identification gate"
     + " (split-half stability, adjusted-R2 improvement) passes"
-    + ` — ${latest.fittedParticipantCount} of ${latest.v1ParticipantCount}`
-    + " contributing accounts pass today.";
+    + (latest === null ? "." : ` — ${latest.fittedParticipantCount} of ${latest.v1ParticipantCount}`
+      + ` contributing accounts pass on ${latest.day}.`)
+    + " Catalog visibility does not imply Codex availability or an allowance estimate.";
   container.append(note);
 }
 

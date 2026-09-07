@@ -4,6 +4,11 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { PRODUCT_BRAND } from "../config/product-brand.js";
 import {
+  resolveReleaseChannel,
+  STABLE_RELEASE_CHANNEL,
+} from "../config/release-channels.js";
+import { normalizeMacOSBuildArchitecture } from "./build-macos-app.js";
+import {
   inspectMacOSApp,
   validateInstalledMacOSApp,
   validateMacOSLoginItemReleaseRehearsal,
@@ -13,13 +18,21 @@ const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REQUIRED_APPLICATION_PATH =
   `/Applications/${PRODUCT_BRAND.bundleName}`;
 
-function parseArguments(argv) {
+export function parseArguments(argv) {
   let appPath = null;
+  let architecture = null;
+  let channel = null;
   let rehearsalPath = null;
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
     if (argument === "--app" && appPath === null && index + 1 < argv.length) {
       appPath = resolve(argv[++index]);
+    } else if (argument === "--architecture"
+        && architecture === null && index + 1 < argv.length) {
+      architecture = normalizeMacOSBuildArchitecture(argv[++index]);
+    } else if (argument === "--channel"
+        && channel === null && index + 1 < argv.length) {
+      channel = argv[++index];
     } else if (argument === "--rehearsal"
         && rehearsalPath === null && index + 1 < argv.length) {
       rehearsalPath = resolve(argv[++index]);
@@ -35,15 +48,24 @@ function parseArguments(argv) {
       `Login Item release rehearsal must use ${REQUIRED_APPLICATION_PATH}`,
     );
   }
-  return { appPath, rehearsalPath };
+  architecture ??= "arm64";
+  const releaseChannel = resolveReleaseChannel(channel ?? STABLE_RELEASE_CHANNEL, {
+    architecture,
+  });
+  return { appPath, architecture, channel: releaseChannel.name, rehearsalPath };
 }
 
-export async function main(argv) {
-  const { appPath, rehearsalPath } = parseArguments(argv);
+export async function main(argv, dependencies = {}) {
+  const { appPath, architecture, channel, rehearsalPath } = parseArguments(argv);
+  const validateInstalled = dependencies.validateInstalledMacOSApp
+    ?? validateInstalledMacOSApp;
+  const inspectApp = dependencies.inspectMacOSApp ?? inspectMacOSApp;
   // Production validation includes a compiled fake-manager contract smoke;
   // it never registers or changes this Mac's real Login Item.
-  await validateInstalledMacOSApp(appPath, { production: true });
-  const inspected = await inspectMacOSApp(appPath, {
+  await validateInstalled(appPath, { architecture, channel, production: true });
+  const inspected = await inspectApp(appPath, {
+    architecture,
+    channel,
     requireExternalDistribution: true,
   });
   let rehearsal;
@@ -56,12 +78,18 @@ export async function main(argv) {
     bundleIdentifier: inspected.bundleIdentifier,
     bundleVersion: inspected.bundleVersion,
     shortVersion: inspected.shortVersion,
+    architecture: inspected.architecture,
+    channel: inspected.buildManifest?.release?.channelName,
+    sourceCommit: inspected.buildManifest?.release?.source?.commit,
+    payloadSha256: inspected.buildManifest?.payload?.payloadSha256,
+    minimumMacos: inspected.minimumMacos,
   });
-  console.log("TiboTattle Login Item release gate: passed");
+  console.log("TiboTattle Login Item manual receipt validation: passed");
   console.log(`Bundle identifier: ${receipt.bundleIdentifier}`);
   console.log(`Bundle version: ${receipt.bundleVersion}`);
   console.log(`Rehearsal date: ${receipt.recordedOn}`);
   console.log(`Manual lifecycle checks: ${receipt.requiredChecks.length}`);
+  console.log("Native hardware and runtime checks are human-attested, not automatic physical proof");
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === SCRIPT_FILE) {

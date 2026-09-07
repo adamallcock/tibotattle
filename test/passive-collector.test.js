@@ -165,6 +165,37 @@ async function readLines(path) {
   }
 }
 
+test("passive collection ignores response usage/checkpoint copies and withholds incomplete component vectors", async () => {
+  const response = { thread_id: "private-response-thread-canary", turn_id: "private-response-turn-canary",
+    session_id: "private-response-root-canary", root_turn_id: "private-root-turn-canary", response_id: "private-response-canary",
+    usage: usage(1000), turn_token_usage: usage(2000), thread_token_usage: usage(3000) };
+  const responseLine = JSON.stringify({ timestamp: "2026-07-23T00:00:01.000Z", type: "token_usage_record", payload: response });
+  const compactedLine = JSON.stringify({ timestamp: "2026-07-23T00:00:02.000Z", type: "compacted", payload: { latest_token_usage_record: response } });
+  const sparse = { input_tokens: 10, output_tokens: 0, total_tokens: 10 };
+  const fixture = await collectorFixture([responseLine, compactedLine, responseLine,
+    tokenRecord("2026-07-23T00:00:03.000Z", sparse, sparse),
+    tokenRecord("2026-07-23T00:00:04.000Z", usage(20), usage(10)),
+  ]);
+  try {
+    const options = { ...fixture, backfill: true, refreshStale: false,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z") };
+    await runCollectorOnce(options);
+    const records = (await readLines(fixture.dataFile)).filter((record) => record.kind === "codex_rollout_usage_snapshot");
+    assert.equal(records.length, 2);
+    assert.equal(records[0].components, null);
+    assert.equal(records[1].components.input_uncached_tokens, 10);
+    assert.equal(JSON.stringify(records).includes("private-response"), false);
+    await runCollectorOnce(options);
+    assert.equal((await readLines(fixture.dataFile)).filter((record) => record.kind === "codex_rollout_usage_snapshot").length, 2);
+    const onlyResponse = await collectorFixture([responseLine, compactedLine]);
+    try {
+      const result = await runCollectorOnce({ ...onlyResponse, backfill: true, refreshStale: false, clock: options.clock });
+      assert.equal(result.rolloutRecordsWritten, 0);
+      assert.deepEqual(await readLines(onlyResponse.dataFile), []);
+    } finally { await rm(onlyResponse.root, { recursive: true }); }
+  } finally { await rm(fixture.root, { recursive: true }); }
+});
+
 test("recursive rollout discovery stops promptly when its AbortSignal fires", async () => {
   const fixture = await collectorFixture();
   const controller = new AbortController();

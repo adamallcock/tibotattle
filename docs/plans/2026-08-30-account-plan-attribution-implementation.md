@@ -7,6 +7,26 @@ status: implemented-merged-pending-qualification
 
 # Account and plan attribution implementation
 
+## 2026-09-04 migration lineage amendment
+
+The implementation results and dated observations below retain their original
+migration numbers; they are historical receipts, not the current filename map.
+The [hosted migration lineage review](../reviews/2026-09-04-hosted-migration-lineage-reconciliation.md)
+records the separately verified production history and local forward-only
+reconciliation. The applied historical
+`0041_community_model_composition_cache.sql` is preserved byte-for-byte. The
+distinct, previously named `0041_community_model_composition.sql` becomes
+`0042_community_model_composition.sql`; analytical fencing moves from `0042` to
+`0043`, attribution transport from `0043` to `0044`, and domain activation from
+`0044` to `0045`, with unchanged SQL bytes. References below to the attribution
+sequence `0042`–`0044` therefore map to current source `0043`–`0045`, and the
+complete primary source inventory now ends at `0045`.
+
+This amendment is not a remote-migration, deployment, consent, or release
+receipt. An environment with the alternative historical filenames must stop at
+the unchanged exact-prefix gate for its own reconciliation review; applying
+production migrations remains a separately authorized owner operation.
+
 ## Boundary and verified baseline
 
 The owner requested local end-to-end implementation after review of the

@@ -13,15 +13,15 @@
     "transportReady": false
   },
   "fieldContract": {
-    "sha256": "f372fb2837e1720b2ce1ae03f8fd2517b07f6184f4facac3d6cda24f835abd34",
+    "sha256": "81be56456cfca4ae5ca51898675ded04890512931c992706c9224a6eb68ba0ee",
     "version": "telemetry-field-dictionary-v0.1"
   },
   "implementation": {
     "checkpointParserVersion": "codex-checkpoint-state-v0.2",
-    "checkpointScanVersion": "codex-export-checkpoint-scan-v0.3",
+    "checkpointScanVersion": "codex-export-checkpoint-scan-v0.5",
     "exporterVersion": "0.3.0-draft.3",
     "packageName": "app-usagemonitor",
-    "packageVersion": "0.1.17",
+    "packageVersion": "0.1.18",
     "resourcePolicyVersion": "g1-r3-candidate-0.5"
   },
   "providerAdapters": {
@@ -62,8 +62,8 @@
           "status": "implemented"
         },
         "rollout": {
-          "adapterVersion": "codex-metadata-export-v5",
-          "parserVersion": "codex-log-scan-v7",
+          "adapterVersion": "codex-metadata-export-v6",
+          "parserVersion": "codex-log-scan-v9",
           "sourceFormat": "codex-rollout-jsonl",
           "status": "implemented"
         }
@@ -72,8 +72,8 @@
     }
   },
   "registry": {
-    "sha256": "c662fa382b9e673d0be40410fcb6a3520005b303cdad80fe9f648bedd9e90359",
-    "version": "telemetry-v0.1-registry-2026-08-06.1"
+    "sha256": "6a786ea575ea6d6731eef4f5fb42302925bae082a432697cb511bb86a14c7612",
+    "version": "telemetry-v0.1-registry-2026-09-03.1"
   },
   "schemas": {
     "members": [
@@ -90,7 +90,7 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/compatibility.schema.json",
         "name": "compatibility.schema.json",
-        "sha256": "4222d99ed1547f0d5b77c5e69e415646b279477b123d3e03f5ed68ef59726c64"
+        "sha256": "72d8accaa8ecef802c8e4a410bc38827bd9f194872302805cadd8dc0845b7188"
       },
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/privacy-receipt.schema.json",
@@ -105,10 +105,10 @@
       {
         "id": "https://app-usagemonitor.local/schemas/telemetry-v0.1/usage-event.schema.json",
         "name": "usage-event.schema.json",
-        "sha256": "0f3203f4949104f7bca19ef2aa926560390965a3dfe564544192641d5ef48fb2"
+        "sha256": "1a3f379200d29bdd1425e3e22ae1be0a6c08d75c38bc5ad2ca6bbbd05d4a68cc"
       }
     ],
-    "setSha256": "de2849b98089b2392736b9db42c7f11d71b1d6be3bfaeb529db08be2844e1471"
+    "setSha256": "8eff2c7dc52d04c8034fa16f4c69242e4cf6a924569bfc75f2dd5e9c5674a5f9"
   },
   "tupleVersion": "usage-export-compatibility-v0.1"
 }

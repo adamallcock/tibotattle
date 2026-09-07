@@ -3,6 +3,7 @@ import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { isProxy } from "node:util/types";
+import { readCompressedRolloutBytes } from "./bounded-rollout-bytes.js";
 
 function configurationFailure() {
   throw new TypeError("Owner-only export workspace storage configuration is invalid");
@@ -278,6 +279,18 @@ async function assertCompleteLineBoundary(path, byteOffset, prefixBytes) {
   if (byteOffset === 0) return;
   let handle;
   try {
+    if (path.endsWith(".jsonl.zst")) {
+      // Checkpoint offsets refer to decoded JSONL, not the physical frame.
+      // The source-plan reader validates the complete frozen decoded hash;
+      // this check independently confirms only the pending commit's boundary.
+      for await (const byte of readCompressedRolloutBytes(path, {
+        start: byteOffset - 1, end: byteOffset,
+      })) {
+        if (byte.length !== 1 || byte[0] !== 0x0a) fail("checkpoint_mismatch");
+        return;
+      }
+      fail("checkpoint_mismatch");
+    }
     handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     const byte = Buffer.allocUnsafe(1);
     const { bytesRead } = await handle.read(byte, 0, 1, byteOffset - 1);

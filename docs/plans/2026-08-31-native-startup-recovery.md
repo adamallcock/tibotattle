@@ -39,9 +39,22 @@ or public release is part of this correction.
   its monotonic native build and freeze the source separately from newer main.
 - [x] Sign, notarize, preserve state and the prior app, and install frozen RC4
   build `1023.2`. This qualifies only source `735a59ce`.
-- [ ] Re-run exact-source artifact gates and verify native startup, refresh,
-  restart, pairing repair, and prompt-free behavior on integrated RC5 build
-  `1023.3`.
+- [x] Re-run exact-source artifact gates and verify native startup, refresh,
+  restart, and prompt-free behavior on integrated RC5 build `1023.3`. Its real
+  refresh failed at five minutes, leading to RC6.
+- [x] Repeat the source, R7, signed-artifact, replacement, startup, and real
+  refresh gates on RC6 build `1023.4`. The lifetime correction passed; the
+  installed run exposed the separate legacy accounting checkpoint recorded
+  below.
+- [x] Repeat the exact-source, R7, signed-artifact, replacement, native startup,
+  prompt-free, and existing local binding/diagnostic checks on RC7 build
+  `1023.5`. End-to-end pairing repair remains unqualified until a compatible
+  hosted Worker is deployed. Its installed refresh ingested generation 44 but
+  exposed the separate fit-metadata defect below.
+- [ ] Repeat the exact-source, R7, signed-artifact, replacement, native startup,
+  refresh, prompt-free, and accounting checks on corrective RC9 build `1023.7`.
+  Installed metadata now identifies RC8 `1023.6`; its evidence cannot qualify
+  RC9. End-to-end pairing repair still requires the separately deployed Worker.
 
 ## Acceptance
 
@@ -129,11 +142,60 @@ closed. The native startup and RC5 allocation files are outside that workload
 closure and remain subject to their separate native and artifact gates.
 
 Installed RC4 source `735a59ce2ec01df0e381fb1aa878c5c7a39edcd8`, build
-`1023.2`, is signed and notarized but excludes PR #94. The next integrated
-dogfood therefore uses monotonic RC5 build `1023.3`; it has not yet been built,
-signed, notarized, or installed. Stable build `1024` remains separately reserved.
+`1023.2`, is signed and notarized but excludes PR #94. At that checkpoint, the
+next integrated dogfood used monotonic RC5 build `1023.3`; it had not yet been
+built, signed, notarized, or installed. Stable build `1024` remained separately
+reserved.
 
 RC5 was subsequently built, signed, notarized and installed, then failed its
 separate real full-accounting refresh gate at the ordinary five-minute timeout.
 The corrective RC6 allocation is `1023.4`; none of RC5's artifact or startup
 evidence qualifies that later source.
+
+## RC6 installed follow-up and RC7 boundary
+
+RC6 source `e59115d41958f6b23496a65c9732a6a9944fdde0`, build `1023.4`,
+was subsequently signed, notarized, installed, and launched against preserved
+schema-11 state without an observed automatic Keychain prompt. Its real refresh
+ran beyond five minutes and reached terminal success, so the RC5 lifetime defect
+is corrected. Native startup recovery also remained successful on that artifact.
+
+The same installed run exposed a separate inherited `recent_7d_indexing` legacy
+checkpoint suppressing otherwise-authoritative unified accounting. RC7 removes
+only that retired collector gate and retains the fail-closed
+`unifiedGenerationAuthoritative` decision. RC7 is allocated build `1023.5`,
+strictly after installed RC6 and before stable `1024`; it still requires fresh
+exact-source gates, protected R7, signing, notarization, state-preserving
+replacement, and installed native verification. PR #94's fixed-real-corpus
+comparator remains **OPEN / NOT RUN**: an explicitly open-gate internal dogfood
+may be tested, but stable and public qualification remain blocked until that
+gate is closed or deliberately resolved.
+
+## RC7 installed follow-up and RC8 boundary
+
+RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, build
+`1023.5`, passed protected R7, the full source gate, signing, notarization,
+stapling, and state-preserving installation. Startup recovery remained healthy.
+The first installed refresh ingested generation 44, then the strict v0.14 cache
+validator rejected inconsistent fit metadata. The fit correctly excluded an
+early diagnostic-only transition, but the projection copied that rejected row's
+eligibility onto the reset fitted from later eligible rows.
+
+RC8 keeps the strict validator and starts reset fit-metadata projection at the
+first eligible row. Build `1023.6` is allocated strictly after RC7 and before
+stable `1024`, but it has not yet passed exact-source R7, artifact, replacement,
+installed-refresh, or physical-native gates. PR #94's formal comparator remains
+**OPEN / NOT RUN** and blocks stable/public qualification; explicitly open-gate
+internal dogfood testing may continue.
+
+## RC9 current follow-up — 2026-09-02
+
+The current corrective source is based on main `35802d21`, after RC8/PR #101.
+RC8 metadata (`0.1.17`, build `1023.6`) was observed in the installed app on
+2026-09-02; this is not a fresh signature or runtime qualification. RC9 `1023.7`
+keeps startup/automatic quota refresh quick and uses one manual Refresh for
+detailed work, with at-most-hourly automatic detailed attempts,
+fences stale native status callbacks, restores authoritative snapshot persistence,
+and supplies a scope-bound mixed-plan Trends projection. It remains under source
+validation. The current execution and open release boundaries are in the
+[RC9 integration amendment](./2026-08-30-native-dogfood-integration.md#rc9-refresh-and-mixed-plan-correction--2026-09-02).

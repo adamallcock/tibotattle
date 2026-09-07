@@ -250,11 +250,24 @@ function openImmutableLocalUnifiedIndex(indexFile) {
   });
 }
 
+const COLD_REFRESH_V15_PREDECESSOR_PARSERS = Object.freeze([
+  "unified-rollout-typed-v10",
+  "unified-rollout-typed-v11",
+  "unified-rollout-typed-v12",
+  "unified-rollout-typed-v13",
+  "unified-rollout-typed-v14",
+]);
+
 function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaVersion) {
   // This is a deadline decision, not permission to read or publish facts. The
-  // worker still validates the complete index. Admit only the observed v10 ->
-  // v11 transition; unknown/future parser stamps never earn a longer deadline.
-  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v11"
+  // worker still validates the complete index. Only reviewed v10 through v14
+  // predecessors can receive the v15 rescan window. Their physical schema and
+  // immutable source identity remain compatible; v12 nullable counters and
+  // v13 ordinal-bearing compaction headers and v14 paginated setting boundaries
+  // and v15 historical parent-model fallback require reparsing present sources.
+  // Keep the target pinned too: a future parser needs an explicit review and
+  // must not silently inherit this longer deadline for every mismatch.
+  if (LOCAL_UNIFIED_INDEX_PARSER_VERSION !== "unified-rollout-typed-v15"
       || schemaVersion !== LOCAL_UNIFIED_INDEX_SCHEMA_VERSION
       || !compatibility.metadataPresent
       || compatibility.formatUserVersion !== LOCAL_UNIFIED_INDEX_USER_VERSION
@@ -296,7 +309,7 @@ function publishedParserUpgradeNeedsColdRefresh(database, compatibility, schemaV
           AND g.tool_provenance_complete = 0)
       )
   `).get(generationId);
-  return generation?.parser_version === "unified-rollout-typed-v10"
+  return COLD_REFRESH_V15_PREDECESSOR_PARSERS.includes(generation?.parser_version)
     && generation.parser_contract_version === TELEMETRY_SCHEMA_VERSION
     && generation.contract_version === TELEMETRY_SCHEMA_VERSION
     && Number.isSafeInteger(generation.completed_at_ms)
@@ -752,6 +765,7 @@ const API_ROUTES = new Set([
   "/api/local/quality",
   "/api/local/timeline/window-breakdown",
   "/api/local/refresh",
+  "/api/local/refresh/quick",
   "/api/local/refresh/cancel",
   "/api/local/contribution/prepare",
   "/api/local/contribution/sync-status",
@@ -4916,11 +4930,35 @@ function createPreparedLocalCompanionServer({
           response,
           "refresh_not_authorized",
         )) return;
-        if (!refresh.start()) {
+        if (!refresh.start({ mode: "detailed" })) {
           // Keep the terminal receipt's opaque run identifier available to a
           // first-party native caller that joined an already-running explicit
           // refresh. It contains no account or evidence data and lets the
           // caller reject a later, unrelated terminal receipt.
+          send(response, 409, {
+            schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+            error: { code: "refresh_in_progress" },
+            refresh: refresh.getStatus(),
+          });
+          return;
+        }
+        send(response, 202, {
+          schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+          refresh: refresh.getStatus(),
+        });
+        return;
+      }
+      if (path === "/api/local/refresh/quick") {
+        if (request.method !== "POST") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        if (!await authorizeLocalMutation(
+          request,
+          response,
+          "refresh_not_authorized",
+        )) return;
+        if (!refresh.start({ mode: "quick" })) {
           send(response, 409, {
             schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
             error: { code: "refresh_in_progress" },

@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import {
+  APP_OFFICIAL_PRICE_CARDS,
   APP_PRICE_REGISTRY_MANIFEST,
   DEFAULT_UNRESOLVED_SPEED_SCENARIO,
   FAST_MODE_ASSUMED_MULTIPLIER,
@@ -100,12 +101,16 @@ const CALIBRATION_AT = "2026-08-17T02:20:00.000Z";
 const CALIBRATION_AT_MS = Date.parse(CALIBRATION_AT);
 const CALIBRATION_FRESH_FOR_MS = 30 * 24 * 60 * 60_000;
 const CALIBRATION_MAX_ACTIVE_CONTEXT_TOKENS = 271_999;
-const CACHE_WRITE_PRICED_MODELS = new Set([
-  "gpt-5.6-sol",
-  "gpt-5.6-sol-wm",
-  "gpt-5.6-terra",
-  "gpt-5.6-luna",
-]);
+const CACHE_WRITE_PRICE_CARDS_BY_MODEL = new Map();
+for (const card of APP_OFFICIAL_PRICE_CARDS) {
+  if (card.provider !== "openai" || card.service_tier !== "standard"
+      || !card.components.some((component) => component.usage_component === "input_cache_write_tokens")) continue;
+  for (const model of [card.model, ...(card.aliases ?? [])]) {
+    const cards = CACHE_WRITE_PRICE_CARDS_BY_MODEL.get(model) ?? [];
+    cards.push(card);
+    CACHE_WRITE_PRICE_CARDS_BY_MODEL.set(model, cards);
+  }
+}
 const CONDITIONAL_ALIAS_MODELS = new Set([
   "codex-auto-review",
   "gpt-5.5-codex",
@@ -119,7 +124,7 @@ const CONDITIONAL_ALIAS_MODELS = new Set([
 // is mostly warm, while the first sampling call after an observed compaction
 // is cold. The low side uses the warmest durable-cohort observation; because
 // child cache and cache-write fields are absent, the high side is deliberately
-// a fully cold sensitivity rather than a claimed p90 interval. GPT-5.6 cards
+// a fully cold sensitivity rather than a claimed p90 interval. Eligible cards
 // price that cold side as a new cache write; older reviewed cards without a
 // cache-write category use ordinary uncached input instead.
 export const SIDE_CHAT_ESTIMATE_ASSUMPTIONS = Object.freeze({
@@ -148,7 +153,8 @@ export const SIDE_CHAT_ESTIMATE_ASSUMPTIONS = Object.freeze({
   }),
   // Cache-write telemetry is absent. The low and point scenarios treat the
   // non-read remainder as ordinary uncached input; the high-cost sensitivity
-  // treats it as a cache write, which current GPT-5.6 cards price at 1.25x.
+  // treats it as a cache write where that exact model/date/context has a
+  // reviewed price component. This does not transfer the Sol calibration.
   uncachedRemainderCacheWriteShare: Object.freeze({
     lowerCost: 0,
     point: 0,
@@ -1345,16 +1351,28 @@ function scenario(name) {
 function priceScenario(sample, selectedScenario) {
   const model = recognizedCodexModelId(sample.model);
   if (model === null) return null;
-  const modelScenario = selectedScenario.name === "upperCost"
-      && selectedScenario.cacheWriteShare > 0
-      && !CACHE_WRITE_PRICED_MODELS.has(model)
-    ? { ...selectedScenario, cacheWriteShare: 0 }
-    : selectedScenario;
-  const estimated = estimatedComponents(
+  let estimated = estimatedComponents(
     sample.activeContextTokens,
-    modelScenario,
+    selectedScenario,
     sample.cacheAssumption,
   );
+  if (selectedScenario.name === "upperCost" && selectedScenario.cacheWriteShare > 0) {
+    const day = new Date(sample.observedAtMs).toISOString().slice(0, 10);
+    const cacheWritePriced = (CACHE_WRITE_PRICE_CARDS_BY_MODEL.get(model) ?? []).some((card) => (
+      (card.effective?.from ?? "0000-00-00") <= day
+      && day <= (card.effective?.to ?? "9999-99-99")
+      && card.components.some((component) => (
+        component.usage_component === "input_cache_write_tokens"
+        && (component.conditions?.min_total_input_tokens === undefined
+          || estimated.totalInputContextTokens >= Number(component.conditions.min_total_input_tokens))
+        && (component.conditions?.max_total_input_tokens === undefined
+          || estimated.totalInputContextTokens <= Number(component.conditions.max_total_input_tokens))
+      ))
+    ));
+    if (!cacheWritePriced) estimated = estimatedComponents(
+      sample.activeContextTokens, { ...selectedScenario, cacheWriteShare: 0 }, sample.cacheAssumption,
+    );
+  }
   // OpenAI charges all generated tokens at the output rate, but the side-chat
   // diagnostic cannot split visible text from hidden reasoning. Keep the
   // public estimate as combined output and map it to ordinary output only at

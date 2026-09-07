@@ -21,6 +21,7 @@ versioning, and retirement rules.
 | Telemetry contribution v0.2 | `packages/telemetry-contract/schemas/v0.2/*.schema.json` and package source | `schemas/telemetry-contribution-v0.2/*.schema.json` byte-canonical mirrors | `npm run telemetry:upload-schemas:check` |
 | Attribution contribution v1.1 (staged) | `packages/telemetry-contract/src/telemetry-v1.1.js`, `telemetry-v1.1-domain.js`, and `telemetry-v1.1-schemas.js` | Eight package JSON Schemas and eight root mirrors in `schemas/telemetry-contribution-v1.1/` | `npm run telemetry:upload-schemas:check`, contract and Worker staging/activation tests |
 | Telemetry browser mirror | Telemetry contract package/source | Browser-consumable generated mirror | `npm run telemetry:browser:check` |
+| Reviewed model identities and admin history | `packages/telemetry-contract/src/model-catalog.js` and `admin-model-history.js` | Public package exports and the telemetry browser mirror; closed export/upload model enums checked against the catalog | Catalog tests, `npm run telemetry:check`, browser and upload mirror checks |
 | Export set v0.1/v0.2 | `schemas/export-set-v0.1/` and `schemas/export-set-v0.2/` | None; controllers/verifiers consume the schemas. | Export schema/controller tests |
 | Export deletion v0.1 | `schemas/export-deletion-v0.1/` | Journal, preflight, commit marker, and receipt are one transaction family. | Export deletion tests |
 | Workspace discard v0.1 | `schemas/export-workspace-discard-v0.1/` | Journal, preflight, commit marker, and receipt are one transaction family. | Workspace discard tests |
@@ -85,6 +86,25 @@ Privacy-sensitive schemas must:
 Schema validation is necessary but not sufficient: construction/projection
 code must also avoid reading forbidden content in the first place.
 
+### Reviewed model vocabulary
+
+The shared model catalog includes every reviewed OpenAI text-model price identity,
+explicit Codex aliases, Spark and the existing Claude identities. It is an exact
+allowlist, not a model-prefix rule or a claim of account availability. The
+catalog records display label, provider, price identity/status and allowance
+track. Aliases stay distinct identities; Spark stays unpriced and on its separate
+allowance. Unknown labels are withheld or fingerprinted at the existing export
+boundary, never copied into admin labels. Legacy telemetry enum positions remain
+stable; newly reviewed values append.
+
+The export registry advances to `telemetry-v0.1-registry-2026-09-03.1` with its
+closed schema and generated compatibility dictionary. Disabled legacy upload
+contracts remain disabled; this vocabulary change does not enable contribution
+or alter consent. Reparse retained source before claiming to recover a model that
+an older extractor normalized to unknown. Admin model history has an independent,
+versioned compact projection; historical absence is not zero observations for a
+newly added model.
+
 ## Compatibility and versioning
 
 Use a new contract version when a consumer could assign a different meaning to
@@ -115,10 +135,10 @@ and opaque plan-era ID (or null). Quota identities represent exact occurrences;
 nullable quota measurements preserve plan-only evidence without inventing a
 reset, percentage or window duration. Conflicting evidence remains explicit.
 
-Code availability is not rollout: migration `0043` initializes v1.1 as `staged`
+Code availability is not rollout: migration `0044` initializes v1.1 as `staged`
 and v0.2 as `blocked`. Accepted lifecycle, an explicit current v1.1 consent grant,
 and the participant's persisted minimum write rank gate every upload route.
-Device renewal/re-pair cannot lower that floor. `0044` activates only complete
+Device renewal/re-pair cannot lower that floor. `0045` activates only complete
 comparison domains after proving predecessor coverage. Partial day arrivals do
 not displace old data. See [architecture](./system-architecture.md) and
 [privacy](./local-data-and-privacy.md) for semantics and lifecycle boundaries.

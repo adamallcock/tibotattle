@@ -118,9 +118,22 @@ function authoritativeSnapshot({ toolHistoryPartial = false } = {}) {
     gradient: { datasets: { rolling: [{ at: 1 }] } },
     weekly: { datasets: { weekly_values: [{ sequence: 1 }] } },
     quality: {},
-    reports: [],
   };
 }
+
+test("authoritative snapshot keys match the production companion projection", () => {
+  const snapshot = authoritativeSnapshot();
+  assert.deepEqual(Object.keys(snapshot).sort(), [
+    "generatedAt",
+    "gradient",
+    "mode",
+    "overview",
+    "quality",
+    "schemaVersion",
+    "weekly",
+  ]);
+  assert.equal(isAuthoritativeDashboardSnapshot(snapshot), true);
+});
 
 function unavailableSnapshot() {
   const snapshot = authoritativeSnapshot();

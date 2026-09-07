@@ -34,10 +34,55 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-**Candidate notes:** [0.1.17](./release-notes/0.1.17.md)
+No changes recorded after 0.1.18.
 
-This candidate section combines direct post-v0.1.16 work with reviewed merged
-pull requests, including [PR #80](https://github.com/adamallcock/tibotattle/pull/80),
+## [0.1.18](./release-notes/0.1.18.md) - 2026-09-05
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.18) ·
+[changes since v0.1.17](https://github.com/adamallcock/tibotattle/compare/v0.1.17...v0.1.18)
+
+- Adds GPT-6 Astra model recognition and Standard, Batch, Flex and Fast
+  API-equivalent pricing, including cache writes and long-context pricing.
+  Missing token components remain unavailable; an Astra reasoning-effort
+  change does not automatically imply a cache reset.
+- Supports compressed Codex histories and current compaction headers, and
+  expands the admin model dashboard to all 39 reviewed OpenAI identities.
+- Fixes resumable paginated reset exports, logical-fork and repeated-generation
+  accounting, and inherited model/speed attribution after a history reset.
+  Exact physical-base continuations remain explicitly unsupported in the
+  checkpoint export lane.
+- Applies the bounded four-hour first-upgrade refresh window to reviewed
+  parser v10/v11/v12/v13-to-v14 rescans; normal warm-refresh limits and
+  preservation safeguards remain unchanged.
+- Introduces separate Apple silicon and Intel macOS 14+ installers, with
+  architecture-specific updates and stable build `1026`
+  ([issue #93](https://github.com/adamallcock/tibotattle/issues/93)). The owner
+  explicitly accepted the unavailable disposable-profile/manual and physical
+  Intel qualification for this release only; reported tester success is not
+  a formal receipt. See the [release-specific waiver](./docs/decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md).
+
+Final artifact trust, data preservation, updater integrity and unexpected
+Keychain prompts remain non-waived gates. This release does not add Windows,
+Linux, Electron or Homebrew Intel support, or activate hosted migrations,
+device pairing or new contribution consent.
+
+## [0.1.17](./release-notes/0.1.17.md) - 2026-09-03
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.17) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.17) ·
+[changes since v0.1.16](https://github.com/adamallcock/tibotattle/compare/v0.1.16...v0.1.17) ·
+[accepted runtime basis](https://github.com/adamallcock/tibotattle/commit/394c8a03a986e0daadbe662679fd002202682e44)
+
+Stable product build `1024` uses accepted runtime basis
+`394c8a03a986e0daadbe662679fd002202682e44`; internal RC9 `1023.7` was the
+preceding dogfood allocation. PR #94 outcome is `passed_with_historical_artifact_refusal`; see the
+[qualification receipt](./docs/receipts/2026-09-03-pr94-account-plan-attribution-qualification.md).
+The manual clean-profile and physical Login Item matrix remains deferred; see
+the [native release plan](./docs/plans/2026-09-03-public-0.1.17-release.md).
+Hosted migrations and device pairing are not activated by the desktop release.
+
+This entry combines direct post-v0.1.16 work with reviewed merges in [PR #80](https://github.com/adamallcock/tibotattle/pull/80),
 [PR #83](https://github.com/adamallcock/tibotattle/pull/83),
 [PR #84](https://github.com/adamallcock/tibotattle/pull/84),
 [PR #85](https://github.com/adamallcock/tibotattle/pull/85),
@@ -50,19 +95,14 @@ pull requests, including [PR #80](https://github.com/adamallcock/tibotattle/pull
 [PR #94](https://github.com/adamallcock/tibotattle/pull/94),
 [PR #95](https://github.com/adamallcock/tibotattle/pull/95), and
 [PR #96](https://github.com/adamallcock/tibotattle/pull/96).
-PRs #73 and #74 are not part of this native macOS candidate. PR #75
-is not merged wholesale; a native subset of its menu-bar and weekly-pace work
-is ported without its Electron or multi-root changes. Separately, this candidate
-advances the local index to schema 11 only for the measured cleanup-index fix;
-it does not import PR #75's broader schema work. The candidate does not include
-the Electron application or unfinished Claude Code usage-monitoring integration
-work. Claude-related carryover is limited to dormant local/export compatibility
-scaffolding already on `main` and removal of the inactive quota route; 0.1.17
-does not collect, display, or claim Claude Code usage. The
-[merged-main comparison](https://github.com/adamallcock/tibotattle/compare/v0.1.16...main)
-is the public branch-history view; PR links identify reviewed merges, while
-unlinked items are direct commits. Nothing in this section is a
-published-release claim.
+PRs #73 and #74 are not part of this native macOS release. PR #75 is not
+merged wholesale; a native subset of its menu-bar and weekly-pace work is
+ported without its Electron or multi-root changes. The release does not
+include the Electron application or unfinished Claude Code usage-monitoring
+integration; 0.1.17 does not collect, display, or claim Claude Code usage.
+The [merged-main comparison](https://github.com/adamallcock/tibotattle/compare/v0.1.16...main)
+provides public branch-history context; PR links identify reviewed merges, while
+unlinked items are direct commits.
 
 ### Added
 
@@ -269,6 +309,7 @@ published-release claim.
 
 ### Release tooling
 
+- Updates the root schema-validation dependency `fast-uri` to patched 3.1.6.
 - Verifies that the rendered social preview is the exact asset selected for the
   release ([PR #52](https://github.com/adamallcock/tibotattle/pull/52)).
 - Adds checked-in, provenance-linked release notes and changelog validation
@@ -281,14 +322,14 @@ published-release claim.
 - Gives Preview its own app, bundle, semantic-open, local-state, Keychain,
   preferences, and Sparkle-feed identities, preventing preview installation or
   updates from replacing stable state.
-- Records builds 1023, 1023.1, 1023.2, and 1023.3 as earlier 0.1.17 internal
-  dogfoods, allocates build 1023.4 to RC6, and retains build 1024 for stable.
-  Signed tooling requires a clean checkout with exactly one matching annotated
-  channel tag at `HEAD` before it can proceed. RC5 build 1023.3 is signed,
-  notarized, and installed evidence for its frozen source, but physical testing
-  found that its ordinary five-minute refresh deadline stopped a legitimate
-  full accounting-cache rebuild. RC6 still requires exact-source gates,
-  protected R7 regeneration, signing, installation, and physical verification.
+- Records the stable build-1024 release allocation and accepted runtime basis
+  `394c8a03a986e0daadbe662679fd002202682e44`; internal RC9 build `1023.7` was
+  the preceding dogfood allocation. Signed tooling requires a clean checkout
+  with exactly one matching annotated channel tag at `HEAD` before it can
+  proceed. The release retains the fail-closed source, generation, resource,
+  validation, atomic-publication, selected-plan Trends, and snapshot safeguards.
+  PR #94 outcome is `passed_with_historical_artifact_refusal` in the [qualification
+  receipt](./docs/receipts/2026-09-03-pr94-account-plan-attribution-qualification.md).
 - Establishes scoped, machine-checked repository guidance for coding agents and
   the root layout they may extend
   ([PR #77](https://github.com/adamallcock/tibotattle/pull/77)).

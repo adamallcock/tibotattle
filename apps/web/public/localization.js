@@ -321,6 +321,12 @@ export const WEB_MESSAGES = Object.freeze({
     "已验证的概要证据仍然可用，但统一历史步骤以固定的降级状态结束（{code}）。自动重试已停止；仍可明确重试。",
     "La evidencia resumida verificada sigue disponible, pero el paso de historial unificado terminó en un estado degradado fijo ({code}). Los reintentos automáticos se han detenido; aún puedes reintentar expresamente.",
   ],
+  "refresh.alreadyRunningTitle": ["An update is already running", "更新正在进行中", "Ya hay una actualización en curso"],
+  "refresh.alreadyRunningCopy": [
+    "This request did not start another update. Your current results remain available; when the current update finishes, choose Refresh again if detailed accounting still needs updating.",
+    "此请求没有启动另一次更新。当前结果仍然可用；当前更新完成后，如果详细核算仍需更新，请再次选择“刷新”。",
+    "Esta solicitud no inició otra actualización. Tus resultados actuales siguen disponibles; cuando termine la actualización en curso, elige Actualizar de nuevo si la contabilidad detallada aún necesita actualizarse.",
+  ],
   // Why the replay-safe accounting artifacts are missing when the rebuild has
   // deferred repeatedly: the rebuild misses its memory ceiling, softly, and
   // retries — this names the cause and the streak instead of showing bare
@@ -384,7 +390,7 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.cacheSwitch.allowanceRange": ["Conditional historical allowance range (may combine accounts): {lower}–{upper} percentage points.", "条件性历史额度范围（可能合并多个帐户）：{lower}–{upper} 个百分点。", "Intervalo histórico condicional de cuota (puede combinar cuentas): {lower}–{upper} puntos porcentuales."],
   "accounting.cacheSwitch.standardPremium": ["Standard-rate accounting equivalent before Fast weighting: {amount}.", "应用 Fast 加权前的 Standard 费率记账等价值：{amount}。", "Equivalente contable con tarifa Standard antes de la ponderación Fast: {amount}."],
   "accounting.cacheSwitch.detailsSummary": ["See possible switch overhead", "查看可能的切换开销", "Ver el posible coste adicional al cambiar"],
-  "accounting.cacheSwitch.detailsExplanation": ["These recent rows pair an adjacent model or reasoning change with an observed material cache-read drop within five minutes. The cache-read change is observed; its relationship to the setting change is inferred.", "这些近期记录将相邻的模型或推理强度更改与五分钟内观测到的缓存读取量大幅下降配对。缓存读取量的变化是观测结果；它与设置更改之间的关系是推断结果。", "Estas filas recientes emparejan un cambio adyacente de modelo o razonamiento con una caída material observada de lectura de caché en un plazo de cinco minutos. El cambio de lectura de caché se observa; su relación con el cambio de configuración se infiere."],
+  "accounting.cacheSwitch.detailsExplanation": ["These recent rows pair an adjacent model or reasoning change with an observed material cache-read drop within five minutes. The cache-read change is observed; its relationship to the setting change is inferred. Effort labels describe recorded request settings, not confirmed backend updates. Astra may retain cache across supported reasoning updates; Ultra’s delegation mode remains a distinct setting.", "这些近期记录将相邻的模型或推理强度更改与五分钟内观测到的缓存读取量大幅下降配对。缓存读取量的变化是观测结果；它与设置更改之间的关系是推断结果。推理标签表示已记录的请求设置，不代表已确认的后端更新。Astra 可在受支持的推理更新期间保留缓存；Ultra 的委派模式仍属于不同的设置。", "Estas filas recientes emparejan un cambio adyacente de modelo o razonamiento con una caída material observada de lectura de caché en un plazo de cinco minutos. El cambio de lectura de caché se observa; su relación con el cambio de configuración se infiere. Los niveles describen la configuración registrada de la solicitud, no actualizaciones confirmadas del servidor. Astra puede conservar la caché con actualizaciones de razonamiento compatibles; el modo de delegación de Ultra sigue siendo una configuración distinta."],
   "accounting.cacheSwitch.detailsEmpty": ["No qualifying material cache-read drops in this period.", "此期间没有符合条件的缓存读取量大幅下降。", "No hay caídas materiales de lectura de caché que cumplan los requisitos en este período."],
   "accounting.cacheSwitch.tableCaption": ["Recent covered switch-overhead comparisons at Standard API rates; not a period total", "近期已覆盖的切换开销比较，按 Standard API 费率计算；并非期间总额", "Comparaciones recientes con cobertura del coste al cambiar, con tarifas de API Standard; no es un total del período"],
   "accounting.cacheDropThread.column": ["Thread name", "会话名称", "Nombre de la conversación"],
@@ -540,6 +546,8 @@ export const WEB_MESSAGES = Object.freeze({
   "accounting.sideChat.estimateRange": ["{point} ({lower}–{upper})", "{point}（{lower}–{upper}）", "{point} ({lower}–{upper})"],
   "accounting.model.noneInPeriod": ["No model usage in this period.", "此期间没有模型使用记录。", "No hay uso de modelos en este período."],
   "accounting.model.unavailable": ["Model usage accounting is unavailable; no zero usage is inferred.", "模型使用情况核算不可用；不会推断为零使用量。", "La contabilidad de uso por modelo no está disponible; no se infiere un uso cero."],
+  "accounting.model.identityUnavailable": ["Model unavailable", "模型不可用", "Modelo no disponible"],
+  "accounting.model.identityUnavailableTitle": ["The model was not recorded or was not recognized. No price is applied to this usage; it is not a zero.", "模型未记录或无法识别。此使用量不会应用价格；这不是零。", "El modelo no se registró o no se reconoció. No se aplica ningún precio a este uso; no es un cero."],
   "accounting.model.unrecognized": ["Unrecognized model", "无法识别的模型", "Modelo no reconocido"],
   "accounting.model.separateAllowanceChip": ["Separate allowance", "独立额度", "Cuota independiente"],
   // Deliberately a marker, not a figure. Spark is metered against its own
@@ -1338,10 +1346,15 @@ export const WEB_MESSAGES = Object.freeze({
   "installer.headerDownload": ["Get the app", "获取应用", "Obtener la app"],
   "installer.installDesktop": ["Install the desktop app", "安装桌面应用", "Instala la app de escritorio"],
   "installer.choosePlatform": ["Choose your platform", "选择你的平台", "Elige tu plataforma"],
-  "installer.platform.macos": ["macOS", "macOS", "macOS"],
+  "installer.platform.macos": ["macOS Apple silicon", "macOS Apple 芯片", "macOS Apple Silicon"],
+  "installer.platform.macosIntel": ["macOS Intel", "macOS Intel", "macOS Intel"],
+  "installer.macosIntel.download": ["Download for macOS Intel", "下载 Intel Mac 版", "Descargar para macOS Intel"],
   "installer.platform.windows": ["Windows", "Windows", "Windows"],
   "installer.platform.linux": ["Linux", "Linux", "Linux"],
   "installer.availability.notYetAvailable": ["Not yet available", "尚未提供", "Aún no disponible"],
+  "installer.macosIntel.unavailableTitle": ["TiboTattle for macOS Intel is not available yet.", "Intel Mac 版 TiboTattle 尚未提供。", "TiboTattle para macOS Intel aún no está disponible."],
+  "installer.macosIntel.unavailableCopy": ["Follow the macOS Intel support work for progress. A download will appear only after the macOS Intel release passes its platform and release checks.", "关注 Intel Mac 支持工作的进展。只有在 Intel Mac 版本通过平台和发行检查后，才会提供下载。", "Sigue el trabajo de compatibilidad con macOS Intel para ver los avances. La descarga solo aparecerá cuando la versión para macOS Intel supere las comprobaciones de plataforma y lanzamiento."],
+  "installer.macosIntel.trackSupport": ["Track macOS Intel support", "关注 Intel Mac 支持", "Seguir la compatibilidad con macOS Intel"],
   "installer.windows.unavailableTitle": ["TiboTattle for Windows is not available yet.", "Windows 版 TiboTattle 尚未提供。", "TiboTattle para Windows aún no está disponible."],
   "installer.windows.unavailableCopy": ["Follow the Windows support work for progress. A download will appear only after the Windows release passes its platform and release checks.", "关注 Windows 支持工作的进展。只有在 Windows 版本通过平台和发行检查后，才会提供下载。", "Sigue el trabajo de compatibilidad con Windows para ver los avances. La descarga solo aparecerá cuando la versión para Windows supere las comprobaciones de plataforma y lanzamiento."],
   "installer.windows.trackSupport": ["Track Windows support", "关注 Windows 支持", "Seguir la compatibilidad con Windows"],

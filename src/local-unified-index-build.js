@@ -13,9 +13,14 @@ import {
   extractRolloutUsage,
   inheritedTierSeed,
   ownObservedTier,
+  resolveLogicalRolloutHeads,
   rolloutContentQuarantineReason,
 } from "./local-unified-index-extract.js";
-import { createHistoryBaseSeedResolver } from "./local-unified-index-history.js";
+import {
+  createHistoryBaseSeedResolver,
+  createParentModelResolver,
+  selectRolloutUsageSeed,
+} from "./local-unified-index-history.js";
 import { withStableRolloutSource } from "./rollout-source-snapshot.js";
 import {
   assertSafeLocalUnifiedIndexTarget,
@@ -710,6 +715,7 @@ export function createEventSink({
         tokensOutCombined: null,
         totalInputContext: null,
         partial: event.partial === true,
+        modelInherited: event.modelInherited === true,
       });
       add(source, "usageEvents");
       if (onCounts !== null && onCounts !== undefined
@@ -791,6 +797,8 @@ async function runWorkerLane(lane, laneIndex, { maximumLineBytes, signal, onBatc
           components: lane.components.map((members) => members.map((info) => ({
             path: info.path,
             size: Number(info.size ?? 0),
+            physicalSize: info.physicalSize,
+            compressed: info.compressed === true,
             sessionId: info.lineage?.sessionId ?? null,
             parentId: info.lineage?.parentId ?? null,
             isFork: info.lineage?.isFork === true,
@@ -1224,18 +1232,12 @@ export async function rebuildLocalUnifiedIndex({
     recordRuntimeIssue(info, reason, state);
   }
 
-  const bySessionId = new Map();
-  for (const info of infos) {
-    if (!info.lineage?.sessionId) continue;
-    const generations = bySessionId.get(info.lineage.sessionId) ?? [];
-    generations.push(info);
-    bySessionId.set(info.lineage.sessionId, generations);
-  }
+  const logicalHeads = resolveLogicalRolloutHeads(infos);
   function seedFor(info) {
     const none = { seedModel: null, seedEffort: null, seedTier: null };
     const parentId = info.lineage?.parentId;
     if (!parentId) return none;
-    const parent = bySessionId.get(parentId)?.at(-1);
+    const parent = logicalHeads.get(parentId);
     if (!parent) return none;
     const parentState = sourceState.get(parent.rolloutKey);
     if (parentState === undefined) return none;
@@ -1249,6 +1251,7 @@ export async function rebuildLocalUnifiedIndex({
       seedTier: inheritedTierSeed(parentState.finalTier),
     };
   }
+  const parentModels = createParentModelResolver(infos, { maximumLineBytes, signal });
   const historySeeds = createHistoryBaseSeedResolver(infos, {
     maximumLineBytes,
     signal,
@@ -1283,7 +1286,9 @@ export async function rebuildLocalUnifiedIndex({
               queueProgress();
               continue;
             }
-            const logicalSeed = seedFor(info);
+            const logicalSeed = info.lineage?.historyMode === "paginated"
+              ? null
+              : seedFor(info);
             const collector = snapshots.collectorFor(info);
             const historySeed = await historySeeds.resolveSeed(info, {
               // Exact history snapshots are only needed when another inline
@@ -1291,8 +1296,11 @@ export async function rebuildLocalUnifiedIndex({
               // continuations need only the constant-size carried state.
               includeSnapshots: collector !== null,
             });
-            if ((historySeed !== null && historySeed.seedModel !== null)
-                || logicalSeed.seedModel !== null) {
+            const selectedSeed = selectRolloutUsageSeed(info, {
+              historySeed,
+              logicalSeed,
+            });
+            if (selectedSeed.seedModel !== null) {
               diagnostics.modelSeededFromLineage += 1;
             }
             replacePersistedSnapshotsFromHistory({
@@ -1304,6 +1312,8 @@ export async function rebuildLocalUnifiedIndex({
               deviceSalt,
               sessionLocalKey: state.sessionLocal,
             });
+            const parentModelAt = selectedSeed.seedModel === null
+              ? await parentModels.forSource(info) : null;
             const outcome = await withStableRolloutSource(info, (source) => (
               extractRolloutUsage(source, {
               size: Number(info.size ?? 0),
@@ -1317,10 +1327,8 @@ export async function rebuildLocalUnifiedIndex({
                 deviceSalt,
                 state.sessionLocal,
               ),
-              seedModel: historySeed?.seedModel ?? logicalSeed.seedModel,
-              seedEffort: historySeed?.seedEffort ?? logicalSeed.seedEffort,
-              seedTier: historySeed?.seedTier ?? logicalSeed.seedTier,
-              seedTotals: historySeed?.seedTotals ?? null,
+              ...selectedSeed,
+              parentModelAt,
               maximumLineBytes,
               signal,
               onEvent: (event) => sink.write(state, event),
@@ -1360,8 +1368,9 @@ export async function rebuildLocalUnifiedIndex({
               finalModel: outcome.finalModel,
               finalEffort: outcome.finalEffort,
               // Only this file's own declarations are carried. An inherited
-              // seed is re-derived from the ancestor chain on the next pass,
-              // so its lineage_inherited provenance survives a resume.
+              // seed is re-derived from the exact physical history base for
+              // paginated sources or the legacy inline ancestor chain, so its
+              // lineage_inherited provenance survives a resume.
               finalTierRaw: ownObservedTier(outcome.finalTier)?.providerTierRaw ?? null,
               finalTierObservedAtMs: ownObservedTier(outcome.finalTier)?.observedAtMs ?? null,
               finalTotals: outcome.finalTotals,

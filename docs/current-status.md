@@ -1,156 +1,108 @@
 ---
 title: Current product and release status
-date: 2026-08-31
+date: 2026-09-05
 type: status
 status: current
-source_commit: 3b0f2d23775c0ca1f092fe3eb48f0c3166c8461a
-observation_date: 2026-08-31
+source_commit: 55c813a1bf7e67c00e47410b760104c0d9fbc0ea
+observation_date: 2026-09-05
 ---
 
 # Current product and release status
 
-This page is the maintained starting point for “what is current?” It separates
-the checked-out source, the public service, published artifacts, and platform
-support because those are independent facts. Re-check the named source before
-using this page for a later release or operational decision.
+This is the maintained starting point for “what is current?” Source, installed
+applications, public downloads, update feeds and hosted service behavior are
+independent observations. Re-check their own source of truth for a later
+operational decision.
 
-## Snapshot identity
+## Published release
 
-| Boundary | Verified state |
+[TiboTattle 0.1.18](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.18)
+is public and immutable. Both macOS 14+ installers are stable build `1026`,
+bound to annotated tag `v0.1.18` at exact source
+`55c813a1bf7e67c00e47410b760104c0d9fbc0ea`.
+[PR #104](https://github.com/adamallcock/tibotattle/pull/104) merged that source
+normally; the release tag and public artifacts must not be rewritten.
+
+| Distribution boundary | Verified on 2026-09-05 |
 |---|---|
-| Documentation/source review | Release-preparation base `origin/main` commit `3b0f2d23775c0ca1f092fe3eb48f0c3166c8461a`, reviewed 2026-08-31; final source freeze is pending |
-| Installed internal dogfood | Signed and notarized RC4 source `735a59ce2ec01df0e381fb1aa878c5c7a39edcd8`, build `1023.2`, installed 2026-08-31; excludes PR #94 and is not current main or stable |
-| Public service | Read-only `GET https://tibotattle.com/api/health`, HTTP 200, deployment source `304f3d736b6f9451d32a616bf3046ea628e828a3`, observed 2026-08-31 |
-| Public updater | Read-only `GET https://updates.tibotattle.com/appcast.xml`, observed 2026-08-27 |
-| Published release | GitHub release API for `adamallcock/tibotattle`, observed 2026-08-27 |
+| GitHub release | All seven public assets independently re-downloaded and matched to the canonical manifest and checksums; immutable release and asset attestations verified |
+| Apple silicon installer | 49,908,061 bytes; SHA-256 `2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae` |
+| Intel installer | 52,128,441 bytes; SHA-256 `70630ba90e92a1cd8cb904e66e1aebe85b04e9d23a50bef7e4e41aca84c4d2f6` |
+| Native trust | Both final artifacts pass their own Developer ID signing, Apple notarization/stapling, Gatekeeper, source/payload and architecture checks |
+| Update feeds | [Apple silicon](https://updates.tibotattle.com/appcast.xml) and [Intel](https://updates.tibotattle.com/intel/appcast.xml) both publish 0.1.18 / 1026; independent signed-XML and streamed enclosure checksum checks passed at 19:38 UTC |
+| Homebrew | Apple silicon cask updated to 0.1.18 with the exact ARM checksum; [update workflow](https://github.com/adamallcock/homebrew-tap/actions/runs/33973076582) succeeded and the live cask was checked |
+| Website | [Both macOS tabs](https://tibotattle.com/#download) show 0.1.18 and their own correct public installer URL, minimum OS and architecture |
+| Installed ARM application | Final stable 1026 passes installed-artifact validation, ordinary launch, detailed replay-safe accounting refresh and restart, with matching generation and zero fallback |
 
-This is a snapshot, not an automatic monitor. A newer commit, deployment, feed,
-or release makes the corresponding row stale without changing the other rows.
+The manifest honestly leaves optional SBOM, source-to-binary provenance and
+store fields unset. GitHub's immutable release/asset attestations are not
+substitutes for SLSA build provenance. Follow
+[verify-release.md](./verify-release.md) for independent artifact verification.
 
-## Source tree
+## Hosted service and current graph incident
 
-The reviewed source implements a local-first macOS product, a loopback local
-analysis service, the public website and optional hosted contribution service,
-and release tooling. The maintained architecture, interface, privacy, schema,
-and command contracts are indexed in [the documentation index](./README.md).
+All approved forward migrations `0042`–`0045` are applied. Exact migration
+prefix 45, complete schema and the preservation reconciliation were verified
+without deleting telemetry, restoring production, changing consent or
+activating v1.1 transport. Applied migration files must not be rewritten.
 
-The source tree at the reviewed commit is ahead of the live Worker reported
-below. Source merge therefore does not prove public deployment.
+[PR #105](https://github.com/adamallcock/tibotattle/pull/105) repaired the
+authenticated admin module dependency and atomic weekly revision replacement.
+The website deployment is source
+`26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad`, whose tree matches that reviewed
+repair. Public downloads and the optional hosted analyzer have separate gates.
 
-### Source-only amendments through 2026-08-31
+The remaining graph incident is a database memory-limit failure in quota
+endpoint sampling. The website truthfully displays history-updating status
+instead of an incomplete estimate. A bounded-memory query repair is being
+qualified separately from the frozen desktop release. Recovery requires
+successful scheduled rebuilding, a subsequent valid preview cache and a
+rendered live graph; health HTTP 200 alone is not sufficient.
 
-The [approved self-service deletion retirement](./decisions/2026-08-30-self-service-deletion-retirement.md)
-retires `DELETE /api/v1/me` as `404 NOT_FOUND` without D1 access or participant
-mutation. It replaces the app control with confirmed **Disconnect this Mac**,
-preserving hosted/local history, and retains private owner erasure through
-admin maintenance. The source health contract is `participantDeletion: false`
-with `deletionSafeRestoreReplay: true`. No migration or retention change is
-part of that retirement. This amendment does not refresh or supersede the
-independent live-service, installed-artifact, release, or updater observations
-below; deployment and release remain separate gates.
+The existing dated social preview was temporarily retained to prioritize the
+verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;
+do not describe that retained image as a new release preview.
 
-[PR #89](https://github.com/adamallcock/tibotattle/pull/89) adds a hosted
-admin-only per-model allowance series and **By model** view. Migration 0041,
-Worker deployment, warming, and real cohort evidence remain separate; desktop
-installation does not activate it.
+The admin per-model view supports the reviewed model catalog, including Astra
+and older model families. Source support does not establish that its live
+preview has recovered. Contribution consent and staged v1.1 activation remain
+unchanged. The source health contract retains `participantDeletion: false`
+and `deletionSafeRestoreReplay: true`; these flags do not prove every route.
 
-[PR #94](https://github.com/adamallcock/tibotattle/pull/94) adds local plan-era
-attribution plus a staged telemetry v1.1 transport and device-continuity repair.
-Local estimates, history, ranges, forecasts, and share cards use one compatible
-selected population; missing or conflicting identity remains unavailable.
-Migrations 0042-0044, stronger-format hosted activation, and new explicit
-consent are not supplied by installing the desktop app.
+## Platform support and qualification limits
 
-[PR #95](https://github.com/adamallcock/tibotattle/pull/95) makes compatible
-Keychain migration bounded and non-interactive, with an explained approval
-fallback available only through a deliberate Settings action. Automatic
-security prompts are release-blocking.
+- **Supported:** macOS 14+ Apple silicon and Intel through the published 0.1.18
+  artifacts and their independent update feeds.
+- **Not released or supported:** Windows, Linux or Electron.
+- Homebrew support remains Apple silicon only; the Intel DMG is distributed
+  directly through the website and GitHub release.
 
-[PR #96](https://github.com/adamallcock/tibotattle/pull/96) makes native startup
-use the bounded primary projection and recover from readiness that arrives after
-the initial wait without retaining a stale timeout page. These entries describe
-merged source at the release-preparation base; they are not installed-artifact,
-hosted-deployment, updater, or stable-release evidence.
+The owner explicitly accepted the unavailable disposable-profile/manual Login
+Item matrix and formal physical Intel install/runtime/update/upload evidence
+**for 0.1.18 only**. These observations are waived, not passed. User-reported
+tester success is not a retained hardware-bound qualification receipt.
+See the [release-specific decision](./decisions/2026-09-05-release-0-1-18-manual-qualification-waiver.md)
+and [platform support authority](./reference/platform-support.md).
 
-## Public service
+Data preservation, exact source/artifact binding, native trust, updater
+integrity and unexpected automatic Keychain prompts were not waived.
+Fresh R7 evidence and both pinned-runtime checks were retained; the existing
+open resource decisions are not relabeled as `release_ready`. The supported
+paginated-history reset subset is documented in the
+[qualification review](./reviews/2026-09-04-paginated-export-qualification.md);
+physical-base continuations remain refused.
 
-At the observation time, `/api/health` returned HTTP 200 and deployment source
-commit `304f3d736b6f9451d32a616bf3046ea628e828a3`. That deployment predates PR
-#94's device-continuity protocol. It can treat replay of one pairing identifier
-idempotently, but does not establish the fresh-pairing recovery protocol needed
-for an already registered local device.
+Private RC1, RC2 and RC3 candidates, the first pre-repair stable attempt, and
+compatible application/state recovery pairs remain preserved historical
+evidence. They are not the published stable bytes. Do not downgrade upgraded
+state by replacing only its application with an older writer.
 
-The live Worker commit is behind this document's reviewed source commit. Do not
-describe PR #89 or PR #94 Worker behavior as deployed until the live health
-identity advances and the affected migration and route are checked directly.
-Read-only production migration-ledger inspection was unavailable to the current
-operator credentials, so remote migration state remains unknown rather than
-assumed current.
+## Maintaining this snapshot
 
-## Published macOS release and updater
-
-The latest public GitHub release was immutable stable release `v0.1.16`,
-published 2026-08-21. It includes the Apple-silicon DMG, appcast, release
-manifest, checksums, and verification guide. The public appcast returned HTTP
-200 and advertised the same `0.1.16` arm64 DMG with macOS 14.0 as the minimum.
-
-These observations prove public availability of the named release endpoints.
-They do not re-run code signing, notarization, Gatekeeper, clean-install, or
-update-install qualification. Use [verify-release.md](./verify-release.md) for
-artifact verification and the retained release receipts for their exact
-point-in-time evidence only.
-
-## Platform support
-
-- **Supported:** macOS 14 or later on Apple silicon, through the published
-  `v0.1.16` stable artifact described above.
-- **Not supported:** Windows and Linux. Source, contract, or simulated lanes do
-  not establish an installed, signed, updateable product on those platforms.
-The complete qualification matrix and rules for changing these claims are in
-[platform-support.md](./reference/platform-support.md).
-
-## Known boundaries
-
-- The checked-out source contains unreleased changes after `v0.1.16`; the
-  [changelog](../CHANGELOG.md) records them without claiming they shipped.
-- Integrated RC5 source `ff506dc3`, build `1023.3`, was signed, notarized and
-  installed on 2026-08-31. Its state-preserving replacement and first launch
-  passed, but its real full-accounting refresh did not: a healthy v0.14 rebuild
-  was terminated by the ordinary five-minute deadline. RC5 is therefore not
-  the dogfood handoff. Corrective RC6 is allocated monotonic build `1023.4` and
-  still needs frozen-source, R7, signed-artifact, replacement and physical
-  refresh evidence.
-- The RC5 R7 workload-source closure has protected dual-runtime
-  receipts for 359 files / workload SHA-256
-  `4c3058b3453bda2696e946952d18e81310f26eb0187074d410c730e44162f1d6`.
-  Both decisions remain honestly `release_open`. RC6 changes workload-owned
-  refresh/accounting source, so those receipts are now historical for RC5 and
-  must be regenerated after the corrective source is frozen. Native UI and
-  build-allocation files remain subject to their separate macOS source, smoke,
-  signed-artifact, and installed-artifact gates.
-- The public service and release feed are remote state. Their health and
-  availability can change after this snapshot.
-- Public health is not proof that every admin, identity, contribution, deletion,
-  or updater path works end to end.
-- Before RC6 dogfood sign-off or 0.1.17 stable qualification, PR #94 still needs
-  the fixed real-corpus before/after coverage, diagnostic-distribution, and
-  resource review. Current APIs cannot emit the complete named fit-rejection
-  reconciliation, so that gate remains open rather than inferred green. The
-  exact integrated native artifact must also pass signing, notarization,
-  state-preserving installation, updater, and physical native checks. Pairing
-  continuity needs compatible hosted Worker migrations/deployment before the
-  repaired desktop flow can be validated end to end.
-- An owner-only fixed-window attempt on 2026-08-31 failed closed before comparison:
-  the strict pre-PR scan reported `codex_rollout_content_invalid`. The supported
-  resource benchmark independently stopped at `benchmark_cold_rebuild_incomplete`
-  on both exact PR #94 revisions. No empirical comparison receipt was produced,
-  no source was excluded, and this remains an open RC6/stable gate.
-
-## How to refresh this page
-
-Update each row from its own source of truth: exact Git commit, read-only public
-health response, public appcast bytes, and the GitHub release API. Record the
-observation date, preserve any disagreement, and never infer deployment or
-platform support from source alone. If the page cannot be refreshed in the same
-change as a material claim, narrow or remove the claim instead of carrying it
-forward.
+Update each boundary from exact source, artifact checks, read-only public
+responses, signed feed bytes and actual rendered behavior. Preserve any
+disagreement instead of inferring publication from a build, service recovery
+from health, or physical qualification from a simulated lane. The
+[documentation index](./README.md) and
+[release execution plan](./plans/2026-09-05-public-0-1-18-release.md) retain the
+implementation and historical qualification context.

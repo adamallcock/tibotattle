@@ -233,6 +233,7 @@ test("stages only verified generated public assets and maps the community entry 
     "app.js",
     "data-client.js",
     "navigation.js",
+    "telemetry-shared.generated.js",
   ]) {
     await assert.rejects(
       readFile(join(value.destination, withheld), "utf8"),
@@ -255,4 +256,34 @@ test("stages only verified generated public assets and maps the community entry 
     }),
     /does not match the source snapshot/u,
   );
+});
+
+test("staging refuses a missing shared admin dependency and never publishes the private telemetry mirror", async (t) => {
+  const value = await fixture();
+  t.after(() => rm(value.root, { recursive: true, force: true }));
+  const manifestPath = join(value.source, "release-site-manifest.json");
+  const originalManifest = await readFile(manifestPath, "utf8");
+  const stage = () => stageProductionAssets({
+    repositoryRoot: value.root,
+    sourceDirectory: value.source,
+    destinationDirectory: value.destination,
+  });
+  for (const path of [
+    "styles.css", "ui-format.js", "localization.js", "i18n.generated.js",
+    "community-data.js", "community-view.js",
+  ]) {
+    const manifest = JSON.parse(originalManifest);
+    manifest.files = manifest.files.filter((entry) => entry.path !== path);
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    await rm(join(value.source, path));
+    await assert.rejects(stage(), /missing a shared admin dependency/u);
+    await writeFile(join(value.source, path), value.generatedFiles[path]);
+  }
+  await writeFile(manifestPath, originalManifest);
+  await writeFile(join(value.source, "telemetry-shared.generated.js"), "export const privateModule = true;");
+  await assert.rejects(stage(), /local-only asset: telemetry-shared\.generated\.js/u);
+  await rm(join(value.source, "telemetry-shared.generated.js"));
+  await writeFile(join(value.source, "community.js"), 'import "./telemetry-shared.generated.js";');
+  await updateManifestRow(value.source, "community.js");
+  await assert.rejects(stage(), /local-only route or control/u);
 });

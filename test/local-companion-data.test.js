@@ -41,6 +41,11 @@ import {
   readLocalUnifiedCompanionProjection,
 } from "../src/local-unified-companion-source.js";
 import { usageProjection } from "../src/local-companion-usage-model.js";
+import {
+  isAuthoritativeDashboardSnapshot,
+  readAuthoritativeDashboardSnapshot,
+  writeAuthoritativeDashboardSnapshot,
+} from "../src/local-authoritative-dashboard-snapshot.js";
 
 const ARTIFACT_FILES = {
   gradient: "2026-07-24-simple-quota-gradient-artifact.json",
@@ -2381,6 +2386,17 @@ test("full unified snapshot prices stored context like the same-generation repla
     assert.equal(accounting.compatibilityBehavior, "legacy_zero");
     assert.equal(timeline.source, "unified_local_index");
     assert.equal(timeline.history.status, "complete");
+    // Exercise the production builder, not a hand-shaped fixture: requiring
+    // a retired top-level report field previously rejected every real save.
+    assert.equal(isAuthoritativeDashboardSnapshot(snapshot), true);
+    const snapshotFile = join(stateDirectory, "private", "last-authoritative-dashboard.json");
+    assert.equal(await writeAuthoritativeDashboardSnapshot({
+      snapshotFile, snapshot, now: () => nowMs,
+    }), true);
+    const restored = await readAuthoritativeDashboardSnapshot({ snapshotFile });
+    assert.notEqual(restored, null);
+    assert.deepEqual(restored.snapshot, JSON.parse(JSON.stringify(snapshot)),
+      "the production JSON projection survives durable persistence exactly");
     const all = usage.find((period) => period.id === "all");
     const history = accounting.periods.find((period) => period.periodId === "history");
     assert.equal(all.events, cases.length);
@@ -3354,5 +3370,90 @@ test("every surface a withheld projection empties is registered for retention", 
     "overview.timeline.sparkUsage",
     "overview.timeline.calibrationUsage",
     "overview.timeline.allowanceCapacity",
+    "overview.timeline.planScoped",
   ]);
+});
+
+
+test("Trends retains plan-scoped history through refresh only with its matching capacity", async (t) => {
+  const scope = {
+    methodVersion: "plan-era-v1", planType: "pro", basisFamilyId: "synthetic-basis",
+    cohortId: "a".repeat(64), sourceGeneration: 35,
+    sourceGenerationFingerprint: "synthetic-generation-35",
+  };
+  const available = {
+    schemaVersion: "local-plan-scoped-accounting-timeline-v1",
+    status: "available", reason: null, encoding: "plan_bucket_v1", planScope: scope,
+    usage: [[Date.parse("2026-09-07T11:45:00.000Z"), 1,
+      1000, 0, 0, 0, 0, 0, 4, 4, 8, 0, 0, 1, 0, 1000]],
+    quota: [[Date.parse("2026-09-07T11:45:00.000Z"),
+      Date.parse("2026-09-08T00:00:00.000Z") / 1000, 30]],
+    comparisonIntervals: [[Date.parse("2026-09-07T11:45:00.000Z"),
+      Date.parse("2026-09-07T12:00:00.000Z")]],
+  };
+  const unavailable = {
+    schemaVersion: available.schemaVersion, status: "unavailable",
+    reason: "plan_scoped_timeline_unavailable", planScope: null,
+    usage: [], quota: [], comparisonIntervals: [],
+  };
+  const snapshot = (matched, planScoped, capacity = { status: "unavailable" }) => ({
+    schemaVersion: LOCAL_COMPANION_SCHEMA_VERSION,
+    mode: "real_local_evidence", generatedAt: "2026-09-07T12:00:00.000Z",
+    overview: {
+      accounting: { sourceMode: "unified", generationMatched: matched },
+      timeline: { usage: [1], planScoped, allowanceCapacity: capacity, quota: ["current quota"] },
+    },
+    gradient: { datasets: {} }, weekly: { datasets: {} }, quality: {}, reports: [],
+  });
+  const initial = snapshot(true, available, { status: "available", planScope: scope });
+  async function reload(next, purpose = "full") {
+    const originals = structuredClone([initial, next]);
+    let call = 0;
+    const store = new LocalCompanionDataStore({ builder: async () => call++ === 0 ? initial : next });
+    await store.reload({ purpose: "full" });
+    await store.reload({ purpose });
+    assert.deepEqual([initial, next], originals, "builder snapshots remain immutable");
+    return store.getOverview();
+  }
+  for (const purpose of ["full", "quick", "startup"]) {
+    await t.test(`${purpose} reuses the scoped history and capacity together`, async () => {
+      const result = await reload(snapshot(false, unavailable), purpose);
+      assert.deepEqual(result.timeline.planScoped, available);
+      assert.deepEqual(result.timeline.allowanceCapacity.planScope, scope);
+      assert.deepEqual(result.timeline.quota, ["current quota"]);
+      assert.equal(result.accounting.generationMatched, false);
+      const { selectAllowancePlanPopulation } = await import("../apps/web/public/data-client.js");
+      const selected = selectAllowancePlanPopulation({ ...result, weekly: {
+        planAttribution: { methodVersion: "plan-era-v1" }, selectedPlanType: "pro",
+        planPopulations: [{ planType: "pro", status: "available" }],
+      } });
+      assert.equal(selected.allowancePlanSelection.comparisonAvailable, true,
+        "the actual Trends selector still accepts the retained comparison");
+      assert.deepEqual(selected.timeline.selectedPlanUsage, available.usage);
+      assert.deepEqual(selected.timeline.comparisonIntervals, available.comparisonIntervals);
+    });
+  }
+  for (const key of Object.keys(scope)) {
+    await t.test(`changed capacity ${key} cannot borrow previous scoped history`, async () => {
+      const changed = { ...scope, [key]: key === "sourceGeneration" ? 36 : "different" };
+      const result = await reload(snapshot(false, unavailable, { status: "available", planScope: changed }));
+      assert.deepEqual(result.timeline.planScoped, unavailable);
+      assert.deepEqual(result.timeline.allowanceCapacity.planScope, changed);
+    });
+  }
+  await t.test("authoritative empty and fresh scoped history replace retained data", async () => {
+    assert.deepEqual((await reload(snapshot(true, unavailable))).timeline.planScoped, unavailable);
+    const fresh = { ...available, usage: [[6, 7]], comparisonIntervals: [[6, 8]] };
+    assert.deepEqual((await reload(snapshot(false, fresh))).timeline.planScoped, fresh);
+  });
+  await t.test("cold start, absent capacity scope and omitted surface do not manufacture history", async () => {
+    const incoming = snapshot(false, unavailable);
+    const cold = new LocalCompanionDataStore({ builder: async () => incoming });
+    await cold.reload({ purpose: "quick" });
+    assert.deepEqual(cold.getOverview().timeline.planScoped, unavailable);
+    const noScope = await reload(snapshot(false, unavailable, { status: "available" }));
+    assert.deepEqual(noScope.timeline.planScoped, unavailable);
+    delete incoming.overview.timeline.planScoped;
+    assert.equal(Object.hasOwn((await reload(incoming)).timeline, "planScoped"), false);
+  });
 });

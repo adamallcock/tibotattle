@@ -15,6 +15,7 @@ an informal archive.
 
 | Area | Authority | Boundary |
 |---|---|---|
+| 0.1.19 patches | [Model attribution and labels](./plans/2026-09-06-v0.1.19-model-attribution-and-labels.md) | Prepared model-inheritance and display patches; private history conservation verified, release pending |
 | Status | [Current product and release status](./current-status.md) | Commit- and date-stamped source, live-service, published-release, updater, and support snapshot; reverify before relying on it later |
 | User help | [User guide](./user-guide.md) | Installation, first run, uncertainty, refresh/recovery, optional contribution, data, updates, and support |
 | Architecture | [System architecture](./reference/system-architecture.md) | Current components, trust boundaries, stores, identities, and data flow |

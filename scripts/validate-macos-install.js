@@ -5,6 +5,7 @@ import { RELEASE_MANIFEST } from "../config/release-manifest.js";
 import { resolveReleaseChannel } from "../config/release-channels.js";
 import {
   MACOS_PREVIEW_DISTRIBUTION_CHANNEL,
+  normalizeMacOSBuildArchitecture,
   validateMacOSPreviewApp,
 } from "./build-macos-app.js";
 import {
@@ -16,6 +17,7 @@ const SCRIPT_FILE = fileURLToPath(import.meta.url);
 
 export function parseArguments(argv) {
   let appPath = null;
+  let architecture = null;
   let dmgPath = null;
   let channel = null;
   let development = false;
@@ -25,6 +27,8 @@ export function parseArguments(argv) {
     const argument = argv[index];
     if (argument === "--app" && appPath === null && index + 1 < argv.length) {
       appPath = resolve(argv[++index]);
+    } else if (argument === "--architecture" && architecture === null && index + 1 < argv.length) {
+      architecture = normalizeMacOSBuildArchitecture(argv[++index]);
     } else if (argument === "--dmg"
         && dmgPath === null
         && index + 1 < argv.length) {
@@ -59,6 +63,7 @@ export function parseArguments(argv) {
     );
   }
   const production = !development && !preview;
+  architecture ??= "arm64";
   if (preview && channel !== MACOS_PREVIEW_DISTRIBUTION_CHANNEL) {
     throw new Error(
       `--preview requires --channel ${MACOS_PREVIEW_DISTRIBUTION_CHANNEL}`,
@@ -66,7 +71,7 @@ export function parseArguments(argv) {
   }
   const releaseChannel = preview
     ? Object.freeze({ name: MACOS_PREVIEW_DISTRIBUTION_CHANNEL })
-    : resolveReleaseChannel(channel);
+    : resolveReleaseChannel(channel, { architecture });
   if (release) {
     return {
       appPath: null,
@@ -74,16 +79,19 @@ export function parseArguments(argv) {
         join(
           ".release-build",
           "macos-release",
-          RELEASE_MANIFEST.macOS.arm64DmgFileName,
+          ...(releaseChannel.name === "stable" ? [] : [releaseChannel.name]),
+          architecture === "x64" ? RELEASE_MANIFEST.macOS.x64DmgFileName : RELEASE_MANIFEST.macOS.arm64DmgFileName,
         ),
       ),
       channel: releaseChannel.name,
+      architecture,
       distribution: "release",
       production,
     };
   }
   return {
     appPath,
+    architecture,
     channel: releaseChannel.name,
     distribution: production ? "release" : preview ? "preview" : "development",
     dmgPath,
@@ -99,13 +107,14 @@ export async function main(argv, dependencies = {}) {
     ?? validateMacOSPreviewApp;
   const validateDMG = dependencies.validateMacOSDMG ?? validateMacOSDMG;
   const validationOptions = {
+    architecture: options.architecture,
     channel: options.channel,
     distribution: options.distribution,
     production: options.production,
   };
   let result;
   if (options.appPath && options.distribution === "preview") {
-    const inspected = await validatePreview(options.appPath);
+    const inspected = await validatePreview(options.appPath, { architecture: options.architecture });
     result = {
       bundleIdentifier: inspected.bundleIdentifier,
       production: false,

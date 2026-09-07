@@ -32,8 +32,16 @@ export const TELEMETRY_BROWSER_MIRROR_FILE = join(
 
 const CANONICAL_MODULES = Object.freeze([
   Object.freeze({
-    basename: "constants.js",
+    basename: "model-catalog.js",
     expectedImports: Object.freeze([]),
+  }),
+  Object.freeze({
+    basename: "admin-model-history.js",
+    expectedImports: Object.freeze(["./model-catalog.js"]),
+  }),
+  Object.freeze({
+    basename: "constants.js",
+    expectedImports: Object.freeze(["./model-catalog.js"]),
   }),
   Object.freeze({
     basename: "errors.js",
@@ -51,6 +59,7 @@ const CANONICAL_MODULES = Object.freeze([
   Object.freeze({
     basename: "telemetry-v0.1.js",
     expectedImports: Object.freeze([
+      "./model-catalog.js",
       "./constants.js",
       "./errors.js",
       "./primitives.js",

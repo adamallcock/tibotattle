@@ -924,7 +924,8 @@ function hideConnectionNotice() {
 }
 
 function renderDashboardUnavailableState(kind) {
-  resetCacheDropThreadLinks();
+  // The last accounting rows remain visible during a failed refresh.
+  resetCacheDropThreadLinks(cacheDropThreadLinks.dashboard);
   const companionCopy = isLoopbackDashboard()
     ? "dashboard.unavailable.companionInAppCopy"
     : "dashboard.unavailable.companionCopy";
@@ -1684,7 +1685,7 @@ function humanize(value) {
 }
 
 function matchedRollingPairs(data) {
-  if (data.timeline?.usage?.length) {
+  if (allowanceTimelineUsage(data).length) {
     return liveTimelinePoints(data, {
       windowHours: CALIBRATION_WINDOW_HOURS,
       rangeDays: activeUsageRangeDays,
@@ -1695,6 +1696,12 @@ function matchedRollingPairs(data) {
   // diagnostics, but cannot supply an allowance comparison without the
   // bucket-level speed evidence needed to match the numerator and capacity.
   return [];
+}
+
+function allowanceTimelineUsage(data) {
+  return data.allowancePlanSelection
+    ? data.timeline?.selectedPlanUsage ?? []
+    : data.timeline?.usage ?? [];
 }
 
 function renderComparison(data) {
@@ -3429,7 +3436,7 @@ function groupRolling(rows, hours) {
 }
 
 function latestTimelineObservationMs(data) {
-  const latest = data.timeline.usage.at(-1)?.endAt
+  const latest = allowanceTimelineUsage(data).at(-1)?.endAt
     ?? mainWeeklyQuotaTrack(data.timeline.quota).at(-1)?.observedAt
     ?? data.freshness.latestObservedAt;
   const latestMs = Date.parse(latest);
@@ -3838,12 +3845,28 @@ function timelineAllowanceWeightedCost(row, capacitySelection) {
     : null;
 }
 
+function timelineComparisonInterval(data, startMs, endMs) {
+  // Legacy DTOs have no plan-selection contract. A selected-plan view must
+  // positively cover the entire span; absence is not evidence of continuity.
+  if (!data.allowancePlanSelection) return null;
+  const intervals = data.timeline.comparisonIntervals ?? [];
+  let low = 0;
+  let high = intervals.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (intervals[middle][0] <= startMs) low = middle + 1;
+    else high = middle;
+  }
+  const interval = intervals[low - 1];
+  return interval && endMs <= interval[1] ? interval : false;
+}
+
 function liveTimelinePoints(
   data,
   {
     windowHours = CALIBRATION_WINDOW_HOURS,
     rangeDays = activeCalibrationRangeDays,
-    usage = data.timeline.usage,
+    usage = allowanceTimelineUsage(data),
   } = {},
 ) {
   const capacitySelection = timelineCalibrationCapacity(data);
@@ -3890,10 +3913,17 @@ function liveTimelinePoints(
   let driftCostUsd = 0;
   let comparisonSegment = 0;
   let previousComparable = false;
+  let previousPlanInterval = null;
   for (let index = 0; index < usage.length; index += 1) {
     const current = usage[index];
     const endMs = Date.parse(current.endAt);
     const currentWeightedCost = weightedCosts[index];
+    const planInterval = timelineComparisonInterval(data, Date.parse(current.startAt), endMs);
+    if (planInterval === false || planInterval !== previousPlanInterval) {
+      driftAnchor = null;
+      driftCostUsd = 0;
+    }
+    previousPlanInterval = planInterval;
     if (currentWeightedCost === null) rollingWeightingGaps += 1;
     else rollingCost += currentWeightedCost;
     rollingEvents += current.usageEvents;
@@ -3951,7 +3981,11 @@ function liveTimelinePoints(
     }
     const before = startMatch?.row ?? null;
     const after = afterMatch?.row ?? null;
+    const planComparable = timelineComparisonInterval(data,
+      Math.min(spanStartMs, startMatch?.timestampMs ?? spanStartMs),
+      Math.max(spanEndMs, afterMatch?.timestampMs ?? spanEndMs)) !== false;
     const bracketed = before && after
+      && planComparable
       && spanStartMs - startMatch.timestampMs <= maximumBracketGapMs
       && endMs - afterMatch.timestampMs <= maximumBracketGapMs;
     const sameReset = Boolean(bracketed)
@@ -4009,6 +4043,7 @@ function liveTimelinePoints(
       windowEvents = Math.max(0, eventsPrefix[top] - eventsPrefix[lower]);
     }
     const expected = !poolSaturated
+        && planComparable
         && capacity !== null && capacity > 0
         && windowWeightingGaps === 0
       ? windowCostUsd / capacity * 100
@@ -4022,9 +4057,10 @@ function liveTimelinePoints(
       apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : 0,
       poolSaturated,
     });
-    const evidence = windowWeightingGaps === 0
-      ? classifiedEvidence
-      : { status: "quota_weighting_unavailable", residual: null };
+    const evidence = !planComparable
+      ? { status: "reset_or_track_change", residual: null }
+      : windowWeightingGaps === 0 ? classifiedEvidence
+        : { status: "quota_weighting_unavailable", residual: null };
     let cumulativeResidual = null;
     // A re-anchor marks the first drift observation of a new reset or track:
     // the deviation-period detector splits its runs here, so a sustained drift
@@ -4034,6 +4070,8 @@ function liveTimelinePoints(
     if (capacity !== null && capacity > 0
         && currentWeightedCost !== null
         && after !== null
+        && timelineComparisonInterval(data,
+          Math.min(Date.parse(current.startAt), afterMatch.timestampMs), endMs) !== false
         && Number.isFinite(finite(after.usedPercent))
         && endMs - afterMatch.timestampMs <= maximumBracketGapMs) {
       // A used_percent DECREASE beyond display jitter inside one boundary is
@@ -4116,8 +4154,8 @@ function liveTimelinePoints(
       // Kept under the legacy internal key for downstream chart diagnostics,
       // but this is now the selected speed-priced amount, never Standard
       // dollars paired with a Fast-adjusted capacity.
-      apiCostUsd: windowWeightingGaps === 0 ? windowCostUsd : null,
-      allowanceWeightedUsd: windowWeightingGaps === 0
+      apiCostUsd: planComparable && windowWeightingGaps === 0 ? windowCostUsd : null,
+      allowanceWeightedUsd: planComparable && windowWeightingGaps === 0
         ? windowCostUsd
         : null,
       allowanceBasisId: capacitySelection?.basisId ?? null,
@@ -4138,7 +4176,7 @@ function groupedUsageTimeline(data) {
   const hourMs = 60 * 60 * 1_000;
   const cutoff = timelineCutoffMs(data, activeUsageRangeDays);
   const groups = new Map();
-  for (const row of data.timeline.usage) {
+  for (const row of allowanceTimelineUsage(data)) {
     const timestamp = Date.parse(row.startAt);
     if (!Number.isFinite(timestamp) || timestamp < cutoff) continue;
     let key;
@@ -4593,13 +4631,18 @@ function selectedTimelinePoints(data) {
       && timelineSeriesMemo.rangeDays === activeCalibrationRangeDays) {
     return timelineSeriesMemo.selection;
   }
-  const sideChatAdjusted = data.accounting?.sideChatEstimates?.status
+  const scopedUsage = allowanceTimelineUsage(data);
+  // Side-chat estimates predate plan-era attribution. They remain visible in
+  // all-plan accounting, but cannot enter a current-plan numerator until they
+  // carry the same plan/generation scope as the exact usage timeline.
+  const sideChatAdjusted = !data.allowancePlanSelection
+    && data.accounting?.sideChatEstimates?.status
       === "available"
     && data.accounting.sideChatEstimates.methodology
       ?.includedInCalibrationTimeline === true
     && Array.isArray(data.timeline.calibrationUsage)
     && data.timeline.calibrationUsage.length > 0;
-  const exactByBucket = new Map(data.timeline.usage.map((row) => [
+  const exactByBucket = new Map(scopedUsage.map((row) => [
     `${row.startAt}|${row.endAt}`,
     row,
   ]));
@@ -4655,7 +4698,7 @@ function selectedTimelinePoints(data) {
   const livePoints = liveTimelinePoints(data, {
     usage: sideChatAdjusted
       ? data.timeline.calibrationUsage
-      : data.timeline.usage,
+      : scopedUsage,
   });
   // Retained gradient artifacts carry only Standard-rate rolling cost. They
   // can remain historical evidence elsewhere, but may never replace the
@@ -4817,6 +4860,11 @@ function renderTimelineConfidence(
   if (accountingIsUnavailable(data)) {
     element.classList.add("low");
     setLocalizedText(element, projectionUnavailableCopyKey(data));
+    return;
+  }
+  if (data.allowancePlanSelection?.comparisonAvailable === false) {
+    element.classList.add("low");
+    setLocalizedText(element, "weekly.plan.comparisonPending");
     return;
   }
   const activePoints = visiblePoints.filter((point) => point.status !== "inactive");
@@ -5338,6 +5386,55 @@ function renderResidualInspectionTable() {
 // panel has a stable target for its toggle's `aria-controls`.
 let nextDivergenceBreakdownId = 0;
 
+// Display-only state for the detector's bounded set of visible windows. Index
+// revisions refresh details without changing a window's identity; a changed
+// population or contributor mix cannot inherit another window's answer.
+const divergenceDetails = new Map();
+const MAX_DIVERGENCE_DETAILS = 20;
+
+function divergenceDetailScope(data) {
+  const scope = data?.timeline?.planScoped?.planScope;
+  return JSON.stringify([
+    data?.mode,
+    data?.allowancePlanSelection?.planType ?? null,
+    scope?.planType ?? null,
+    scope?.methodVersion ?? null,
+    scope?.basisFamilyId ?? null,
+    scope?.cohortId ?? null,
+  ]);
+}
+
+function divergenceDetailKey(period, scope) {
+  return JSON.stringify([scope, period.startMs, period.endMs, period.contributors]);
+}
+
+function prepareDivergenceDetails(data, periods) {
+  const scope = divergenceDetailScope(data);
+  const generation = data?.accounting?.generation;
+  const planScope = data?.timeline?.planScoped?.planScope;
+  const revision = generation == null && !planScope?.sourceGeneration
+    ? data
+    : JSON.stringify([generation, data?.accounting?.generationFingerprint,
+      planScope?.sourceGeneration, planScope?.sourceGenerationFingerprint]);
+  const retained = new Set();
+  for (const period of periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
+    const key = divergenceDetailKey(period, scope);
+    retained.add(key);
+    let state = divergenceDetails.get(key);
+    if (!state) {
+      state = { key, expanded: false, breakdown: null, loadedRevision: null,
+        pending: false, render: null, load: null };
+      divergenceDetails.set(key, state);
+    }
+    state.revision = revision;
+    state.local = ["local", "real_local_evidence"].includes(data?.mode);
+  }
+  for (const key of divergenceDetails.keys()) {
+    if (!retained.has(key)) divergenceDetails.delete(key);
+  }
+  return scope;
+}
+
 function divergenceRangeContext(data) {
   const accounting = accountingPeriod(data);
   if (!accounting) return null;
@@ -5346,9 +5443,11 @@ function divergenceRangeContext(data) {
     ?? models[0]
     ?? null;
   const modelLabel = topModel === null ? null
-    : topModel.model === "unknown" || topModel.pricingStatus === "unrecognized"
-      ? t("accounting.model.unrecognized")
-      : formatModelName(topModel.model) || topModel.model;
+    : topModel.model === "unknown"
+      ? t("accounting.model.identityUnavailable")
+      : topModel.pricingStatus === "unrecognized"
+        ? t("accounting.model.unrecognized")
+        : formatModelName(topModel.model) || topModel.model;
   const bySpeed = accounting.bySpeed ?? {};
   const rankedSpeed = ["fast", "standard", "unknown"]
     .map((key) => [key, finite(bySpeed?.[key]?.events, 0)])
@@ -5376,7 +5475,7 @@ function divergenceSpeedLabel(key) {
  * magnitude, and the contributor mix (exact per-period totals plus range-level
  * model/speed context).
  */
-function divergencePeriodItem(period, rangeContext) {
+function divergencePeriodItem(period, rangeContext, state) {
   const item = node(
     "li",
     `divergence-period ${period.direction === "under_costed"
@@ -5453,27 +5552,49 @@ function divergencePeriodItem(period, rangeContext) {
   panel.id = breakdownId;
   panel.hidden = true;
 
-  let loadState = "idle";
+  const renderBreakdown = () => {
+    if (state.breakdown !== null || !state.pending) {
+      renderDivergenceBreakdown(panel, state.breakdown, rangeContext);
+    } else {
+      clear(panel);
+      panel.append(localizedNode(
+        "p",
+        "divergence-breakdown-status",
+        "divergence.breakdown.loading",
+      ));
+    }
+  };
+  state.render = renderBreakdown;
   const loadBreakdown = async () => {
-    if (loadState === "loaded" || loadState === "loading") return;
-    loadState = "loading";
-    clear(panel);
-    panel.append(localizedNode(
-      "p",
-      "divergence-breakdown-status",
-      "divergence.breakdown.loading",
-    ));
+    if (!state.local || state.pending
+        || state.loadedRevision === state.revision) return;
+    const revision = state.revision;
+    state.pending = true;
+    renderBreakdown();
     let breakdown = null;
     try {
       breakdown = await localClient.windowBreakdown(period.startMs, period.endMs);
     } catch {
       breakdown = null;
     }
-    loadState = "loaded";
-    renderDivergenceBreakdown(panel, breakdown, rangeContext);
+    state.pending = false;
+    if (divergenceDetails.get(state.key) !== state) return;
+    if (state.revision !== revision) {
+      if (state.expanded) state.load();
+      return;
+    }
+    if (breakdown?.status === "available") {
+      state.breakdown = breakdown;
+      state.loadedRevision = revision;
+    }
+    // Failed refreshes never erase a successful answer or mark failure as
+    // loaded. Reopening or the next dashboard refresh can try again.
+    state.render();
   };
+  state.load = loadBreakdown;
   toggle.addEventListener("click", () => {
     const open = toggle.getAttribute("aria-expanded") === "true";
+    state.expanded = !open;
     toggle.setAttribute("aria-expanded", open ? "false" : "true");
     setLocalizedText(
       toggle,
@@ -5482,7 +5603,14 @@ function divergencePeriodItem(period, rangeContext) {
     panel.hidden = open;
     if (!open) loadBreakdown();
   });
+  toggle.setAttribute("aria-expanded", String(state.expanded));
+  setLocalizedText(toggle, state.expanded
+    ? "divergence.breakdown.hide" : "divergence.breakdown.show");
+  panel.hidden = !state.expanded;
+  renderBreakdown();
+  if (state.expanded) loadBreakdown();
 
+  state.toggle = toggle;
   item.append(toggle, panel);
   return item;
 }
@@ -5492,7 +5620,7 @@ function divergencePeriodItem(period, rangeContext) {
 // exists to supply; an unavailable breakdown falls back to the range-level
 // context rather than pretending this window had none.
 function divergenceModelLabel(model) {
-  if (model === "unknown") return t("accounting.model.unrecognized");
+  if (model === "unknown") return t("accounting.model.identityUnavailable");
   return formatModelName(model) || model;
 }
 
@@ -5597,11 +5725,14 @@ function renderDivergencePeriods(data, points) {
   const summary = $("#divergence-summary");
   const caveat = $("#divergence-caveat");
   if (!list || !empty || !summary) return;
+  const focusedKey = [...divergenceDetails.values()]
+    .find((state) => state.toggle === document.activeElement)?.key;
   clear(list);
 
   const result = detectDeviationPeriods(points, {
     usageBuckets: data?.timeline?.usage ?? [],
   });
+  const detailScope = prepareDivergenceDetails(data, result.periods);
 
   if (!result.periods.length) {
     list.hidden = true;
@@ -5648,8 +5779,11 @@ function renderDivergencePeriods(data, points) {
   }
 
   const rangeContext = divergenceRangeContext(data);
-  for (const period of result.periods) {
-    list.append(divergencePeriodItem(period, rangeContext));
+  for (const period of result.periods.slice(0, MAX_DIVERGENCE_DETAILS)) {
+    const key = divergenceDetailKey(period, detailScope);
+    const state = divergenceDetails.get(key);
+    list.append(divergencePeriodItem(period, rangeContext, state));
+    if (key === focusedKey) state.toggle.focus({ preventScroll: true });
   }
 }
 
@@ -8248,7 +8382,29 @@ function updateCacheDropThreadCells() {
   }
 }
 
+function cacheDropThreadKeys(data) {
+  const keys = new Set();
+  if (!isCacheDropThreadDashboard(data) || !isLoopbackDashboard()) return keys;
+  for (const [kind, impact] of [
+    ["switch", data.accounting?.cacheSwitchImpact],
+    ["continuity", data.accounting?.cacheContinuityImpact],
+  ]) {
+    if (impact?.status !== "available") continue;
+    const periods = Array.isArray(impact.periods) ? impact.periods.slice(0, 4) : [];
+    for (const period of [impact, ...periods]) {
+      const recent = Array.isArray(period?.recent) ? period.recent.slice(0, 20) : [];
+      for (const row of recent) {
+        const key = cacheDropThreadLookupKey(kind, row);
+        if (key !== null) keys.add(key);
+        if (keys.size === 160) return keys;
+      }
+    }
+  }
+  return keys;
+}
+
 function resetCacheDropThreadLinks(data = null) {
+  const sameDashboard = cacheDropThreadLinks.dashboard === data;
   cacheDropThreadLinks.requestToken += 1;
   cacheDropThreadLinks.dashboard = data;
   cacheDropThreadLinks.generation = isCacheDropThreadDashboard(data)
@@ -8256,11 +8412,15 @@ function resetCacheDropThreadLinks(data = null) {
     ? data.accounting.generation
     : null;
   cacheDropThreadLinks.requested = false;
-  cacheDropThreadLinks.entries.clear();
-  // Remove old names even when a failed dashboard load leaves its previous
-  // accounting rows visible underneath the unavailable-state notice.
+  // A new accounting generation does not change an already resolved thread.
+  // Reuse only exact event-pair keys still present in the local snapshot, across
+  // all selectable periods. New/changed rows must resolve independently.
+  const retainedKeys = cacheDropThreadKeys(data);
+  for (const key of cacheDropThreadLinks.entries.keys()) {
+    if (!retainedKeys.has(key)) cacheDropThreadLinks.entries.delete(key);
+  }
   updateCacheDropThreadCells();
-  cacheDropThreadLinks.cells = { switch: [], continuity: [] };
+  if (!sameDashboard) cacheDropThreadLinks.cells = { switch: [], continuity: [] };
 }
 
 async function loadCacheDropThreadLinks(data) {
@@ -8274,6 +8434,7 @@ async function loadCacheDropThreadLinks(data) {
   cacheDropThreadLinks.requested = true;
   const token = ++cacheDropThreadLinks.requestToken;
   const loadToken = cacheDropThreadLinks.loadToken;
+  let completed = false;
   try {
     const result = await localClient.cacheDropThreadLinks();
     if (token !== cacheDropThreadLinks.requestToken
@@ -8284,13 +8445,31 @@ async function loadCacheDropThreadLinks(data) {
         || data.accounting?.generationMatched !== true
         || result?.status !== "available"
         || result.generation !== generation) return;
-    cacheDropThreadLinks.entries = new Map(
-      result.entries.map((entry) => [entry.key, entry.thread]),
-    );
+    const selectedKeys = cacheDropThreadKeys(data);
+    for (const { key, thread } of result.entries) {
+      if (!selectedKeys.has(key)) continue;
+      const previous = cacheDropThreadLinks.entries.get(key);
+      // Optional name-store failures must not erase details already known for
+      // this UUID. A newly resolved identity replaces the old entry outright.
+      cacheDropThreadLinks.entries.set(key, previous?.id === thread.id ? {
+        ...thread,
+        name: thread.name ?? previous.name,
+        nickname: thread.nickname ?? previous.nickname,
+        parent: thread.parent === null ? previous.parent : {
+          ...thread.parent,
+          name: thread.parent.name ?? (thread.parent.id === previous.parent?.id
+            ? previous.parent.name : null),
+        },
+      } : thread);
+    }
+    completed = true;
     updateCacheDropThreadCells();
   } catch {
-    // Older companions and unavailable local metadata are a normal, quiet
-    // fallback. Accounting remains usable and no private lookup error leaks.
+    // Keep resolved details usable through temporary local lookup failures.
+  } finally {
+    if (!completed && token === cacheDropThreadLinks.requestToken) {
+      cacheDropThreadLinks.requested = false;
+    }
   }
 }
 
@@ -10229,7 +10408,9 @@ function modelApiEquivalentCell(row) {
     // guessed one would be worse than none. Printing "$0.00" here read as a
     // priced zero, which is a different and untrue claim.
     setLocalizedText(cell, "accounting.model.notPricedUnknown");
-    cell.title = t("accounting.model.notPricedUnknownTitle");
+    cell.title = t(row.model === "unknown"
+      ? "accounting.model.identityUnavailableTitle"
+      : "accounting.model.notPricedUnknownTitle");
     return cell;
   }
   const amount = finite(row?.apiPriceEquivalentUsd);
@@ -10331,7 +10512,9 @@ function modelComponentRow(model, key, labelKey, totals) {
         : model.pricingStatus === "known_unpriced"
           ? "accounting.model.noPublishedPriceTitle"
           : model.pricingStatus === "unrecognized"
-            ? "accounting.model.notPricedUnknownTitle"
+            ? model.model === "unknown"
+              ? "accounting.model.identityUnavailableTitle"
+              : "accounting.model.notPricedUnknownTitle"
             : "accounting.model.componentCostWithheldTitle",
     );
     costShareCell = localizedNode(
@@ -10403,9 +10586,13 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
   for (const model of page.rows) {
     const row = node("tr");
     const identity = node("td", "model-identity");
-    // "Unrecognized model" now means exactly one thing: an identifier this
-    // build has never reviewed, so it is withheld rather than printed.
-    if (model.model === "unknown" || model.pricingStatus === "unrecognized") {
+    // The unknown aggregate combines missing attribution and unreviewed
+    // identifiers. Its label must not claim either cause as established.
+    if (model.model === "unknown") {
+      const label = localizedNode("span", "", "accounting.model.identityUnavailable");
+      label.title = t("accounting.model.identityUnavailableTitle");
+      identity.append(label);
+    } else if (model.pricingStatus === "unrecognized") {
       identity.append(localizedNode("span", "", "accounting.model.unrecognized"));
     } else {
       // The wire identifier is what the provider reported and what any
@@ -10463,7 +10650,11 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
             row.getAttribute("aria-expanded") === "true"
               ? "accounting.model.collapse"
               : "accounting.model.expand",
-            { model: formatModelName(model.model) },
+            { model: model.model === "unknown"
+              ? t("accounting.model.identityUnavailable")
+              : model.pricingStatus === "unrecognized"
+                ? t("accounting.model.unrecognized")
+                : formatModelName(model.model) },
           ),
         );
       };
@@ -11357,7 +11548,7 @@ function historyProgressReceipt() {
 }
 
 /**
- * After a successful refresh that left the history index incomplete, run the
+ * After an explicit detailed refresh that left the history index incomplete, run the
  * next pass promptly instead of waiting for the sparse auto-cadence, bounded
  * by REINDEX_AUTO_CONTINUE_LIMIT. Stops the moment coverage completes, the
  * user interacts, or the bound is reached (the ordinary cadence then carries
@@ -11384,11 +11575,11 @@ function scheduleReindexAutoContinuation() {
       return;
     }
     reindexAutoContinuations += 1;
-    void requestRefresh({ autoContinue: true });
+    void requestRefresh({ autoContinue: true, detailed: true });
   }, REINDEX_AUTO_CONTINUE_DELAY_MS);
 }
 
-async function requestRefresh({ autoContinue = false } = {}) {
+async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   if (localActionBusy) return;
   // Fence continuation against the exact coverage visible before this pass.
   // If the terminal reload presents the same generation/count/byte receipt,
@@ -11418,11 +11609,15 @@ async function requestRefresh({ autoContinue = false } = {}) {
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
   archiveHistoryScanActive = false;
-  button.textContent = "Starting local analysis…";
+  button.textContent = detailed
+    ? "Starting detailed accounting…"
+    : "Starting local analysis…";
   updateLocalActionButtons();
   setGlobalState("updating");
   try {
-    await localClient.refresh();
+    await (detailed
+      ? localClient.recalculateDetailedAccounting()
+      : localClient.refresh());
     refreshAccepted = true;
     let activePassStartedMs = Date.now();
     const pollingBudget = createRefreshPollingBudget();
@@ -11519,7 +11714,9 @@ async function requestRefresh({ autoContinue = false } = {}) {
           throw new Error("The bounded continuation limit was reached.");
         }
         try {
-          await localClient.refresh();
+          await (detailed
+            ? localClient.recalculateDetailedAccounting()
+            : localClient.refresh());
           pollingBudget.noteContinuation();
           activePassStartedMs = Date.now();
           timeoutSettlementNoted = false;
@@ -11620,12 +11817,23 @@ async function requestRefresh({ autoContinue = false } = {}) {
     archiveHistoryScanActive = false;
     button.textContent = "Loading updated evidence…";
     await loadLocalDashboard();
-    scheduleReindexAutoContinuation();
+    if (detailed) scheduleReindexAutoContinuation();
   } catch (error) {
     if (dashboard) {
       setGlobalState(dashboard.state, {
         companionReachable: dashboard.mode !== "demo",
       });
+    }
+    if (!refreshAccepted && error?.status === 409) {
+      // Another surface owns the shared controller. In particular, a quick
+      // run is not proof that this request's detailed work was accepted. Do
+      // not enqueue an escalation or turn a safe conflict into a failure.
+      showConnectionNotice({
+        title: t("refresh.alreadyRunningTitle"),
+        copy: t("refresh.alreadyRunningCopy"),
+        kind: "info",
+      });
+      return;
     }
     // This was a bare `catch {}`: it printed one of three sentences for every
     // possible cause and discarded the only evidence of which one occurred.
@@ -14647,8 +14855,12 @@ async function restoreCommunitySession() {
   }
 }
 
-$("#refresh-button").addEventListener("click", requestRefresh);
-$("#setup-refresh").addEventListener("click", requestRefresh);
+$("#refresh-button").addEventListener("click", () => {
+  void requestRefresh({ detailed: true });
+});
+$("#setup-refresh").addEventListener("click", () => {
+  void requestRefresh({ detailed: true });
+});
 $("#cancel-refresh").addEventListener("click", cancelLocalAnalysis);
 $("#open-installed-app").addEventListener("click", openInstalledApp);
 $("#connection-check").addEventListener("click", checkLocalSetup);

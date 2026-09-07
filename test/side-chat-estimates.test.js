@@ -14,6 +14,7 @@ import {
 import {
   collectHistoricalSideChatGapProbe,
   collectSideChatEstimates,
+  SIDE_CHAT_ESTIMATE_ASSUMPTIONS,
 } from "../src/side-chat-estimates.js";
 import {
   writeLocalCollectorAccountingCache,
@@ -430,6 +431,61 @@ test("cold sensitivity uses ordinary uncached input when an older model has no c
     );
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("Astra side-chat cold sensitivity uses dated cache-write cards without borrowing the Sol calibration", async () => {
+  for (const [day, activeContextTokens, priced] of [
+    ["2026-09-03", 100_000, true], ["2026-09-03", 300_000, true],
+    ["2026-09-02", 100_000, false],
+  ]) {
+    const root = await mkdtemp(join(tmpdir(), "side-chat-astra-"));
+    const codexHome = join(root, ".codex");
+    const desktopRoot = join(root, "desktop-logs");
+    await mkdir(codexHome, { recursive: true });
+    await mkdir(desktopRoot, { recursive: true });
+    await writeFile(join(desktopRoot, "main.log"), [
+      `${day}T11:00:00.000Z method=thread/fork conversationId=${PARENT}`,
+      `${day}T11:00:01.000Z method=thread/inject_items conversationId=${CHILD}`,
+      `${day}T11:00:02.000Z IAB_LIFECYCLE captured session route conversationId=${CHILD} disposeAfterSessionActivity=false`,
+      "",
+    ].join("\n"));
+    const database = new DatabaseSync(join(codexHome, "logs_2.sqlite"));
+    database.exec(`CREATE TABLE logs (
+      id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, ts_nanos INTEGER NOT NULL,
+      target TEXT NOT NULL, feedback_log_body TEXT, thread_id TEXT
+    )`);
+    database.prepare(`INSERT INTO logs VALUES (?, ?, ?, ?, ?, ?)`).run(
+      1, seconds(`${day}T11:01:00.000Z`), 0, "codex_core::session::turn",
+      samplingBody(TURN_ONE, activeContextTokens, "gpt-6-astra"), CHILD,
+    );
+    database.close();
+    try {
+      const result = await collectSideChatEstimates({
+        codexHome, desktopLogRoot: desktopRoot,
+        now: () => Date.parse(`${day}T12:00:00.000Z`),
+      });
+      const all = result.periods.find((period) => period.periodId === "all");
+      assert.equal(all.pricedCalls, priced ? 1 : 0);
+      assert.equal(all.unpricedCalls, priced ? 0 : 1);
+      assert.equal(result.recent[0].model, "gpt-6-astra");
+      assert.equal(result.methodology.includedInCalibrationTimeline, false);
+      if (priced) {
+        const providerTotal = Math.round(activeContextTokens / SIDE_CHAT_ESTIMATE_ASSUMPTIONS.activeToProviderTotal.upperCost);
+        const input = Math.round(providerTotal / (1 + SIDE_CHAT_ESTIMATE_ASSUMPTIONS.outputToInput.upperCost));
+        const output = providerTotal - input;
+        const long = input > 272_000;
+        const expected = (input * (long ? 25 : 12.5) + output * (long ? 75 : 50)) / 1_000_000;
+        assert.equal(all.estimatedRangeUsd.upper, expected);
+        assert.equal(result.recent[0].pricingBasis, "reviewed_model_card");
+        assert.equal(result.methodology.calibrationStatus, "withheld_cohort_mismatch");
+      } else {
+        assert.equal(all.estimatedRangeUsd, null);
+        assert.equal(result.recent[0].pricingBasis, "unavailable");
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 

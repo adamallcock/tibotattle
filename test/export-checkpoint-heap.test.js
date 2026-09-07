@@ -242,9 +242,9 @@ test("checkpoint scanner completes a task/tool-heavy export under a constrained 
       usageRecords: EVENT_COUNT,
       localShellTools: EVENT_COUNT,
       diagnostics: [{ code: "missing_rate_limit_records", count: EVENT_COUNT }],
-      // The tier and record passes read the whole source; lineage discovery
-      // stops after its first session_meta line.
-      lines: ((2 + (EVENT_COUNT * 4)) * 2) + 1,
+      // The tier and record passes read the whole source. Discovery and the
+      // same-handle frozen-metadata check each read its first session_meta.
+      lines: ((2 + (EVENT_COUNT * 4)) * 2) + 2,
     });
   } finally {
     await rm(value.root, { recursive: true, force: true });
@@ -262,7 +262,7 @@ test("checkpoint scanner bounds a default-batch export with many simultaneously 
       usageRecords: 0,
       localShellTools: 0,
       diagnostics: [],
-      lines: ((2 + OPEN_TASK_COUNT) * 2) + 1,
+      lines: ((2 + OPEN_TASK_COUNT) * 2) + 2,
     });
   } finally {
     await rm(value.root, { recursive: true, force: true });
@@ -283,7 +283,7 @@ test("checkpoint scanner bounds default-batch inherited snapshot lookups at a se
         { code: "fork_replay_events_skipped", count: FORK_SNAPSHOT_COUNT },
         { code: "missing_rate_limit_records", count: FORK_SNAPSHOT_COUNT },
       ],
-      lines: (((2 + FORK_SNAPSHOT_COUNT) * 2) * 2) + 2,
+      lines: (((2 + FORK_SNAPSHOT_COUNT) * 2) * 2) + 4,
     });
   } finally {
     await rm(value.root, { recursive: true, force: true });

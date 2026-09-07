@@ -1,4 +1,9 @@
 import {
+  ADMIN_MODEL_CONFIG,
+  ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  projectAdminModelHistoryDay,
+} from "@app-usagemonitor/telemetry-contract";
+import {
   COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
   COMMUNITY_ALLOWANCE_QUALIFICATION,
@@ -17,9 +22,9 @@ import { ApiError } from "./errors";
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 const MINIMUM_FITS_FOR_BAND = 3;
-// The preview is roughly 70 small aggregate rows. Keep its ceiling well below
-// D1's value limit and enforce it before both cache writes and reads.
-const PREVIEW_CACHE_JSON_LIMIT_BYTES = 128 * 1_024;
+// 70 compact days across the reviewed catalog, including fully populated rows.
+// Enforced before writes and reads; tests cover the complete reviewed roster.
+const PREVIEW_CACHE_JSON_LIMIT_BYTES = 256 * 1_024;
 // Scheduled maintenance runs every minute but only rebuilds this aggregate
 // about hourly. Two hours tolerates one missed Cron without serving it forever.
 const PREVIEW_CACHE_MIN_INTERVAL_MILLISECONDS = 55 * 60 * 1_000;
@@ -27,7 +32,7 @@ const PREVIEW_CACHE_MAX_AGE_MILLISECONDS = 2 * 60 * 60 * 1_000;
 const PREVIEW_CACHE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
-  "admin-community-allowance-preview-v0.2";
+  "admin-community-allowance-preview-v0.3";
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS =
   "seven_day_codex_pro20x_equivalent_personal_plans_trailing_30d_preview";
 
@@ -43,50 +48,17 @@ export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS =
 export const ADMIN_COMMUNITY_ALLOWANCE_PLAN_CONFIG =
   COMMUNITY_ALLOWANCE_PERSONAL_PLAN_CONFIG;
 
-// The displayed per-model roster is pinned, exactly like the plan roster: an
-// unlisted model observed in a fit simply does not render (it still shaped the
-// NNLS solution), so a provider adding a model can never inject an unreviewed
-// series into the admin chart.
-export const ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG = Object.freeze([
-  Object.freeze({ modelId: "gpt-5.6-sol", label: "Sol" }),
-  Object.freeze({ modelId: "gpt-5.6-terra", label: "Terra" }),
-  Object.freeze({ modelId: "gpt-5.6-luna", label: "Luna" }),
-  Object.freeze({ modelId: "gpt-5.5", label: "GPT-5.5" }),
-] as const);
+// Visibility is not fit eligibility or availability. Raw/custom model strings
+// cannot enter the dashboard through this shared reviewed identity catalog.
+export const ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG = ADMIN_MODEL_CONFIG;
 
 export const ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS =
   "seven_day_codex_pro20x_equivalent_per_model_composition";
 export const ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE =
   "shared_composition_kernel_identification";
 
-type AdminCommunityAllowanceModelId =
-  (typeof ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG)[number]["modelId"];
-
-export interface AdminCommunityModelSummary {
-  /** Median Pro-20x-equivalent dollars per 100 weekly pp, or null when no
-   * identification-passing fit carries this model. */
-  readonly capacityUsd: number | null;
-  readonly participantCount: number;
-}
-
-export interface AdminCommunityModelCompositionDay {
-  readonly day: string;
-  readonly byModel: Readonly<Record<
-    AdminCommunityAllowanceModelId,
-    AdminCommunityModelSummary
-  >>;
-  /** Participants whose composition passed the kernel's identification gate. */
-  readonly fittedParticipantCount: number;
-  /** Participants whose composition ran but failed identification. */
-  readonly unstableParticipantCount: number;
-  /** Cached compositions whose newest quota evidence fell out of the
-   * trailing window — a departed device must age out of the cohort, never
-   * ride a frozen chunk epoch into every future day. */
-  readonly staleParticipantCount: number;
-  readonly refusedParticipantCount: number;
-  readonly v1ParticipantCount: number;
-  readonly unsupportedSourceParticipantCount: number;
-}
+export type AdminCommunityModelCompositionDay =
+  NonNullable<ReturnType<typeof projectAdminModelHistoryDay>>;
 
 export interface AdminCommunityAllowanceModels {
   readonly modelConfig: typeof ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG;
@@ -215,59 +187,13 @@ function validSummary(value: unknown): value is AdminCommunityAllowanceSummary {
     && summary.centralUsd <= band.upperUsd;
 }
 
-function validModelSummary(value: unknown): value is AdminCommunityModelSummary {
-  const summary = record(value);
-  if (summary === null
-      || !exactKeys(summary, ["capacityUsd", "participantCount"])
-      || !validCount(summary.participantCount)) {
-    return false;
-  }
-  if (summary.capacityUsd === null) return summary.participantCount === 0;
-  return validFiniteNonNegative(summary.capacityUsd)
-    && (summary.participantCount as number) >= 1;
-}
-
 function validModelCompositionDay(
   value: unknown,
 ): value is AdminCommunityModelCompositionDay {
-  const day = record(value);
-  if (day === null || !exactKeys(day, [
-    "day",
-    "byModel",
-    "fittedParticipantCount",
-    "unstableParticipantCount",
-    "staleParticipantCount",
-    "refusedParticipantCount",
-    "v1ParticipantCount",
-    "unsupportedSourceParticipantCount",
-  ]) || !validDay(day.day)
-      || !validCount(day.fittedParticipantCount)
-      || !validCount(day.unstableParticipantCount)
-      || !validCount(day.staleParticipantCount)
-      || !validCount(day.refusedParticipantCount)
-      || !validCount(day.v1ParticipantCount)
-      || !validCount(day.unsupportedSourceParticipantCount)) {
-    return false;
-  }
-  const fitted = day.fittedParticipantCount as number;
-  const unstable = day.unstableParticipantCount as number;
-  const stale = day.staleParticipantCount as number;
-  const refused = day.refusedParticipantCount as number;
-  const v1Count = day.v1ParticipantCount as number;
-  if (fitted + unstable + stale + refused !== v1Count) return false;
-  const byModel = record(day.byModel);
-  if (byModel === null || !exactKeys(
-    byModel,
-    ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.map((model) => model.modelId),
-  )) {
-    return false;
-  }
-  for (const model of ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG) {
-    const summary = byModel[model.modelId];
-    if (!validModelSummary(summary)) return false;
-    if ((summary.participantCount as number) > fitted) return false;
-  }
-  return true;
+  // Cached v0.3 payloads are compact only. Retained legacy rows are converted
+  // on the scheduled read path, never relabelled or rewritten in place.
+  return record(value)?.catalogVersion !== undefined
+    && projectAdminModelHistoryDay(value) !== null;
 }
 
 function validAdminCommunityAllowanceModels(
@@ -291,9 +217,11 @@ function validAdminCommunityAllowanceModels(
   for (const [index, expected] of ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.entries()) {
     const model = record(models.modelConfig[index]);
     if (model === null
-        || !exactKeys(model, ["modelId", "label"])
+        || !exactKeys(model, ["modelId", "label", "allowanceTrack", "pricingStatus"])
         || model.modelId !== expected.modelId
-        || model.label !== expected.label) {
+        || model.label !== expected.label
+        || model.allowanceTrack !== expected.allowanceTrack
+        || model.pricingStatus !== expected.pricingStatus) {
       return false;
     }
   }
@@ -572,21 +500,20 @@ export function buildCommunityModelCompositionDay(
     }
     normalized.push(scaled);
   }
-  const byModel = Object.fromEntries(
-    ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG.map((model) => {
+  const values = ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG
+    .filter((model) => model.allowanceTrack === "primary")
+    .flatMap((model) => {
       const values = normalized
         .map((vector) => vector[model.modelId])
         .filter((value): value is number => value !== undefined);
       const central = medianOf(values);
-      return [model.modelId, Object.freeze({
-        capacityUsd: central === null ? null : usd4(central),
-        participantCount: values.length,
-      })];
-    }),
-  ) as Record<AdminCommunityAllowanceModelId, AdminCommunityModelSummary>;
-  return Object.freeze({
+      if (central === null) return [];
+      return [[model.modelId, usd4(central), values.length]];
+    });
+  const result = projectAdminModelHistoryDay({
     day,
-    byModel: Object.freeze(byModel),
+    catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+    values,
     fittedParticipantCount: normalized.length,
     unstableParticipantCount,
     staleParticipantCount,
@@ -595,6 +522,8 @@ export function buildCommunityModelCompositionDay(
     unsupportedSourceParticipantCount:
       collection.unsupportedSourceParticipantCount,
   });
+  if (result === null) throw new Error("invalid admin model composition aggregate");
+  return result;
 }
 
 const MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES = 16 * 1024;
@@ -650,8 +579,9 @@ async function readCommunityModelCompositionDays(
     }
     // A malformed retained row is dropped, never served: the validator would
     // otherwise fail the whole preview closed over one historical day.
-    if (validModelCompositionDay(parsed) && parsed.day === row.day) {
-      days.push(parsed);
+    const projected = projectAdminModelHistoryDay(parsed);
+    if (projected !== null && projected.day === row.day) {
+      days.push(projected);
     }
   }
   return days.reverse();
@@ -779,7 +709,7 @@ export async function buildAdminCommunityAllowancePreviewFromSource(
   if (!Number.isSafeInteger(sourceEpoch) || sourceEpoch! < 0) return null;
   const corpus = await readCachedCommunityAllowanceCorpus(db, nowMs);
   if (corpus === null) return null;
-  // The per-model series is additive evidence: any failure here (missing 0041
+  // The per-model series is additive evidence: any failure here (missing 0042
   // migration, a refusing analyzer) degrades to whatever day rows already
   // exist — or an empty series — and never withholds the blended preview.
   const today = new Date(nowMs).toISOString().slice(0, 10);

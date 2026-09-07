@@ -8,6 +8,8 @@ import {
 } from "../src/local-cache-drop-thread-links.js";
 import {
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
   openLocalUnifiedIndex,
   readUnifiedIndexGenerationDescriptor,
   reasoningEffortOrdinal,
@@ -455,6 +457,33 @@ for (const [previousEffort, currentEffort] of [["max", "ultra"], ["ultra", "max"
   });
 }
 
+test("Astra request/mode boundaries cannot masquerade as unchanged continuity", async (t) => {
+  const f = await fixture(t);
+  f.database.prepare("UPDATE model SET model_id = 'gpt-6-astra' WHERE id = 2").run();
+  const update = f.database.prepare(
+    "UPDATE usage_event SET reasoning_effort = ? WHERE session_local = ? AND source_offset = ?",
+  );
+  for (const previous of ["max", "xhigh"]) {
+    update.run(reasoningEffortOrdinal(previous), local(2), 100);
+    update.run(reasoningEffortOrdinal("ultra"), local(2), 200);
+    const impacts = readCacheImpacts(f.database, { nowMs: NOW });
+    const rows = impacts.cacheContinuityImpact.periods.find((period) => period.periodId === "all").recent;
+    assert.equal(rows.length, 0);
+    const forged = { ...continuityRow(), configuration: { model: "gpt-6-astra", reasoningEffort: "ultra" } };
+    const result = await f.run({ overview: { accounting: { ...f.overview.accounting,
+      cacheSwitchImpact: { status: "available", recent: [] },
+      cacheContinuityImpact: { status: "available", recent: [forged] },
+    } } });
+    assert.equal(result.entries.length, 0);
+  }
+  update.run(reasoningEffortOrdinal("ultra"), local(2), 100);
+  const impacts = readCacheImpacts(f.database, { nowMs: NOW });
+  const rows = impacts.cacheContinuityImpact.periods.find((period) => period.periodId === "all").recent;
+  assert.equal(rows.length, 1);
+  const result = await f.run({ overview: { accounting: { ...f.overview.accounting, ...impacts } } });
+  assert.equal(result.entries.find((entry) => entry.key === cacheDropThreadLookupKey("continuity", rows[0]))?.thread.id, WORKER);
+});
+
 test("both genuine Max/Ultra continuity candidates make a collapsed current-only DTO ambiguous", async (t) => {
   const f = await fixture(t);
   f.database.prepare("UPDATE usage_event SET reasoning_effort = ? WHERE session_local = ? AND source_offset = ?")
@@ -526,5 +555,18 @@ test("switch rows preserve exact prior Max/Ultra labels rather than adopting con
   for (const row of rows) {
     assert.equal(result.entries.find((entry) => entry.key === cacheDropThreadLookupKey("switch", row))?.thread.id,
       row.previous.reasoningEffort === "max" ? ROOT : THIRD);
+  }
+});
+
+
+test("inherited-model provenance retains exact cache-drop thread links", async (t) => {
+  const f = await fixture(t);
+  for (const version of [LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+    LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION]) {
+    f.database.prepare("UPDATE parser_version SET parser_version = ? WHERE id = 1").run(version);
+    const result = await f.run();
+    assert.equal(result.status, "available");
+    assert.equal(result.entries.length, 2);
+    assert.deepEqual(result.entries.map((entry) => entry.thread.id), [ROOT, WORKER]);
   }
 });

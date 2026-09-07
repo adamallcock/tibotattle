@@ -109,7 +109,23 @@ export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
 // valid usage, tool, and quota facts from the same source remain available.
 // A paginated replacement without history_base resets the selected lineage
 // snapshot generation at the source-start boundary accepted by Codex.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v11";
+// v12 (2026-09-04): preserve missing usage components as nullable facts and
+// cursor counters. Existing retained sources reparse from byte zero; removed
+// sources keep their original parser provenance rather than inventing proof.
+// v13 (2026-09-04): recover compaction boundaries whose top-level header
+// includes the current Codex serializer's ordinal before type.
+// v14 (2026-09-04): paginated resets and exact history-base unknowns cannot
+// inherit a logical parent's later model, effort, tier or counter state.
+// Resume keeps own cursor state and reconstructs an absent inherited tier
+// only from the same exact physical base, never the parent's final state.
+// Inline descendants also stop tier and replay-snapshot traversal at that
+// physical boundary instead of reviving discarded logical-ancestor history.
+// Logical-parent state and ancestry are selected by resolved head, never by
+// dependency/scan order among retained physical generations of one thread.
+// v15 (2026-09-07): parent model declarations at/before the event and fork
+// boundary recover missing paginated-fork models. Explicit child selections
+// supersede the default. Counters, effort, tier and replay remain independent.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v15";
 export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
   "codex-immutable-rollout-v1";
 
@@ -120,7 +136,14 @@ export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v11-partial";
+  "unified-rollout-typed-v15-partial";
+
+// Per-row provenance variants retain the inherited-model assumption without
+// changing the physical schema. Ingest cursors keep the base v15 stamp.
+export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION =
+  "unified-rollout-typed-v15-parent-model";
+export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION =
+  "unified-rollout-typed-v15-parent-model-partial";
 
 export const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
 const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;
@@ -2427,9 +2450,13 @@ export function createUnifiedIndexWriter(database, {
         event.observedAtMs,
         event.generationId ?? generationId,
         ingestRunId,
-        event.partial
-          ? internParserVersion(LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION)
-          : defaultParserVersionId,
+        event.modelInherited
+          ? internParserVersion(event.partial
+            ? LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION
+            : LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION)
+          : event.partial
+            ? internParserVersion(LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION)
+            : defaultParserVersionId,
         event.sourceId ?? null,
         event.sourceOffset ?? null,
         event.sessionLocal,

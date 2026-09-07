@@ -74,7 +74,7 @@ CREATE TABLE telemetry_transport_floor_rollbacks (
 CREATE TRIGGER telemetry_transport_rollback_owner_only
 BEFORE INSERT ON telemetry_transport_floor_rollbacks
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM admin_action_audit a
       JOIN telemetry_transport_participant_floors f ON f.participant_id = NEW.participant_id
       JOIN participants p ON p.id = f.participant_id
@@ -86,7 +86,7 @@ BEGIN
        AND json_extract(a.details_json, '$.fromRank') = NEW.from_rank
        AND json_extract(a.details_json, '$.toRank') = NEW.to_rank
        AND f.revision = NEW.expected_revision AND f.minimum_rank = NEW.from_rank
-  ) THEN RAISE(ABORT, 'telemetry_transport_rollback_denied') END;
+  ) THEN RAISE(ABORT, 'telemetry_transport_rollback_denied') END);
 END;
 CREATE TRIGGER telemetry_transport_floor_revision
 BEFORE UPDATE ON telemetry_transport_participant_floors
@@ -96,13 +96,13 @@ CREATE TRIGGER telemetry_transport_floor_no_implicit_downgrade
 BEFORE UPDATE OF minimum_rank ON telemetry_transport_participant_floors
 WHEN NEW.minimum_rank < OLD.minimum_rank
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM telemetry_transport_floor_rollbacks r
       JOIN admin_action_audit a ON a.operation_id = r.operation_id
      WHERE r.participant_id = OLD.participant_id AND r.expected_revision = OLD.revision
        AND r.from_rank = OLD.minimum_rank AND r.to_rank = NEW.minimum_rank
        AND a.outcome = 'started'
-  ) THEN RAISE(ABORT, 'telemetry_transport_rollback_required') END;
+  ) THEN RAISE(ABORT, 'telemetry_transport_rollback_required') END);
 END;
 
 -- Older account-scoped contributions have no successor compatibility adapter.
@@ -130,7 +130,7 @@ CREATE TABLE telemetry_v11_device_consents (
 CREATE INDEX telemetry_v11_consents_device ON telemetry_v11_device_consents(device_id);
 CREATE TRIGGER telemetry_v11_consent_admission BEFORE INSERT ON telemetry_v11_device_consents
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM participants p JOIN device_credentials d ON d.participant_id = p.id
       JOIN attribution_enrollments e ON e.participant_id = p.id
       JOIN telemetry_transport_formats f ON f.schema_version = NEW.telemetry_schema_version
@@ -139,7 +139,7 @@ BEGIN
        AND NOT EXISTS (SELECT 1 FROM telemetry_contributions legacy
          WHERE legacy.participant_id = NEW.participant_id AND legacy.status = 'accepted'
            AND legacy.transport_schema_version = 'telemetry-contribution-v0.2')
-  ) THEN RAISE(ABORT, 'telemetry_transport_blocked') END;
+  ) THEN RAISE(ABORT, 'telemetry_transport_blocked') END);
 END;
 CREATE TRIGGER telemetry_v11_consent_floor AFTER INSERT ON telemetry_v11_device_consents
 BEGIN
@@ -154,21 +154,21 @@ BEGIN SELECT RAISE(ABORT, 'telemetry_consent_immutable'); END;
 -- the dormant v0.2 branch. Retained old rows are unchanged and still readable.
 CREATE TRIGGER telemetry_transport_legacy_insert BEFORE INSERT ON telemetry_contributions
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM telemetry_transport_formats f
       JOIN telemetry_transport_participant_floors p ON p.participant_id = NEW.participant_id
      WHERE f.schema_version = NEW.transport_schema_version
        AND f.lifecycle = 'accepted' AND f.format_rank >= p.minimum_rank
-  ) THEN RAISE(ABORT, 'telemetry_transport_blocked') END;
+  ) THEN RAISE(ABORT, 'telemetry_transport_blocked') END);
 END;
 CREATE TRIGGER telemetry_transport_v1_insert BEFORE INSERT ON telemetry_v1_chunks
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM telemetry_transport_formats f
       JOIN telemetry_transport_participant_floors p ON p.participant_id = NEW.participant_id
      WHERE f.schema_version = 'telemetry-contribution-v1.0'
        AND f.lifecycle = 'accepted' AND f.format_rank >= p.minimum_rank
-  ) THEN RAISE(ABORT, 'telemetry_transport_blocked') END;
+  ) THEN RAISE(ABORT, 'telemetry_transport_blocked') END);
 END;
 
 CREATE TABLE telemetry_v11_day_manifests (
@@ -236,7 +236,7 @@ CREATE INDEX telemetry_v11_records_legacy_counterpart
 
 CREATE TRIGGER telemetry_v11_manifest_admission BEFORE INSERT ON telemetry_v11_day_manifests
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM telemetry_v11_device_consents c
       JOIN device_credentials d ON d.id = c.device_id AND d.participant_id = c.participant_id
       JOIN participants p ON p.id = c.participant_id
@@ -248,17 +248,17 @@ BEGIN
        AND NOT EXISTS (SELECT 1 FROM telemetry_contributions legacy
          WHERE legacy.participant_id = NEW.participant_id AND legacy.status = 'accepted'
            AND legacy.transport_schema_version = 'telemetry-contribution-v0.2')
-  ) THEN RAISE(ABORT, 'telemetry_transport_blocked') END;
-  SELECT CASE WHEN NEW.expected_chunk_count != json_array_length(NEW.manifest_json, '$.chunks')
-    OR NEW.state != 'staged' THEN RAISE(ABORT, 'telemetry_manifest_invalid') END;
+  ) THEN RAISE(ABORT, 'telemetry_transport_blocked') END);
+  SELECT (CASE WHEN NEW.expected_chunk_count != json_array_length(NEW.manifest_json, '$.chunks')
+    OR NEW.state != 'staged' THEN RAISE(ABORT, 'telemetry_manifest_invalid') END);
   -- Empty manifests need their own bound; chunk admission alone does not
   -- constrain zero-row days or endless different candidate digests.
-  SELECT CASE WHEN (SELECT count(*) FROM (
+  SELECT (CASE WHEN (SELECT count(*) FROM (
     SELECT 1 FROM telemetry_v11_day_manifests
      WHERE participant_id = NEW.participant_id AND device_id = NEW.device_id
        AND created_at >= substr(NEW.created_at, 1, 10) || 'T00:00:00.000Z'
      LIMIT 8192
-  )) >= 8192 THEN RAISE(ABORT, 'telemetry_manifest_admission_exhausted') END;
+  )) >= 8192 THEN RAISE(ABORT, 'telemetry_manifest_admission_exhausted') END);
 END;
 CREATE TRIGGER telemetry_v11_manifest_immutable
 BEFORE UPDATE OF id, participant_id, device_id, chunk_day, manifest_digest, parser_version, manifest_json, expected_chunk_count, created_at
@@ -267,7 +267,7 @@ BEGIN SELECT RAISE(ABORT, 'telemetry_manifest_immutable'); END;
 
 CREATE TRIGGER telemetry_v11_chunk_admission BEFORE INSERT ON telemetry_v11_chunks
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM telemetry_v11_day_manifests m
       JOIN telemetry_v11_device_consents c ON c.participant_id = m.participant_id AND c.device_id = m.device_id
       JOIN telemetry_transport_formats t ON t.schema_version = c.telemetry_schema_version
@@ -291,16 +291,16 @@ BEGIN
        AND json_extract(expected.value, '$.chunkId') = NEW.chunk_id
        AND json_extract(expected.value, '$.chunkDigest') = NEW.chunk_digest
        AND json_extract(expected.value, '$.recordCount') = NEW.record_count
-  ) THEN RAISE(ABORT, 'telemetry_chunk_staging_denied') END;
+  ) THEN RAISE(ABORT, 'telemetry_chunk_staging_denied') END);
 END;
 CREATE TRIGGER telemetry_v11_chunks_enforce_admission BEFORE INSERT ON telemetry_v11_chunks
 WHEN COALESCE((
   SELECT accepted_count FROM telemetry_v1_chunk_admission_windows
    WHERE participant_id = NEW.participant_id AND device_id = NEW.device_id
      AND window_day = substr(NEW.created_at, 1, 10)
-), 0) >= CASE WHEN (
+), 0) >= (CASE WHEN (
   SELECT issued_at FROM device_credentials WHERE id = NEW.device_id
-) > strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at, '-7 days') THEN 20000 ELSE 2000 END
+) > strftime('%Y-%m-%dT%H:%M:%fZ', NEW.created_at, '-7 days') THEN 20000 ELSE 2000 END)
 BEGIN SELECT RAISE(ABORT, 'chunk admission window exhausted'); END;
 CREATE TRIGGER telemetry_v11_chunks_record_admission AFTER INSERT ON telemetry_v11_chunks
 BEGIN
@@ -321,22 +321,22 @@ BEFORE UPDATE OF id, manifest_id, participant_id, device_id, stream, chunk_day, 
 BEGIN SELECT RAISE(ABORT, 'telemetry_chunk_immutable'); END;
 CREATE TRIGGER telemetry_v11_record_admission BEFORE INSERT ON telemetry_v11_records
 BEGIN
-  SELECT CASE WHEN NOT EXISTS (
+  SELECT (CASE WHEN NOT EXISTS (
     SELECT 1 FROM telemetry_v11_chunks c JOIN telemetry_v11_day_manifests m ON m.id = c.manifest_id
      WHERE c.id = NEW.chunk_id AND c.manifest_id = NEW.manifest_id
        AND c.stream = NEW.stream AND m.state = 'staged'
        AND substr(NEW.observed_at, 1, 10) = c.chunk_day
        AND (SELECT count(*) FROM telemetry_v11_records r WHERE r.chunk_id = c.id) < c.record_count
-  ) THEN RAISE(ABORT, 'telemetry_record_staging_denied') END;
+  ) THEN RAISE(ABORT, 'telemetry_record_staging_denied') END);
 END;
 CREATE TRIGGER telemetry_v11_record_immutable BEFORE UPDATE ON telemetry_v11_records
 BEGIN SELECT RAISE(ABORT, 'telemetry_record_immutable'); END;
 CREATE TRIGGER telemetry_v11_manifest_ready BEFORE UPDATE OF state ON telemetry_v11_day_manifests
 BEGIN
-  SELECT CASE WHEN OLD.state != 'staged' OR NEW.state != 'ready'
+  SELECT (CASE WHEN OLD.state != 'staged' OR NEW.state != 'ready'
     OR NEW.expected_chunk_count != (SELECT count(*) FROM telemetry_v11_chunks WHERE manifest_id = NEW.id)
     OR EXISTS (
       SELECT 1 FROM telemetry_v11_chunks c WHERE c.manifest_id = NEW.id
         AND c.record_count != (SELECT count(*) FROM telemetry_v11_records r WHERE r.chunk_id = c.id)
-    ) THEN RAISE(ABORT, 'telemetry_manifest_incomplete') END;
+    ) THEN RAISE(ABORT, 'telemetry_manifest_incomplete') END);
 END;

@@ -26,6 +26,7 @@ import {
 } from "../config/deployment-endpoints.js";
 import {
   assertReleaseChannelPublication,
+  normalizeReleaseArchitecture,
   resolveReleaseChannel,
 } from "../config/release-channels.js";
 import {
@@ -492,6 +493,7 @@ function validateReleaseManifest(
   channel,
 ) {
   if (manifest.schemaVersion !== RELEASE_MANIFEST_SCHEMA
+      || normalizeReleaseArchitecture(manifest.application?.architecture) !== channel.architecture
       || manifest.application?.bundleIdentifier !== PRODUCT_BRAND.bundleIdentifier
       || typeof manifest.application?.bundleVersion !== "string"
       || !isAppleMacOSBundleVersion(manifest.application.bundleVersion)
@@ -515,7 +517,7 @@ function validateReleaseManifest(
     fail("Release manifest is not a complete canonical signed-DMG release");
   }
   try {
-    assertReleaseChannelPublication(channel.name, manifest.channel);
+    assertReleaseChannelPublication(channel, manifest.channel);
   } catch {
     fail(
       `Release manifest channel provenance does not match ${channel.name}`,
@@ -866,8 +868,9 @@ function assertDeltaEnclosurePlacement(text, enclosures) {
  */
 export function validateCandidateAppcastShape(text, channelName, {
   appcastPolicy = CANONICAL_STABLE_APPCAST_POLICY,
+  architecture = "arm64",
 } = {}) {
-  const channel = resolveReleaseChannel(channelName);
+  const channel = resolveReleaseChannel(channelName, { architecture });
   const enclosures = appcastEnclosures(text, channel);
   assertCanonicalStableAppcast(text, channel, enclosures, appcastPolicy);
   assertDeltaEnclosurePlacement(text, enclosures);
@@ -961,6 +964,7 @@ function assertNamedChannelCandidateFeedSigned({
     );
   }
   const validated = validateSignedSparkleFeed({
+    architecture: channel.architecture,
     appcastText,
     dmg: {
       bytes: dmgBytes,
@@ -2099,6 +2103,7 @@ async function readCandidateDeltaArtifacts({
  * local authentication.
  */
 export async function publishSparkleUpdate({
+  architecture = "arm64",
   atomicAppcastGuard = null,
   atomicAppcastGuardEndpoint = null,
   atomicAppcastGuardTokenEnv = null,
@@ -2149,7 +2154,7 @@ export async function publishSparkleUpdate({
         !== CANONICAL_STABLE_APPCAST_POLICY.schemaVersion) {
     fail("Publisher options are invalid");
   }
-  const releaseChannel = resolveReleaseChannel(channel);
+  const releaseChannel = resolveReleaseChannel(channel, { architecture });
   normalizeBucket(bucket, releaseChannel);
   const normalizedAppcastAtomicGuardEndpoint =
     normalizeAppcastAtomicGuardEndpoint(
@@ -2217,6 +2222,7 @@ export async function publishSparkleUpdate({
     },
   );
   const validatedDMG = await validateDMG(dmg.path, {
+    architecture: releaseChannel.architecture,
     expectedBundleIdentifier: manifest.manifest.application.bundleIdentifier,
     expectedBundleVersion: manifest.bundleVersion,
     expectedShortVersion: manifest.manifest.application.shortVersion,
@@ -2285,6 +2291,7 @@ export async function publishSparkleUpdate({
     ? null
     : await readStableReleaseManifest(previousStableManifestPath);
   assertStableSparkleKeyContinuity({
+    architecture: releaseChannel.architecture,
     candidateBundleVersion: manifest.bundleVersion,
     candidatePublicEdKeySha256: normalizedSparklePublicKey.sha256,
     channel: releaseChannel.name,
@@ -2292,6 +2299,7 @@ export async function publishSparkleUpdate({
     stableBootstrap,
   });
   const publication = Object.freeze({
+    architecture: releaseChannel.architecture,
     appcast: Object.freeze({
       cacheControl: APPCAST_CACHE_CONTROL,
       contentType: "application/xml; charset=utf-8",
@@ -2605,6 +2613,7 @@ export async function publishSparkleUpdate({
 
 export function parseSparkleUpdatePublisherArguments(argv) {
   const options = {
+    architecture: null,
     appcastPath: null,
     atomicAppcastGuardEndpoint: null,
     atomicAppcastGuardTokenEnv: null,
@@ -2619,6 +2628,7 @@ export function parseSparkleUpdatePublisherArguments(argv) {
     stableBootstrap: false,
   };
   const flags = new Map([
+    ["--architecture", "architecture"],
     ["--appcast", "appcastPath"],
     ["--atomic-appcast-guard-endpoint", "atomicAppcastGuardEndpoint"],
     ["--atomic-appcast-guard-token-env", "atomicAppcastGuardTokenEnv"],
@@ -2655,7 +2665,10 @@ export function parseSparkleUpdatePublisherArguments(argv) {
     ["--release-manifest", "releaseManifestPath"],
     ["--sparkle-public-ed-key", "sparklePublicEdKey"],
   ]) requiredOption(options[key], flag);
-  const releaseChannel = resolveReleaseChannel(options.channel);
+  options.architecture = normalizeReleaseArchitecture(options.architecture ?? "arm64");
+  const releaseChannel = resolveReleaseChannel(options.channel, {
+    architecture: options.architecture,
+  });
   normalizeAppcastAtomicGuardEndpoint(
     options.atomicAppcastGuardEndpoint,
     releaseChannel,

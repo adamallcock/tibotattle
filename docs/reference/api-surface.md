@@ -149,7 +149,8 @@ is never an arbitrary local proxy.
 | `GET` | `/api/local/weekly-pace-outlook` | Native shell | Loopback read | Reads the bounded account-scoped weekly pace presentation projection. | Local analysis |
 | `GET` | `/api/local/quality` | Dashboard | Loopback read | Reads monitoring-quality evidence. | Local analysis |
 | `GET` | `/api/local/timeline/window-breakdown` | Dashboard | Loopback read | Reads a bounded `from`/`to` timeline window; it is the only local API query-string route. | Local analysis |
-| `GET`, `POST` | `/api/local/refresh` | Dashboard/native shell | Loopback mutation | GET reads refresh state; POST starts source reads and an atomic snapshot/index refresh. | Refresh controller |
+| `GET`, `POST` | `/api/local/refresh` | Dashboard/native shell | Loopback mutation | GET reads refresh state, closed `mode` (`null`, `quick`, `detailed`) and actual `startedAt`; POST explicitly advances retained history and recalculates generation-bound detailed accounting before full publication. A 409 returns the in-flight receipt. | Refresh controller |
+| `POST` | `/api/local/refresh/quick` | Dashboard/native shell | Loopback mutation | Refreshes current quota/headline evidence without advancing the unified index or rebuilding detailed accounting; the last authoritative detailed projection remains available with current freshness truth fields. | Refresh controller |
 | `POST` | `/api/local/refresh/cancel` | Dashboard/native shell | Loopback mutation | Requests cancellation; published prior state remains intact. | Refresh controller |
 | `POST` | `/api/local/contribution/prepare` | Dashboard | Loopback mutation | Materializes a reviewed, bounded prepared contribution set locally. | Contribution |
 | `GET` | `/api/local/contribution/sync-status` | Dashboard | Loopback read | Reads the legacy prepared-set queue state. | Contribution sync |

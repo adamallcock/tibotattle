@@ -3,6 +3,12 @@ import { sha256, sha256Hex } from "./crypto";
 import stableSparkleReleaseContract from "./sparkle-release-contract.json";
 
 export interface SparkleAppcastGuardContract {
+  readonly architecture?: "arm64" | "x64";
+  readonly intel?: {
+    readonly appcastURL: string;
+    readonly appcastObjectKey: string;
+    readonly objectPrefix: string;
+  };
   readonly channel: string;
   readonly updateOrigin: string;
   readonly appcastObjectKey: string;
@@ -457,6 +463,7 @@ function parseSparkleArtifactURL(
   value: string,
   version: string,
   contract: SparkleAppcastGuardContract,
+  shortVersion?: string,
 ): {
   readonly key: string;
   readonly sha256: string;
@@ -485,6 +492,13 @@ function parseSparkleArtifactURL(
       )) {
     invalidCandidate();
   }
+  const fileName = segments[fileNameIndex] ?? "";
+  if ((contract.architecture === "x64" && (
+      !/^TiboTattle-[0-9]+\.[0-9]+\.[0-9]+-macOS-x64\.dmg$/u.test(fileName)
+      || fileName !== `TiboTattle-${shortVersion}-macOS-x64.dmg`))
+      || (contract.architecture !== "x64" && /-macOS-x64\.dmg$/u.test(fileName))) {
+    invalidCandidate();
+  }
   return {
     key: segments.join("/"),
     sha256: segments[sha256Index] as string,
@@ -510,7 +524,9 @@ function parseSparkleEnclosure(
       || canonicalBase64Bytes(signature)?.byteLength !== 64) {
     invalidCandidate();
   }
-  const object = parseSparkleArtifactURL(url, version, contract);
+  const object = parseSparkleArtifactURL(
+    url, version, contract, attributes.get("sparkle:shortVersionString"),
+  );
   const deltaFrom = attributes.get("sparkle:deltaFrom");
   if (deltaFrom !== undefined) invalidCandidate();
   return {
@@ -547,13 +563,20 @@ function parseOfficialSignedSparkleAppcast(
     invalidCandidate();
   }
   const signedText = text.slice(0, trailer.index);
-  const official = /^<\?xml version="1\.0" standalone="yes"\?><!-- sparkle-sign-warning:\n[^\u0000\r]*?--><rss xmlns:sparkle="http:\/\/www\.andymatuschak\.org\/xml-namespaces\/sparkle" version="2\.0">\s*<channel>\s*<title>([^<&\r\n]{1,128})<\/title>\s*<item>\s*<title>([^<&\r\n]{1,64})<\/title>\s*<pubDate>([^<&\r\n]{1,64})<\/pubDate>\s*<sparkle:version>([^<&\r\n]{1,32})<\/sparkle:version>\s*<sparkle:shortVersionString>([^<&\r\n]{1,32})<\/sparkle:shortVersionString>\s*<sparkle:minimumSystemVersion>([0-9]+(?:\.[0-9]+){1,2})<\/sparkle:minimumSystemVersion>\s*<sparkle:hardwareRequirements>arm64<\/sparkle:hardwareRequirements>\s*<enclosure\b([^>]*?)>\s*<\/enclosure\s*>\s*<\/item>\s*<\/channel>\s*<\/rss>$/u.exec(signedText);
+  const official = /^<\?xml version="1\.0" standalone="yes"\?><!-- sparkle-sign-warning:\n[^\u0000\r]*?--><rss xmlns:sparkle="http:\/\/www\.andymatuschak\.org\/xml-namespaces\/sparkle" version="2\.0">\s*<channel>\s*<title>([^<&\r\n]{1,128})<\/title>\s*<item>\s*<title>([^<&\r\n]{1,64})<\/title>\s*<pubDate>([^<&\r\n]{1,64})<\/pubDate>\s*<sparkle:version>([^<&\r\n]{1,32})<\/sparkle:version>\s*<sparkle:shortVersionString>([^<&\r\n]{1,32})<\/sparkle:shortVersionString>\s*<sparkle:minimumSystemVersion>([0-9]+(?:\.[0-9]+){1,2})<\/sparkle:minimumSystemVersion>\s*(?:<sparkle:hardwareRequirements>(arm64)<\/sparkle:hardwareRequirements>\s*)?<enclosure\b([^>]*?)>\s*<\/enclosure\s*>\s*<\/item>\s*<\/channel>\s*<\/rss>$/u.exec(signedText);
   if (official === null || Number.isNaN(Date.parse(official[3] ?? ""))) {
     invalidCandidate();
   }
   const version = official[4];
   const shortVersion = official[5];
-  const attributeSource = official[7];
+  // Sparkle 2.9.3 emits the hardware element only for ARM-only applications.
+  // Intel is identified by its separate signed namespace and canonical filename.
+  const hardwareRequirements = official[7];
+  const architecture = contract.architecture ?? "arm64";
+  if ((architecture === "arm64" && hardwareRequirements !== "arm64")
+      || (architecture === "x64" && (hardwareRequirements !== undefined
+        || official[6] !== "14.0"))) invalidCandidate();
+  const attributeSource = official[8];
   if (version === undefined
       || !BUNDLE_VERSION_PATTERN.test(version)
       || shortVersion === undefined
@@ -572,6 +595,7 @@ function parseOfficialSignedSparkleAppcast(
     invalidCandidate();
   }
   attributes.set("sparkle:version", version);
+  attributes.set("sparkle:shortVersionString", shortVersion);
   const latest = parseSparkleEnclosure(attributes, contract);
   return {
     enclosures: [latest],
@@ -587,6 +611,7 @@ function parseSparkleAppcast(
   if (text.includes("<!-- sparkle-signatures:")) {
     return parseOfficialSignedSparkleAppcast(text, contract);
   }
+  if (contract.architecture === "x64") invalidCandidate();
   if (text.length === 0 || text.includes("<!") || text.includes("<!--")
       || text.includes("<![CDATA[") || text.includes("<?xml-stylesheet")) {
     invalidCandidate();
@@ -978,6 +1003,18 @@ export async function handleSparkleAppcastGuardForContract(
   } catch (error) {
     if (error instanceof ApiError) throw error;
     throw new ApiError(503, "SPARKLE_APPCAST_GUARD_STORAGE_UNAVAILABLE");
+  }
+  // The HMAC covers the complete target key and the nonce is consumed across
+  // both architectures. Select only a checked-in namespace, after authentication;
+  // configuration still binds the shared owner token/key/bucket to this channel.
+  let target: Record<string, unknown>;
+  try {
+    target = parseObject(JSON.parse(decoder.decode(body)) as unknown);
+  } catch {
+    invalidRequest();
+  }
+  if (contract.intel !== undefined && target.key === contract.intel.appcastObjectKey) {
+    contract = { ...contract, ...contract.intel, architecture: "x64" };
   }
   const payload = parsePayload(body, contract);
   const candidateBytes = base64UrlDecode(payload.candidate.base64);

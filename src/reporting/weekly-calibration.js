@@ -811,6 +811,7 @@ function summarizeResetGroup(rows) {
     observedSpanPp: percentages.length > 0 ? Math.max(...percentages) - Math.min(...percentages) : 0,
     interval: groupInterval(ordered),
     first: ordered[0],
+    firstEligible: eligible[0] ?? null,
   };
 }
 
@@ -1014,7 +1015,12 @@ export function analyzeWeeklyCalibration(
     (row.planType ?? "unknown") === selectedPlanType
   )));
   const resetFits = grouped.selected.map((group) => {
-    const first = group.first;
+    // A diagnostic-only transition may precede the clean observations that
+    // actually qualify this reset for a fit. Project the fit's identity and
+    // eligibility from its first admitted row; carrying metadata from the
+    // rejected row makes a valid estimate describe itself as diagnostic-only
+    // and correctly fail the bounded cache validator.
+    const first = group.firstEligible ?? group.first;
     const fits = Object.fromEntries(CANDIDATES.map((candidate) => [candidate.id, fitReset(group.rows, candidate)]));
     const lagFits = Object.fromEntries(LAG_CANDIDATES.map((candidate) => [candidate.id, fitReset(group.rows, candidate)]));
     return {

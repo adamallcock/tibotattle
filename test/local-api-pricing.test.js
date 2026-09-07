@@ -49,6 +49,28 @@ test("Codex defaults to event-time history while retaining explicit current sens
   );
 });
 
+test("Astra prices separate cache writes and combined output once with event-time context", () => {
+  const event = {
+    timestamp: "2026-09-03T12:00:00.000Z", model: "gpt-6-astra",
+    totalInputContextTokens: 272_000, raw: { input_tokens: 999_999 },
+    components: { input_uncached_tokens: 100_000, input_cache_read_tokens: 100_000,
+      input_cache_write_tokens: 72_000, output_text_tokens: 40_000, output_reasoning_tokens: 60_000 },
+    componentAvailability: { input_uncached_tokens: true, input_cache_read_tokens: true,
+      input_cache_write_tokens: true, output_text_tokens: true, output_reasoning_tokens: true },
+  };
+  assert.equal(priceCodexUsageEvent(event).totalUsd, "7");
+  assert.equal(priceCodexUsageEvent(event, { apiServiceTier: "priority" }).totalUsd, "14");
+  assert.equal(priceCodexUsageEvent({ ...event, totalInputContextTokens: 272_001 }).totalUsd, "11.5");
+  const missing = priceCodexUsageEvent({ ...event, componentAvailability: {
+    ...event.componentAvailability, input_cache_write_tokens: false,
+  } });
+  assert.equal(missing.coverageStatus, "partially_priced");
+  assert.equal(missing.coverageCounts.unavailableComponents, 1);
+  const old = priceCodexUsageEvent({ ...event, timestamp: "2026-09-02T12:00:00.000Z" });
+  assert.notEqual(old.coverageStatus, "fully_priced");
+  assert.equal(priceCodexUsageEvent(event, { priceEpochBasis: "current_price_sensitivity" }).totalUsd, "7");
+});
+
 test("Codex component availability reaches the ledger and never becomes observed zero", () => {
   const result = priceCodexUsageEvent({
     timestamp: "2026-07-26T15:00:00.000Z",

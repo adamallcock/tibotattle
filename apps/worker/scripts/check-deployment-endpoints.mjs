@@ -29,6 +29,7 @@ import {
 import {
   RELEASE_CHANNELS,
   STABLE_RELEASE_CHANNEL,
+  resolveReleaseChannel,
 } from "../../../config/release-channels.js";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
@@ -160,6 +161,12 @@ export function validateWorkerSparkleReleaseContract(
       fail(
         `Worker Sparkle release contract ${field} must match the canonical release manifests`,
       );
+    }
+  }
+  const intel = resolveReleaseChannel(STABLE_RELEASE_CHANNEL, { architecture: "x64" });
+  for (const field of ["appcastURL", "appcastObjectKey", "objectPrefix"]) {
+    if (contract.intel?.[field] !== intel.sparkle[field]) {
+      fail(`Worker Sparkle Intel contract ${field} must match the reviewed architecture`);
     }
   }
   if (contract.serviceOrigin !== endpoints.public.origin

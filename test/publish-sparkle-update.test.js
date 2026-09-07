@@ -231,7 +231,8 @@ length: ${prefixBytes.length}
 }
 
 async function createReleaseFixture({
-  appcastURL = CANONICAL_APPCAST_URL,
+  architecture = "arm64",
+  appcastURL = null,
   bundleVersion = "1",
   dmgbBytes = Buffer.from("signed-notarized-dmg-fixture"),
   mutateAppcast = (value) => value,
@@ -242,34 +243,39 @@ async function createReleaseFixture({
   const root = await mkdtemp(
     join(await realpath(tmpdir()), "tibotattle-r2-publisher-test-"),
   );
-  const fileName = RELEASE_MANIFEST.macOS.arm64DmgFileName;
+  const selectedChannel = getReleaseChannel("stable", { architecture });
+  appcastURL ??= selectedChannel.sparkle.appcastURL;
+  const fileName = architecture === "x64"
+    ? RELEASE_MANIFEST.macOS.x64DmgFileName : RELEASE_MANIFEST.macOS.arm64DmgFileName;
   const dmgPath = join(root, fileName);
   const appcastPath = join(root, "appcast.xml");
   const releaseManifestPath = join(root, `${fileName}.release.json`);
   const digest = sha256(dmgbBytes);
   const signature = sign(null, dmgbBytes, TEST_KEY_PAIR.privateKey)
     .toString("base64");
-  const artifactURL = `${STABLE_CHANNEL.sparkle.origin}/${STABLE_CHANNEL.sparkle.objectPrefix}/${bundleVersion}/${digest}/${fileName}`;
+  const artifactURL = `${selectedChannel.sparkle.origin}/${selectedChannel.sparkle.objectPrefix}/${bundleVersion}/${digest}/${fileName}`;
   const manifest = mutateManifest({
     schemaVersion: "usage-monitor-macos-release-v0.2",
     application: {
+      ...(architecture === "x64" ? { architecture } : {}),
       bundleIdentifier: "com.usagemonitor.local",
       bundleVersion,
       shortVersion,
     },
     artifact: { bytes: dmgbBytes.length, fileName, sha256: digest },
     channel: {
-      name: STABLE_CHANNEL.name,
-      serviceOriginMode: STABLE_CHANNEL.serviceOriginMode,
-      serviceOrigin: STABLE_CHANNEL.serviceOrigin,
-      publicWebsiteOrigin: STABLE_CHANNEL.publicWebsiteOrigin,
+      ...(architecture === "x64" ? { architecture } : {}),
+      name: selectedChannel.name,
+      serviceOriginMode: selectedChannel.serviceOriginMode,
+      serviceOrigin: selectedChannel.serviceOrigin,
+      publicWebsiteOrigin: selectedChannel.publicWebsiteOrigin,
       sparkle: {
-        origin: STABLE_CHANNEL.sparkle.origin,
-        appcastURL: STABLE_CHANNEL.sparkle.appcastURL,
-        appcastObjectKey: STABLE_CHANNEL.sparkle.appcastObjectKey,
-        r2Bucket: STABLE_CHANNEL.sparkle.r2Bucket,
-        objectPrefix: STABLE_CHANNEL.sparkle.objectPrefix,
-        atomicGuardURL: STABLE_CHANNEL.sparkle.atomicGuardURL,
+        origin: selectedChannel.sparkle.origin,
+        appcastURL: selectedChannel.sparkle.appcastURL,
+        appcastObjectKey: selectedChannel.sparkle.appcastObjectKey,
+        r2Bucket: selectedChannel.sparkle.r2Bucket,
+        objectPrefix: selectedChannel.sparkle.objectPrefix,
+        atomicGuardURL: selectedChannel.sparkle.atomicGuardURL,
         publicEdKeySha256: TEST_PUBLIC_ED_KEY_SHA256,
       },
     },
@@ -322,8 +328,8 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
             <pubDate>Wed, 05 Aug 2026 14:55:05 -0400</pubDate>
             <sparkle:version>${bundleVersion}</sparkle:version>
             <sparkle:shortVersionString>${shortVersion}</sparkle:shortVersionString>
-            <sparkle:minimumSystemVersion>13.0</sparkle:minimumSystemVersion>
-            <sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>
+            <sparkle:minimumSystemVersion>${architecture === "x64" ? "14.0" : "13.0"}</sparkle:minimumSystemVersion>
+            ${architecture === "arm64" ? "<sparkle:hardwareRequirements>arm64</sparkle:hardwareRequirements>" : ""}
             <enclosure url="${artifactURL}" length="${dmgbBytes.length}" type="application/octet-stream" sparkle:edSignature="${signature}"></enclosure>
         </item>
     </channel>
@@ -337,6 +343,7 @@ IMPORTANT: This file was signed by Sparkle. Any modifications to this file requi
   return {
     appcast,
     appcastPath,
+    appcastURL,
     artifactURL,
     cleanup: () => rm(root, { recursive: true, force: true }),
     dmgBytes: dmgbBytes,
@@ -356,7 +363,7 @@ function publicReadbackFixture(fixture, {
     calls,
     fetch: async (url, options = {}) => {
       calls.push({ method: options.method ?? "GET", url });
-      if (url === CANONICAL_APPCAST_URL) {
+      if (url === (fixture.appcastURL ?? CANONICAL_APPCAST_URL)) {
         return new Response(appcastBody, {
           headers: {
             "Cache-Control": APPCAST_CACHE_CONTROL,
@@ -866,6 +873,7 @@ test("validates an explicitly supplied canonical signed update without invoking 
     assert.equal(publication.manifest.cacheControl, IMMUTABLE_CACHE_CONTROL);
     assert.equal(publication.appcast.cacheControl, APPCAST_CACHE_CONTROL);
     assert.deepEqual(verified, [[fixture.dmgPath, {
+      architecture: "arm64",
       channel: "stable",
       expectedBundleIdentifier: "com.usagemonitor.local",
       expectedBundleVersion: "1",
@@ -3249,4 +3257,65 @@ test("no named channel can emit the unsigned hand-built feed from the CLI", asyn
   } finally {
     await rm(temporaryRoot, { recursive: true, force: true });
   }
+});
+
+
+test("Intel publisher preflight binds manifest, validator, and object destinations to x64", async () => {
+  const fixture = await createReleaseFixture({ architecture: "x64" });
+  const validations = [];
+  try {
+    const publication = await publishSparkleUpdate({
+      architecture: "x64", channel: "stable", bucket: APPROVED_R2_BUCKET,
+      dmgPath: fixture.dmgPath, appcastPath: fixture.appcastPath,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+      validateDMG: async (_path, options) => { validations.push(options); },
+    });
+    assert.equal(publication.architecture, "x64");
+    assert.equal(publication.appcast.key, "intel/appcast.xml");
+    assert.match(publication.artifact.key, /^intel\/releases\//u);
+    assert.match(publication.manifest.key, /^intel\/releases\//u);
+    assert.equal(validations[0].architecture, "x64");
+    await assert.rejects(publishSparkleUpdate({
+      channel: "stable", bucket: APPROVED_R2_BUCKET,
+      dmgPath: fixture.dmgPath, appcastPath: fixture.appcastPath,
+      releaseManifestPath: fixture.releaseManifestPath,
+      sparklePublicEdKey: TEST_PUBLIC_ED_KEY,
+    }));
+  } finally { await fixture.cleanup(); }
+});
+
+
+test("Intel first publication bootstraps only its empty feed and cannot reuse ARM history", async () => {
+  const arm = await createReleaseFixture({ bundleVersion: "1024" });
+  const intel = await createReleaseFixture({ architecture: "x64", bundleVersion: "1026" });
+  const armObjectPath = `${APPROVED_R2_BUCKET}/appcast.xml`;
+  const intelObjectPath = `${APPROVED_R2_BUCKET}/intel/appcast.xml`;
+  const armBytes = await readFile(arm.appcastPath);
+  const runner = statefulRemoteObjectRunner({ objects: new Map([[armObjectPath, armBytes]]) });
+  const publicReadback = publicReadbackFixture(intel);
+  const options = {
+    architecture: "x64", channel: "stable", bucket: APPROVED_R2_BUCKET,
+    dmgPath: intel.dmgPath, appcastPath: intel.appcastPath,
+    releaseManifestPath: intel.releaseManifestPath,
+    sparklePublicEdKey: TEST_PUBLIC_ED_KEY, publish: true,
+    runWrangler: runner.run, fetchPublic: publicReadback.fetch,
+  };
+  try {
+    await assert.rejects(publishSparkleUpdate({ ...options, stableBootstrap: false,
+      previousStableManifestPath: arm.releaseManifestPath }),
+    { code: "MACOS_RELEASE_ARCHITECTURE_MISMATCH" });
+    assert.equal(runner.calls.length, 0);
+    const publication = await publishSparkleUpdate(options);
+    assert.equal(publication.status, "published");
+    assert.equal(publication.verified, true);
+    assert.deepEqual(runner.objects.get(armObjectPath), armBytes);
+    assert.deepEqual(runner.objects.get(intelObjectPath), await readFile(intel.appcastPath));
+    assert.equal(runner.calls.some((call) => call[3] === armObjectPath), false);
+    assert.deepEqual(runner.calls.filter((call) => call[2] === "put").map((call) => call[3]), [
+      `${APPROVED_R2_BUCKET}/${publication.artifact.key}`,
+      `${APPROVED_R2_BUCKET}/${publication.manifest.key}`,
+      intelObjectPath,
+    ]);
+  } finally { await arm.cleanup(); await intel.cleanup(); }
 });

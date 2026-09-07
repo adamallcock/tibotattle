@@ -1,3 +1,4 @@
+import { codexCacheReasoningConfiguration } from "@app-usagemonitor/telemetry-contract";
 import {
   emptySpeedWeightingCrossing,
   fastModeModelFamilyKey,
@@ -7,6 +8,8 @@ import { codexPrimaryAllowanceBasis } from "./codex-primary-allowance-basis.js";
 import {
   LOCAL_UNIFIED_INDEX_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+  LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
   reasoningEffortName,
 } from "./local-unified-index.js";
 import {
@@ -173,14 +176,6 @@ function observedTokenCount(value) {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
-function effectiveReasoningEffort(value) {
-  // Codex Max and Ultra currently serialize to the same API effort. They are
-  // presentation choices inside one effective prompt-cache lineage, so a
-  // label-only Max <-> Ultra boundary is not an effort change.
-  if (value === "max" || value === "ultra") return "max";
-  return value;
-}
-
 function recognizedModel(model, recognition) {
   return recognition === "recognized"
     && typeof model === "string"
@@ -210,8 +205,12 @@ function configurationFor(row) {
     return null;
   }
   const modelChanged = previousModel !== currentModel;
-  const reasoningChanged = effectiveReasoningEffort(previousEffort)
-    !== effectiveReasoningEffort(currentEffort);
+  // Configuration aliases are model-specific (Astra Ultra also changes mode).
+  // This comparison is not proof
+  // that a configuration update was applied or that a cache reset occurred;
+  // the separate observed-token and compaction gates remain authoritative.
+  const reasoningChanged = codexCacheReasoningConfiguration(previousModel, previousEffort)
+    !== codexCacheReasoningConfiguration(currentModel, currentEffort);
   return {
     previousModel,
     currentModel,
@@ -258,7 +257,9 @@ function sameContinuityConfiguration(row) {
 
 function compactionAwareParser(value) {
   return value === LOCAL_UNIFIED_INDEX_PARSER_VERSION
-    || value === LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION;
+    || value === LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION
+    || value === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION
+    || value === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION;
 }
 
 function componentsFor(row) {

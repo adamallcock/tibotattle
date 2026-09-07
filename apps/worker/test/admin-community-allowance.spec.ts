@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { ADMIN_MODEL_CONFIG, ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+  LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION, expandAdminModelHistoryDay,
+  projectAdminModelHistoryDay } from "@app-usagemonitor/telemetry-contract";
 
 import {
   ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS,
@@ -30,7 +33,9 @@ interface CacheRow {
 const ACTIVE_V11_SOURCE_QUERY =
   "SELECT 1 AS present FROM telemetry_v11_domain_heads WHERE participant_id = ? LIMIT 1";
 
-function cacheDatabase(rows: CacheRow[], { fail = false } = {}) {
+function cacheDatabase(rows: CacheRow[], { fail = false,
+  modelDays = [] as { day: string; payload_json: string }[],
+} = {}) {
   const statements: string[] = [];
   const bindings: unknown[][] = [];
   const database = {
@@ -62,8 +67,10 @@ function cacheDatabase(rows: CacheRow[], { fail = false } = {}) {
           if (!/^\s*WITH\b/u.test(statement) && /telemetry_(?:v1|analytical)_chunks/u.test(statement)) {
             return { results: [] };
           }
-          if (statement.includes("day_device_evidence")
-              || statement.includes("community_model_composition_days")) {
+          if (statement.includes("community_model_composition_days")) {
+            return { results: modelDays };
+          }
+          if (statement.includes("day_device_evidence")) {
             return { results: [] };
           }
           return { results: rows };
@@ -266,6 +273,51 @@ function expectPinnedCompositionRefresh(statements: string[]) {
 }
 
 describe("admin community allowance preview", () => {
+  it("scheduled reads retain legacy model days without inventing newer-model coverage", async () => {
+    const legacy = { day: "2026-08-22", byModel: Object.fromEntries([
+      "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5",
+    ].map((id) => [id, { capacityUsd: null, participantCount: 0 }])),
+    fittedParticipantCount: 0, unstableParticipantCount: 1, staleParticipantCount: 0,
+    refusedParticipantCount: 0, v1ParticipantCount: 1, unsupportedSourceParticipantCount: 0 };
+    const source = cacheDatabase([cacheRow()], { modelDays: [
+      { day: "2026-08-23", payload_json: JSON.stringify({ ...legacy, day: "2026-08-23", rawModel: "private-canary" }) },
+      { day: legacy.day, payload_json: JSON.stringify(legacy) },
+    ] });
+    const preview = await buildAdminCommunityAllowancePreviewFromSource(
+      source.database, Date.parse("2026-08-23T10:30:00.000Z"),
+    );
+    expect(preview?.models.days).toHaveLength(1);
+    const kept = preview!.models.days[0]!;
+    expect(kept.catalogVersion).toBe(LEGACY_ADMIN_MODEL_HISTORY_CATALOG_VERSION);
+    expect(kept.day).toBe(legacy.day);
+    expect(expandAdminModelHistoryDay(kept)!.byModel["gpt-6-astra"])
+      .toEqual({ capacityUsd: null, participantCount: null });
+    expect(JSON.stringify(preview)).not.toContain("private-canary");
+  });
+
+  it("serves all 70 fully populated catalog days inside the bounded cache", async () => {
+    const now = Date.parse("2026-09-03T12:00:00.000Z");
+    const base = buildAdminCommunityAllowancePreview([], now);
+    const models = { ...base.models, days: base.days.map(({ day }) => {
+      const projected = projectAdminModelHistoryDay({
+        day, catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+        values: ADMIN_MODEL_CONFIG.filter((model) => model.allowanceTrack === "primary")
+          .map((model) => [model.modelId, 1.7976931348623157e308, Number.MAX_SAFE_INTEGER]),
+        fittedParticipantCount: Number.MAX_SAFE_INTEGER,
+        unstableParticipantCount: 0, staleParticipantCount: 0, refusedParticipantCount: 0,
+        v1ParticipantCount: Number.MAX_SAFE_INTEGER, unsupportedSourceParticipantCount: 0,
+      });
+      expect(projected).not.toBeNull();
+      return projected!;
+    }) };
+    const preview = { ...base, models };
+    const payload = JSON.stringify(preview);
+    expect(new TextEncoder().encode(payload).byteLength).toBeLessThan(256 * 1024);
+    const cached = previewCacheDatabase({ generated_at: preview.generatedAt, payload_json: payload });
+    await expect(readCachedAdminCommunityAllowancePreview(cached.database, now)).resolves.toEqual(preview);
+    expect(cached.statements).toHaveLength(1);
+  });
+
   it("normalizes eligible fits before merging and deduplicates participants", () => {
     const fits = [
       fit(),
@@ -465,12 +517,7 @@ describe("admin community allowance preview", () => {
       /^INSERT INTO community_model_composition_days\b/u,
     );
     expect(preview?.models.days).toEqual([]);
-    expect(preview?.models.modelConfig.map((model) => model.modelId)).toEqual([
-      "gpt-5.6-sol",
-      "gpt-5.6-terra",
-      "gpt-5.6-luna",
-      "gpt-5.5",
-    ]);
+    expect(preview?.models.modelConfig).toEqual(ADMIN_MODEL_CONFIG);
   });
 
   it("reports the production-shaped 8/8/6/5 coverage without exposing IDs", async () => {
@@ -570,7 +617,7 @@ describe("admin community allowance preview", () => {
     expect(statements[0]).not.toMatch(
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu,
     );
-    expect(bindings).toEqual([[128 * 1_024, COMMUNITY_ATTRIBUTION_METHOD_VERSION]]);
+    expect(bindings).toEqual([[256 * 1_024, COMMUNITY_ATTRIBUTION_METHOD_VERSION]]);
     expect(JSON.stringify(cached)).not.toContain("participant-1");
   });
 
@@ -588,7 +635,7 @@ describe("admin community allowance preview", () => {
         [],
         nowEpoch - 3 * 60 * 60 * 1_000,
       )),
-      { generated_at: preview.generatedAt, payload_json: "x".repeat(128 * 1_024 + 1) },
+      { generated_at: preview.generatedAt, payload_json: "x".repeat(256 * 1_024 + 1) },
       { generated_at: preview.generatedAt, payload_json: "{" },
       { generated_at: preview.generatedAt, payload_json: JSON.stringify(withIdentifier) },
     ];

@@ -228,3 +228,32 @@ test("stable publication provenance rejects a wrong feed or bucket", () => {
     { code: "RELEASE_CHANNEL_PUBLICATION_MISMATCH" },
   );
 });
+
+
+test("Intel and Apple silicon have disjoint feed and immutable object namespaces", () => {
+  for (const name of ["stable", "internal-dogfood"]) {
+    const arm = resolveReleaseChannel(name);
+    const intel = resolveReleaseChannel(name, { architecture: "x64" });
+    assert.equal(arm.architecture, "arm64");
+    assert.equal(intel.architecture, "x64");
+    assert.notEqual(arm.sparkle.appcastObjectKey, intel.sparkle.appcastObjectKey);
+    assert.notEqual(arm.sparkle.objectPrefix, intel.sparkle.objectPrefix);
+    assert.equal(arm.sparkle.r2Bucket, intel.sparkle.r2Bucket);
+    assert.equal(arm.sparkle.atomicGuardURL, intel.sparkle.atomicGuardURL);
+    const publication = createReleaseChannelProvenance(intel, {
+      publicEdKeySha256: intel.sparkle.publicEdKeySha256 ?? TEST_PUBLIC_KEY_SHA256,
+    });
+    assert.equal(assertReleaseChannelPublication(name, publication), intel);
+    assert.throws(() => assertReleaseChannelPublication(arm, publication),
+      { code: "RELEASE_CHANNEL_PUBLICATION_MISMATCH" });
+    const legacy = { ...publication };
+    delete legacy.architecture;
+    assert.throws(() => assertReleaseChannelPublication(intel, legacy),
+      { code: "RELEASE_CHANNEL_PUBLICATION_MISMATCH" });
+    assert.throws(() => assertReleaseChannelConfiguration({ ...intel, sparkle: arm.sparkle }));
+  }
+  for (const architecture of ["x86_64", "universal", "", null]) {
+    assert.throws(() => resolveReleaseChannel("stable", { architecture }),
+      { code: "RELEASE_ARCHITECTURE_INVALID" });
+  }
+});

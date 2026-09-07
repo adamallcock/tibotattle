@@ -300,3 +300,24 @@ automatic Keychain prompt, but failed the separate real accounting-refresh
 gate. Corrective RC6 is build `1023.4`; the prompt-avoidance contract and its
 release-blocking treatment are unchanged and must be reverified on that exact
 installed artifact.
+
+### RC7 allocation follow-up
+
+RC6 build `1023.4` was subsequently signed, notarized, installed, launched, and
+refreshed without an observed automatic Keychain prompt. That qualifies the
+prompt-free automatic path only for the exact RC6 artifact. Its refresh exposed
+a separate inherited `recent_7d_indexing` accounting checkpoint, so the narrow
+correction must ship as a newly signed candidate rather than relabel RC6. RC7 is
+allocated monotonic build `1023.5`; the Keychain contract is unchanged, and an
+unexpected prompt remains release-blocking during its fresh installed-artifact
+qualification.
+
+### RC8 allocation follow-up
+
+RC7 source merge `87e07be350582713d815a21b4db470ed84aae037`, build
+`1023.5`, subsequently passed signing, notarization, stapling, installation,
+launch, and automatic prompt-free checks. Its installed refresh exposed a
+separate accounting fit-metadata defect, so that source cannot be relabelled.
+RC8 is allocated monotonic build `1023.6`; the Keychain contract is unchanged,
+and an unexpected automatic prompt remains release-blocking during fresh RC8
+artifact and installed qualification. No RC8 artifact result is claimed here.
