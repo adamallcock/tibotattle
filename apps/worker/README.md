@@ -42,8 +42,14 @@ latest verified external state.
 - Account-scoped reads authenticate before revealing whether data exists.
 - Contribution ingestion, device operations, protected session operations, and
   private owner participant erasure remain replay-safe and auditable.
-- Public aggregates are delayed, thresholded, rounded, and withheld when
+- Sealed weekly aggregates are delayed, thresholded, rounded, and withheld when
   support, maturity, privacy, or quality evidence is insufficient.
+- Daily activity and allowance estimates have no minimum account count or
+  per-account cap. The owner-approved optional plan/model projection includes
+  dollar estimates and sample counts even for one account, without identifiers
+  or admin diagnostics. It uses only fresh, source-matched cached evidence and
+  closed, requested, published dates; missing evidence is omitted, never fitted
+  during a public request. See the [public contract](../../docs/reference/api-surface.md#public-allowance-breakdowns).
 - Unknown routes and wrong methods fail closed with bounded content-free errors.
 - Production admin actions exist only on the reviewed admin host behind
   Cloudflare Access.

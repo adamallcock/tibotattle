@@ -291,6 +291,7 @@ export const CLIENT_WEB_FILES = Object.freeze([
   "apps/web/public/install-cta.js",
   "apps/web/public/lib.js",
   "apps/web/public/localization.js",
+  "apps/web/public/model-catalog.generated.js",
   "apps/web/public/navigation.js",
   "apps/web/public/styles.css",
   "apps/web/public/telemetry-envelope.js",

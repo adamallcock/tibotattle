@@ -25,6 +25,7 @@ const PUBLIC_RELEASE_SOURCE_BASENAMES = new Set([
   "i18n.generated.js",
   "install-cta.js",
   "localization.js",
+  "model-catalog.generated.js",
   "privacy.html",
   "styles.css",
   "tibotattle-icon.png",

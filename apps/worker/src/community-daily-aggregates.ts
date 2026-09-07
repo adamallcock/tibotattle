@@ -8,6 +8,8 @@ import {
   summarizeCommunityAllowanceDay,
 } from "./community-allowance";
 import type { CommunityAllowanceFit, CommunityModelCacheReadBudget } from "./community-allowance";
+import { PREVIEW_CACHE_JSON_LIMIT_BYTES } from "./admin-community-allowance";
+import type { PublicAllowanceBreakdownsCacheRow } from "./public-allowance-breakdowns";
 import { sha256Hex } from "./crypto";
 import {
   DAILY_SPEND_CHUNKS_PER_PASS,
@@ -716,20 +718,33 @@ export function isCurrentCommunityAllowancePublication(
 export interface PublishedCommunityDailyRead {
   rows: PublishedCommunityDailyAggregateRow[];
   allowancePublicationState: CommunityAllowancePublicationStateRow | null;
+  allowanceBreakdownsCache: PublicAllowanceBreakdownsCacheRow | null;
+}
+
+interface PublishedCommunityDailyQueryRow {
+  day: string | null;
+  revision: number | null;
+  payload_json: string | null;
+  released_at: string | null;
+  publication_state: "updating" | "ready" | null;
+  expected_basis: string | null;
+  attribution_method_version: string | null;
+  safe_from_day: string | null;
+  safe_to_day: string | null;
 }
 
 /**
- * Constant-cost public read for requested daily rows plus the scheduled
- * allowance cutover singleton. A sentinel LEFT JOIN preserves requested daily
- * availability even if the singleton is unexpectedly absent; callers then
- * fail the allowance surface closed as updating.
+ * One atomic read-only batch keeps requested publication, readiness, and preview
+ * source epoch on the same snapshot. The bounded preview is read once, not
+ * joined and repeated for every daily row. A sentinel LEFT JOIN preserves
+ * activity when readiness is absent; callers fail allowance closed as updating.
  */
 export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
   db: D1Database,
   fromDay: string,
   toDay: string,
 ): Promise<PublishedCommunityDailyRead> {
-  const result = await db.prepare(
+  const dailyStatement = db.prepare(
     `WITH latest AS (
        SELECT day, MAX(revision) AS revision
          FROM community_daily_aggregates
@@ -757,18 +772,44 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
          ON state.singleton = gate.singleton
        LEFT JOIN requested ON 1 = 1
       ORDER BY requested.day ASC`,
-  ).bind(fromDay, toDay).all<{
-    day: string | null;
-    revision: number | null;
-    payload_json: string | null;
-    released_at: string | null;
-    publication_state: "updating" | "ready" | null;
-    expected_basis: string | null;
-    attribution_method_version: string | null;
-    safe_from_day: string | null;
-    safe_to_day: string | null;
-  }>();
-  const first = result.results[0];
+  ).bind(fromDay, toDay);
+  let queryRows: PublishedCommunityDailyQueryRow[];
+  let allowanceBreakdownsCache: PublicAllowanceBreakdownsCacheRow | null = null;
+  try {
+    const previewStatement = db.prepare(
+      `SELECT cache.generated_at, cache.payload_json
+         FROM admin_community_allowance_preview_cache cache
+         JOIN community_snapshot_mutation_control source
+           ON source.singleton_id = 1
+          AND cache.source_mutation_epoch = source.mutation_epoch
+        WHERE cache.singleton = 1
+          AND length(CAST(cache.payload_json AS BLOB)) <= ?1
+          AND cache.attribution_method_version = ?2
+        LIMIT 1`,
+    ).bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION);
+    const results = await db.batch<PublishedCommunityDailyQueryRow | PublicAllowanceBreakdownsCacheRow>([
+      dailyStatement,
+      previewStatement,
+    ]);
+    queryRows = (results[0]?.results ?? []).filter(
+      (row): row is PublishedCommunityDailyQueryRow => "publication_state" in row,
+    );
+    const cache = results[1]?.results[0];
+    if (cache && "generated_at" in cache
+        && typeof cache.generated_at === "string"
+        && typeof cache.payload_json === "string") {
+      allowanceBreakdownsCache = {
+        generated_at: cache.generated_at,
+        payload_json: cache.payload_json,
+      };
+    }
+  } catch {
+    // An unavailable optional cache/schema cannot hide existing activity. This
+    // fallback has no preview, so it cannot combine rows from different epochs.
+    // An unavailable daily store still fails normally; no source work is tried.
+    queryRows = (await dailyStatement.all<PublishedCommunityDailyQueryRow>()).results;
+  }
+  const first = queryRows[0];
   const allowancePublicationState = first?.publication_state !== null
       && first?.publication_state !== undefined
       && typeof first.expected_basis === "string"
@@ -782,7 +823,7 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
         safe_to_day: first.safe_to_day,
       }
     : null;
-  const rows = result.results.flatMap((row) => (
+  const rows = queryRows.flatMap((row) => (
     typeof row.day === "string"
       && typeof row.revision === "number"
       && typeof row.payload_json === "string"
@@ -795,7 +836,7 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
         }]
       : []
   ));
-  return { rows, allowancePublicationState };
+  return { rows, allowancePublicationState, allowanceBreakdownsCache };
 }
 
 /**

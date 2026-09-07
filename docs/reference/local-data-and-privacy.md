@@ -128,9 +128,16 @@ and arbitrary metadata. Canonical schemas and mirror ownership are listed in
 
 Hosted storage uses Cloudflare D1 for identity/session/device/contribution and
 derived aggregate state, R2 for encrypted contribution objects and update
-artifacts, and a Durable Object for shared upload admission. Public community
-figures are derived, delayed, rounded/capped, and withheld when privacy or
-quality thresholds are not met.
+artifacts, and a Durable Object for shared upload admission. Public daily
+activity totals and allowance estimates have no minimum account count or
+per-account cap. The owner explicitly approved plan/model dollar estimates
+and supporting account/fit counts even for one account. Such small samples can
+reveal a contributor's estimated capacity despite omitting identifiers; they
+are not anonymous. Plan/model comparisons use closed UTC dates, a fresh
+source-matched cache and qualified evidence; missing or unstable estimates
+remain gaps. Only the older sealed weekly snapshot contract applies its own
+delay, minimum-account threshold, caps and rounding. Its guarantees are not
+weakened or attributed to the daily view.
 
 Stable pseudonyms and identity reattachment permit longitudinal linkage.
 Content-free, pseudonymous contribution is not anonymous data.

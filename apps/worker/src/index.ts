@@ -282,6 +282,7 @@ import {
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
 import { isCurrentCommunityDailySpend } from "./community-daily-spend";
+import { projectPublicAllowanceBreakdowns } from "./public-allowance-breakdowns";
 import {
   COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
@@ -3169,15 +3170,16 @@ async function handleCommunityDaily(
   if (rangeDays < 1 || rangeDays > COMMUNITY_DAILY_MAX_RANGE_DAYS) {
     throw new ApiError(400, "BODY_INVALID");
   }
-  // The one public data SELECT reads only this requested precomputed range and
-  // joins the scheduled allowance-publication singleton. Interactive requests
-  // never rescan global history or write readiness state.
+  // Two SELECTs in one snapshot read this precomputed range/readiness plus one
+  // bounded current-epoch cache. Interactive requests never analyze history,
+  // duplicate the preview JSON across daily rows, or write readiness state.
+  const nowMs = Date.now();
   const read = await readPublishedCommunityDailyAggregatesWithAllowanceState(
     env.USAGE_MONITOR_DB,
     from,
     to,
   );
-  const today = new Date().toISOString().slice(0, 10);
+  const today = new Date(nowMs).toISOString().slice(0, 10);
   const todayStartMs = Date.parse(`${today}T00:00:00.000Z`);
   const mergedHistoryFrom = new Date(
     todayStartMs
@@ -3187,6 +3189,11 @@ async function handleCommunityDaily(
   const allowanceState = isCurrentCommunityAllowancePublication(read.allowancePublicationState, todayStartMs)
     ? "ready"
     : "updating";
+  const allowanceBreakdowns = projectPublicAllowanceBreakdowns(read.allowanceBreakdownsCache, {
+    allowanceState,
+    publishedDays: read.rows.map((row) => row.day),
+    nowMs,
+  });
   const days = read.rows.map((row) => {
     let payload: unknown;
     try {
@@ -3208,8 +3215,9 @@ async function handleCommunityDaily(
         || day.payload === null
         || Array.isArray(day.payload)) continue;
     const publicPayload = { ...day.payload as Record<string, unknown> };
-    // Historical revisions carried a per-plan diagnostic object. It remains
-    // private admin evidence and is never part of the public combined system.
+    // The old diagnostic shape remains private. Only the separate validated,
+    // owner-approved public allowanceBreakdowns contract exposes plan/model
+    // dollar estimates and counts; it never serializes these historical fields.
     delete publicPayload.capacityByPlanType;
     const spend = publicPayload.apiEquivalentSpend;
     const totals = publicPayload.totals;
@@ -3235,6 +3243,7 @@ async function handleCommunityDaily(
       from,
       to,
       allowanceState,
+      ...(allowanceBreakdowns === null ? {} : { allowanceBreakdowns }),
       days,
     },
     200,

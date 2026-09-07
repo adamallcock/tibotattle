@@ -3729,6 +3729,41 @@ footer p { margin: 0; }
 .community-site .allowance-controls .evidence-chip {
   margin: 0;
 }
+.community-site .allowance-view-controls {
+  margin: 14px 0;
+  flex-wrap: wrap;
+  max-width: 100%;
+}
+.community-site .allowance-view-controls button { min-height: 40px; }
+.community-site .community-chart-dialog-toolbar { flex-wrap: wrap; }
+.allowance-summary-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 190px), 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+.allowance-summary-card {
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  min-width: 0;
+}
+.allowance-summary-card h3 { font-size: 1rem; margin: 0 0 8px; }
+.allowance-summary-card p { font-size: .875rem; margin: 6px 0 0; }
+.allowance-summary-value { font-family: var(--serif); font-size: 2.4rem; }
+.allowance-series-0 { --allowance-color: #42636c; }
+.allowance-series-1 { --allowance-color: #ac4b16; }
+.allowance-series-2 { --allowance-color: #7542a0; }
+.allowance-series-3 { --allowance-color: #2664a2; }
+.allowance-series-4 { --allowance-color: #08778a; }
+.allowance-series-5 { --allowance-color: #956218; }
+.allowance-series-6 { --allowance-color: #9d3c64; }
+.allowance-series-7 { --allowance-color: #546b22; }
+.community-site .community-allowance-chart .daily-legend-swatch.allowance-central { background: var(--allowance-color, var(--green)); }
+.community-allowance-chart .allowance-central-line,
+.community-allowance-chart .allowance-band-mark { stroke: var(--allowance-color, var(--green)); }
+.community-allowance-chart .allowance-fit-dot,
+.community-allowance-chart .allowance-band-area { fill: var(--allowance-color, var(--green)); }
 
 /*
  * The hero chart expands into a modal lightbox rather than taking over the

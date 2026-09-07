@@ -55,6 +55,7 @@ const PUBLIC_RELEASE_ASSET_BASENAMES = Object.freeze([
   "i18n.generated.js",
   "index.html",
   "localization.js",
+  "model-catalog.generated.js",
   "install-cta.js",
   "privacy.html",
   "robots.txt",

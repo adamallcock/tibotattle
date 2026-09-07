@@ -7,6 +7,8 @@
 // and deletion clients remain in data-client.js and are not part of the public
 // website's module graph.
 
+import { REVIEWED_MODEL_CATALOG } from "./model-catalog.generated.js";
+
 const COMMUNITY_ROOT = "/api/v1";
 const SAFE_ERROR_CODE_PATTERN =
   /^(?:[A-Z][A-Z0-9_]{1,63}|[a-z][a-z0-9_]{1,63})$/u;
@@ -286,6 +288,87 @@ export const COMMUNITY_ALLOWANCE_REFERENCE_PLAN_TYPE = "pro";
 export const COMMUNITY_ALLOWANCE_NORMALIZATION =
   "pro_x1_prolite_x4_plus_x20";
 
+export const PUBLIC_ALLOWANCE_MODEL_CONFIG = Object.freeze(REVIEWED_MODEL_CATALOG
+  .filter(model => model.provider === "openai_codex" && model.allowanceTrack === "primary")
+  .map(model => Object.freeze({ modelId: model.id, label: model.label })));
+const PUBLIC_ALLOWANCE_MODEL_IDS = new Set(PUBLIC_ALLOWANCE_MODEL_CONFIG.map(model => model.modelId));
+const PUBLIC_ALLOWANCE_PLAN_IDS = Object.freeze(["pro", "prolite", "plus"]);
+const exactObject = (value, keys) => value !== null && typeof value === "object"
+  && !Array.isArray(value) && Object.keys(value).length === keys.length
+  && keys.every(key => Object.prototype.hasOwnProperty.call(value, key));
+const publicCount = value => Number.isSafeInteger(value) && value >= 0;
+const publicDollars = value => typeof value === "number" && Number.isFinite(value) && value > 0;
+const publicDay = value => typeof value === "string" && DAY_PATTERN.test(value)
+  && Number.isFinite(Date.parse(`${value}T00:00:00.000Z`))
+  && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
+
+function publicAllowanceSummary(value) {
+  if (!exactObject(value, ["centralUsd", "participantCount", "fitCount", "band80Usd"])
+      || !publicCount(value.fitCount) || !publicCount(value.participantCount)
+      || value.participantCount > value.fitCount) return null;
+  if (value.fitCount === 0) {
+    if (value.participantCount !== 0 || value.centralUsd !== null || value.band80Usd !== null) return null;
+  } else if (value.participantCount < 1 || !publicDollars(value.centralUsd)) return null;
+  let band80Usd = null;
+  if (value.band80Usd !== null) {
+    const band = value.band80Usd;
+    if (value.fitCount < 3 || !exactObject(band, ["lowerUsd", "upperUsd"])
+        || !publicDollars(band.lowerUsd) || !publicDollars(band.upperUsd)
+        || band.lowerUsd > value.centralUsd || band.upperUsd < value.centralUsd) return null;
+    band80Usd = { lowerUsd: band.lowerUsd, upperUsd: band.upperUsd };
+  }
+  return { centralUsd: value.centralUsd, participantCount: value.participantCount,
+    fitCount: value.fitCount, band80Usd };
+}
+
+/** New public contract, never the private preview. Invalid optional breakdowns
+ * cannot hide the separately validated daily activity or aggregate estimates. */
+export function normalizePublicAllowanceBreakdowns(value, publishedDays, nowMs = Date.now()) {
+  if (!exactObject(value, ["schemaVersion", "basis", "referencePlanType", "normalization",
+    "modelBasis", "modelGate", "generatedAt", "days"])
+      || value.schemaVersion !== "community-allowance-breakdowns-v1.0"
+      || value.basis !== COMMUNITY_ALLOWANCE_BASIS || value.referencePlanType !== "pro"
+      || value.normalization !== COMMUNITY_ALLOWANCE_NORMALIZATION
+      || value.modelBasis !== "seven_day_codex_pro20x_equivalent_per_model_composition"
+      || value.modelGate !== "shared_composition_kernel_identification"
+      || typeof value.generatedAt !== "string" || !Number.isFinite(nowMs)
+      || !Array.isArray(value.days) || value.days.length > 70) return null;
+  const generatedMs = Date.parse(value.generatedAt);
+  // Match server freshness, allowing its five-minute HTTP cache lifetime.
+  if (!Number.isFinite(generatedMs) || new Date(generatedMs).toISOString() !== value.generatedAt
+      || generatedMs > nowMs + 5 * 60 * 1000 || nowMs - generatedMs > 125 * 60 * 1000) return null;
+  const today = new Date(nowMs).toISOString().slice(0, 10);
+  const generatedDay = value.generatedAt.slice(0, 10);
+  const earliestDay = new Date(Date.parse(`${generatedDay}T00:00:00.000Z`)
+    - 69 * MILLISECONDS_PER_DAY).toISOString().slice(0, 10);
+  const allowedDays = new Set(publishedDays);
+  const days = [];
+  for (const row of value.days) {
+    if (!exactObject(row, ["day", "byPlanType", "models"]) || !publicDay(row.day)
+        || !allowedDays.has(row.day) || row.day < earliestDay || row.day >= today || row.day >= generatedDay
+        || (days.length > 0 && row.day <= days.at(-1).day)
+        || !exactObject(row.byPlanType, PUBLIC_ALLOWANCE_PLAN_IDS)
+        || !Array.isArray(row.models) || row.models.length > PUBLIC_ALLOWANCE_MODEL_IDS.size) return null;
+    const byPlanType = {};
+    for (const id of PUBLIC_ALLOWANCE_PLAN_IDS) {
+      const summary = publicAllowanceSummary(row.byPlanType[id]);
+      if (summary === null) return null;
+      byPlanType[id] = summary;
+    }
+    const models = [];
+    const seen = new Set();
+    for (const tuple of row.models) {
+      if (!Array.isArray(tuple) || tuple.length !== 3
+          || !PUBLIC_ALLOWANCE_MODEL_IDS.has(tuple[0]) || seen.has(tuple[0])
+          || !publicDollars(tuple[1]) || !publicCount(tuple[2]) || tuple[2] < 1) return null;
+      seen.add(tuple[0]);
+      models.push([tuple[0], tuple[1], tuple[2]]);
+    }
+    days.push({ day: row.day, byPlanType, models });
+  }
+  return { generatedAt: value.generatedAt, modelConfig: PUBLIC_ALLOWANCE_MODEL_CONFIG, days };
+}
+
 function normalizedDailyAllowance(candidate) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
     return null;
@@ -424,7 +507,7 @@ function normalizedDailyDay(candidate) {
  * out-of-order series — collapses to `unsupported_schema` rather than a
  * partially trusted render.
  */
-export function normalizeCommunityDailySeries(payload) {
+export function normalizeCommunityDailySeries(payload, { nowMs = Date.now() } = {}) {
   if (!payload) return { state: "service_unavailable", days: [] };
   const from = dayString(payload.from);
   const to = dayString(payload.to);
@@ -452,6 +535,8 @@ export function normalizeCommunityDailySeries(payload) {
     from,
     to,
     allowanceState: payload.allowanceState,
+    breakdowns: payload.allowanceState === "ready"
+      ? normalizePublicAllowanceBreakdowns(payload.allowanceBreakdowns, days.map(day => day.day), nowMs) : null,
     days,
   };
 }

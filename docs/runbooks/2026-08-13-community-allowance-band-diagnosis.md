@@ -131,6 +131,27 @@ scheduled progress, the exact admin response and the rendered multi-day chart.
 
 ## 5. Confirm the participant is even selected
 
+### Public Aggregate / By plan / By model views
+
+The public chart uses only the daily API's optional closed
+[`allowanceBreakdowns`](../reference/api-surface.md#public-allowance-breakdowns),
+not an admin endpoint. View and date-range selection are client-side over that
+one read. All views share date and dollar axes; plan values are normalized to
+Pro 20x and model values estimate a full weekly allowance on that model.
+
+If activity works but a breakdown does not, check publication state and the
+fresh, source-matched preview cache first. A cache older than two hours, epoch
+mismatch, invalid payload or unavailable optional table omits the breakdown
+without failing activity. Only closed UTC dates present in the requested
+published range may appear. An open-day admin point can therefore be absent
+publicly. Model gaps remain gaps; do not copy today's vector backward or force
+an interactive reconstruction to make a graph appear populated.
+
+Sample counts may be one account and must remain visibly disclosed. No
+account identifiers, private coverage diagnostics or plan-by-model cross-tabs
+belong in this response. Check all three rendered views, their localized
+disclosures, and the live revision separately from local tests.
+
 The collector requires an active participant and the source selected by the
 current source-precedence rules. Winning-device v1 history, retained accepted
 legacy data and activated v1.1 have distinct policies. Missing source evidence

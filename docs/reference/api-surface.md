@@ -84,6 +84,36 @@ Production admin API and UI paths are served only on the configured admin host.
 Public-host requests to those paths are deliberately 404. Static site assets
 are not part of the API registry.
 
+### Public allowance breakdowns
+
+`GET /api/v1/community/daily` may add `allowanceBreakdowns` with schema
+`community-allowance-breakdowns-v1.0`. Its only fields are schema version,
+aggregate basis, reference plan, normalization, model basis/gate, generation
+timestamp and up to 70 date rows. Each row contains the day, the three reviewed
+personal-plan summaries and reviewed model tuples `[modelId, usd, accountCount]`.
+Plan summaries contain only median dollars, account/fit counts and an optional
+middle-80%-of-fits band. Model estimates have no band or reset-fit count.
+
+All comparisons use the same Pro 20x-equivalent weekly basis: Pro ×1,
+Pro 5x ×4, Plus ×20. Unknown plans and separate-track Spark estimates are
+excluded. Model values require the existing composition identification gate;
+historical values are never carried backward from today's fit.
+
+The daily range/state and cached preview are read in one two-statement
+transaction. The optional cache is limited to 256 KiB and two hours, must
+match the current source epoch/method, and is projected into a new closed
+object. Only requested, actually published days before both the current and
+generation UTC dates are included. Updating publication, stale/missing/invalid
+cache or an unavailable optional cache table omits the breakdown, preserving
+the independent daily activity response. No public request invokes analysis,
+writes state, accepts cohort filters or exposes the private admin response.
+
+The owner explicitly approved dollar estimates and sample counts even when
+based on one account. This can reveal that contributor's estimated capacity;
+omitting identifiers is not an anonymity guarantee. The visible small-sample
+disclosure applies to all three views. Older sealed weekly snapshot thresholds
+are unchanged; contribution consent and v1.1 activation are unchanged.
+
 ### Self-service retirement and private owner erasure
 
 Under the [2026-08-30 source decision](../decisions/2026-08-30-self-service-deletion-retirement.md),

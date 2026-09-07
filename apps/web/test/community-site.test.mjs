@@ -1301,9 +1301,15 @@ test("the community allowance surface leads the product hero with honest labelin
     html,
     /data-range-days="30" class="active" aria-pressed="true"/u,
   );
-  assert.match(html, /Combined Pro 20x-equivalent allowance/u);
-  assert.match(html, /One combined estimate across contributing personal-plan accounts/u);
-  assert.doesNotMatch(html, /data-allowance-mode|By plan|plan selector/u);
+  assert.match(html, /Pro 20x-equivalent allowance/u);
+  assert.match(html, /Compare the aggregate, plan groups, or individual models/u);
+  for (const view of ["aggregate", "plans", "models"]) {
+    assert.equal(html.match(new RegExp(`data-allowance-view="${view}"`, "gu"))?.length, 2);
+  }
+  assert.equal(html.match(/data-allowance-view-controls/gu)?.length, 2);
+  assert.match(html, /role="group" aria-label="Allowance graph view"/u);
+  assert.doesNotMatch(source, /admin-client|admin\.js|\/admin\/community/u,
+    "public controls must never call or import the private admin surface");
 
   // The larger chart is a standard native-dialog lightbox. The launcher is
   // hidden until a published chart is actually renderable, then exposes the

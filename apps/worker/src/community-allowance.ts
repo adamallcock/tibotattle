@@ -50,8 +50,9 @@ import { assertV11SourcePinCurrent, loadV11SourcePin, V11_DOMAIN_METHOD_VERSION,
  * they are combined. This is the same deliberately narrow merge trial shown
  * in the private admin dashboard: Pro stays unchanged, Pro 5x is multiplied
  * by four, and Plus by twenty. Unsupported or unknown plan labels do not enter
- * the estimate. The public wire carries only the resulting combined summary;
- * plan-specific diagnostics remain private admin evidence.
+ * the estimate. The daily payload carries the resulting combined summary;
+ * the optional public breakdown adds reviewed plan/model summaries, while
+ * identifiers and operational diagnostics remain private admin evidence.
  */
 
 export const COMMUNITY_ALLOWANCE_BASIS =

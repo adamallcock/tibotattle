@@ -62,6 +62,7 @@ let communityDailySettled = false;
 // published series. Re-rendering is purely client-side — the year window is
 // already fetched — so a range change never issues a request.
 let allowanceRangeDays = 30;
+let allowanceView = "aggregate";
 let allowanceDialogReturnFocus = null;
 const communityClient = new PublicCommunityClient();
 
@@ -420,6 +421,7 @@ function renderCommunityAllowanceResult(payload) {
     stateNode: $("#community-allowance-state"),
     payload,
     rangeDays: allowanceRangeDays,
+    view: allowanceView,
   });
   updateAllowanceDialogAvailability(state);
   if ($("#community-allowance-dialog")?.open) {
@@ -436,6 +438,7 @@ function renderCommunityAllowanceDialogResult(payload) {
     container,
     payload,
     rangeDays: allowanceRangeDays,
+    view: allowanceView,
   });
 }
 
@@ -448,12 +451,21 @@ function allowanceDialogSupported() {
 function updateAllowanceDialogAvailability(state) {
   const launcher = $("#community-allowance-expand");
   const dialog = $("#community-allowance-dialog");
+  // Empty/stale tabs stay inside an already-open dialog: users can switch back,
+  // and the close action retains its visible return-focus target.
+  if (dialog?.open) return;
   const available = state === "published" && allowanceDialogSupported();
   if (launcher) launcher.hidden = !available;
-  if (!available && dialog?.open) dialog.close();
 }
 
 function syncAllowanceRangeControls() {
+  for (const controls of document.querySelectorAll("[data-allowance-view-controls]")) {
+    for (const candidate of controls.querySelectorAll("button[data-allowance-view]")) {
+      const active = candidate.dataset.allowanceView === allowanceView;
+      candidate.classList.toggle("active", active);
+      candidate.setAttribute("aria-pressed", String(active));
+    }
+  }
   for (const controls of document.querySelectorAll("[data-allowance-range-controls]")) {
     for (const candidate of controls.querySelectorAll("button[data-range-days]")) {
       const candidateRange = candidate.dataset.rangeDays === ""
@@ -477,6 +489,18 @@ function selectAllowanceRange(value) {
 }
 
 function wireAllowanceRangeControls() {
+  for (const controls of document.querySelectorAll("[data-allowance-view-controls]")) {
+    if (controls.dataset.allowanceViewBound === "true") continue;
+    controls.dataset.allowanceViewBound = "true";
+    controls.addEventListener("click", (event) => {
+      const button = event.target?.closest?.("button[data-allowance-view]");
+      if (!button || !controls.contains(button)
+          || !["aggregate", "plans", "models"].includes(button.dataset.allowanceView)) return;
+      allowanceView = button.dataset.allowanceView;
+      syncAllowanceRangeControls();
+      if (communityDailySettled) renderCommunityAllowanceResult(lastCommunityDailyPayload);
+    });
+  }
   for (const controls of document.querySelectorAll("[data-allowance-range-controls]")) {
     if (controls.dataset.allowanceRangeBound === "true") continue;
     controls.dataset.allowanceRangeBound = "true";

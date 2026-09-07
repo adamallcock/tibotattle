@@ -26,7 +26,7 @@ const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 const MINIMUM_FITS_FOR_BAND = 3;
 // 70 compact days across the reviewed catalog, including fully populated rows.
 // Enforced before writes and reads; tests cover the complete reviewed roster.
-const PREVIEW_CACHE_JSON_LIMIT_BYTES = 256 * 1_024;
+export const PREVIEW_CACHE_JSON_LIMIT_BYTES = 256 * 1_024;
 // Scheduled maintenance runs every minute but only rebuilds this aggregate
 // about hourly. Two hours tolerates one missed Cron without serving it forever.
 const PREVIEW_CACHE_MIN_INTERVAL_MILLISECONDS = 55 * 60 * 1_000;
@@ -243,7 +243,7 @@ function validAdminCommunityAllowanceModels(
   return true;
 }
 
-function validCachedAdminCommunityAllowancePreview(
+export function validCachedAdminCommunityAllowancePreview(
   value: unknown,
   storedGeneratedAt: string,
   nowEpoch: number,

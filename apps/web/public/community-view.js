@@ -310,7 +310,7 @@ export const COMMUNITY_ALLOWANCE_CHART_HEIGHT = 320;
  * range carries an estimate; the caller distinguishes those two states from
  * the series itself.
  */
-export function buildCommunityAllowanceChartModel(series, {
+function buildCommunityAllowanceSingleChartModel(series, {
   rangeDays = null,
   width = COMMUNITY_ALLOWANCE_CHART_WIDTH,
   height = COMMUNITY_ALLOWANCE_CHART_HEIGHT,
@@ -447,6 +447,98 @@ export function buildCommunityAllowanceChartModel(series, {
     tickLabelStyle,
     latest: dots[dots.length - 1],
   };
+}
+
+/** Presentation only: validated public series in, shared axes and gap-aware
+ * geometry out. No owner data access, pricing, fitting, or inferred history. */
+export function buildCommunityAllowanceChartModel(series, options = {}) {
+  const { view = "aggregate", rangeDays = null,
+    width = COMMUNITY_ALLOWANCE_CHART_WIDTH,
+    height = COMMUNITY_ALLOWANCE_CHART_HEIGHT } = options;
+  if (!["aggregate", "plans", "models"].includes(view)) return null;
+  if (!series?.breakdowns) {
+    return view === "aggregate" ? buildCommunityAllowanceSingleChartModel(series, options) : null;
+  }
+  if (series.state !== "published" || series.days.length === 0) return null;
+  const anchor = series.days.at(-1).day;
+  const cutoff = Number.isFinite(rangeDays) && rangeDays >= 1
+    ? communityDayStartMs(anchor) - (rangeDays - 1) * MILLISECONDS_PER_DAY : -Infinity;
+  const days = series.days.filter(day => communityDayStartMs(day.day) >= cutoff);
+  if (days.length === 0) return null;
+  const breakdownDays = new Map(series.breakdowns.days.map(day => [day.day, day]));
+  const definitions = [
+    { key: "aggregate", view: "aggregate", label: null, className: "" },
+    ...[ ["pro", "Pro 20×"], ["prolite", "Pro 5×"], ["plus", "Plus"] ].map(([key, label], index) => ({
+      key, label, view: "plans", className: `allowance-series-${index}`,
+    })),
+    ...series.breakdowns.modelConfig.map(({ modelId, label }, index) => ({
+      key: modelId, label, view: "models", className: `allowance-series-${index % 8}`,
+    })),
+  ];
+  const summaryFor = (day, definition) => {
+    if (definition.view === "aggregate") return day.allowance;
+    const breakdown = breakdownDays.get(day.day);
+    if (definition.view === "plans") return breakdown?.byPlanType[definition.key];
+    const value = breakdown?.models.find(([id]) => id === definition.key);
+    return value ? { centralUsd: value[1], participantCount: value[2], fitCount: null, band80Usd: null } : null;
+  };
+  // The entire view family shares one scale, even when a tab is empty.
+  let maximum = 0;
+  for (const day of days) for (const definition of definitions) {
+    const summary = summaryFor(day, definition);
+    if (summary?.centralUsd != null) maximum = Math.max(maximum,
+      summary.centralUsd, summary.band80Usd?.upperUsd ?? 0);
+  }
+  if (maximum <= 0) return null;
+  const margin = { top: 16, right: 24, bottom: 32, left: 64 };
+  const plot = { top: margin.top, bottom: height - margin.bottom,
+    left: margin.left, right: width - margin.right };
+  const startMs = communityDayStartMs(days[0].day);
+  const endMs = communityDayStartMs(days.at(-1).day);
+  const x = day => startMs === endMs ? (plot.left + plot.right) / 2
+    : plot.left + (communityDayStartMs(day) - startMs) / (endMs - startMs) * (plot.right - plot.left);
+  const dollars = valueAxis(maximum, plot.top, plot.bottom);
+  const split = points => {
+    const segments = [];
+    for (const point of points) {
+      const last = segments.at(-1);
+      if (!last || communityDayStartMs(point.day) - communityDayStartMs(last.at(-1).day) > MILLISECONDS_PER_DAY) {
+        segments.push([point]);
+      } else last.push(point);
+    }
+    return segments;
+  };
+  const visible = definitions.filter(definition => definition.view === view).map(definition => {
+    const dots = days.flatMap(day => {
+      const summary = summaryFor(day, definition);
+      if (summary?.centralUsd == null) return [];
+      return [{ ...summary, day: day.day, x: x(day.day), y: dollars.y(summary.centralUsd),
+        radius: Math.min(7, 2.6 + Math.sqrt(summary.fitCount ?? summary.participantCount)),
+        seriesKey: definition.key, seriesLabel: definition.label, seriesClass: definition.className }];
+    });
+    const band = dots.filter(dot => dot.band80Usd !== null).map(dot => ({
+      day: dot.day, x: dot.x, upperY: dollars.y(dot.band80Usd.upperUsd),
+      lowerY: dollars.y(dot.band80Usd.lowerUsd), seriesClass: dot.seriesClass,
+    }));
+    return { ...definition, dots, centralSegments: split(dots), bandSegments: split(band), latest: dots.at(-1) ?? null };
+  }).filter(definition => definition.dots.length > 0);
+  if (visible.length === 0) return null;
+  const dots = visible.flatMap(definition => definition.dots)
+    .sort((a, b) => a.day.localeCompare(b.day) || a.seriesKey.localeCompare(b.seriesKey));
+  const dayTicks = Array.from({ length: 6 }, (_, index) => {
+    const day = new Date(startMs + Math.round((endMs - startMs) * index / 5 / MILLISECONDS_PER_DAY)
+      * MILLISECONDS_PER_DAY).toISOString().slice(0, 10);
+    return { day, x: x(day) };
+  }).filter((tick, index, ticks) => index === 0 || tick.day !== ticks[index - 1].day);
+  return { width, height, margin, plot, dots, view,
+    latest: dots.at(-1), legendSeries: view === "aggregate" ? null : visible,
+    latestSummaries: visible.map(definition => definition.latest),
+    spanDays: 1 + Math.round((endMs - startMs) / MILLISECONDS_PER_DAY),
+    sparse: new Set(dots.map(dot => dot.day)).size <= 2,
+    centralSegments: visible.flatMap(definition => definition.centralSegments),
+    bandSegments: visible.flatMap(definition => definition.bandSegments),
+    dollarTicks: dollars.ticks, dayTicks,
+    tickLabelStyle: endMs - startMs > MONTH_TICK_SPAN_DAYS * MILLISECONDS_PER_DAY ? "month" : "day" };
 }
 
 function svgNode(documentRef, tag, className = "", attributes = {}) {
@@ -754,15 +846,18 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
 
   const figure = node("div", "community-daily-chart community-allowance-chart");
   const legend = node("p", "community-daily-legend");
-  for (const [swatchClass, labelKey] of [
+  const legendItems = model.legendSeries?.map(series => [
+    `daily-legend-swatch allowance-central ${series.className}`, series.label,
+  ]) ?? [
     ["daily-legend-swatch allowance-central", "community.allowance.legendCentral"],
     ["daily-legend-swatch allowance-band", "community.allowance.legendBand"],
     ["daily-legend-swatch allowance-dot", "community.allowance.legendDots"],
-  ]) {
+  ].map(([className, key]) => [className, t(key)]);
+  for (const [swatchClass, label] of legendItems) {
     const item = node("span");
     const swatch = node("span", swatchClass);
     swatch.setAttribute("aria-hidden", "true");
-    item.append(swatch, node("span", "", t(labelKey)));
+    item.append(swatch, node("span", "", label));
     legend.append(item);
   }
   figure.append(legend);
@@ -770,8 +865,10 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
   const svg = svgNode(documentRef, "svg", "", {
     viewBox: `0 0 ${model.width} ${model.height}`,
     role: "img",
-    "aria-label": t("community.allowance.chartLabel"),
-    "aria-description": t("community.allowance.chartDescription"),
+    "aria-label": t(model.view === "models" ? "community.allowance.modelChartLabel"
+      : model.view === "plans" ? "community.allowance.planChartLabel" : "community.allowance.chartLabel"),
+    "aria-description": t(model.view === "models" ? "community.allowance.modelChartDescription"
+      : model.view === "plans" ? "community.allowance.planChartDescription" : "community.allowance.chartDescription"),
   });
   svg.setAttribute("data-i18n-skip", "");
 
@@ -809,11 +906,11 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
         .map((point) => `${point.x.toFixed(1)},${point.upperY.toFixed(1)}`);
       const backward = [...band].reverse()
         .map((point) => `${point.x.toFixed(1)},${point.lowerY.toFixed(1)}`);
-      svg.append(svgNode(documentRef, "path", "allowance-band-area", {
+      svg.append(svgNode(documentRef, "path", `allowance-band-area ${band[0].seriesClass ?? ""}`.trim(), {
         d: `M${[...forward, ...backward].join(" L")} Z`,
       }));
     } else {
-      svg.append(svgNode(documentRef, "line", "allowance-band-mark", {
+      svg.append(svgNode(documentRef, "line", `allowance-band-mark ${band[0].seriesClass ?? ""}`.trim(), {
         x1: band[0].x,
         x2: band[0].x,
         y1: band[0].upperY,
@@ -824,7 +921,7 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
 
   for (const segment of model.centralSegments) {
     if (segment.length >= 2) {
-      svg.append(svgNode(documentRef, "polyline", "allowance-central-line", {
+      svg.append(svgNode(documentRef, "polyline", `allowance-central-line ${segment[0].seriesClass ?? ""}`.trim(), {
         points: segment
           .map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`)
           .join(" "),
@@ -834,20 +931,21 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
 
   const locale = documentRef?.documentElement?.lang ?? "en-US";
   const plural = (key, count) => translatePlural(key, count, {}, locale);
+  const pointEvidence = dot => dot.fitCount === null
+    ? plural("community.allowance.accountCount", dot.participantCount)
+    : `${plural("community.allowance.fitCount", dot.fitCount)} · ${plural("community.allowance.accountCount", dot.participantCount)}`;
 
   // Data dots. Each keeps a native <title> so the accessibility tree and any
   // no-JS fallback still name the point; the richer visual tooltip below layers
   // on top for pointer and keyboard users.
   for (const dot of model.dots) {
-    const circle = svgNode(documentRef, "circle", "allowance-fit-dot", {
+    const circle = svgNode(documentRef, "circle", `allowance-fit-dot ${dot.seriesClass ?? ""}`.trim(), {
       cx: dot.x,
       cy: dot.y,
       r: dot.radius,
     });
     const title = svgNode(documentRef, "title");
-    title.textContent = `${dot.day}: ${dollars.format(dot.centralUsd)} — ${
-      plural("community.allowance.fitCount", dot.fitCount)
-    } · ${plural("community.allowance.accountCount", dot.participantCount)}`;
+    title.textContent = `${dot.seriesLabel ? `${dot.seriesLabel} · ` : ""}${dot.day}: ${dollars.format(dot.centralUsd)} — ${pointEvidence(dot)}`;
     circle.append(title);
     svg.append(circle);
   }
@@ -903,6 +1001,7 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
 
   const fillTooltip = (dot) => {
     tooltip.replaceChildren();
+    if (dot.seriesLabel) tooltip.append(node("strong", "", dot.seriesLabel));
     tooltip.append(node(
       "div",
       "allowance-tooltip-date",
@@ -931,9 +1030,7 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
     tooltip.append(node(
       "div",
       "allowance-tooltip-meta",
-      `${plural("community.allowance.fitCount", dot.fitCount)} · ${
-        plural("community.allowance.accountCount", dot.participantCount)
-      }`,
+      pointEvidence(dot),
     ));
   };
 
@@ -986,24 +1083,28 @@ function appendCommunityAllowanceChart({ documentRef, container, model, t }) {
     tooltip.setAttribute("data-visible", "false");
   };
 
-  const nearestDot = (clientX) => {
+  const nearestDot = (clientX, clientY) => {
     const rect = svg.getBoundingClientRect();
     if (!rect || rect.width === 0) return model.dots[0];
     const viewX = ((clientX - rect.left) / rect.width) * model.width;
+    const viewY = ((clientY - rect.top) / rect.height) * model.height;
     let best = model.dots[0];
     let bestDistance = Infinity;
+    let bestVerticalDistance = Infinity;
     for (const dot of model.dots) {
       const distance = Math.abs(dot.x - viewX);
-      if (distance < bestDistance) {
+      const vertical = Math.abs(dot.y - viewY);
+      if (distance < bestDistance || (distance === bestDistance && vertical < bestVerticalDistance)) {
         bestDistance = distance;
+        bestVerticalDistance = vertical;
         best = dot;
       }
     }
     return best;
   };
 
-  capture.addEventListener("pointermove", (event) => showDot(nearestDot(event.clientX)));
-  capture.addEventListener("pointerdown", (event) => showDot(nearestDot(event.clientX)));
+  capture.addEventListener("pointermove", (event) => showDot(nearestDot(event.clientX, event.clientY)));
+  capture.addEventListener("pointerdown", (event) => showDot(nearestDot(event.clientX, event.clientY)));
   // A touch tap fires pointerleave the instant the finger lifts, which would
   // hide the tooltip before it could be read; keep it up for touch (the next
   // tap moves it) and only auto-dismiss for a mouse leaving the plot.
@@ -1066,6 +1167,7 @@ export function renderCommunityAllowanceSection({
   stateNode = null,
   payload,
   rangeDays = null,
+  view = "aggregate",
 }) {
   const { clear, node } = createDomHelpers(documentRef);
   const locale = documentRef?.documentElement?.lang ?? "en-US";
@@ -1096,17 +1198,22 @@ export function renderCommunityAllowanceSection({
     return "allowance_updating";
   }
 
-  const model = buildCommunityAllowanceChartModel(series, { rangeDays });
+  if (view !== "aggregate" && !series.breakdowns) {
+    setChip("community.allowance.unavailable", false);
+    container.append(node("p", "", t("community.allowance.breakdownsUnavailable")));
+    return "breakdowns_unavailable";
+  }
+
+  const model = buildCommunityAllowanceChartModel(series, { rangeDays, view });
   if (model === null) {
-    const anyEstimate = series.days.some((day) => (
-      day.allowance && day.allowance.centralUsd !== null
-    ));
+    const anyEstimate = buildCommunityAllowanceChartModel(series, { view }) !== null;
     setChip("community.allowance.accumulating", false);
     container.append(node(
       "p",
       "",
       t(anyEstimate
         ? "community.allowance.noneInRange"
+        : view === "models" ? "community.allowance.modelsAccumulating"
         : "community.allowance.stillAccumulating"),
     ));
     return anyEstimate ? "no_estimates_in_range" : "estimates_accumulating";
@@ -1114,6 +1221,23 @@ export function renderCommunityAllowanceSection({
 
   setChip("community.allowance.available", true);
   const dollars = usdFormatter();
+  container.append(node("p", "snapshot-disclosure", t("community.allowance.smallSampleDisclosure")));
+  if (view !== "aggregate") {
+    const cards = node("div", "allowance-summary-cards");
+    for (const latest of model.latestSummaries) {
+      const card = node("article", "allowance-summary-card");
+      card.append(node("h3", "", latest.seriesLabel),
+        node("strong", "allowance-summary-value", dollars.format(latest.centralUsd)),
+        node("p", "", t("community.allowance.perWindow")),
+        node("p", "allowance-headline-caveat", `${formatUtcCalendarDay(latest.day)} · ${plural("community.allowance.accountCount", latest.participantCount)}`));
+      cards.append(card);
+    }
+    container.append(cards);
+    appendCommunityAllowanceChart({ documentRef, container, model, t });
+    container.append(node("p", "snapshot-disclosure", t(view === "models"
+      ? "community.allowance.modelMethod" : "community.allowance.planMethod")));
+    return "published";
+  }
   const headline = node("div", "allowance-headline");
   const value = node("p", "allowance-headline-value");
   value.append(
