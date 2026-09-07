@@ -356,3 +356,10 @@ source-unqualified at this point. Its macOS source lane stops before compiling
 the tray changes because the current base has a separate helper-inventory
 mismatch. That repair is deliberately separate from this merge; this record
 makes no app-build, signing, installation, or release claim.
+
+The separate helper-selector correction then restored source qualification. It
+allows the exact Electron handover helper beside the Keychain helper while
+keeping both compilation closures fixed and refusing any other helper file.
+The macOS source, development-bundle, and test-build contracts passed locally.
+They remain source/test-profile evidence only and do not change the installed
+0.1.18 app, signing, notarization, installation, or release state.

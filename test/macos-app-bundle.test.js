@@ -7272,6 +7272,8 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/desktop-shell.js",
     "apps/web/public/electron-tray-popup.js",
     "apps/web/public/electron-settings.js",
+    "apps/web/public/electron-tray-settings.js",
+    "apps/web/public/electron-tray-preferences.js",
   ]);
   // Shared dashboard, tray-popup, and settings entries plus their
   // dependencies. The Electron bridge is inert without its preload; the
@@ -7283,6 +7285,8 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/desktop-shell.js",
     "apps/web/public/electron-settings.js",
     "apps/web/public/electron-tray-popup.js",
+    "apps/web/public/electron-tray-preferences.js",
+    "apps/web/public/electron-tray-settings.js",
     "apps/web/public/i18n.generated.js",
     "apps/web/public/install-cta.js",
     "apps/web/public/lib.js",
@@ -7330,6 +7334,8 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/electron-tray-popup.css",
     "apps/web/public/electron-tray-popup.html",
     "apps/web/public/electron-tray-popup.js",
+    "apps/web/public/electron-tray-preferences.js",
+    "apps/web/public/electron-tray-settings.js",
     "apps/web/public/i18n.generated.js",
     "apps/web/public/icon-panel-left.svg",
     "apps/web/public/icon-refresh-cw.svg",
