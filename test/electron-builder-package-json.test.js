@@ -12,10 +12,14 @@ import test from "node:test";
 
 import {
   canonicalElectronBuilderPackageJsonBytes,
+  createProductionDistributionMetadata,
   transformElectronBuilderPackageJsonBytes,
 } from "../scripts/lib/electron-builder-package-json.mjs";
 
 const VERSION = "0.1.16";
+const REHEARSAL_CURRENT_VERSION = "0.1.19-native-to-electron-handover.1";
+const REHEARSAL_NEXT_VERSION = "0.1.19-native-to-electron-handover.2";
+const SOURCE_REVISION = "a".repeat(40);
 const require = createRequire(import.meta.url);
 const builderRequire = createRequire(require.resolve("electron-builder"));
 const appBuilderRequire = createRequire(builderRequire.resolve("app-builder-lib"));
@@ -113,6 +117,47 @@ test("package-json canonicalization is idempotent and preserves dependency integ
     ),
     null,
   );
+});
+
+test("production package canonicalization accepts only metadata-bound rehearsal prerelease versions", () => {
+  const metadata = createProductionDistributionMetadata({
+    buildNumber: "2026090701",
+    rehearsal: "current",
+    rehearsalCurrentVersion: REHEARSAL_CURRENT_VERSION,
+    rehearsalNextVersion: REHEARSAL_NEXT_VERSION,
+    sourceRevision: SOURCE_REVISION,
+    target: "darwin-arm64",
+  });
+  const transformed = canonicalElectronBuilderPackageJsonBytes(
+    "package.json",
+    rootSource(),
+    {
+      distributionMetadata: metadata,
+      packageVersion: REHEARSAL_CURRENT_VERSION,
+      profile: "production",
+    },
+  );
+  const packageJson = JSON.parse(transformed.toString("utf8"));
+  assert.equal(packageJson.version, REHEARSAL_CURRENT_VERSION);
+  assert.deepEqual(packageJson.tibotattleDistribution, metadata);
+  assert.equal(transformElectronBuilderPackageJsonBytes(
+    "package.json",
+    rootSource(),
+    {
+      distributionMetadata: metadata,
+      packageVersion: REHEARSAL_NEXT_VERSION,
+      profile: "production",
+    },
+  ), null);
+  assert.throws(() => canonicalElectronBuilderPackageJsonBytes(
+    "package.json",
+    rootSource(),
+    {
+      distributionMetadata: { ...metadata, updateFeed: "https://untrusted.example.invalid/feed" },
+      packageVersion: REHEARSAL_CURRENT_VERSION,
+      profile: "production",
+    },
+  ), /invalid/u);
 });
 
 test("non-Electron runtime staging leaves package-json bytes unchanged", () => {

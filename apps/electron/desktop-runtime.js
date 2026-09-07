@@ -40,7 +40,10 @@ import { createDesktopFirstRunLoginRegistrar } from "./desktop-first-run-login.j
 import { createDesktopRecoverySettingsAction } from "./desktop-recovery-settings.js";
 import { createDesktopOwnedDownloadRegistry } from "./desktop-owned-downloads.js";
 import { createDesktopSharingBackend, createDesktopSharingCoordinator } from "./desktop-sharing.js";
-import { createDesktopContributionCredentialBackend } from "./desktop-contribution-credential.js";
+import {
+  createDesktopContributionCredentialBackend,
+  createDesktopContributionCredentialLegacyProbe,
+} from "./desktop-contribution-credential.js";
 import { classifyDesktopSharingInstallation } from "./desktop-sharing-installation.js";
 import { attachAccountlessParentChannel } from "../../src/platform/index.js";
 import {
@@ -50,7 +53,11 @@ import {
 } from "./desktop-notification-coordinator.js";
 import { createDesktopNotificationDelivery } from "./desktop-notification-delivery.js";
 import { shellError } from "./errors.js";
-import { createProductionDesktopUpdater, validateProductionDistributionMetadata } from "./desktop-updater.js";
+import {
+  createProductionDesktopUpdater,
+  PRODUCTION_ELECTRON_CHANNEL,
+  validateProductionDistributionMetadata,
+} from "./desktop-updater.js";
 import { createDesktopUpdatePreferences, createDesktopUpdatePreferencesBackend } from "./desktop-update-preferences.js";
 import {
   createWindowsFilesystemAdapter,
@@ -429,10 +436,17 @@ export async function launchDesktopRuntime({
         || sharingBackend === undefined || sharingInstallationState === undefined
         || qualificationContext !== null) throw shellError("electron_configuration_invalid");
   }
+  const accountlessProductionUsesMacNativeCredential = accountlessProduction !== undefined
+    && platform === "darwin";
   if (accountlessProduction !== undefined && (
     accountlessProduction === null || typeof accountlessProduction !== "object"
       || Array.isArray(accountlessProduction)
-      || Object.keys(accountlessProduction).sort().join(",") !== "origin,policyVersion"
+      || Object.keys(accountlessProduction).sort().join(",") !== (
+        accountlessProductionUsesMacNativeCredential
+          ? "createMacOSCredentialBackend,origin,policyVersion"
+          : "origin,policyVersion")
+      || (accountlessProductionUsesMacNativeCredential
+        && typeof accountlessProduction.createMacOSCredentialBackend !== "function")
       || accountlessProduction.origin !== DEPLOYMENT_ENDPOINTS.public.origin
       || accountlessProduction.policyVersion !== "accountless-opt-out-v1"
       || accountlessLaboratory !== undefined || app.isPackaged !== true
@@ -441,7 +455,14 @@ export async function launchDesktopRuntime({
       || qualificationContext !== null)) throw shellError("electron_configuration_invalid");
   const accountlessEnabled = accountlessLaboratory !== undefined || accountlessProduction !== undefined;
   if (productionDistribution !== undefined) {
-    validateProductionDistributionMetadata(productionDistribution, { platform, architecture });
+    const distribution = validateProductionDistributionMetadata(productionDistribution, {
+      platform,
+      architecture,
+    });
+    if (distribution.channel !== PRODUCTION_ELECTRON_CHANNEL
+        && accountlessProduction !== undefined) {
+      throw shellError("electron_configuration_invalid");
+    }
     if (app.isPackaged !== true || app.getName?.() !== "TiboTattle"
         || environment.USAGE_MONITOR_TEST_LANE !== undefined
         || qualificationContext !== null || platformServices !== undefined) {
@@ -660,16 +681,37 @@ export async function launchDesktopRuntime({
       rootPath: settingsRootPath,
     })
     : null;
-  // Native encryption must be ready before the owned companion can request
-  // the installation credential. Unavailable encryption cannot authorize a send.
+  // Production macOS installs use the signed, prompt-disabled native adapter.
+  // Do not call Electron safeStorage there: its asynchronous availability probe
+  // may initialize a prompt-capable Chromium Keychain provider. Existing
+  // encrypted records are inspected without decrypting or changing them so a
+  // prior installation stops for explicit recovery instead of rotating identity.
   if (accountlessEnabled) {
-    installationCredentialBackend = accountlessLaboratory?.backend
-      ?? createDesktopContributionCredentialBackend({
-        safeStorage: runtime.safeStorage,
+    if (accountlessProductionUsesMacNativeCredential) {
+      const legacyCredentialProbe = createDesktopContributionCredentialLegacyProbe({
         platform,
         rootPath: settingsRootPath,
-        windowsProtectedStateStore,
       });
+      installationCredentialBackend = accountlessProduction
+        .createMacOSCredentialBackend({
+          legacyCredentialProbe: legacyCredentialProbe.inspect,
+        });
+      if (!installationCredentialBackend
+          || typeof installationCredentialBackend !== "object"
+          || ["read", "createIfMissing", "deleteExact"].some(
+            (operation) => typeof installationCredentialBackend[operation] !== "function",
+          )) {
+        throw shellError("electron_configuration_invalid");
+      }
+    } else {
+      installationCredentialBackend = accountlessLaboratory?.backend
+        ?? createDesktopContributionCredentialBackend({
+          safeStorage: runtime.safeStorage,
+          platform,
+          rootPath: settingsRootPath,
+          windowsProtectedStateStore,
+        });
+    }
   }
   const firstRunBackend = firstRunReceiptBackend
     ?? createDesktopFirstRunReceiptBackend({

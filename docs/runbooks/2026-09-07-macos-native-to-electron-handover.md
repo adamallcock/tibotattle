@@ -159,13 +159,87 @@ feed-isolated rehearsal candidate must therefore have both a semantic version
 greater than the installed candidate and a strictly greater `buildNumber` for
 the native handover check. A higher `buildNumber` while both package and feed
 versions remain `0.1.18` is not an Electron update rehearsal. This source
-version remains unchanged until a concrete candidate version is allocated.
+version remains unchanged: a rehearsal supplies its two candidate versions as
+closed preparation inputs rather than allocating a future stable release in
+source control.
 
-The current production configuration accepts only the four fixed stable feed
-URLs. It has no isolated rehearsal feed selector yet. A reviewed private feed
-policy and executable rehearsal path must be added before this update exercise;
-changing the version alone does not make it runnable. No stable feed is changed
-by source preparation.
+## Source-only isolated updater rehearsal
+
+The source selector accepts exactly two macOS versions with this grammar:
+
+```text
+M.m.p-native-to-electron-handover.N
+```
+
+`M`, `m`, `p`, and `N` are bounded non-negative decimal components, `N` is
+positive, both versions have the same `M.m.p` core, the current candidate's
+`N` is lower than the next candidate's, and that core is newer than the checked
+out `RELEASE_VERSION`. It accepts no preview labels, a different prerelease
+name, Windows/Linux target, feed hostname, feed path, or unpaired version.
+
+For a clean, frozen checkout, prepare the two source candidates with the same
+ordered pair and distinct disposable build numbers:
+
+```sh
+CURRENT_VERSION='<M.m.p-native-to-electron-handover.lower-positive-N>'
+NEXT_VERSION='<the-same-M.m.p-native-to-electron-handover.higher-positive-N>'
+SOURCE_REVISION='<the-clean-40-character-commit>'
+
+node scripts/package-electron-production.mjs \
+  --target darwin-arm64 \
+  --source-revision "$SOURCE_REVISION" \
+  --build-number 2026090701 \
+  --rehearsal-candidate current \
+  --rehearsal-current-version "$CURRENT_VERSION" \
+  --rehearsal-next-version "$NEXT_VERSION"
+
+node scripts/package-electron-production.mjs \
+  --target darwin-arm64 \
+  --source-revision "$SOURCE_REVISION" \
+  --build-number 2026090702 \
+  --rehearsal-candidate next \
+  --rehearsal-current-version "$CURRENT_VERSION" \
+  --rehearsal-next-version "$NEXT_VERSION"
+```
+
+The pair's shared updater endpoint is fixed to
+`https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/darwin-arm64`.
+The stable endpoint remains
+`https://updates.tibotattle.com/electron/stable/darwin-arm64`; neither command
+changes it. The current and next source receipts are separately written to:
+
+```text
+.release-build/electron-production/rehearsal/native-to-electron-handover-v1/current/darwin-arm64/production-source-candidate.json
+.release-build/electron-production/rehearsal/native-to-electron-handover-v1/next/darwin-arm64/production-source-candidate.json
+```
+
+Each receipt names a distinct `app/`, `native/`, and planned `artifacts/`
+directory. The staged `package.json`, distribution metadata, and
+`electron-runtime-manifest.json` carry the same candidate semantic version.
+The builder independently checks that staging metadata and package version
+before it could create an installer. For macOS, the package and updater retain
+the full prerelease semantic version; the builder writes its numeric `M.m.p`
+core to `CFBundleShortVersionString` and the candidate build number to
+`CFBundleVersion`, which is what the guided native handover compares.
+
+Rehearsal metadata uses the fixed channel
+`native-to-electron-handover-rehearsal-v1` and contribution policy
+`disabled-for-native-to-electron-handover-rehearsal-v1`. It enables prerelease
+comparison only for that exact packaged metadata shape. It does not set a feed
+URL at runtime, enable accountless production uploads, upload a generic feed,
+or claim a released/supported installer. It disables automatic download: the
+current candidate may manually download only the metadata-named next version,
+and the next candidate accepts no later feed entry.
+
+This source stage remains short of the protected exercise. Before any private
+feed is authorized, independently sign and notarize both exact candidate
+builds; inspect their identities, plist fields, package/runtime manifests, and
+target artifacts; publish a private target-scoped generic feed with a receipt;
+then test native `0.1.18` to current and current to next on Apple Silicon and
+Intel. Verify the live updater response, retained history and salt, settings,
+sharing choice, Keychain continuity, one writer/login owner, restart, and
+interrupted recovery. Public downloads and the stable feed are separate rollout
+gates.
 
 Keep the native Sparkle routes for users who do not take the guided handover
 until that rehearsal and rollout are complete.

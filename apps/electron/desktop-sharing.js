@@ -119,7 +119,7 @@ export function createDesktopSharingCoordinator({
       }
     },
     updateTransport(value) {
-      if (["off", "unavailable", "uploading", "pending", "up_to_date", "retry_wait", "paused"].includes(value?.state)) {
+      if (["off", "unavailable", "uploading", "pending", "up_to_date", "retry_wait", "paused", "recovery_required"].includes(value?.state)) {
         transportStatus = value.state;
       }
     },

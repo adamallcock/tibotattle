@@ -4,7 +4,10 @@ import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { createDesktopContributionCredentialBackend } from "../desktop-contribution-credential.js";
+import {
+  createDesktopContributionCredentialBackend,
+  createDesktopContributionCredentialLegacyProbe,
+} from "../desktop-contribution-credential.js";
 
 function cryptoFixture() {
   const key = randomBytes(32);
@@ -31,6 +34,29 @@ function cryptoFixture() {
     },
   };
 }
+
+test("legacy macOS ciphertext inspection never initializes or decrypts safeStorage", async () => {
+  const calls = [];
+  for (const [stored, expected] of [
+    [null, "absent"],
+    [{ schemaVersion: "accountless-encrypted-credential-v1", encrypted: "AAAA" }, "present"],
+    [{ schemaVersion: "unexpected", encrypted: null }, "unavailable"],
+  ]) {
+    const probe = createDesktopContributionCredentialLegacyProbe({
+      platform: "darwin",
+      rootPath: "/synthetic/profile",
+      storage: {
+        load: async () => {
+          calls.push("load");
+          return stored;
+        },
+      },
+    });
+    assert.equal(await probe.inspect(), expected);
+  }
+  assert.deepEqual(calls, ["load", "load", "load"]);
+});
+
 test("installation credential persists encrypted and survives adapter restart", async (t) => {
   const rootPath = await mkdtemp(join(tmpdir(), "accountless-vault-"));
   t.after(() => rm(rootPath, { recursive: true, force: true }));

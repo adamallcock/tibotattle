@@ -1,7 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createDesktopMacOSCredentialBackend, loadDesktopMacOSCredentialBackend } from "../desktop-macos-keychain.js";
-import { MACOS_KEYCHAIN_ADAPTER_CAPABILITIES, MACOS_KEYCHAIN_ADAPTER_CONTRACT_VERSION } from "../../../native/macos-keychain/contract.js";
+import {
+  createDesktopMacOSAccountlessCredentialBackend,
+  createDesktopMacOSCredentialBackend,
+  loadDesktopMacOSCredentialBackend,
+  loadDesktopMacOSCredentialBackends,
+} from "../desktop-macos-keychain.js";
+import {
+  MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES,
+  MACOS_KEYCHAIN_ADAPTER_CAPABILITIES,
+  MACOS_KEYCHAIN_ADAPTER_CONTRACT_VERSION,
+} from "../../../native/macos-keychain/contract.js";
 import { createProductionMacCredentialHandover } from "../main.js";
 import { Duplex } from "node:stream";
 
@@ -28,6 +37,21 @@ function bindingFixture() {
       return "stored";
     },
     async remove(capability) { items.delete(capability); return "deleted"; },
+    async createIfMissing(capability, value) {
+      calls.push(["createIfMissing", capability]);
+      if (items.has(capability)) return "existing";
+      items.set(capability, Buffer.from(value));
+      buffers.push(value);
+      return "created";
+    },
+    async deleteExact(capability, value) {
+      calls.push(["deleteExact", capability]);
+      if (!items.has(capability)) return "missing";
+      if (!items.get(capability).equals(value)) return "mismatch";
+      items.delete(capability);
+      buffers.push(value);
+      return "deleted";
+    },
   };
   return { binding, items, calls, buffers };
 }
@@ -37,7 +61,7 @@ test("native bytes retain the existing identity through the fixed broker port", 
   f.items.set("export_identity", Buffer.from(SECRET, "base64url"));
   const backend = createDesktopMacOSCredentialBackend({ binding: f.binding });
   await backend.preflight();
-  assert.deepEqual(f.calls, MACOS_KEYCHAIN_ADAPTER_CAPABILITIES.map((cap) => ["read", cap]));
+  assert.deepEqual(f.calls, MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES.map((cap) => ["read", cap]));
   assert.equal(await backend.get("export_identity"), SECRET);
   await backend.set("account_observation", SECRET);
   assert.equal(await backend.get("account_observation"), SECRET);
@@ -46,6 +70,70 @@ test("native bytes retain the existing identity through the fixed broker port", 
   assert.equal(await backend.get("account_observation"), null);
   await assert.rejects(backend.set("export_identity", "a".repeat(43)));
   await assert.rejects(backend.get("unknown"));
+  await assert.rejects(backend.get("accountless_installation"));
+});
+
+test("main-only accountless credentials use native conditional operations and preserve legacy recovery", async () => {
+  const f = bindingFixture();
+  const secret = Buffer.alloc(32, 19);
+  const accountless = createDesktopMacOSAccountlessCredentialBackend({
+    binding: f.binding,
+    legacyCredentialProbe: async () => "absent",
+  });
+  assert.equal(await accountless.read(), null);
+  assert.equal(await accountless.createIfMissing(secret), "created");
+  assert.deepEqual(await accountless.read(), secret);
+  assert.equal(await accountless.createIfMissing(Buffer.alloc(32, 20)), "existing");
+  assert.equal(await accountless.deleteExact(Buffer.alloc(32, 21)), "mismatch");
+  assert.equal(await accountless.deleteExact(secret), "deleted");
+  assert.equal(await accountless.read(), null);
+  assert.equal(f.calls.some(([operation]) => operation === "store"), false);
+  assert.equal(f.calls.some(([operation, capability]) => operation === "createIfMissing"
+    && capability === "accountless_installation"), true);
+  assert.ok(f.buffers.every((buffer) => buffer.every((byte) => byte === 0)));
+
+  const blocked = createDesktopMacOSAccountlessCredentialBackend({
+    binding: f.binding,
+    legacyCredentialProbe: async () => "present",
+  });
+  const callsBeforeBlockedRead = f.calls.length;
+  await assert.rejects(blocked.read(), {
+    code: "contribution_device_credential_recovery_required",
+  });
+  await assert.rejects(blocked.createIfMissing(secret), {
+    code: "contribution_device_credential_recovery_required",
+  });
+  assert.equal(f.calls.length, callsBeforeBlockedRead,
+    "legacy recovery must block native reads and writes without replacing identity");
+});
+
+test("locked accountless credentials are retryable while denial and recovery remain terminal", async () => {
+  for (const [status, code, retryable] of [
+    ["locked", "contribution_device_credential_unavailable", true],
+    ["denied", "contribution_device_credential_unavailable", false],
+    ["migration_required", "contribution_device_credential_recovery_required", false],
+  ]) {
+    const f = bindingFixture();
+    f.binding.read = async () => ({ status, value: null });
+    const accountless = createDesktopMacOSAccountlessCredentialBackend({
+      binding: f.binding,
+      legacyCredentialProbe: async () => "absent",
+    });
+    await assert.rejects(accountless.read(), (error) => error?.code === code
+      && error.retryable === retryable);
+  }
+
+  const f = bindingFixture();
+  f.binding.createIfMissing = async () => "locked";
+  const accountless = createDesktopMacOSAccountlessCredentialBackend({
+    binding: f.binding,
+    legacyCredentialProbe: async () => "absent",
+  });
+  await assert.rejects(accountless.createIfMissing(Buffer.alloc(32, 9)),
+    (error) => error?.code === "contribution_device_credential_unavailable"
+      && error.retryable === true
+      && error.knownNonMutation === true);
+  assert.equal(f.items.size, 0, "a locked conditional write must not mint a replacement identity");
 });
 
 test("preflight remains read-only and blocks unavailable or migration-required credentials", async () => {
@@ -82,6 +170,24 @@ test("both Mac targets verify the enclosing application before loading and prefl
   }
 });
 
+test("verified adapter loading exposes a separate accountless factory without preflighting it", async () => {
+  const f = bindingFixture();
+  const backends = await loadDesktopMacOSCredentialBackends({
+    app: { isPackaged: true, getAppPath: () => `${RESOURCES}/app.asar` },
+    resourcesPath: RESOURCES, platform: "darwin", architecture: "arm64",
+    inspectFile: async () => METADATA,
+    resolveRealPath: async (path) => path,
+    verifyApplication: async () => true,
+    requireBinding: () => f.binding,
+  });
+  assert.equal(f.calls.length, 4);
+  const accountless = backends.createAccountlessCredentialBackend({
+    legacyCredentialProbe: async () => "absent",
+  });
+  assert.equal(await accountless.createIfMissing(Buffer.alloc(32, 3)), "created");
+  assert.equal(f.calls.filter((call) => call[0] === "read").length, 4);
+});
+
 test("unsigned, replaced, linked, development and wrong-target candidates cannot load native code", async () => {
   const base = {
     app: { isPackaged: true, getAppPath: () => `${RESOURCES}/app.asar` },
@@ -115,12 +221,20 @@ test("production composition establishes credentials before touching the predece
   const order = [];
   const app = {};
   let completeHandover;
+  const accountless = { read: async () => null, createIfMissing: async () => "created",
+    deleteExact: async () => "missing" };
   const bridge = createProductionMacCredentialHandover({
     app, resourcesPath: RESOURCES,
     async loadBackend(options) {
       assert.deepEqual(options, { app, resourcesPath: RESOURCES });
       order.push("credentials");
-      return { get: async () => null, set: async () => {}, delete: async () => {} };
+      return {
+        broker: { get: async () => null, set: async () => {}, delete: async () => {} },
+        createAccountlessCredentialBackend(options) {
+          assert.equal(typeof options.legacyCredentialProbe, "function");
+          return accountless;
+        },
+      };
     },
     async runHandover(options) {
       assert.deepEqual(options, { electronApp: app, resourcesPath: RESOURCES, homeDirectory: "/synthetic/home" });
@@ -130,6 +244,9 @@ test("production composition establishes credentials before touching the predece
   });
   const stream = new Duplex({ read() {}, write(chunk, encoding, done) { done(); } });
   assert.throws(() => bridge.attachCredentialBroker(stream));
+  assert.throws(() => bridge.createAccountlessCredentialBackend({
+    legacyCredentialProbe: async () => "absent",
+  }));
   const preparation = bridge.prepareNativeHandover({ homeDirectory: "/synthetic/home" });
   await new Promise((done) => setImmediate(done));
   assert.deepEqual(order, ["credentials", "handover"]);
@@ -138,6 +255,9 @@ test("production composition establishes credentials before touching the predece
   assert.deepEqual(await preparation, { status: "migrated" });
   bridge.attachCredentialBroker(stream).dispose();
   assert.equal(stream.destroyed, true);
+  assert.equal(bridge.createAccountlessCredentialBackend({
+    legacyCredentialProbe: async () => "absent",
+  }), accountless);
 });
 
 test("credential refusal and failed handover never open a child credential channel", async () => {

@@ -34,6 +34,8 @@ function binding(overrides = {}) {
     read: async () => ({ status: "absent", value: null }),
     store: async () => "stored",
     remove: async () => "deleted",
+    createIfMissing: async () => "created",
+    deleteExact: async () => "deleted",
     ...overrides,
   };
 }
@@ -54,6 +56,10 @@ test("macOS Keychain adapter facade preserves its closed Promise contract", asyn
   assert.equal(await pending, "locked");
   assert.equal(inspected, true);
   assert.equal(await facade.remove("contribution_device"), "absent");
+  assert.equal(await facade.createIfMissing(
+    "accountless_installation",
+    Buffer.alloc(32, 5),
+  ), "created");
   await assert.rejects(
     facade.inspect("arbitrary_service"),
     (error) => isMacOSKeychainAdapterContractError(error)
@@ -97,6 +103,22 @@ test("macOS Keychain adapter facade copies and clears native boundary secrets", 
   assert.equal(await facade.store("account_observation", callerSecret), "stored");
   assert.deepEqual(nativeStoreInput, Buffer.alloc(32));
   assert.deepEqual(callerSecret, Buffer.alloc(32, 91));
+
+  await assert.rejects(
+    facade.createIfMissing("contribution_device", Buffer.alloc(32, 4)),
+    (error) => isMacOSKeychainAdapterContractError(error)
+      && error.code === "macos_keychain_adapter_invalid_capability",
+  );
+  await assert.rejects(
+    facade.store("accountless_installation", Buffer.alloc(32, 4)),
+    (error) => isMacOSKeychainAdapterContractError(error)
+      && error.code === "macos_keychain_adapter_invalid_capability",
+  );
+  await assert.rejects(
+    facade.remove("accountless_installation"),
+    (error) => isMacOSKeychainAdapterContractError(error)
+      && error.code === "macos_keychain_adapter_invalid_capability",
+  );
 });
 
 test("macOS Keychain adapter facade refuses synchronous or malformed native replies", async () => {
@@ -165,6 +187,7 @@ test("macOS Keychain adapter source retains the fixed, prompt-free modern policy
     "app-usagemonitor.account-observation.app.v1",
     "app-usagemonitor.claude-session-pseudonym.app.v1",
     "app-usagemonitor.contribution-device.app.v1",
+    "app-usagemonitor.accountless-installation.app.v1",
   ]) {
     assert.equal(source.includes(service), true);
   }
@@ -173,6 +196,7 @@ test("macOS Keychain adapter source retains the fixed, prompt-free modern policy
     "app-usagemonitor.account-observation.v1",
     "app-usagemonitor.claude-session-pseudonym.v1",
     "app-usagemonitor.contribution-device.v1",
+    "app-usagemonitor.accountless-installation.v1",
   ]) {
     assert.equal(source.includes(legacyService), true);
   }
@@ -214,10 +238,34 @@ test("macOS Keychain adapter source retains the fixed, prompt-free modern policy
   assert.doesNotMatch(storeImplementation, /\bSecItemDelete\s*\(/u);
   const removeImplementation = source.slice(
     source.indexOf("ItemStatus RemoveModernSecret"),
-    source.indexOf("struct OperationContext"),
+    source.indexOf("ConditionalStatus CreateModernSecretIfMissing"),
   );
   assert.match(removeImplementation, /\bSecItemDelete\s*\(/u);
-  assert.equal((source.match(/\bSecItemDelete\s*\(/gu) ?? []).length, 1);
+  const createIfMissingImplementation = source.slice(
+    source.indexOf("ConditionalStatus CreateModernSecretIfMissing"),
+    source.indexOf("ConditionalStatus DeleteModernSecretExact"),
+  );
+  assert.match(createIfMissingImplementation, /\bSecItemAdd\s*\(/u);
+  assert.match(createIfMissingImplementation, /errSecDuplicateItem/u);
+  assert.doesNotMatch(createIfMissingImplementation, /\bSecItemUpdate\s*\(/u);
+  assert.doesNotMatch(createIfMissingImplementation, /\bSecItemDelete\s*\(/u);
+  const deleteExactImplementation = source.slice(
+    source.indexOf("ConditionalStatus DeleteModernSecretExact"),
+    source.indexOf("struct OperationContext"),
+  );
+  assert.match(deleteExactImplementation, /kSecReturnPersistentRef/u);
+  assert.match(deleteExactImplementation, /kSecValuePersistentRef/u);
+  assert.match(deleteExactImplementation, /\bSecItemDelete\s*\(/u);
+  const storeCallback = source.slice(
+    source.indexOf("napi_value StoreCallback"),
+    source.indexOf("napi_value RemoveCallback"),
+  );
+  const removeCallback = source.slice(
+    source.indexOf("napi_value RemoveCallback"),
+    source.indexOf("napi_value CreateIfMissingCallback"),
+  );
+  assert.match(storeCallback, /IsAccountlessInstallationCapability/u);
+  assert.match(removeCallback, /IsAccountlessInstallationCapability/u);
   assert.match(bindingGyp, /"macos-keychain\.mm"/u);
   assert.match(bindingGyp, /"NAPI_VERSION=8"/u);
 });
@@ -242,6 +290,8 @@ test("macOS Keychain adapter compiles both architectures without loading Keychai
   assert.deepEqual(Object.keys(loaded).sort(), [
     "capabilities",
     "contractVersion",
+    "createIfMissing",
+    "deleteExact",
     "identityStatus",
     "inspect",
     "read",

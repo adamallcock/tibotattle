@@ -506,6 +506,84 @@ test("native handover blocks before settings writes and companion start when exi
   assert.match(notices[0].detail, /existing data has been preserved/u);
 });
 
+test("handover rehearsal keeps the packaged updater but omits the FD3 accountless path", async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "handover-rehearsal-runtime-"));
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  app.getPath = () => profile;
+  const autoUpdater = new EventEmitter();
+  let checks = 0;
+  autoUpdater.checkForUpdates = async () => {
+    checks += 1;
+    return { updateInfo: null };
+  };
+  autoUpdater.downloadUpdate = async () => [];
+  autoUpdater.quitAndInstall = () => {};
+  let fixture;
+  t.after(async () => {
+    await fixture?.desktop.lifecycle.requestQuit();
+    await rm(profile, { recursive: true, force: true });
+  });
+  fixture = await launchFixture({
+    app,
+    load: async () => null,
+    environment: { HOME: profile },
+    runtimeOverrides: {
+      autoUpdater,
+      dialog: {
+        showMessageBox: async () => ({ response: 0 }),
+        showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+      },
+    },
+    productionDistribution: createProductionDistributionMetadata({
+      target: `darwin-${process.arch}`,
+      sourceRevision: "c".repeat(40),
+      buildNumber: "20260907",
+      rehearsal: "current",
+      rehearsalCurrentVersion: "0.1.19-native-to-electron-handover.1",
+      rehearsalNextVersion: "0.1.19-native-to-electron-handover.2",
+    }),
+    firstRunReceiptBackend: { load: async () => null, save: async () => {} },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(checks >= 1);
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, undefined);
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_MODE, undefined);
+});
+
+test("handover rehearsal refuses accountless production composition before native credentials are created", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let factoryCalls = 0;
+  await assert.rejects(launchFixture({
+    app,
+    load: async () => null,
+    environment: { HOME: "/synthetic" },
+    productionDistribution: createProductionDistributionMetadata({
+      target: `darwin-${process.arch}`,
+      sourceRevision: "d".repeat(40),
+      buildNumber: "20260907",
+      rehearsal: "next",
+      rehearsalCurrentVersion: "0.1.19-native-to-electron-handover.1",
+      rehearsalNextVersion: "0.1.19-native-to-electron-handover.2",
+    }),
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createMacOSCredentialBackend() {
+        factoryCalls += 1;
+        return { read: async () => null, createIfMissing: async () => "created",
+          deleteExact: async () => "missing" };
+      },
+    },
+  }), { code: "electron_shell_electron_configuration_invalid" });
+  assert.equal(factoryCalls, 0);
+  assert.equal(app.readyCalls, 0);
+});
+
 test("accountless laboratory rejects hosted destinations and absent synthetic lane", async () => {
   for (const [origin, lane] of [["https://tibotattle.com", "accountless-local-lab-v1"], ["http://127.0.0.1:18901", undefined]]) {
     await assert.rejects(launchFixture({ load: async () => null,
@@ -530,7 +608,72 @@ test("accountless laboratory rejects incomplete injected credential capabilities
   }
 });
 
-for (const production of [false, true]) test(`desktop ${production ? "production" : "laboratory"} composes encrypted credentials with an owned companion and durable opt-out`, async (t) => {
+test("macOS production composes the main-only credential backend without touching safeStorage", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let factoryCalls = 0;
+  let safeStorageCalls = 0;
+  const backend = {
+    read: async () => null,
+    createIfMissing: async () => "created",
+    deleteExact: async () => "missing",
+  };
+  const fixture = await launchFixture({
+    app,
+    load: async () => null,
+    runtimeOverrides: {
+      safeStorage: {
+        isAsyncEncryptionAvailable: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
+        encryptStringAsync: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
+        decryptStringAsync: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
+      },
+    },
+    environment: { HOME: "/synthetic" },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createMacOSCredentialBackend(options) {
+        factoryCalls += 1;
+        assert.deepEqual(Object.keys(options), ["legacyCredentialProbe"]);
+        assert.equal(typeof options.legacyCredentialProbe, "function");
+        return backend;
+      },
+    },
+  });
+  assert.equal(factoryCalls, 1);
+  assert.equal(safeStorageCalls, 0);
+  await fixture.desktop.lifecycle.requestQuit();
+});
+
+test("macOS production fails closed when its main-only credential backend cannot compose", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let safeStorageCalls = 0;
+  await assert.rejects(launchFixture({
+    app,
+    load: async () => null,
+    runtimeOverrides: {
+      safeStorage: {
+        isAsyncEncryptionAvailable: async () => { safeStorageCalls += 1; return true; },
+      },
+    },
+    environment: { HOME: "/synthetic" },
+    sharingBackend: { load: async () => null, save: async () => {} },
+    sharingInstallationState: "fresh",
+    accountlessProduction: {
+      origin: "https://tibotattle.com",
+      policyVersion: "accountless-opt-out-v1",
+      createMacOSCredentialBackend() { throw new Error("native adapter unavailable"); },
+    },
+  }), /native adapter unavailable/u);
+  assert.equal(safeStorageCalls, 0);
+});
+
+for (const production of [false, true]) test(`desktop ${production ? "production" : "laboratory"} composes protected credentials with an owned companion and durable opt-out`, async (t) => {
   const profile = await mkdtemp(join(tmpdir(), "accountless-runtime-"));
   const launched = [];
   const app = new FakeApp();
@@ -540,14 +683,20 @@ for (const production of [false, true]) test(`desktop ${production ? "production
   const key = randomBytes(32);
   t.after(async () => {
     try { await Promise.all(launched.map((fixture) => fixture.desktop.lifecycle.requestQuit())); }
-    finally { key.fill(0); await rm(profile, { recursive: true, force: true }); }
+    finally { key.fill(0); nativeSecret?.fill(0); await rm(profile, { recursive: true, force: true }); }
   });
+  let safeStorageCalls = 0;
   let encryptions = 0;
   let decryptions = 0;
   let encryptionAvailable = false;
   const safeStorage = {
-    isAsyncEncryptionAvailable: async () => { assert.equal(app.ready, true); return encryptionAvailable; },
+    isAsyncEncryptionAvailable: async () => {
+      safeStorageCalls += 1;
+      assert.equal(app.ready, true);
+      return encryptionAvailable;
+    },
     async encryptStringAsync(value) {
+      safeStorageCalls += 1;
       encryptions += 1;
       const nonce = randomBytes(12);
       const cipher = createCipheriv("aes-256-gcm", key, nonce);
@@ -555,11 +704,47 @@ for (const production of [false, true]) test(`desktop ${production ? "production
       return Buffer.concat([nonce, cipher.getAuthTag(), body]);
     },
     async decryptStringAsync(bytes) {
+      safeStorageCalls += 1;
       decryptions += 1;
       const decipher = createDecipheriv("aes-256-gcm", key, bytes.subarray(0, 12));
       decipher.setAuthTag(bytes.subarray(12, 28));
       return { result: Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]).toString("utf8"), shouldReEncrypt: false };
     },
+  };
+  let nativeAvailable = false;
+  let nativeSecret = null;
+  let nativeCreates = 0;
+  const nativeUnavailable = () => Object.assign(new Error("native credential unavailable"), {
+    code: "contribution_device_credential_unavailable",
+    retryable: true,
+  });
+  const createMacOSCredentialBackend = ({ legacyCredentialProbe }) => {
+    assert.equal(typeof legacyCredentialProbe, "function");
+    const readyNative = async () => {
+      assert.equal(await legacyCredentialProbe(), "absent");
+      if (!nativeAvailable) throw nativeUnavailable();
+    };
+    return {
+      async read() {
+        await readyNative();
+        return nativeSecret === null ? null : Buffer.from(nativeSecret);
+      },
+      async createIfMissing(value) {
+        await readyNative();
+        if (nativeSecret !== null) return "existing";
+        nativeSecret = Buffer.from(value);
+        nativeCreates += 1;
+        return "created";
+      },
+      async deleteExact(value) {
+        await readyNative();
+        if (nativeSecret === null) return "missing";
+        if (!nativeSecret.equals(value)) return "mismatch";
+        nativeSecret.fill(0);
+        nativeSecret = null;
+        return "deleted";
+      },
+    };
   };
   let savedChoice = null;
   const sharingBackend = {
@@ -572,6 +757,7 @@ for (const production of [false, true]) test(`desktop ${production ? "production
     sharingBackend, sharingInstallationState: "fresh",
     ...(production ? { accountlessProduction: {
       origin: "https://tibotattle.com", policyVersion: "accountless-opt-out-v1",
+      createMacOSCredentialBackend,
     } } : { accountlessLaboratory: { origin: "http://127.0.0.1:18901" } }),
     ownedCompanionScript: fileURLToPath(new URL("../../../test/fixtures/accountless-runtime-child.mjs", import.meta.url)),
   };
@@ -586,14 +772,23 @@ for (const production of [false, true]) test(`desktop ${production ? "production
   launched.push(first);
   assert.deepEqual(first.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
   await waitFor(async () => (await first.desktop.sharingCoordinator.inspect()).transportStatus === "retry_wait");
-  assert.equal(encryptions, 0, "unavailable encryption must not create a credential or block local launch");
-  encryptionAvailable = true;
+  assert.equal(encryptions, 0, "unavailable credentials must not create a credential or block local launch");
+  if (production) nativeAvailable = true;
+  else encryptionAvailable = true;
   first.children[0].send({ schemaVersion: "synthetic-accountless-runtime-control-v1", action: "run" });
   await waitFor(async () => (await first.desktop.sharingCoordinator.inspect()).transportStatus === "up_to_date");
-  assert.equal(encryptions, 1);
   const credentialPath = join(profile, "desktop-settings", "accountless-installation-credential-v1.json");
-  const stored = await readFile(credentialPath, "utf8");
-  assert.deepEqual(Object.keys(JSON.parse(stored)).sort(), ["encrypted", "schemaVersion"]);
+  let stored = null;
+  if (production) {
+    assert.equal(encryptions, 0);
+    assert.equal(safeStorageCalls, 0, "production macOS must not initialize safeStorage");
+    assert.equal(nativeCreates, 1);
+    await assert.rejects(readFile(credentialPath), { code: "ENOENT" });
+  } else {
+    assert.equal(encryptions, 1);
+    stored = await readFile(credentialPath, "utf8");
+    assert.deepEqual(Object.keys(JSON.parse(stored)).sort(), ["encrypted", "schemaVersion"]);
+  }
   first.children[0].send({ schemaVersion: "synthetic-accountless-runtime-control-v1", action: "run" });
   await waitFor(async () => (await first.desktop.sharingCoordinator.inspect()).transportStatus === "uploading");
   await first.desktop.sharingCoordinator.setEnabled(false);
@@ -605,10 +800,21 @@ for (const production of [false, true]) test(`desktop ${production ? "production
   await waitFor(async () => (await restarted.desktop.sharingCoordinator.inspect()).transportStatus === "off");
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(decryptions, readsBeforeRestart, "saved opt-out must deny credential access on restart");
-  assert.equal(await readFile(credentialPath, "utf8"), stored, "restart must not rotate the installation");
+  if (production) {
+    assert.equal(safeStorageCalls, 0, "restart must still avoid safeStorage");
+    assert.equal(nativeCreates, 1, "restart must not rotate the installation");
+    await assert.rejects(readFile(credentialPath), { code: "ENOENT" });
+  } else {
+    assert.equal(await readFile(credentialPath, "utf8"), stored, "restart must not rotate the installation");
+  }
   await restarted.desktop.sharingCoordinator.setEnabled(true);
   await waitFor(async () => (await restarted.desktop.sharingCoordinator.inspect()).transportStatus === "up_to_date");
-  assert.equal(encryptions, 1, "explicit re-enable reuses the same installation credential");
+  if (production) {
+    assert.equal(nativeCreates, 1, "explicit re-enable reuses the same installation credential");
+    assert.equal(safeStorageCalls, 0);
+  } else {
+    assert.equal(encryptions, 1, "explicit re-enable reuses the same installation credential");
+  }
   await restarted.desktop.lifecycle.requestQuit();
 });
 

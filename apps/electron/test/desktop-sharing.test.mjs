@@ -34,6 +34,18 @@ test("Electron explicitly selects default-on but exposes only a safe preference 
   await assert.rejects(coordinator.inspect(), { code: "desktop_sharing_unavailable" });
 });
 
+test("Electron exposes a fixed credential recovery transport state", async () => {
+  const coordinator = createDesktopSharingCoordinator({ ...OPTIONS, backend: memoryBackend(),
+    now: () => new Date(START) });
+  await coordinator.initialize();
+  coordinator.updateTransport({ state: "recovery_required", lastAcceptedAt: null, nextAttemptAt: null });
+  const value = await coordinator.inspect();
+  assert.equal(value.transportStatus, "recovery_required");
+  assert.equal(value.enabled, true);
+  assert.equal(Object.hasOwn(value, "credential"), false);
+  coordinator.dispose();
+});
+
 test("three actual notice receipts survive restart and activate only after the final grace period", async () => {
   const backend = memoryBackend();
   let clock = START;

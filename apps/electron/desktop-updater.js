@@ -8,6 +8,14 @@ export const PRODUCTION_ELECTRON_CONTRIBUTION_POLICY =
   distribution.PRODUCTION_ELECTRON_CONTRIBUTION_POLICY;
 export const PRODUCTION_ELECTRON_DISTRIBUTION_SCHEMA_VERSION =
   distribution.PRODUCTION_ELECTRON_DISTRIBUTION_SCHEMA_VERSION;
+export const PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CANDIDATES =
+  distribution.PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CANDIDATES;
+export const PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CHANNEL =
+  distribution.PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CHANNEL;
+export const PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CONTRIBUTION_POLICY =
+  distribution.PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CONTRIBUTION_POLICY;
+export const PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_SCHEMA_VERSION =
+  distribution.PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_SCHEMA_VERSION;
 export const PRODUCTION_ELECTRON_TARGETS = distribution.PRODUCTION_ELECTRON_TARGETS;
 export const PRODUCTION_ELECTRON_UPDATE_ORIGIN = distribution.PRODUCTION_ELECTRON_UPDATE_ORIGIN;
 export const PRODUCTION_ELECTRON_UPDATE_CHECK_INTERVAL_MS = 4 * 60 * 60_000;
@@ -76,29 +84,53 @@ export function productionUpdateFeedForTarget({ platform, architecture } = {}) {
   return target === null ? null : distribution.productionElectronFeedForTarget(target);
 }
 
+function rehearsalForMetadata(value) {
+  if (!isPlainRecord(value)
+      || typeof value.rehearsalCurrentVersion !== "string"
+      || typeof value.rehearsalNextVersion !== "string") return null;
+  if (value.semanticVersion === value.rehearsalCurrentVersion) return "current";
+  if (value.semanticVersion === value.rehearsalNextVersion) return "next";
+  return null;
+}
+
 export function createProductionDistributionMetadata({
   buildNumber,
   target,
   sourceRevision,
-  channel = PRODUCTION_ELECTRON_CHANNEL,
+  channel,
+  rehearsal = null,
+  rehearsalCurrentVersion,
+  rehearsalNextVersion,
 } = {}) {
-  const spec = PRODUCTION_ELECTRON_TARGETS[target];
-  if (!spec || channel !== PRODUCTION_ELECTRON_CHANNEL
+  const selected = distribution.productionElectronDistributionForTarget({
+    target,
+    rehearsal,
+    rehearsalCurrentVersion,
+    rehearsalNextVersion,
+  });
+  if (selected === null
+      || (channel !== undefined && channel !== selected.channel)
       || typeof buildNumber !== "string"
       || !PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN.test(buildNumber)
       || typeof sourceRevision !== "string" || !SOURCE_REVISION_PATTERN.test(sourceRevision)) {
     throw new TypeError("production Electron distribution metadata is invalid");
   }
-  return Object.freeze({
+  const metadata = {
     appId: PRODUCTION_ELECTRON_APP_ID,
     buildNumber,
-    channel,
-    contributionPolicy: PRODUCTION_ELECTRON_CONTRIBUTION_POLICY,
-    schemaVersion: PRODUCTION_ELECTRON_DISTRIBUTION_SCHEMA_VERSION,
+    channel: selected.channel,
+    contributionPolicy: selected.contributionPolicy,
+    schemaVersion: selected.schemaVersion,
     sourceRevision,
     target,
-    updateFeed: spec.feedURL,
-  });
+    updateFeed: selected.feedURL,
+  };
+  if (selected.semanticVersion !== null) {
+    metadata.semanticVersion = selected.semanticVersion;
+    metadata.rehearsalCurrentVersion = selected.rehearsalCurrentVersion;
+    metadata.rehearsalNextVersion = selected.rehearsalNextVersion;
+  }
+  return Object.freeze(metadata);
 }
 
 export function validateProductionDistributionMetadata(value, {
@@ -106,7 +138,10 @@ export function validateProductionDistributionMetadata(value, {
   architecture,
 } = {}) {
   const target = targetFor(platform, architecture);
-  if (target === null || !hasExactKeys(value, [
+  const stable = target === null
+    ? null
+    : distribution.productionElectronDistributionForTarget({ target });
+  const validStable = stable !== null && hasExactKeys(value, [
     "appId",
     "buildNumber",
     "channel",
@@ -116,22 +151,67 @@ export function validateProductionDistributionMetadata(value, {
     "target",
     "updateFeed",
   ])
+      && value.appId === PRODUCTION_ELECTRON_APP_ID
+      && typeof value.buildNumber === "string"
+      && PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN.test(value.buildNumber)
+      && value.channel === stable.channel
+      && value.contributionPolicy === stable.contributionPolicy
+      && value.schemaVersion === stable.schemaVersion
+      && value.target === target
+      && typeof value.sourceRevision === "string"
+      && SOURCE_REVISION_PATTERN.test(value.sourceRevision)
+      && value.updateFeed === stable.feedURL;
+  if (validStable) {
+    return createProductionDistributionMetadata({
+      buildNumber: value.buildNumber,
+      target: value.target,
+      sourceRevision: value.sourceRevision,
+    });
+  }
+  const rehearsal = rehearsalForMetadata(value);
+  const selected = target === null || rehearsal === null
+    ? null
+    : distribution.productionElectronDistributionForTarget({
+      target,
+      rehearsal,
+      rehearsalCurrentVersion: value.rehearsalCurrentVersion,
+      rehearsalNextVersion: value.rehearsalNextVersion,
+    });
+  if (selected === null || !hasExactKeys(value, [
+    "appId",
+    "buildNumber",
+    "channel",
+    "contributionPolicy",
+    "schemaVersion",
+    "sourceRevision",
+    "target",
+    "updateFeed",
+    "semanticVersion",
+    "rehearsalCurrentVersion",
+    "rehearsalNextVersion",
+  ])
       || value.appId !== PRODUCTION_ELECTRON_APP_ID
       || typeof value.buildNumber !== "string"
       || !PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN.test(value.buildNumber)
-      || value.channel !== PRODUCTION_ELECTRON_CHANNEL
-      || value.contributionPolicy !== PRODUCTION_ELECTRON_CONTRIBUTION_POLICY
-      || value.schemaVersion !== PRODUCTION_ELECTRON_DISTRIBUTION_SCHEMA_VERSION
+      || value.channel !== selected.channel
+      || value.contributionPolicy !== selected.contributionPolicy
+      || value.schemaVersion !== selected.schemaVersion
       || value.target !== target
       || typeof value.sourceRevision !== "string"
       || !SOURCE_REVISION_PATTERN.test(value.sourceRevision)
-      || value.updateFeed !== PRODUCTION_ELECTRON_TARGETS[target].feedURL) {
+      || value.updateFeed !== selected.feedURL
+      || value.semanticVersion !== selected.semanticVersion
+      || value.rehearsalCurrentVersion !== selected.rehearsalCurrentVersion
+      || value.rehearsalNextVersion !== selected.rehearsalNextVersion) {
     throw new TypeError("production Electron distribution metadata is invalid");
   }
   return createProductionDistributionMetadata({
     buildNumber: value.buildNumber,
     target: value.target,
     sourceRevision: value.sourceRevision,
+    rehearsal,
+    rehearsalCurrentVersion: value.rehearsalCurrentVersion,
+    rehearsalNextVersion: value.rehearsalNextVersion,
   });
 }
 
@@ -270,6 +350,15 @@ export function createProductionDesktopUpdater({
     });
     updater = assertUpdater(autoUpdater);
   }
+  const handoverRehearsal = metadata?.channel
+    === PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CHANNEL;
+  // The current candidate may consume only the named next candidate. The
+  // second candidate closes the exercise: it never treats a later feed entry
+  // as an update. Metadata validation above establishes the exact pair.
+  const permittedRehearsalUpdateVersion = handoverRehearsal
+      && metadata.semanticVersion === metadata.rehearsalCurrentVersion
+    ? metadata.rehearsalNextVersion
+    : null;
 
   let disposed = false;
   let started = false;
@@ -280,6 +369,7 @@ export function createProductionDesktopUpdater({
   let preparedForInstall = false;
   let installFailureRequested = false;
   let installationRecovery = null;
+  let rehearsalUpdateAvailable = false;
   let status = updaterUnavailableStatus();
   const listeners = [];
 
@@ -311,23 +401,43 @@ export function createProductionDesktopUpdater({
       listeners.push([event, listener]);
     };
     on("checking-for-update", () => {
-      if (!disposed) publishWith({ state: "checking", progress: null, error: "none" });
+      if (!disposed) {
+        rehearsalUpdateAvailable = false;
+        publishWith({ state: "checking", progress: null, error: "none" });
+      }
     });
-    on("update-available", () => {
-      if (!disposed) publishWith({ state: "available", progress: null, error: "none" });
+    on("update-available", (updateInfo) => {
+      if (disposed) return;
+      if (handoverRehearsal
+          && (permittedRehearsalUpdateVersion === null
+            || updateInfo?.version !== permittedRehearsalUpdateVersion)) {
+        // AppUpdater begins automatic downloads before this event returns.
+        // Rehearsal startup therefore always sets autoDownload false, and this
+        // guard makes the validated current-to-next edge the sole manual path.
+        rehearsalUpdateAvailable = false;
+        publishWith({ state: "error", progress: null, error: "check_failed" });
+        return;
+      }
+      rehearsalUpdateAvailable = handoverRehearsal;
+      publishWith({ state: "available", progress: null, error: "none" });
     });
     on("update-not-available", () => {
-      if (!disposed) publishWith({ state: "current", progress: null, error: "none" });
+      if (!disposed) {
+        rehearsalUpdateAvailable = false;
+        publishWith({ state: "current", progress: null, error: "none" });
+      }
     });
     on("download-progress", (progress) => {
-      if (!disposed) publishWith({
+      if (!disposed && (!handoverRehearsal || rehearsalUpdateAvailable)) publishWith({
         state: "downloading",
         progress: safePercent(progress?.percent),
         error: "none",
       });
     });
     on("update-downloaded", () => {
-      if (!disposed) publishWith({ state: "downloaded", progress: 100, error: "none" });
+      if (!disposed && (!handoverRehearsal || rehearsalUpdateAvailable)) {
+        publishWith({ state: "downloaded", progress: 100, error: "none" });
+      }
     });
     on("error", () => {
       if (disposed) return;
@@ -358,7 +468,11 @@ export function createProductionDesktopUpdater({
     } catch {
       saved = { automaticDownload: false, available: false };
     }
-    const automaticDownloadAvailable = saved?.available === true;
+    // AppUpdater starts its automatic download before update-available
+    // listeners can reject an unexpected feed entry. The closed rehearsal
+    // therefore has no automatic path; the user may explicitly download only
+    // after the exact metadata-bound next version was observed.
+    const automaticDownloadAvailable = !handoverRehearsal && saved?.available === true;
     const automaticDownload = automaticDownloadAvailable
       && saved.automaticDownload === true;
     try {
@@ -366,7 +480,11 @@ export function createProductionDesktopUpdater({
       // action reaches installAndRestart(), which first stops our child.
       updater.autoDownload = automaticDownload;
       updater.autoInstallOnAppQuit = false;
-      updater.allowPrerelease = false;
+      // Generic feeds remain fixed by electron-builder. The isolated handover
+      // lane deliberately uses an ordered prerelease pair, so preserve the
+      // updater library's prerelease mode only for that closed metadata shape.
+      updater.allowPrerelease = metadata?.channel
+        === PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CHANNEL;
       updater.allowDowngrade = false;
       installEventHandlers();
     } catch {
@@ -383,7 +501,7 @@ export function createProductionDesktopUpdater({
       automaticDownload,
       automaticDownloadAvailable,
       progress: null,
-      error: automaticDownloadAvailable ? "none" : "preferences_unavailable",
+      error: automaticDownloadAvailable || handoverRehearsal ? "none" : "preferences_unavailable",
     });
     scheduleInitialCheck();
     schedulePeriodicChecks();
@@ -481,7 +599,10 @@ export function createProductionDesktopUpdater({
     // past its asynchronous readiness boundary.
     initialCheckCancelled = true;
     await requireStarted();
-    if (status.state !== "available") fail("download_unavailable");
+    if (status.state !== "available"
+        || (handoverRehearsal && !rehearsalUpdateAvailable)) {
+      fail("download_unavailable");
+    }
     return runOperation("download", async () => {
       publishWith({ state: "downloading", progress: 0, error: "none" });
       try {
@@ -499,6 +620,7 @@ export function createProductionDesktopUpdater({
   async function setAutomaticDownload(enabled) {
     if (typeof enabled !== "boolean") throw new TypeError("automaticDownload is invalid");
     await requireStarted();
+    if (handoverRehearsal) fail("preferences_unavailable");
     if (!status.automaticDownloadAvailable) fail("preferences_unavailable");
     try {
       const saved = await preferenceStore.setAutomaticDownload(enabled);

@@ -107,6 +107,9 @@ export function parseProductionCandidateArguments(argv) {
       "--target": "target",
       "--source-revision": "sourceRevision",
       "--build-number": "buildNumber",
+      "--rehearsal-candidate": "rehearsal",
+      "--rehearsal-current-version": "rehearsalCurrentVersion",
+      "--rehearsal-next-version": "rehearsalNextVersion",
       "--windows-binding": "windowsBindingPath",
       "--windows-manifest": "windowsManifestPath",
     }[flag];
@@ -114,9 +117,18 @@ export function parseProductionCandidateArguments(argv) {
     result[property] = requireArgumentValue(argv, index);
     index += 1;
   }
+  const rehearsal = result.rehearsal ?? null;
+  const distributionSelection = distribution.productionElectronDistributionForTarget({
+    target: result.target,
+    rehearsal,
+    rehearsalCurrentVersion: result.rehearsalCurrentVersion,
+    rehearsalNextVersion: result.rehearsalNextVersion,
+    ...(rehearsal === null ? {} : { minimumRehearsalVersion: RELEASE_VERSION }),
+  });
   if (!TARGETS.includes(result.target)
       || !validSourceRevision(result.sourceRevision)
       || !validBuildNumber(result.buildNumber)
+      || distributionSelection === null
       || Boolean(result.windowsBindingPath) !== Boolean(result.windowsManifestPath)
       || (result.target !== "win32-x64" && result.windowsBindingPath)) {
     fail("ARGUMENT_INVALID");
@@ -133,20 +145,46 @@ export function productionElectronCandidatePlan({
   target,
   sourceRevision,
   buildNumber,
+  rehearsal = null,
+  rehearsalCurrentVersion,
+  rehearsalNextVersion,
   hostPlatform = process.platform,
   hostArchitecture = process.arch,
 } = {}) {
   const targetSpec = PRODUCTION_ELECTRON_TARGETS[target];
   const runtimeTarget = ELECTRON_TARGETS[target];
-  if (!targetSpec || !runtimeTarget
+  const distributionSelection = distribution.productionElectronDistributionForTarget({
+    target,
+    rehearsal,
+    rehearsalCurrentVersion,
+    rehearsalNextVersion,
+    ...(rehearsal === null ? {} : { minimumRehearsalVersion: RELEASE_VERSION }),
+  });
+  if (!targetSpec || !runtimeTarget || distributionSelection === null
       || targetSpec.platform !== runtimeTarget.platform
       || targetSpec.architecture !== runtimeTarget.architecture
       || !validSourceRevision(sourceRevision)
       || !validBuildNumber(buildNumber)) {
     fail("PLAN_INVALID");
   }
-  const metadata = createProductionDistributionMetadata({ buildNumber, sourceRevision, target });
-  const stagingRoot = `.release-build/electron-production/${target}`;
+  const metadata = createProductionDistributionMetadata({
+    buildNumber,
+    rehearsal,
+    rehearsalCurrentVersion,
+    rehearsalNextVersion,
+    sourceRevision,
+    target,
+  });
+  const stagingPathSegments = distribution.productionElectronStagingPathSegments({
+    target,
+    rehearsal,
+    rehearsalCurrentVersion,
+    rehearsalNextVersion,
+    ...(rehearsal === null ? {} : { minimumRehearsalVersion: RELEASE_VERSION }),
+  });
+  if (stagingPathSegments === null) fail("PLAN_INVALID");
+  const stagingRoot = `.release-build/${stagingPathSegments.join("/")}`;
+  const version = distributionSelection.semanticVersion ?? RELEASE_VERSION;
   const nativeHandoverHelper = targetSpec.platform === "darwin"
     ? Object.freeze({
       architecture: targetSpec.architecture,
@@ -169,7 +207,7 @@ export function productionElectronCandidatePlan({
     schemaVersion: SCHEMA_VERSION,
     buildNumber,
     sourceRevision,
-    version: RELEASE_VERSION,
+    version,
     target,
     updateFeed: metadata.updateFeed,
     host: Object.freeze({ platform: hostPlatform, architecture: hostArchitecture }),
@@ -183,12 +221,33 @@ export function productionElectronCandidatePlan({
       "--publish",
       "never",
     ]),
+    builderEnvironment: Object.freeze({
+      TIBOTATTLE_ELECTRON_BUILD_NUMBER: buildNumber,
+      TIBOTATTLE_ELECTRON_SOURCE_REVISION: sourceRevision,
+      TIBOTATTLE_ELECTRON_TARGET: target,
+      TIBOTATTLE_ELECTRON_VERSION: version,
+      ...(rehearsal === null ? {} : {
+        TIBOTATTLE_ELECTRON_REHEARSAL_CANDIDATE: rehearsal,
+        TIBOTATTLE_ELECTRON_REHEARSAL_CURRENT_VERSION: rehearsalCurrentVersion,
+        TIBOTATTLE_ELECTRON_REHEARSAL_NEXT_VERSION: rehearsalNextVersion,
+      }),
+    }),
     updaterEnabled: true,
     signingRequired: targetSpec.platform !== "linux",
     signingPerformed: false,
     publishingPerformed: false,
     nativeHandoverHelper,
     nativeMacOSKeychainAdapter,
+    ...(rehearsal === null ? {} : {
+      rehearsal: Object.freeze({
+        candidate: rehearsal,
+        currentVersion: rehearsalCurrentVersion,
+        id: distribution.PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_ID,
+        nextVersion: rehearsalNextVersion,
+        releaseStatus: "not_released",
+        hostedUploads: "disabled",
+      }),
+    }),
     // The current Windows runtime still requires a separate qualification
     // context. Source staging does not turn this into a launch claim.
     windowsRuntimeQualification: target === "win32-x64" ? "required" : "not_applicable",
@@ -404,6 +463,9 @@ export async function prepareProductionElectronCandidate(options = {}) {
   const targetSpec = PRODUCTION_ELECTRON_TARGETS[plan.target];
   const metadata = createProductionDistributionMetadata({
     buildNumber: plan.buildNumber,
+    rehearsal: plan.rehearsal?.candidate ?? null,
+    rehearsalCurrentVersion: plan.rehearsal?.currentVersion,
+    rehearsalNextVersion: plan.rehearsal?.nextVersion,
     sourceRevision: plan.sourceRevision,
     target: plan.target,
   });
@@ -412,6 +474,7 @@ export async function prepareProductionElectronCandidate(options = {}) {
     target: plan.target,
     replace: options.replaceStaging === true,
     packagingProfile: "production",
+    packageVersion: plan.version,
     distributionMetadata: metadata,
     ...(plan.target === "win32-x64" ? {
       windowsBindingPath: options.windowsBindingPath,
@@ -447,7 +510,9 @@ export async function prepareProductionElectronCandidate(options = {}) {
     ...plan,
     ...(nativeHandoverHelper === null ? {} : { nativeHandoverHelper }),
     ...(nativeMacOSKeychainAdapter === null ? {} : { nativeMacOSKeychainAdapter }),
-    status: "production_source_staged",
+    status: plan.rehearsal === undefined
+      ? "production_source_staged"
+      : "native_to_electron_handover_rehearsal_source_staged",
     stagedManifest: "app/package.json",
     runtimeManifest: "app/electron-runtime-manifest.json",
   });

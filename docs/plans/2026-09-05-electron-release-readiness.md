@@ -7,28 +7,43 @@ status: in-progress
 
 # Objective and current position
 
-Updated 2026-09-06. Deliver one primary Electron application for Apple Silicon
+Updated 2026-09-07. Deliver one primary Electron application for Apple Silicon
 Mac, Intel Mac, Windows x64 and Linux x64, with one shared product and release
 process. Provider support stays inside that app. The accepted
 [sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md) remains
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-The current tested development candidate is
-`65a1132bf5ecf4505a8c3d1d456cb1f955db8cea`. Its four unsigned packages passed
-[CI run 34012137047](https://github.com/adamallcock/tibotattle/actions/runs/34012137047).
-The Mac app started, its owned companion reported ready with hosted
-contributions disabled, and a copied-history refresh completed. The shared
-accounting/cache release changes are present; released Worker repairs were
-also reconciled. Native 0.1.18 is the predecessor baseline, whose tag resolves
-to `55c813a1bf7e67c00e47410b760104c0d9fbc0ea`.
+The latest four-target successful development build is
+`aead5d009d4a34a7c24b7e4d3cf8a2b7e749f548`. Its unsigned packages passed
+[CI run 34144823459](https://github.com/adamallcock/tibotattle/actions/runs/34144823459),
+including native Windows protected-child binding tests. It includes upstream
+changes through `11276bb84793b273276a3026029d3a8efb99467e` and the new Mac
+credential-broker and production-disclosure source. The inspected local Mac
+candidate at that same `aead5d00` revision runs against a private
+copied profile with hosted contributions disabled and repairs the accounting
+compatibility defect found in the earlier package. Both include the latest
+shared model-attribution and retained-view fixes.
+Native 0.1.18 is the predecessor baseline, whose tag resolves to
+`55c813a1bf7e67c00e47410b760104c0d9fbc0ea`.
 
 This establishes a development candidate, not a production replacement.
-Final rendered inspection of the corrected package remains uncompleted after
-the Mac locked. The current update UI is disabled. Accountless scheduling and
-credentials work only in the injected local laboratory; ordinary distributed
-launches do not have accountless upload authority. Physical platform and
-installed upgrade evidence remain incomplete.
+The accounting reader now accepts only the exact compatible base/parent-model
+parser pair, retaining generation checks and rejecting other mixed versions.
+The packaged `49d84a33` refresh rebuilt complete, replay-safe accounting and
+restored cache-task links, including Auto Review parent links. Settings/About
+and the shared contribution-settings destination were inspected; sharing stayed
+off. The subsequent `aead5d00` candidate passed the same page/control checks,
+active-refresh responsiveness, cancellation and a durable-launcher restart with
+sharing still off. Actual tray interaction still needs its final check because the native
+menu-bar automation surface is unavailable. The earlier production updater and
+native migration source at `91355893` had a
+[four-target CI run 34137413523](https://github.com/adamallcock/tibotattle/actions/runs/34137413523)
+failure at shared packaging contracts before installer creation. The repaired
+inventory, independent verifier and platform staging passed the subsequent
+four-target run at `aead5d00`; the failed run remains preserved. Physical
+platform, credential continuity and installed
+upgrade evidence remain incomplete.
 
 # Workstreams and completion evidence
 
@@ -50,9 +65,10 @@ the transition. Test supported 0.1.17 upgrade paths as well, or provide a
 qualified bridge rather than silently excluding users who skipped a release.
 
 Run product parity, accountless integration and Windows/Linux preparation in
-parallel. The accountless schema approval does not block product QA, updater
-source work, migration design or platform qualification preparation. Likewise,
-a locked Mac blocks visible inspection, not the rest of the programme.
+parallel. The user requested completion of every stage after reviewing this
+roadmap, authorizing the reviewed accountless source migration and disposable
+synthetic rehearsal. This work is now assigned alongside migration and updater
+implementation. Hardware or visible-inspection gaps do not stop independent work.
 
 Use three explicit readiness milestones:
 
@@ -126,14 +142,187 @@ status), within the unchanged 250 ms p95 budget. This does not cover every cold
 or quick-publication phase, renderer responsiveness or UI Quit. Keep those
 qualification cases in the product journey ledger.
 
-Current dependencies are an unlocked Mac for final visible QA, actual target
-OS/desktop environments, production signing/update access, and the pending
-[source-only accountless migration approval](../reviews/2026-09-05-accountless-migration-proposal.md).
-Automatic approval review rejected rebuilding the ownership tables without
-specific authorization. The pending request is for source implementation and
-fresh disposable synthetic D1 rehearsals only; no 0047 migration or routed
-ownership endpoint has been added. Remote migrations, hosted activation,
-signing, installed replacement and publication remain separate authorizations.
+On 2026-09-06 the unlocked Mac allowed packaged inspection: Settings navigation,
+About alignment in light and dark, persistent sharing off, responsive Settings
+during cancellation, and completed cancellation preserving prior results were
+observed on candidate `65a1132b`. The 7-day allowance control exposed misleading
+minimum-span wording: short ranges deliberately include every fit, so source
+now labels the slider as observation classification and explains that behavior.
+The correction was subsequently checked in packaged candidate `259d6d8d`.
+
+On 2026-09-07, the same retained `65a1132b` package completed its analysis and
+resolved cache-drop task links, including Auto Review rows pointing at their
+parent task. Sidebar hide/show and the rendered share-card preview worked.
+Choosing Quit produced an `exited_cleanly` receipt and a process check confirmed
+the package and owned launcher/companion were gone. A second 45-second status
+probe collected only idle samples (180 successful rounds, p95 1 ms); its
+`active_insufficient_samples` result is preserved and does not replace the
+earlier active-refresh evidence. The wording/layout correction is committed as
+`d6b9214d` and is rendered correctly in `259d6d8d`.
+
+The `259d6d8d` Mac build has ASAR SHA-256
+`cb8e67148ad729663b02fdc28504f5239d789ccbdc97e79b588bb7537fbdf979`.
+Overview, 7-day allowance classification, full-width Community, persistent
+sharing off, retained expanded Trends charts, Astra labels, and cache-table
+pagination were inspected. The cache-task failure was diagnosed through
+read-only index and refresh metadata, preserving the original databases and
+generation checks. Its 45-second responsiveness probe caught idle samples only
+(p95 2 ms for each endpoint), so it is explicitly not active-refresh proof.
+
+The integration source now binds production contribution and update selection
+to the packaged app's own validated distribution manifest. Development and QA
+launches retain their disabled hosted transports. The production client uses
+the existing v1.1 usage/quota transport with accountless upload authorization;
+it explicitly rejects borrowing social consent as that authorization. The
+owned-companion tests cover encrypted installation-credential reuse, persistent
+opt-out/restart and cancellation. Updater composition tests cover protected
+preferences and child shutdown before installation. Native handover runs after
+primary-instance ownership and readiness, before settings writes, and blocks
+startup if existing data cannot be transferred. The combined root-owned
+integration suite passes 154 tests; architecture checks pass with no debt.
+The subsequent 101-test composition gate also covers failed update-install
+recovery and migration retry. An actual compiled Swift helper regression test
+proved it must be placed in `Contents/MacOS` to see the enclosing app identity;
+the production staging configuration now uses that location. These are source
+and synthetic-composition results, not installed migration,
+hosted service activation or signed update receipts.
+
+The `49d84a33` Mac candidate has ASAR SHA-256
+`8e561614c2fbc0f8de80febe9a4149fd1f900f7654ac53fe937669da9941fee1`.
+Its active-refresh qualification collected 180 active rounds in 45 seconds,
+zero failures, and p95 1 ms for both endpoints; maximum health/status response
+times were 22/8 ms. The original 250 ms p95 budget remains unchanged. The
+accounting repair passed 206 related tests and independent review.
+Choosing the native menu's Quit action returned an `exited_cleanly` receipt
+with artifact verification; a separate process check found no remaining owned
+candidate or companion process.
+The durable launcher was then exercised again: the app reopened with sharing
+off, an active refresh accepted cancellation and returned to the available
+refresh control, and a second normal Quit produced the same clean receipt.
+
+The `aead5d00` candidate has ASAR SHA-256
+`6a7a0694b6cdb25d19f2485d8b0dd4cf1c38e4c6274db009a0719a2097d61a6a`.
+Its confirmed owned-companion port was bound to the actual process before the
+final UI and responsiveness checks. An earlier ambiguous development-window
+observation is excluded from this proof. The confirmed pass inspected About,
+General, Notifications, Data & privacy, Community, cache-table pagination,
+daily Trends and the seven-day allowance explanation. All 180 active-refresh
+rounds succeeded in 45 seconds, with p95 1 ms for both endpoints and maxima
+19/7 ms for health/status. Cancellation retained the prior view and restored the
+refresh control. The durable launcher now selects this exact artifact and a
+separate copied profile; the previous app, profile and launcher remain available.
+
+Credential review found a separate production blocker: the old native
+Keychain broker terminates with the native app, while Electron's legacy
+fallback cannot establish continuity with app-owned credentials and refuses
+Intel. A fixed-capability, main-process macOS adapter now composes the existing
+companion protocol over a separate owned-child pipe. Read-only preflight runs
+before predecessor or data mutation. Modern absence requires a separate
+attribute-only legacy check; locked, denied and legacy-only state never become
+new identities. Existing values are updated without deleting the old item or
+changing its ACL. The main/transport tests pass 62 cases and the separate
+runtime suite passes 28 outside the loopback-restricting sandbox. The complete
+Electron source suite subsequently passed all 430 tests. Combined native helper,
+adapter compilation and packaging checks passed 45 tests with two expected
+platform skips. Both thin Mac adapter binaries compile; only the host module's
+constants are loaded, without accessing real Keychain items. Independent review
+also tightened absence checks to the exact readable, unlocked Keychain search
+list, while preserving successful reads from available stores. Signed prompt-free continuity
+still requires actual qualification. Linux's
+account-observation/identity adapter and Windows's remaining filesystem race
+qualification remain explicit gates. A successful installer build does not
+activate those production selectors.
+
+First-launch disclosure now selects production copy from the validated
+distribution metadata. Production explains automatic sharing, persistent
+opt-out and available update controls; development retains its unavailable
+upload/update disclosure. All three desktop languages are covered. The
+disclosure tests pass 10 cases and the runtime suite passes 28, including the
+production composition. The acknowledgement still grants no upload authority.
+Rendered production-dialog qualification remains outstanding.
+
+A separate accountless credential review found that Electron's async
+safeStorage availability probe initializes its Keychain provider; it does not
+guarantee noninteractive access. A main-owned native accountless credential
+backend now operates separately from the four legacy capabilities; production
+macOS never initializes safeStorage. Existing encrypted installation credentials
+fail closed for explicit recovery rather than silently rotating an identity.
+Locked native storage can retry after unlock. The complete integrated Electron
+suite passes 445 tests, and both thin native adapter architectures compile.
+Signed runtime qualification and the explicit legacy-ciphertext recovery
+journey remain gates; automatic setup is not yet claimed prompt-free.
+
+Source lifecycle review found that the accountless enrollment lease expires
+after 30 days and replay does not renew it. A same-secret authenticated renewal
+route and client now extend the existing installation/owner graph within seven
+days of expiry or after an offline period. The client recovers once from expiry
+between enrollment and ownership verification, without creating a replacement
+identity or resetting upload history. Its 32 focused tests and 89 related
+client/scheduler/transport tests pass. Worker renewal and migration focused
+tests pass 27 cases, including due and expired leases, concurrent requests,
+revocation, erasure and transaction rollback. The actual client also passes the
+local HTTP Worker journey with the new renewal route and rejects renewal after
+disconnect. Full Worker regression qualification is in progress.
+
+Updater source review also confirmed that a higher build number alone cannot
+trigger an Electron update: the successor needs a higher semantic app version.
+The production source now supports a closed, explicitly supplied pair of later
+Mac prerelease versions on a fixed isolated feed. Automatic download is disabled
+for this exercise; only the first candidate can manually download its exact
+named successor. The 27 focused updater/distribution/manifest tests pass,
+including rejection of unrelated feed versions. Clean frozen source staging of
+both candidates precedes the signed upgrade gate; no feed was published.
+
+Accountless synthetic enrollment/upload/deduplication/disconnect tests have
+run against disposable Worker databases. Independent review identified two
+additional release blockers: accountless chunks consumed the public source
+selection budget before filtering, and accountless lifecycle triggers could
+withdraw social public aggregates. Both fixes now pass targeted regressions,
+including 30,001 private source chunks without exhausting the public selector's
+budget. Independent review then added an exact enrollment/device ID invariant and its
+negative SQL test. The frozen integration commit `86062adc` passed all 576
+Worker tests and 190 script checks, including generated types and package-copy
+guards. Its dry-deployment checks initially stopped because the clean checkout
+had no generated public-site assets. After generating the exact source tree
+with installer links disabled, both remaining dry-deployment and staging
+configuration checks passed. No service was deployed; staging still reports
+unconfigured resource identifiers and no collection authority.
+
+The actual Node accountless client now passes a disposable local Worker
+journey using the default rate limits: enrollment, direct upload ownership,
+capabilities, three encrypted objects containing five synthetic usage/quota/
+session records, restart with no duplicate uploads, disconnect fencing and
+persistent opt-out with no requests. The later renewal-enabled journey also
+passes with the same installation identity and unchanged history. This test
+exposed and fixed a missing
+authorization-shape validator in the real incremental dispatcher. The related
+40-test client suite passes. A Miniflare migration rehearsal also preserved
+10,001 social participant rows plus the complete dense descendant fixture in
+796 ms, with matching digests/counts, no foreign-key violations and no leftover
+snapshot tables. This is a bounded local scale sample, not a production-size
+history or a hosted migration receipt.
+
+Read-only signing access checks found a valid local Developer ID Application
+identity. The repository-level GitHub Actions secret list is empty; environment
+secrets and Windows signing access are not yet established. Windows production
+startup still needs its actual storage/binding qualification and entry wiring;
+its development CI receipts cannot satisfy that gate.
+
+Linux review found a production-entry bypass: valid stable metadata could start
+credential, upload and updater composition despite the unqualified platform.
+The entrypoint now refuses that selection before composing these services,
+while preserving the existing development launch. Its entry-level regression
+is included in the 445-test Electron pass. Linux still needs an OS-held
+credential mutation lease, abandoned-operation recovery and the production
+identity adapter. Local containers are ARM or emulated x64 at older source
+revisions, so neither qualifies the proposed Ubuntu 24.04/GNOME target.
+
+The earlier source-only migration approval request is superseded by the user's
+explicit request to complete every stage. Source implementation and disposable
+synthetic migration/upload rehearsals are proceeding. Hosted activation and
+migration, signing, installed replacement and publication will be bound to the
+concrete qualified candidate and exact target operation. Actual target desktop
+access and signing/update credentials remain to be verified before those steps.
 
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)

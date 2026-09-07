@@ -122,7 +122,7 @@ const ELECTRON_SHARING_STATES = new Set([
   "disabled",
   "legacy_preserved",
 ]);
-const ELECTRON_SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off", "uploading", "pending", "up_to_date", "retry_wait", "paused"]);
+const ELECTRON_SHARING_TRANSPORT_STATUSES = new Set(["unavailable", "off", "uploading", "pending", "up_to_date", "retry_wait", "paused", "recovery_required"]);
 
 function electronSharingBridge(windowRef = globalThis.window) {
   const bridge = windowRef?.tibotattleDesktop;
@@ -1039,7 +1039,7 @@ function electronSharingStateMessageKey(preference) {
 
 function electronSharingTransportMessageKey(preference) {
   switch (preference?.transportStatus) {
-    case "uploading": case "pending": case "up_to_date": case "retry_wait": case "paused":
+    case "uploading": case "pending": case "up_to_date": case "retry_wait": case "paused": case "recovery_required":
       return `electron.sharing.transport.${preference.transportStatus}`;
     case "off":
       return "electron.sharing.transport.off";

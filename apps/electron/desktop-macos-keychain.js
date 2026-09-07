@@ -2,7 +2,11 @@ import { spawn } from "node:child_process";
 import { lstat, realpath } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { createMacOSKeychainAdapterFacade, MACOS_KEYCHAIN_ADAPTER_CAPABILITIES } from "../../native/macos-keychain/contract.js";
+import {
+  createMacOSKeychainAdapterFacade,
+  MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY,
+  MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES,
+} from "../../native/macos-keychain/contract.js";
 import { CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER } from "../../src/platform/index.js";
 import { PRODUCTION_ELECTRON_APP_ID } from "./desktop-updater.js";
 import distribution from "../../config/electron-production-distribution.cjs";
@@ -24,19 +28,61 @@ function assertStatus(status) {
   throw failure("broker_unavailable");
 }
 
-/** Map the native fixed-capability adapter onto the existing broker port. */
-export function createDesktopMacOSCredentialBackend({ binding } = {}) {
-  const adapter = createMacOSKeychainAdapterFacade(binding);
-  if (adapter.identityStatus() !== "valid") throw failure();
+function assertBrokerCapability(capability) {
+  if (!MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES.includes(capability)) throw failure();
+  return capability;
+}
+
+function accountlessFailure({
+  recoveryRequired = false,
+  retryable = false,
+  knownNonMutation = false,
+} = {}) {
+  const error = Object.assign(new Error(recoveryRequired
+    ? "Installation credential recovery is required"
+    : "Installation credential unavailable"), {
+    code: recoveryRequired
+      ? "contribution_device_credential_recovery_required"
+      : "contribution_device_credential_unavailable",
+    retryable: recoveryRequired ? false : retryable,
+  });
+  // A native locked result is returned before a conditional Keychain mutation
+  // completes. Keep that fact main-process-only so FD3 can retry instead of
+  // retaining a public binding for a secret that was never stored.
+  if (knownNonMutation) {
+    Object.defineProperty(error, "knownNonMutation", { value: true });
+  }
+  return error;
+}
+
+function assertAccountlessStatus(status, { knownNonMutation = false } = {}) {
+  if (status === "locked") {
+    throw accountlessFailure({ retryable: true, knownNonMutation });
+  }
+  if (status === "migration_required") throw accountlessFailure({ recoveryRequired: true });
+  throw accountlessFailure();
+}
+
+async function assertLegacyCredentialAbsent(legacyCredentialProbe) {
+  let status;
+  try { status = await legacyCredentialProbe(); }
+  catch { throw accountlessFailure(); }
+  if (status === "absent") return;
+  if (status === "present") throw accountlessFailure({ recoveryRequired: true });
+  throw accountlessFailure();
+}
+
+function createDesktopMacOSCredentialBackendFromAdapter(adapter) {
   const backend = {
     async get(capability) {
-      const result = await adapter.read(capability);
+      const result = await adapter.read(assertBrokerCapability(capability));
       if (result.status === "absent") return null;
       if (result.status !== "present") return assertStatus(result.status);
       try { return result.value.toString("base64url"); }
       finally { result.value.fill(0); }
     },
     async set(capability, value) {
+      assertBrokerCapability(capability);
       if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/u.test(value)) throw failure();
       const secret = Buffer.from(value, "base64url");
       try {
@@ -46,17 +92,93 @@ export function createDesktopMacOSCredentialBackend({ binding } = {}) {
       } finally { secret.fill(0); }
     },
     async delete(capability) {
-      const status = await adapter.remove(capability);
+      const status = await adapter.remove(assertBrokerCapability(capability));
       if (status !== "deleted" && status !== "absent") assertStatus(status);
     },
     async preflight() {
-      // Read, then discard, every fixed capability before stopping the old app
-      // or copying its state. An absent modern item must have passed the native
-      // legacy-attribute check; denied/unknown/legacy-only is never fresh.
-      for (const capability of MACOS_KEYCHAIN_ADAPTER_CAPABILITIES) await backend.get(capability);
+      // Read, then discard, only the four credentials that the inherited
+      // companion broker may serve. Accountless installation credentials stay
+      // main-process-only and are checked only when sharing needs one.
+      for (const capability of MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES) {
+        await backend.get(capability);
+      }
     },
   };
   return Object.freeze(backend);
+}
+
+function createDesktopMacOSAccountlessCredentialBackendFromAdapter(
+  adapter,
+  { legacyCredentialProbe } = {},
+) {
+  if (typeof legacyCredentialProbe !== "function") throw accountlessFailure();
+  return Object.freeze({
+    async read() {
+      await assertLegacyCredentialAbsent(legacyCredentialProbe);
+      const result = await adapter.read(
+        MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY,
+      );
+      if (result.status === "absent") return null;
+      if (result.status !== "present") return assertAccountlessStatus(result.status);
+      try { return Buffer.from(result.value); }
+      finally { result.value.fill(0); }
+    },
+    async createIfMissing(value) {
+      await assertLegacyCredentialAbsent(legacyCredentialProbe);
+      if (!Buffer.isBuffer(value) || value.length !== 32) throw accountlessFailure();
+      const status = await adapter.createIfMissing(
+        MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY,
+        value,
+      );
+      if (status !== "created" && status !== "existing") {
+        assertAccountlessStatus(status, { knownNonMutation: true });
+      }
+      return status;
+    },
+    async deleteExact(value) {
+      await assertLegacyCredentialAbsent(legacyCredentialProbe);
+      if (!Buffer.isBuffer(value) || value.length !== 32) throw accountlessFailure();
+      const status = await adapter.deleteExact(
+        MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY,
+        value,
+      );
+      if (!["deleted", "missing", "mismatch"].includes(status)) {
+        assertAccountlessStatus(status);
+      }
+      return status;
+    },
+  });
+}
+
+/** Map the native fixed-capability adapter onto the existing broker port. */
+export function createDesktopMacOSCredentialBackend({ binding } = {}) {
+  const adapter = createMacOSKeychainAdapterFacade(binding);
+  if (adapter.identityStatus() !== "valid") throw failure();
+  return createDesktopMacOSCredentialBackendFromAdapter(adapter);
+}
+
+/** Main-only accountless credential backend; never exposed through FD4. */
+export function createDesktopMacOSAccountlessCredentialBackend({
+  binding,
+  legacyCredentialProbe,
+} = {}) {
+  const adapter = createMacOSKeychainAdapterFacade(binding);
+  if (adapter.identityStatus() !== "valid") throw accountlessFailure();
+  return createDesktopMacOSAccountlessCredentialBackendFromAdapter(adapter, {
+    legacyCredentialProbe,
+  });
+}
+
+function createDesktopMacOSCredentialBackends({ binding } = {}) {
+  const adapter = createMacOSKeychainAdapterFacade(binding);
+  if (adapter.identityStatus() !== "valid") throw failure();
+  const broker = createDesktopMacOSCredentialBackendFromAdapter(adapter);
+  return Object.freeze({
+    broker,
+    createAccountlessCredentialBackend(options) {
+      return createDesktopMacOSAccountlessCredentialBackendFromAdapter(adapter, options);
+    },
+  });
 }
 
 function verifySignedApplication(appBundle, { spawnProcess = spawn } = {}) {
@@ -96,8 +218,8 @@ function sameFile(left, right) {
     && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
 }
 
-/** Load only the fixed native resource inside the verified production app. */
-export async function loadDesktopMacOSCredentialBackend({
+/** Load the fixed native resource inside the verified production app once. */
+export async function loadDesktopMacOSCredentialBackends({
   app,
   resourcesPath,
   platform = process.platform,
@@ -128,17 +250,22 @@ export async function loadDesktopMacOSCredentialBackend({
     const binding = requireBinding(binary);
     const after = await inspectFile(binary);
     if (!safeBinary(after) || !sameFile(verified, after)) throw failure();
-    const backend = createDesktopMacOSCredentialBackend({ binding });
+    const backends = createDesktopMacOSCredentialBackends({ binding });
     let timer;
     try {
       await Promise.race([
-        backend.preflight(),
+        backends.broker.preflight(),
         new Promise((_, reject) => { timer = setTimeout(() => reject(failure("broker_timeout")), TIMEOUT_MS); }),
       ]);
     } finally { clearTimeout(timer); }
-    return backend;
+    return backends;
   } catch (error) {
     if (["KEYCHAIN_LOCKED", "KEYCHAIN_DENIED", "KEYCHAIN_MIGRATION_REQUIRED", "broker_timeout"].includes(error?.code)) throw error;
     throw failure("broker_unavailable");
   }
+}
+
+/** Backward-compatible broker-only loader for the FD4 handover path. */
+export async function loadDesktopMacOSCredentialBackend(options = {}) {
+  return (await loadDesktopMacOSCredentialBackends(options)).broker;
 }

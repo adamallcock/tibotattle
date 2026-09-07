@@ -2,13 +2,19 @@
 // on Electron renderer IPC, an HTTP route, or a discoverable socket.
 const SCHEMA = "accountless-process-v1";
 const OPERATIONS = new Set(["preference", "read", "create", "delete", "status"]);
-const STATES = new Set(["off", "unavailable", "uploading", "pending", "up_to_date", "retry_wait", "paused"]);
+const STATES = new Set(["off", "unavailable", "uploading", "pending", "up_to_date", "retry_wait", "paused", "recovery_required"]);
 const SECRET = /^[A-Za-z0-9_-]{43}$/u;
 const RETRYABLE_CREDENTIAL_UNAVAILABLE = "retryable_credential_unavailable";
+const CREDENTIAL_RECOVERY_REQUIRED = "credential_recovery_required";
 const denied = () => Object.assign(new Error("Contribution channel unavailable"),
   { code: "contribution_device_credential_unavailable", retryable: false });
 const temporarilyUnavailable = () => Object.assign(new Error("Contribution channel unavailable"),
   { code: "contribution_device_credential_unavailable", retryable: true });
+// The only non-availability credential failure carried across FD3. It reveals
+// neither the legacy record nor any native Keychain detail, but lets the local
+// sharing surface stop retries and give the owner a fixed recovery action.
+const recoveryRequired = () => Object.assign(new Error("Installation credential recovery is required"),
+  { code: "contribution_device_credential_recovery_required", retryable: false });
 // A dispatched create/delete request can race channel loss or a parent-side
 // storage failure. Its result must not be treated as a known non-mutation:
 // the public binding is retained so a later process can recover the exact
@@ -20,6 +26,20 @@ const retryableCredentialFailure = (error) => {
   try {
     return error?.code === "contribution_device_credential_unavailable"
       && error?.retryable === true;
+  } catch {
+    return false;
+  }
+};
+const retryableKnownNonMutationCredentialFailure = (error) => {
+  try {
+    return retryableCredentialFailure(error) && error?.knownNonMutation === true;
+  } catch {
+    return false;
+  }
+};
+const recoveryRequiredCredentialFailure = (error) => {
+  try {
+    return error?.code === "contribution_device_credential_recovery_required";
   } catch {
     return false;
   }
@@ -107,8 +127,17 @@ export function attachAccountlessParentChannel({ channel, readPreference, backen
       if (disposed || (epoch !== generation && message.operation === "read")) throw denied();
       reply(message.id, result);
     } catch (error) {
-      reply(message.id, mutationStarted ? "mutation_uncertain"
-        : retryableCredentialFailure(error) ? RETRYABLE_CREDENTIAL_UNAVAILABLE : null, false);
+      // The accountless native backend emits this only before it can mint,
+      // replace, or delete an identity. Preserve the fixed recovery result
+      // ahead of the generic dispatched-mutation uncertainty classification.
+      reply(message.id, recoveryRequiredCredentialFailure(error)
+        ? CREDENTIAL_RECOVERY_REQUIRED
+        : retryableKnownNonMutationCredentialFailure(error)
+          ? RETRYABLE_CREDENTIAL_UNAVAILABLE
+          : mutationStarted ? "mutation_uncertain"
+          : retryableCredentialFailure(error)
+            ? RETRYABLE_CREDENTIAL_UNAVAILABLE
+            : null, false);
     }
     finally { bytes?.fill(0); busy = false; }
   };
@@ -145,9 +174,12 @@ export function createAccountlessChildChannel({ channel, onInvalidated = () => {
   let disposed = false;
   let sequence = 0;
   const pending = new Map();
-  const rejection = (request, { outcomeUncertain = false, retryable = false } = {}) => (
-    outcomeUncertain && isMutation(request.operation) ? mutationUncertain()
-      : retryable ? temporarilyUnavailable() : denied()
+  const rejection = (request, {
+    outcomeUncertain = false, retryable = false, recoveryRequired: needsRecovery = false,
+  } = {}) => (
+    needsRecovery ? recoveryRequired()
+      : outcomeUncertain && isMutation(request.operation) ? mutationUncertain()
+        : retryable ? temporarilyUnavailable() : denied()
   );
   const rejectAll = (preserveMutations = false, options = {}) => {
     for (const [id, request] of pending) {
@@ -179,6 +211,7 @@ export function createAccountlessChildChannel({ channel, onInvalidated = () => {
     else request.reject(rejection(request, {
       outcomeUncertain: message.value === "mutation_uncertain",
       retryable: message.value === RETRYABLE_CREDENTIAL_UNAVAILABLE,
+      recoveryRequired: message.value === CREDENTIAL_RECOVERY_REQUIRED,
     }));
   };
   const onDisconnect = () => {

@@ -986,6 +986,44 @@ test("production policy reads only the final packaged app manifest and validates
   }
 });
 
+test("handover rehearsal policy binds its selected semantic version to the packaged manifest", async () => {
+  const metadata = createProductionDistributionMetadata({
+    target: "darwin-arm64",
+    sourceRevision: "b".repeat(40),
+    buildNumber: "20260907",
+    rehearsal: "current",
+    rehearsalCurrentVersion: "0.1.19-native-to-electron-handover.1",
+    rehearsalNextVersion: "0.1.19-native-to-electron-handover.2",
+  });
+  const app = {
+    isPackaged: true,
+    getName: () => "TiboTattle",
+    getAppPath: () => "/Applications/TiboTattle.app/Contents/Resources/app.asar",
+  };
+  const readManifest = async () => Buffer.from(JSON.stringify({
+    version: metadata.semanticVersion,
+    tibotattleDistribution: metadata,
+  }));
+  assert.deepEqual(await readProductionDistribution({
+    app,
+    platform: "darwin",
+    architecture: "arm64",
+    readManifest,
+  }), metadata);
+
+  for (const version of [undefined, "0.1.18", "0.1.20"]) {
+    await assert.rejects(readProductionDistribution({
+      app,
+      platform: "darwin",
+      architecture: "arm64",
+      readManifest: async () => Buffer.from(JSON.stringify({
+        ...(version === undefined ? {} : { version }),
+        tibotattleDistribution: metadata,
+      })),
+    }), errorCode("electron_configuration_invalid"));
+  }
+});
+
 test("companion supervisor fails closed on malformed readiness and bounded startup timeout", async () => {
   const malformedChild = new FakeChild();
   const malformed = createCompanionSupervisor({

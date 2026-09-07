@@ -46,7 +46,7 @@ export const ELECTRON_BUILDER_IGNORED_PACKAGE_PROPERTIES = Object.freeze([
 
 const RELEASE_VERSION_PATTERN = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const SOURCE_REVISION_PATTERN = /^[0-9a-f]{40}$/u;
-const PRODUCTION_DISTRIBUTION_KEYS = Object.freeze([
+const STABLE_PRODUCTION_DISTRIBUTION_KEYS = Object.freeze([
   "appId",
   "buildNumber",
   "channel",
@@ -55,6 +55,12 @@ const PRODUCTION_DISTRIBUTION_KEYS = Object.freeze([
   "sourceRevision",
   "target",
   "updateFeed",
+]);
+const REHEARSAL_PRODUCTION_DISTRIBUTION_KEYS = Object.freeze([
+  ...STABLE_PRODUCTION_DISTRIBUTION_KEYS,
+  "semanticVersion",
+  "rehearsalCurrentVersion",
+  "rehearsalNextVersion",
 ]);
 
 const IGNORED_PACKAGE_PROPERTIES = new Set(
@@ -77,11 +83,8 @@ function hasExactKeys(value, keys) {
     && keys.every((key) => Object.hasOwn(value, key));
 }
 
-/** Validate the exact app-owned policy copied into a production package. */
-export function validateProductionDistributionMetadata(value) {
-  if (!hasExactKeys(value, PRODUCTION_DISTRIBUTION_KEYS)) {
-    throw new TypeError("production distribution metadata is invalid");
-  }
+function validStableProductionDistributionMetadata(value) {
+  if (!hasExactKeys(value, STABLE_PRODUCTION_DISTRIBUTION_KEYS)) return null;
   const target = typeof value.target === "string"
     ? distribution.PRODUCTION_ELECTRON_TARGETS[value.target]
     : null;
@@ -95,7 +98,7 @@ export function validateProductionDistributionMetadata(value) {
       || typeof value.sourceRevision !== "string"
       || !SOURCE_REVISION_PATTERN.test(value.sourceRevision)
       || value.updateFeed !== target.feedURL) {
-    throw new TypeError("production distribution metadata is invalid");
+    return null;
   }
   return Object.freeze({
     appId: distribution.PRODUCTION_ELECTRON_APP_ID,
@@ -109,20 +112,87 @@ export function validateProductionDistributionMetadata(value) {
   });
 }
 
-export function createProductionDistributionMetadata({ buildNumber, target, sourceRevision } = {}) {
-  const targetSpec = typeof target === "string"
-    ? distribution.PRODUCTION_ELECTRON_TARGETS[target]
-    : null;
-  return validateProductionDistributionMetadata({
+function rehearsalCandidateForMetadata(value) {
+  if (!hasExactKeys(value, REHEARSAL_PRODUCTION_DISTRIBUTION_KEYS)
+      || typeof value.rehearsalCurrentVersion !== "string"
+      || typeof value.rehearsalNextVersion !== "string") return null;
+  if (value.semanticVersion === value.rehearsalCurrentVersion) return "current";
+  if (value.semanticVersion === value.rehearsalNextVersion) return "next";
+  return null;
+}
+
+/** Validate the exact app-owned policy copied into a production package. */
+export function validateProductionDistributionMetadata(value) {
+  const stable = validStableProductionDistributionMetadata(value);
+  if (stable !== null) return stable;
+  const rehearsal = rehearsalCandidateForMetadata(value);
+  const selected = rehearsal === null ? null : distribution.productionElectronDistributionForTarget({
+    target: value.target,
+    rehearsal,
+    rehearsalCurrentVersion: value.rehearsalCurrentVersion,
+    rehearsalNextVersion: value.rehearsalNextVersion,
+  });
+  if (selected === null
+      || value.appId !== distribution.PRODUCTION_ELECTRON_APP_ID
+      || typeof value.buildNumber !== "string"
+      || !distribution.PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN.test(value.buildNumber)
+      || value.channel !== selected.channel
+      || value.contributionPolicy !== selected.contributionPolicy
+      || value.schemaVersion !== selected.schemaVersion
+      || typeof value.sourceRevision !== "string"
+      || !SOURCE_REVISION_PATTERN.test(value.sourceRevision)
+      || value.target !== selected.target
+      || value.updateFeed !== selected.feedURL
+      || value.semanticVersion !== selected.semanticVersion
+      || value.rehearsalCurrentVersion !== selected.rehearsalCurrentVersion
+      || value.rehearsalNextVersion !== selected.rehearsalNextVersion) {
+    throw new TypeError("production distribution metadata is invalid");
+  }
+  return Object.freeze({
+    appId: distribution.PRODUCTION_ELECTRON_APP_ID,
+    buildNumber: value.buildNumber,
+    channel: selected.channel,
+    contributionPolicy: selected.contributionPolicy,
+    schemaVersion: selected.schemaVersion,
+    sourceRevision: value.sourceRevision,
+    target: selected.target,
+    updateFeed: selected.feedURL,
+    semanticVersion: selected.semanticVersion,
+    rehearsalCurrentVersion: selected.rehearsalCurrentVersion,
+    rehearsalNextVersion: selected.rehearsalNextVersion,
+  });
+}
+
+export function createProductionDistributionMetadata({
+  buildNumber,
+  target,
+  sourceRevision,
+  rehearsal = null,
+  rehearsalCurrentVersion,
+  rehearsalNextVersion,
+} = {}) {
+  const selected = distribution.productionElectronDistributionForTarget({
+    target,
+    rehearsal,
+    rehearsalCurrentVersion,
+    rehearsalNextVersion,
+  });
+  const metadata = {
     appId: distribution.PRODUCTION_ELECTRON_APP_ID,
     buildNumber,
-    channel: distribution.PRODUCTION_ELECTRON_CHANNEL,
-    contributionPolicy: distribution.PRODUCTION_ELECTRON_CONTRIBUTION_POLICY,
-    schemaVersion: distribution.PRODUCTION_ELECTRON_DISTRIBUTION_SCHEMA_VERSION,
+    channel: selected?.channel,
+    contributionPolicy: selected?.contributionPolicy,
+    schemaVersion: selected?.schemaVersion,
     sourceRevision,
     target,
-    updateFeed: targetSpec?.feedURL,
-  });
+    updateFeed: selected?.feedURL,
+  };
+  if (selected?.semanticVersion !== null && selected?.semanticVersion !== undefined) {
+    metadata.semanticVersion = selected.semanticVersion;
+    metadata.rehearsalCurrentVersion = selected.rehearsalCurrentVersion;
+    metadata.rehearsalNextVersion = selected.rehearsalNextVersion;
+  }
+  return validateProductionDistributionMetadata(metadata);
 }
 
 /**
@@ -152,14 +222,14 @@ export function transformElectronBuilderPackageJsonBytes(
     && Object.hasOwn(ELECTRON_BUILDER_PACKAGE_PROFILES, profile)
     ? ELECTRON_BUILDER_PACKAGE_PROFILES[profile]
     : null;
-  if (!selectedProfile
-      || (isMain
-        && (typeof packageVersion !== "string" || !RELEASE_VERSION_PATTERN.test(packageVersion)))) {
-    return null;
-  }
   const productionMetadata = profile === "production"
     ? validateProductionDistributionMetadata(distributionMetadata)
     : null;
+  const packageVersionMatchesDistribution = typeof packageVersion === "string"
+    && (productionMetadata?.semanticVersion === undefined
+      ? RELEASE_VERSION_PATTERN.test(packageVersion)
+      : packageVersion === productionMetadata.semanticVersion);
+  if (!selectedProfile || (isMain && !packageVersionMatchesDistribution)) return null;
   if (profile !== "production" && distributionMetadata !== undefined) {
     throw new TypeError("production distribution metadata is not allowed for this profile");
   }

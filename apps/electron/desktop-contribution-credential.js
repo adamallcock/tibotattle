@@ -32,6 +32,44 @@ const codec = {
   decodeBytes(bytes) { return validate(JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes))); },
   decodeValue: validate,
 };
+
+/**
+ * Inspect only the old ciphertext record before a production macOS native
+ * backend mints an accountless identity. This deliberately never calls
+ * safeStorage, decrypts, rewrites, or deletes the record: an encrypted or
+ * unreadable legacy file must remain an explicit recovery boundary.
+ */
+export function createDesktopContributionCredentialLegacyProbe({
+  platform = process.platform,
+  rootPath,
+  storage,
+} = {}) {
+  if (platform !== "darwin") throw new TypeError("legacy credential probe is macOS-only");
+  const selected = storage ?? createPosixDesktopSettingsBackend({
+    platform,
+    rootPath,
+    filename: FILE,
+    maximumBytes: LIMIT,
+    codec,
+  });
+  if (!selected || typeof selected.load !== "function") {
+    throw new TypeError("legacy credential probe storage is invalid");
+  }
+  return Object.freeze({
+    async inspect() {
+      let stored;
+      try { stored = await selected.load(); }
+      catch { return "unavailable"; }
+      try {
+        if (stored === null) return "absent";
+        return validate(stored).encrypted === null ? "absent" : "present";
+      } catch {
+        return "unavailable";
+      }
+    },
+  });
+}
+
 export function createDesktopContributionCredentialBackend({
   safeStorage, platform = process.platform, rootPath, windowsProtectedStateStore, storage,
 } = {}) {

@@ -45,6 +45,7 @@ const ERROR_CODES = new Set([
   "credential_locked",
   "credential_denied",
   "credential_migration_required",
+  "credential_recovery_required",
   "credential_unavailable",
   "credential_mutation_uncertain",
   "credential_missing",
@@ -101,6 +102,9 @@ function translateBackendFailure(error) {
   }
   if (code === "contribution_device_credential_mutation_uncertain") {
     fail("credential_mutation_uncertain", { retryable });
+  }
+  if (code === "contribution_device_credential_recovery_required") {
+    fail("credential_recovery_required");
   }
   // A protected parent channel and the Electron credential adapter mark only
   // provider availability failures as retryable. Do not infer retryability for

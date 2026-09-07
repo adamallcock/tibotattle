@@ -7,13 +7,24 @@
  */
 
 export const MACOS_KEYCHAIN_ADAPTER_CONTRACT_VERSION =
-  "tibotattle-macos-keychain-v1";
+  "tibotattle-macos-keychain-v2";
 
-export const MACOS_KEYCHAIN_ADAPTER_CAPABILITIES = Object.freeze([
+// These four credentials remain the only capabilities that may cross the
+// inherited companion pipe. Keep this list distinct from the adapter's full
+// fixed list: accountless installation enrollment is main-process-only.
+export const MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES = Object.freeze([
   "export_identity",
   "account_observation",
   "claude_session_pseudonym",
   "contribution_device",
+]);
+
+export const MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY =
+  "accountless_installation";
+
+export const MACOS_KEYCHAIN_ADAPTER_CAPABILITIES = Object.freeze([
+  ...MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES,
+  MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY,
 ]);
 
 export const MACOS_KEYCHAIN_ADAPTER_ITEM_STATUSES = Object.freeze([
@@ -41,12 +52,40 @@ export const MACOS_KEYCHAIN_ADAPTER_REMOVE_STATUSES = Object.freeze([
   "unknown",
 ]);
 
+export const MACOS_KEYCHAIN_ADAPTER_CREATE_IF_MISSING_STATUSES = Object.freeze([
+  "created",
+  "existing",
+  "locked",
+  "denied",
+  "migration_required",
+  "unknown",
+]);
+
+export const MACOS_KEYCHAIN_ADAPTER_DELETE_EXACT_STATUSES = Object.freeze([
+  "deleted",
+  "missing",
+  "mismatch",
+  "locked",
+  "denied",
+  "migration_required",
+  "unknown",
+]);
+
 const ITEM_STATUSES = new Set(MACOS_KEYCHAIN_ADAPTER_ITEM_STATUSES);
 const STORE_STATUSES = new Set(MACOS_KEYCHAIN_ADAPTER_STORE_STATUSES);
 const REMOVE_STATUSES = new Set(MACOS_KEYCHAIN_ADAPTER_REMOVE_STATUSES);
+const CREATE_IF_MISSING_STATUSES = new Set(
+  MACOS_KEYCHAIN_ADAPTER_CREATE_IF_MISSING_STATUSES,
+);
+const DELETE_EXACT_STATUSES = new Set(
+  MACOS_KEYCHAIN_ADAPTER_DELETE_EXACT_STATUSES,
+);
 const CAPABILITIES = new Set(MACOS_KEYCHAIN_ADAPTER_CAPABILITIES);
+const BROKER_CAPABILITIES = new Set(MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES);
 const REQUIRED_KEYS = Object.freeze([
   "capabilities",
+  "createIfMissing",
+  "deleteExact",
   "contractVersion",
   "identityStatus",
   "inspect",
@@ -103,6 +142,20 @@ function checkedCapability(value) {
   return value;
 }
 
+function checkedBrokerCapability(value) {
+  if (typeof value !== "string" || !BROKER_CAPABILITIES.has(value)) {
+    fail("invalid_capability");
+  }
+  return value;
+}
+
+function checkedAccountlessInstallationCapability(value) {
+  if (value !== MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY) {
+    fail("invalid_capability");
+  }
+  return value;
+}
+
 function copiedSecret(value) {
   if (!Buffer.isBuffer(value) || value.length !== 32) {
     fail("invalid_secret");
@@ -154,6 +207,30 @@ function invokeCapabilityAsync(callback, capability) {
   }
 }
 
+function invokeBrokerCapabilityAsync(callback, capability) {
+  try {
+    return invokeAsync(callback, [checkedBrokerCapability(capability)]);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+function invokeAccountlessInstallationSecretAsync(callback, capability, secret) {
+  let copied;
+  let pending;
+  try {
+    copied = copiedSecret(secret);
+    pending = invokeAsync(callback, [
+      checkedAccountlessInstallationCapability(capability),
+      copied,
+    ]);
+  } catch (error) {
+    copied?.fill(0);
+    return Promise.reject(error);
+  }
+  return pending.finally(() => copied.fill(0));
+}
+
 /**
  * Snapshot an already-loaded native adapter into a narrow, content-free facade.
  * All Keychain operations must remain Promise-based so the Electron main
@@ -179,6 +256,8 @@ export function createMacOSKeychainAdapterFacade(binding) {
   const read = binding.read.bind(binding);
   const store = binding.store.bind(binding);
   const remove = binding.remove.bind(binding);
+  const createIfMissing = binding.createIfMissing.bind(binding);
+  const deleteExact = binding.deleteExact.bind(binding);
 
   return Object.freeze({
     identityStatus() {
@@ -198,8 +277,9 @@ export function createMacOSKeychainAdapterFacade(binding) {
       let copied;
       let pending;
       try {
+        const brokerCapability = checkedBrokerCapability(capability);
         copied = copiedSecret(secret);
-        pending = invokeAsync(store, [checkedCapability(capability), copied]);
+        pending = invokeAsync(store, [brokerCapability, copied]);
       } catch (error) {
         if (copied !== undefined) copied.fill(0);
         return Promise.reject(error);
@@ -209,8 +289,22 @@ export function createMacOSKeychainAdapterFacade(binding) {
         .finally(() => copied.fill(0));
     },
     remove(capability) {
-      return invokeCapabilityAsync(remove, capability)
+      return invokeBrokerCapabilityAsync(remove, capability)
         .then((response) => checkedStatus(response, REMOVE_STATUSES));
+    },
+    createIfMissing(capability, secret) {
+      return invokeAccountlessInstallationSecretAsync(
+        createIfMissing,
+        capability,
+        secret,
+      ).then((response) => checkedStatus(response, CREATE_IF_MISSING_STATUSES));
+    },
+    deleteExact(capability, secret) {
+      return invokeAccountlessInstallationSecretAsync(
+        deleteExact,
+        capability,
+        secret,
+      ).then((response) => checkedStatus(response, DELETE_EXACT_STATUSES));
     },
   });
 }

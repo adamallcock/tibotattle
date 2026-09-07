@@ -459,6 +459,7 @@ test("locked, denied, malformed, and partial states fail closed with fixed conte
     ["export_identity_keychain_locked", "credential_locked"],
     ["export_identity_keychain_denied", "credential_denied"],
     ["export_identity_keychain_migration_required", "credential_migration_required"],
+    ["contribution_device_credential_recovery_required", "credential_recovery_required"],
     ["arbitrary", "credential_unavailable"],
   ]) {
     await fixture(async ({ stateFile }) => {

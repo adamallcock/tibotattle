@@ -345,8 +345,9 @@ function normalizePackagingProfile(value = DEFAULT_PACKAGING_PROFILE) {
   return value;
 }
 
-function normalizePackageVersion(value = RELEASE_VERSION) {
-  if (typeof value !== "string" || value !== RELEASE_VERSION) {
+function normalizePackageVersion(value = RELEASE_VERSION, distributionMetadata) {
+  const expectedVersion = distributionMetadata?.semanticVersion ?? RELEASE_VERSION;
+  if (typeof value !== "string" || value !== expectedVersion) {
     fail("INVALID_PACKAGE_VERSION", "Electron packaging version does not match the reviewed release");
   }
   return value;
@@ -1317,7 +1318,7 @@ function assertManifestContentFree(manifest) {
   return serialized;
 }
 
-function validateRuntimeManifestShape(manifest) {
+function validateRuntimeManifestShape(manifest, { expectedReleaseVersion = RELEASE_VERSION } = {}) {
   assertManifestContentFree(manifest);
   if (!exactObjectKeys(manifest, [
     "architecture", "dashboardRoot", "entrypoint", "files", "payload",
@@ -1329,7 +1330,7 @@ function validateRuntimeManifestShape(manifest) {
     spec.platform === manifest.target && spec.architecture === manifest.architecture
   ));
   if (manifest.schemaVersion !== MANIFEST_SCHEMA
-      || manifest.releaseVersion !== RELEASE_VERSION
+      || manifest.releaseVersion !== expectedReleaseVersion
       || !["apps/local/server.js", "apps/electron/main.js"].includes(manifest.entrypoint)
       || manifest.dashboardRoot !== "apps/web/public"
       || manifestTarget === undefined) {
@@ -1427,7 +1428,11 @@ function expectedDirectoryPaths(rows) {
   return [...expected].sort(comparePathBytes);
 }
 
-async function validateExistingRuntime(output, expectedTarget = null) {
+async function validateExistingRuntime(
+  output,
+  expectedTarget = null,
+  expectedReleaseVersion = RELEASE_VERSION,
+) {
   await assertNoSymlinkPathComponents(output, "existing Electron runtime");
   let metadata;
   try {
@@ -1458,7 +1463,7 @@ async function validateExistingRuntime(output, expectedTarget = null) {
   } catch {
     fail("EXISTING_OUTPUT_INVALID", "Existing runtime manifest is not JSON");
   }
-  validateRuntimeManifestShape(manifest);
+  validateRuntimeManifestShape(manifest, { expectedReleaseVersion });
   if (expectedTarget !== null) {
     const expectedSpec = TARGET_SPECS[expectedTarget];
     if (expectedSpec === undefined
@@ -1543,7 +1548,10 @@ export async function buildElectronRuntime({
   } else if (distributionMetadata !== undefined) {
     fail("PRODUCTION_DISTRIBUTION", "Distribution metadata requires the production profile");
   }
-  const selectedPackageVersion = normalizePackageVersion(packageVersion);
+  const selectedPackageVersion = normalizePackageVersion(
+    packageVersion,
+    selectedDistributionMetadata,
+  );
   const packageJsonOptions = includeElectronShell
     ? Object.freeze({
       ...(selectedDistributionMetadata
@@ -1558,7 +1566,9 @@ export async function buildElectronRuntime({
     fail("WINDOWS_BINDING_TARGET", "Windows binding arguments require the Windows target");
   }
   const destination = await validateOutputDestination(output, REPOSITORY_ROOT, replace);
-  if (destination.existed) await validateExistingRuntime(destination.output, selectedTarget);
+  if (destination.existed) {
+    await validateExistingRuntime(destination.output, selectedTarget, selectedPackageVersion);
+  }
   const temporaryRoot = await mkdtemp(join(
     destination.parent,
     `.${basename(destination.output)}.staging-`,
@@ -1738,7 +1748,9 @@ export async function buildElectronRuntime({
         || commitDestination.parent !== destination.parent) {
       fail("UNSAFE_OUTPUT", "Electron runtime destination changed before commit");
     }
-    if (destination.existed) await validateExistingRuntime(destination.output, selectedTarget);
+    if (destination.existed) {
+      await validateExistingRuntime(destination.output, selectedTarget, selectedPackageVersion);
+    }
     else {
       let currentMetadata;
       try {

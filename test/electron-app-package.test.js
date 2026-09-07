@@ -102,6 +102,7 @@ test("Electron builder configuration is an unsigned macOS arm64 directory build"
         "apps/web/public/**",
         "config/**",
         "contracts/**",
+        "native/macos-keychain/contract.js",
         "native/windows-filesystem/build/Release/windows_filesystem.node",
         "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
         "schemas/**",

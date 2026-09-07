@@ -80,6 +80,10 @@ export function createAccountlessContributionScheduler({
               || result.chunksUploaded < 0 || result.chunksUploaded > 2000))) {
           throw Object.assign(new Error("Contribution result unavailable"), { retryable: true });
         }
+        if (result?.failure?.code === "credential_recovery_required") {
+          publish("recovery_required");
+          return status;
+        }
         if (result?.failure?.deviceUnavailable === true
             || result?.failure?.retryable === false) {
           publish("paused");
