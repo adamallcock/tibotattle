@@ -2,18 +2,20 @@
 title: Historical per-model allowance reconstruction
 date: 2026-09-06
 type: plan
-status: locally-qualified
+status: deployment-authorized
 ---
 
 # Scope and acceptance
 
-Local implementation is complete at `e35008d5`; production application and
-live backfill verification remain separate, unperformed gates.
+Local implementation is complete at `e35008d5`. On 2026-09-06 the owner
+authorized applying migration 0048 and deploying the updated Worker, followed
+by live backfill verification. Those operational gates remain unperformed.
 
 The owner requested historical per-model points alongside the existing plan
 history. Work starts from the completed hosted repair at `e9c56452` in an
-isolated branch. This change does not authorize production migration application
-or deployment, change contribution consent, or touch desktop release artifacts.
+isolated branch. The authorization covers only this migration, its guarded
+Worker deployment and verification. It does not change contribution consent,
+enable v1.1, or touch desktop release artifacts.
 
 Keep the existing model fitting and identification rules, Pro 20x normalization,
 and unavailable values. Do not repeat today's vector across historical dates.
@@ -110,7 +112,7 @@ corpus cost, progress or completion.
 # Deployment boundary
 
 Migration 0048 and the updated Worker must be applied/deployed together through
-the normal guarded production lane, after separate owner authorization. Do not
+the normal guarded production lane under the separate owner authorization. Do not
 rewrite a published tag, merge unrelated release work, change contribution
 consent, enable v1.1, or regenerate desktop evidence for this change.
 
