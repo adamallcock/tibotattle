@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-07
 type: status
 status: current
-source_commit: 0207a3c1f728ae6682d4423cf31540f72cc4d19c
+source_commit: a4f4da50edf35d29ef06bb2bd629e9dcd7c4a7f3
 observation_date: 2026-09-07
 ---
 
@@ -39,7 +39,35 @@ store fields unset. GitHub's immutable release/asset attestations are not
 substitutes for SLSA build provenance. Follow
 [verify-release.md](./verify-release.md) for independent artifact verification.
 
-## Hosted service and current graph incident
+## Hosted service and community graphs
+
+### Verified public graph state
+
+On 2026-09-07 the guarded deployment published
+`a4f4da50edf35d29ef06bb2bd629e9dcd7c4a7f3`. Independent health, public response
+validation and rendered Chrome checks confirm Aggregate, By plan, and By model
+views on [the public website](https://tibotattle.com/), including Astra. Expanded
+and inline selections stay synchronized; all comparisons use the same Pro 20x
+weekly reference basis. See the
+[deployment receipt](./receipts/2026-09-07-public-allowance-views-deployment.md).
+
+The inspected public cache supplied 69 closed-date breakdown rows. Identified
+GPT-5.5 and GPT-5.6 history covered September 2–6; Astra covered September 5–6.
+Earlier missing/unstable model estimates remain gaps. This establishes real
+public history and working views, not unlimited retrospective coverage or a
+provider-authoritative allowance. The owner explicitly approved small-sample
+dollar estimates and counts, including one account; the page explains the
+associated capacity-inference risk while excluding account identifiers and
+private admin diagnostics.
+
+The activity graph still measures all tokens. Its live spend card explicitly
+labels the priced portion: USD 100,671.8 across 279 of 318 shared days at this
+observation, not complete historical spend. Both 0.1.18 Mac downloads, exact
+asset bytes, private-route isolation and social-image metadata passed independent
+checks. No migrations, telemetry rewrites, consent changes, v1.1 activation,
+desktop rebuilds or updater changes accompanied this feature deployment.
+
+### Recovery history and retained qualification boundaries
 
 All approved forward migrations `0042`–`0045` are applied. Exact migration
 prefix 45, complete schema and the preservation reconciliation were verified
@@ -64,18 +92,18 @@ At 15:48 UTC on 2026-09-06, source
 allowance-reconstruction pause. Normal pre/post health and source checks
 passed; the approved emergency health exception was not used. Natural
 scheduled runs completed essential maintenance without exceptions, and the
-authenticated Operations view recovered. The allowance graph remains a
+authenticated Operations view recovered. The allowance graph was still a
 separate, unfinished recovery gate.
 
 The [restartable calculator replacement](./decisions/2026-09-06-hosted-calculator-recovery.md)
 deployed as `91171029fb5a16255502b380677fac27df18a70a`, with exact source
 confirmed at 19:00 UTC on 2026-09-06. Approved migrations `0046`–`0047` are
 applied and verified; the normal guarded deployment passed with no health
-exception. The lookup backfill has completed, and natural scheduled runs are
-advancing restartable calculations without exceptions. The authenticated
-Operations view loads. The main allowance graph remains unavailable while fresh
-caches and historical publications rebuild: this is
-verified deployment and progress, not completed graph recovery. See the
+exception. The lookup backfill had completed, and natural scheduled runs were
+advancing restartable calculations without exceptions at that observation. The
+authenticated Operations view loaded. The main allowance graph was unavailable
+while fresh caches and historical publications rebuilt: that receipt established
+deployment and progress, not completed graph recovery. See the
 [deployment receipt](./receipts/2026-09-06-hosted-calculator-deployment.md).
 
 The two root R7 evidence checks are stale after the shared-library change.
@@ -117,10 +145,11 @@ later scheduled run was canceled without a recorded exception. Its ordinary
 maintenance lease expired and natural schedules resumed successfully; the
 00:38 UTC read confirmed no held lease and 11 complete current-account heads,
 with four still acquiring. No lease override was used. Historical checkpoint,
-day-publication and rendered-series verification remain open.
-The public all-token activity chart renders 317 days and labels USD 101,954.04
-as the priced portion across 262 of them; the separate public allowance graph
-still reports that merged history is updating.
+day-publication and rendered-series verification were open at that observation.
+The public all-token activity chart then rendered 317 days and labeled USD
+101,954.04 as the priced portion across 262 of them; the separate public allowance
+graph reported that merged history was updating. The verified public graph state
+above supersedes those earlier availability and coverage observations.
 
 The existing dated social preview was temporarily retained to prioritize the
 verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;
