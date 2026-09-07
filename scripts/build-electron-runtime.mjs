@@ -59,6 +59,7 @@ import {
 import {
   canonicalElectronBuilderPackageJsonBytes,
   ELECTRON_BUILDER_PACKAGE_PROFILES,
+  validateProductionDistributionMetadata,
 } from "./lib/electron-builder-package-json.mjs";
 import { extractEsmImports } from "./lib/esm-imports.mjs";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
@@ -72,6 +73,9 @@ const MAXIMUM_MANIFEST_BYTES = 1 * 1024 * 1024;
 const DEFAULT_PACKAGING_PROFILE = "development";
 const DEFAULT_TARGET = "darwin-arm64";
 const STAGED_ELECTRON_MODULE_LINKAGE_TIMEOUT_MS = 10_000;
+const ELECTRON_RUNTIME_ONLY_DYNAMIC_IMPORTS = new Set([
+  "electron",
+]);
 const DARWIN_ARM64_TARGET = "darwin-arm64";
 const DARWIN_X64_TARGET = "darwin-x64";
 const WINDOWS_X64_TARGET = "win32-x64";
@@ -128,6 +132,29 @@ export const ELECTRON_KEYTAR_PREBUILD_SHA256 = Object.freeze({
   "win32-x64": "b82625e7c713fd20b5cb57993e073076c87660652202893fad39d874d77169fc",
   "linux-x64": "e7894a1e1001764de29ff08d3dae418ccbaaf78889c5673d367e05df1682fc7c",
 });
+// electron-updater shares the Electron-shell dependency closure in every
+// profile. Development still cannot activate it: production metadata and the
+// packaged-app gate are checked before the wrapper accepts an updater object.
+// Pin its complete JavaScript closure so a lockfile or semver range update
+// cannot silently change the bytes available to the production path.
+export const ELECTRON_UPDATER_RUNTIME_PACKAGE_PINS = Object.freeze({
+  "electron-updater": Object.freeze({ version: "6.8.9", treeDigest: "a0af15bd47e92fc55adcb9090f1194123c0061b6e68ec05aeb8c870d11cd967d" }),
+  "fs-extra": Object.freeze({ version: "10.1.0", treeDigest: "6f25f07c6627d8c90d74f98484d7826976b8466ec63214c9d8ad6de45ad7a2e1" }),
+  "graceful-fs": Object.freeze({ version: "4.2.11", treeDigest: "50be26497cde8fa218ef0972211226e0875a2d92215503f359bbf1f5f74f7029" }),
+  jsonfile: Object.freeze({ version: "6.2.1", treeDigest: "f1539bed75ece7992551b1a0455407ebf20c0db7c789c2fde48d240582bbe3bc" }),
+  universalify: Object.freeze({ version: "2.0.1", treeDigest: "4a7ddf63a214114d9464731e81bc668a74ee6bf7aceb8727fe7fe40b7d96e770" }),
+  "js-yaml": Object.freeze({ version: "4.3.2", treeDigest: "5f599dde104457d922f7a9f6407171ce24c7571a673821a147c3e080e0ea00ed" }),
+  argparse: Object.freeze({ version: "2.0.1", treeDigest: "1444dc2abbede4a7da787c6bc5f76f5b1dee7da6bf4c439d65a9c7b1ca8b26e9" }),
+  "lazy-val": Object.freeze({ version: "1.0.5", treeDigest: "c04e8c581f2ebe64f03e2285387903e9e262f6272c5c3b0a277bd130d59acb5c" }),
+  "lodash.escaperegexp": Object.freeze({ version: "4.1.2", treeDigest: "fab738661a8b04c7d9031603b620d2ca44721f330c0a9034a450691dde772508" }),
+  "lodash.isequal": Object.freeze({ version: "4.5.0", treeDigest: "61917e555449da3087c982b809f8692172bd0ba4fe4e5f4e622cd85bc5c82674" }),
+  semver: Object.freeze({ version: "7.7.4", treeDigest: "544f5cd6a26320479db1d49616fc92e77d0ef314d8fbe1695e608a3b87dd4bf2" }),
+  "tiny-typed-emitter": Object.freeze({ version: "2.1.0", treeDigest: "831a3e7981d9ee9cc57e53193d80874ddaa44b4dc56c5ee743d17f23ffaa7008" }),
+  "builder-util-runtime": Object.freeze({ version: "9.7.0", treeDigest: "af3dc063ecb635713de7c3f6ba31dd6b12d81bdcb1ee801fcb120564356c5c65" }),
+  debug: Object.freeze({ version: "4.4.3", treeDigest: "08a42db71c877d8571d319974cdc7be35cf7f2838401b4b85c9916c659bf8b0b" }),
+  ms: Object.freeze({ version: "2.1.3", treeDigest: "1b61283cc0533e5f326e9459a3dae42765bd4567878e880df697c66ac24490fe" }),
+  sax: Object.freeze({ version: "1.6.1", treeDigest: "616cded19b800467ab721b4c766a54829d701b975cee2e4e59e9844081b875cf" }),
+});
 const WINDOWS_BINDING_RELATIVE_PATH =
   "native/windows-filesystem/build/Release/windows_filesystem.node";
 const WINDOWS_MANIFEST_RELATIVE_PATH =
@@ -139,6 +166,7 @@ const NATIVE_PATH_MODULE = Object.freeze({
   sep,
 });
 export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
+  "config/electron-production-distribution.cjs",
   "config/deployment-endpoints.js",
   "apps/electron/companion-supervisor.js",
   "apps/electron/desktop-automatic-refresh-cadence.js",
@@ -158,6 +186,8 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/desktop-owned-downloads.js",
   "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
+  "apps/electron/desktop-native-migration.js",
+  "apps/electron/desktop-native-migration-macos.js",
   "apps/electron/desktop-notification-coordinator.js",
   "apps/electron/desktop-notification-delivery.js",
   "apps/electron/desktop-notification-policy.js",
@@ -171,6 +201,8 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/desktop-tray-popover.js",
   "apps/electron/desktop-status-monitor.js",
   "apps/electron/desktop-tray-status.js",
+  "apps/electron/desktop-update-preferences.js",
+  "apps/electron/desktop-updater.js",
   "apps/electron/errors.js",
   "apps/electron/loopback-policy.js",
   "apps/electron/main.js",
@@ -665,7 +697,9 @@ function stagedBarePackageManifest(stagingRoot, specifier) {
  * source file or direct package cannot be masked by a checkout ancestor.
  * Electron itself remains an explicit runtime-only dynamic import.
  */
-export async function assertStagedElectronShellModuleLinkage(stagingRoot) {
+export async function assertStagedElectronShellModuleLinkage(
+  stagingRoot,
+) {
   if (typeof stagingRoot !== "string" || !isAbsolute(stagingRoot)) {
     failStagedElectronModuleLinkage();
   }
@@ -705,7 +739,8 @@ export async function assertStagedElectronShellModuleLinkage(stagingRoot) {
           resolve(dirname(importer), specifier),
         ));
       } else if (!specifier.startsWith("node:")
-          && !(kind === "dynamic-import" && specifier === "electron")) {
+          && !(kind === "dynamic-import"
+            && ELECTRON_RUNTIME_ONLY_DYNAMIC_IMPORTS.has(specifier))) {
         await stagedElectronModuleFile(root, stagedBarePackageManifest(root, specifier));
       }
     }
@@ -780,8 +815,8 @@ async function importStagedElectronMain(stagingRoot) {
  * temporary root. The entrypoint's Electron guard prevents a desktop launch;
  * no target-native binding is imported by this ESM-only check.
  */
-export async function assertStagedElectronShellNodeLinkage(stagingRoot) {
-  await assertStagedElectronShellModuleLinkage(stagingRoot);
+export async function assertStagedElectronShellNodeLinkage(stagingRoot, options) {
+  await assertStagedElectronShellModuleLinkage(stagingRoot, options);
   const isolatedParent = await mkdtemp(join(tmpdir(), "tibotattle-electron-linkage-"));
   const isolatedRuntime = join(isolatedParent, "app");
   try {
@@ -923,7 +958,65 @@ export async function pinnedElectronKeytarPackage(packagePath) {
   });
 }
 
-async function resolveThirdPartyPackages(repositoryRoot, target) {
+async function pinnedElectronUpdaterRuntimePackage(name, packagePath) {
+  const expected = ELECTRON_UPDATER_RUNTIME_PACKAGE_PINS[name];
+  if (!expected) fail("UPDATER_PACKAGE_MISMATCH", "Updater runtime package is not reviewed");
+  const canonicalPath = await realpath(packagePath);
+  const captured = await captureRegularFile(canonicalPath, "Electron updater package manifest", {
+    maximumBytes: MAXIMUM_MANIFEST_BYTES,
+  });
+  let manifest;
+  try {
+    manifest = JSON.parse(captured.bytes.toString("utf8"));
+  } catch {
+    fail("UPDATER_PACKAGE_MISMATCH", "Updater runtime package manifest is invalid");
+  }
+  const root = dirname(canonicalPath);
+  const treeDigest = await pinnedPackageTreeDigest(root);
+  if (manifest?.name !== name || manifest?.version !== expected.version
+      || treeDigest !== expected.treeDigest) {
+    fail("UPDATER_PACKAGE_MISMATCH", "Updater runtime package does not match its reviewed pin");
+  }
+  return Object.freeze({
+    dependencies: Object.freeze(Object.keys(manifest.dependencies ?? {}).sort(comparePathBytes)),
+    name,
+    root,
+    version: expected.version,
+  });
+}
+
+async function resolveElectronUpdaterRuntimePackages(rootRequire) {
+  const visited = new Map();
+  async function visit(name, resolver) {
+    const packagePath = resolver.resolve(`${name}/package.json`);
+    const resolved = await pinnedElectronUpdaterRuntimePackage(name, packagePath);
+    const previous = visited.get(name);
+    if (previous !== undefined) {
+      if (previous.root !== resolved.root) {
+        fail("UPDATER_PACKAGE_MISMATCH", "Updater runtime resolves multiple package copies");
+      }
+      return;
+    }
+    visited.set(name, resolved);
+    const packageRequire = createRequire(packagePath);
+    for (const dependency of resolved.dependencies) await visit(dependency, packageRequire);
+  }
+  await visit("electron-updater", rootRequire);
+  const actual = [...visited.keys()].sort(comparePathBytes);
+  const expected = Object.keys(ELECTRON_UPDATER_RUNTIME_PACKAGE_PINS).sort(comparePathBytes);
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+    fail("UPDATER_PACKAGE_MISMATCH", "Updater runtime dependency closure changed");
+  }
+  return Object.freeze([...visited.values()].sort((left, right) => (
+    comparePathBytes(left.name, right.name)
+  )));
+}
+
+async function resolveThirdPartyPackages(
+  repositoryRoot,
+  target,
+  { includeElectronUpdater = false } = {},
+) {
   const rootRequire = createRequire(join(repositoryRoot, "package.json"));
   const ajvPackage = rootRequire.resolve("ajv/package.json");
   const ajvRoot = dirname(ajvPackage);
@@ -964,6 +1057,9 @@ async function resolveThirdPartyPackages(repositoryRoot, target) {
   if (keytarPrebuild.sha256 !== ELECTRON_KEYTAR_PREBUILD_SHA256[keytarArchitecture]) {
     fail("NATIVE_PACKAGE_MISMATCH", "Electron Keytar prebuild bytes are not pinned");
   }
+  const updater = includeElectronUpdater
+    ? await resolveElectronUpdaterRuntimePackages(rootRequire)
+    : Object.freeze([]);
   return Object.freeze({
     ajv: { name: "ajv", root: ajvRoot, pin: ajv },
     keytar: {
@@ -975,6 +1071,7 @@ async function resolveThirdPartyPackages(repositoryRoot, target) {
     },
     runcost: { name: "runcost", root: runcostRoot, pin: runcost },
     transitive: Object.freeze(transitive),
+    updater,
   });
 }
 
@@ -1028,6 +1125,15 @@ async function stageThirdPartyPackages({ stagingRoot, packages, packageJsonOptio
   ].sort(comparePathBytes);
   if (JSON.stringify(actualKeytarFiles) !== JSON.stringify(expectedKeytarFiles)) {
     fail("PACKAGE_CLOSURE", "Keytar runtime must remain direct-native-only");
+  }
+  for (const packageInfo of packages.updater) {
+    staged.push(...await stagePackageFiles({
+      stagingRoot,
+      name: packageInfo.name,
+      packageRoot: packageInfo.root,
+      packageJsonOptions,
+      include: packageRuntimeFile,
+    }));
   }
   return staged;
 }
@@ -1397,6 +1503,7 @@ export async function buildElectronRuntime({
   includeElectronShell = false,
   packagingProfile = DEFAULT_PACKAGING_PROFILE,
   packageVersion = RELEASE_VERSION,
+  distributionMetadata,
 } = {}) {
   if (typeof includeElectronShell !== "boolean") {
     fail("INVALID_SHELL_MODE", "includeElectronShell must be a boolean");
@@ -1413,9 +1520,32 @@ export async function buildElectronRuntime({
       "The Windows production profile requires a Windows Electron shell build",
     );
   }
+  let selectedDistributionMetadata;
+  if (selectedPackagingProfile === "production") {
+    if (!includeElectronShell) {
+      fail(
+        "PACKAGING_PROFILE_TARGET",
+        "The production profile requires an Electron shell build",
+      );
+    }
+    try {
+      selectedDistributionMetadata = validateProductionDistributionMetadata(distributionMetadata);
+    } catch {
+      fail("PRODUCTION_DISTRIBUTION", "Production distribution metadata is invalid");
+    }
+    const metadataTarget = selectedDistributionMetadata.target;
+    if (metadataTarget !== selectedTarget) {
+      fail("PRODUCTION_DISTRIBUTION", "Production distribution target does not match staging");
+    }
+  } else if (distributionMetadata !== undefined) {
+    fail("PRODUCTION_DISTRIBUTION", "Distribution metadata requires the production profile");
+  }
   const selectedPackageVersion = normalizePackageVersion(packageVersion);
   const packageJsonOptions = includeElectronShell
     ? Object.freeze({
+      ...(selectedDistributionMetadata
+        ? { distributionMetadata: selectedDistributionMetadata }
+        : {}),
       packageVersion: selectedPackageVersion,
       profile: selectedPackagingProfile,
     })
@@ -1489,7 +1619,9 @@ export async function buildElectronRuntime({
       captures,
       packageJsonOptions,
     }));
-    const packages = await resolveThirdPartyPackages(REPOSITORY_ROOT, selectedTarget);
+    const packages = await resolveThirdPartyPackages(REPOSITORY_ROOT, selectedTarget, {
+      includeElectronUpdater: includeElectronShell,
+    });
     staged.push(...await stageThirdPartyPackages({
       stagingRoot: temporaryRoot,
       packages,
@@ -1536,7 +1668,9 @@ export async function buildElectronRuntime({
       });
     }
 
-    if (includeElectronShell) await assertStagedElectronShellNodeLinkage(temporaryRoot);
+    if (includeElectronShell) {
+      await assertStagedElectronShellNodeLinkage(temporaryRoot);
+    }
 
     const inventory = await collectInventory(temporaryRoot);
     if (windowsBinding.included) {

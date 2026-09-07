@@ -50,6 +50,8 @@ import {
 } from "./desktop-notification-coordinator.js";
 import { createDesktopNotificationDelivery } from "./desktop-notification-delivery.js";
 import { shellError } from "./errors.js";
+import { createProductionDesktopUpdater, validateProductionDistributionMetadata } from "./desktop-updater.js";
+import { createDesktopUpdatePreferences, createDesktopUpdatePreferencesBackend } from "./desktop-update-preferences.js";
 import {
   createWindowsFilesystemAdapter,
   createWindowsProtectedStateStore,
@@ -295,6 +297,7 @@ function runtimePlatformServices({
   platform,
   homeDirectory,
   environment,
+  getUpdater,
 }) {
   // Electron always supplies these modules in a real launch.  The bounded
   // fallback keeps the plain-Node composition tests independent of Electron;
@@ -316,6 +319,7 @@ function runtimePlatformServices({
     platform,
     homeDirectory,
     environment,
+    getUpdater,
   });
 }
 
@@ -393,6 +397,9 @@ export async function launchDesktopRuntime({
   automaticRefreshCadence,
   argv,
   accountlessLaboratory,
+  accountlessProduction,
+  productionDistribution,
+  prepareNativeHandover,
 } = {}) {
   assertObject(runtime, "runtime");
   if (!app || typeof app.on !== "function") throw new TypeError("app is required");
@@ -405,8 +412,7 @@ export async function launchDesktopRuntime({
   }
   assertObject(environment, "environment");
   // Test-only loopback composition. Normal main.js does not provide this port.
-  // Hosted activation is deliberately absent until the exact payload and
-  // destination have completed their separate approval/release gate.
+  // Production is a separate packaged-manifest selection below.
   if (accountlessLaboratory !== undefined) {
     let url;
     try { url = new URL(accountlessLaboratory.origin); } catch { throw shellError("electron_configuration_invalid"); }
@@ -422,6 +428,29 @@ export async function launchDesktopRuntime({
         || environment.USAGE_MONITOR_TEST_LANE !== "accountless-local-lab-v1"
         || sharingBackend === undefined || sharingInstallationState === undefined
         || qualificationContext !== null) throw shellError("electron_configuration_invalid");
+  }
+  if (accountlessProduction !== undefined && (
+    accountlessProduction === null || typeof accountlessProduction !== "object"
+      || Array.isArray(accountlessProduction)
+      || Object.keys(accountlessProduction).sort().join(",") !== "origin,policyVersion"
+      || accountlessProduction.origin !== DEPLOYMENT_ENDPOINTS.public.origin
+      || accountlessProduction.policyVersion !== "accountless-opt-out-v1"
+      || accountlessLaboratory !== undefined || app.isPackaged !== true
+      || app.getName?.() !== "TiboTattle"
+      || environment.USAGE_MONITOR_TEST_LANE !== undefined
+      || qualificationContext !== null)) throw shellError("electron_configuration_invalid");
+  const accountlessEnabled = accountlessLaboratory !== undefined || accountlessProduction !== undefined;
+  if (productionDistribution !== undefined) {
+    validateProductionDistributionMetadata(productionDistribution, { platform, architecture });
+    if (app.isPackaged !== true || app.getName?.() !== "TiboTattle"
+        || environment.USAGE_MONITOR_TEST_LANE !== undefined
+        || qualificationContext !== null || platformServices !== undefined) {
+      throw shellError("electron_configuration_invalid");
+    }
+  }
+  if (prepareNativeHandover !== undefined && (typeof prepareNativeHandover !== "function"
+      || productionDistribution === undefined || platform !== "darwin")) {
+    throw shellError("electron_configuration_invalid");
   }
   assertObject(supervisorOptions, "supervisorOptions");
   assertObject(lifecycleOptions, "lifecycleOptions");
@@ -447,16 +476,24 @@ export async function launchDesktopRuntime({
     throw new TypeError("BrowserWindow is required");
   }
   const childEnvironment = childEnvironmentWithStateRoot({ app, environment });
-  const sharingDestinationOrigin = accountlessLaboratory?.origin ?? childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN
+  if (productionDistribution !== undefined) {
+    childEnvironment.USAGE_MONITOR_STATE_ROOT = join(userDataPath(app), "companion-state");
+  }
+  const sharingDestinationOrigin = accountlessProduction?.origin ?? accountlessLaboratory?.origin ?? childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN
     ?? DEPLOYMENT_ENDPOINTS.public.origin;
-  // The accountless candidate has no upload authority yet. Do not let an old
-  // participant scheduler bypass its new opt-out or fall back to social login.
+  // Never run the legacy scheduler beside the installation policy. The
+  // selected accountless mode still requires current server upload authority.
   // Local provider capture and offline analysis remain independently available.
   delete childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN;
   delete childEnvironment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN;
+  delete childEnvironment.USAGE_MONITOR_ACCOUNTLESS_MODE;
   if (accountlessLaboratory) childEnvironment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN = accountlessLaboratory.origin;
+  if (accountlessProduction) {
+    childEnvironment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN = accountlessProduction.origin;
+    childEnvironment.USAGE_MONITOR_ACCOUNTLESS_MODE = "production-v1";
+  }
   let sharingCoordinator;
-  let laboratoryCredentialBackend;
+  let installationCredentialBackend;
   // Keep one mutable argument vector for the lifetime of this runtime. The
   // supervisor snapshots it for each spawn, so a Settings root change can
   // persist first, update this vector, and then use the ordinary bounded
@@ -479,19 +516,21 @@ export async function launchDesktopRuntime({
     args: companionArgs,
     cwd: paths.companionCwd,
     environment: childEnvironment,
-    attachPrivateChannel: accountlessLaboratory ? (channel) => attachAccountlessParentChannel({
+    attachPrivateChannel: accountlessEnabled ? (channel) => attachAccountlessParentChannel({
       channel,
       readPreference: () => sharingCoordinator.readAuthorization(),
-      backend: laboratoryCredentialBackend,
+      backend: installationCredentialBackend,
       onStatus: (value) => sharingCoordinator.updateTransport?.(value),
     }) : undefined,
   });
+  let updater = null;
   const services = platformServices ?? runtimePlatformServices({
     runtime,
     app,
     platform,
     homeDirectory: runtimeHomeDirectory({ platform, environment }),
     environment,
+    getUpdater: () => updater,
   });
   const requestedDesktopSystemLocales = lifecycleOptions.desktopSystemLocales;
   const firstRunLocale = lifecycleOptions.desktopLocale ?? "system";
@@ -567,6 +606,29 @@ export async function launchDesktopRuntime({
   // Electron's native dialog must be shown only after the app is ready. This
   // does not start the companion, register a login item, or enable updates.
   await app.whenReady?.();
+  if (prepareNativeHandover !== undefined) {
+    let handover;
+    try {
+      handover = await prepareNativeHandover({
+        homeDirectory: runtimeHomeDirectory({ platform, environment }),
+      });
+    } catch {
+      handover = { status: "migration_blocked" };
+    }
+    if (!["no_legacy_state", "migrated", "already_migrated"].includes(handover?.status)) {
+      await runtime.dialog?.showMessageBox?.({
+        type: "warning", title: "Finish moving to TiboTattle",
+        message: "Your Mac app data needs to be transferred before TiboTattle can start.",
+        detail: "Run the guided migration again. Your existing data has been preserved.",
+        buttons: ["Quit"], defaultId: 0, cancelId: 0, noLink: true,
+      });
+      deepLinkIntakeCleanup();
+      app.quit?.();
+      return Object.freeze({ status: "native_handover_blocked", firstRun: null,
+        lifecycle: null, supervisor: null, controller: null, settingsStore: null,
+        settingsBackend: null, ipc: createNoopIpcInstallation(), childEnvironment: null });
+    }
+  }
   const desktopSystemLocales = requestedDesktopSystemLocales
     ?? electronSystemLocales(app);
   const settingsRootPath = join(userDataPath(app), DESKTOP_SETTINGS_DIRECTORY);
@@ -598,11 +660,10 @@ export async function launchDesktopRuntime({
       rootPath: settingsRootPath,
     })
     : null;
-  // Construct the adapter only after Electron readiness and only for the
-  // explicitly injected loopback laboratory. The normal launcher never
-  // enters this path, and unavailable encryption cannot authorize a send.
-  if (accountlessLaboratory) {
-    laboratoryCredentialBackend = accountlessLaboratory.backend
+  // Native encryption must be ready before the owned companion can request
+  // the installation credential. Unavailable encryption cannot authorize a send.
+  if (accountlessEnabled) {
+    installationCredentialBackend = accountlessLaboratory?.backend
       ?? createDesktopContributionCredentialBackend({
         safeStorage: runtime.safeStorage,
         platform,
@@ -1049,6 +1110,7 @@ export async function launchDesktopRuntime({
     cleanupPromise = (async () => {
       removeNativeThemeListener();
       removeNativeThemeListener = () => {};
+      updater?.dispose();
       ipcInstallation.dispose?.();
       sharingCoordinator.dispose();
       await controller.dispose();
@@ -1135,6 +1197,24 @@ export async function launchDesktopRuntime({
       };
     }
     await lifecycle.start();
+    if (productionDistribution !== undefined) {
+      // Load the third-party native updater only in the selected production
+      // package, after Electron readiness and ownership of the child lifecycle.
+      const updaterModule = runtime.autoUpdater ? null : await import("electron-updater");
+      const autoUpdater = runtime.autoUpdater ?? updaterModule.autoUpdater ?? updaterModule.default?.autoUpdater;
+      updater = createProductionDesktopUpdater({
+        app, autoUpdater, distributionMetadata: productionDistribution,
+        platform, architecture,
+        preferences: createDesktopUpdatePreferences({
+          backend: createDesktopUpdatePreferencesBackend({
+            platform, rootPath: settingsRootPath, windowsProtectedStateStore,
+          }),
+        }),
+        prepareForUpdate: () => lifecycle.prepareForUpdate(),
+        cancelPreparedUpdate: () => lifecycle.cancelUpdatePreparation(),
+      });
+      await updater.start();
+    }
   } catch (error) {
     deepLinkIntakeCleanup();
     await disposeControllerAndIpc();

@@ -100,6 +100,7 @@ export async function buildElectronApp({
   windowsManifestPath,
   packagingProfile,
   packageVersion,
+  distributionMetadata,
 } = {}) {
   const selectedTarget = normalizeElectronTarget(target);
   const selectedPackagingProfile = normalizePackagingProfile(packagingProfile);
@@ -118,6 +119,7 @@ export async function buildElectronApp({
     includeElectronShell: true,
     packagingProfile: selectedPackagingProfile,
     packageVersion,
+    distributionMetadata,
     ...(windowsInputs ?? {}),
   });
 }

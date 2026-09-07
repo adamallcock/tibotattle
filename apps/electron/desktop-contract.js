@@ -96,6 +96,9 @@ export const DESKTOP_ACTIONS = Object.freeze([
   "openHostedSignIn",
   "openCodexThread",
   "checkForUpdates",
+  "downloadUpdate",
+  "installUpdateAndRestart",
+  "setAutomaticDownload",
   "revealLatestDownload",
   "openDashboardInBrowser",
   "showDiagnostics",
@@ -130,6 +133,9 @@ const ACTION_ARGUMENT_KEYS = Object.freeze({
   openHostedSignIn: Object.freeze(["authorizeUrl"]),
   openCodexThread: Object.freeze(["url"]),
   checkForUpdates: Object.freeze([]),
+  downloadUpdate: Object.freeze([]),
+  installUpdateAndRestart: Object.freeze([]),
+  setAutomaticDownload: Object.freeze(["enabled"]),
   revealLatestDownload: Object.freeze([]),
   openDashboardInBrowser: Object.freeze([]),
   showDiagnostics: Object.freeze([]),
@@ -251,6 +257,7 @@ export function validateDesktopRequest(request) {
       break;
     case "setStartAtLogin":
     case "setSharingEnabled":
+    case "setAutomaticDownload":
       assertBoolean(args.enabled, "enabled");
       break;
     case "sharingNoticePresented":

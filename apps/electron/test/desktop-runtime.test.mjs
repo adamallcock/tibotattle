@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import { DESKTOP_DEFAULT_SETTINGS } from "../desktop-contract.js";
 import { DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION } from "../desktop-first-run.js";
 import { launchDesktopRuntime } from "../desktop-runtime.js";
+import { createProductionDistributionMetadata } from "../desktop-updater.js";
 import {
   DESKTOP_SHELL_NOTIFICATION_EVIDENCE_SCHEMA_VERSION,
   DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
@@ -312,6 +313,9 @@ async function launchFixture({
   runtimeOverrides = {},
   lifecycleOptions = {},
   accountlessLaboratory,
+  accountlessProduction,
+  productionDistribution,
+  prepareNativeHandover,
   sharingBackend,
   sharingInstallationState,
   ownedCompanionScript,
@@ -336,13 +340,16 @@ async function launchFixture({
       preloadPath: "/repo/apps/electron/preload.cjs",
     },
     environment,
-    platformServices: suppliedPlatformServices ?? platformServices(),
+    platformServices: suppliedPlatformServices ?? (productionDistribution ? undefined : platformServices()),
     notificationBackend,
     firstRunReceiptBackend,
     platform,
     argv,
     lifecycleOptions,
     accountlessLaboratory,
+    accountlessProduction,
+    productionDistribution,
+    prepareNativeHandover,
     sharingBackend,
     sharingInstallationState,
     settingsBackend: backend,
@@ -351,6 +358,9 @@ async function launchFixture({
         spawnCalls.push({ args: [...args], options });
         const child = ownedCompanionScript ? spawn(_command, args, options) : new FakeChild();
         children.push(child);
+        if (productionDistribution && !ownedCompanionScript) queueMicrotask(() => {
+          child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4811/\n"));
+        });
         return child;
       },
       startupTimeoutMs: ownedCompanionScript ? 5_000 : 1_000,
@@ -362,7 +372,7 @@ async function launchFixture({
   // can return its outer promise to the test.
   launch.catch(() => {});
   await new Promise((resolve) => setImmediate(resolve));
-  if (!ownedCompanionScript) children[0]?.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4811/\n"));
+  if (!ownedCompanionScript && !productionDistribution) children[0]?.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4811/\n"));
   const desktop = await launch;
   return { app, children, spawnCalls, desktop };
 }
@@ -376,6 +386,120 @@ test("normal desktop cannot enable accountless uploads through environment varia
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, undefined);
   assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
   await fixture.desktop.lifecycle.requestQuit();
+});
+
+test("macOS production runtime connects updater controls to protected preferences and owned-child shutdown", {
+  skip: process.platform === "win32" ? "Exercises the POSIX protected settings backend" : false,
+}, async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "production-updater-runtime-"));
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  app.getPath = () => profile;
+  app.getVersion = () => "0.1.18";
+  const autoUpdater = new EventEmitter();
+  let checks = 0;
+  let installs = 0;
+  let rejectInstall = true;
+  let handoverCompleted = false;
+  let fixture;
+  autoUpdater.checkForUpdates = async () => {
+    checks += 1;
+    autoUpdater.emit("update-available", { version: "0.1.19" });
+    return { updateInfo: { version: "0.1.19" } };
+  };
+  autoUpdater.downloadUpdate = async () => {
+    autoUpdater.emit("update-downloaded", { version: "0.1.19" });
+    return [];
+  };
+  autoUpdater.quitAndInstall = () => {
+    assert.equal(fixture.desktop.supervisor.state.hasChild, false);
+    assert.equal(app.quitCalls, 0);
+    installs += 1;
+    if (rejectInstall) throw new Error("synthetic installer handover failure");
+  };
+  t.after(async () => {
+    await fixture?.desktop.lifecycle.requestQuit();
+    await rm(profile, { recursive: true, force: true });
+  });
+  fixture = await launchFixture({ app, load: async () => {
+    assert.equal(handoverCompleted, true);
+    return null;
+  },
+    environment: { HOME: profile },
+    runtimeOverrides: { autoUpdater, dialog: {
+      showMessageBox: async () => ({ response: 0 }),
+      showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+    } },
+    productionDistribution: createProductionDistributionMetadata({
+      target: `darwin-${process.arch}`, sourceRevision: "a".repeat(40), buildNumber: "20260906",
+    }),
+    prepareNativeHandover: async () => {
+      assert.equal(app.ready, true);
+      handoverCompleted = true;
+      return { status: "already_migrated" };
+    },
+  });
+  assert.equal(autoUpdater.autoInstallOnAppQuit, false);
+  assert.equal(autoUpdater.autoDownload, true);
+  await fixture.desktop.controller.handlers.setAutomaticDownload({ enabled: false });
+  assert.equal(autoUpdater.autoDownload, false);
+  const saved = JSON.parse(await readFile(join(profile, "desktop-settings", "update-preferences-v1.json"), "utf8"));
+  assert.equal(saved.automaticDownload, false);
+  await fixture.desktop.controller.handlers.checkForUpdates({});
+  assert.ok(checks >= 1);
+  await fixture.desktop.controller.handlers.downloadUpdate({});
+  await fixture.desktop.controller.handlers.installUpdateAndRestart({});
+  assert.equal(installs, 1);
+  assert.equal(fixture.desktop.lifecycle.state.preparingForUpdate, false);
+  assert.equal(fixture.desktop.supervisor.state.hasChild, true);
+  assert.equal(app.quitCalls, 0);
+  rejectInstall = false;
+  await fixture.desktop.controller.handlers.checkForUpdates({});
+  await fixture.desktop.controller.handlers.downloadUpdate({});
+  await fixture.desktop.controller.handlers.installUpdateAndRestart({});
+  assert.equal(installs, 2);
+  assert.equal(fixture.desktop.lifecycle.state.preparingForUpdate, true);
+  assert.equal(fixture.desktop.supervisor.state.hasChild, false);
+  assert.equal(app.quitCalls, 0);
+});
+
+test("native handover blocks before settings writes and companion start when existing data cannot move", {
+  skip: process.platform === "win32" ? "Exercises macOS handover composition" : false,
+}, async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "native-handover-runtime-"));
+  t.after(() => rm(profile, { recursive: true, force: true }));
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  app.getPath = () => profile;
+  let settingsReads = 0;
+  let settingsWrites = 0;
+  const notices = [];
+  const fixture = await launchFixture({ app,
+    load: async () => { settingsReads += 1; return null; },
+    save: async () => { settingsWrites += 1; },
+    environment: { HOME: profile },
+    runtimeOverrides: { dialog: {
+      showMessageBox: async (notice) => { notices.push(notice); return { response: 0 }; },
+      showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+    } },
+    productionDistribution: createProductionDistributionMetadata({
+      target: `darwin-${process.arch}`, sourceRevision: "b".repeat(40), buildNumber: "20260906",
+    }),
+    prepareNativeHandover: async ({ homeDirectory }) => {
+      assert.equal(app.ready, true);
+      assert.equal(app.lockCalls, 1);
+      assert.equal(homeDirectory, profile);
+      return { status: "bridge_unavailable" };
+    },
+  });
+  assert.equal(fixture.desktop.status, "native_handover_blocked");
+  assert.equal(fixture.children.length, 0);
+  assert.equal(settingsReads, 0);
+  assert.equal(settingsWrites, 0);
+  assert.equal(app.quitCalls, 1);
+  assert.match(notices[0].detail, /existing data has been preserved/u);
 });
 
 test("accountless laboratory rejects hosted destinations and absent synthetic lane", async () => {
@@ -402,11 +526,13 @@ test("accountless laboratory rejects incomplete injected credential capabilities
   }
 });
 
-test("desktop laboratory composes encrypted credentials with an owned companion and durable opt-out", async (t) => {
+for (const production of [false, true]) test(`desktop ${production ? "production" : "laboratory"} composes encrypted credentials with an owned companion and durable opt-out`, async (t) => {
   const profile = await mkdtemp(join(tmpdir(), "accountless-runtime-"));
   const launched = [];
   const app = new FakeApp();
   app.getPath = () => profile;
+  app.isPackaged = production;
+  app.getName = () => "TiboTattle";
   const key = randomBytes(32);
   t.after(async () => {
     try { await Promise.all(launched.map((fixture) => fixture.desktop.lifecycle.requestQuit())); }
@@ -438,9 +564,11 @@ test("desktop laboratory composes encrypted credentials with an owned companion 
   };
   const options = {
     app, load: async () => null, runtimeOverrides: { safeStorage },
-    environment: { HOME: profile, USAGE_MONITOR_TEST_LANE: "accountless-local-lab-v1" },
+    environment: { HOME: profile, ...(production ? {} : { USAGE_MONITOR_TEST_LANE: "accountless-local-lab-v1" }) },
     sharingBackend, sharingInstallationState: "fresh",
-    accountlessLaboratory: { origin: "http://127.0.0.1:18901" },
+    ...(production ? { accountlessProduction: {
+      origin: "https://tibotattle.com", policyVersion: "accountless-opt-out-v1",
+    } } : { accountlessLaboratory: { origin: "http://127.0.0.1:18901" } }),
     ownedCompanionScript: fileURLToPath(new URL("../../../test/fixtures/accountless-runtime-child.mjs", import.meta.url)),
   };
   const waitFor = async (predicate) => {
@@ -1183,4 +1311,23 @@ test("Windows qualification rejects injected notification persistence", async ()
     }),
     (error) => error?.code === "electron_shell_windows_qualification_launch_override_forbidden",
   );
+});
+
+
+test("production contributions reject development identity, ambient QA and conflicting destinations before readiness", async () => {
+  for (const override of [
+    { packaged: false }, { name: "TiboTattle Dev" },
+    { environment: { USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1" } },
+    { origin: "https://unreviewed.example" }, { policyVersion: "unknown" },
+  ]) {
+    const app = new FakeApp();
+    app.isPackaged = override.packaged ?? true;
+    app.getName = () => override.name ?? "TiboTattle";
+    await assert.rejects(launchFixture({ app, load: async () => null,
+      environment: override.environment ?? {},
+      accountlessProduction: { origin: override.origin ?? "https://tibotattle.com",
+        policyVersion: override.policyVersion ?? "accountless-opt-out-v1" },
+    }), { code: "electron_shell_electron_configuration_invalid" });
+    assert.equal(app.readyCalls, 0);
+  }
 });

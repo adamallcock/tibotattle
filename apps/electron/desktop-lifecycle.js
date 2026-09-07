@@ -175,6 +175,8 @@ export function createDesktopLifecycle({
   let destroyingRecoveryWindow = false;
   let settingsLoadedURL = null;
   let shutdownPromise = null;
+  let updatePreparationPromise = null;
+  let updatePreparing = false;
   let retryPromise = null;
   let automaticRetryPromise = null;
   let automaticRetryUsed = false;
@@ -1332,7 +1334,10 @@ export function createDesktopLifecycle({
       else showRecoveryWindow(startupFailureStatus ?? "starting");
     });
     listen(app, "before-quit", (event) => {
-      if (quitting) return;
+      // electron-updater owns the native installer hand-off after the
+      // companion has been stopped. Its quit must not be converted back into
+      // the ordinary app.quit() path, which would race the installer.
+      if (quitting || updatePreparing) return;
       event?.preventDefault?.();
       void requestQuit();
     });
@@ -1370,9 +1375,13 @@ export function createDesktopLifecycle({
   }
 
   function performRetry({ epoch = lifecycleEpoch } = {}) {
-    if (!lifecycleActive || quitting) return Promise.reject(shellError("companion_not_running"));
+    if (!lifecycleActive || quitting || updatePreparing) {
+      return Promise.reject(shellError("companion_not_running"));
+    }
     const operation = enqueueExclusive(async () => {
-      if (quitting || epoch !== lifecycleEpoch) throw shellError("companion_busy");
+      if (quitting || updatePreparing || epoch !== lifecycleEpoch) {
+        throw shellError("companion_busy");
+      }
       stopDesktopStatusMonitor();
       destroyTrayPopover();
       destroyWindow();
@@ -1382,9 +1391,11 @@ export function createDesktopLifecycle({
       started = false;
       try {
         await supervisor.stop();
-        if (quitting || epoch !== lifecycleEpoch) throw shellError("companion_busy");
+        if (quitting || updatePreparing || epoch !== lifecycleEpoch) {
+          throw shellError("companion_busy");
+        }
         ready = await supervisor.start();
-        if (quitting || epoch !== lifecycleEpoch) {
+        if (quitting || updatePreparing || epoch !== lifecycleEpoch) {
           await supervisor.stop().catch(() => {});
           ready = null;
           throw shellError("companion_busy");
@@ -1402,7 +1413,7 @@ export function createDesktopLifecycle({
         showWindow();
         return Object.freeze({ status: "ready", origin: ready.origin });
       } catch (error) {
-        if (quitting || epoch !== lifecycleEpoch) throw error;
+        if (quitting || updatePreparing || epoch !== lifecycleEpoch) throw error;
         const status = recoveryStatusFor(error);
         stopDesktopStatusMonitor();
         ready = null;
@@ -1420,7 +1431,9 @@ export function createDesktopLifecycle({
   }
 
   function retry() {
-    if (!lifecycleActive || quitting) return Promise.reject(shellError("companion_not_running"));
+    if (!lifecycleActive || quitting || updatePreparing) {
+      return Promise.reject(shellError("companion_not_running"));
+    }
     if (startupAttemptPromise !== null) return startupAttemptPromise;
     // A user-directed Retry is a new bounded recovery attempt. The automatic
     // lane itself remains capped at one restart per child failure sequence.
@@ -1435,7 +1448,8 @@ export function createDesktopLifecycle({
   }
 
   function scheduleAutomaticRetry({ status = "companion_exit_before_ready" } = {}) {
-    if (!lifecycleActive || quitting || automaticRetryUsed || automaticRetryPromise !== null) {
+    if (lifecycleActive === false || quitting || updatePreparing
+        || automaticRetryUsed || automaticRetryPromise !== null) {
       return;
     }
     automaticRetryUsed = true;
@@ -1455,7 +1469,7 @@ export function createDesktopLifecycle({
   }
 
   function handleUnexpectedCompanionExit() {
-    if (quitting) return;
+    if (quitting || updatePreparing) return;
     if (!started) {
       if (!startupInProgress) return;
       // The supervisor can report a child exit after emitting its ready line
@@ -1487,6 +1501,64 @@ export function createDesktopLifecycle({
     scheduleAutomaticRetry();
   }
 
+  /**
+   * Stop the owned companion before electron-updater transfers control to a
+   * native installer. This is intentionally not the ordinary quit path: the
+   * visible shell remains available until the updater has accepted the hand-
+   * off, and no call to app.quit() happens here.
+   */
+  async function prepareForUpdate() {
+    if (quitting) throw shellError("companion_not_running");
+    if (updatePreparationPromise !== null) return updatePreparationPromise;
+    updatePreparing = true;
+    ++lifecycleEpoch;
+    stopDesktopStatusMonitor();
+    const pendingStartup = startupAttemptPromise;
+    const preparation = enqueueExclusive(async () => {
+      // A child can be between spawn and ready when an update is selected.
+      // Wait for that bounded handshake before stop(), so it cannot outlive
+      // the installer hand-off.
+      await pendingStartup?.catch(() => {});
+      await supervisor.stop();
+      ready = null;
+      started = false;
+      startupFailureStatus = null;
+    });
+    updatePreparationPromise = preparation;
+    preparation.catch(() => {
+      if (!quitting && updatePreparationPromise === preparation) {
+        updatePreparationPromise = null;
+        updatePreparing = false;
+      }
+    });
+    return preparation;
+  }
+
+  /**
+   * An installer hand-off can fail synchronously (for example if the native
+   * updater rejects the prepared artifact). Restore the ordinary bounded
+   * companion lifecycle so a failed install never strands the visible app.
+   */
+  async function cancelUpdatePreparation() {
+    if (quitting || updatePreparationPromise === null) return false;
+    const preparation = updatePreparationPromise;
+    try {
+      await preparation;
+    } catch {
+      return false;
+    }
+    if (quitting || updatePreparationPromise !== preparation) return false;
+    updatePreparationPromise = null;
+    updatePreparing = false;
+    if (!lifecycleActive) return false;
+    try {
+      await retry();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async function requestQuit() {
     if (shutdownPromise !== null) return shutdownPromise;
     quitting = true;
@@ -1503,6 +1575,7 @@ export function createDesktopLifecycle({
       // to exit; otherwise a child that has not emitted its ready line could
       // outlive the GUI process.
       await pendingStartup?.catch(() => {});
+      await updatePreparationPromise?.catch(() => {});
       await supervisor.stop().catch(() => {});
       ownedDownloadsRegistry?.clear?.();
       tray?.destroy?.();
@@ -1515,6 +1588,7 @@ export function createDesktopLifecycle({
 
   async function dispose() {
     quitting = true;
+    updatePreparing = true;
     ++lifecycleEpoch;
     stopDesktopStatusMonitor();
     await enqueueExclusive(async () => {
@@ -1550,6 +1624,8 @@ export function createDesktopLifecycle({
     navigateDashboardSection,
     setDesktopLanguage,
     invokeTrayCommand,
+    prepareForUpdate,
+    cancelUpdatePreparation,
     requestQuit,
     openDashboardInBrowser,
     dispose,
@@ -1570,6 +1646,7 @@ export function createDesktopLifecycle({
       return Object.freeze({
         started,
         quitting,
+        preparingForUpdate: updatePreparing,
         primaryInstance,
         hasWindow: window !== null && !window.isDestroyed?.(),
         dashboardReady,

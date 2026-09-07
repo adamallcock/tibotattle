@@ -1,9 +1,12 @@
 import { dirname, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
 import { launchDesktopRuntime } from "./desktop-runtime.js";
 import { createDesktopTrayIconFactory } from "./desktop-tray.js";
+import { validateProductionDistributionMetadata } from "./desktop-updater.js";
+import { runProductionNativeMacHandover } from "./desktop-native-migration-macos.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
 import { assertElectronPlatformGate } from "./platform-gate.js";
 import {
@@ -59,6 +62,31 @@ function isPackagedElectronApp(app) {
 function packagedAppPath(app) {
   const value = app?.getAppPath?.();
   return typeof value === "string" && value.length > 0 ? resolve(value) : null;
+}
+
+/** Production policy comes only from the packaged application's own manifest. */
+export async function readProductionDistribution({
+  app,
+  platform = process.platform,
+  architecture = process.arch,
+  readManifest = readFile,
+} = {}) {
+  if (!isPackagedElectronApp(app) || app.getName?.() !== "TiboTattle") return null;
+  const appPath = packagedAppPath(app);
+  if (appPath === null) throw shellError("electron_configuration_invalid");
+  try {
+    const bytes = await readManifest(resolve(appPath, "package.json"));
+    if (!Buffer.isBuffer(bytes) || bytes.length > 1_048_576) {
+      throw new Error("Invalid packaged manifest");
+    }
+    const manifest = JSON.parse(bytes.toString("utf8"));
+    return validateProductionDistributionMetadata(manifest.tibotattleDistribution, {
+      platform,
+      architecture,
+    });
+  } catch {
+    throw shellError("electron_configuration_invalid");
+  }
 }
 
 function packagedResourcesPath(app, appPath, resourcesPath) {
@@ -490,6 +518,10 @@ export async function launchElectronShell({
       architecture: process.arch,
       qualificationContext,
     });
+    const productionDistribution = await readProductionDistribution({ app });
+    // A local-QA launch must never inherit production sending or updating.
+    const productionEnabled = productionDistribution !== null
+      && environment.USAGE_MONITOR_TEST_LANE === undefined;
     const trayIconFactory = createDesktopTrayIconFactory({
       nativeImage: runtime.nativeImage,
       resourceRoot: paths.resourceRoot,
@@ -512,7 +544,8 @@ export async function launchElectronShell({
       },
       supervisorOptions,
       lifecycleOptions: {
-        appName: isPackagedElectronApp(app) ? "TiboTattle Dev" : "TiboTattle",
+        appName: productionDistribution !== null || !isPackagedElectronApp(app)
+          ? "TiboTattle" : "TiboTattle Dev",
         ...lifecycleOptions,
       },
       firstRunReceiptBackend,
@@ -521,6 +554,17 @@ export async function launchElectronShell({
       qualificationContext,
       platform: process.platform,
       architecture: process.arch,
+      productionDistribution: productionEnabled ? productionDistribution : undefined,
+      prepareNativeHandover: productionEnabled && process.platform === "darwin"
+        ? ({ homeDirectory }) => runProductionNativeMacHandover({
+          electronApp: app,
+          resourcesPath: packagedResourcesPath(app, packagedAppPath(app), resourcesPath),
+          homeDirectory,
+        }) : undefined,
+      accountlessProduction: productionEnabled ? {
+        origin: DEPLOYMENT_ENDPOINTS.public.origin,
+        policyVersion: productionDistribution.contributionPolicy,
+      } : undefined,
     });
     installWindowsSmokeControl(desktop.lifecycle, {
       environment,

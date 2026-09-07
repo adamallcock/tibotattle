@@ -47,6 +47,9 @@ test("desktop contract freezes the exact bridge action and enum vocabulary", () 
     "openHostedSignIn",
     "openCodexThread",
     "checkForUpdates",
+    "downloadUpdate",
+    "installUpdateAndRestart",
+    "setAutomaticDownload",
     "revealLatestDownload",
     "openDashboardInBrowser",
     "showDiagnostics",
@@ -96,6 +99,8 @@ test("request validation accepts exact envelopes and freezes the result", () => 
     "addCodexHome",
     "useDefaultCodexHome",
     "checkForUpdates",
+    "downloadUpdate",
+    "installUpdateAndRestart",
     "revealLatestDownload",
     "openDashboardInBrowser",
     "showDiagnostics",
@@ -104,11 +109,13 @@ test("request validation accepts exact envelopes and freezes the result", () => 
   ]) {
     assert.deepEqual(validateDesktopRequest({ action, args: {} }), { action, args: {} });
   }
-  for (const enabled of [true, false]) {
-    assert.deepEqual(
-      validateDesktopRequest({ action: "setSharingEnabled", args: { enabled } }),
-      { action: "setSharingEnabled", args: { enabled } },
-    );
+  for (const action of ["setSharingEnabled", "setAutomaticDownload"]) {
+    for (const enabled of [true, false]) {
+      assert.deepEqual(
+        validateDesktopRequest({ action, args: { enabled } }),
+        { action, args: { enabled } },
+      );
+    }
   }
   for (const index of [1, 2, 3]) {
     assert.deepEqual(
@@ -177,6 +184,9 @@ test("request validation rejects unknown actions, extra keys, malformed values, 
     { action: "setSharingEnabled", args: {} },
     { action: "setSharingEnabled", args: { enabled: "true" } },
     { action: "setSharingEnabled", args: { enabled: true, extra: true } },
+    { action: "setAutomaticDownload", args: {} },
+    { action: "setAutomaticDownload", args: { enabled: "true" } },
+    { action: "downloadUpdate", args: { extra: true } },
     { action: "sharingNoticePresented", args: {} },
     { action: "sharingNoticePresented", args: { index: 0 } },
     { action: "sharingNoticePresented", args: { index: 4 } },

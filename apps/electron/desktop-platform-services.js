@@ -32,6 +32,29 @@ const SYSTEM_SETTINGS_URLS = Object.freeze({
   }),
 });
 
+const UPDATE_STATES = new Set([
+  "unavailable",
+  "ready",
+  "checking",
+  "available",
+  "downloading",
+  "downloaded",
+  "current",
+  "installing",
+  "error",
+]);
+
+const UPDATE_ERRORS = new Set([
+  "none",
+  "configuration_failed",
+  "check_failed",
+  "download_failed",
+  "install_failed",
+  "preferences_unavailable",
+  "shutdown_failed",
+  "unavailable",
+]);
+
 function fixedFailure(code) {
   const error = new Error("Desktop platform operation failed");
   error.name = "DesktopPlatformError";
@@ -75,6 +98,79 @@ function safeBuildLabel(value) {
   return typeof value === "string" && /^[A-Za-z0-9._+-]{1,80}$/u.test(value)
     ? value
     : "development";
+}
+
+function safeUpdateProgress(value) {
+  if (!Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function unavailableUpdateStatus() {
+  return Object.freeze({
+    automaticDownload: false,
+    automaticDownloadAvailable: false,
+    canCheck: false,
+    canDownload: false,
+    canInstall: false,
+    error: "unavailable",
+    progress: null,
+    state: "unavailable",
+  });
+}
+
+function safeUpdateStatus(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return unavailableUpdateStatus();
+  }
+  const state = UPDATE_STATES.has(value.state) ? value.state : "unavailable";
+  if (state === "unavailable") return unavailableUpdateStatus();
+  return Object.freeze({
+    automaticDownload: value.automaticDownload === true,
+    automaticDownloadAvailable: value.automaticDownloadAvailable === true,
+    canCheck: value.canCheck === true,
+    canDownload: value.canDownload === true,
+    canInstall: value.canInstall === true,
+    error: UPDATE_ERRORS.has(value.error) ? value.error : "unavailable",
+    progress: safeUpdateProgress(value.progress),
+    state,
+  });
+}
+
+function updateDetail(status, textOptions = {}) {
+  switch (status.state) {
+    case "checking":
+      return "Checking the signed update feed…";
+    case "available":
+      return "A signed update is available.";
+    case "downloading":
+      return status.progress === null
+        ? "Downloading a signed update…"
+        : `Downloading a signed update (${status.progress}%).`;
+    case "downloaded":
+      return "A signed update is ready to install.";
+    case "current":
+      return "This is the latest signed build available to this installation.";
+    case "installing":
+      return "Preparing the signed update to restart…";
+    case "ready":
+      return "Updates are ready to check.";
+    case "error":
+      return "The signed update operation could not be completed. Local analysis is unaffected.";
+    default:
+      return desktopText("electron.settings.updates.unavailable", {}, textOptions);
+  }
+}
+
+function automaticUpdateDetail(status, textOptions = {}) {
+  return status.automaticDownloadAvailable
+    ? "Verified updates can be downloaded automatically."
+    : desktopText("electron.settings.updates.automaticUnavailable", {}, textOptions);
+}
+
+function usableUpdater(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+      || typeof value.getStatus !== "function") return null;
+  return value;
 }
 
 // The runtime manifest records content hashes for the packaged shell.
@@ -203,6 +299,7 @@ export function createDesktopPlatformServices({
   environment = process.env,
   locale = "system",
   systemLocales,
+  getUpdater = () => null,
   validateCodexHome = (path) => validateDesktopCodexHome(path, { platform }),
 } = {}) {
   if (!app || typeof app !== "object") throw new TypeError("app is required");
@@ -217,9 +314,42 @@ export function createDesktopPlatformServices({
   if (typeof validateCodexHome !== "function") {
     throw new TypeError("validateCodexHome is required");
   }
+  if (typeof getUpdater !== "function") {
+    throw new TypeError("getUpdater is required");
+  }
 
   const defaultCodexHome = resolve(join(homeDirectory, ".codex"));
   const textOptions = { locale, systemLocales };
+
+  function selectedUpdater() {
+    try {
+      return usableUpdater(getUpdater());
+    } catch {
+      return null;
+    }
+  }
+
+  function currentUpdateStatus() {
+    const updater = selectedUpdater();
+    if (updater === null) return unavailableUpdateStatus();
+    try {
+      return safeUpdateStatus(updater.getStatus());
+    } catch {
+      return unavailableUpdateStatus();
+    }
+  }
+
+  async function invokeUpdater(method, args, errorCode) {
+    const updater = selectedUpdater();
+    if (updater === null || typeof updater[method] !== "function") {
+      throw fixedFailure("desktop_update_unavailable");
+    }
+    try {
+      return await updater[method](...args);
+    } catch {
+      throw fixedFailure(errorCode);
+    }
+  }
 
   function setLocale(value) {
     if (!DESKTOP_LANGUAGES.includes(value)) {
@@ -351,6 +481,27 @@ export function createDesktopPlatformServices({
     return true;
   }
 
+  async function checkForUpdates() {
+    return invokeUpdater("checkForUpdates", [], "desktop_update_check_failed");
+  }
+
+  async function downloadUpdate() {
+    return invokeUpdater("downloadUpdate", [], "desktop_update_download_failed");
+  }
+
+  async function installUpdateAndRestart() {
+    return invokeUpdater("installAndRestart", [], "desktop_update_install_failed");
+  }
+
+  async function setAutomaticDownload(enabled) {
+    if (typeof enabled !== "boolean") throw new TypeError("enabled is required");
+    return invokeUpdater(
+      "setAutomaticDownload",
+      [enabled],
+      "desktop_update_preferences_unavailable",
+    );
+  }
+
   function about() {
     const version = typeof app.getVersion === "function"
       ? safeBuildLabel(app.getVersion())
@@ -359,19 +510,24 @@ export function createDesktopPlatformServices({
     const build = typeof configuredBuild === "string" && configuredBuild.length > 0
       ? safeBuildLabel(configuredBuild)
       : packagedRuntimeContentBuild(app) ?? "development";
+    const updateStatus = currentUpdateStatus();
     return Object.freeze({
       version,
       build,
       update: Object.freeze({
-        status: "unavailable",
-        canCheck: false,
-        detail: desktopText("electron.settings.updates.unavailable", {}, textOptions),
+        status: updateStatus.state,
+        canCheck: updateStatus.canCheck,
+        canDownload: updateStatus.canDownload,
+        canInstall: updateStatus.canInstall,
+        progress: updateStatus.progress,
+        error: updateStatus.error,
+        detail: updateDetail(updateStatus, textOptions),
       }),
       automaticUpdates: Object.freeze({
-        enabled: false,
-        available: false,
-        canSet: false,
-        detail: desktopText("electron.settings.updates.automaticUnavailable", {}, textOptions),
+        enabled: updateStatus.automaticDownload,
+        available: updateStatus.automaticDownloadAvailable,
+        canSet: updateStatus.automaticDownloadAvailable,
+        detail: automaticUpdateDetail(updateStatus, textOptions),
       }),
     });
   }
@@ -391,7 +547,10 @@ export function createDesktopPlatformServices({
     openHostedSignIn,
     openCodexThread,
     about,
-    checkForUpdates: about,
+    checkForUpdates,
+    downloadUpdate,
+    installUpdateAndRestart,
+    setAutomaticDownload,
   });
 }
 

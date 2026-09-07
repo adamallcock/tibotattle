@@ -330,6 +330,31 @@ test("controller implements every bounded bridge action and desktop command", as
   assert.deepEqual(value.persisted.notifications, { enabled: false, threshold: "off" });
 });
 
+test("controller invokes the bounded updater actions rather than returning a stale About snapshot", async () => {
+  const calls = [];
+  const value = fixture({
+    platformOverrides: {
+      async checkForUpdates() { calls.push("check"); },
+      async downloadUpdate() { calls.push("download"); },
+      async installUpdateAndRestart() { calls.push("install"); },
+      async setAutomaticDownload(enabled) { calls.push(["automatic", enabled]); },
+    },
+  });
+  await value.controller.initialize();
+  await value.controller.handlers.checkForUpdates({});
+  await value.controller.handlers.downloadUpdate({});
+  await value.controller.handlers.installUpdateAndRestart({});
+  await value.controller.handlers.setAutomaticDownload({ enabled: false });
+  assert.deepEqual(calls, ["check", "download", "install", ["automatic", false]]);
+
+  const unavailable = fixture();
+  await unavailable.controller.initialize();
+  await assert.rejects(
+    unavailable.controller.handlers.downloadUpdate({}),
+    (error) => error?.code === "desktop_update_unavailable",
+  );
+});
+
 test("controller exposes bounded browser, diagnostics, local-data, and refresh lifecycle actions", async () => {
   const actions = [];
   const value = fixture({

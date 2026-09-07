@@ -1270,6 +1270,31 @@ export function createDesktopController({
       return true;
     },
     async checkForUpdates() {
+      if (typeof platform.checkForUpdates !== "function") {
+        throw controllerError("desktop_update_unavailable");
+      }
+      await platform.checkForUpdates();
+      return snapshot();
+    },
+    async downloadUpdate() {
+      if (typeof platform.downloadUpdate !== "function") {
+        throw controllerError("desktop_update_unavailable");
+      }
+      await platform.downloadUpdate();
+      return snapshot();
+    },
+    async installUpdateAndRestart() {
+      if (typeof platform.installUpdateAndRestart !== "function") {
+        throw controllerError("desktop_update_unavailable");
+      }
+      await platform.installUpdateAndRestart();
+      return snapshot();
+    },
+    async setAutomaticDownload({ enabled }) {
+      if (typeof platform.setAutomaticDownload !== "function") {
+        throw controllerError("desktop_update_unavailable");
+      }
+      await platform.setAutomaticDownload(enabled);
       return snapshot();
     },
     async revealLatestDownload(_args, context = {}) {

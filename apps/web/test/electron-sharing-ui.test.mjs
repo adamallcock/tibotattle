@@ -113,6 +113,12 @@ test("Electron sharing UI uses the accountless bridge and visible receipt gate",
   assert.match(settingsSource, /"is-error", hasMessage && error/u);
   assert.match(settingsCss, /\.settings-operation-status\.is-success\s*\{\s*color: var\(--green\);/u);
   assert.match(settingsCss, /\.settings-operation-status\.is-error\s*\{\s*color: var\(--rust\);/u);
+  assert.match(settingsHtml, /id="settings-download-update"[^>]*hidden[^>]*disabled/u);
+  assert.match(settingsHtml, /id="settings-install-update"[^>]*hidden[^>]*disabled/u);
+  assert.match(settingsSource, /"downloadUpdate",\s*"installUpdateAndRestart",\s*"setAutomaticDownload"/u);
+  assert.match(settingsSource, /void invoke\("downloadUpdate"\)/u);
+  assert.match(settingsSource, /void invoke\("installUpdateAndRestart"\)/u);
+  assert.match(settingsSource, /void invoke\("setAutomaticDownload", event\.target\.checked === true\)/u);
 });
 
 test("Community sharing confirms saved state and restores it after a rejected change", async () => {
@@ -346,6 +352,7 @@ test("the singleton default chooser refreshes the rendered folder card after sel
     "#settings-notifications-enabled", "#settings-notifications-detail",
     "#settings-notification-status", "#settings-open-notification-settings",
     "#settings-automatic-updates", "#settings-check-for-updates",
+    "#settings-download-update", "#settings-install-update",
     "#settings-open-dashboard-browser", "#settings-show-diagnostics",
     "#settings-reveal-local-data", "#settings-version", "#settings-build",
     "#settings-updates-status", "#settings-operation-status",
@@ -444,6 +451,7 @@ test("Settings restores its saved language when the language bridge rejects", as
     "#settings-notifications-enabled", "#settings-notifications-detail",
     "#settings-notification-status", "#settings-open-notification-settings",
     "#settings-automatic-updates", "#settings-check-for-updates",
+    "#settings-download-update", "#settings-install-update",
     "#settings-open-dashboard-browser", "#settings-show-diagnostics",
     "#settings-reveal-local-data", "#settings-version", "#settings-build",
     "#settings-updates-status", "#settings-operation-status",

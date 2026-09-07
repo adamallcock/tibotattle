@@ -126,6 +126,10 @@ test("platform services use only native-picker paths and fixed open targets", as
     update: {
       status: "unavailable",
       canCheck: false,
+      canDownload: false,
+      canInstall: false,
+      progress: null,
+      error: "unavailable",
       detail: "Update checks are unavailable in this development build.",
     },
     automaticUpdates: {
@@ -143,6 +147,54 @@ test("platform services use only native-picker paths and fixed open targets", as
   assert.equal(dialogOptions.at(-1).title, "Elegir carpeta de Codex");
   assert.equal(dialogOptions.at(-1).buttonLabel, "Usar esta carpeta");
   assert.throws(() => services.setLocale("file:///tmp/not-a-language"), /locale is invalid/u);
+});
+
+test("platform services expose only the bounded updater port and fixed failures", async () => {
+  const calls = [];
+  let status = {
+    automaticDownload: true,
+    automaticDownloadAvailable: true,
+    canCheck: true,
+    canDownload: true,
+    canInstall: false,
+    error: "none",
+    progress: null,
+    state: "available",
+  };
+  const updater = {
+    getStatus: () => status,
+    checkForUpdates: async () => calls.push("check"),
+    downloadUpdate: async () => calls.push("download"),
+    installAndRestart: async () => calls.push("install"),
+    setAutomaticDownload: async (enabled) => {
+      calls.push(["automatic", enabled]);
+      status = { ...status, automaticDownload: enabled };
+    },
+  };
+  const services = createDesktopPlatformServices({
+    app: { isPackaged: true, getVersion: () => "0.1.18" },
+    platform: "darwin",
+    homeDirectory: "/Users/adam",
+    dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+    shell: { openExternal: async () => {} },
+    Notification: { isSupported: () => false },
+    getUpdater: () => updater,
+  });
+  await services.checkForUpdates();
+  await services.downloadUpdate();
+  await services.setAutomaticDownload(false);
+  assert.deepEqual(calls, ["check", "download", ["automatic", false]]);
+  assert.equal(services.about().update.canDownload, true);
+  assert.equal(services.about().automaticUpdates.enabled, false);
+  await assert.rejects(
+    services.setAutomaticDownload("false"),
+    /enabled is required/u,
+  );
+  updater.downloadUpdate = async () => { throw new Error("network"); };
+  await assert.rejects(
+    services.downloadUpdate(),
+    (error) => error?.code === "desktop_update_download_failed",
+  );
 });
 
 test("About identifies packaged runtime content when no explicit build label exists", async () => {

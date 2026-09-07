@@ -388,6 +388,13 @@ function installDesktopBridge() {
         : rejected("authorizeUrl is invalid"),
     ),
     checkForUpdates: (...values) => noArguments("checkForUpdates", values),
+    downloadUpdate: (...values) => noArguments("downloadUpdate", values),
+    installUpdateAndRestart: (...values) => noArguments("installUpdateAndRestart", values),
+    setAutomaticDownload: (...values) => oneArgument(
+      "setAutomaticDownload",
+      values,
+      (enabled) => booleanMethod("setAutomaticDownload", enabled),
+    ),
     revealLatestDownload: (...values) => noArguments(
       "revealLatestDownload",
       values,

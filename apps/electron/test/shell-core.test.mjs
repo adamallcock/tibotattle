@@ -34,8 +34,10 @@ import {
   installWindowsSmokeControl,
   installWindowsSmokeControlForTest,
   launchElectronShell,
+  readProductionDistribution,
   MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
 } from "../main.js";
+import { createProductionDistributionMetadata } from "../desktop-updater.js";
 import {
   ELECTRON_ENTRY_FAILURE_DIAGNOSTIC,
   ElectronShellError,
@@ -955,6 +957,33 @@ test("packaged macOS local QA withholds the production central origin", () => {
     platform: "linux",
   });
   assert.equal(nonMac.USAGE_MONITOR_CENTRAL_ORIGIN, "https://tibotattle.com");
+});
+
+test("production policy reads only the final packaged app manifest and validates its target", async () => {
+  const metadata = createProductionDistributionMetadata({
+    target: "darwin-arm64", sourceRevision: "a".repeat(40), buildNumber: "20260906",
+  });
+  const paths = [];
+  const app = { isPackaged: true, getName: () => "TiboTattle",
+    getAppPath: () => "/Applications/TiboTattle.app/Contents/Resources/app.asar" };
+  const readManifest = async (path) => {
+    paths.push(path);
+    return Buffer.from(JSON.stringify({ tibotattleDistribution: metadata }));
+  };
+  assert.deepEqual(await readProductionDistribution({ app, platform: "darwin",
+    architecture: "arm64", readManifest }), metadata);
+  assert.deepEqual(paths, ["/Applications/TiboTattle.app/Contents/Resources/app.asar/package.json"]);
+  await assert.rejects(readProductionDistribution({ app, platform: "darwin",
+    architecture: "x64", readManifest }), errorCode("electron_configuration_invalid"));
+  for (const value of [{}, { tibotattleDistribution: { ...metadata, updateFeed: "https://example.test" } }]) {
+    await assert.rejects(readProductionDistribution({ app, platform: "darwin", architecture: "arm64",
+      readManifest: async () => Buffer.from(JSON.stringify(value)) }),
+    errorCode("electron_configuration_invalid"));
+  }
+  for (const candidate of [{ ...app, isPackaged: false }, { ...app, getName: () => "TiboTattle Dev" }]) {
+    assert.equal(await readProductionDistribution({ app: candidate,
+      readManifest: () => { throw new Error("Development must not read production metadata"); } }), null);
+  }
 });
 
 test("companion supervisor fails closed on malformed readiness and bounded startup timeout", async () => {
@@ -2563,6 +2592,7 @@ test("desktop lifecycle owns a bounded Settings window and authorizes only its t
   assert.deepEqual(lifecycle.state, {
     started: true,
     quitting: false,
+    preparingForUpdate: false,
     primaryInstance: true,
     hasWindow: true,
     dashboardReady: false,
@@ -3237,6 +3267,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "openExternal",
     "openHostedSignIn",
     "checkForUpdates",
+    "downloadUpdate",
+    "installUpdateAndRestart",
+    "setAutomaticDownload",
     "revealLatestDownload",
     "openDashboardInBrowser",
     "showDiagnostics",
@@ -3321,6 +3354,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "https://accounts.google.com/o/oauth2/v2/auth?client_id=test",
   );
   await bridge.checkForUpdates();
+  await bridge.downloadUpdate();
+  await bridge.installUpdateAndRestart();
+  await bridge.setAutomaticDownload(false);
   await bridge.revealLatestDownload();
   await bridge.openDashboardInBrowser();
   await bridge.showDiagnostics();
@@ -3396,6 +3432,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
       },
     },
     { channel: "tibotattle:desktop:v1", request: { action: "checkForUpdates", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "downloadUpdate", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "installUpdateAndRestart", args: {} } },
+    { channel: "tibotattle:desktop:v1", request: { action: "setAutomaticDownload", args: { enabled: false } } },
     { channel: "tibotattle:desktop:v1", request: { action: "revealLatestDownload", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "openDashboardInBrowser", args: {} } },
     { channel: "tibotattle:desktop:v1", request: { action: "showDiagnostics", args: {} } },
@@ -3434,6 +3473,11 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
       "extra",
     ),
     () => bridge.revealLatestDownload("extra"),
+    () => bridge.checkForUpdates("extra"),
+    () => bridge.downloadUpdate("extra"),
+    () => bridge.installUpdateAndRestart("extra"),
+    () => bridge.setAutomaticDownload("true"),
+    () => bridge.setAutomaticDownload(true, "extra"),
     () => bridge.openDashboardInBrowser("extra"),
     () => bridge.openCommunity("extra"),
     () => bridge.showDiagnostics("extra"),

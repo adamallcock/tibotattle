@@ -61,6 +61,9 @@ export const SETTINGS_ACTION_NAMES = Object.freeze([
   "setNotificationPreferences",
   "openSystemSettings",
   "checkForUpdates",
+  "downloadUpdate",
+  "installUpdateAndRestart",
+  "setAutomaticDownload",
   "openExternal",
   "openDashboardInBrowser",
   "showDiagnostics",
@@ -136,10 +139,25 @@ const NOTIFICATION_REASONS = new Set([
 
 const UPDATE_STATUSES = new Set([
   "unavailable",
+  "ready",
   "checking",
   "available",
+  "downloading",
+  "downloaded",
   "current",
+  "installing",
   "error",
+]);
+
+const UPDATE_ERRORS = new Set([
+  "none",
+  "configuration_failed",
+  "check_failed",
+  "download_failed",
+  "install_failed",
+  "preferences_unavailable",
+  "shutdown_failed",
+  "unavailable",
 ]);
 
 const LOGIN_ITEM_LABELS = Object.freeze({
@@ -168,9 +186,13 @@ const NOTIFICATION_PERMISSION_MESSAGE_KEYS = Object.freeze({
 
 const UPDATE_STATUS_LABELS = Object.freeze({
   unavailable: "Update checks are unavailable in this development build.",
+  ready: "Updates are ready to check.",
   checking: "Checking the signed update feed…",
   available: "A signed update is available.",
+  downloading: "Downloading a signed update…",
+  downloaded: "A signed update is ready to install.",
   current: "This is the latest signed build available to this installation.",
+  installing: "Preparing the signed update to restart…",
   error: "The signed update feed could not be checked. Local analysis is unaffected.",
 });
 
@@ -204,6 +226,11 @@ function valueIn(values, value) {
 function finiteNumber(value, fallback) {
   const number = Number(value);
   return Number.isFinite(number) ? number : fallback;
+}
+
+function boundedUpdateProgress(value) {
+  if (!Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(100, Math.round(value)));
 }
 
 function safeText(value, fallback) {
@@ -393,6 +420,12 @@ export function normalizeSettingsState(raw, settingsRoots = null) {
   const updateStatus = UPDATE_STATUSES.has(update.status)
     ? update.status
     : "unavailable";
+  const updateError = UPDATE_ERRORS.has(update.error) ? update.error : "unavailable";
+  const updateCanCheck = updateStatus !== "unavailable" && update.canCheck === true;
+  const updateCanDownload = updateStatus === "available" && update.canDownload === true;
+  const updateCanInstall = updateStatus === "downloaded" && update.canInstall === true;
+  const automaticUpdatesAvailable = automaticUpdates.available === true
+    && automaticUpdates.canSet === true;
 
   return Object.freeze({
     language,
@@ -431,13 +464,17 @@ export function normalizeSettingsState(raw, settingsRoots = null) {
       build: safeText(about.build, safeText(source.build, "unknown")),
       update: Object.freeze({
         status: updateStatus,
-        canCheck: update.canCheck === true,
+        canCheck: updateCanCheck,
+        canDownload: updateCanDownload,
+        canInstall: updateCanInstall,
+        progress: boundedUpdateProgress(update.progress),
+        error: updateError,
         detail: safeText(update.detail, UPDATE_STATUS_LABELS[updateStatus]),
       }),
       automaticUpdates: Object.freeze({
-        enabled: automaticUpdates.enabled === true,
-        available: automaticUpdates.available === true,
-        canSet: automaticUpdates.canSet === true,
+        enabled: automaticUpdatesAvailable && automaticUpdates.enabled === true,
+        available: automaticUpdatesAvailable,
+        canSet: automaticUpdatesAvailable,
         detail: safeText(
           automaticUpdates.detail,
           automaticUpdates.available === true
@@ -569,6 +606,7 @@ function fixedActionValue(actionName, value) {
     case "openExternal":
       return Object.hasOwn(SETTINGS_EXTERNAL_TARGETS, value);
     case "setStartAtLogin":
+    case "setAutomaticDownload":
       return typeof value === "boolean";
     case "editCodexHome":
     case "removeCodexHome":
@@ -872,6 +910,8 @@ function renderSettingsState(
   );
   const automaticSwitch = queryRequired(documentRef, "#settings-automatic-updates");
   const checkForUpdates = queryRequired(documentRef, "#settings-check-for-updates");
+  const downloadUpdate = queryRequired(documentRef, "#settings-download-update");
+  const installUpdate = queryRequired(documentRef, "#settings-install-update");
   const openDashboardBrowser = queryRequired(
     documentRef,
     "#settings-open-dashboard-browser",
@@ -912,8 +952,9 @@ function renderSettingsState(
     input.checked = input.value === state.notifications.threshold;
     input.disabled = !notificationReady;
   }
-  automaticSwitch.checked = false;
-  automaticSwitch.disabled = true;
+  const automaticUpdatesReady = bridgeAvailable && state.about.automaticUpdates.canSet;
+  automaticSwitch.checked = automaticUpdatesReady && state.about.automaticUpdates.enabled;
+  automaticSwitch.disabled = !automaticUpdatesReady;
   setText(
     documentRef,
     "#settings-version",
@@ -928,20 +969,26 @@ function renderSettingsState(
       value: state.about.build,
     }),
   );
+  const updateStatusKey = UPDATE_STATUS_KEYS[state.about.update.status];
   setText(
     documentRef,
     "#settings-updates-status",
-    translateSettingsMessage(
-      localizer,
-      UPDATE_STATUS_KEYS[state.about.update.status] ?? UPDATE_STATUS_KEYS.unavailable,
-    ),
+    state.about.update.status === "downloading" || updateStatusKey === undefined
+      ? state.about.update.detail
+      : translateSettingsMessage(localizer, updateStatusKey),
   );
   checkForUpdates.disabled = !bridgeAvailable
     || !state.about.update.canCheck
-    || state.about.update.status === "checking";
+    || state.about.update.status === "checking"
+    || state.about.update.status === "downloading"
+    || state.about.update.status === "installing";
   checkForUpdates.textContent = state.about.update.status === "checking"
     ? translateSettingsMessage(localizer, "electron.settings.updates.checkingButton")
     : translateSettingsMessage(localizer, "electron.settings.updates.check");
+  downloadUpdate.hidden = !state.about.update.canDownload;
+  downloadUpdate.disabled = !bridgeAvailable || !state.about.update.canDownload;
+  installUpdate.hidden = !state.about.update.canInstall;
+  installUpdate.disabled = !bridgeAvailable || !state.about.update.canInstall;
   openDashboardBrowser.disabled = !bridgeAvailable;
   showDiagnostics.disabled = !bridgeAvailable;
   revealLocalData.disabled = !bridgeAvailable;
@@ -1304,6 +1351,16 @@ export async function mountSettingsPage({
   });
   listen(queryRequired(documentRef, "#settings-check-for-updates"), "click", () => {
     void invoke("checkForUpdates");
+  });
+  listen(queryRequired(documentRef, "#settings-download-update"), "click", () => {
+    void invoke("downloadUpdate");
+  });
+  listen(queryRequired(documentRef, "#settings-install-update"), "click", () => {
+    void invoke("installUpdateAndRestart");
+  });
+  listen(queryRequired(documentRef, "#settings-automatic-updates"), "change", (event) => {
+    if (!currentState.about.automaticUpdates.canSet) return;
+    void invoke("setAutomaticDownload", event.target.checked === true);
   });
   listen(queryRequired(documentRef, "#settings-open-dashboard-browser"), "click", () => {
     void invoke("openDashboardInBrowser");
