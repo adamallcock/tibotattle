@@ -33,9 +33,9 @@ one. The Mac daily-use tester is available; that is not full cutover readiness.
    required production credential/trust composition and installed updates.
    Linux's packaged native credential journey now passes, including its read
    deadline and fixed observation IPC. Its normal packaged production launch
-   is next. Windows now passes guarded artifact transfer and its first installed
-   launch under a fresh account; the repaired second launch and uninstall need
-   a new native result.
+   is next. Windows now passes guarded artifact transfer, both installed
+   launches under a fresh account, credential persistence and uninstaller
+   settlement. The final registry cleanup probe needs a valid result.
 3. Complete one authorized hosted contribution rehearsal and explicit
    accountless public-sample/overlapping-history decisions. Preserve accepted
    automatic-sharing and persistent opt-out behavior throughout.
@@ -51,6 +51,14 @@ native provenance. Preserve those limits and legacy ciphertext recovery; do
 not manufacture a full-readiness attestation or select legacy identity/device
 routes to make the candidate run.
 
+The maintained native binding contract limits replacement safety to cooperating
+writers holding the capability lease; deliberate same-owner mutation is outside
+that contract (`native/windows-filesystem/README.md`). Do not expand this into
+a privileged service or claim a hostile-writer atomic replacement guarantee.
+Prepare the fixed normal Windows composition within the existing contract,
+keeping both native production-safety flags false and qualifying actual startup
+separately from release trust.
+
 Across these three streams, freeze release candidates, verify four-target
 installation/update evidence, then request the concrete staged
 publication/activation decision.
@@ -61,7 +69,34 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest combined result: `0fc262cf` in
+Latest combined result: `b356656c` in
+[run 34242621490](https://github.com/adamallcock/tibotattle/actions/runs/34242621490)
+passes both Mac package jobs and the Windows producer. Windows again completes
+installation, both app launches, FD3/FD4 credential continuity and uninstaller
+settlement. The remaining cleanup failure is now specifically the uninstall
+registry read deadline (`POST_UNINSTALL_REGISTRY_PROBE_TIMED_OUT`), not evidence
+of a remaining installation or failed restart. The total post-uninstall budget
+currently leaves less than ten seconds for a registry read whose own cap is
+twenty seconds, because ten seconds are reserved for process termination. Give
+that existing probe its full bounded budget while retaining absence predicates
+and strict failure on an unavailable read.
+
+Linux again passes normal candidate preparation and packaged native credential
+checks. Its normal app receipt now preserves `SOURCE_SMOKE_RENDERER_FAILED`
+after verified artifact binding; it does not prove initial refresh or the normal
+credential lifecycle. Identify the specific renderer assertion before changing
+product behavior. Preserve all earlier failed receipts and the distinction
+between source, packaged credential and whole-app evidence.
+
+The next candidate integrates `11330adf` (the bounded Windows cleanup repair)
+and `d1ceaaef` (closed Linux readiness, origin, health, resource, navigation and
+late network diagnostics). Linux startup waits and renderer predicates remain
+unchanged. Readiness failures retain only three boolean results, never page
+content. The source harness also validates its container before resolving a
+default Electron executable (`8ed1346e`). The integrated owning tests pass 58
+cases with five Windows-only cases deferred. Native results remain required.
+
+Previous combined result: `0fc262cf` in
 [run 34239981348](https://github.com/adamallcock/tibotattle/actions/runs/34239981348)
 passes both Mac package jobs and the Windows producer. The fresh Windows
 receipt proves successful installation, both complete app launches, FD3/FD4

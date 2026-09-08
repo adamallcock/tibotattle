@@ -1278,9 +1278,9 @@ export async function runSmoke({
       MAX_STARTUP_MS,
       "Electron dashboard frame",
     ));
-    // Only booleans cross the CDP boundary here. A readiness timeout retains
-    // their last observed true/false state as a closed stage, never a title,
-    // heading, URL, or page content.
+    // A readiness timeout retains only the last observed boolean state as a
+    // closed stage. Location and resource URLs remain local inputs to the
+    // origin checks; no title, heading, URL, or page content enters diagnostics.
     failureStage = "renderer_readiness_unobserved";
     const ready = await waitFor(
       async () => {
