@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, relative, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 import { init, parse } from "es-module-lexer";
 
@@ -22,6 +23,10 @@ const NODE_AMD64_CHILD_DIGEST =
   "ba2f9edd0785ee291c1a5287764cb41fdb7922336f878993f9d58622613e67a8";
 const REPOSITORY_ROOT = resolve(".");
 const BUILD_HELPER = resolve("scripts/build-electron-linux-container.mjs");
+
+function repositoryRelativePath(path) {
+  return relative(REPOSITORY_ROOT, path).replaceAll("\\", "/");
+}
 
 async function writeExecutable(path, source) {
   await writeFile(path, source, "utf8");
@@ -94,6 +99,7 @@ async function collectProductionDependencyGraph(entryPaths) {
   await init;
   const pending = entryPaths.map((path) => resolve(REPOSITORY_ROOT, path));
   const visited = new Set();
+  const dependenciesByPath = new Map();
   while (pending.length > 0) {
     const current = pending.pop();
     if (visited.has(current)) continue;
@@ -106,12 +112,16 @@ async function collectProductionDependencyGraph(entryPaths) {
     for (const match of source.matchAll(/\brequire\(\s*["']([^"']+)["']\s*\)/gu)) {
       specifiers.add(match[1]);
     }
+    const dependencies = new Set();
     for (const specifier of specifiers) {
       const dependency = await resolveLocalModule(current, specifier);
-      if (dependency !== null && !visited.has(dependency)) pending.push(dependency);
+      if (dependency === null) continue;
+      dependencies.add(dependency);
+      if (!visited.has(dependency)) pending.push(dependency);
     }
+    dependenciesByPath.set(current, dependencies);
   }
-  return visited;
+  return Object.freeze({ paths: visited, dependenciesByPath });
 }
 
 test("Linux AMD64 image pins the reviewed native Node child, GUI, and Secret Service boundary", async () => {
@@ -404,7 +414,7 @@ exit 92
   });
 });
 
-test("Linux foundation modules remain unreachable from production composition", async () => {
+test("Production composition admits only the reviewed Linux qualification closure", async () => {
   const productionCompositionRoots = [
     "apps/electron/main.js",
     "apps/electron/desktop-runtime.js",
@@ -421,39 +431,175 @@ test("Linux foundation modules remain unreachable from production composition", 
     "scripts/build-electron-runtime.mjs",
     "apps/electron/electron-builder.config.cjs",
   ];
-  const forbiddenPaths = new Set([
-    "apps/electron/linux-autostart.js",
-    "apps/electron/linux-desktop-capabilities.js",
+  const reviewedLinuxFoundationPaths = new Set([
+    "apps/electron/desktop-linux-secret-service-broker.js",
+    "apps/electron/desktop-linux-secret-service.js",
     "apps/electron/linux-qualification.js",
-    "apps/electron/linux-tray-assets.js",
     "src/platform/linux-credential-mutation-lease.js",
     "src/platform/linux-credential-mutex.js",
+    "src/platform/linux-credential-state.js",
     "src/platform/linux-secret-service-binding.js",
+    "src/platform/linux-secret-service-broker.js",
     "src/platform/linux-secret-service.js",
-    "src/platform/linux-state-composition.js",
-    "src/platform/linux-xdg-paths.js",
   ]);
-  const forbiddenSpecifier = /(?:linux-(?:autostart|desktop-capabilities|qualification|tray-assets)|platform\/linux-(?:credential-mutation-lease|credential-mutex|secret-service(?:-binding)?|state-composition|xdg-paths))/u;
+  // Each direct local import touching this closure is reviewed.  The two
+  // non-Electron callers are deliberately narrow: the companion owns only an
+  // inherited-descriptor transport, and the packager validates the fixed
+  // binding manifest. Neither path may select or load native credentials.
+  const reviewedLinuxFoundationEdges = new Set([
+    "apps/electron/desktop-linux-secret-service-broker.js -> src/platform/linux-secret-service-broker.js",
+    "apps/electron/desktop-linux-secret-service.js -> apps/electron/desktop-linux-secret-service-broker.js",
+    "apps/electron/desktop-linux-secret-service.js -> apps/electron/errors.js",
+    "apps/electron/desktop-linux-secret-service.js -> apps/electron/linux-qualification.js",
+    "apps/electron/desktop-linux-secret-service.js -> src/platform/linux-credential-mutation-lease.js",
+    "apps/electron/desktop-linux-secret-service.js -> src/platform/linux-credential-state.js",
+    "apps/electron/desktop-linux-secret-service.js -> src/platform/linux-secret-service.js",
+    "apps/electron/main.js -> apps/electron/desktop-linux-secret-service.js",
+    "apps/local/server.js -> src/platform/linux-secret-service-broker.js",
+    "scripts/build-electron-runtime.mjs -> src/platform/linux-credential-mutex.js",
+    "src/platform/linux-credential-mutation-lease.js -> src/platform/export-identity-keychain.js",
+    "src/platform/linux-credential-mutation-lease.js -> src/platform/linux-credential-mutex.js",
+    "src/platform/linux-credential-state.js -> src/platform/linux-credential-mutex.js",
+    "src/platform/linux-secret-service-broker.js -> src/platform/keychain-capabilities.js",
+    "src/platform/linux-secret-service.js -> src/platform/export-identity-keychain.js",
+    "src/platform/linux-secret-service.js -> src/platform/linux-credential-mutation-lease.js",
+    "src/platform/linux-secret-service.js -> src/platform/linux-secret-service-binding.js",
+  ]);
+  const forbiddenSpecifier = /(?:linux-(?:autostart|desktop-capabilities|tray-assets)|platform\/linux-(?:state-composition|xdg-paths))/u;
   const graph = await collectProductionDependencyGraph(productionCompositionRoots);
-  const relativeGraph = new Set([...graph].map((path) => relative(REPOSITORY_ROOT, path)));
+  const relativeGraph = new Set([...graph.paths].map(repositoryRelativePath));
   assert.ok(
     relativeGraph.has("apps/electron/companion-supervisor.js"),
     "the dormancy guard must traverse indirect production imports",
   );
-  for (const forbiddenPath of forbiddenPaths) {
-    assert.equal(
-      relativeGraph.has(forbiddenPath),
-      false,
-      `${forbiddenPath} remains unreachable from every production composition root`,
-    );
+  const actualLinuxFoundationPaths = new Set(
+    [...relativeGraph].filter((path) => path.toLowerCase().includes("linux")),
+  );
+  assert.deepEqual(
+    [...actualLinuxFoundationPaths].sort(),
+    [...reviewedLinuxFoundationPaths].sort(),
+    "new Linux production dependencies require an explicit closure review",
+  );
+
+  const actualLinuxFoundationEdges = new Set();
+  for (const [importer, dependencies] of graph.dependenciesByPath) {
+    const from = repositoryRelativePath(importer);
+    for (const dependency of dependencies) {
+      const to = repositoryRelativePath(dependency);
+      if (reviewedLinuxFoundationPaths.has(from)
+          || reviewedLinuxFoundationPaths.has(to)) {
+        actualLinuxFoundationEdges.add(`${from} -> ${to}`);
+      }
+    }
   }
-  for (const path of graph) {
+  assert.deepEqual(
+    [...actualLinuxFoundationEdges].sort(),
+    [...reviewedLinuxFoundationEdges].sort(),
+    "Linux foundations stay behind the reviewed qualification, transport, and packaging links",
+  );
+  for (const path of graph.paths) {
     if (![".js", ".mjs", ".cjs"].includes(extname(path))) continue;
     const source = await readFile(path, "utf8");
     assert.doesNotMatch(
       source,
       forbiddenSpecifier,
-      `${relative(REPOSITORY_ROOT, path)} has no unresolved Linux foundation specifier`,
+      `${repositoryRelativePath(path)} has no unreviewed Linux foundation specifier`,
     );
   }
+});
+
+test("Linux native construction is dormant by default and branded qualification stays non-production", () => {
+  const mainUrl = pathToFileURL(resolve(
+    REPOSITORY_ROOT,
+    "apps/electron/main.js",
+  )).href;
+  const platformGateUrl = pathToFileURL(resolve(
+    REPOSITORY_ROOT,
+    "apps/electron/platform-gate.js",
+  )).href;
+  const qualificationUrl = pathToFileURL(resolve(
+    REPOSITORY_ROOT,
+    "apps/electron/linux-qualification.js",
+  )).href;
+  const probe = `
+    import assert from "node:assert/strict";
+
+    for (const [name, value] of [["platform", "linux"], ["arch", "x64"]]) {
+      const descriptor = Object.getOwnPropertyDescriptor(process, name);
+      if (!descriptor?.configurable) throw new Error("runtime identity is not configurable");
+      Object.defineProperty(process, name, { ...descriptor, value });
+    }
+
+    const main = await import(${JSON.stringify(mainUrl)});
+    const platformGate = await import(${JSON.stringify(platformGateUrl)});
+    const qualification = await import(${JSON.stringify(qualificationUrl)});
+    const context = qualification.createLinuxQualificationContext({
+      platform: "linux",
+      architecture: "x64",
+      sourceRevision: "a".repeat(40),
+      distribution: "ubuntu-24.04",
+      desktopProtocol: "x11",
+      credentialStoreMode: "isolated-secret-service",
+      subjectKind: "source",
+      artifactDigest: null,
+      developmentOnly: true,
+    });
+    const ordinary = main.createLinuxQualificationSupervisorOptions();
+    assert.deepEqual(Object.keys(ordinary), []);
+    assert.equal(Object.isFrozen(ordinary), true);
+    assert.equal(Object.hasOwn(ordinary, "attachLinuxSecretServiceBroker"), false);
+
+    const qualified = main.createLinuxQualificationSupervisorOptions({
+      linuxQualificationContext: context,
+    });
+    assert.deepEqual(Object.keys(qualified), ["attachLinuxSecretServiceBroker"]);
+    assert.equal(Object.isFrozen(qualified), true);
+    assert.equal(typeof qualified.attachLinuxSecretServiceBroker, "function");
+
+    let untrustedContextCode = null;
+    try {
+      main.createLinuxQualificationSupervisorOptions({
+        linuxQualificationContext: { ...context },
+      });
+    } catch (error) {
+      untrustedContextCode = error?.code ?? null;
+    }
+    assert.equal(untrustedContextCode, "electron_shell_electron_configuration_invalid");
+
+    let productionGateCode = null;
+    try {
+      platformGate.assertElectronPlatformGate({
+        platform: "linux",
+        architecture: "x64",
+        qualificationContext: context,
+        productionDistribution: {},
+      });
+    } catch (error) {
+      productionGateCode = error?.code ?? null;
+    }
+    assert.equal(productionGateCode, "electron_shell_linux_readiness_unavailable");
+    process.stdout.write(JSON.stringify({
+      ordinaryKeys: Object.keys(ordinary),
+      qualifiedKeys: Object.keys(qualified),
+      untrustedContextCode,
+      productionGateCode,
+    }));
+  `;
+  const result = spawnSync(process.execPath, ["--input-type=module", "--eval", probe], {
+    cwd: REPOSITORY_ROOT,
+    encoding: "utf8",
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 10_000,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.signal, null, result.stderr);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, "");
+  assert.deepEqual(JSON.parse(result.stdout), {
+    ordinaryKeys: [],
+    qualifiedKeys: ["attachLinuxSecretServiceBroker"],
+    untrustedContextCode: "electron_shell_electron_configuration_invalid",
+    productionGateCode: "electron_shell_linux_readiness_unavailable",
+  });
 });
