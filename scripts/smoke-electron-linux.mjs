@@ -162,6 +162,29 @@ function rendererDiagnosticTarget(value, origin) {
   return RENDERER_READINESS_ASSET_SET.has(asset) ? { kind: "asset", name: asset } : null;
 }
 
+function selectedRendererDashboardOrigin(value) {
+  if (typeof value !== "string") return null;
+  let dashboard;
+  try {
+    dashboard = new URL(value);
+  } catch {
+    return null;
+  }
+  const port = Number(dashboard.port);
+  return dashboard.protocol === "http:"
+    && dashboard.hostname === "127.0.0.1"
+    && Number.isInteger(port)
+    && port >= 1
+    && port <= 65_535
+    && dashboard.pathname === "/"
+    && dashboard.search === ""
+    && dashboard.hash === ""
+    && dashboard.username === ""
+    && dashboard.password === ""
+    ? dashboard.origin
+    : null;
+}
+
 function rendererDiagnosticLine(value) {
   return Number.isInteger(value) && value >= 0 && value < MAX_RENDERER_DIAGNOSTIC_LINE
     ? value + 1
@@ -283,8 +306,12 @@ export async function probeRendererReadinessPrimaryApis(origin, {
   }
 }
 
-export function createRendererReadinessDiagnostics({ cdp, dashboardUrl }) {
-  const origin = new URL(dashboardUrl).origin;
+export function createRendererReadinessDiagnostics({ cdp }) {
+  // A CDP page target can be observed as about:blank before the same target
+  // navigates to the companion. Bind only once its exact loopback dashboard
+  // URL has been selected, otherwise an early opaque origin hides every later
+  // local API observation and makes the bounded diagnostic probe unusable.
+  let origin = null;
   const assets = new Map(RENDERER_READINESS_ASSETS.map((asset) => [asset, {
     responseClass: "unobserved", completion: "unobserved", requestId: null,
   }]));
@@ -360,6 +387,13 @@ export function createRendererReadinessDiagnostics({ cdp, dashboardUrl }) {
     cdp.on("Runtime.exceptionThrown", observeException),
   ];
   return Object.freeze({
+    bindSelectedDashboardUrl(dashboardUrl) {
+      if (origin !== null) return null;
+      const selectedOrigin = selectedRendererDashboardOrigin(dashboardUrl);
+      if (selectedOrigin === null) return null;
+      origin = selectedOrigin;
+      return origin;
+    },
     snapshot() {
       return validateRendererReadinessDiagnostics({
         exception,
@@ -372,6 +406,7 @@ export function createRendererReadinessDiagnostics({ cdp, dashboardUrl }) {
       });
     },
     async snapshotWithTimingAndProbe({ probe = probeRendererReadinessPrimaryApis } = {}) {
+      if (origin === null) return this.snapshot();
       let timing = null;
       try {
         timing = await cdp.evaluate(`(() => {
@@ -1566,10 +1601,7 @@ export async function runSmoke({
         try {
           pageCdp = await connectCdp(target);
           pageRefreshObserver = observeLocalRefreshRequests(pageCdp);
-          pageRendererReadinessDiagnostics = createRendererReadinessDiagnostics({
-            cdp: pageCdp,
-            dashboardUrl: target.url,
-          });
+          pageRendererReadinessDiagnostics = createRendererReadinessDiagnostics({ cdp: pageCdp });
           const observedNetworkUrls = [];
           let networkEvidenceInvalid = false;
           const observeNetworkURL = (url) => {
@@ -1588,12 +1620,14 @@ export async function runSmoke({
           pageCdp.on("Network.webSocketCreated", ({ url } = {}) => {
             observeNetworkURL(url);
           });
-          // The observers exist before either domain is enabled. The selected
-          // page must later contain its own POST; no other page's traffic is
-          // merged into the dashboard receipt.
+          // Page and network observers exist before their domains are enabled.
+          // The selected page must later contain its own POST; no other page's
+          // traffic is merged into the dashboard receipt. Runtime is enabled
+          // only after this target has been bound to its selected loopback
+          // origin, so an early exception cannot be classified against an
+          // opaque about:blank origin.
           await pageCdp.request("Page.enable");
           await pageCdp.request("Network.enable");
-          await pageCdp.request("Runtime.enable");
           attachedPages.set(target.id, Object.freeze({
             targetId: target.id,
             cdp: pageCdp,
@@ -1620,6 +1654,11 @@ export async function runSmoke({
     rendererReadinessDiagnostics = selectedPage.rendererReadinessDiagnostics;
     const observedNetworkUrls = selectedPage.observedNetworkUrls;
     const selectedDashboardUrl = new URL(target.url);
+    if (rendererReadinessDiagnostics.bindSelectedDashboardUrl(selectedDashboardUrl.href)
+        !== selectedDashboardUrl.origin) {
+      fail("dashboard diagnostics did not bind the selected loopback origin");
+    }
+    await cdp.request("Runtime.enable");
     selectRequiredRefreshLoader(refreshObserver, await waitFor(
       () => mainFrameLoaderId(cdp),
       MAX_STARTUP_MS,

@@ -67,10 +67,11 @@ test("Linux renderer readiness diagnostics retain only allowlisted module and pr
     assets: [{ asset: "data-client.js", responseClass: "2xx", completion: "timing_recorded" }],
     primaryApis: [{ endpoint: "quality", responseClass: "5xx", completion: "timing_recorded" }],
   });
-  const diagnostics = createRendererReadinessDiagnostics({
-    cdp,
-    dashboardUrl: "http://127.0.0.1:45678/",
-  });
+  const diagnostics = createRendererReadinessDiagnostics({ cdp });
+  assert.equal(
+    diagnostics.bindSelectedDashboardUrl("http://127.0.0.1:45678/"),
+    "http://127.0.0.1:45678",
+  );
   const request = (requestId, path) => cdp.emit("Network.requestWillBeSent", {
     requestId,
     request: { url: `http://127.0.0.1:45678/${path}` },
@@ -141,6 +142,53 @@ test("Linux renderer readiness diagnostics retain only allowlisted module and pr
   diagnostics.dispose();
 });
 
+test("Linux renderer diagnostics bind a blank page target only after its selected loopback navigation", async () => {
+  const cdp = new FakeCdp();
+  cdp.evaluate = async (expression) => {
+    assert.match(expression, /http:\/\/127\.0\.0\.1:45678/u);
+    return { assets: [], primaryApis: [] };
+  };
+  const diagnostics = createRendererReadinessDiagnostics({ cdp });
+  assert.equal(diagnostics.bindSelectedDashboardUrl("about:blank"), null);
+  assert.equal(diagnostics.bindSelectedDashboardUrl("file:///tmp/recovery.html"), null);
+  assert.equal(
+    diagnostics.bindSelectedDashboardUrl("http://127.0.0.1:45678/"),
+    "http://127.0.0.1:45678",
+  );
+  assert.equal(diagnostics.bindSelectedDashboardUrl("http://127.0.0.1:45679/"), null);
+
+  cdp.emit("Network.requestWillBeSent", {
+    requestId: "overview",
+    request: { url: "http://127.0.0.1:45678/api/local/overview" },
+  });
+  cdp.emit("Network.responseReceived", {
+    requestId: "overview",
+    response: { status: 503 },
+  });
+  cdp.emit("Network.loadingFinished", { requestId: "overview" });
+
+  let probedOrigin = null;
+  const snapshot = await diagnostics.snapshotWithTimingAndProbe({
+    probe: async (origin) => {
+      probedOrigin = origin;
+      return [
+        { endpoint: "overview", responseClass: "5xx", outcome: "response" },
+        { endpoint: "gradient", responseClass: "unobserved", outcome: "request_failed" },
+        { endpoint: "weekly", responseClass: "unobserved", outcome: "request_failed" },
+        { endpoint: "quality", responseClass: "unobserved", outcome: "request_failed" },
+      ];
+    },
+  });
+  assert.equal(probedOrigin, "http://127.0.0.1:45678");
+  assert.deepEqual(snapshot.primaryApis[0], {
+    endpoint: "overview", responseClass: "5xx", completion: "finished",
+  });
+  assert.deepEqual(snapshot.primaryProbe[0], {
+    endpoint: "overview", responseClass: "5xx", outcome: "response",
+  });
+  diagnostics.dispose();
+});
+
 test("Linux renderer diagnostic probe shares one bounded deadline and timing evidence never claims network completion", async () => {
   const calls = [];
   const probe = await probeRendererReadinessPrimaryApis("http://127.0.0.1:45678", {
@@ -169,10 +217,11 @@ test("Linux renderer diagnostic probe shares one bounded deadline and timing evi
     assets: [{ asset: "app.js", responseClass: "2xx", completion: "timing_recorded" }],
     primaryApis: [{ endpoint: "overview", responseClass: "5xx", completion: "timing_recorded" }],
   });
-  const diagnostics = createRendererReadinessDiagnostics({
-    cdp,
-    dashboardUrl: "http://127.0.0.1:45678/",
-  });
+  const diagnostics = createRendererReadinessDiagnostics({ cdp });
+  assert.equal(
+    diagnostics.bindSelectedDashboardUrl("http://127.0.0.1:45678/"),
+    "http://127.0.0.1:45678",
+  );
   const snapshot = await diagnostics.snapshotWithTimingAndProbe({ probe: async () => probe });
   assert.deepEqual(snapshot.assets.find(({ asset }) => asset === "app.js"), {
     asset: "app.js", responseClass: "2xx", completion: "timing_recorded",
@@ -206,6 +255,10 @@ test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
   assert.match(source, /attemptedPageTargetIds/u);
   assert.match(source, /Promise\.all\(inspectablePages\.map/u);
   assert.match(source, /attachedPages\.get\(target\.id\)/u);
+  assert.match(
+    source,
+    /rendererReadinessDiagnostics\.bindSelectedDashboardUrl\(selectedDashboardUrl\.href\)/u,
+  );
   assert.doesNotMatch(source, /Target\.setAutoAttach/u);
   assert.match(source, /dashboardUrl\.origin !== selectedDashboardUrl\.origin/u);
   assert.doesNotMatch(
@@ -280,10 +333,22 @@ test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
   assert.match(dockerfile, /USER node/u);
   assert.doesNotMatch(dockerignore, /!patches\//u);
   const readyWait = source.indexOf("const ready = await waitFor");
+  const diagnosticsBind = source.indexOf(
+    "rendererReadinessDiagnostics.bindSelectedDashboardUrl(selectedDashboardUrl.href)",
+  );
+  const runtimeEnabled = source.indexOf('await cdp.request("Runtime.enable")', diagnosticsBind);
   const automaticRefresh = source.indexOf("await assertAutomaticStartupRefresh({");
   assert.ok(
     readyWait >= 0 && automaticRefresh > readyWait,
     "the startup refresh check is ordered after the readiness wait",
+  );
+  assert.ok(
+    diagnosticsBind >= 0 && diagnosticsBind < readyWait,
+    "renderer diagnostics bind only after the selected loopback target is known",
+  );
+  assert.ok(
+    runtimeEnabled > diagnosticsBind && runtimeEnabled < readyWait,
+    "runtime exception observation starts only after the renderer diagnostic origin is bound",
   );
   const pageObserver = source.indexOf("pageRefreshObserver = observeLocalRefreshRequests");
   const networkEnabled = source.indexOf('await pageCdp.request("Network.enable")', pageObserver);
