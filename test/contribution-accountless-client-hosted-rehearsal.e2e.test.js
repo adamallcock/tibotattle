@@ -262,7 +262,11 @@ test("synthetic hosted accountless client proof uses the one reviewed staging or
     requestTimeoutMilliseconds: 10_000,
     stateFile,
   });
-  assert.equal(result.status, "complete");
+  assert.equal(result.status, "complete", JSON.stringify({
+    status: result.status,
+    failure: result.failure,
+    requests,
+  }));
   assert.equal(result.failure, null);
   assert.equal(requests.some(({ path }) => path === "/api/v1/accountless/enrollment"), true);
   assert.equal(requests.some(({ path }) => path === "/api/v1/accountless/ownership"), true);
