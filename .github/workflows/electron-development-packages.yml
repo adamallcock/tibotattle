@@ -141,6 +141,9 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'NATIVE_RUNTIME_REQUIRED' }
           pnpm install --frozen-lockfile --ignore-scripts
           if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }
+      # Fail on native process-probe prerequisites before packaging installers.
+      - name: Validate disposable Windows installer lifecycle contracts
+        run: node --test test/electron-windows-nsis-lifecycle.test.js
       - name: Build the reviewed Windows filesystem binding
         run: |
           $ErrorActionPreference = 'Stop'
@@ -170,8 +173,6 @@ jobs:
           $smokeReceipt = Join-Path $packageRoot 'accountless-storage-smoke.json'
           node scripts/smoke-electron-windows-accountless.mjs --app $appPath --staged-app $stagedApp --package-receipt $packageReceipt --source-revision $env:GITHUB_SHA --receipt $smokeReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_ACCOUNTLESS_PACKAGED_SMOKE_FAILED' }
-      - name: Validate disposable Windows installer lifecycle contracts
-        run: node --test test/electron-windows-nsis-lifecycle.test.js
       - name: Exercise unsigned NSIS install, whole-app restart and owned uninstall
         run: |
           $ErrorActionPreference = 'Stop'

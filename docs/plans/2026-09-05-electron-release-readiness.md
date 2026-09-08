@@ -47,10 +47,26 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest four-target results: `611200c7` in
+Latest four-target results: `45d5ec15` in
+[run 34219167483](https://github.com/adamallcock/tibotattle/actions/runs/34219167483)
+passes both Mac builds, including the real startup-verifier regression. Windows
+still times out in both the exact-executable and Toolhelp native probes, before
+the installed lifecycle. Removing WMI did not resolve the common cause. The
+passing registry probe uses only .NET APIs; the failing probes also require
+PowerShell utility-module loading under the closed child environment. That is
+the next causal check, not yet a verified fix. The prerequisite test now runs
+before native compilation and installer packaging to shorten feedback.
+Linux reports `SERVICE_DEADLINE_NATIVE_READ`: the separate diagnostic reaches
+the read boundary on the native runner and returns before the required wait.
+The original read operation remains the qualification criterion; a successful
+create diagnostic cannot satisfy it. Both original failures and logs remain
+retained. Neither installed Windows lifecycle nor the full Linux credential
+journey is qualified.
+
+The preceding four-target results: `611200c7` in
 [run 34215345667](https://github.com/adamallcock/tibotattle/actions/runs/34215345667)
 passes both Mac builds. Windows's new native empty-result process regression
-hangs inside WMI and fails after its settlement deadline, before the installer
+uses WMI and fails after its settlement deadline, before the installer
 journey. The name filter did not resolve that dependency; both process-inspection
 paths need one bounded native replacement. Linux again fails the service-deadline
 fixture in about one second. The nested-runner environment defect was real but
@@ -64,8 +80,8 @@ The integrated Windows repair at `146ece1a` removes WMI from both process
 proofs. A fixed Toolhelp query supplies real parent PIDs and process creation
 identities; the post-exit proof rechecks only retained PIDs. The early Windows
 regression now exercises this actual helper in the lifecycle's closed child
-environment, including a real child and its exit. Native verification is
-pending; the prior hanging process regression remains a failure.
+environment, including a real child and its exit. Both native probes still
+fail at `45d5ec15`; the API replacement does not close their common failure.
 
 Hosted preparation at `086ae315` fixes the rehearsal target to the isolated
 staging Worker and leaves checked-in accountless admission disabled. The
