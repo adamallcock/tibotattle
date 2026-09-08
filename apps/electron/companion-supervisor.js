@@ -186,6 +186,8 @@ export function createCompanionSupervisor({
   let credentialBroker = null;
   const selectedCredentialBroker = attachCredentialBroker ?? attachLinuxSecretServiceBroker;
   const selectedWindowsAccountObservationBroker = attachWindowsAccountObservationBroker;
+  const requiresNodeIpc = attachPrivateChannel !== undefined
+    || selectedWindowsAccountObservationBroker !== undefined;
   const credentialBrokerKind = attachCredentialBroker !== undefined ? "macos_keychain"
     : attachLinuxSecretServiceBroker !== undefined ? "linux_secret_service"
       : attachWindowsAccountObservationBroker !== undefined ? "windows_account_observation" : null;
@@ -333,11 +335,10 @@ export function createCompanionSupervisor({
         fail(shellError("companion_spawn_failed"));
         return;
       }
-      if (currentChild.connected === false) {
-        fail(shellError("companion_exit_before_ready"), {
-          childAlreadyExited: Number.isSafeInteger(currentChild.exitCode)
-            || typeof currentChild.signalCode === "string",
-        });
+      const childAlreadyExited = Number.isSafeInteger(currentChild.exitCode)
+        || typeof currentChild.signalCode === "string";
+      if (childAlreadyExited || (requiresNodeIpc && currentChild.connected === false)) {
+        fail(shellError("companion_exit_before_ready"), { childAlreadyExited });
         return;
       }
       try {

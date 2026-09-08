@@ -992,11 +992,16 @@ test("companion supervisor announces only its composed Windows observation IPC a
   }
 });
 
-test("companion supervisor refuses a pre-disconnected Windows observation child before broker construction", async () => {
+test("companion supervisor refuses a pre-disconnected Windows IPC child before broker construction", async () => {
   const child = new FakeChild();
   child.connected = false;
-  child.exitCode = 0;
+  child.exitCode = null;
   child.signalCode = null;
+  child.kill = (signal) => {
+    child.kills.push(signal);
+    queueMicrotask(() => child.emit("exit", null, signal));
+    return true;
+  };
   let brokerConstructed = false;
   const supervisor = createCompanionSupervisor({
     spawnChild() { return child; },
@@ -1007,8 +1012,61 @@ test("companion supervisor refuses a pre-disconnected Windows observation child 
   });
   await assert.rejects(supervisor.start(), errorCode("companion_exit_before_ready"));
   assert.equal(brokerConstructed, false);
+  assert.deepEqual(child.kills, ["SIGKILL"]);
+  assert.equal(supervisor.state.state, "stopped");
+});
+
+test("companion supervisor refuses an exited FD4-only child before broker construction", async () => {
+  const child = new FakeChild();
+  child.connected = false;
+  child.exitCode = 0;
+  child.signalCode = null;
+  let brokerConstructed = false;
+  const supervisor = createCompanionSupervisor({
+    spawnChild() { return child; },
+    attachLinuxSecretServiceBroker() {
+      brokerConstructed = true;
+      return { dispose() {} };
+    },
+  });
+  await assert.rejects(supervisor.start(), errorCode("companion_exit_before_ready"));
+  assert.equal(brokerConstructed, false);
   assert.deepEqual(child.kills, []);
   assert.equal(supervisor.state.state, "stopped");
+});
+
+test("companion supervisor accepts FD4-only macOS and Linux brokers without Node IPC", async () => {
+  for (const [factoryName, marker] of [
+    ["attachCredentialBroker", "USAGE_MONITOR_KEYCHAIN_BROKER_FD"],
+    ["attachLinuxSecretServiceBroker", "USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD"],
+  ]) {
+    const child = new FakeChild();
+    const fd4 = new EventEmitter();
+    child.connected = false;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdio = [null, child.stdout, child.stderr, null, fd4];
+    let selected;
+    let attached = null;
+    let disposed = false;
+    const supervisor = createCompanionSupervisor({
+      spawnChild(_command, _args, options) { selected = options; return child; },
+      [factoryName](stream) {
+        attached = stream;
+        return { dispose() { disposed = true; } };
+      },
+    });
+    const started = supervisor.start();
+    child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
+    await started;
+    assert.equal(attached, fd4);
+    assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", "ignore", "pipe"]);
+    assert.equal(selected.env[marker], "4");
+    const stopped = supervisor.stop();
+    child.emit("exit", 0, null);
+    await stopped;
+    assert.equal(disposed, true);
+  }
 });
 
 test("companion supervisor rejects competing credential factories and ambient Windows channel authority", async () => {
