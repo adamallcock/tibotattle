@@ -24,8 +24,30 @@ The newer frozen Mac app `e2c4a784` passes full copied-history refresh and,
 with independently reviewed harness fixes, synthetic tray/settings restart and
 copied-history cancellation/retry. A separate copied-history relaunch run fails
 a startup control-plane request at the existing three-second ceiling. Its
-receipt is preserved and the stall is being investigated. The daily launcher
-therefore still selects verified `1f74bbb6`.
+receipt is preserved. A consistent disposable copy isolates the blocker to the
+synchronous post-write SQLite `PRAGMA quick_check`: a cold scan blocks the event
+loop for 8,545 ms, while open, mutation commit, ordinary reads, projection and
+publication do not reproduce that stall. The in-progress repair moves only the
+read-only integrity scan into a worker and retains the collector lock and success
+gate. The daily launcher still selects verified `1f74bbb6`.
+
+The next native candidate adds the fixed Linux account-observation credential
+facade and its libsecret implementation at `547d4467`. Its read/create-only
+contract uses a digest-only intent and refuses ambiguous recovery. The CI
+harness runs its exact native test in a separate disposable Secret Service
+container and requires the success marker after assertions; a skipped test
+cannot qualify it. Portable integration passes 46 tests with one native-only
+exclusion, 32 packaging tests with two artifact exclusions, and architecture
+checks. Native compilation and execution remain pending.
+
+Windows signing configuration is repaired at `48da8404` and `261bfa83`. The
+pinned packager previously rejected the configured Azure boolean switches and
+ledger fields. Its schema, types and runtime now agree; native `.node` signing
+refusal applies to the configured release ledger, preserving ordinary development
+behavior. Nineteen tests pass against the actual installed patch, including real
+configuration validation, target-completion ordering, cancellation and the
+non-Windows path. All four development runners now execute these tests. This
+uses no signing credentials and does not qualify Authenticode or installation.
 
 The earlier all-four development packaging baseline passes at
 `f26146aaf7fe34845ed7192ae0100e88b9d9b660` in
