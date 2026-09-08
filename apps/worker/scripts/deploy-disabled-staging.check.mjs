@@ -185,6 +185,8 @@ test("bootstrap installs isolated keys only for a confirmed absent Worker", asyn
   generateEnvelopeKeys(secretsFile);
   for (const [name, inventory, expected, installs] of [
     ["absent", { status: 1, stderr: "Worker not found [code: 10007]" }, true, true],
+    ["absent-cli", { status: 1, stderr: 'Worker "app-usagemonitor-staging" (env: staging) not found.' }, true, true],
+    ["other-worker", { status: 1, stderr: 'Worker "unrelated-worker" (env: staging) not found.' }, false, false],
     ["existing", { status: 0, stdout: "[]" }, true, false],
     ["uncertain", { status: 1, stderr: "Network error" }, false, false],
   ]) {

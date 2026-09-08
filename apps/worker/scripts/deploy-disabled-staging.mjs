@@ -284,8 +284,12 @@ export async function runDisabledStagingDeployment({
       });
       // Only first creation may install this file. Existing Workers retain
       // their installed keys; an uncertain inventory must never rotate them.
+      const inventoryOutput = `${installed.stdout ?? ""}\n${installed.stderr ?? ""}`;
       const absent = !installed.error && installed.status !== 0
-        && /\b10007\b/u.test(`${installed.stdout ?? ""}\n${installed.stderr ?? ""}`);
+        && (/\b10007\b/u.test(inventoryOutput)
+          || inventoryOutput.includes(
+            `Worker "${config.env.staging.name}" (env: staging) not found.`,
+          ));
       if (installed.error || (installed.status !== 0 && !absent)) {
         return { ok: false, code: "STAGING_SECRET_INVENTORY_FAILED" };
       }
