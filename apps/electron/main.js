@@ -344,6 +344,60 @@ export function installMacosSmokeObservation(lifecycle, {
 }
 
 /**
+ * Ask the ordinary Windows lifecycle to quit through the test parent's
+ * inherited pipe. This explicit quit-only control grants no renderer, storage,
+ * status or network capability and never selects a qualification runtime.
+ */
+export function installWindowsNormalCandidateQuitControl(lifecycle, {
+  environment = process.env,
+  messageSource = process,
+  platform = process.platform,
+  onFailure = () => { process.exitCode = 1; },
+} = {}) {
+  if (platform !== "win32"
+      || environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL !== ELECTRON_SMOKE_CONTROL
+      || Object.hasOwn(environment, "USAGE_MONITOR_TEST_LANE")
+      || Object.hasOwn(environment, "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION")
+      || lifecycle?.state?.primaryInstance !== true
+      || typeof lifecycle?.requestQuit !== "function"
+      || messageSource?.connected !== true
+      || typeof messageSource?.on !== "function"
+      || typeof messageSource?.send !== "function") {
+    return () => {};
+  }
+  let active = true;
+  const cleanup = () => {
+    if (!active) return;
+    active = false;
+    messageSource.off?.("message", onMessage);
+    messageSource.off?.("disconnect", cleanup);
+  };
+  const onMessage = (message) => {
+    if (!active || message === null || typeof message !== "object"
+        || Array.isArray(message) || Reflect.ownKeys(message).length !== 1
+        || message.type !== "tibotattle-electron-smoke-quit-v1") return;
+    cleanup();
+    let acknowledged = false;
+    const flushed = (error) => {
+      if (acknowledged) return;
+      acknowledged = true;
+      if (error) return;
+      // Let the acknowledgement reach the parent before the lifecycle tears
+      // down its companion and Electron closes the inherited channel.
+      void Promise.resolve().then(() => lifecycle.requestQuit()).catch(onFailure);
+    };
+    try {
+      messageSource.send({ type: "tibotattle-electron-smoke-quit-accepted-v1" }, flushed);
+    } catch {
+      // An unavailable parent pipe cannot create a successful quit receipt.
+    }
+  };
+  messageSource.on("message", onMessage);
+  messageSource.on("disconnect", cleanup);
+  return cleanup;
+}
+
+/**
  * Install the packaged Windows smoke control only for the exact opt-in test
  * environment. It uses the Node child-process IPC channel because a packaged
  * Windows GUI Electron process has no usable stdin/stdout stream. This is not
@@ -807,6 +861,7 @@ if (process.versions.electron) {
   launchElectronShell({ emitFailureDiagnostic: true })
     .then((lifecycle) => {
       if (lifecycle !== null) installMacosSmokeObservation(lifecycle);
+      if (lifecycle !== null) installWindowsNormalCandidateQuitControl(lifecycle);
       // The Linux GUI smoke needs a deterministic way to exercise the same
       // main-process shutdown path as the tray's Quit action. Keep that
       // control test-only, opt-in, and out of the renderer/preload boundary.
