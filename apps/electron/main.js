@@ -3,7 +3,10 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
-import { launchDesktopRuntime } from "./desktop-runtime.js";
+import {
+  launchDesktopRuntime,
+  validateAccountlessHostedRehearsalMetadata,
+} from "./desktop-runtime.js";
 import { createDesktopTrayIconFactory } from "./desktop-tray.js";
 import {
   PRODUCTION_ELECTRON_CHANNEL,
@@ -113,6 +116,39 @@ export async function readProductionDistribution({
       throw new Error("Rehearsal manifest version does not match its distribution metadata");
     }
     return distribution;
+  } catch {
+    throw shellError("electron_configuration_invalid");
+  }
+}
+
+/**
+ * Read the separate unsigned Dev-package selection for the private hosted
+ * scheduler rehearsal. A normal development app has no field and cannot be
+ * enabled by an environment variable or renderer input.
+ */
+export async function readAccountlessHostedRehearsal({
+  app,
+  platform = process.platform,
+  architecture = process.arch,
+  readManifest = readFile,
+} = {}) {
+  if (!isPackagedElectronApp(app) || app.getName?.() !== "TiboTattle Dev") return null;
+  const appPath = packagedAppPath(app);
+  if (appPath === null) throw shellError("electron_configuration_invalid");
+  try {
+    const bytes = await readManifest(resolve(appPath, "package.json"));
+    if (!Buffer.isBuffer(bytes) || bytes.length > 1_048_576) {
+      throw new Error("Invalid packaged manifest");
+    }
+    const manifest = JSON.parse(bytes.toString("utf8"));
+    if (!Object.hasOwn(manifest, "tibotattleAccountlessHostedRehearsal")) return null;
+    if (Object.hasOwn(manifest, "tibotattleDistribution")) {
+      throw new Error("Hosted rehearsal manifest carries production metadata");
+    }
+    return validateAccountlessHostedRehearsalMetadata(
+      manifest.tibotattleAccountlessHostedRehearsal,
+      { platform, architecture },
+    );
   } catch {
     throw shellError("electron_configuration_invalid");
   }
@@ -646,6 +682,7 @@ export async function launchElectronShell({
     // record remains source-only until its real credential/identity and
     // installed lifecycle gates are qualified.
     const productionDistribution = await readProductionDistribution({ app });
+    const accountlessHostedRehearsal = await readAccountlessHostedRehearsal({ app });
     assertElectronPlatformGate({
       platform: process.platform,
       architecture: process.arch,
@@ -661,8 +698,10 @@ export async function launchElectronShell({
     // A local-QA launch must never inherit production sending or updating.
     const productionEnabled = productionDistribution !== null
       && environment.USAGE_MONITOR_TEST_LANE === undefined;
-    // A rehearsal candidate retains the signed native handover and FD4
-    // continuity path, but it never enables the accountless FD3/upload path.
+    // A native-to-Electron handover candidate retains the signed handover and
+    // FD4 continuity path, but it never enables the accountless FD3/upload
+    // path. The separate unsigned hosted scheduler rehearsal is selected
+    // below from its own packaged Dev manifest.
     const accountlessProductionEnabled = productionEnabled
       && productionDistribution.channel === PRODUCTION_ELECTRON_CHANNEL;
     const linuxQualificationSupervisorOptions =
@@ -720,6 +759,7 @@ export async function launchElectronShell({
             macCredentialHandover.createAccountlessCredentialBackend,
         }),
       } : undefined,
+      accountlessHostedRehearsal: accountlessHostedRehearsal ?? undefined,
     });
     installWindowsSmokeControl(desktop.lifecycle, {
       environment,

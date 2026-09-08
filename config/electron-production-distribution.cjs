@@ -12,6 +12,20 @@ const PRODUCTION_ELECTRON_APP_ID = "com.usagemonitor.local";
 const PRODUCTION_ELECTRON_CHANNEL = "stable";
 const PRODUCTION_ELECTRON_CONTRIBUTION_POLICY = "accountless-opt-out-v1";
 const PRODUCTION_ELECTRON_UPDATE_ORIGIN = "https://updates.tibotattle.com";
+// This is a separately packaged, unsigned development-only selection for
+// the private hosted scheduler rehearsal. It deliberately has no production
+// app identity, updater feed, signing contract, or native Keychain adapter.
+// The reviewed staging origin remains in config/deployment-endpoints.js so
+// this policy never becomes a second authority for Worker hostnames.
+const ACCOUNTLESS_HOSTED_REHEARSAL_APP_ID =
+  "com.adamallcock.tibotattle.electron.dev";
+const ACCOUNTLESS_HOSTED_REHEARSAL_CHANNEL =
+  "accountless-hosted-rehearsal-v1";
+const ACCOUNTLESS_HOSTED_REHEARSAL_CREDENTIAL_STORAGE =
+  "electron-safe-storage-file-v1";
+const ACCOUNTLESS_HOSTED_REHEARSAL_SCHEMA_VERSION =
+  "tibotattle-accountless-hosted-rehearsal-v1";
+const ACCOUNTLESS_HOSTED_REHEARSAL_TARGET = "darwin-arm64";
 // The native-to-Electron handover accepts one explicit, ordered prerelease
 // pair. It shares a private target-scoped feed so an installed current
 // candidate can discover the later candidate, while remaining isolated from
@@ -260,6 +274,11 @@ function productionElectronMacOSBundleShortVersionForTarget({ target, version } 
 }
 
 module.exports = Object.freeze({
+  ACCOUNTLESS_HOSTED_REHEARSAL_APP_ID,
+  ACCOUNTLESS_HOSTED_REHEARSAL_CHANNEL,
+  ACCOUNTLESS_HOSTED_REHEARSAL_CREDENTIAL_STORAGE,
+  ACCOUNTLESS_HOSTED_REHEARSAL_SCHEMA_VERSION,
+  ACCOUNTLESS_HOSTED_REHEARSAL_TARGET,
   PRODUCTION_ELECTRON_APP_ID,
   PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN,
   PRODUCTION_ELECTRON_CHANNEL,

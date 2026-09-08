@@ -12,6 +12,8 @@ import { DESKTOP_DEFAULT_SETTINGS } from "../desktop-contract.js";
 import { DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION } from "../desktop-first-run.js";
 import { launchDesktopRuntime } from "../desktop-runtime.js";
 import { createProductionDistributionMetadata } from "../desktop-updater.js";
+import distribution from "../../../config/electron-production-distribution.cjs";
+import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
 import {
   DESKTOP_SHELL_NOTIFICATION_EVIDENCE_SCHEMA_VERSION,
   DESKTOP_SHELL_STATUS_SCHEMA_VERSION,
@@ -253,12 +255,25 @@ function runtime(app) {
         assert.equal(app.ready, true);
         return { response: 0 };
       },
+      showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
     },
     BrowserWindow: FakeWindow,
     Tray: FakeTray,
     Menu: { buildFromTemplate: (template) => ({ template }) },
     icon: "test-icon",
   };
+}
+
+function hostedRehearsalMetadata(sourceRevision = "a".repeat(40)) {
+  return Object.freeze({
+    appId: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_APP_ID,
+    channel: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_CHANNEL,
+    credentialStorage: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_CREDENTIAL_STORAGE,
+    origin: DEPLOYMENT_ENDPOINTS.staging.origin,
+    schemaVersion: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_SCHEMA_VERSION,
+    sourceRevision,
+    target: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_TARGET,
+  });
 }
 
 function shellStatus({ usedPercent, observedAt }) {
@@ -329,6 +344,7 @@ async function launchFixture({
   lifecycleOptions = {},
   accountlessLaboratory,
   accountlessProduction,
+  accountlessHostedRehearsal,
   productionDistribution,
   prepareNativeHandover,
   sharingBackend,
@@ -344,6 +360,7 @@ async function launchFixture({
   FakeTray.instances = [];
   FakeWindow.instances = [];
   const app = suppliedApp ?? new FakeApp();
+  const hostedRehearsal = accountlessHostedRehearsal !== undefined;
   const children = [];
   const spawnCalls = [];
   const backend = { load, save };
@@ -357,20 +374,24 @@ async function launchFixture({
       preloadPath: "/repo/apps/electron/preload.cjs",
     },
     environment,
-    platformServices: suppliedPlatformServices ?? (productionDistribution ? undefined : platformServices()),
-    notificationBackend,
-    firstRunReceiptBackend,
+    platformServices: suppliedPlatformServices ?? (productionDistribution || hostedRehearsal
+      ? undefined : platformServices()),
+    ...(hostedRehearsal ? {} : {
+      notificationBackend,
+      firstRunReceiptBackend,
+    }),
     platform,
     architecture,
-    argv,
+    ...(hostedRehearsal ? {} : { argv }),
     lifecycleOptions,
     accountlessLaboratory,
     accountlessProduction,
+    accountlessHostedRehearsal,
     productionDistribution,
     prepareNativeHandover,
     sharingBackend,
     sharingInstallationState,
-    settingsBackend: backend,
+    ...(hostedRehearsal ? {} : { settingsBackend: backend }),
     supervisorOptions: {
       spawnChild(_command, args, options) {
         spawnCalls.push({ args: [...args], options });
@@ -406,6 +427,98 @@ test("normal desktop cannot enable accountless uploads through environment varia
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, undefined);
   assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
   await fixture.desktop.lifecycle.requestQuit();
+});
+
+test("compiled hosted rehearsal owns every history, state and private scheduler root", async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "hosted-rehearsal-runtime-"));
+  let fixture;
+  t.after(async () => {
+    await fixture?.desktop.lifecycle.requestQuit();
+    await rm(profile, { recursive: true, force: true });
+  });
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle Dev";
+  app.getVersion = () => "0.1.19";
+  app.getPath = () => profile;
+  fixture = await launchFixture({
+    app,
+    accountlessHostedRehearsal: hostedRehearsalMetadata(),
+    childFactory: () => new FakeIpcChild(),
+    environment: {
+      HOME: "/ambient/home",
+      USERPROFILE: "/ambient/profile",
+      CODEX_HOME: "/ambient/codex",
+      CODEX_BIN: "/ambient/codex-bin",
+      CODEX_THREAD_ID: "ambient-thread",
+      CLAUDE_CONFIG_DIR: "/ambient/claude-config",
+      CLAUDE_PROJECT_DIR: "/ambient/claude-project",
+      CLAUDE_PROJECT_DIRECTORY: "/ambient/claude-project-directory",
+      USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "legacy",
+      USAGE_MONITOR_ACCOUNTLESS_MODE: "production-v1",
+      USAGE_MONITOR_ACCOUNTLESS_ORIGIN: "https://unreviewed.example",
+      USAGE_MONITOR_CENTRAL_ORIGIN: "https://unreviewed.example",
+      USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE: "/ambient/queue",
+      USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/ambient/export-secret",
+      USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY: "1",
+      USAGE_MONITOR_PREPARED_DIRECTORY: "/ambient/prepared",
+      USAGE_MONITOR_RESOURCE_ROOT: "/ambient/resources",
+      USAGE_MONITOR_STATE_ROOT: "/ambient/state",
+      USAGE_MONITOR_TEST_LANE: "ambient-lane",
+      XDG_CACHE_HOME: "/ambient/xdg-cache",
+      XDG_CONFIG_HOME: "/ambient/xdg-config",
+      XDG_DATA_HOME: "/ambient/xdg-data",
+      XDG_RUNTIME_DIR: "/ambient/xdg-runtime",
+      XDG_STATE_HOME: "/ambient/xdg-state",
+    },
+  });
+  const environment = fixture.spawnCalls[0].options.env;
+  const root = join(profile, "accountless-hosted-rehearsal-v1");
+  const syntheticHome = join(root, "synthetic-home");
+  assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  assert.equal(environment.HOME, syntheticHome);
+  assert.equal(environment.USERPROFILE, syntheticHome);
+  assert.equal(environment.CODEX_HOME, join(syntheticHome, ".codex"));
+  assert.equal(environment.CLAUDE_CONFIG_DIR, join(syntheticHome, ".claude"));
+  assert.equal(environment.CLAUDE_PROJECT_DIR, join(syntheticHome, "project"));
+  assert.equal(environment.CLAUDE_PROJECT_DIRECTORY, join(syntheticHome, "project"));
+  assert.equal(environment.USAGE_MONITOR_ACCOUNTING_SOURCE_MODE, "unified");
+  assert.equal(environment.USAGE_MONITOR_STATE_ROOT, join(root, "companion-state"));
+  assert.equal(environment.USAGE_MONITOR_RESOURCE_ROOT, "/repo");
+  // The supervisor deliberately passes only XDG state. The other ambient
+  // XDG roots are scrubbed and cannot expand the child configuration surface.
+  assert.equal(environment.XDG_CACHE_HOME, undefined);
+  assert.equal(environment.XDG_CONFIG_HOME, undefined);
+  assert.equal(environment.XDG_DATA_HOME, undefined);
+  assert.equal(environment.XDG_RUNTIME_DIR, undefined);
+  assert.equal(environment.XDG_STATE_HOME, join(root, "xdg-state"));
+  assert.equal(environment.USAGE_MONITOR_ACCOUNTLESS_MODE, "rehearsal-v1");
+  assert.equal(environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, DEPLOYMENT_ENDPOINTS.staging.origin);
+  for (const key of [
+    "CODEX_BIN",
+    "CODEX_THREAD_ID",
+    "USAGE_MONITOR_CENTRAL_ORIGIN",
+    "USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE",
+    "USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE",
+    "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY",
+    "USAGE_MONITOR_PREPARED_DIRECTORY",
+    "USAGE_MONITOR_TEST_LANE",
+  ]) {
+    assert.equal(environment[key], undefined, key);
+  }
+});
+
+test("compiled hosted rehearsal refuses test and settings injection before Electron readiness", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle Dev";
+  await assert.rejects(launchFixture({
+    app,
+    accountlessHostedRehearsal: hostedRehearsalMetadata(),
+    platformServices: platformServices(),
+    childFactory: () => new FakeIpcChild(),
+  }), { code: "electron_shell_electron_configuration_invalid" });
+  assert.equal(app.readyCalls, 0);
 });
 
 test("macOS production runtime connects updater controls to protected preferences and owned-child shutdown", {
@@ -1282,6 +1395,114 @@ for (const production of [false, true]) test(`desktop ${production ? "production
     assert.equal(encryptions, 1, "explicit re-enable reuses the same installation credential");
   }
   await restarted.desktop.lifecycle.requestQuit();
+});
+
+test("compiled hosted rehearsal keeps the real private scheduler default-on, retryable and durably opted out", async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "hosted-rehearsal-scheduler-"));
+  const profileRoot = join(profile, "accountless-hosted-rehearsal-v1");
+  // A future package rehearsal seeds only raw synthetic activity before the
+  // first launch. It must never pre-create managed collector or index state,
+  // because those records classify the profile as an existing installation.
+  await mkdir(join(profileRoot, "synthetic-home", ".codex", "sessions"), {
+    recursive: true,
+    mode: 0o700,
+  });
+  await writeFile(join(profileRoot, "synthetic-home", ".codex", "sessions", "synthetic.jsonl"),
+    "{\"type\":\"synthetic\"}\n", { mode: 0o600 });
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle Dev";
+  app.getVersion = () => "0.1.19";
+  app.getPath = () => profile;
+  const key = randomBytes(32);
+  let encryptionAvailable = false;
+  let encryptions = 0;
+  let decryptions = 0;
+  const safeStorage = {
+    isAsyncEncryptionAvailable: async () => encryptionAvailable,
+    async encryptStringAsync(value) {
+      encryptions += 1;
+      const nonce = randomBytes(12);
+      const cipher = createCipheriv("aes-256-gcm", key, nonce);
+      const body = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]);
+      return Buffer.concat([nonce, cipher.getAuthTag(), body]);
+    },
+    async decryptStringAsync(bytes) {
+      decryptions += 1;
+      const decipher = createDecipheriv("aes-256-gcm", key, bytes.subarray(0, 12));
+      decipher.setAuthTag(bytes.subarray(12, 28));
+      return {
+        result: Buffer.concat([
+          decipher.update(bytes.subarray(28)),
+          decipher.final(),
+        ]).toString("utf8"),
+        shouldReEncrypt: false,
+      };
+    },
+  };
+  const options = {
+    app,
+    accountlessHostedRehearsal: hostedRehearsalMetadata("b".repeat(40)),
+    environment: {
+      HOME: "/ambient/home",
+      CODEX_HOME: "/ambient/codex",
+      USAGE_MONITOR_ACCOUNTLESS_ORIGIN: "https://unreviewed.example",
+      USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE: "/ambient/identity",
+      XDG_STATE_HOME: "/ambient/state",
+    },
+    runtimeOverrides: { safeStorage },
+    ownedCompanionScript: fileURLToPath(new URL(
+      "../../../test/fixtures/accountless-runtime-child.mjs",
+      import.meta.url,
+    )),
+  };
+  const launched = [];
+  const waitFor = async (predicate) => {
+    const deadline = Date.now() + 5_000;
+    while (!await predicate()) {
+      assert.ok(Date.now() < deadline, "owned hosted rehearsal companion did not reach expected state");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  };
+  try {
+    const first = await launchFixture(options);
+    launched.push(first);
+    assert.deepEqual(first.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+    assert.equal(first.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN,
+      DEPLOYMENT_ENDPOINTS.staging.origin);
+    assert.equal(first.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_MODE, "rehearsal-v1");
+    await waitFor(async () => (await first.desktop.sharingCoordinator.inspect()).transportStatus === "retry_wait");
+    assert.equal(encryptions, 0, "an unavailable local safeStorage provider cannot mint a credential");
+    encryptionAvailable = true;
+    first.children[0].send({
+      schemaVersion: "synthetic-accountless-runtime-control-v1",
+      action: "run",
+    });
+    await waitFor(async () => (await first.desktop.sharingCoordinator.inspect()).transportStatus === "up_to_date");
+    assert.equal(encryptions, 1);
+    const credentialPath = join(profileRoot, "desktop-settings", "accountless-installation-credential-v1.json");
+    const stored = await readFile(credentialPath, "utf8");
+    assert.deepEqual(Object.keys(JSON.parse(stored)).sort(), ["encrypted", "schemaVersion"]);
+    await first.desktop.sharingCoordinator.setEnabled(false);
+    assert.equal((await first.desktop.sharingCoordinator.inspect()).transportStatus, "off");
+    await first.desktop.lifecycle.requestQuit();
+
+    const readsBeforeRestart = decryptions;
+    const restarted = await launchFixture(options);
+    launched.push(restarted);
+    await waitFor(async () => (await restarted.desktop.sharingCoordinator.inspect()).transportStatus === "off");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.equal(decryptions, readsBeforeRestart,
+      "persistent opt-out denies credential access after a profile restart");
+    await restarted.desktop.sharingCoordinator.setEnabled(true);
+    await waitFor(async () => (await restarted.desktop.sharingCoordinator.inspect()).transportStatus === "up_to_date");
+    assert.equal(encryptions, 1, "re-enable reuses the isolated installation credential");
+    await restarted.desktop.lifecycle.requestQuit();
+  } finally {
+    await Promise.all(launched.map((fixture) => fixture.desktop.lifecycle.requestQuit()));
+    key.fill(0);
+    await rm(profile, { recursive: true, force: true });
+  }
 });
 
 test("runtime persists the fixed Electron appearance and updates live renderers", async () => {

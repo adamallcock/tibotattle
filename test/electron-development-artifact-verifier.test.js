@@ -40,6 +40,7 @@ import {
 import {
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../src/platform/windows-filesystem.js";
+import { createAccountlessHostedRehearsalMetadata } from "../scripts/lib/electron-builder-package-json.mjs";
 
 const require = createRequire(import.meta.url);
 const asar = createRequire(require.resolve("electron-builder"))("@electron/asar");
@@ -211,6 +212,7 @@ async function makeFixture(
     extraArchive = null,
     keytarMutation = null,
     physicalUnpackedMutation = null,
+    packageMetadata = {},
     unpackPattern = target === "linux-x64" ? "{**/*.node,**/linux_credential_mutex.node.manifest.json}" : "**/*.node",
   } = {},
 ) {
@@ -230,6 +232,7 @@ async function makeFixture(
       private: true,
       type: "module",
       version: "0.1.12",
+      ...packageMetadata,
     }) + "\n")],
     ["apps/local/server.js", Buffer.from("export default {};\n")],
     ["apps/web/public/index.html", Buffer.from("<!doctype html>\n")],
@@ -352,12 +355,13 @@ async function withFixture(target, options, run) {
   }
 }
 
-function verify(fixture, target) {
+function verify(fixture, target, options = {}) {
   return verifyElectronDevelopmentArtifact({
     target,
     appPath: fixture.appPath,
     asarPath: fixture.asarPath,
     unpackedPath: fixture.unpackedPath,
+    ...options,
   });
 }
 
@@ -379,6 +383,31 @@ test("verifies a macOS arm64 archive/unpacked union with aggregate-only output",
       "asar", "artifact", "binding", "nativeFileCount", "staged", "status", "target", "unpacked",
     ].sort());
   });
+});
+
+test("hosted rehearsal archive requires its exact selected metadata even when all staged bytes match", async () => {
+  const metadata = createAccountlessHostedRehearsalMetadata({ sourceRevision: "a".repeat(40) });
+  const options = {
+    packagingProfile: "accountless-hosted-rehearsal",
+    hostedRehearsalMetadata: metadata,
+  };
+  await withFixture("darwin-arm64", {
+    packageMetadata: { tibotattleAccountlessHostedRehearsal: metadata },
+  }, async (fixture) => {
+    const result = await verify(fixture, "darwin-arm64", options);
+    assert.equal(result.status, FIXED_STATUS.verified);
+    await assert.rejects(verify(fixture, "darwin-arm64"));
+    await assert.rejects(verify(fixture, "darwin-arm64", {
+      ...options,
+      hostedRehearsalMetadata: { ...metadata, sourceRevision: "b".repeat(40) },
+    }));
+  });
+  await withFixture("darwin-arm64", {}, async (fixture) => {
+    await assert.rejects(verify(fixture, "darwin-arm64", options));
+  });
+  await assert.rejects(verifyElectronDevelopmentArtifact({
+    target: "darwin-x64", ...options,
+  }), { code: FIXED_STATUS.targetInvalid });
 });
 
 test("verifies the target-specific Keytar boundary for macOS x64 and Linux x64", async () => {

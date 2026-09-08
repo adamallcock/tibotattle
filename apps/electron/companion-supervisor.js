@@ -31,6 +31,7 @@ const COMPANION_ENVIRONMENT_KEYS = Object.freeze([
   "TEMP",
   "TMP",
   "TMPDIR",
+  "XDG_STATE_HOME",
   "LANG",
   "LC_ALL",
   "TZ",

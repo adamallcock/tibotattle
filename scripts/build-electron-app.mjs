@@ -103,6 +103,7 @@ export async function buildElectronApp({
   packagingProfile,
   packageVersion,
   distributionMetadata,
+  hostedRehearsalMetadata,
 } = {}) {
   const selectedTarget = normalizeElectronTarget(target);
   const selectedPackagingProfile = normalizePackagingProfile(packagingProfile);
@@ -122,6 +123,7 @@ export async function buildElectronApp({
     packagingProfile: selectedPackagingProfile,
     packageVersion,
     distributionMetadata,
+    hostedRehearsalMetadata,
     linuxBindingPath,
     linuxManifestPath,
     ...(windowsInputs ?? {}),

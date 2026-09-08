@@ -1,5 +1,6 @@
 import { isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
+import distribution from "../../config/electron-production-distribution.cjs";
 import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
 
 import { createCompanionSupervisor } from "./companion-supervisor.js";
@@ -67,6 +68,43 @@ import {
 } from "../../src/platform/index.js";
 
 const DESKTOP_SETTINGS_DIRECTORY = "desktop-settings";
+const ACCOUNTLESS_HOSTED_REHEARSAL_DIRECTORY = "accountless-hosted-rehearsal-v1";
+const ACCOUNTLESS_HOSTED_REHEARSAL_METADATA_KEYS = Object.freeze([
+  "appId",
+  "channel",
+  "credentialStorage",
+  "origin",
+  "schemaVersion",
+  "sourceRevision",
+  "target",
+]);
+const ACCOUNTLESS_HOSTED_REHEARSAL_ENVIRONMENT_KEYS = Object.freeze([
+  "CODEX_BIN",
+  "CODEX_HOME",
+  "CODEX_THREAD_ID",
+  "CLAUDE_CONFIG_DIR",
+  "CLAUDE_PROJECT_DIR",
+  "CLAUDE_PROJECT_DIRECTORY",
+  "HOME",
+  "USERPROFILE",
+  "USAGE_MONITOR_ACCOUNTING_SOURCE_MODE",
+  "USAGE_MONITOR_ACCOUNTLESS_MODE",
+  "USAGE_MONITOR_ACCOUNTLESS_ORIGIN",
+  "USAGE_MONITOR_CENTRAL_ORIGIN",
+  "USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE",
+  "USAGE_MONITOR_DEVELOPMENT_EXPORT_SECRET_FILE",
+  "USAGE_MONITOR_ENABLE_DEVELOPMENT_IDENTITY",
+  "USAGE_MONITOR_PREPARED_DIRECTORY",
+  "USAGE_MONITOR_RESOURCE_ROOT",
+  "USAGE_MONITOR_STATE_ROOT",
+  "USAGE_MONITOR_TEST_LANE",
+  "XDG_CACHE_HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_RUNTIME_DIR",
+  "XDG_STATE_HOME",
+]);
+const SOURCE_REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 
 const SETTINGS_CODEX_ROOT_ACTIONS = new Set([
   "getCodexHomesForSettings",
@@ -86,12 +124,100 @@ function assertObject(value, label) {
   return value;
 }
 
+function hasExactKeys(value, keys) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype
+    && Reflect.ownKeys(value).length === keys.length
+    && keys.every((key) => Object.hasOwn(value, key));
+}
+
+/**
+ * The staged package itself is the only authority that may select this
+ * private hosted rehearsal. Renderer settings and launch environment values
+ * cannot supply an origin, storage mode, target, or profile identity.
+ */
+export function validateAccountlessHostedRehearsalMetadata(value, {
+  platform = process.platform,
+  architecture = process.arch,
+} = {}) {
+  if (platform !== "darwin" || architecture !== "arm64"
+      || !hasExactKeys(value, ACCOUNTLESS_HOSTED_REHEARSAL_METADATA_KEYS)
+      || value.appId !== distribution.ACCOUNTLESS_HOSTED_REHEARSAL_APP_ID
+      || value.channel !== distribution.ACCOUNTLESS_HOSTED_REHEARSAL_CHANNEL
+      || value.credentialStorage
+        !== distribution.ACCOUNTLESS_HOSTED_REHEARSAL_CREDENTIAL_STORAGE
+      || value.origin !== DEPLOYMENT_ENDPOINTS.staging.origin
+      || value.schemaVersion
+        !== distribution.ACCOUNTLESS_HOSTED_REHEARSAL_SCHEMA_VERSION
+      || typeof value.sourceRevision !== "string"
+      || !SOURCE_REVISION_PATTERN.test(value.sourceRevision)
+      || value.target !== distribution.ACCOUNTLESS_HOSTED_REHEARSAL_TARGET) {
+    throw new TypeError("accountless hosted rehearsal metadata is invalid");
+  }
+  return Object.freeze({
+    appId: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_APP_ID,
+    channel: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_CHANNEL,
+    credentialStorage: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_CREDENTIAL_STORAGE,
+    origin: DEPLOYMENT_ENDPOINTS.staging.origin,
+    schemaVersion: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_SCHEMA_VERSION,
+    sourceRevision: value.sourceRevision,
+    target: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_TARGET,
+  });
+}
+
 function userDataPath(app) {
   const selected = app?.getPath?.("userData");
   if (typeof selected !== "string" || selected.length === 0) {
     throw new TypeError("Electron userData path is unavailable");
   }
   return resolve(selected);
+}
+
+function accountlessHostedRehearsalPaths(app) {
+  const rootPath = join(userDataPath(app), ACCOUNTLESS_HOSTED_REHEARSAL_DIRECTORY);
+  const syntheticHome = join(rootPath, "synthetic-home");
+  return Object.freeze({
+    codexHome: join(syntheticHome, ".codex"),
+    profileRoot: rootPath,
+    settingsRoot: join(rootPath, DESKTOP_SETTINGS_DIRECTORY),
+    stateRoot: join(rootPath, "companion-state"),
+    syntheticClaudeConfig: join(syntheticHome, ".claude"),
+    syntheticHome,
+    syntheticProject: join(syntheticHome, "project"),
+    xdgCacheHome: join(rootPath, "xdg-cache"),
+    xdgConfigHome: join(rootPath, "xdg-config"),
+    xdgDataHome: join(rootPath, "xdg-data"),
+    xdgRuntimeDirectory: join(rootPath, "xdg-runtime"),
+    xdgStateHome: join(rootPath, "xdg-state"),
+  });
+}
+
+function accountlessHostedRehearsalEnvironment({ environment, paths, resourceRoot }) {
+  const selected = { ...environment };
+  for (const key of ACCOUNTLESS_HOSTED_REHEARSAL_ENVIRONMENT_KEYS) delete selected[key];
+  // This profile owns every root used by the companion. In particular, a
+  // future explicit Claude shadow selection cannot inherit a user config or
+  // project root through the child environment.
+  selected.HOME = paths.syntheticHome;
+  selected.USERPROFILE = paths.syntheticHome;
+  selected.CODEX_HOME = paths.codexHome;
+  selected.CLAUDE_CONFIG_DIR = paths.syntheticClaudeConfig;
+  selected.CLAUDE_PROJECT_DIR = paths.syntheticProject;
+  selected.CLAUDE_PROJECT_DIRECTORY = paths.syntheticProject;
+  selected.USAGE_MONITOR_ACCOUNTING_SOURCE_MODE = "unified";
+  selected.USAGE_MONITOR_STATE_ROOT = paths.stateRoot;
+  // This root identifies only reviewed packaged static/runtime assets. It is
+  // supplied by main.js after resolving the bundle, never inherited from a
+  // caller's environment or renderer setting.
+  selected.USAGE_MONITOR_RESOURCE_ROOT = resourceRoot;
+  selected.XDG_CACHE_HOME = paths.xdgCacheHome;
+  selected.XDG_CONFIG_HOME = paths.xdgConfigHome;
+  selected.XDG_DATA_HOME = paths.xdgDataHome;
+  selected.XDG_RUNTIME_DIR = paths.xdgRuntimeDirectory;
+  selected.XDG_STATE_HOME = paths.xdgStateHome;
+  return selected;
 }
 
 function electronSystemLocales(app) {
@@ -218,6 +344,7 @@ function createNotificationPolicyBackend({
   app,
   platform,
   notificationBackend,
+  rootPath,
   windowsProtectedStateStore,
   qualificationContext,
   architecture = process.arch,
@@ -228,7 +355,7 @@ function createNotificationPolicyBackend({
     }
     return notificationBackend;
   }
-  const rootPath = join(userDataPath(app), DESKTOP_SETTINGS_DIRECTORY);
+  const selectedRootPath = rootPath ?? join(userDataPath(app), DESKTOP_SETTINGS_DIRECTORY);
   const codec = createDesktopNotificationPolicyCodec();
   if (platform === "win32") {
     // The qualified Windows lane must use the branded protected store for
@@ -243,7 +370,7 @@ function createNotificationPolicyBackend({
     });
     const protectedStore = windowsProtectedStateStore ?? createWindowsProtectedStateStore({
       adapter,
-      rootPath,
+      rootPath: selectedRootPath,
     });
     return createWindowsDesktopSettingsBackend({
       platform: "win32",
@@ -254,7 +381,7 @@ function createNotificationPolicyBackend({
   }
   return createPosixDesktopSettingsBackend({
     platform,
-    rootPath,
+    rootPath: selectedRootPath,
     filename: DESKTOP_NOTIFICATION_POLICY_FILE_NAME,
     codec,
   });
@@ -335,12 +462,13 @@ function createSettingsBackend({
   app,
   platform,
   settingsBackend,
+  rootPath,
   windowsProtectedStateStore,
   qualificationContext,
   architecture = process.arch,
 } = {}) {
   if (settingsBackend !== undefined) return settingsBackend;
-  const rootPath = join(userDataPath(app), DESKTOP_SETTINGS_DIRECTORY);
+  const selectedRootPath = rootPath ?? join(userDataPath(app), DESKTOP_SETTINGS_DIRECTORY);
   if (platform === "win32") {
     // Windows never falls back to Node filesystem state. The repository's
     // branded adapter and protected store are the only accepted backend.
@@ -356,7 +484,7 @@ function createSettingsBackend({
     });
     const protectedStore = windowsProtectedStateStore ?? createWindowsProtectedStateStore({
       adapter,
-      rootPath,
+      rootPath: selectedRootPath,
     });
     return createWindowsDesktopSettingsBackend({
       platform: "win32",
@@ -365,7 +493,7 @@ function createSettingsBackend({
   }
   return createPosixDesktopSettingsBackend({
     platform,
-    rootPath,
+    rootPath: selectedRootPath,
   });
 }
 
@@ -406,6 +534,7 @@ export async function launchDesktopRuntime({
   argv,
   accountlessLaboratory,
   accountlessProduction,
+  accountlessHostedRehearsal,
   productionDistribution,
   prepareNativeHandover,
 } = {}) {
@@ -466,7 +595,39 @@ export async function launchDesktopRuntime({
       || app.getName?.() !== "TiboTattle"
       || environment.USAGE_MONITOR_TEST_LANE !== undefined
       || qualificationContext !== null)) throw shellError("electron_configuration_invalid");
-  const accountlessEnabled = accountlessLaboratory !== undefined || accountlessProduction !== undefined;
+  let selectedAccountlessHostedRehearsal;
+  if (accountlessHostedRehearsal !== undefined) {
+    try {
+      selectedAccountlessHostedRehearsal = validateAccountlessHostedRehearsalMetadata(
+        accountlessHostedRehearsal,
+        { platform, architecture },
+      );
+    } catch {
+      throw shellError("electron_configuration_invalid");
+    }
+    if (accountlessLaboratory !== undefined
+        || accountlessProduction !== undefined
+        || productionDistribution !== undefined
+        || prepareNativeHandover !== undefined
+        || qualificationContext !== null
+        || app.isPackaged !== true
+        || app.getName?.() !== "TiboTattle Dev"
+        || platformServices !== undefined
+        || settingsBackend !== undefined
+        || settingsStore !== undefined
+        || notificationBackend !== undefined
+        || sharingBackend !== undefined
+        || sharingInstallationState !== undefined
+        || firstRunReceiptBackend !== undefined
+        || ownedDownloadsRegistry !== undefined
+        || automaticRefreshCadence !== undefined
+        || argv !== undefined) {
+      throw shellError("electron_configuration_invalid");
+    }
+  }
+  const accountlessEnabled = accountlessLaboratory !== undefined
+    || accountlessProduction !== undefined
+    || selectedAccountlessHostedRehearsal !== undefined;
   if (productionDistribution !== undefined) {
     const distribution = validateProductionDistributionMetadata(productionDistribution, {
       platform,
@@ -509,11 +670,26 @@ export async function launchDesktopRuntime({
   if (typeof runtime.BrowserWindow !== "function") {
     throw new TypeError("BrowserWindow is required");
   }
-  const childEnvironment = childEnvironmentWithStateRoot({ app, environment });
+  const hostedRehearsalPaths = selectedAccountlessHostedRehearsal === undefined
+    ? null
+    : accountlessHostedRehearsalPaths(app);
+  const runtimeEnvironment = hostedRehearsalPaths === null
+    ? environment
+    : accountlessHostedRehearsalEnvironment({
+      environment,
+      paths: hostedRehearsalPaths,
+      resourceRoot: paths.resourceRoot,
+    });
+  const childEnvironment = childEnvironmentWithStateRoot({
+    app,
+    environment: runtimeEnvironment,
+  });
   if (productionDistribution !== undefined) {
     childEnvironment.USAGE_MONITOR_STATE_ROOT = join(userDataPath(app), "companion-state");
   }
-  const sharingDestinationOrigin = accountlessProduction?.origin ?? accountlessLaboratory?.origin ?? childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN
+  const sharingDestinationOrigin = selectedAccountlessHostedRehearsal?.origin
+    ?? accountlessProduction?.origin ?? accountlessLaboratory?.origin
+    ?? childEnvironment.USAGE_MONITOR_CENTRAL_ORIGIN
     ?? DEPLOYMENT_ENDPOINTS.public.origin;
   // Never run the legacy scheduler beside the installation policy. The
   // selected accountless mode still requires current server upload authority.
@@ -529,6 +705,16 @@ export async function launchDesktopRuntime({
     delete childEnvironment.USAGE_MONITOR_PREPARED_DIRECTORY;
     childEnvironment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN = accountlessProduction.origin;
     childEnvironment.USAGE_MONITOR_ACCOUNTLESS_MODE = "production-v1";
+  }
+  if (selectedAccountlessHostedRehearsal) {
+    // The package marker selects the one reviewed nonproduction endpoint. No
+    // renderer or inherited environment value can alter the scheduler mode,
+    // destination, queue, or state root.
+    delete childEnvironment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE;
+    delete childEnvironment.USAGE_MONITOR_PREPARED_DIRECTORY;
+    childEnvironment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN =
+      selectedAccountlessHostedRehearsal.origin;
+    childEnvironment.USAGE_MONITOR_ACCOUNTLESS_MODE = "rehearsal-v1";
   }
   let sharingCoordinator;
   let installationCredentialBackend;
@@ -562,14 +748,22 @@ export async function launchDesktopRuntime({
     }) : undefined,
   });
   let updater = null;
-  const services = platformServices ?? runtimePlatformServices({
+  const selectedPlatformServices = platformServices ?? runtimePlatformServices({
     runtime,
     app,
     platform,
-    homeDirectory: runtimeHomeDirectory({ platform, environment }),
-    environment,
+    homeDirectory: runtimeHomeDirectory({ platform, environment: runtimeEnvironment }),
+    environment: runtimeEnvironment,
     getUpdater: () => updater,
   });
+  const services = hostedRehearsalPaths === null
+    ? selectedPlatformServices
+    : Object.freeze({
+      ...selectedPlatformServices,
+      // Renderer settings must not pick a host directory for the compiled
+      // rehearsal. The default root is the profile's synthetic CODEX_HOME.
+      chooseCodexHome: async () => null,
+    });
   const requestedDesktopSystemLocales = lifecycleOptions.desktopSystemLocales;
   const firstRunLocale = lifecycleOptions.desktopLocale ?? "system";
   const deepLinkQueue = createDesktopDeepLinkQueue();
@@ -677,19 +871,30 @@ export async function launchDesktopRuntime({
   }
   const desktopSystemLocales = requestedDesktopSystemLocales
     ?? electronSystemLocales(app);
-  const settingsRootPath = join(userDataPath(app), DESKTOP_SETTINGS_DIRECTORY);
+  const settingsRootPath = hostedRehearsalPaths?.settingsRoot
+    ?? join(userDataPath(app), DESKTOP_SETTINGS_DIRECTORY);
   const injectedSettings = settingsBackend !== undefined || settingsStore !== undefined
     || firstRunReceiptBackend !== undefined;
-  const homeDirectory = runtimeHomeDirectory({ platform, environment });
-  const legacyStateRoots = [defaultExportStateDirectory({ platform, homeDirectory, environment })];
-  if (platform === "darwin") {
+  const homeDirectory = runtimeHomeDirectory({
+    platform,
+    environment: runtimeEnvironment,
+  });
+  const legacyStateRoots = hostedRehearsalPaths === null
+    ? [defaultExportStateDirectory({
+      platform,
+      homeDirectory,
+      environment: runtimeEnvironment,
+    })]
+    : [];
+  if (hostedRehearsalPaths === null && platform === "darwin") {
     legacyStateRoots.push(join(homeDirectory, "Library", "Application Support", "Usage Monitor"));
   }
   // Establish provenance before the first-run receipt or settings create a new
   // managed marker. Injected test backends never inspect real profile state.
   const installationState = sharingInstallationState ?? (injectedSettings
     ? "unknown"
-    : await classifyDesktopSharingInstallation({ profileRoot: userDataPath(app),
+    : await classifyDesktopSharingInstallation({
+      profileRoot: hostedRehearsalPaths?.profileRoot ?? userDataPath(app),
       stateRoot: childEnvironment.USAGE_MONITOR_STATE_ROOT, legacyStateRoots }));
   const needsWindowsProtectedStateStore = platform === "win32"
     && (qualificationContext !== null
@@ -820,6 +1025,7 @@ export async function launchDesktopRuntime({
       app,
       platform,
       settingsBackend,
+      rootPath: settingsRootPath,
       qualificationContext,
       architecture,
       windowsProtectedStateStore,
@@ -840,6 +1046,7 @@ export async function launchDesktopRuntime({
     app,
     platform,
     notificationBackend,
+    rootPath: settingsRootPath,
     qualificationContext,
     architecture,
     windowsProtectedStateStore,
@@ -987,11 +1194,14 @@ export async function launchDesktopRuntime({
   }
 
   function assignCodexHome(home) {
+    if (hostedRehearsalPaths !== null && home.mode !== "default") {
+      throw shellError("desktop_codex_roots_invalid");
+    }
     if (home.mode === "custom") {
       childEnvironment.CODEX_HOME = home.path;
     } else {
       childEnvironment.CODEX_HOME = services.defaultCodexHome
-        ?? join(runtimeHomeDirectory({ platform, environment }), ".codex");
+        ?? join(runtimeHomeDirectory({ platform, environment: runtimeEnvironment }), ".codex");
     }
   }
 
@@ -1010,9 +1220,18 @@ export async function launchDesktopRuntime({
       ({ rootId }) => rootId === selected.primaryRootId,
     );
     if (!primary) throw shellError("desktop_codex_roots_invalid");
+    if (hostedRehearsalPaths !== null && (
+      selected.activityRoots.length !== 1
+      || primary.kind !== "default"
+    )) {
+      // This package can rehearse the real scheduler only from its compiled
+      // synthetic source. A saved UI choice may make the private test profile
+      // unusable, but it can never redirect a companion to host history.
+      throw shellError("desktop_codex_roots_invalid");
+    }
     let primaryPath = primary.kind === "default"
       ? services.defaultCodexHome
-        ?? join(runtimeHomeDirectory({ platform, environment }), ".codex")
+        ?? join(runtimeHomeDirectory({ platform, environment: runtimeEnvironment }), ".codex")
       : primary.path;
     if (typeof primaryPath !== "string" || !isPlatformCodexPath(primaryPath, platform)) {
       throw shellError("desktop_codex_roots_invalid");

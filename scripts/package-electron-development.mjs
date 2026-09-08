@@ -11,6 +11,9 @@ import { fileURLToPath } from "node:url";
 import { buildElectronApp, ELECTRON_APP_OUTPUTS } from "./build-electron-app.mjs";
 import { ELECTRON_TARGETS } from "./build-electron-runtime.mjs";
 import { verifyElectronDevelopmentArtifact } from "./verify-electron-development-artifact.mjs";
+import {
+  createAccountlessHostedRehearsalMetadata,
+} from "./lib/electron-builder-package-json.mjs";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -19,6 +22,7 @@ const SCHEMA = "tibotattle-electron-development-package-v1";
 const TARGET_NAMES = Object.freeze(Object.keys(ELECTRON_TARGETS));
 const SHA = /^[0-9a-f]{40}$/u;
 const FORMATS = new Set(["dir", "distribution"]);
+const ACCOUNTLESS_HOSTED_REHEARSAL_PROFILE = "accountless-hosted-rehearsal";
 
 function fail(code) {
   const error = new Error(`ELECTRON_DEVELOPMENT_${code}`);
@@ -28,7 +32,13 @@ function fail(code) {
 
 export function parseDevelopmentPackageArguments(argv) {
   if (!Array.isArray(argv)) fail("ARGUMENT_INVALID");
-  const result = { target: `${process.platform}-${process.arch}`, format: "distribution", dryRun: false, replaceStaging: false };
+  const result = {
+    target: `${process.platform}-${process.arch}`,
+    format: "distribution",
+    dryRun: false,
+    replaceStaging: false,
+    accountlessHostedRehearsal: false,
+  };
   const seen = new Set();
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -36,6 +46,9 @@ export function parseDevelopmentPackageArguments(argv) {
     seen.add(flag);
     if (flag === "--dry-run") result.dryRun = true;
     else if (flag === "--replace-staging") result.replaceStaging = true;
+    else if (flag === "--accountless-hosted-rehearsal") {
+      result.accountlessHostedRehearsal = true;
+    }
     else if (["--target", "--format", "--windows-binding", "--windows-manifest"].includes(flag)) {
       const value = argv[++index];
       if (!value || value.startsWith("--") || value.includes("\0")) fail("ARGUMENT_INVALID");
@@ -45,11 +58,28 @@ export function parseDevelopmentPackageArguments(argv) {
   if (!TARGET_NAMES.includes(result.target) || !FORMATS.has(result.format)) fail("TARGET_OR_FORMAT_INVALID");
   if (Boolean(result.windowsBindingPath) !== Boolean(result.windowsManifestPath)
       || (result.target !== "win32-x64" && result.windowsBindingPath)) fail("WINDOWS_INPUT_INVALID");
+  if (result.accountlessHostedRehearsal
+      && (result.target !== "darwin-arm64" || result.format !== "dir")) {
+    fail("HOSTED_REHEARSAL_TARGET_OR_FORMAT_INVALID");
+  }
   return Object.freeze(result);
 }
 
-export function developmentPackagePlan({ target, format = "distribution", sourceRevision, hostPlatform = process.platform, hostArchitecture = process.arch }) {
-  if (!TARGET_NAMES.includes(target) || !FORMATS.has(format) || !SHA.test(sourceRevision ?? "")) fail("PLAN_INVALID");
+export function developmentPackagePlan({
+  target,
+  format = "distribution",
+  sourceRevision,
+  hostPlatform = process.platform,
+  hostArchitecture = process.arch,
+  accountlessHostedRehearsal = false,
+}) {
+  if (!TARGET_NAMES.includes(target) || !FORMATS.has(format)
+      || !SHA.test(sourceRevision ?? "")
+      || typeof accountlessHostedRehearsal !== "boolean") fail("PLAN_INVALID");
+  if (accountlessHostedRehearsal
+      && (target !== "darwin-arm64" || format !== "dir")) {
+    fail("HOSTED_REHEARSAL_TARGET_OR_FORMAT_INVALID");
+  }
   const spec = ELECTRON_TARGETS[target];
   const platformFlag = { darwin: "--mac", win32: "--win", linux: "--linux" }[spec.platform];
   const distributionTargets = { darwin: ["dmg", "zip"], win32: ["nsis", "zip"], linux: ["AppImage", "tar.gz"] }[spec.platform];
@@ -62,8 +92,14 @@ export function developmentPackagePlan({ target, format = "distribution", source
     buildHostAvailable: spec.platform === "win32" || hostPlatform === spec.platform
       || (spec.platform === "linux" && hostPlatform === "darwin"),
     stagingDirectory: `.release-build/electron-dev/${target}/app`,
-    outputDirectory: `.release-build/electron-candidates/${sourceRevision}/${target}/${format}`,
+    outputDirectory: accountlessHostedRehearsal
+      ? `.release-build/electron-candidates/${sourceRevision}/${target}/accountless-hosted-rehearsal`
+      : `.release-build/electron-candidates/${sourceRevision}/${target}/${format}`,
     builderArguments: Object.freeze([platformFlag, ...(format === "dir" ? ["dir"] : distributionTargets), `--${spec.architecture}`, "--publish", "never"]),
+    ...(accountlessHostedRehearsal ? {
+      accountlessHostedRehearsal: createAccountlessHostedRehearsalMetadata({ sourceRevision }),
+      packagingProfile: ACCOUNTLESS_HOSTED_REHEARSAL_PROFILE,
+    } : { packagingProfile: "development" }),
     signed: false, published: false, updaterEnabled: false, installedLifecycleQualified: false,
   });
 }
@@ -157,8 +193,16 @@ function artifactPaths(output, target) {
 // Local and CI builds receive the same complete test handoff. These sidecars
 // use the package's own Electron executable as Node, then the reviewed launcher
 // strips node mode and ambient credentials before creating its GUI child.
-export async function writeDevelopmentHandoff({ target, outputDirectory }) {
-  if (!TARGET_NAMES.includes(target)) fail("TARGET_OR_FORMAT_INVALID");
+export async function writeDevelopmentHandoff({
+  target,
+  outputDirectory,
+  accountlessHostedRehearsal = false,
+}) {
+  if (!TARGET_NAMES.includes(target)
+      || typeof accountlessHostedRehearsal !== "boolean"
+      || (accountlessHostedRehearsal && target !== "darwin-arm64")) {
+    fail("TARGET_OR_FORMAT_INVALID");
+  }
   const scripts = target === "win32-x64" ? [
     ["launch-electron-windows-development.mjs", "TiboTattle-Windows-Development-Launcher.mjs", false],
     ["launch-electron-windows-development.cmd", "TiboTattle-Windows-Development-Launch.cmd", false],
@@ -183,7 +227,9 @@ export async function writeDevelopmentHandoff({ target, outputDirectory }) {
       await retain(file, bytes, executable);
     } finally { await handle.close(); }
   }
-  const instructions = target === "win32-x64"
+  const instructions = accountlessHostedRehearsal
+    ? "This unsigned private development package is the compiled hosted accountless scheduler rehearsal. It selects only the reviewed staging origin, keeps all history roots and safeStorage-file credentials below its disposable Electron userData profile, and has no updater, signing, publication, installation, or native Keychain continuity claim."
+    : target === "win32-x64"
     ? "Extract the complete bundle, keeping win-unpacked beside the launch files. Double-click TiboTattle-Windows-Development-Launch.cmd. No separate Node.js installation or source checkout is needed. The persistent private test profile is under %LOCALAPPDATA%\\TiboTattle\\electron-user-test\\win32-x64\\profile. The packaged main process verifies the development runtime and native binding before opening."
     : target === "linux-x64"
       ? "Extract the complete bundle, keeping linux-unpacked beside the launch files. Run ./TiboTattle-Linux-Development-Launch.sh from a Linux x64 desktop. No separate Node.js installation or source checkout is needed. The persistent private test profile uses XDG_STATE_HOME or ~/.local/state/tibotattle/linux-x64-development. Chromium's normal sandbox requirements apply; the launcher never disables the sandbox."
@@ -193,7 +239,9 @@ export async function writeDevelopmentHandoff({ target, outputDirectory }) {
     "",
     instructions,
     "",
-    "Use Settings to select the Codex history to read. Local analysis and sharing controls are testable; hosted accountless uploads remain unavailable in this candidate.",
+    accountlessHostedRehearsal
+      ? "The compiled profile fixes its synthetic activity source. Settings cannot select a host history root. Its accountless preference is private and the only eligible upload destination is the reviewed staging Worker."
+      : "Use Settings to select the Codex history to read. Local analysis and sharing controls are testable; hosted accountless uploads remain unavailable in this candidate.",
     "These are unsigned development artifacts. Production signing, installed migration, updates and native desktop qualification remain separate gates.",
     "",
   ].join("\n")));
@@ -222,13 +270,28 @@ export async function packageElectronDevelopment(options) {
       env, logPath: join(partial, "launcher-check.log"),
     });
   }
-  const stage = await buildElectronApp({ target: options.target, replace: options.replaceStaging, windowsBindingPath: options.windowsBindingPath, windowsManifestPath: options.windowsManifestPath });
+  const hostedRehearsalMetadata = plan.accountlessHostedRehearsal ?? undefined;
+  const stage = await buildElectronApp({
+    target: options.target,
+    replace: options.replaceStaging,
+    windowsBindingPath: options.windowsBindingPath,
+    windowsManifestPath: options.windowsManifestPath,
+    packagingProfile: plan.packagingProfile,
+    ...(hostedRehearsalMetadata === undefined ? {} : { hostedRehearsalMetadata }),
+  });
   void stage;
   const builder = require.resolve("electron-builder/cli.js");
   await run(process.execPath, [builder, "--config", "apps/electron/electron-builder.config.cjs", `--config.directories.output=${partial}`, ...plan.builderArguments], { env, logPath: join(partial, "builder.log") });
   const paths = artifactPaths(partial, options.target);
   const asarPath = join(paths.resources, "app.asar");
-  const verification = await verifyElectronDevelopmentArtifact({ target: options.target, appPath: ELECTRON_APP_OUTPUTS[options.target], asarPath, unpackedPath: `${asarPath}.unpacked` });
+  const verification = await verifyElectronDevelopmentArtifact({
+    target: options.target,
+    appPath: ELECTRON_APP_OUTPUTS[options.target],
+    asarPath,
+    unpackedPath: `${asarPath}.unpacked`,
+    packagingProfile: plan.packagingProfile,
+    ...(hostedRehearsalMetadata === undefined ? {} : { hostedRehearsalMetadata }),
+  });
   const executable = await open(paths.executable, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
   try {
     const header = Buffer.alloc(64 * 1024);
@@ -243,7 +306,11 @@ export async function packageElectronDevelopment(options) {
   }
   const required = options.target.startsWith("darwin-") ? [".dmg", ".zip"] : options.target === "win32-x64" ? [".exe", ".zip"] : [".AppImage", ".tar.gz"];
   if (options.format === "distribution" && required.some((extension) => !distributions.some(({ file }) => file.endsWith(extension)))) fail("DISTRIBUTION_MISSING");
-  const handoff = await writeDevelopmentHandoff({ target: options.target, outputDirectory: partial });
+  const handoff = await writeDevelopmentHandoff({
+    target: options.target,
+    outputDirectory: partial,
+    accountlessHostedRehearsal: options.accountlessHostedRehearsal,
+  });
   if (await cleanSource() !== sourceRevision) fail("SOURCE_CHANGED");
   const receipt = { ...plan, status: "development_package_verified", runtimeExecuted: false, appImageLauncherContractChecked: options.target === "linux-x64", verification, executable: await digestFile(paths.executable), asar: await digestFile(asarPath), distributions, handoff };
   await writeFile(join(partial, "development-package.json"), `${JSON.stringify(receipt, null, 2)}\n`, { flag: "wx", mode: 0o600 });

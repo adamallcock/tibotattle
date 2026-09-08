@@ -36,7 +36,9 @@ import {
   ELECTRON_TARGETS,
 } from "./build-electron-runtime.mjs";
 import {
+  ELECTRON_BUILDER_PACKAGE_PROFILES,
   transformElectronBuilderPackageJsonBytes,
+  validateAccountlessHostedRehearsalMetadata,
 } from "./lib/electron-builder-package-json.mjs";
 import {
   WINDOWS_FILESYSTEM_BINDING_MANIFEST_SCHEMA_VERSION,
@@ -866,6 +868,7 @@ async function readArchive(asarPath) {
   const rows = [];
   const markedUnpacked = new Set();
   const seen = new Set();
+  let packageJsonBytes = null;
   for (const rawPath of listed) {
     const path = normalizeArchivePath(rawPath);
     const lookupPath = archiveLookupPath(path);
@@ -902,6 +905,7 @@ async function readArchive(asarPath) {
       fail(FIXED_STATUS.archiveInvalid);
     }
     seen.add(path);
+    if (path === "package.json") packageJsonBytes = Buffer.from(bytes);
     rows.push({
       bytes: bytes.byteLength,
       path,
@@ -911,6 +915,7 @@ async function readArchive(asarPath) {
   rows.sort((left, right) => comparePathBytes(left.path, right.path));
   return Object.freeze({
     markedUnpacked,
+    packageJsonBytes,
     rows,
   });
 }
@@ -1085,7 +1090,60 @@ async function validateWindowsBinding({ appPath, staged }) {
   return Object.freeze({ bytes: bindingBytes.byteLength, sha256: sha256(bindingBytes) });
 }
 
-async function compareArtifactToStaged({ appPath, staged, archive, unpacked }) {
+async function compareArtifactToStaged({
+  appPath,
+  staged,
+  archive,
+  archivePackageJsonBytes,
+  unpacked,
+  packageJsonOptions,
+}) {
+  const validateProfilePackageJson = (bytes, status) => {
+    let value;
+    try {
+      value = JSON.parse(Buffer.from(bytes).toString("utf8"));
+    } catch {
+      fail(status);
+    }
+    if (value === null || typeof value !== "object" || Array.isArray(value)
+        || value.version !== staged.manifest.releaseVersion) {
+      fail(status);
+    }
+    const hasDistribution = Object.hasOwn(value, "tibotattleDistribution");
+    const hasHostedRehearsal = Object.hasOwn(
+      value,
+      "tibotattleAccountlessHostedRehearsal",
+    );
+    if (packageJsonOptions.profile === "development") {
+      if (hasDistribution || hasHostedRehearsal) fail(status);
+      return;
+    }
+    if (hasDistribution || !hasHostedRehearsal) fail(status);
+    let selected;
+    try {
+      selected = validateAccountlessHostedRehearsalMetadata(
+        value.tibotattleAccountlessHostedRehearsal,
+      );
+    } catch {
+      fail(status);
+    }
+    if (JSON.stringify(selected) !== JSON.stringify(
+      packageJsonOptions.hostedRehearsalMetadata,
+    )) {
+      fail(status);
+    }
+  };
+  const stagedPackageJsonBytes = await readRegularFile(
+    join(appPath, "package.json"),
+    FIXED_STATUS.stagedInventoryInvalid,
+    appPath,
+  );
+  // buildElectronRuntime writes the profile's canonical package metadata into
+  // the staged app before electron-builder reads it. Verify that source of
+  // truth independently of the archive-byte comparison below.
+  validateProfilePackageJson(stagedPackageJsonBytes, FIXED_STATUS.stagedInventoryInvalid);
+  if (archivePackageJsonBytes === null) fail(FIXED_STATUS.inventoryMismatch);
+  validateProfilePackageJson(archivePackageJsonBytes, FIXED_STATUS.inventoryMismatch);
   const artifactRows = [...archive, ...unpacked];
   const artifactMap = rowsByPath(artifactRows);
   const expected = new Set(staged.rows.map(({ path }) => path));
@@ -1104,10 +1162,11 @@ async function compareArtifactToStaged({ appPath, staged, archive, unpacked }) {
       FIXED_STATUS.stagedInventoryInvalid,
       appPath,
     );
-    const transformed = transformElectronBuilderPackageJsonBytes(row.path, sourceBytes, {
-      packageVersion: staged.manifest.releaseVersion,
-      profile: "development",
-    });
+    const transformed = transformElectronBuilderPackageJsonBytes(
+      row.path,
+      sourceBytes,
+      packageJsonOptions,
+    );
     if (transformed === null
         || transformed.byteLength !== artifact.bytes
         || sha256(transformed) !== artifact.sha256) {
@@ -1138,8 +1197,30 @@ export async function verifyElectronDevelopmentArtifact({
   appPath,
   asarPath,
   unpackedPath,
+  packagingProfile = "development",
+  hostedRehearsalMetadata,
 } = {}) {
   if (!Object.hasOwn(TARGETS, target)) fail(FIXED_STATUS.targetInvalid);
+  if (typeof packagingProfile !== "string"
+      || !Object.hasOwn(ELECTRON_BUILDER_PACKAGE_PROFILES, packagingProfile)
+      || !["development", "accountless-hosted-rehearsal"].includes(packagingProfile)) {
+    fail(FIXED_STATUS.inputInvalid);
+  }
+  let selectedHostedRehearsalMetadata;
+  if (packagingProfile === "accountless-hosted-rehearsal") {
+    try {
+      selectedHostedRehearsalMetadata = validateAccountlessHostedRehearsalMetadata(
+        hostedRehearsalMetadata,
+      );
+    } catch {
+      fail(FIXED_STATUS.inputInvalid);
+    }
+    if (target !== selectedHostedRehearsalMetadata.target) {
+      fail(FIXED_STATUS.targetInvalid);
+    }
+  } else if (hostedRehearsalMetadata !== undefined) {
+    fail(FIXED_STATUS.inputInvalid);
+  }
   const selectedAppPath = normalizeInputPath(appPath);
   const selectedAsarPath = normalizeInputPath(asarPath);
   const selectedUnpackedPath = normalizeInputPath(unpackedPath);
@@ -1169,7 +1250,14 @@ export async function verifyElectronDevelopmentArtifact({
       appPath: selectedAppPath,
       staged,
       archive,
+      archivePackageJsonBytes: archiveResult.packageJsonBytes,
       unpacked,
+      packageJsonOptions: {
+        packageVersion: staged.manifest.releaseVersion,
+        profile: packagingProfile,
+        ...(selectedHostedRehearsalMetadata === undefined
+          ? {} : { hostedRehearsalMetadata: selectedHostedRehearsalMetadata }),
+      },
     });
     return Object.freeze({
       status: FIXED_STATUS.verified,

@@ -59,6 +59,7 @@ import {
 import {
   canonicalElectronBuilderPackageJsonBytes,
   ELECTRON_BUILDER_PACKAGE_PROFILES,
+  validateAccountlessHostedRehearsalMetadata,
   validateProductionDistributionMetadata,
 } from "./lib/electron-builder-package-json.mjs";
 import { extractEsmImports } from "./lib/esm-imports.mjs";
@@ -1583,6 +1584,7 @@ export async function buildElectronRuntime({
   packagingProfile = DEFAULT_PACKAGING_PROFILE,
   packageVersion = RELEASE_VERSION,
   distributionMetadata,
+  hostedRehearsalMetadata,
 } = {}) {
   if (typeof includeElectronShell !== "boolean") {
     fail("INVALID_SHELL_MODE", "includeElectronShell must be a boolean");
@@ -1600,6 +1602,7 @@ export async function buildElectronRuntime({
     );
   }
   let selectedDistributionMetadata;
+  let selectedHostedRehearsalMetadata;
   if (selectedPackagingProfile === "production") {
     if (!includeElectronShell) {
       fail(
@@ -1619,6 +1622,26 @@ export async function buildElectronRuntime({
   } else if (distributionMetadata !== undefined) {
     fail("PRODUCTION_DISTRIBUTION", "Distribution metadata requires the production profile");
   }
+  if (selectedPackagingProfile === "accountless-hosted-rehearsal") {
+    if (!includeElectronShell || selectedTarget !== DARWIN_ARM64_TARGET) {
+      fail(
+        "PACKAGING_PROFILE_TARGET",
+        "The hosted accountless rehearsal requires a Darwin arm64 Electron shell build",
+      );
+    }
+    try {
+      selectedHostedRehearsalMetadata = validateAccountlessHostedRehearsalMetadata(
+        hostedRehearsalMetadata,
+      );
+    } catch {
+      fail("HOSTED_REHEARSAL_METADATA", "Hosted accountless rehearsal metadata is invalid");
+    }
+    if (selectedHostedRehearsalMetadata.target !== selectedTarget) {
+      fail("HOSTED_REHEARSAL_METADATA", "Hosted accountless rehearsal target does not match staging");
+    }
+  } else if (hostedRehearsalMetadata !== undefined) {
+    fail("HOSTED_REHEARSAL_METADATA", "Hosted rehearsal metadata requires its selected profile");
+  }
   const selectedPackageVersion = normalizePackageVersion(
     packageVersion,
     selectedDistributionMetadata,
@@ -1627,6 +1650,9 @@ export async function buildElectronRuntime({
     ? Object.freeze({
       ...(selectedDistributionMetadata
         ? { distributionMetadata: selectedDistributionMetadata }
+        : {}),
+      ...(selectedHostedRehearsalMetadata
+        ? { hostedRehearsalMetadata: selectedHostedRehearsalMetadata }
         : {}),
       packageVersion: selectedPackageVersion,
       profile: selectedPackagingProfile,

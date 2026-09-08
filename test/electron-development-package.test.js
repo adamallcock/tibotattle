@@ -25,10 +25,41 @@ test("one development packaging contract covers the four actual target architect
     assert.equal(plan.published, false);
     assert.equal(plan.updaterEnabled, false);
     assert.equal(plan.installedLifecycleQualified, false);
+    assert.equal(plan.packagingProfile, "development");
+    assert.equal(Object.hasOwn(plan, "accountlessHostedRehearsal"), false);
   }
   assert.equal(developmentPackagePlan({ target: "linux-x64", sourceRevision, hostPlatform: "darwin" }).buildHostAvailable, true);
   assert.equal(developmentPackagePlan({ target: "darwin-x64", sourceRevision, hostPlatform: "linux" }).buildHostAvailable, false);
   assert.equal(developmentPackagePlan({ target: "linux-x64", sourceRevision, hostPlatform: "linux", hostArchitecture: "arm64" }).nativeHost, false);
+});
+
+test("hosted scheduler rehearsal is an explicit unsigned arm64 directory package", () => {
+  const options = parseDevelopmentPackageArguments([
+    "--target", "darwin-arm64", "--format", "dir", "--accountless-hosted-rehearsal",
+  ]);
+  assert.equal(options.accountlessHostedRehearsal, true);
+  const plan = developmentPackagePlan({ ...options, sourceRevision });
+  assert.equal(plan.packagingProfile, "accountless-hosted-rehearsal");
+  assert.equal(plan.accountlessHostedRehearsal.sourceRevision, sourceRevision);
+  assert.equal(plan.accountlessHostedRehearsal.target, "darwin-arm64");
+  assert.deepEqual(plan.builderArguments, ["--mac", "dir", "--arm64", "--publish", "never"]);
+  assert.equal(plan.outputDirectory,
+    `.release-build/electron-candidates/${sourceRevision}/darwin-arm64/accountless-hosted-rehearsal`);
+  assert.equal(plan.signed, false);
+  assert.equal(plan.updaterEnabled, false);
+  for (const target of ["darwin-x64", "win32-x64", "linux-x64"]) {
+    assert.throws(() => parseDevelopmentPackageArguments([
+      "--target", target, "--format", "dir", "--accountless-hosted-rehearsal",
+    ]), /HOSTED_REHEARSAL_TARGET_OR_FORMAT_INVALID/u);
+  }
+  assert.throws(() => developmentPackagePlan({
+    target: "darwin-arm64", format: "distribution", sourceRevision,
+    accountlessHostedRehearsal: true,
+  }), /HOSTED_REHEARSAL_TARGET_OR_FORMAT_INVALID/u);
+  assert.throws(() => parseDevelopmentPackageArguments([
+    "--target", "darwin-arm64", "--format", "dir", "--accountless-hosted-rehearsal",
+    "--origin", "https://example.invalid",
+  ]), /ARGUMENT_INVALID/u);
 });
 
 test("package CLI refuses unknown targets, publication flags, duplicate selections and ambiguous native inputs", () => {

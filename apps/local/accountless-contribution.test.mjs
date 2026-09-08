@@ -15,8 +15,10 @@ test("companion accountless mode is absent without an explicit mode and private 
   ]) assert.throws(() => createLocalAccountlessContribution({ environment }), /Invalid accountless contribution configuration/u);
 });
 
-for (const mode of ["laboratory", "production"]) test(`${mode} companion composes saved preference, private credential port and one bounded runner`, async () => {
-  const origin = mode === "laboratory" ? "http://127.0.0.1:18765" : "https://tibotattle.com";
+for (const mode of ["laboratory", "production", "rehearsal"]) test(`${mode} companion composes saved preference, private credential port and one bounded runner`, async () => {
+  const origin = mode === "laboratory" ? "http://127.0.0.1:18765"
+    : mode === "rehearsal" ? DEPLOYMENT_ENDPOINTS.staging.origin
+      : "https://tibotattle.com";
   const parent = new EventEmitter();
   const child = new EventEmitter();
   for (const [from, to] of [[parent, child], [child, parent]]) {
@@ -31,14 +33,15 @@ for (const mode of ["laboratory", "production"]) test(`${mode} companion compose
   const selected = createLocalAccountlessContribution({
     environment: { USAGE_MONITOR_ACCOUNTLESS_ORIGIN: origin,
       ...(mode === "laboratory" ? { USAGE_MONITOR_TEST_LANE: "accountless-local-lab-v1" }
-        : { USAGE_MONITOR_ACCOUNTLESS_MODE: "production-v1" }) },
+        : { USAGE_MONITOR_ACCOUNTLESS_MODE: mode === "rehearsal"
+          ? "rehearsal-v1" : "production-v1" }) },
     stateRoot: "/synthetic", indexFile: "/synthetic/index.sqlite", channel: child,
     schedulerOptions: { setTimer: () => 1, clearTimer: () => {} },
     runner: async (options) => {
       calls++;
       assert.equal(options.laboratory, mode === "laboratory");
       assert.equal(options.production, mode === "production");
-      assert.equal(Object.hasOwn(options, "rehearsal"), false);
+      assert.equal(options.rehearsal, mode === "rehearsal");
       assert.equal(options.origin, origin);
       assert.equal(options.indexFile, "/synthetic/index.sqlite");
       assert.equal(options.stateFile, "/synthetic/accountless-device-binding-v1.json");

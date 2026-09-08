@@ -34,21 +34,46 @@ export function selectLocalAccountlessProductionProfile({
   return true;
 }
 
-// Both modes require the private inherited channel. Only Electron can supply
+/**
+ * The packaged Dev rehearsal uses the same inherited private capability as
+ * production, but its destination is the single reviewed staging Worker.
+ * Neither a renderer nor a child environment can choose another hosted URL.
+ */
+export function selectLocalAccountlessHostedRehearsalProfile({
+  environment,
+  channel = process,
+} = {}) {
+  if (!environment || typeof environment !== "object" || Array.isArray(environment)) {
+    throw accountlessConfigurationError();
+  }
+  if (environment.USAGE_MONITOR_ACCOUNTLESS_MODE === undefined) return false;
+  const origin = environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN;
+  if (environment.USAGE_MONITOR_ACCOUNTLESS_MODE !== "rehearsal-v1"
+      || Object.hasOwn(environment, "USAGE_MONITOR_TEST_LANE")
+      || Object.hasOwn(environment, "USAGE_MONITOR_CENTRAL_ORIGIN")
+      || accountlessTransportOrigin({ rehearsal: true, origin }) === null
+      || typeof channel?.send !== "function" || channel.connected !== true) {
+    throw accountlessConfigurationError();
+  }
+  return true;
+}
+
+// Every mode requires the private inherited channel. Only Electron can supply
 // the protected preference and credential; environment values grant neither.
 export function createLocalAccountlessContribution({
   environment, stateRoot, indexFile, channel = process,
   readAccountMarkers, loadExistingAccountObservationSecret,
   runner = runAccountlessContributionSyncOnce, schedulerOptions = {},
 } = {}) {
-  const production = selectLocalAccountlessProductionProfile({
-    environment,
-    channel,
-  });
+  const selectedMode = environment?.USAGE_MONITOR_ACCOUNTLESS_MODE;
+  const production = selectedMode === "rehearsal-v1" ? false
+    : selectLocalAccountlessProductionProfile({ environment, channel });
+  const rehearsal = selectedMode === "production-v1" ? false
+    : selectLocalAccountlessHostedRehearsalProfile({ environment, channel });
   if (environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN === undefined) return null;
   const origin = environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN;
   const laboratory = environment.USAGE_MONITOR_TEST_LANE === "accountless-local-lab-v1";
-  if (accountlessTransportOrigin({ laboratory, production, origin }) === null
+  if (accountlessTransportOrigin({ laboratory, rehearsal, production, origin }) === null
       || environment.USAGE_MONITOR_CENTRAL_ORIGIN !== undefined
       || (laboratory && environment.USAGE_MONITOR_ACCOUNTLESS_MODE !== undefined)
       || typeof channel.send !== "function" || channel.connected !== true) {
@@ -60,7 +85,7 @@ export function createLocalAccountlessContribution({
   scheduler = createAccountlessContributionScheduler({
     ...schedulerOptions, origin,
     readPreference: bridge.readPreference,
-    runner: ({ signal }) => runner({ laboratory, production, origin, indexFile,
+    runner: ({ signal }) => runner({ laboratory, rehearsal, production, origin, indexFile,
       stateFile: join(stateRoot, "accountless-device-binding-v1.json"),
       progressFile: join(stateRoot, "private", "accountless-upload-progress-v1.json"),
       backend: bridge.backend, readPreference: bridge.readPreference, signal,

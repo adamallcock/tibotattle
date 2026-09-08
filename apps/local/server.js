@@ -65,6 +65,7 @@ import {
 } from "../../src/contribution-incremental-sync.js";
 import {
   createLocalAccountlessContribution,
+  selectLocalAccountlessHostedRehearsalProfile,
   selectLocalAccountlessProductionProfile,
 } from "./accountless-contribution.js";
 import { readLocalCollectorCheckpoint } from "../../src/local-collector-state.js";
@@ -2742,13 +2743,19 @@ export function createLocalCompanionServer(options = {}) {
     throw new TypeError("environment must be an object");
   }
   const accountlessChannel = options.accountlessChannel ?? process;
-  // This is a closed selection, not an environment feature toggle: production
-  // accountless mode requires the live inherited private channel before any
-  // legacy contribution path is accepted or normalized.
-  const accountlessProductionProfile = selectLocalAccountlessProductionProfile({
-    environment,
-    channel: accountlessChannel,
-  });
+  // This is a closed selection, not an environment feature toggle: the
+  // production and compiled rehearsal modes both require the live inherited
+  // private channel before any legacy contribution path is normalized.
+  const accountlessProductionProfile = environment.USAGE_MONITOR_ACCOUNTLESS_MODE
+    === "rehearsal-v1"
+    ? selectLocalAccountlessHostedRehearsalProfile({
+      environment,
+      channel: accountlessChannel,
+    })
+    : selectLocalAccountlessProductionProfile({
+      environment,
+      channel: accountlessChannel,
+    });
   const semanticOpenTarget = configuredSemanticOpenTarget(environment);
   const parentWatchdogPid = configuredParentWatchdogPid(environment);
   const homeDirectory = configuredHomeDirectory(environment);
@@ -2990,16 +2997,23 @@ function createPreparedLocalCompanionServer({
     accountObservationOperationLockFile:
       statePaths.accountObservationLockFile,
     readAccountAttributionBinding: () => readAccountAttributionBinding?.() ?? null,
-    selectAccountObservationSecret: (options = {}) =>
-      selectProductionAccountObservationSecret({
-        ...options,
-        createKeychainBackend: () =>
-          createAppAwareKeychainBackend(environment),
-        createLinuxBackend: () =>
-          createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
-        createWindowsBrokerBackend: () =>
-          createWindowsAccountObservationBrokerBackendFromEnvironment(environment),
-      }),
+    selectAccountObservationSecret: (options = {}) => (
+      // The compiled hosted rehearsal intentionally has no account-observation
+      // capability. Its scheduler uses only the profile-local Electron
+      // safeStorage record received over FD3; even a foreground refresh must
+      // not open the fixed production native record namespace.
+      environment.USAGE_MONITOR_ACCOUNTLESS_MODE === "rehearsal-v1"
+        ? Object.freeze({ loadAccountObservationSecret: null })
+        : selectProductionAccountObservationSecret({
+          ...options,
+          createKeychainBackend: () =>
+            createAppAwareKeychainBackend(environment),
+          createLinuxBackend: () =>
+            createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
+          createWindowsBrokerBackend: () =>
+            createWindowsAccountObservationBrokerBackendFromEnvironment(environment),
+        })
+    ),
     refreshAccounting: refreshReplaySafeAccountingCache,
     refreshClaudeUsageShadow: claudeShadowEnabled
       ? ({ signal }) => claudeShadowController.refresh({ signal })
@@ -3120,14 +3134,19 @@ function createPreparedLocalCompanionServer({
   incrementalAttributionReviewProvider = null,
   accountlessContributionRunner = undefined,
   accountlessSchedulerOptions = undefined,
-  loadExistingAccountObservationSecret = async () => selectProductionAccountObservationSecret({
-    operationLockFile: statePaths.accountObservationLockFile,
-    createKeychainBackend: () => createAppAwareKeychainBackend(environment),
-    createLinuxBackend: () => createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
-    createWindowsBrokerBackend: () =>
-      createWindowsAccountObservationBrokerBackendFromEnvironment(environment),
-    createIfMissing: false,
-  }).loadAccountObservationSecret(),
+  loadExistingAccountObservationSecret = async () => {
+    if (environment.USAGE_MONITOR_ACCOUNTLESS_MODE === "rehearsal-v1") {
+      return null;
+    }
+    return selectProductionAccountObservationSecret({
+      operationLockFile: statePaths.accountObservationLockFile,
+      createKeychainBackend: () => createAppAwareKeychainBackend(environment),
+      createLinuxBackend: () => createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
+      createWindowsBrokerBackend: () =>
+        createWindowsAccountObservationBrokerBackendFromEnvironment(environment),
+      createIfMissing: false,
+    }).loadAccountObservationSecret();
+  },
   readContributionAccountMarkers = async () => {
     try {
       const checkpoint = await readLocalCollectorCheckpoint({ stateFile: statePaths.collectorStateFile });
@@ -3143,11 +3162,18 @@ function createPreparedLocalCompanionServer({
   if (typeof accountlessProductionProfile !== "boolean") {
     throw new TypeError("accountlessProductionProfile must be a boolean");
   }
+  const selectedAccountlessPrivateProfile = environment.USAGE_MONITOR_ACCOUNTLESS_MODE
+    === "rehearsal-v1"
+    ? selectLocalAccountlessHostedRehearsalProfile({
+      environment,
+      channel: accountlessChannel,
+    })
+    : selectLocalAccountlessProductionProfile({
+      environment,
+      channel: accountlessChannel,
+    });
   if (accountlessProductionProfile
-      && (!selectLocalAccountlessProductionProfile({
-        environment,
-        channel: accountlessChannel,
-      })
+      && (!selectedAccountlessPrivateProfile
         || contributionQueueFile !== null
         || preparedContributionDirectory !== null
         || legacyContributionDeviceStateFile !== null

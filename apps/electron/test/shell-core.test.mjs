@@ -34,10 +34,12 @@ import {
   installWindowsSmokeControl,
   installWindowsSmokeControlForTest,
   launchElectronShell,
+  readAccountlessHostedRehearsal,
   readProductionDistribution,
   MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
 } from "../main.js";
 import { createProductionDistributionMetadata } from "../desktop-updater.js";
+import { createAccountlessHostedRehearsalMetadata } from "../../../scripts/lib/electron-builder-package-json.mjs";
 import {
   ELECTRON_ENTRY_FAILURE_DIAGNOSTIC,
   ElectronShellError,
@@ -1252,6 +1254,54 @@ test("production policy reads only the final packaged app manifest and validates
   for (const candidate of [{ ...app, isPackaged: false }, { ...app, getName: () => "TiboTattle Dev" }]) {
     assert.equal(await readProductionDistribution({ app: candidate,
       readManifest: () => { throw new Error("Development must not read production metadata"); } }), null);
+  }
+});
+
+test("hosted rehearsal policy reads only its exact packaged Dev manifest", async () => {
+  const metadata = createAccountlessHostedRehearsalMetadata({
+    sourceRevision: "c".repeat(40),
+  });
+  const packagedAppPath = join(tmpdir(), "tibotattle-hosted-rehearsal-fixture", "app.asar");
+  const paths = [];
+  const app = {
+    isPackaged: true,
+    getName: () => "TiboTattle Dev",
+    getAppPath: () => packagedAppPath,
+  };
+  const readManifest = async (path) => {
+    paths.push(path);
+    return Buffer.from(JSON.stringify({
+      tibotattleAccountlessHostedRehearsal: metadata,
+    }));
+  };
+  assert.deepEqual(await readAccountlessHostedRehearsal({
+    app, platform: "darwin", architecture: "arm64", readManifest,
+  }), metadata);
+  assert.deepEqual(paths, [join(packagedAppPath, "package.json")]);
+  assert.equal(await readAccountlessHostedRehearsal({
+    app, platform: "darwin", architecture: "arm64",
+    readManifest: async () => Buffer.from("{}"),
+  }), null);
+  for (const manifest of [
+    { tibotattleAccountlessHostedRehearsal: { ...metadata, origin: "https://unreviewed.example" } },
+    { tibotattleAccountlessHostedRehearsal: metadata, tibotattleDistribution: {} },
+  ]) {
+    await assert.rejects(readAccountlessHostedRehearsal({
+      app, platform: "darwin", architecture: "arm64",
+      readManifest: async () => Buffer.from(JSON.stringify(manifest)),
+    }), errorCode("electron_configuration_invalid"));
+  }
+  await assert.rejects(readAccountlessHostedRehearsal({
+    app, platform: "darwin", architecture: "x64", readManifest,
+  }), errorCode("electron_configuration_invalid"));
+  for (const candidate of [
+    { ...app, isPackaged: false },
+    { ...app, getName: () => "TiboTattle" },
+  ]) {
+    assert.equal(await readAccountlessHostedRehearsal({
+      app: candidate,
+      readManifest: () => { throw new Error("ordinary app must not read rehearsal metadata"); },
+    }), null);
   }
 });
 

@@ -12,9 +12,12 @@ import test from "node:test";
 
 import {
   canonicalElectronBuilderPackageJsonBytes,
+  createAccountlessHostedRehearsalMetadata,
   createProductionDistributionMetadata,
   transformElectronBuilderPackageJsonBytes,
+  validateAccountlessHostedRehearsalMetadata,
 } from "../scripts/lib/electron-builder-package-json.mjs";
+import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 
 const VERSION = "0.1.16";
 const REHEARSAL_CURRENT_VERSION = "0.1.19-native-to-electron-handover.1";
@@ -56,6 +59,45 @@ test("canonicalizes the Electron root package with the selected fixed profile", 
   assert.equal(development.toString("utf8").endsWith("\n"), false);
   assert.equal(production.toString("utf8").endsWith("\n"), false);
   assert.notEqual(development.toString("utf8"), production.toString("utf8"));
+});
+
+test("hosted rehearsal metadata has one destination and cannot select production credentials or updates", () => {
+  const metadata = createAccountlessHostedRehearsalMetadata({ sourceRevision: SOURCE_REVISION });
+  assert.equal(metadata.origin, DEPLOYMENT_ENDPOINTS.staging.origin);
+  assert.equal(metadata.credentialStorage, "electron-safe-storage-file-v1");
+  const options = {
+    packageVersion: VERSION,
+    profile: "accountless-hosted-rehearsal",
+    hostedRehearsalMetadata: metadata,
+  };
+  const bytes = canonicalElectronBuilderPackageJsonBytes("package.json", rootSource(), options);
+  const value = JSON.parse(bytes);
+  assert.equal(value.productName, "TiboTattle Dev");
+  assert.deepEqual(value.tibotattleAccountlessHostedRehearsal, metadata);
+  assert.equal(Object.hasOwn(value, "tibotattleDistribution"), false);
+  assert.deepEqual(canonicalElectronBuilderPackageJsonBytes("package.json", bytes, options), bytes);
+  for (const mutation of [
+    { origin: DEPLOYMENT_ENDPOINTS.public.origin },
+    { target: "darwin-x64" },
+    { appId: "com.usagemonitor.local" },
+    { credentialStorage: "native-keychain" },
+    { updateFeed: "https://example.invalid/feed" },
+    { sourceRevision: "main" },
+  ]) {
+    assert.throws(() => validateAccountlessHostedRehearsalMetadata({ ...metadata, ...mutation }), /invalid/u);
+  }
+  assert.throws(() => canonicalElectronBuilderPackageJsonBytes("package.json", rootSource(), {
+    ...options, profile: "development",
+  }), /not allowed/u);
+  assert.throws(() => canonicalElectronBuilderPackageJsonBytes("package.json", rootSource(), {
+    packageVersion: VERSION, profile: "accountless-hosted-rehearsal",
+  }), /invalid/u);
+  const markedSource = Buffer.from(JSON.stringify({
+    ...JSON.parse(rootSource()), tibotattleAccountlessHostedRehearsal: metadata,
+  }));
+  assert.throws(() => canonicalElectronBuilderPackageJsonBytes("package.json", markedSource, {
+    packageVersion: VERSION, profile: "development",
+  }), TypeError);
 });
 
 test("package-json canonicalization is idempotent and preserves dependency integrity", () => {
