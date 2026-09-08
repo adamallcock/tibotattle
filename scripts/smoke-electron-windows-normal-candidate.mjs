@@ -87,6 +87,11 @@ const FAILURE_CODES = new Set([
   "RECEIPT_INVALID",
   "SOURCE_CANDIDATE_INVALID",
   "PACKAGE_IDENTITY_INVALID",
+  "PACKAGE_PATHS_INVALID",
+  "PACKAGE_STAGED_MANIFEST_INVALID",
+  "PACKAGE_ARCHIVE_MANIFEST_INVALID",
+  "PACKAGE_METADATA_INVALID",
+  "PACKAGE_NATIVE_MEMBERS_INVALID",
   "NATIVE_PAIR_INVALID",
   "ASAR_UNAVAILABLE",
   "PROFILE_INVALID",
@@ -260,11 +265,11 @@ function stableMetadata(value, sourceRevision) {
       architecture: "x64",
     });
   } catch {
-    fail("PACKAGE_IDENTITY_INVALID");
+    fail("PACKAGE_METADATA_INVALID");
   }
   if (metadata.target !== TARGET || metadata.channel !== "stable"
       || metadata.sourceRevision !== sourceRevision) {
-    fail("PACKAGE_IDENTITY_INVALID");
+    fail("PACKAGE_METADATA_INVALID");
   }
   return metadata;
 }
@@ -283,7 +288,7 @@ export function validateWindowsNormalCandidateSmokeMetadata({
   if (JSON.stringify(staged) !== JSON.stringify(archived)
       || stagedManifest?.version !== sourceCandidate.version
       || archiveManifest?.version !== sourceCandidate.version) {
-    fail("PACKAGE_IDENTITY_INVALID");
+    fail("PACKAGE_METADATA_INVALID");
   }
   return Object.freeze({ sourceRevision, target: TARGET, distribution: staged });
 }
@@ -320,28 +325,38 @@ function loadAsar() {
   }
 }
 
-function readArchiveFile(archivePath, member, asar = loadAsar()) {
+function readArchiveFile(
+  archivePath,
+  member,
+  asar = loadAsar(),
+  code = "PACKAGE_IDENTITY_INVALID",
+) {
   let bytes;
   try {
     bytes = asar.extractFile(archivePath, member);
   } catch {
-    fail("PACKAGE_IDENTITY_INVALID");
+    fail(code);
   }
   if (!(Buffer.isBuffer(bytes) || bytes instanceof Uint8Array)
       || bytes.byteLength < 1 || bytes.byteLength > MAXIMUM_JSON_BYTES) {
-    fail("PACKAGE_IDENTITY_INVALID");
+    fail(code);
   }
   return Buffer.from(bytes);
 }
 
-function readArchiveJson(archivePath, member, asar = loadAsar()) {
+function readArchiveJson(
+  archivePath,
+  member,
+  asar = loadAsar(),
+  code = "PACKAGE_IDENTITY_INVALID",
+) {
   try {
-    const value = JSON.parse(readArchiveFile(archivePath, member, asar).toString("utf8"));
-    if (!exactObject(value)) fail("PACKAGE_IDENTITY_INVALID");
+    const value = JSON.parse(readArchiveFile(archivePath, member, asar, code).toString("utf8"));
+    if (!exactObject(value)) fail(code);
     return value;
   } catch (error) {
     if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
-    fail("PACKAGE_IDENTITY_INVALID");
+    fail(code);
   }
 }
 
@@ -349,36 +364,62 @@ function sameDigest(left, right) {
   return left?.bytes === right?.bytes && left?.sha256 === right?.sha256;
 }
 
-async function digestArchiveMember(archivePath, member, { asar = loadAsar() } = {}) {
-  const bytes = readArchiveFile(archivePath, member, asar);
+async function digestArchiveMember(
+  archivePath,
+  member,
+  { asar = loadAsar(), code = "PACKAGE_IDENTITY_INVALID" } = {},
+) {
+  const bytes = readArchiveFile(archivePath, member, asar, code);
   return Object.freeze({
     bytes: bytes.byteLength,
     sha256: createHash("sha256").update(bytes).digest("hex"),
   });
 }
 
-async function validateNativePair({ stagedAppPath, asarPath, unpackedPath, asar = loadAsar() } = {}) {
+async function validateNativePair({
+  stagedAppPath,
+  asarPath,
+  unpackedPath,
+  asar = loadAsar(),
+  failureCode = "PACKAGE_NATIVE_MEMBERS_INVALID",
+} = {}) {
   const relativeBinding = WINDOWS_ELECTRON_BINDING_RELATIVE_PATH;
   const relativeManifest = `${relativeBinding}.manifest.json`;
   const relativeKeytar = WINDOWS_ELECTRON_KEYTAR_RELATIVE_PATH;
   const [stagedBinding, packagedBinding, stagedKeytar, packagedKeytar, stagedManifest, archivedManifest] =
     await Promise.all([
-      digestRegularFile(join(stagedAppPath, ...relativeBinding.split("/")), "NATIVE_PAIR_INVALID"),
-      digestRegularFile(join(unpackedPath, ...relativeBinding.split("/")), "NATIVE_PAIR_INVALID"),
-      digestRegularFile(join(stagedAppPath, ...relativeKeytar.split("/")), "NATIVE_PAIR_INVALID"),
-      digestRegularFile(join(unpackedPath, ...relativeKeytar.split("/")), "NATIVE_PAIR_INVALID"),
-      digestRegularFile(join(stagedAppPath, ...relativeManifest.split("/")), "NATIVE_PAIR_INVALID"),
-      digestArchiveMember(asarPath, relativeManifest, { asar }),
+      digestRegularFile(join(stagedAppPath, ...relativeBinding.split("/")), failureCode),
+      digestRegularFile(join(unpackedPath, ...relativeBinding.split("/")), failureCode),
+      digestRegularFile(join(stagedAppPath, ...relativeKeytar.split("/")), failureCode),
+      digestRegularFile(join(unpackedPath, ...relativeKeytar.split("/")), failureCode),
+      digestRegularFile(join(stagedAppPath, ...relativeManifest.split("/")), failureCode),
+      digestArchiveMember(asarPath, relativeManifest, { asar, code: failureCode }),
     ]);
   if (!sameDigest(stagedBinding, packagedBinding)
       || !sameDigest(stagedKeytar, packagedKeytar)
       || !sameDigest(stagedManifest, archivedManifest)) {
-    fail("NATIVE_PAIR_INVALID");
+    fail(failureCode);
   }
   return Object.freeze({
     windowsFilesystemSha256: packagedBinding.sha256,
     keytarSha256: packagedKeytar.sha256,
   });
+}
+
+async function verifyWindowsNormalCandidateSmokePackagePaths({
+  appPath,
+  stagedAppPath,
+  resourcesPath,
+  asarPath,
+  unpackedPath,
+} = {}) {
+  await Promise.all([
+    regularFile(appPath, "PACKAGE_PATHS_INVALID"),
+    regularDirectory(stagedAppPath, "PACKAGE_PATHS_INVALID"),
+    regularDirectory(resourcesPath, "PACKAGE_PATHS_INVALID"),
+    regularFile(asarPath, "PACKAGE_PATHS_INVALID"),
+    regularDirectory(unpackedPath, "PACKAGE_PATHS_INVALID"),
+  ]);
 }
 
 /** Verify the exact staged app, unpacked executable, stable metadata, and native pair. */
@@ -389,6 +430,7 @@ export async function verifyWindowsNormalCandidateSmokePackage(options = {}, {
   digest = digestRegularFile,
   asar = loadAsar(),
   validateNative = validateNativePair,
+  verifyPaths = verifyWindowsNormalCandidateSmokePackagePaths,
 } = {}) {
   if (platform !== "win32" || architecture !== "x64"
       || !exactWindowsPath(options.appPath) || !exactWindowsPath(options.stagedAppPath)
@@ -403,16 +445,28 @@ export async function verifyWindowsNormalCandidateSmokePackage(options = {}, {
   const resourcesPath = win32.join(win32.dirname(appPath), "resources");
   const asarPath = win32.join(resourcesPath, "app.asar");
   const unpackedPath = `${asarPath}.unpacked`;
-  await Promise.all([
-    regularFile(appPath), regularDirectory(options.stagedAppPath), regularDirectory(resourcesPath),
-    regularFile(asarPath), regularDirectory(unpackedPath),
+  await verifyPaths({
+    appPath,
+    stagedAppPath: options.stagedAppPath,
+    resourcesPath,
+    asarPath,
+    unpackedPath,
+  });
+  const sourceCandidate = await readJsonFile(options.sourceCandidatePath, "SOURCE_CANDIDATE_INVALID");
+  const stagedManifest = await readJsonFile(
+    win32.join(options.stagedAppPath, "package.json"),
+    "PACKAGE_STAGED_MANIFEST_INVALID",
+  );
+  const [executable, artifact] = await Promise.all([
+    digest(appPath, "PACKAGE_PATHS_INVALID"),
+    digest(asarPath, "PACKAGE_PATHS_INVALID"),
   ]);
-  const [sourceCandidate, stagedManifest, executable, artifact] = await Promise.all([
-    readJsonFile(options.sourceCandidatePath, "SOURCE_CANDIDATE_INVALID"),
-    readJsonFile(win32.join(options.stagedAppPath, "package.json"), "PACKAGE_IDENTITY_INVALID"),
-    digest(appPath), digest(asarPath),
-  ]);
-  const archiveManifest = readArchiveJson(asarPath, "package.json", asar);
+  const archiveManifest = readArchiveJson(
+    asarPath,
+    "package.json",
+    asar,
+    "PACKAGE_ARCHIVE_MANIFEST_INVALID",
+  );
   const metadata = validateWindowsNormalCandidateSmokeMetadata({
     sourceCandidate, stagedManifest, archiveManifest, sourceRevision: options.sourceRevision,
   });
@@ -421,6 +475,7 @@ export async function verifyWindowsNormalCandidateSmokePackage(options = {}, {
     asarPath,
     unpackedPath,
     asar,
+    failureCode: "PACKAGE_NATIVE_MEMBERS_INVALID",
   });
   return Object.freeze({
     sourceRevision: metadata.sourceRevision,

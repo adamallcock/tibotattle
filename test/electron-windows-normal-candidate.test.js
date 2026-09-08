@@ -21,6 +21,7 @@ import {
   selectWindowsNormalCandidateDashboardTarget,
   selectWindowsNormalCandidateSettingsTarget,
   validateWindowsNormalCandidateSmokeMetadata,
+  verifyWindowsNormalCandidateSmokePackage,
 } from "../scripts/smoke-electron-windows-normal-candidate.mjs";
 
 const SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567";
@@ -79,6 +80,40 @@ function candidateMetadata() {
     sourceRevision: SOURCE_REVISION,
     target: "win32-x64",
   });
+}
+
+function packageStageFailure(code) {
+  return Object.assign(new Error(code), {
+    code: `ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_${code}`,
+  });
+}
+
+function packageVerificationDependencies({
+  verifyPaths = async () => {},
+  readJsonFile,
+  digest = async () => ({ bytes: 1, sha256: "a".repeat(64) }),
+  asar,
+  validateNative = async () => ({
+    windowsFilesystemSha256: "b".repeat(64),
+    keytarSha256: "c".repeat(64),
+  }),
+} = {}) {
+  const manifest = { version: "0.1.0", tibotattleDistribution: candidateMetadata() };
+  return {
+    platform: "win32",
+    architecture: "x64",
+    verifyPaths,
+    readJsonFile: readJsonFile ?? (async (_path, code) => {
+      if (code === "SOURCE_CANDIDATE_INVALID") return sourceCandidate();
+      assert.equal(code, "PACKAGE_STAGED_MANIFEST_INVALID");
+      return manifest;
+    }),
+    digest,
+    asar: asar ?? {
+      extractFile: () => Buffer.from(JSON.stringify(manifest)),
+    },
+    validateNative,
+  };
 }
 
 function passedJourney() {
@@ -154,7 +189,77 @@ test("Windows normal candidate smoke binds source staging and archived metadata 
     stagedManifest: manifest,
     archiveManifest: { version: "0.1.0", tibotattleDistribution: { ...distribution, channel: "beta" } },
     sourceRevision: SOURCE_REVISION,
-  }), /ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_IDENTITY_INVALID/u);
+  }), /ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_METADATA_INVALID/u);
+});
+
+test("normal candidate package verification keeps its closed failure stages distinct", async () => {
+  const verify = (dependencies) => verifyWindowsNormalCandidateSmokePackage(
+    smokeOptions(),
+    packageVerificationDependencies(dependencies),
+  );
+  const valid = await verify({
+    validateNative: async ({ failureCode }) => {
+      assert.equal(failureCode, "PACKAGE_NATIVE_MEMBERS_INVALID");
+      return {
+        windowsFilesystemSha256: "b".repeat(64),
+        keytarSha256: "c".repeat(64),
+      };
+    },
+  });
+  assert.equal(valid.target, "win32-x64");
+
+  await assert.rejects(verify({
+    verifyPaths: async () => { throw packageStageFailure("PACKAGE_PATHS_INVALID"); },
+  }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_PATHS_INVALID" });
+
+  const readCodes = [];
+  await assert.rejects(verify({
+    readJsonFile: async (_path, code) => {
+      readCodes.push(code);
+      if (code === "SOURCE_CANDIDATE_INVALID") return sourceCandidate();
+      throw packageStageFailure("PACKAGE_STAGED_MANIFEST_INVALID");
+    },
+  }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_STAGED_MANIFEST_INVALID" });
+  assert.deepEqual(readCodes, ["SOURCE_CANDIDATE_INVALID", "PACKAGE_STAGED_MANIFEST_INVALID"]);
+
+  await assert.rejects(verify({
+    asar: { extractFile: () => { throw new Error("unavailable"); } },
+  }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_ARCHIVE_MANIFEST_INVALID" });
+
+  const manifest = { version: "0.1.0", tibotattleDistribution: {
+    ...candidateMetadata(), channel: "beta",
+  } };
+  await assert.rejects(verify({
+    asar: { extractFile: () => Buffer.from(JSON.stringify(manifest)) },
+  }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_METADATA_INVALID" });
+
+  let nativeFailureCode = null;
+  await assert.rejects(verify({
+    validateNative: async ({ failureCode }) => {
+      nativeFailureCode = failureCode;
+      throw packageStageFailure("PACKAGE_NATIVE_MEMBERS_INVALID");
+    },
+  }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_NATIVE_MEMBERS_INVALID" });
+  assert.equal(nativeFailureCode, "PACKAGE_NATIVE_MEMBERS_INVALID");
+});
+
+test("normal candidate runner preserves a package stage in its content-free receipt", async () => {
+  let receipt = null;
+  await assert.rejects(runWindowsNormalCandidateSmoke(smokeOptions(), {
+    platform: "win32",
+    architecture: "x64",
+    environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: String.raw`C:\\runner\\temp` },
+    ensureReceiptParent: async () => {},
+    reserveReceipt: async () => ({
+      writeFile: async (value) => { receipt = JSON.parse(value); },
+      sync: async () => {},
+      close: async () => {},
+    }),
+    verifyPackage: async () => { throw packageStageFailure("PACKAGE_ARCHIVE_MANIFEST_INVALID"); },
+  }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_ARCHIVE_MANIFEST_INVALID" });
+  assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_ARCHIVE_MANIFEST_INVALID");
+  assert.equal(receipt.packageArtifactVerified, false);
+  assert.equal(receipt.packagedElectronExecutionVerified, false);
 });
 
 test("normal candidate launcher keeps only the private profile, unified mode, and quit-only control", async () => {
