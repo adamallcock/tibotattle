@@ -3,7 +3,7 @@ title: Current product and release status
 date: 2026-09-08
 type: status
 status: current
-source_commit: 080142f65918b7abdd6e346332cbad42bcb31fbc
+source_commit: 32cd6317622c9aef9b7bf015b376b4cdb93c91fc
 observation_date: 2026-09-08
 ---
 
@@ -43,7 +43,29 @@ substitutes for SLSA build provenance. Follow
 
 ### Current presentation and live-data availability
 
-The hosted incremental-refresh repair and owner progress detail are deployed at
+The thousand-contributor calculator changes are deployed at
+`32cd6317622c9aef9b7bf015b376b4cdb93c91fc`, at 14:39:51 UTC on 2026-09-08.
+The owner-approved migrations 0054–0056 applied successfully. Exact schema
+checks and both migration ledgers passed, with no pending migrations. Normal
+guarded deployment, exact-source health, public asset checks and rendered
+public/admin views passed. See the
+[scale publication receipt](./receipts/2026-09-08-thousand-contributor-publication.md)
+and [local scale qualification](./reviews/2026-09-08-thousand-contributor-qualification.md).
+
+Current refreshes use a durable dirty-account queue; publication captures a
+finite cohort without restarting on ordinary new contributions. Admin source
+preparation reads transactionally maintained counters. Existing authorized
+graphs remain available during work. At 14:41 UTC, the admin showed 31 of 69
+historical days resolved and all 738 retained source days prepared. Historical
+work then advanced August 7 from 7 to 10 of 15 accounts in a successful natural
+refresh; unchanged current work was skipped and daily publication used one
+query. Backfill remains incomplete. Local qualification covers 1,000 contributors,
+not simultaneous production traffic or a fast initial-backfill SLA. Consent,
+retention, v1.1 activation and desktop distribution remain unchanged.
+
+### Earlier incremental-refresh deployment
+
+The hosted incremental-refresh repair and owner progress detail were deployed at
 `080142f65918b7abdd6e346332cbad42bcb31fbc`. The final guarded deployment completed
 at 02:52:46 UTC on 2026-09-08, following core deployment `2e3fbdc7` and reviewed
 forward migrations 0050–0053. Both migration ledgers have no pending migrations;
