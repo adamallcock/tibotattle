@@ -1069,6 +1069,34 @@ test("companion supervisor accepts FD4-only macOS and Linux brokers without Node
   }
 });
 
+test("companion supervisor starts a live plain child without Node IPC", async (t) => {
+  const childSource = [
+    "process.stdout.write('USAGE_MONITOR_READY http://127.0.0.1:4546/\\n');",
+    "process.on('SIGTERM', () => process.exit(0));",
+    "setInterval(() => {}, 1_000);",
+  ].join("\n");
+  let child = null;
+  let selected = null;
+  const supervisor = createCompanionSupervisor({
+    command: process.execPath,
+    args: ["--eval", childSource],
+    cwd: REPOSITORY_ROOT,
+    spawnChild(command, args, options) {
+      selected = options;
+      child = spawn(command, args, options);
+      return child;
+    },
+  });
+  t.after(async () => { await supervisor.stop().catch(() => {}); });
+
+  const ready = await supervisor.start();
+  assert.equal(child?.connected, false);
+  assert.deepEqual(selected?.stdio, ["ignore", "pipe", "pipe"]);
+  assert.equal(ready.origin, "http://127.0.0.1:4546");
+  await supervisor.stop();
+  assert.equal(supervisor.state.state, "stopped");
+});
+
 test("companion supervisor rejects competing credential factories and ambient Windows channel authority", async () => {
   const factory = () => ({ dispose() {} });
   for (const other of ["attachCredentialBroker", "attachLinuxSecretServiceBroker"]) {
