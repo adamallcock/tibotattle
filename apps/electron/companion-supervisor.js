@@ -106,6 +106,9 @@ function companionEnvironment(environment, parentPid, credentialBrokerKind = nul
   if (credentialBrokerKind === "linux_secret_service") {
     selected.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD = "4";
   }
+  if (credentialBrokerKind === "windows_account_observation") {
+    selected.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD = "4";
+  }
   return selected;
 }
 
@@ -128,6 +131,7 @@ export function createCompanionSupervisor({
   attachPrivateChannel,
   attachCredentialBroker,
   attachLinuxSecretServiceBroker,
+  attachWindowsAccountObservationBroker,
 } = {}) {
   if (typeof spawnChild !== "function") throw new TypeError("spawnChild is required");
   if (typeof command !== "string" || command.length === 0) {
@@ -149,7 +153,12 @@ export function createCompanionSupervisor({
       && typeof attachLinuxSecretServiceBroker !== "function") {
     throw new TypeError("Linux Secret Service broker factory is invalid");
   }
-  if (attachCredentialBroker !== undefined && attachLinuxSecretServiceBroker !== undefined) {
+  if (attachWindowsAccountObservationBroker !== undefined
+      && typeof attachWindowsAccountObservationBroker !== "function") {
+    throw new TypeError("Windows account-observation broker factory is invalid");
+  }
+  if ([attachCredentialBroker, attachLinuxSecretServiceBroker, attachWindowsAccountObservationBroker]
+    .filter((factory) => factory !== undefined).length > 1) {
     throw new TypeError("credential broker factories are mutually exclusive");
   }
   assertTimeout(startupTimeoutMs, "startupTimeoutMs");
@@ -170,10 +179,11 @@ export function createCompanionSupervisor({
   let unexpectedExitHandler = onUnexpectedExit;
   let privateChannel = null;
   let credentialBroker = null;
-  const selectedCredentialBroker = attachCredentialBroker ?? attachLinuxSecretServiceBroker;
-  const credentialBrokerKind = attachCredentialBroker === undefined
-    ? attachLinuxSecretServiceBroker === undefined ? null : "linux_secret_service"
-    : "macos_keychain";
+  const selectedCredentialBroker = attachCredentialBroker ?? attachLinuxSecretServiceBroker
+    ?? attachWindowsAccountObservationBroker;
+  const credentialBrokerKind = attachCredentialBroker !== undefined ? "macos_keychain"
+    : attachLinuxSecretServiceBroker !== undefined ? "linux_secret_service"
+      : attachWindowsAccountObservationBroker !== undefined ? "windows_account_observation" : null;
 
   function stateSnapshot() {
     return Object.freeze({

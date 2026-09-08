@@ -935,6 +935,78 @@ test("companion supervisor restricts file identity selection to complete local M
   }
 });
 
+test("companion supervisor announces only its composed Windows observation channel and keeps FD3 separate", async () => {
+  for (const withPrivateChannel of [false, true]) {
+    const child = new FakeChild();
+    const observationStream = new EventEmitter();
+    child.stdio = [null, child.stdout, child.stderr, null, observationStream];
+    let selected;
+    let observationDisposed = false;
+    let privateDisposed = false;
+    let privateInvalidated = false;
+    const supervisor = createCompanionSupervisor({
+      environment: {
+        USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD: "99",
+        USAGE_MONITOR_KEYCHAIN_BROKER_FD: "98",
+        USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD: "97",
+      },
+      spawnChild(_command, _args, options) { selected = options; return child; },
+      attachWindowsAccountObservationBroker(stream) {
+        assert.equal(stream, observationStream);
+        return { dispose() { observationDisposed = true; } };
+      },
+      ...(withPrivateChannel ? {
+        attachPrivateChannel(channel) {
+          assert.equal(channel, child);
+          return {
+            invalidate() { privateInvalidated = true; },
+            dispose() { privateDisposed = true; },
+          };
+        },
+      } : {}),
+    });
+    const started = supervisor.start();
+    child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
+    await started;
+    assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", withPrivateChannel ? "ipc" : "ignore", "pipe"]);
+    assert.equal(selected.env.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD, "4");
+    assert.equal(selected.env.USAGE_MONITOR_KEYCHAIN_BROKER_FD, undefined);
+    assert.equal(selected.env.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD, undefined);
+    const stopped = supervisor.stop();
+    child.emit("exit", 0, null);
+    await stopped;
+    assert.equal(observationDisposed, true);
+    assert.equal(privateDisposed, withPrivateChannel);
+    assert.equal(privateInvalidated, withPrivateChannel);
+  }
+});
+
+test("companion supervisor rejects competing FD4 factories and ambient Windows channel authority", async () => {
+  const factory = () => ({ dispose() {} });
+  for (const other of ["attachCredentialBroker", "attachLinuxSecretServiceBroker"]) {
+    assert.throws(() => createCompanionSupervisor({
+      [other]: factory, attachWindowsAccountObservationBroker: factory,
+    }), /mutually exclusive/u);
+  }
+  assert.throws(() => createCompanionSupervisor({
+    attachWindowsAccountObservationBroker: {},
+  }), /factory is invalid/u);
+  const child = new FakeChild();
+  let selected;
+  const supervisor = createCompanionSupervisor({
+    environment: { USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD: "4" },
+    spawnChild(_command, _args, options) { selected = options; return child; },
+  });
+  const started = supervisor.start();
+  child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
+  await started;
+  assert.equal(selected.env.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD, undefined);
+  assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe"]);
+  const stopped = supervisor.stop();
+  child.emit("exit", 0, null);
+  await stopped;
+});
+
 test("companion supervisor owns one child, injects a parent contract, and strips child output", async () => {
   const child = new FakeChild();
   const spawnCalls = [];
