@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
-import { Duplex } from "node:stream";
 import test from "node:test";
 
 import {
@@ -15,8 +15,13 @@ import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "../../../src/export-identity-keychain.js";
 import {
-  WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD_ENV,
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS as CHILD_INTEGRATION_STATUS,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
   WindowsAccountObservationBrokerError,
   createWindowsAccountObservationBrokerBackend,
   createWindowsAccountObservationBrokerBackendFromEnvironment,
@@ -31,20 +36,39 @@ import {
 } from "../../../src/platform/windows-credential-manager.js";
 
 const ACCOUNT_CAPABILITY = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
+const ACCOUNTLESS_SCHEMA = "accountless-process-v1";
 
-function pair() {
-  let client;
-  let parent;
-  const side = (peer) => new Duplex({
-    read() {},
-    write(chunk, _encoding, done) {
-      queueMicrotask(() => { peer().push(Buffer.from(chunk)); done(); });
-    },
-    destroy(error, done) { peer()?.push(null); done(error); },
-  });
-  client = side(() => parent);
-  parent = side(() => client);
-  return { client, parent };
+function channelPair({ childSendReturnsFalse = false, parentSendReturnsFalse = false } = {}) {
+  const parent = new EventEmitter();
+  const child = new EventEmitter();
+  parent.connected = true;
+  child.connected = true;
+  parent.sendReturnsFalse = parentSendReturnsFalse;
+  child.sendReturnsFalse = childSendReturnsFalse;
+
+  function wire(sender, recipient) {
+    sender.send = (message, callback = undefined) => {
+      if (sender.connected === false || recipient.connected === false) {
+        queueMicrotask(() => callback?.(new Error("channel unavailable")));
+        return false;
+      }
+      queueMicrotask(() => {
+        if (recipient.connected !== false) recipient.emit("message", message);
+        callback?.(recipient.connected === false ? new Error("channel unavailable") : null);
+      });
+      return sender.sendReturnsFalse !== true;
+    };
+    sender.disconnect = () => {
+      if (sender.connected === false) return;
+      sender.connected = false;
+      recipient.connected = false;
+      sender.emit("disconnect");
+      recipient.emit("disconnect");
+    };
+  }
+  wire(parent, child);
+  wire(child, parent);
+  return Object.freeze({ child, parent });
 }
 
 function nextTurn() {
@@ -61,6 +85,28 @@ function assertBrokerError(code) {
   };
 }
 
+function request(id, operation = "read", secret = undefined) {
+  const frame = {
+    schemaVersion: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+    kind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND,
+    v: WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+    id,
+    op: operation,
+  };
+  if (secret !== undefined) frame.secret = secret;
+  return Object.freeze(frame);
+}
+
+function response(id, value = { ok: true, secret: null }) {
+  return Object.freeze({
+    schemaVersion: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+    kind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
+    v: WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+    id,
+    ...value,
+  });
+}
+
 function createSyntheticManager({ initial = null, readFailure = null, readGate = null, onRead = null } = {}) {
   let stored = initial === null ? null : Buffer.from(initial);
   let closeCalls = 0;
@@ -71,7 +117,7 @@ function createSyntheticManager({ initial = null, readFailure = null, readGate =
   const receivedCandidates = [];
 
   function assertOpen() {
-    assert.equal(closed, false, "synthetic manager must stay open while FD4 is live");
+    assert.equal(closed, false, "synthetic manager must stay open while owned IPC is live");
   }
 
   const manager = Object.freeze({
@@ -132,7 +178,7 @@ function createSyntheticManager({ initial = null, readFailure = null, readGate =
 }
 
 function fixture(options = {}) {
-  const wires = pair();
+  const wires = channelPair(options.channelOptions);
   const synthetic = createSyntheticManager(options);
   const parentCredential = createWindowsAccountObservationCredentialBackend({
     platform: "win32",
@@ -140,12 +186,11 @@ function fixture(options = {}) {
     createCredentialManagerBackend: () => synthetic.manager,
   });
   const server = attachDesktopWindowsAccountObservationBroker({
-    stream: wires.parent,
+    channel: wires.parent,
     createBackend: () => parentCredential,
   });
   const transport = createWindowsAccountObservationBrokerTransport({
-    fd: 4,
-    connect: () => wires.client,
+    channel: wires.child,
     timeoutMs: 1_000,
   });
   return Object.freeze({
@@ -160,44 +205,34 @@ function fixture(options = {}) {
 function disposeFixture(value) {
   value.server.dispose();
   value.transport.dispose();
-  value.client.destroy();
-  value.parent.destroy();
 }
 
-function transportSocket(onWrite) {
-  let socket;
-  socket = new Duplex({
-    read() {},
-    write(chunk, _encoding, done) {
-      onWrite(String(chunk), socket);
-      done();
-    },
-  });
-  return socket;
-}
-
-test("Windows FD4 is dormant, exact, and unavailable without its explicitly composed descriptor", async () => {
+test("Windows account-observation IPC is dormant, exact, and unavailable without explicit composition", async () => {
   assert.equal(PARENT_INTEGRATION_STATUS, "dormant");
   assert.equal(CHILD_INTEGRATION_STATUS, "dormant");
   assert.equal(windowsAccountObservationBrokerConfiguration({}), null);
   assert.deepEqual(windowsAccountObservationBrokerConfiguration({
-    [WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD_ENV]: "4",
-  }), { fd: 4 });
-  for (const value of ["0", "3", "5", "04", "4 ", 4]) {
+    [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+  }), { ipc: true });
+  for (const value of ["0", "2", "1 ", 1]) {
     assert.deepEqual(windowsAccountObservationBrokerConfiguration({
-      [WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD_ENV]: value,
-    }), { fd: null });
+      [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: value,
+    }), { ipc: false });
   }
-  for (const collision of ["USAGE_MONITOR_KEYCHAIN_BROKER_FD", "USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD"]) {
+  for (const collision of [
+    "USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD",
+    "USAGE_MONITOR_KEYCHAIN_BROKER_FD",
+    "USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD",
+  ]) {
     assert.deepEqual(windowsAccountObservationBrokerConfiguration({
-      [WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD_ENV]: "4",
+      [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
       [collision]: "4",
-    }), { fd: null });
+    }), { ipc: false });
   }
 
-  let connects = 0;
+  let requests = 0;
   const unavailable = createWindowsAccountObservationBrokerBackend({
-    transport: { async request() { connects += 1; } },
+    transport: { async request() { requests += 1; } },
     available: false,
   });
   assert.deepEqual(await unavailable.describe(ACCOUNT_CAPABILITY), {
@@ -205,39 +240,34 @@ test("Windows FD4 is dormant, exact, and unavailable without its explicitly comp
     status: "unavailable",
   });
   await assert.rejects(unavailable.read(ACCOUNT_CAPABILITY), assertBrokerError("unavailable"));
-  assert.equal(connects, 0);
+  assert.equal(requests, 0);
 
   const malformed = createWindowsAccountObservationBrokerBackendFromEnvironment({
-    [WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD_ENV]: "3",
-  });
+    [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: "not-ipc",
+  }, channelPair().child);
   assert.deepEqual(await malformed.describe(ACCOUNT_CAPABILITY), {
     backend: "windows_account_observation_broker",
     status: "unavailable",
   });
   await assert.rejects(malformed.createIfMissing(ACCOUNT_CAPABILITY, Buffer.alloc(32, 2)),
     assertBrokerError("unavailable"));
+  assert.equal(createWindowsAccountObservationBrokerBackendFromEnvironment({
+    USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD: "4",
+  }, channelPair().child), null);
 
-  let nullDescriptorConnects = 0;
-  const nullDescriptorTransport = createWindowsAccountObservationBrokerTransport({
-    fd: null,
-    connect() {
-      nullDescriptorConnects += 1;
-      throw new Error("must not create an unannounced descriptor");
-    },
-  });
-  await assert.rejects(nullDescriptorTransport.request({ op: "read" }),
+  assert.throws(() => createWindowsAccountObservationBrokerTransport({ channel: null }),
     assertBrokerError("invalid_configuration"));
-  assert.equal(nullDescriptorConnects, 0);
 
   const source = await readFile(
     new URL("../../../src/platform/windows-account-observation-broker.js", import.meta.url),
     "utf8",
   );
+  assert.equal(source.includes('from "node:net"'), false);
   assert.equal(source.includes('from "./windows-credential-manager.js"'), false);
   assert.equal(source.includes('from "keytar"'), false);
 });
 
-test("Windows FD4 keeps the fixed capability, parent mutation lease, and secret cleanup end to end", async () => {
+test("Windows observation IPC keeps fixed capability, parent mutation lease, and secret cleanup end to end", async () => {
   const f = fixture();
   const source = Buffer.alloc(32, 71);
   let generated = null;
@@ -286,10 +316,10 @@ test("Windows FD4 keeps the fixed capability, parent mutation lease, and secret 
   assert.equal(f.synthetic.closeCalls, 1);
 });
 
-test("Windows FD4 redacts parent failures and closes a rejected parent factory", async () => {
+test("Windows observation IPC redacts parent failures and closes a rejected parent factory", async () => {
   for (const [failure, code, canary] of [
     [new WindowsCredentialManagerError("locked"), "locked", null],
-    [Object.assign(new Error("WINDOWS-FD4-PRIVATE-CANARY"), { code: "private_canary" }), "unavailable", "WINDOWS-FD4-PRIVATE-CANARY"],
+    [Object.assign(new Error("WINDOWS-IPC-PRIVATE-CANARY"), { code: "private_canary" }), "unavailable", "WINDOWS-IPC-PRIVATE-CANARY"],
   ]) {
     const f = fixture({ readFailure: failure });
     try {
@@ -304,7 +334,7 @@ test("Windows FD4 redacts parent failures and closes a rejected parent factory",
     assert.equal(f.synthetic.closeCalls, 1);
   }
 
-  const wires = pair();
+  const wires = channelPair();
   let closeCalls = 0;
   const rejected = Object.freeze({
     close() { closeCalls += 1; },
@@ -317,60 +347,64 @@ test("Windows FD4 redacts parent failures and closes a rejected parent factory",
     productionSafe: false,
   });
   assert.throws(() => attachDesktopWindowsAccountObservationBroker({
-    stream: wires.parent,
+    channel: wires.parent,
     createBackend: () => rejected,
   }), assertBrokerError("invalid_configuration"));
   assert.equal(closeCalls, 1);
-  wires.client.destroy();
-  wires.parent.destroy();
 });
 
-test("Windows FD4 transport preserves ordering and poisons malformed, timed-out, or disposed channels", async () => {
+test("Windows observation IPC preserves ordered replies, ignores accountless frames, and honors callback delivery over send backpressure", async () => {
   const writes = [];
-  const orderedSocket = transportSocket((wire, stream) => {
-    const request = JSON.parse(wire);
-    writes.push(request);
+  const channel = new EventEmitter();
+  channel.connected = true;
+  channel.send = (frame, callback) => {
+    writes.push(frame);
     if (writes.length === 2) {
-      queueMicrotask(() => stream.push(writes.map((entry) => `${JSON.stringify({
-        id: entry.id,
-        ok: true,
-        secret: null,
-      })}\n`).join("")));
+      queueMicrotask(() => {
+        channel.emit("message", Object.freeze({
+          schemaVersion: ACCOUNTLESS_SCHEMA,
+          kind: "response",
+          id: 1,
+          ok: true,
+          value: null,
+        }));
+        for (const item of writes) channel.emit("message", response(item.id));
+      });
     }
-  });
-  const ordered = createWindowsAccountObservationBrokerTransport({
-    fd: 4,
-    connect: () => orderedSocket,
-    timeoutMs: 1_000,
-  });
+    queueMicrotask(() => callback?.(null));
+    return false;
+  };
+  const ordered = createWindowsAccountObservationBrokerTransport({ channel, timeoutMs: 1_000 });
   assert.deepEqual(await Promise.all([
     ordered.request({ op: "read" }),
     ordered.request({ op: "read" }),
   ]), [{ ok: true, secret: null }, { ok: true, secret: null }]);
   assert.deepEqual(writes.map((entry) => entry.id), [1, 2]);
+  assert.equal(channel.connected, true);
   ordered.dispose();
 
-  const malformedSocket = transportSocket((wire, stream) => {
-    const request = JSON.parse(wire);
-    queueMicrotask(() => stream.push(`${JSON.stringify({
-      id: request.id + 1,
-      ok: true,
-      secret: null,
-    })}\n`));
-  });
+  const malformedChannel = new EventEmitter();
+  malformedChannel.connected = true;
+  malformedChannel.send = (frame, callback) => {
+    queueMicrotask(() => {
+      malformedChannel.emit("message", response(frame.id + 1));
+      callback?.(null);
+    });
+    return true;
+  };
   const malformed = createWindowsAccountObservationBrokerTransport({
-    fd: 4,
-    connect: () => malformedSocket,
+    channel: malformedChannel,
     timeoutMs: 1_000,
   });
   await assert.rejects(malformed.request({ op: "read" }), assertBrokerError("protocol"));
   await assert.rejects(malformed.request({ op: "read" }), assertBrokerError("protocol"));
-  assert.equal(malformedSocket.destroyed, true);
+  assert.equal(malformedChannel.connected, true);
 
-  const silentSocket = transportSocket(() => {});
+  const silentChannel = new EventEmitter();
+  silentChannel.connected = true;
+  silentChannel.send = (_frame, callback) => { queueMicrotask(() => callback?.(null)); return true; };
   const timeout = createWindowsAccountObservationBrokerTransport({
-    fd: 4,
-    connect: () => silentSocket,
+    channel: silentChannel,
     timeoutMs: 5,
   });
   const keepAlive = setInterval(() => {}, 50);
@@ -379,31 +413,49 @@ test("Windows FD4 transport preserves ordering and poisons malformed, timed-out,
   } finally {
     clearInterval(keepAlive);
   }
-  assert.equal(silentSocket.destroyed, true);
+  assert.equal(silentChannel.connected, true);
 
-  const disposableSocket = transportSocket(() => {});
+  const disposableChannel = new EventEmitter();
+  disposableChannel.connected = true;
+  disposableChannel.send = (_frame, callback) => { queueMicrotask(() => callback?.(null)); return true; };
   const disposable = createWindowsAccountObservationBrokerTransport({
-    fd: 4,
-    connect: () => disposableSocket,
+    channel: disposableChannel,
     timeoutMs: 1_000,
   });
   const pending = disposable.request({ op: "read" });
   disposable.dispose();
   await assert.rejects(pending, assertBrokerError("unavailable"));
   await assert.rejects(disposable.request({ op: "read" }), assertBrokerError("unavailable"));
-  assert.equal(disposableSocket.destroyed, true);
+  assert.equal(disposableChannel.connected, true);
 });
 
-test("Windows FD4 parent bounds queued requests and never responds after disposal", async () => {
+test("Windows observation IPC parent bounds queued requests, leaves accountless listeners intact, and never responds after disposal", async () => {
   const malformed = fixture();
+  let accountlessMessages = 0;
+  malformed.parent.on("message", (frame) => {
+    if (frame?.schemaVersion === ACCOUNTLESS_SCHEMA) accountlessMessages += 1;
+  });
   try {
-    malformed.parent.emit("data", `${JSON.stringify({
-      v: 1,
+    malformed.child.send(Object.freeze({
+      schemaVersion: ACCOUNTLESS_SCHEMA,
+      kind: "request",
+      id: 1,
+      operation: "read",
+      value: null,
+    }));
+    await nextTurn();
+    assert.equal(accountlessMessages, 1);
+    assert.equal(malformed.synthetic.calls.length, 0);
+    malformed.child.send(Object.freeze({
+      schemaVersion: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+      kind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND,
+      v: WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
       id: 1,
       op: "read",
       capability: "export_identity",
-    })}\n`);
-    assert.equal(malformed.parent.destroyed, true);
+    }));
+    await nextTurn();
+    assert.equal(malformed.parent.connected, true);
     assert.deepEqual(malformed.synthetic.calls, []);
   } finally {
     disposeFixture(malformed);
@@ -416,14 +468,15 @@ test("Windows FD4 parent bounds queued requests and never responds after disposa
   const readStarted = new Promise((resolve) => { observedRead = resolve; });
   const f = fixture({ readGate, onRead: observedRead });
   const replies = [];
-  f.client.on("data", (value) => replies.push(String(value)));
+  f.child.on("message", (value) => {
+    if (value?.schemaVersion === WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA) replies.push(value);
+  });
   try {
-    f.parent.emit("data", `${JSON.stringify({ v: 1, id: 1, op: "read" })}\n`);
+    f.child.send(request(1));
     await readStarted;
-    for (let id = 2; id <= 33; id += 1) {
-      f.parent.emit("data", `${JSON.stringify({ v: 1, id, op: "read" })}\n`);
-    }
-    assert.equal(f.parent.destroyed, true);
+    for (let id = 2; id <= 33; id += 1) f.child.send(request(id));
+    await nextTurn();
+    assert.equal(f.parent.connected, true);
     assert.deepEqual(f.synthetic.calls, [["read"]]);
     releaseRead();
     await nextTurn();

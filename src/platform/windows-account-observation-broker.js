@@ -1,17 +1,20 @@
-import { Socket } from "node:net";
-
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "./keychain-capabilities.js";
 
 export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS = "dormant";
-export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD_ENV =
-  "USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD";
+export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV =
+  "USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC";
+export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER = "1";
+export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA =
+  "windows-account-observation-broker-ipc-v1";
+export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND = "request-v1";
+export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND = "response-v1";
 export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION = 1;
 export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY =
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
 
-const MAXIMUM_FRAME_BYTES = 4_096;
+const LEGACY_FD_ENV = "USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD";
 const MAXIMUM_PENDING = 32;
 const SECRET_BYTES = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
@@ -61,24 +64,64 @@ function fail(code) {
   throw new WindowsAccountObservationBrokerError(code);
 }
 
-function validDescriptor(value) {
-  return value === "4";
+function record(value) {
+  try {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
+function exact(value, keys) {
+  try {
+    return record(value)
+      && Object.keys(value).length === keys.length
+      && keys.every((key) => Object.hasOwn(value, key));
+  } catch {
+    return false;
+  }
+}
+
+function validId(value) {
+  return Number.isSafeInteger(value) && value > 0 && value <= 1_000_000_000;
+}
+
+function validIpcChannel(channel) {
+  try {
+    return record(channel)
+      && typeof channel.on === "function"
+      && typeof channel.off === "function"
+      && typeof channel.send === "function";
+  } catch {
+    return false;
+  }
+}
+
+function isBrokerMessage(value) {
+  try {
+    return record(value)
+      && value.schemaVersion === WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA;
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Read only the explicit Windows FD4 announcement. A concurrent macOS/Linux
- * credential broker announcement is malformed, not an invitation to fall
- * back to a child-side loader or generic Credential Manager path.
+ * Read only the explicit, inherited Node IPC announcement. The retired FD4
+ * environment name and any other credential broker announcement are malformed;
+ * neither can select a child-side native or socket fallback.
  */
 export function windowsAccountObservationBrokerConfiguration(environment = process.env) {
   if (!environment || typeof environment !== "object" || Array.isArray(environment)) {
     fail("invalid_configuration");
   }
   let raw;
+  let legacyFd;
   let macBroker;
   let linuxBroker;
   try {
-    raw = environment[WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD_ENV];
+    raw = environment[WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV];
+    legacyFd = environment[LEGACY_FD_ENV];
     macBroker = environment.USAGE_MONITOR_KEYCHAIN_BROKER_FD;
     linuxBroker = environment.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD;
   } catch {
@@ -86,7 +129,8 @@ export function windowsAccountObservationBrokerConfiguration(environment = proce
   }
   if (raw === undefined || raw === null) return null;
   return Object.freeze({
-    fd: macBroker === undefined && linuxBroker === undefined && validDescriptor(raw) ? 4 : null,
+    ipc: raw === WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER
+      && legacyFd === undefined && macBroker === undefined && linuxBroker === undefined,
   });
 }
 
@@ -96,19 +140,14 @@ export function encodeWindowsAccountObservationBrokerSecret(value) {
   }
   const copied = Buffer.from(value);
   try {
-    const encoded = copied.toString("base64url");
-    if (Buffer.byteLength(encoded, "utf8") > MAXIMUM_FRAME_BYTES) fail("invalid_configuration");
-    return encoded;
+    return copied.toString("base64url");
   } finally {
     copied.fill(0);
   }
 }
 
 export function decodeWindowsAccountObservationBrokerSecret(value) {
-  if (typeof value !== "string" || value.length < 1
-      || Buffer.byteLength(value, "utf8") > MAXIMUM_FRAME_BYTES) {
-    fail("protocol");
-  }
+  if (typeof value !== "string" || value.length !== 43) fail("protocol");
   let decoded;
   try {
     decoded = Buffer.from(value, "base64url");
@@ -122,37 +161,38 @@ export function decodeWindowsAccountObservationBrokerSecret(value) {
   return decoded;
 }
 
-function defaultConnect({ fd }) {
-  if (fd !== 4) fail("invalid_configuration");
-  return new Socket({ fd, readable: true, writable: true });
-}
-
 function validOperation(operation) {
-  if (!operation || typeof operation !== "object" || Array.isArray(operation)
+  if (!record(operation)
       || (operation.op !== "read" && operation.op !== "create_if_missing")) {
     fail("invalid_configuration");
   }
   const expected = operation.op === "read" ? ["op"] : ["op", "secret"];
-  if (Object.keys(operation).length !== expected.length
-      || !expected.every((key) => Object.hasOwn(operation, key))
+  if (!exact(operation, expected)
       || (operation.op === "create_if_missing" && typeof operation.secret !== "string")) {
     fail("invalid_configuration");
   }
 }
 
 function validateResponse(response, operation, expectedId) {
-  if (!response || typeof response !== "object" || Array.isArray(response)
+  if (!exact(response, ["schemaVersion", "kind", "v", "id", "ok", "secret"])
+      && !exact(response, ["schemaVersion", "kind", "v", "id", "ok", "status"])
+      && !exact(response, ["schemaVersion", "kind", "v", "id", "ok", "code"])) {
+    return null;
+  }
+  if (response.schemaVersion !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA
+      || response.kind !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND
+      || response.v !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION
       || response.id !== expectedId || typeof response.ok !== "boolean") {
     return null;
   }
   if (response.ok === false) {
-    return Object.keys(response).length === 3
+    return Object.keys(response).length === 6
       && typeof response.code === "string" && RESPONSE_ERROR_CODES.has(response.code)
       ? Object.freeze({ ok: false, code: response.code })
       : null;
   }
   if (operation.op === "read") {
-    if (Object.keys(response).length !== 3 || !Object.hasOwn(response, "secret")
+    if (Object.keys(response).length !== 6 || !Object.hasOwn(response, "secret")
         || (response.secret !== null && typeof response.secret !== "string")) return null;
     if (response.secret !== null) {
       let decoded = null;
@@ -162,24 +202,25 @@ function validateResponse(response, operation, expectedId) {
     }
     return Object.freeze({ ok: true, secret: response.secret });
   }
-  return Object.keys(response).length === 3
+  return Object.keys(response).length === 6
     && typeof response.status === "string" && ["created", "existing"].includes(response.status)
     ? Object.freeze({ ok: true, status: response.status })
     : null;
 }
 
-/** One bounded ordered request/response transport over the inherited FD4. */
+/**
+ * One bounded ordered request/response transport over the owning Node IPC
+ * channel. It ignores other closed schemas so FD3 accountless traffic remains
+ * independent, while malformed messages in this schema poison only this route.
+ */
 export function createWindowsAccountObservationBrokerTransport({
-  fd = null,
-  connect = defaultConnect,
+  channel = null,
   timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
 } = {}) {
-  if ((fd !== null && fd !== 4) || typeof connect !== "function"
+  if (!validIpcChannel(channel)
       || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
     fail("invalid_configuration");
   }
-  let socket = null;
-  let received = "";
   let nextId = 1;
   let poisonedCode = null;
   const pending = [];
@@ -187,84 +228,69 @@ export function createWindowsAccountObservationBrokerTransport({
   function poison(code) {
     if (poisonedCode !== null) return;
     poisonedCode = ERROR_CODES.has(code) ? code : "unavailable";
-    received = "";
+    try { channel.off("message", onMessage); } catch { /* Channel is already closing. */ }
+    try { channel.off("disconnect", onDisconnect); } catch { /* Channel is already closing. */ }
     while (pending.length > 0) {
       const entry = pending.shift();
       clearTimeout(entry.timer);
       entry.reject(new WindowsAccountObservationBrokerError(poisonedCode));
     }
-    try { socket?.destroy?.(); } catch { /* The inherited descriptor is gone. */ }
   }
 
-  function consume(chunk) {
-    if (poisonedCode !== null) return;
-    received += String(chunk);
-    let end;
-    while ((end = received.indexOf("\n")) !== -1 && poisonedCode === null) {
-      const line = received.slice(0, end);
-      received = received.slice(end + 1);
-      if (Buffer.byteLength(line, "utf8") + 1 > MAXIMUM_FRAME_BYTES) {
-        poison("protocol");
-        return;
-      }
-      let response;
-      try { response = JSON.parse(line); } catch { poison("protocol"); return; }
-      const entry = pending[0];
-      const normalized = entry === undefined ? null
-        : validateResponse(response, entry.operation, entry.id);
-      if (normalized === null) { poison("protocol"); return; }
-      pending.shift();
-      clearTimeout(entry.timer);
-      if (normalized.ok) entry.resolve(normalized);
-      else entry.reject(new WindowsAccountObservationBrokerError(normalized.code));
+  function onMessage(message) {
+    if (poisonedCode !== null || !isBrokerMessage(message)) return;
+    const entry = pending[0];
+    const normalized = entry === undefined ? null
+      : validateResponse(message, entry.operation, entry.id);
+    if (normalized === null) {
+      poison("protocol");
+      return;
     }
-    if (Buffer.byteLength(received, "utf8") > MAXIMUM_FRAME_BYTES) poison("protocol");
+    pending.shift();
+    clearTimeout(entry.timer);
+    if (normalized.ok) entry.resolve(normalized);
+    else entry.reject(new WindowsAccountObservationBrokerError(normalized.code));
   }
 
-  function ensureSocket() {
-    if (poisonedCode !== null) fail(poisonedCode);
-    if (socket !== null) return socket;
-    let created;
-    try { created = connect({ fd }); } catch { poison("unavailable"); fail("unavailable"); }
-    if (!created || typeof created.on !== "function" || typeof created.write !== "function") {
-      poison("unavailable");
-      fail("unavailable");
-    }
-    created.on("data", consume);
-    created.on("error", () => poison("unavailable"));
-    created.on("close", () => poison("unavailable"));
-    created.on("end", () => poison("unavailable"));
-    socket = created;
-    return created;
+  function onDisconnect() {
+    poison("unavailable");
   }
+
+  channel.on("message", onMessage);
+  channel.on("disconnect", onDisconnect);
 
   async function request(operation) {
     validOperation(operation);
-    if (fd !== 4) fail("invalid_configuration");
     if (poisonedCode !== null) fail(poisonedCode);
-    if (!Number.isSafeInteger(nextId) || pending.length >= MAXIMUM_PENDING) fail("unavailable");
+    if (!validId(nextId) || pending.length >= MAXIMUM_PENDING) fail("unavailable");
     const id = nextId;
-    const frame = `${JSON.stringify({
+    const frame = Object.freeze({
+      schemaVersion: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+      kind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND,
       v: WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
       id,
       ...operation,
-    })}\n`;
-    if (Buffer.byteLength(frame, "utf8") > MAXIMUM_FRAME_BYTES) fail("invalid_configuration");
-    const channel = ensureSocket();
+    });
     nextId += 1;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => poison("timeout"), timeoutMs);
       timer.unref?.();
       pending.push({ id, operation, resolve, reject, timer });
-      try { channel.write(frame); } catch { poison("unavailable"); }
+      try {
+        if (channel.connected === false) throw new Error("channel closed");
+        channel.send(frame, (error) => {
+          if (error) poison("unavailable");
+        });
+      } catch {
+        poison("unavailable");
+      }
     });
   }
 
-  function dispose() {
-    poison("unavailable");
-  }
-
-  return Object.freeze({ request, dispose });
+  return Object.freeze({
+    request,
+    dispose() { poison("unavailable"); },
+  });
 }
 
 function assertCapability(capability) {
@@ -311,20 +337,25 @@ export function createWindowsAccountObservationBrokerBackend({
   return backend;
 }
 
-const sharedBackends = new Map();
+const sharedBackends = new WeakMap();
 
-/** Discover the explicit Windows FD4 announcement without any fallback path. */
+/** Discover only the explicit inherited Node IPC announcement, without FD fallback. */
 export function createWindowsAccountObservationBrokerBackendFromEnvironment(
   environment = process.env,
+  channel = process,
 ) {
   const configuration = windowsAccountObservationBrokerConfiguration(environment);
   if (configuration === null) return null;
-  const key = configuration.fd;
-  if (!sharedBackends.has(key)) {
-    sharedBackends.set(key, createWindowsAccountObservationBrokerBackend({
-      transport: createWindowsAccountObservationBrokerTransport(configuration),
-      available: configuration.fd !== null,
+  if (configuration.ipc !== true || !validIpcChannel(channel)) {
+    return createWindowsAccountObservationBrokerBackend({
+      transport: Object.freeze({ async request() { fail("unavailable"); } }),
+      available: false,
+    });
+  }
+  if (!sharedBackends.has(channel)) {
+    sharedBackends.set(channel, createWindowsAccountObservationBrokerBackend({
+      transport: createWindowsAccountObservationBrokerTransport({ channel }),
     }));
   }
-  return sharedBackends.get(key);
+  return sharedBackends.get(channel);
 }

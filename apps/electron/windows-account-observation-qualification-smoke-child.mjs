@@ -4,14 +4,16 @@ import {
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY,
   createWindowsAccountObservationBrokerBackendFromEnvironment,
   isWindowsAccountObservationBrokerError,
+  windowsAccountObservationBrokerConfiguration,
 } from "../../src/platform/index.js";
 
+const CONTROL_SCHEMA = "windows-account-observation-qualification-smoke-ipc-v1";
 const PHASES = new Set(["create-v1", "restart-read-v1"]);
 const RUN_ID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 // Only fixed stage numbers cross the child-process boundary. Native errors,
-// account identifiers, record values, and descriptor diagnostics stay local.
+// account identifiers, record values, and IPC diagnostics stay local.
 let failureExitCode = 41;
 
 const INITIAL_READ_FAILURE_EXIT_CODES = new Map([
@@ -42,9 +44,41 @@ function argumentsForQualification() {
   return Object.freeze({ phase: values[0], runId: values[1].toLowerCase() });
 }
 
+function exact(value, keys) {
+  try {
+    return value !== null && typeof value === "object" && !Array.isArray(value)
+      && Object.keys(value).length === keys.length
+      && keys.every((key) => Object.hasOwn(value, key));
+  } catch {
+    return false;
+  }
+}
+
+function isStartMessage(message, expected) {
+  try {
+    return exact(message, ["schemaVersion", "kind", "phase", "runId"])
+      && message.schemaVersion === CONTROL_SCHEMA
+      && message.kind === "start-v1"
+      && message.phase === expected.phase
+      && typeof message.runId === "string"
+      && message.runId.toLowerCase() === expected.runId;
+  } catch {
+    return false;
+  }
+}
+
+function isControlMessage(message) {
+  try {
+    return message !== null && typeof message === "object" && !Array.isArray(message)
+      && message.schemaVersion === CONTROL_SCHEMA;
+  } catch {
+    return false;
+  }
+}
+
 function syntheticSecret(runId) {
   return createHash("sha256")
-    .update(`tibotattle-windows-account-observation-fd4-smoke-v1:${runId}`)
+    .update(`tibotattle-windows-account-observation-ipc-smoke-v1:${runId}`)
     .digest();
 }
 
@@ -70,13 +104,16 @@ async function readExact(backend, expected) {
   }
 }
 
-async function run() {
-  const { phase, runId } = argumentsForQualification();
+async function run({ phase, runId }) {
+  const configuration = windowsAccountObservationBrokerConfiguration();
+  if (configuration?.ipc !== true) {
+    failureExitCode = 53;
+    throw new Error("missing fixed IPC broker");
+  }
   const backend = createWindowsAccountObservationBrokerBackendFromEnvironment();
-  if (backend === null
-      || process.env.USAGE_MONITOR_KEYCHAIN_BROKER_FD !== undefined
-      || process.env.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD !== undefined) {
-    throw new Error("missing fixed FD4 broker");
+  if (backend === null) {
+    failureExitCode = 53;
+    throw new Error("missing fixed IPC broker");
   }
   const expected = syntheticSecret(runId);
   try {
@@ -115,11 +152,50 @@ async function run() {
   }
 }
 
-run().then(() => {
+let started = false;
+let finished = false;
+let expectedArguments = null;
+
+function finishFailure() {
+  if (finished) return;
+  finished = true;
+  process.off("message", onMessage);
+  process.exit(failureExitCode);
+}
+
+function finishSuccess() {
+  if (finished) return;
+  finished = true;
+  process.off("message", onMessage);
   process.stdout.write("USAGE_MONITOR_READY http://127.0.0.1:4545/\n");
   setInterval(() => {}, 1_000);
-}).catch(() => {
-  // The inherited FD4 socket keeps Node alive. Exit directly on failure so
-  // the supervisor gets a bounded failure instead of a startup-timeout claim.
-  process.exit(failureExitCode);
-});
+}
+
+function onMessage(message) {
+  if (finished || !isControlMessage(message)) return;
+  if (started || !isStartMessage(message, expectedArguments)) {
+    failureExitCode = 41;
+    finishFailure();
+    return;
+  }
+  started = true;
+  // Listener installation for the Windows observation backend deliberately
+  // happens only after the parent broker and this control handshake are ready.
+  // Accountless and broker frames use different schemas and remain ignored here.
+  void run(expectedArguments).then(finishSuccess, finishFailure);
+}
+
+try {
+  expectedArguments = argumentsForQualification();
+  if (typeof process.send !== "function") throw new Error("missing parent IPC");
+  process.on("message", onMessage);
+  process.send(Object.freeze({ schemaVersion: CONTROL_SCHEMA, kind: "ready-v1" }), (error) => {
+    if (error && !started) {
+      failureExitCode = 41;
+      finishFailure();
+    }
+  });
+} catch {
+  failureExitCode = 41;
+  finishFailure();
+}

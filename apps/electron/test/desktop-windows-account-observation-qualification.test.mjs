@@ -119,7 +119,7 @@ function fixture({ contextAccepted = true } = {}) {
     },
     attachBroker(options) {
       calls.push(["broker", {
-        stream: options.stream,
+        channel: options.channel,
         isBackendError: options.isBackendError,
       }]);
       const selected = options.createBackend();
@@ -171,14 +171,14 @@ test("Windows account-observation handover authenticates the packaged context an
   assert.deepEqual(noCi.calls.map(([name]) => name), ["electron-context"]);
 });
 
-test("Windows account-observation handover binds the exact disposable profile and fixed FD4 backend", () => {
+test("Windows account-observation handover binds the exact disposable profile and fixed Node IPC backend", () => {
   const value = fixture();
   const handover = createWindowsQualificationAccountObservationHandoverForTest(
     value.options,
     value.dependencies,
   );
-  const stream = Object.freeze({ kind: "synthetic-fd4" });
-  const broker = handover.attachWindowsAccountObservationBroker(stream);
+  const channel = Object.freeze({ kind: "synthetic-ipc" });
+  const broker = handover.attachWindowsAccountObservationBroker(channel);
   assert.equal(typeof broker.dispose, "function");
   assert.deepEqual(value.calls.map(([name]) => name), [
     "electron-context", "adapter", "platform-context", "broker", "backend",
@@ -198,7 +198,7 @@ test("Windows account-observation handover binds the exact disposable profile an
   assert.equal(platformOptions.environment.USAGE_MONITOR_STATE_ROOT,
     "C:\\qualification\\profile\\state");
   assert.equal(platformOptions.resourceRoot, value.qualificationContext.resourceRoot);
-  assert.deepEqual(value.calls[3][1].stream, stream);
+  assert.deepEqual(value.calls[3][1].channel, channel);
   assert.deepEqual(value.calls[4][1], {
     adapter: value.adapter,
     resourceRoot: value.qualificationContext.resourceRoot,
@@ -214,7 +214,7 @@ test("Windows account-observation handover accepts the actual launcher environme
     ...value.options,
     environment,
   }, value.dependencies);
-  handover.attachWindowsAccountObservationBroker(Object.freeze({ kind: "derived-fd4" }));
+  handover.attachWindowsAccountObservationBroker(Object.freeze({ kind: "derived-ipc" }));
   const platformOptions = value.calls.find(([name]) => name === "platform-context")[1];
   assert.equal(platformOptions.environment.TEMP, "C:\\qualification\\launcher-profile");
   assert.equal(platformOptions.environment.USAGE_MONITOR_ACCOUNTING_SOURCE_MODE, "unified");

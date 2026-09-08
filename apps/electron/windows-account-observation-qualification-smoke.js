@@ -14,6 +14,7 @@ const CHILD_PATH = fileURLToPath(new URL(
   import.meta.url,
 ));
 const PHASES = Object.freeze(["create-v1", "restart-read-v1"]);
+const CONTROL_SCHEMA = "windows-account-observation-qualification-smoke-ipc-v1";
 const CHILD_FAILURE_STAGES = new Map([
   [41, "child_configuration"],
   [42, "child_initial_read"],
@@ -93,6 +94,113 @@ function exactOptions(value, keys) {
   }
 }
 
+function isControlMessage(message) {
+  try {
+    return message !== null
+      && typeof message === "object"
+      && !Array.isArray(message)
+      && message.schemaVersion === CONTROL_SCHEMA;
+  } catch {
+    return false;
+  }
+}
+
+function isReadyMessage(message) {
+  try {
+    return isControlMessage(message)
+      && Object.keys(message).sort().join(",") === "kind,schemaVersion"
+      && message.kind === "ready-v1";
+  } catch {
+    return false;
+  }
+}
+
+function validChannel(channel) {
+  try {
+    return channel !== null
+      && typeof channel === "object"
+      && typeof channel.on === "function"
+      && typeof channel.off === "function"
+      && typeof channel.send === "function";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Attach the observation broker first, then begin the child phase only after
+ * its independently installed control listener has acknowledged readiness.
+ * The control schema is closed and distinct from both accountless and broker
+ * messages, so sharing the Node IPC descriptor cannot consume either route.
+ */
+function attachHandoverWithControl({ handover, phase, runId }, channel) {
+  if (!validChannel(channel)) throw new Error("invalid child IPC channel");
+  let disposed = false;
+  let attached = false;
+  let ready = false;
+  let started = false;
+  let broker = null;
+
+  const cleanup = () => {
+    try { channel.off("message", onMessage); } catch { /* Child is closing. */ }
+    try { broker?.dispose?.(); } catch { /* Supervisor teardown stays bounded. */ }
+    broker = null;
+  };
+  const abort = () => {
+    if (disposed) return;
+    disposed = true;
+    cleanup();
+    try { channel.kill?.(); } catch { /* The owned child may already be gone. */ }
+  };
+  const sendStart = () => {
+    if (disposed || !attached || !ready || started) return;
+    started = true;
+    try {
+      if (channel.connected === false) throw new Error("child IPC is closed");
+      channel.send(Object.freeze({
+        schemaVersion: CONTROL_SCHEMA,
+        kind: "start-v1",
+        phase,
+        runId,
+      }), (error) => {
+        if (error) abort();
+      });
+    } catch {
+      abort();
+    }
+  };
+  function onMessage(message) {
+    if (disposed || !isControlMessage(message)) return;
+    if (!isReadyMessage(message) || ready) {
+      abort();
+      return;
+    }
+    ready = true;
+    sendStart();
+  }
+
+  channel.on("message", onMessage);
+  try {
+    broker = handover.attachWindowsAccountObservationBroker(channel);
+    if (broker === null || typeof broker !== "object" || typeof broker.dispose !== "function") {
+      throw new Error("invalid Windows observation broker");
+    }
+    attached = true;
+    sendStart();
+  } catch (error) {
+    disposed = true;
+    cleanup();
+    throw error;
+  }
+  return Object.freeze({
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      cleanup();
+    },
+  });
+}
+
 async function runWithDependencies({
   environment,
   qualificationContext,
@@ -136,8 +244,9 @@ async function runWithDependencies({
           });
           return child;
         },
-        attachWindowsAccountObservationBroker:
-          handover.attachWindowsAccountObservationBroker,
+        attachWindowsAccountObservationBroker(channel) {
+          return attachHandoverWithControl({ handover, phase, runId }, channel);
+        },
       });
       if (supervisor === null || typeof supervisor !== "object"
           || typeof supervisor.start !== "function" || typeof supervisor.stop !== "function") {
@@ -155,19 +264,19 @@ async function runWithDependencies({
       throw smokeFailure("shutdown");
     }
   }
-  // The fixed FD4 capability has no delete operation. The outer Windows
+  // The fixed IPC capability has no delete operation. The outer Windows
   // runner must use a disposable account/profile and reports that account
   // lifetime as its cleanup boundary; this smoke never broadens the wire.
   return Object.freeze({ status: "passed-v1" });
 }
 
 /**
- * Exercise the actual supervisor-owned FD4 route twice in a packaged Windows
+ * Exercise the supervisor-owned Windows Node IPC route twice in a packaged
  * qualification run. The first child refuses any pre-existing record, writes
- * a deterministic synthetic secret through the fixed parent broker, and
- * reads it back. A fresh child then proves restart retention over a new FD4
- * descriptor. This function deliberately has no named-pipe or child-native
- * fallback: descriptor support is qualified only by the Windows runner.
+ * a deterministic synthetic secret through the fixed parent broker, and reads
+ * it back. A fresh child then proves restart retention over a new owned IPC
+ * channel. This function deliberately has no named-pipe or child-native
+ * fallback: IPC support is qualified only by the Windows runner.
  */
 export async function runWindowsAccountObservationQualificationSmoke(options = {}) {
   if (!exactOptions(options, ["context", "environment"])) {

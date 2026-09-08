@@ -1,5 +1,8 @@
 import {
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
   WindowsAccountObservationBrokerError,
   decodeWindowsAccountObservationBrokerSecret,
   encodeWindowsAccountObservationBrokerSecret,
@@ -10,15 +13,56 @@ import {
 } from "../../src/platform/windows-account-observation-credential.js";
 
 // This is a dormant composition seam. Only a later qualified Electron main
-// composition may attach it to FD4; the companion never loads Keytar itself.
+// composition may attach it to owned Node IPC; the companion never loads Keytar.
 export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS = "dormant";
 
-const MAXIMUM_FRAME_BYTES = 4_096;
 const MAXIMUM_PENDING = 32;
 const OPERATIONS = new Set(["read", "create_if_missing"]);
 
 function fail(code) {
   throw new WindowsAccountObservationBrokerError(code);
+}
+
+function record(value) {
+  try {
+    return value !== null && typeof value === "object" && !Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
+function exact(value, keys) {
+  try {
+    return record(value)
+      && Object.keys(value).length === keys.length
+      && keys.every((key) => Object.hasOwn(value, key));
+  } catch {
+    return false;
+  }
+}
+
+function validChannel(channel) {
+  try {
+    return record(channel)
+      && typeof channel.on === "function"
+      && typeof channel.off === "function"
+      && typeof channel.send === "function";
+  } catch {
+    return false;
+  }
+}
+
+function isBrokerMessage(value) {
+  try {
+    return record(value)
+      && value.schemaVersion === WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA;
+  } catch {
+    return false;
+  }
+}
+
+function validId(value) {
+  return Number.isSafeInteger(value) && value > 0 && value <= 1_000_000_000;
 }
 
 function backendFailureCode(error, isBackendError) {
@@ -71,34 +115,47 @@ function validSecret(value) {
 }
 
 function validRequest(frame, nextId) {
-  if (!frame || typeof frame !== "object" || Array.isArray(frame)
+  if (!record(frame)
+      || frame.schemaVersion !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA
+      || frame.kind !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND
       || frame.v !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION
       || frame.id !== nextId || !OPERATIONS.has(frame.op)) {
     return false;
   }
-  const keys = frame.op === "read" ? ["v", "id", "op"] : ["v", "id", "op", "secret"];
-  return Object.keys(frame).length === keys.length
-    && keys.every((key) => Object.hasOwn(frame, key))
+  const keys = frame.op === "read"
+    ? ["schemaVersion", "kind", "v", "id", "op"]
+    : ["schemaVersion", "kind", "v", "id", "op", "secret"];
+  return exact(frame, keys)
     && (frame.op !== "create_if_missing" || validSecret(frame.secret));
 }
 
 function disposeBackend(backend) {
-  try { backend.close(); } catch { /* The private descriptor is already closed. */ }
+  try { backend.close(); } catch { /* The owned IPC channel is already closed. */ }
+}
+
+function send(channel, message, onFailure) {
+  try {
+    if (channel.connected === false) throw new Error("channel closed");
+    channel.send(message, (error) => {
+      if (error) onFailure();
+    });
+  } catch {
+    onFailure();
+  }
 }
 
 /**
  * Serve only the fixed account-observation record to one supervisor-owned
- * companion. Mutations are serialized and journaled inside the main-owned
- * backend before Keytar is touched; no child request can select another
- * legacy capability, record name, native binding, or state path.
+ * companion over Node IPC. Mutations are serialized and journaled inside the
+ * main-owned backend before Keytar is touched; no child request can select
+ * another legacy capability, record name, native binding, or state path.
  */
 export function attachDesktopWindowsAccountObservationBroker({
-  stream,
+  channel,
   createBackend,
   isBackendError = isWindowsAccountObservationCredentialError,
 } = {}) {
-  if (!stream || typeof stream.on !== "function" || typeof stream.write !== "function"
-      || typeof stream.destroy !== "function" || typeof createBackend !== "function"
+  if (!validChannel(channel) || typeof createBackend !== "function"
       || typeof isBackendError !== "function") {
     fail("invalid_configuration");
   }
@@ -114,7 +171,6 @@ export function attachDesktopWindowsAccountObservationBroker({
   }
   let closed = false;
   let backendClosed = false;
-  let received = "";
   let nextId = 1;
   let active = false;
   const pending = [];
@@ -128,16 +184,21 @@ export function attachDesktopWindowsAccountObservationBroker({
   function dispose() {
     if (closed) return;
     closed = true;
-    received = "";
     pending.length = 0;
-    stream.off?.("data", consume);
-    try { stream.destroy(); } catch { /* The owned descriptor may already be closed. */ }
+    try { channel.off("message", consume); } catch { /* Channel is already closing. */ }
+    try { channel.off("disconnect", dispose); } catch { /* Channel is already closing. */ }
     closeBackendWhenIdle();
   }
 
   function response(id, value) {
     if (closed) return;
-    try { stream.write(`${JSON.stringify({ id, ...value })}\n`); } catch { dispose(); }
+    send(channel, Object.freeze({
+      schemaVersion: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+      kind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
+      v: WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+      id,
+      ...value,
+    }), dispose);
   }
 
   async function execute(request) {
@@ -184,35 +245,19 @@ export function attachDesktopWindowsAccountObservationBroker({
     }
   }
 
-  function consume(chunk) {
-    if (closed) return;
-    received += String(chunk);
-    let end;
-    while ((end = received.indexOf("\n")) !== -1 && !closed) {
-      const line = received.slice(0, end);
-      received = received.slice(end + 1);
-      if (Buffer.byteLength(line, "utf8") + 1 > MAXIMUM_FRAME_BYTES) {
-        dispose();
-        return;
-      }
-      let request;
-      try { request = JSON.parse(line); } catch { dispose(); return; }
-      if (!Number.isSafeInteger(nextId) || !validRequest(request, nextId)
-          || pending.length + Number(active) >= MAXIMUM_PENDING) {
-        dispose();
-        return;
-      }
-      nextId += 1;
-      pending.push(request);
-      void drain();
+  function consume(message) {
+    if (closed || !isBrokerMessage(message)) return;
+    if (!validId(nextId) || !validRequest(message, nextId)
+        || pending.length + Number(active) >= MAXIMUM_PENDING) {
+      dispose();
+      return;
     }
-    if (Buffer.byteLength(received, "utf8") > MAXIMUM_FRAME_BYTES) dispose();
+    nextId += 1;
+    pending.push(message);
+    void drain();
   }
 
-  stream.setEncoding?.("utf8");
-  stream.on("data", consume);
-  stream.on("error", dispose);
-  stream.on("end", dispose);
-  stream.on("close", dispose);
+  channel.on("message", consume);
+  channel.on("disconnect", dispose);
   return Object.freeze({ dispose });
 }

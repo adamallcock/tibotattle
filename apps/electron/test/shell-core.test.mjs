@@ -74,6 +74,10 @@ import {
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../../../src/platform/windows-filesystem.js";
 import {
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+} from "../../../src/platform/windows-account-observation-broker.js";
+import {
   createWindowsFilesystemBindingManifest,
 } from "../../../scripts/build-windows-filesystem-manifest.mjs";
 
@@ -935,15 +939,14 @@ test("companion supervisor restricts file identity selection to complete local M
   }
 });
 
-test("companion supervisor announces only its composed Windows observation channel and keeps FD3 separate", async () => {
+test("companion supervisor announces only its composed Windows observation IPC and keeps accountless traffic separate", async () => {
   for (const withPrivateChannel of [false, true]) {
     const child = new FakeChild();
-    const observationStream = new EventEmitter();
-    child.stdio = [null, child.stdout, child.stderr, null, observationStream];
     let selected;
     let observationDisposed = false;
     let privateDisposed = false;
     let privateInvalidated = false;
+    const attachments = [];
     const supervisor = createCompanionSupervisor({
       environment: {
         USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD: "99",
@@ -951,12 +954,14 @@ test("companion supervisor announces only its composed Windows observation chann
         USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD: "97",
       },
       spawnChild(_command, _args, options) { selected = options; return child; },
-      attachWindowsAccountObservationBroker(stream) {
-        assert.equal(stream, observationStream);
+      attachWindowsAccountObservationBroker(channel) {
+        attachments.push(["observation", channel]);
+        assert.equal(channel, child);
         return { dispose() { observationDisposed = true; } };
       },
       ...(withPrivateChannel ? {
         attachPrivateChannel(channel) {
+          attachments.push(["accountless", channel]);
           assert.equal(channel, child);
           return {
             invalidate() { privateInvalidated = true; },
@@ -968,10 +973,16 @@ test("companion supervisor announces only its composed Windows observation chann
     const started = supervisor.start();
     child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
     await started;
-    assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", withPrivateChannel ? "ipc" : "ignore", "pipe"]);
-    assert.equal(selected.env.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD, "4");
+    assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+    assert.equal(selected.env[WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV],
+      WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER);
+    assert.equal(selected.env.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD, undefined);
     assert.equal(selected.env.USAGE_MONITOR_KEYCHAIN_BROKER_FD, undefined);
     assert.equal(selected.env.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD, undefined);
+    assert.deepEqual(attachments.map(([kind, channel]) => [kind, channel === child]),
+      withPrivateChannel
+        ? [["observation", true], ["accountless", true]]
+        : [["observation", true]]);
     const stopped = supervisor.stop();
     child.emit("exit", 0, null);
     await stopped;
@@ -981,7 +992,7 @@ test("companion supervisor announces only its composed Windows observation chann
   }
 });
 
-test("companion supervisor rejects competing FD4 factories and ambient Windows channel authority", async () => {
+test("companion supervisor rejects competing credential factories and ambient Windows channel authority", async () => {
   const factory = () => ({ dispose() {} });
   for (const other of ["attachCredentialBroker", "attachLinuxSecretServiceBroker"]) {
     assert.throws(() => createCompanionSupervisor({

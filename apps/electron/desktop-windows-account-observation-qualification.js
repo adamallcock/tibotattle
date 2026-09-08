@@ -186,9 +186,9 @@ function createHandover({
   }
 
   return Object.freeze({
-    attachWindowsAccountObservationBroker(stream) {
+    attachWindowsAccountObservationBroker(channel) {
       return attachBroker({
-        stream,
+        channel,
         createBackend() {
           return createQualifiedBackend({
             adapter,
@@ -197,7 +197,7 @@ function createHandover({
           });
         },
         // The desktop broker converts only trusted fixed backend errors into
-        // its protocol codes. All construction/stream detail remains local.
+        // its protocol codes. All construction/IPC detail remains local.
         isBackendError,
       });
     },
@@ -205,9 +205,9 @@ function createHandover({
 }
 
 /**
- * Construct the parent side of the real FD4 path for an authenticated,
+ * Construct the parent side of the real Node IPC path for an authenticated,
  * disposable, packaged Windows qualification run. Native Credential Manager
- * work begins only when the supervisor actually attaches descriptor 4.
+ * work begins only when the supervisor actually attaches its owned child.
  */
 export function createWindowsQualificationAccountObservationHandover(options = {}) {
   const source = exactOptions(options, PRODUCTION_OPTION_KEYS);

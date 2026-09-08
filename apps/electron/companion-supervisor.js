@@ -1,5 +1,9 @@
 import { spawn as nodeSpawn } from "node:child_process";
 
+import {
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+} from "../../src/platform/index.js";
 import { shellError } from "./errors.js";
 import { createCompanionReadyLineParser } from "./ready-line.js";
 
@@ -107,7 +111,8 @@ function companionEnvironment(environment, parentPid, credentialBrokerKind = nul
     selected.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD = "4";
   }
   if (credentialBrokerKind === "windows_account_observation") {
-    selected.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD = "4";
+    selected[WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV] =
+      WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER;
   }
   return selected;
 }
@@ -179,8 +184,8 @@ export function createCompanionSupervisor({
   let unexpectedExitHandler = onUnexpectedExit;
   let privateChannel = null;
   let credentialBroker = null;
-  const selectedCredentialBroker = attachCredentialBroker ?? attachLinuxSecretServiceBroker
-    ?? attachWindowsAccountObservationBroker;
+  const selectedCredentialBroker = attachCredentialBroker ?? attachLinuxSecretServiceBroker;
+  const selectedWindowsAccountObservationBroker = attachWindowsAccountObservationBroker;
   const credentialBrokerKind = attachCredentialBroker !== undefined ? "macos_keychain"
     : attachLinuxSecretServiceBroker !== undefined ? "linux_secret_service"
       : attachWindowsAccountObservationBroker !== undefined ? "windows_account_observation" : null;
@@ -311,9 +316,13 @@ export function createCompanionSupervisor({
         currentChild = spawnChild(command, [...args], {
           cwd,
           env: companionEnvironment(environment, parentPid, credentialBrokerKind),
+          // Windows observation and FD3 accountless share the one inherited
+          // Node IPC channel, with distinct closed schemas. macOS/Linux keep
+          // their existing FD4 pipe contracts unchanged.
           stdio: selectedCredentialBroker
             ? ["ignore", "pipe", "pipe", attachPrivateChannel ? "ipc" : "ignore", "pipe"]
-            : attachPrivateChannel ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
+            : (attachPrivateChannel || selectedWindowsAccountObservationBroker)
+              ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
       } catch {
@@ -327,6 +336,13 @@ export function createCompanionSupervisor({
       try {
         if (selectedCredentialBroker) {
           currentCredentialBroker = selectedCredentialBroker(currentChild.stdio?.[4]);
+          if (typeof currentCredentialBroker?.dispose !== "function") {
+            throw new TypeError("credential broker is invalid");
+          }
+          credentialBroker = currentCredentialBroker;
+        }
+        if (selectedWindowsAccountObservationBroker) {
+          currentCredentialBroker = selectedWindowsAccountObservationBroker(currentChild);
           if (typeof currentCredentialBroker?.dispose !== "function") {
             throw new TypeError("credential broker is invalid");
           }

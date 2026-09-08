@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -17,66 +17,23 @@ import {
   createWindowsAccountObservationCredentialBackend,
 } from "../../../src/platform/windows-account-observation-credential.js";
 import {
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
+} from "../../../src/platform/windows-account-observation-broker.js";
+import {
   WindowsCredentialManagerError,
 } from "../../../src/platform/windows-credential-manager.js";
 
 const RUN_ID = "550e8400-e29b-41d4-a716-446655440000";
+const CONTROL_SCHEMA = "windows-account-observation-qualification-smoke-ipc-v1";
 const CHILD_PATH = fileURLToPath(new URL(
   "../windows-account-observation-qualification-smoke-child.mjs",
   import.meta.url,
 ));
-
-function fixture({ failPhase = null, childExitCode = null, failStopPhase = null } = {}) {
-  const calls = [];
-  const context = Object.freeze({ kind: "synthetic-packaged-context" });
-  const environment = Object.freeze({
-    USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: RUN_ID,
-  });
-  const handover = Object.freeze({
-    attachWindowsAccountObservationBroker() {},
-  });
-  const dependencies = Object.freeze({
-    validateRunId(value) {
-      calls.push(["run-id", value]);
-      if (value !== RUN_ID) throw new Error("invalid run id");
-      return RUN_ID;
-    },
-    createHandover(options) {
-      calls.push(["handover", options]);
-      return handover;
-    },
-    createSupervisor(options) {
-      calls.push(["supervisor", options]);
-      const phase = options.args[1];
-      return Object.freeze({
-        async start() {
-          const child = options.spawnChild("synthetic-child", [], {});
-          calls.push(["start", phase]);
-          if (phase === failPhase) {
-            child.emitExit(childExitCode);
-            throw new Error("private child failure");
-          }
-        },
-        async stop() {
-          calls.push(["stop", phase]);
-          if (phase === failStopPhase) throw new Error("private shutdown failure");
-        },
-      });
-    },
-    spawnChild(command, args, options) {
-      calls.push(["spawn", { args, command, options }]);
-      let exitHandler = null;
-      return Object.freeze({
-        once(event, handler) {
-          if (event === "exit") exitHandler = handler;
-          return this;
-        },
-        emitExit(code) { exitHandler?.(code); },
-      });
-    },
-  });
-  return Object.freeze({ calls, context, dependencies, environment, handover });
-}
 
 function smokeError(error) {
   assert.equal(error?.code, "windows_account_observation_qualification_smoke_failed");
@@ -87,11 +44,32 @@ function smokeError(error) {
 function childEnvironment() {
   const environment = {
     ...process.env,
-    USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD: "4",
+    [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
   };
+  delete environment.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD;
   delete environment.USAGE_MONITOR_KEYCHAIN_BROKER_FD;
   delete environment.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD;
   return environment;
+}
+
+function isReadyMessage(message) {
+  try {
+    return message !== null && typeof message === "object" && !Array.isArray(message)
+      && Object.keys(message).sort().join(",") === "kind,schemaVersion"
+      && message.schemaVersion === CONTROL_SCHEMA
+      && message.kind === "ready-v1";
+  } catch {
+    return false;
+  }
+}
+
+function startMessage(phase = "create-v1") {
+  return Object.freeze({
+    schemaVersion: CONTROL_SCHEMA,
+    kind: "start-v1",
+    phase,
+    runId: RUN_ID,
+  });
 }
 
 function syntheticManager(read) {
@@ -105,6 +83,31 @@ function syntheticManager(read) {
     async createIfMissing() { return "created"; },
     async withOperationLease(_capability, _options, callback) {
       return callback(Object.freeze({}));
+    },
+    close() {},
+  });
+}
+
+function workingManager() {
+  let stored = null;
+  const leases = new WeakSet();
+  return Object.freeze({
+    crossProcessSafe: true,
+    auditDurable: true,
+    auditFilesystemProtected: true,
+    startupRecoveryComplete: true,
+    productionSafe: false,
+    async read() { return stored === null ? null : Buffer.from(stored); },
+    async withOperationLease(_capability, _options, callback) {
+      const lease = Object.freeze({});
+      leases.add(lease);
+      return callback(lease);
+    },
+    async createIfMissing(_capability, secret, lease) {
+      assert.equal(leases.has(lease), true);
+      if (stored !== null) return "existing";
+      stored = Buffer.from(secret);
+      return "created";
     },
     close() {},
   });
@@ -133,6 +136,77 @@ function childResult(child) {
   });
 }
 
+function childReady(child) {
+  let stdout = "";
+  child.stdout.setEncoding("utf8");
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("Windows observation child readiness timed out")), 5_000);
+    const onData = (chunk) => {
+      stdout += chunk;
+      if (!stdout.includes("USAGE_MONITOR_READY http://127.0.0.1:4545/\n")) return;
+      cleanup();
+      resolve();
+    };
+    const onError = () => { cleanup(); reject(new Error("Windows observation child failed to start")); };
+    const onClose = () => { cleanup(); reject(new Error("Windows observation child exited before ready")); };
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.stdout.off("data", onData);
+      child.off("error", onError);
+      child.off("close", onClose);
+    };
+    child.stdout.on("data", onData);
+    child.on("error", onError);
+    child.on("close", onClose);
+  });
+}
+
+function launchChild({
+  phase = "create-v1",
+  attachBroker = null,
+  onMessage = null,
+} = {}) {
+  const child = spawn(process.execPath, [CHILD_PATH, phase, RUN_ID], {
+    env: childEnvironment(),
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+    windowsHide: true,
+  });
+  let broker = null;
+  let started = false;
+  const control = (message) => {
+    if (isReadyMessage(message)) {
+      if (started) return;
+      started = true;
+      try {
+        child.send(startMessage(phase), () => {});
+      } catch {
+        // The result observer exposes only a fixed local failure assertion.
+      }
+      return;
+    }
+    onMessage?.(message, child);
+  };
+  child.on("message", control);
+  try {
+    broker = attachBroker?.(child) ?? null;
+  } catch (error) {
+    child.off("message", control);
+    try { child.kill("SIGKILL"); } catch { /* The owned child may already be gone. */ }
+    throw error;
+  }
+  return Object.freeze({
+    child,
+    async dispose() {
+      child.off("message", control);
+      broker?.dispose?.();
+      if (child.exitCode === null && child.signalCode === null) {
+        try { child.kill("SIGKILL"); } catch { /* The owned child may have exited. */ }
+        await once(child, "close").catch(() => undefined);
+      }
+    },
+  });
+}
+
 async function runChildWithBroker(read) {
   const manager = syntheticManager(read);
   const backend = createWindowsAccountObservationCredentialBackend({
@@ -140,70 +214,120 @@ async function runChildWithBroker(read) {
     architecture: "x64",
     createCredentialManagerBackend: () => manager,
   });
-  const child = spawn(process.execPath, [CHILD_PATH, "create-v1", RUN_ID], {
-    env: childEnvironment(),
-    stdio: ["ignore", "pipe", "pipe", "ignore", "pipe"],
-    windowsHide: true,
+  const launched = launchChild({
+    attachBroker(channel) {
+      return attachDesktopWindowsAccountObservationBroker({
+        channel,
+        createBackend: () => backend,
+      });
+    },
   });
-  const result = childResult(child);
-  let broker = null;
+  const result = childResult(launched.child);
   try {
-    broker = attachDesktopWindowsAccountObservationBroker({
-      stream: child.stdio[4],
-      createBackend: () => backend,
-    });
     return await result;
   } finally {
-    broker?.dispose();
-    if (child.exitCode === null && child.signalCode === null) {
-      try { child.kill("SIGKILL"); } catch { /* The owned child may have exited. */ }
-      await once(child, "close").catch(() => undefined);
-    }
+    await launched.dispose();
   }
 }
 
 async function runChildWithMalformedBrokerResponse() {
-  const child = spawn(process.execPath, [CHILD_PATH, "create-v1", RUN_ID], {
-    env: childEnvironment(),
-    stdio: ["ignore", "pipe", "pipe", "ignore", "pipe"],
-    windowsHide: true,
+  const launched = launchChild({
+    onMessage(message, child) {
+      if (message?.schemaVersion !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA
+          || message?.kind !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND) return;
+      try {
+        child.send(Object.freeze({
+          schemaVersion: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+          kind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
+          v: WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+          id: message.id + 1,
+          ok: true,
+          secret: null,
+        }), () => {});
+      } catch {
+        // The child owns bounded closure.
+      }
+    },
   });
-  const result = childResult(child);
-  const stream = child.stdio[4];
-  stream.on("error", () => {});
-  stream.on("data", () => {
-    try { stream.write('{"id":1,"ok":true}\n'); } catch { /* The child owns closure. */ }
-  });
+  const result = childResult(launched.child);
   try {
     return await result;
   } finally {
-    stream.destroy();
-    if (child.exitCode === null && child.signalCode === null) {
-      try { child.kill("SIGKILL"); } catch { /* The owned child may have exited. */ }
-      await once(child, "close").catch(() => undefined);
-    }
+    await launched.dispose();
   }
 }
 
-test("Windows account-observation smoke owns two sequential FD4 supervisors with a fixed restart boundary", async () => {
-  const value = fixture();
+function controlFixture({ failPhase = null, childExitCode = null, failStopPhase = null } = {}) {
+  const calls = [];
+  const context = Object.freeze({ kind: "synthetic-packaged-context" });
+  const environment = Object.freeze({
+    USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: RUN_ID,
+  });
+  const handover = Object.freeze({
+    attachWindowsAccountObservationBroker(channel) {
+      calls.push(["handover-attach", channel]);
+      return Object.freeze({ dispose() { calls.push(["handover-dispose"]); } });
+    },
+  });
+  const dependencies = Object.freeze({
+    validateRunId(value) {
+      calls.push(["run-id", value]);
+      if (value !== RUN_ID) throw new Error("invalid run id");
+      return RUN_ID;
+    },
+    createHandover(options) {
+      calls.push(["handover", options]);
+      return handover;
+    },
+    createSupervisor(options) {
+      calls.push(["supervisor", options]);
+      const phase = options.args[1];
+      return Object.freeze({
+        async start() {
+          const child = options.spawnChild("synthetic-child", [], {});
+          const broker = options.attachWindowsAccountObservationBroker(child);
+          calls.push(["start", phase]);
+          if (phase === failPhase) {
+            child.emit("exit", childExitCode);
+            throw new Error("private child failure");
+          }
+          child.emit("message", Object.freeze({ schemaVersion: CONTROL_SCHEMA, kind: "ready-v1" }));
+          await new Promise((resolve) => setImmediate(resolve));
+          assert.deepEqual(child.sent, [startMessage(phase)]);
+          broker.dispose();
+        },
+        async stop() {
+          calls.push(["stop", phase]);
+          if (phase === failStopPhase) throw new Error("private shutdown failure");
+        },
+      });
+    },
+    spawnChild(command, args, options) {
+      calls.push(["spawn", { args, command, options }]);
+      const child = new EventEmitter();
+      child.connected = true;
+      child.sent = [];
+      child.send = (message, callback) => {
+        child.sent.push(message);
+        queueMicrotask(() => callback?.(null));
+        return false;
+      };
+      child.kill = () => true;
+      return child;
+    },
+  });
+  return Object.freeze({ calls, context, dependencies, environment, handover });
+}
+
+test("Windows observation smoke attaches the parent before one explicit IPC start per phase", async () => {
+  const value = controlFixture();
   const result = await runWindowsAccountObservationQualificationSmokeForTest({
     environment: value.environment,
     qualificationContext: value.context,
   }, value.dependencies);
   assert.deepEqual(result, { status: "passed-v1" });
-  assert.deepEqual(value.calls.map(([name, detail]) => [name, detail]), [
-    ["run-id", RUN_ID],
-    ["handover", { qualificationContext: value.context, environment: value.environment }],
-    ["supervisor", value.calls[2][1]],
-    ["spawn", value.calls[3][1]],
-    ["start", "create-v1"],
-    ["stop", "create-v1"],
-    ["supervisor", value.calls[6][1]],
-    ["spawn", value.calls[7][1]],
-    ["start", "restart-read-v1"],
-    ["stop", "restart-read-v1"],
-  ]);
+  assert.deepEqual(value.calls.filter(([name]) => name === "handover-attach").map(([, channel]) =>
+    channel.sent), [[startMessage("create-v1")], [startMessage("restart-read-v1")]]);
   const supervisors = value.calls.filter(([name]) => name === "supervisor").map(([, options]) => options);
   assert.equal(supervisors.length, 2);
   for (const [index, options] of supervisors.entries()) {
@@ -213,13 +337,12 @@ test("Windows account-observation smoke owns two sequential FD4 supervisors with
     assert.equal(options.args[1], index === 0 ? "create-v1" : "restart-read-v1");
     assert.equal(options.args[2], RUN_ID);
     assert.equal(options.environment, value.environment);
-    assert.equal(options.attachWindowsAccountObservationBroker,
-      value.handover.attachWindowsAccountObservationBroker);
+    assert.equal(typeof options.attachWindowsAccountObservationBroker, "function");
   }
 });
 
-test("Windows account-observation smoke fails closed before handover and exposes only fixed child stages", async () => {
-  const invalid = fixture();
+test("Windows observation smoke fails closed before handover and exposes only fixed child stages", async () => {
+  const invalid = controlFixture();
   await assert.rejects(runWindowsAccountObservationQualificationSmokeForTest({
     environment: Object.freeze({ USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: "invalid" }),
     qualificationContext: invalid.context,
@@ -230,40 +353,9 @@ test("Windows account-observation smoke fails closed before handover and exposes
   });
   assert.deepEqual(invalid.calls, [["run-id", "invalid"]]);
 
-  const failed = fixture({ failPhase: "restart-read-v1" });
-  await assert.rejects(runWindowsAccountObservationQualificationSmokeForTest({
-    environment: failed.environment,
-    qualificationContext: failed.context,
-  }, failed.dependencies), (error) => {
-    assert.equal(smokeError(error), true);
-    assert.equal(classifyWindowsAccountObservationSmokeFailure(error), "startup");
-    return true;
-  });
-  assert.deepEqual(failed.calls.map(([name, detail]) => [name, detail]), [
-    ["run-id", RUN_ID],
-    ["handover", { qualificationContext: failed.context, environment: failed.environment }],
-    ["supervisor", failed.calls[2][1]],
-    ["spawn", failed.calls[3][1]],
-    ["start", "create-v1"],
-    ["stop", "create-v1"],
-    ["supervisor", failed.calls[6][1]],
-    ["spawn", failed.calls[7][1]],
-    ["start", "restart-read-v1"],
-    ["stop", "restart-read-v1"],
-  ]);
-
-  const classified = fixture({ failPhase: "create-v1", childExitCode: 44 });
-  await assert.rejects(runWindowsAccountObservationQualificationSmokeForTest({
-    environment: classified.environment,
-    qualificationContext: classified.context,
-  }, classified.dependencies), (error) => {
-    assert.equal(smokeError(error), true);
-    assert.equal(classifyWindowsAccountObservationSmokeFailure(error), "child_readback");
-    return true;
-  });
-  assert.equal(classifyWindowsAccountObservationSmokeFailure(new Error("foreign")), null);
-
   for (const [childExitCode, stage] of [
+    [null, "startup"],
+    [44, "child_readback"],
     [46, "child_initial_read_existing_record"],
     [47, "child_initial_read_broker_unavailable"],
     [48, "child_initial_read_broker_locked"],
@@ -273,18 +365,19 @@ test("Windows account-observation smoke fails closed before handover and exposes
     [52, "child_initial_read_broker_protocol"],
     [53, "child_initial_read_broker_invalid_configuration"],
   ]) {
-    const diagnostic = fixture({ failPhase: "create-v1", childExitCode });
+    const failed = controlFixture({ failPhase: "create-v1", childExitCode });
     await assert.rejects(runWindowsAccountObservationQualificationSmokeForTest({
-      environment: diagnostic.environment,
-      qualificationContext: diagnostic.context,
-    }, diagnostic.dependencies), (error) => {
+      environment: failed.environment,
+      qualificationContext: failed.context,
+    }, failed.dependencies), (error) => {
       assert.equal(smokeError(error), true);
       assert.equal(classifyWindowsAccountObservationSmokeFailure(error), stage);
       return true;
     });
   }
+  assert.equal(classifyWindowsAccountObservationSmokeFailure(new Error("foreign")), null);
 
-  const shutdown = fixture({ failStopPhase: "restart-read-v1" });
+  const shutdown = controlFixture({ failStopPhase: "restart-read-v1" });
   await assert.rejects(runWindowsAccountObservationQualificationSmokeForTest({
     environment: shutdown.environment,
     qualificationContext: shutdown.context,
@@ -295,7 +388,29 @@ test("Windows account-observation smoke fails closed before handover and exposes
   });
 });
 
-test("Windows FD4 child distinguishes an existing fixed record from closed parent and protocol failures", async () => {
+test("Windows observation child keeps the startup listener race closed with the actual delayed broker installation", async () => {
+  const manager = workingManager();
+  const backend = createWindowsAccountObservationCredentialBackend({
+    platform: "win32",
+    architecture: "x64",
+    createCredentialManagerBackend: () => manager,
+  });
+  const launched = launchChild({
+    attachBroker(channel) {
+      return attachDesktopWindowsAccountObservationBroker({
+        channel,
+        createBackend: () => backend,
+      });
+    },
+  });
+  try {
+    await childReady(launched.child);
+  } finally {
+    await launched.dispose();
+  }
+});
+
+test("Windows observation child distinguishes an existing fixed record from closed parent and protocol failures", async () => {
   const privateCanary = "WINDOWS-OBSERVATION-CHILD-PRIVATE-CANARY";
   const cases = [
     {
@@ -328,7 +443,7 @@ test("Windows FD4 child distinguishes an existing fixed record from closed paren
   assert.equal(protocol.stderr.includes(privateCanary), false);
 });
 
-test("production smoke accepts the established context option and the FD4 child contains no native manager or fallback route", async () => {
+test("production smoke accepts the established context option and child source has no native or socket fallback", async () => {
   await assert.rejects(runWindowsAccountObservationQualificationSmoke({
     context: Object.freeze({}),
     environment: Object.freeze({ USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: "invalid" }),
@@ -341,5 +456,6 @@ test("production smoke accepts the established context option and the FD4 child 
   assert.equal(source.includes("windows-credential-manager"), false);
   assert.equal(source.includes("keytar"), false);
   assert.equal(source.includes("named pipe"), false);
+  assert.equal(source.includes("node:net"), false);
   assert.equal(source.includes("createWindowsAccountObservationBrokerBackendFromEnvironment"), true);
 });
