@@ -10,6 +10,7 @@ import { validateDesktopFirstRunReceipt } from "../apps/electron/desktop-first-r
 import {
   assertContainerContract,
   classifyAutomaticStartupRefreshReceipt,
+  createRendererReadinessCompanionSnapshotObserver,
   combineStartupRefreshEvidence,
   createRendererReadinessDiagnostics,
   createSyntheticHome,
@@ -134,11 +135,17 @@ test("Linux renderer readiness diagnostics retain only allowlisted module and pr
     { endpoint: "weekly", responseClass: "unobserved", outcome: "unobserved" },
     { endpoint: "quality", responseClass: "unobserved", outcome: "unobserved" },
   ]);
+  assert.deepEqual(snapshot.companionSnapshot, { status: "unobserved", errorCode: null });
   assert.equal(JSON.stringify(snapshot).includes("127.0.0.1"), false);
   assert.equal(validateRendererReadinessDiagnostics({
     ...snapshot,
     exception: { ...snapshot.exception, asset: "private-value.js" },
   }), null);
+  assert.equal(validateRendererReadinessDiagnostics({
+    ...snapshot,
+    companionSnapshot: { status: "failed", errorCode: "private-value" },
+  }), null);
+  assert.equal(validateRendererReadinessDiagnostics({ ...snapshot, unexpected: "value" }), null);
   diagnostics.dispose();
 });
 
@@ -231,6 +238,70 @@ test("Linux renderer diagnostic probe shares one bounded deadline and timing evi
   });
   assert.deepEqual(snapshot.primaryProbe, probe);
   diagnostics.dispose();
+});
+
+test("Linux renderer companion snapshot observer retains only closed health state and drains its active read", async () => {
+  let calls = 0;
+  const observer = createRendererReadinessCompanionSnapshotObserver("http://127.0.0.1:45678/", {
+    pollIntervalMs: 1,
+    requestTimeoutMs: 100,
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({
+        snapshot: calls === 1
+          ? { status: "building", errorCode: null }
+          : { status: "failed", errorCode: "collector_projection_unavailable" },
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  await waitFor(
+    () => observer.snapshot().status === "failed",
+    500,
+    "terminal companion snapshot observation",
+  );
+  assert.deepEqual(observer.snapshot(), {
+    status: "failed", errorCode: "collector_projection_unavailable",
+  });
+  const stoppedCalls = calls;
+  await new Promise((resolveWait) => setTimeout(resolveWait, 15));
+  assert.equal(calls, stoppedCalls, "a terminal snapshot stops low-frequency health observation");
+  await observer.stop();
+
+  let abortObserved = false;
+  let readerCancelled = false;
+  let resolveRead = null;
+  const reader = {
+    read: () => new Promise((resolveReadResult) => { resolveRead = resolveReadResult; }),
+    cancel: async () => {
+      readerCancelled = true;
+      resolveRead?.({ done: true, value: undefined });
+    },
+    releaseLock() {},
+  };
+  const pending = createRendererReadinessCompanionSnapshotObserver("http://127.0.0.1:45679/", {
+    pollIntervalMs: 100,
+    requestTimeoutMs: 100,
+    fetchImpl: async (_url, { signal }) => {
+      signal.addEventListener("abort", () => { abortObserved = true; }, { once: true });
+      return {
+        status: 200,
+        redirected: false,
+        headers: { get: () => null },
+        body: {
+          getReader: () => reader,
+          cancel: async () => {},
+        },
+      };
+    },
+  });
+  await waitFor(() => resolveRead !== null, 500, "active companion health read");
+  await pending.stop();
+  assert.equal(abortObserved, true);
+  assert.equal(readerCancelled, true);
+  assert.deepEqual(pending.snapshot(), { status: "unobserved", errorCode: null });
 });
 
 test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
@@ -336,7 +407,12 @@ test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
   const diagnosticsBind = source.indexOf(
     "rendererReadinessDiagnostics.bindSelectedDashboardUrl(selectedDashboardUrl.href)",
   );
+  const companionSnapshotObserver = source.indexOf(
+    "createRendererReadinessCompanionSnapshotObserver(",
+    diagnosticsBind,
+  );
   const runtimeEnabled = source.indexOf('await cdp.request("Runtime.enable")', diagnosticsBind);
+  const companionSnapshotStop = source.indexOf("await companionSnapshotObserver.stop()", readyWait);
   const automaticRefresh = source.indexOf("await assertAutomaticStartupRefresh({");
   assert.ok(
     readyWait >= 0 && automaticRefresh > readyWait,
@@ -345,6 +421,11 @@ test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
   assert.ok(
     diagnosticsBind >= 0 && diagnosticsBind < readyWait,
     "renderer diagnostics bind only after the selected loopback target is known",
+  );
+  assert.ok(
+    companionSnapshotObserver > diagnosticsBind && companionSnapshotObserver < readyWait
+      && companionSnapshotStop > readyWait,
+    "the existing health state is observed only during the unchanged readiness wait",
   );
   assert.ok(
     runtimeEnabled > diagnosticsBind && runtimeEnabled < readyWait,

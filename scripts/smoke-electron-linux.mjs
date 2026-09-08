@@ -42,6 +42,9 @@ const MAX_NETWORK_EVIDENCE_URL_LENGTH = 2_048;
 const MAX_JSON_RESPONSE_BYTES = 1_048_576;
 const MAX_CDP_PAGE_TARGETS = 16;
 const RENDERER_READINESS_DIAGNOSTIC_PROBE_MS = 2_000;
+const RENDERER_READINESS_COMPANION_HEALTH_POLL_MS = 500;
+const RENDERER_READINESS_COMPANION_HEALTH_REQUEST_MS = 2_000;
+const RENDERER_READINESS_COMPANION_HEALTH_MAX_BODY_BYTES = 64 * 1024;
 const CLI_FAILURE_STATUS = "ELECTRON_LINUX_SMOKE_FAILED";
 const NETWORK_BOUNDARY = "network-none";
 const PLATFORM_ARCHITECTURES = Object.freeze({
@@ -131,6 +134,10 @@ const RENDERER_READINESS_EXCEPTION_CLASSES = new Set([
 const RENDERER_READINESS_PROBE_OUTCOMES = new Set([
   "unobserved", "response", "timeout", "request_failed",
 ]);
+const RENDERER_READINESS_COMPANION_SNAPSHOT_STATUSES = new Set([
+  "unobserved", "building", "ready", "failed",
+]);
+const RENDERER_READINESS_COMPANION_SNAPSHOT_ERROR_CODE = /^[a-z0-9_]{1,64}$/u;
 const MAX_RENDERER_DIAGNOSTIC_LINE = 250_000;
 
 function rendererResponseClass(status) {
@@ -202,8 +209,14 @@ function isRendererReadinessFailureStage(stage) {
  * means CDP attached too late to prove the event was absent.
  */
 export function validateRendererReadinessDiagnostics(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const expectedKeys = [
+    "exception", "assets", "primaryApis", "primaryProbe", "companionSnapshot",
+  ];
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== expectedKeys.length
+      || !expectedKeys.every((key) => Object.hasOwn(value, key))) return null;
   const exception = value.exception;
+  const companionSnapshot = validateRendererCompanionSnapshot(value.companionSnapshot);
   if (!exception || typeof exception !== "object" || Array.isArray(exception)
       || typeof exception.observed !== "boolean"
       || !RENDERER_READINESS_EXCEPTION_CLASSES.has(exception.classification)
@@ -217,6 +230,7 @@ export function validateRendererReadinessDiagnostics(value) {
       || exception.observed && exception.classification === "unobserved") {
     return null;
   }
+  if (companionSnapshot === null) return null;
   if (!Array.isArray(value.assets) || value.assets.length !== RENDERER_READINESS_ASSETS.length
       || !Array.isArray(value.primaryApis)
       || value.primaryApis.length !== RENDERER_READINESS_PRIMARY_ENDPOINTS.length
@@ -263,6 +277,7 @@ export function validateRendererReadinessDiagnostics(value) {
       responseClass: row.responseClass,
       outcome: row.outcome,
     }))),
+    companionSnapshot,
   });
 }
 
@@ -304,6 +319,193 @@ export async function probeRendererReadinessPrimaryApis(origin, {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+function unobservedRendererCompanionSnapshot() {
+  return Object.freeze({ status: "unobserved", errorCode: null });
+}
+
+function validateRendererCompanionSnapshot(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== 2
+      || !RENDERER_READINESS_COMPANION_SNAPSHOT_STATUSES.has(value.status)
+      || !Object.hasOwn(value, "errorCode")) {
+    return null;
+  }
+  if (value.status === "unobserved" || value.status === "building" || value.status === "ready") {
+    return value.errorCode === null
+      ? Object.freeze({ status: value.status, errorCode: null })
+      : null;
+  }
+  return typeof value.errorCode === "string"
+      && RENDERER_READINESS_COMPANION_SNAPSHOT_ERROR_CODE.test(value.errorCode)
+    ? Object.freeze({ status: "failed", errorCode: value.errorCode })
+    : null;
+}
+
+async function readRendererCompanionSnapshot(origin, {
+  fetchImpl,
+  timeoutMs,
+  maximumBytes,
+  setActive,
+} = {}) {
+  const controller = new AbortController();
+  let body = null;
+  let reader = null;
+  let cancelled = false;
+  let timer = null;
+  const abortAndDrain = async () => {
+    if (cancelled) return;
+    cancelled = true;
+    controller.abort();
+    const operations = [];
+    if (typeof reader?.cancel === "function") {
+      try { operations.push(Promise.resolve(reader.cancel())); } catch { /* Best-effort cancellation. */ }
+    }
+    if (typeof body?.cancel === "function") {
+      try { operations.push(Promise.resolve(body.cancel())); } catch { /* Best-effort cancellation. */ }
+    }
+    await withTimeout(
+      Promise.allSettled(operations),
+      timeoutMs,
+      "companion health body cleanup",
+    ).catch(() => {});
+  };
+  timer = setTimeout(() => { void abortAndDrain(); }, timeoutMs);
+  timer.unref?.();
+  setActive(abortAndDrain);
+  try {
+    const response = await fetchImpl(new URL("/api/local/health", origin), {
+      redirect: "error",
+      signal: controller.signal,
+    });
+    body = response?.body ?? null;
+    if (response?.status !== 200 || response?.redirected === true) {
+      await abortAndDrain();
+      return null;
+    }
+    const contentLength = response.headers?.get?.("content-length") ?? null;
+    if (contentLength !== null) {
+      const parsedLength = typeof contentLength === "string" && /^\d+$/u.test(contentLength)
+        ? Number(contentLength)
+        : NaN;
+      if (!Number.isSafeInteger(parsedLength) || parsedLength > maximumBytes) {
+        await abortAndDrain();
+        return null;
+      }
+    }
+    reader = body?.getReader?.() ?? null;
+    if (reader === null) {
+      await abortAndDrain();
+      return null;
+    }
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) {
+        await abortAndDrain();
+        return null;
+      }
+      total += value.byteLength;
+      if (total > maximumBytes) {
+        await abortAndDrain();
+        return null;
+      }
+      chunks.push(Buffer.from(value));
+    }
+    let payload;
+    try { payload = JSON.parse(Buffer.concat(chunks, total).toString("utf8")); } catch { return null; }
+    return validateRendererCompanionSnapshot(payload?.snapshot);
+  } catch {
+    await abortAndDrain();
+    return null;
+  } finally {
+    clearTimeout(timer);
+    try { reader?.releaseLock?.(); } catch { /* Best-effort reader cleanup. */ }
+    setActive(null);
+  }
+}
+
+/**
+ * Observe only the companion's existing content-free snapshot state while the
+ * renderer waits for its first dashboard result. A successful `building`
+ * sample remains useful if the child later closes before another poll; failed
+ * requests themselves never replace that last safe state.
+ */
+export function createRendererReadinessCompanionSnapshotObserver(origin, {
+  fetchImpl = globalThis.fetch,
+  pollIntervalMs = RENDERER_READINESS_COMPANION_HEALTH_POLL_MS,
+  requestTimeoutMs = RENDERER_READINESS_COMPANION_HEALTH_REQUEST_MS,
+  maximumBytes = RENDERER_READINESS_COMPANION_HEALTH_MAX_BODY_BYTES,
+} = {}) {
+  const selectedOrigin = selectedRendererDashboardOrigin(origin);
+  if (selectedOrigin === null || typeof fetchImpl !== "function"
+      || !Number.isInteger(pollIntervalMs) || pollIntervalMs < 1 || pollIntervalMs > MAX_STARTUP_MS
+      || !Number.isInteger(requestTimeoutMs) || requestTimeoutMs < 1 || requestTimeoutMs > MAX_STARTUP_MS
+      || !Number.isInteger(maximumBytes) || maximumBytes < 1
+      || maximumBytes > MAX_JSON_RESPONSE_BYTES) {
+    return Object.freeze({
+      snapshot: unobservedRendererCompanionSnapshot,
+      stop: async () => {},
+    });
+  }
+  let last = unobservedRendererCompanionSnapshot();
+  let stopped = false;
+  let timer = null;
+  let active = null;
+  let cancelActive = null;
+  const clearScheduledPoll = () => {
+    if (timer !== null) clearTimeout(timer);
+    timer = null;
+  };
+  const stopScheduling = () => {
+    stopped = true;
+    clearScheduledPoll();
+  };
+  const schedule = () => {
+    if (stopped || timer !== null) return;
+    timer = setTimeout(() => {
+      timer = null;
+      observe();
+    }, pollIntervalMs);
+    timer.unref?.();
+  };
+  const observe = () => {
+    if (stopped || active !== null) return;
+    const task = readRendererCompanionSnapshot(selectedOrigin, {
+      fetchImpl,
+      timeoutMs: requestTimeoutMs,
+      maximumBytes,
+      setActive(cancel) {
+        cancelActive = cancel;
+      },
+    }).then((observed) => {
+      if (observed !== null) {
+        last = observed;
+        if (observed.status === "ready" || observed.status === "failed") {
+          stopScheduling();
+        }
+      }
+    }).finally(() => {
+      if (active === task) active = null;
+      if (!stopped) schedule();
+    });
+    active = task;
+    void task.catch(() => {});
+  };
+  observe();
+  return Object.freeze({
+    snapshot: () => last,
+    stop: async () => {
+      stopScheduling();
+      await withTimeout(Promise.allSettled([
+        Promise.resolve(cancelActive?.()),
+        active?.catch(() => {}),
+      ]), requestTimeoutMs, "companion health observer cleanup").catch(() => {});
+    },
+  });
 }
 
 export function createRendererReadinessDiagnostics({ cdp }) {
@@ -394,7 +596,7 @@ export function createRendererReadinessDiagnostics({ cdp }) {
       origin = selectedOrigin;
       return origin;
     },
-    snapshot() {
+    snapshot({ companionSnapshot = unobservedRendererCompanionSnapshot() } = {}) {
       return validateRendererReadinessDiagnostics({
         exception,
         assets: RENDERER_READINESS_ASSETS.map((asset) => ({ asset, ...assets.get(asset) })),
@@ -403,10 +605,14 @@ export function createRendererReadinessDiagnostics({ cdp }) {
           ...primaryApis.get(name),
         })),
         primaryProbe,
+        companionSnapshot,
       });
     },
-    async snapshotWithTimingAndProbe({ probe = probeRendererReadinessPrimaryApis } = {}) {
-      if (origin === null) return this.snapshot();
+    async snapshotWithTimingAndProbe({
+      probe = probeRendererReadinessPrimaryApis,
+      companionSnapshot = unobservedRendererCompanionSnapshot(),
+    } = {}) {
+      if (origin === null) return this.snapshot({ companionSnapshot });
       let timing = null;
       try {
         timing = await cdp.evaluate(`(() => {
@@ -457,7 +663,7 @@ export function createRendererReadinessDiagnostics({ cdp }) {
       if (typeof probe === "function") {
         try { primaryProbe = await probe(origin); } catch { /* Keep the prior unobserved probe. */ }
       }
-      return this.snapshot();
+      return this.snapshot({ companionSnapshot });
     },
     dispose() {
       for (const dispose of listeners) dispose();
@@ -1565,6 +1771,7 @@ export async function runSmoke({
   let cleanupConfirmed = false;
   let failureStage = null;
   let rendererReadinessDiagnostics = null;
+  let companionSnapshotObserver = null;
   try {
     failureStage = "startup";
     if (!child.pid) fail("Electron did not provide a process id");
@@ -1658,6 +1865,9 @@ export async function runSmoke({
         !== selectedDashboardUrl.origin) {
       fail("dashboard diagnostics did not bind the selected loopback origin");
     }
+    companionSnapshotObserver = createRendererReadinessCompanionSnapshotObserver(
+      selectedDashboardUrl.origin,
+    );
     await cdp.request("Runtime.enable");
     selectRequiredRefreshLoader(refreshObserver, await waitFor(
       () => mainFrameLoaderId(cdp),
@@ -1683,6 +1893,7 @@ export async function runSmoke({
       MAX_STARTUP_MS,
       "dashboard renderer readiness",
     );
+    await companionSnapshotObserver.stop();
     failureStage = "renderer_origin";
     selectRequiredRefreshLoader(refreshObserver, await mainFrameLoaderId(cdp));
     const dashboardUrl = new URL(ready.location);
@@ -1862,8 +2073,13 @@ export async function runSmoke({
     if (isRendererReadinessFailureStage(failureStage)
         && onRendererReadinessDiagnostics !== null) {
       try {
-        const diagnostic = await rendererReadinessDiagnostics?.snapshotWithTimingAndProbe?.()
-          ?? rendererReadinessDiagnostics?.snapshot?.()
+        await companionSnapshotObserver?.stop?.();
+        const companionSnapshot = companionSnapshotObserver?.snapshot?.()
+          ?? unobservedRendererCompanionSnapshot();
+        const diagnostic = await rendererReadinessDiagnostics?.snapshotWithTimingAndProbe?.({
+          companionSnapshot,
+        })
+          ?? rendererReadinessDiagnostics?.snapshot?.({ companionSnapshot })
           ?? null;
         onRendererReadinessDiagnostics(diagnostic);
       } catch {
@@ -1880,6 +2096,7 @@ export async function runSmoke({
     }
     throw error;
   } finally {
+    await companionSnapshotObserver?.stop?.();
     for (const page of attachedPages.values()) {
       page.rendererReadinessDiagnostics?.dispose?.();
       page.refreshObserver?.dispose?.();

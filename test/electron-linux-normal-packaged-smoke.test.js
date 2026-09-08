@@ -101,6 +101,10 @@ function validRendererReadinessDiagnostics() {
       { endpoint: "weekly", responseClass: "unobserved", outcome: "request_failed" },
       { endpoint: "quality", responseClass: "unobserved", outcome: "timeout" },
     ],
+    companionSnapshot: {
+      status: "failed",
+      errorCode: "collector_projection_unavailable",
+    },
   });
 }
 
@@ -367,7 +371,7 @@ test("normal packaged Linux session and outer receipt retain only validated rend
     child.stdout.end();
     child.stderr.write("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_TRUE_FAILED\n");
     child.stderr.write(`${JSON.stringify({
-      schemaVersion: "tibotattle-electron-linux-normal-packaged-renderer-readiness-diagnostic-v1",
+      schemaVersion: "tibotattle-electron-linux-normal-packaged-renderer-readiness-diagnostic-v2",
       rendererReadinessDiagnostics: diagnostic,
     })}\n`);
     child.stderr.end();

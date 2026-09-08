@@ -41,7 +41,7 @@ const SHA256 = /^[0-9a-f]{64}$/u;
 const TARGET = "linux-x64";
 const RECEIPT_SCHEMA = "tibotattle-electron-linux-normal-packaged-smoke-v1";
 const RENDERER_READINESS_DIAGNOSTIC_SCHEMA =
-  "tibotattle-electron-linux-normal-packaged-renderer-readiness-diagnostic-v1";
+  "tibotattle-electron-linux-normal-packaged-renderer-readiness-diagnostic-v2";
 const CLI_FAILURE = "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_FAILED";
 const MAX_JSON_BYTES = 1_048_576;
 // Two source-smoke journeys each retain their existing 30s startup, two 45s
