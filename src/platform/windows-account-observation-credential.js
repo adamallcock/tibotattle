@@ -2,12 +2,49 @@ import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "./export-identity-keychain.js";
 import {
+  createWindowsCredentialManagerBackend,
   WindowsCredentialManagerError,
 } from "./windows-credential-manager.js";
+import {
+  createWindowsCredentialOperationLeaseContext,
+  isWindowsCredentialOperationLeaseError,
+} from "./windows-credential-operation-lease.js";
+import {
+  createWindowsCredentialMutexContext,
+} from "./windows-credential-mutex.js";
+import {
+  createWindowsCredentialOperationAuditStore,
+  defaultWindowsCredentialOperationAuditFile,
+} from "./windows-credential-operation-audit.js";
+import {
+  createWindowsCredentialAuditFileGuardContext,
+} from "./windows-credential-audit-file-guard.js";
+import {
+  isWindowsQualificationModeContextFor,
+} from "./windows-qualification-mode.js";
 
 const SECRET_BYTES = 32;
 const trustedErrors = new WeakSet();
 const trustedBackends = new WeakSet();
+const QUALIFIED_PRODUCTION_OPTION_KEYS = Object.freeze([
+  "adapter",
+  "resourceRoot",
+  "windowsQualificationModeContext",
+]);
+const QUALIFIED_TEST_OPTION_KEYS = Object.freeze([
+  ...QUALIFIED_PRODUCTION_OPTION_KEYS,
+  "architecture",
+  "platform",
+]);
+const QUALIFIED_TEST_DEPENDENCY_KEYS = Object.freeze([
+  "createAuditFileGuardContext",
+  "createAuditStore",
+  "createCredentialManagerBackend",
+  "createLeaseContext",
+  "createMutexContext",
+  "defaultAuditFile",
+  "isQualificationModeContextFor",
+]);
 
 export const WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_INTEGRATION_STATUS = "qualification_only";
 export const WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_PRODUCTION_SAFE = false;
@@ -67,6 +104,22 @@ function exactOptions(options) {
     fail("invalid_configuration");
   }
   return options;
+}
+
+function exactObject(value, keys) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    fail("invalid_configuration");
+  }
+  let actual;
+  try {
+    actual = Object.keys(value);
+  } catch {
+    fail("invalid_configuration");
+  }
+  if (actual.length !== keys.length || actual.some((key) => !keys.includes(key))) {
+    fail("invalid_configuration");
+  }
+  return value;
 }
 
 function copySecret(value) {
@@ -129,6 +182,101 @@ function disposeManager(manager) {
   }
 }
 
+function closeQuietly(value) {
+  try { value?.close?.(); } catch { /* Preserve the fixed constructor failure. */ }
+}
+
+function qualifiedFailureCode(error) {
+  if (isWindowsCredentialOperationLeaseError(error)) return "recovery_required";
+  return managerFailureCode(error);
+}
+
+function qualifiedModeContext({
+  adapter,
+  resourceRoot,
+  windowsQualificationModeContext,
+  isQualificationContextFor,
+}) {
+  let valid = false;
+  try {
+    valid = adapter !== null
+      && (typeof adapter === "object" || typeof adapter === "function")
+      && typeof resourceRoot === "string"
+      && resourceRoot.length > 0
+      && windowsQualificationModeContext !== null
+      && typeof windowsQualificationModeContext === "object"
+      && windowsQualificationModeContext.platform === "win32"
+      && windowsQualificationModeContext.architecture === "x64"
+      && windowsQualificationModeContext.qualificationOnly === true
+      && windowsQualificationModeContext.productionSafe === false
+      && typeof windowsQualificationModeContext.stateRoot === "string"
+      && windowsQualificationModeContext.stateRoot.length > 0
+      && typeof isQualificationContextFor === "function"
+      && isQualificationContextFor({
+        context: windowsQualificationModeContext,
+        adapter,
+        stateRoot: windowsQualificationModeContext.stateRoot,
+        resourceRoot,
+      }) === true;
+  } catch {
+    valid = false;
+  }
+  if (!valid) fail("unavailable");
+  return windowsQualificationModeContext;
+}
+
+function validRecoveryReceipt(value) {
+  try {
+    return value !== null
+      && typeof value === "object"
+      && !Array.isArray(value)
+      && Object.keys(value).length === 3
+      && Object.hasOwn(value, "complete")
+      && Object.hasOwn(value, "recovered")
+      && Object.hasOwn(value, "contended")
+      && value.complete === true
+      && Number.isSafeInteger(value.recovered)
+      && value.recovered >= 0
+      && value.contended === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The generic Credential Manager cannot own an explicitly injected lease
+ * context. This narrow facade gives that context one clear owner: the fixed
+ * account-observation backend. It exposes only the manager operations that
+ * the existing fixed wrapper already snapshots, and it never forwards an
+ * arbitrary credential capability or binding.
+ */
+function wrapLeaseOwningQualifiedManager(manager, leaseContext) {
+  const selected = snapshotManager(manager);
+  let closed = false;
+  return Object.freeze({
+    read: selected.read,
+    createIfMissing: selected.createIfMissing,
+    withOperationLease: selected.withOperationLease,
+    close() {
+      if (closed) return;
+      closed = true;
+      try {
+        // `createWindowsCredentialManagerBackend` rejects close() when it
+        // was given an external lease, so closing it here would only mask the
+        // lifetime error. The lease owns the audit store and file guard.
+        leaseContext.close();
+      } catch {
+        throw new WindowsCredentialManagerError("operation_lease_audit_failed");
+      }
+    },
+    crossProcessSafe: true,
+    auditDurable: true,
+    auditFilesystemProtected: true,
+    startupRecoveryComplete: true,
+    productionSafe: false,
+  });
+}
+
 function snapshotManager(manager) {
   let valid = false;
   try {
@@ -164,8 +312,10 @@ function snapshotManager(manager) {
  * prepared/settled/recovered journal, while exposing neither generic manager
  * capabilities nor raw Credential Manager service/account inputs. The
  * manager constructor is explicit: only a later app-owned, branded
- * qualification composition may provide it. This module never discovers a
- * native binding, state root, or ambient credential route on its own.
+ * qualification composition may provide it. This injected constructor never
+ * discovers a native binding, state root, or ambient credential route on its
+ * own; the separate qualified constructor below verifies both authorities
+ * before it composes the reviewed native factories internally.
  */
 export function createWindowsAccountObservationCredentialBackend(options = {}) {
   const configuration = exactOptions(options);
@@ -265,4 +415,148 @@ export function createWindowsAccountObservationCredentialBackend(options = {}) {
   });
   trustedBackends.add(backend);
   return backend;
+}
+
+function createQualifiedBackend({
+  adapter,
+  architecture,
+  createAuditFileGuardContext,
+  createAuditStore,
+  createCredentialManagerBackend,
+  createLeaseContext,
+  createMutexContext,
+  defaultAuditFile,
+  isQualificationContextFor,
+  platform,
+  resourceRoot,
+  windowsQualificationModeContext,
+}) {
+  if (platform !== "win32") fail("unsupported_platform");
+  if (architecture !== "x64") fail("unsupported_architecture");
+  if ([
+    createAuditFileGuardContext,
+    createAuditStore,
+    createCredentialManagerBackend,
+    createLeaseContext,
+    createMutexContext,
+    defaultAuditFile,
+    isQualificationContextFor,
+  ].some((value) => typeof value !== "function")) {
+    fail("invalid_configuration");
+  }
+  const qualifiedContext = qualifiedModeContext({
+    adapter,
+    resourceRoot,
+    windowsQualificationModeContext,
+    isQualificationContextFor,
+  });
+
+  let auditStore = null;
+  let leaseContext = null;
+  try {
+    const mutexContext = createMutexContext({ platform, architecture });
+    const fileGuardContext = createAuditFileGuardContext({ platform, architecture });
+    auditStore = createAuditStore({
+      filePath: defaultAuditFile({
+        platform,
+        stateRoot: qualifiedContext.stateRoot,
+      }),
+      fileGuardContext,
+    });
+    const candidateLeaseContext = createLeaseContext({
+      mutexContext,
+      auditStore,
+      ownsAuditStore: true,
+    });
+    if (candidateLeaseContext === null || typeof candidateLeaseContext !== "object"
+        || typeof candidateLeaseContext.close !== "function"
+        || typeof candidateLeaseContext.recoverPreparedOperations !== "function") {
+      fail("unavailable");
+    }
+    leaseContext = candidateLeaseContext;
+    // Once a lease context has been returned, it owns the audit store. Keep
+    // explicit ownership only across the factory call so a constructor throw
+    // cannot leave its durable database/file guards open.
+    auditStore = null;
+    const recovery = leaseContext?.recoverPreparedOperations?.();
+    if (!validRecoveryReceipt(recovery)) fail("recovery_required");
+
+    const qualifiedManager = createCredentialManagerBackend({
+      platform,
+      architecture,
+      operationLeaseContext: leaseContext,
+    });
+    const manager = wrapLeaseOwningQualifiedManager(qualifiedManager, leaseContext);
+    // The explicit fixed factory still performs its own trusted-manager
+    // snapshot and retains the capability restriction in one place.
+    return createWindowsAccountObservationCredentialBackend({
+      platform,
+      architecture,
+      createCredentialManagerBackend: () => manager,
+    });
+  } catch (error) {
+    // The generic manager's close method deliberately rejects external lease
+    // ownership. The lease context is the one resource owner on every
+    // constructor-failure path, including failed recovery and manager shape.
+    closeQuietly(leaseContext);
+    closeQuietly(auditStore);
+    if (isWindowsAccountObservationCredentialError(error)) throw error;
+    fail(qualifiedFailureCode(error));
+  }
+}
+
+/**
+ * Construct the fixed account-observation credential backend for an already
+ * authenticated packaged Windows qualification run. This is intentionally
+ * not a production selector: it uses the current native Windows process,
+ * requires both branded qualification authorities, and remains
+ * `productionSafe: false` end to end.
+ *
+ * No caller-controlled binding, state root, capability, service, account, or
+ * generic manager factory is accepted. The generic manager remains an
+ * implementation detail of this fixed platform facade.
+ */
+export function createQualifiedWindowsAccountObservationCredentialBackend(options = {}) {
+  const source = exactObject(options, QUALIFIED_PRODUCTION_OPTION_KEYS);
+  return createQualifiedBackend({
+    adapter: source.adapter,
+    architecture: process.arch,
+    createAuditFileGuardContext: createWindowsCredentialAuditFileGuardContext,
+    createAuditStore: createWindowsCredentialOperationAuditStore,
+    createCredentialManagerBackend: createWindowsCredentialManagerBackend,
+    createLeaseContext: createWindowsCredentialOperationLeaseContext,
+    createMutexContext: createWindowsCredentialMutexContext,
+    defaultAuditFile: defaultWindowsCredentialOperationAuditFile,
+    isQualificationContextFor: isWindowsQualificationModeContextFor,
+    platform: process.platform,
+    resourceRoot: source.resourceRoot,
+    windowsQualificationModeContext: source.windowsQualificationModeContext,
+  });
+}
+
+/**
+ * Plain-Node seam for qualification-contract tests. It mirrors the exact
+ * production shape while replacing native factories with disposable
+ * synthetic ones; application code must use the production constructor.
+ */
+export function createQualifiedWindowsAccountObservationCredentialBackendForTest(
+  options = {},
+  dependencies = {},
+) {
+  const source = exactObject(options, QUALIFIED_TEST_OPTION_KEYS);
+  const factories = exactObject(dependencies, QUALIFIED_TEST_DEPENDENCY_KEYS);
+  return createQualifiedBackend({
+    adapter: source.adapter,
+    architecture: source.architecture,
+    createAuditFileGuardContext: factories.createAuditFileGuardContext,
+    createAuditStore: factories.createAuditStore,
+    createCredentialManagerBackend: factories.createCredentialManagerBackend,
+    createLeaseContext: factories.createLeaseContext,
+    createMutexContext: factories.createMutexContext,
+    defaultAuditFile: factories.defaultAuditFile,
+    isQualificationContextFor: factories.isQualificationModeContextFor,
+    platform: source.platform,
+    resourceRoot: source.resourceRoot,
+    windowsQualificationModeContext: source.windowsQualificationModeContext,
+  });
 }

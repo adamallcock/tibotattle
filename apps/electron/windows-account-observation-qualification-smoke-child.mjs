@@ -1,0 +1,97 @@
+import { createHash, timingSafeEqual } from "node:crypto";
+
+import {
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY,
+  createWindowsAccountObservationBrokerBackendFromEnvironment,
+} from "../../src/platform/index.js";
+
+const PHASES = new Set(["create-v1", "restart-read-v1"]);
+const RUN_ID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
+
+// Only fixed stage numbers cross the child-process boundary. Native errors,
+// account identifiers, record values, and descriptor diagnostics stay local.
+let failureExitCode = 41;
+
+function argumentsForQualification() {
+  const values = process.argv.slice(2);
+  if (values.length !== 2 || !PHASES.has(values[0])
+      || typeof values[1] !== "string" || !RUN_ID.test(values[1])) {
+    throw new Error("invalid qualification arguments");
+  }
+  return Object.freeze({ phase: values[0], runId: values[1].toLowerCase() });
+}
+
+function syntheticSecret(runId) {
+  return createHash("sha256")
+    .update(`tibotattle-windows-account-observation-fd4-smoke-v1:${runId}`)
+    .digest();
+}
+
+function sameSecret(left, right) {
+  try {
+    return Buffer.isBuffer(left)
+      && Buffer.isBuffer(right)
+      && left.byteLength === 32
+      && right.byteLength === 32
+      && timingSafeEqual(left, right);
+  } catch {
+    return false;
+  }
+}
+
+async function readExact(backend, expected) {
+  let observed = null;
+  try {
+    observed = await backend.read(WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY);
+    return sameSecret(observed, expected);
+  } finally {
+    observed?.fill?.(0);
+  }
+}
+
+async function run() {
+  const { phase, runId } = argumentsForQualification();
+  const backend = createWindowsAccountObservationBrokerBackendFromEnvironment();
+  if (backend === null
+      || process.env.USAGE_MONITOR_KEYCHAIN_BROKER_FD !== undefined
+      || process.env.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD !== undefined) {
+    throw new Error("missing fixed FD4 broker");
+  }
+  const expected = syntheticSecret(runId);
+  try {
+    if (phase === "create-v1") {
+      let existing = null;
+      try {
+        failureExitCode = 42;
+        existing = await backend.read(WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY);
+        if (existing !== null) throw new Error("unexpected existing synthetic record");
+      } finally {
+        existing?.fill?.(0);
+      }
+      failureExitCode = 43;
+      if (await backend.createIfMissing(
+        WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY,
+        expected,
+      ) !== "created") {
+        throw new Error("record was not created");
+      }
+      failureExitCode = 44;
+      if (!(await readExact(backend, expected))) throw new Error("readback mismatch");
+      return;
+    }
+    failureExitCode = 45;
+    if (!(await readExact(backend, expected))) throw new Error("restart read mismatch");
+  } finally {
+    expected.fill(0);
+  }
+}
+
+run().then(() => {
+  process.stdout.write("USAGE_MONITOR_READY http://127.0.0.1:4545/\n");
+  setInterval(() => {}, 1_000);
+}).catch(() => {
+  // The inherited FD4 socket keeps Node alive. Exit directly on failure so
+  // the supervisor gets a bounded failure instead of a startup-timeout claim.
+  process.exit(failureExitCode);
+});

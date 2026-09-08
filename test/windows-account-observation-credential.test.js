@@ -11,6 +11,8 @@ import {
   WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_INTEGRATION_STATUS,
   WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_PRODUCTION_SAFE,
   WindowsAccountObservationCredentialError,
+  createQualifiedWindowsAccountObservationCredentialBackend,
+  createQualifiedWindowsAccountObservationCredentialBackendForTest,
   createWindowsAccountObservationCredentialBackend,
   isWindowsAccountObservationCredentialBackend,
 } from "../src/platform/windows-account-observation-credential.js";
@@ -95,6 +97,95 @@ function createBackend(synthetic) {
     },
   });
   return { backend, constructionCalls };
+}
+
+function qualificationContext() {
+  return Object.freeze({
+    platform: "win32",
+    architecture: "x64",
+    qualificationOnly: true,
+    productionSafe: false,
+    stateRoot: "C:\\qualification\\state",
+  });
+}
+
+function qualifiedBackendFixture({
+  manager = createSyntheticManager(),
+  context = qualificationContext(),
+  contextValid = true,
+  recovery = Object.freeze({ complete: true, recovered: 0, contended: 0 }),
+  managerFailure = null,
+  leaseFailure = null,
+} = {}) {
+  const calls = [];
+  let leaseCloses = 0;
+  let auditStoreCloses = 0;
+  let leaseContext = null;
+  const adapter = Object.freeze({ kind: "synthetic-windows-adapter" });
+  const factories = Object.freeze({
+    createMutexContext(options) {
+      calls.push(["mutex", options]);
+      return Object.freeze({ kind: "mutex" });
+    },
+    createAuditFileGuardContext(options) {
+      calls.push(["guard", options]);
+      return Object.freeze({ kind: "guard" });
+    },
+    defaultAuditFile(options) {
+      calls.push(["file", options]);
+      return "C:\\qualification\\state\\private\\windows-credential-operation-audit-v1.sqlite";
+    },
+    createAuditStore(options) {
+      calls.push(["store", options]);
+      return Object.freeze({
+        kind: "audit",
+        close() { auditStoreCloses += 1; },
+      });
+    },
+    createLeaseContext(options) {
+      calls.push(["lease", options]);
+      if (leaseFailure !== null) throw leaseFailure;
+      const ownedAuditStore = options.auditStore;
+      leaseContext = Object.freeze({
+        recoverPreparedOperations() {
+          calls.push(["recover"]);
+          return recovery;
+        },
+        close() {
+          leaseCloses += 1;
+          ownedAuditStore.close();
+        },
+      });
+      return leaseContext;
+    },
+    createCredentialManagerBackend(options) {
+      calls.push(["manager", options]);
+      if (managerFailure !== null) throw managerFailure;
+      return manager.manager;
+    },
+    isQualificationModeContextFor(options) {
+      calls.push(["context", options]);
+      return contextValid;
+    },
+  });
+  const options = Object.freeze({
+    platform: "win32",
+    architecture: "x64",
+    adapter,
+    resourceRoot: "C:\\qualification\\resources",
+    windowsQualificationModeContext: context,
+  });
+  return Object.freeze({
+    adapter,
+    calls,
+    context,
+    factories,
+    manager,
+    options,
+    get leaseCloses() { return leaseCloses; },
+    get auditStoreCloses() { return auditStoreCloses; },
+    get leaseContext() { return leaseContext; },
+  });
 }
 
 test("Windows account-observation wrapper limits the generic manager to the fixed legacy observation capability", async () => {
@@ -219,4 +310,124 @@ test("Windows account-observation wrapper maps only fixed manager errors and nev
   const { backend } = createBackend(synthetic);
   await assert.rejects(backend.createIfMissing(Buffer.alloc(31, 3)), accountObservationError("invalid_configuration"));
   backend.close();
+});
+
+test("qualified Windows account-observation construction keeps the generic manager private behind the fixed lease-owning facade", async () => {
+  const fixture = qualifiedBackendFixture();
+  const backend = createQualifiedWindowsAccountObservationCredentialBackendForTest(
+    fixture.options,
+    fixture.factories,
+  );
+  const candidate = Buffer.alloc(32, 81);
+  try {
+    assert.equal(await backend.read(), null);
+    assert.equal(await backend.createIfMissing(candidate), "created");
+    const observed = await backend.read();
+    assert.deepEqual(observed, candidate);
+    observed.fill(0);
+  } finally {
+    candidate.fill(0);
+    backend.close();
+  }
+  assert.deepEqual(fixture.calls.map(([name]) => name), [
+    "context", "mutex", "guard", "file", "store", "lease", "recover", "manager",
+  ]);
+  assert.deepEqual(fixture.calls[0][1], {
+    context: fixture.context,
+    adapter: fixture.adapter,
+    stateRoot: "C:\\qualification\\state",
+    resourceRoot: "C:\\qualification\\resources",
+  });
+  assert.deepEqual(fixture.calls[2][1], { platform: "win32", architecture: "x64" });
+  assert.deepEqual(fixture.calls[3][1], {
+    platform: "win32",
+    stateRoot: "C:\\qualification\\state",
+  });
+  assert.deepEqual(fixture.calls[6], ["recover"]);
+  assert.deepEqual(Object.keys(fixture.calls[7][1]).sort(), [
+    "architecture", "operationLeaseContext", "platform",
+  ]);
+  assert.equal(fixture.calls[7][1].platform, "win32");
+  assert.equal(fixture.calls[7][1].architecture, "x64");
+  assert.equal(fixture.calls[7][1].operationLeaseContext, fixture.leaseContext);
+  assert.equal(fixture.leaseCloses, 1);
+  assert.equal(fixture.auditStoreCloses, 1);
+  // The generic manager cannot close an injected lease. The fixed facade owns
+  // the lease instead, so a close cannot accidentally call the generic path.
+  assert.equal(fixture.manager.closeCalls, 0);
+  assert.equal(fixture.manager.calls.every(([, capability]) => capability === ACCOUNT_CAPABILITY), true);
+});
+
+test("qualified Windows account-observation construction authenticates context and recovery before native factories", () => {
+  const invalidContext = qualifiedBackendFixture({ contextValid: false });
+  assert.throws(
+    () => createQualifiedWindowsAccountObservationCredentialBackendForTest(
+      invalidContext.options,
+      invalidContext.factories,
+    ),
+    accountObservationError("unavailable"),
+  );
+  assert.deepEqual(invalidContext.calls.map(([name]) => name), ["context"]);
+  assert.equal(invalidContext.leaseCloses, 0);
+
+  const incompleteRecovery = qualifiedBackendFixture({
+    recovery: Object.freeze({ complete: false, recovered: 0, contended: 1 }),
+  });
+  assert.throws(
+    () => createQualifiedWindowsAccountObservationCredentialBackendForTest(
+      incompleteRecovery.options,
+      incompleteRecovery.factories,
+    ),
+    accountObservationError("recovery_required"),
+  );
+  assert.deepEqual(incompleteRecovery.calls.map(([name]) => name), [
+    "context", "mutex", "guard", "file", "store", "lease", "recover",
+  ]);
+  assert.equal(incompleteRecovery.leaseCloses, 1);
+
+  const failedLease = qualifiedBackendFixture({
+    leaseFailure: new Error("WINDOWS-QUALIFIED-LEASE-PRIVATE-CANARY"),
+  });
+  assert.throws(
+    () => createQualifiedWindowsAccountObservationCredentialBackendForTest(
+      failedLease.options,
+      failedLease.factories,
+    ),
+    accountObservationError("unavailable"),
+  );
+  assert.deepEqual(failedLease.calls.map(([name]) => name), [
+    "context", "mutex", "guard", "file", "store", "lease",
+  ]);
+  assert.equal(failedLease.leaseCloses, 0);
+  assert.equal(failedLease.auditStoreCloses, 1,
+    "a durable audit store is closed if lease construction never takes ownership");
+
+  const privateCanary = "WINDOWS-QUALIFIED-MANAGER-PRIVATE-CANARY";
+  const failedManager = qualifiedBackendFixture({ managerFailure: new Error(privateCanary) });
+  assert.throws(
+    () => createQualifiedWindowsAccountObservationCredentialBackendForTest(
+      failedManager.options,
+      failedManager.factories,
+    ),
+    (error) => {
+      assert.equal(accountObservationError("unavailable")(error), true);
+      assert.equal(`${error.stack}\n${JSON.stringify(error)}`.includes(privateCanary), false);
+      return true;
+    },
+  );
+  assert.equal(failedManager.leaseCloses, 1);
+});
+
+test("production qualified constructor never accepts a synthetic platform or manager seam", () => {
+  const expected = process.platform === "win32" && process.arch === "x64"
+    ? "unavailable"
+    : process.platform === "win32" ? "unsupported_architecture" : "unsupported_platform";
+  assert.throws(
+    () => createQualifiedWindowsAccountObservationCredentialBackend({
+      adapter: Object.freeze({}),
+      resourceRoot: "C:\\qualification\\resources",
+      windowsQualificationModeContext: Object.freeze({}),
+    }),
+    accountObservationError(expected),
+  );
 });
