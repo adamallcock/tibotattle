@@ -8,17 +8,19 @@
  */
 
 import { execFileSync, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createReadStream } from "node:fs";
 import {
   chmod,
+  link,
   mkdir,
   readFile,
   readdir,
   rename,
   rm,
   stat,
+  unlink,
   writeFile,
 } from "node:fs/promises";
 import { createServer } from "node:net";
@@ -490,15 +492,27 @@ async function ensureFreshDestination(args) {
   if ((await readdir(args.screenshotsDirectory)).length !== 0) throw fixedError("arguments_invalid", "contract");
 }
 
-async function writeReceipt(destination, receipt) {
+/** Publish a complete receipt once; a concurrent final destination is never replaced. */
+export async function writeReceipt(destination, receipt) {
   await mkdir(dirname(destination), { recursive: true, mode: 0o700 });
   if (await stat(destination).then(() => true).catch(() => false)) {
     throw fixedError("arguments_invalid", "contract");
   }
-  const temporary = join(dirname(destination), `.${basename(destination)}.tmp`);
-  await writeFile(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600, flag: "wx" });
-  await chmod(temporary, 0o600).catch(() => {});
-  await rename(temporary, destination);
+  const temporary = join(dirname(destination), `.${basename(destination)}.${process.pid}.${randomUUID()}.tmp`);
+  let temporaryWritten = false;
+  try {
+    await writeFile(temporary, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    temporaryWritten = true;
+    await chmod(temporary, 0o600).catch(() => {});
+    try {
+      await link(temporary, destination);
+    } catch (error) {
+      if (error?.code === "EEXIST") throw fixedError("arguments_invalid", "contract");
+      throw error;
+    }
+  } finally {
+    if (temporaryWritten) await unlink(temporary).catch(() => {});
+  }
 }
 
 async function captureScreenshot(cdp, outputDirectory, key) {
@@ -865,7 +879,7 @@ function descendantsOf(parentPid) {
     const result = []; const pending = [...(children.get(parentPid) ?? [])];
     while (pending.length > 0) { const pid = pending.shift(); result.push(pid); pending.push(...(children.get(pid) ?? [])); }
     return result;
-  } catch { return []; }
+  } catch { return null; }
 }
 
 function processAlive(pid) {
@@ -875,13 +889,75 @@ function processAlive(pid) {
 async function cleanQuit(child) {
   if (!child?.pid || child.exitCode !== null || child.signalCode !== null) throw fixedError("clean_quit_invalid", "quit");
   const descendants = descendantsOf(child.pid);
-  if (descendants.length === 0) throw fixedError("clean_quit_invalid", "quit");
+  if (!Array.isArray(descendants) || descendants.length === 0) throw fixedError("clean_quit_invalid", "quit");
   const exit = once(child, "exit");
   if (!child.kill("SIGUSR2")) throw fixedError("clean_quit_invalid", "quit");
   await withTimeout(exit, SHUTDOWN_TIMEOUT_MS, "clean_quit_invalid", "quit");
   if (child.exitCode !== 0 || child.signalCode !== null) throw fixedError("clean_quit_invalid", "quit");
   await waitFor(() => descendants.every((pid) => !processAlive(pid)), SHUTDOWN_TIMEOUT_MS, "clean_quit_invalid", "quit");
   return true;
+}
+
+function childHasExited(child) {
+  return (child?.exitCode !== null && child?.exitCode !== undefined)
+    || (child?.signalCode !== null && child?.signalCode !== undefined);
+}
+
+function prepareChildExitWaiter(child) {
+  let resolveExit;
+  const exit = new Promise((resolveExitEvent) => { resolveExit = resolveExitEvent; });
+  const onExit = () => resolveExit(true);
+  try { child.once("exit", onExit); } catch { return async () => childHasExited(child); }
+  return async (timeoutMs) => {
+    let timer;
+    try {
+      const exited = await Promise.race([
+        exit,
+        new Promise((resolveTimeout) => { timer = setTimeout(() => resolveTimeout(false), timeoutMs); }),
+      ]);
+      return exited === true || childHasExited(child);
+    } finally {
+      clearTimeout(timer);
+      try { child.removeListener("exit", onExit); } catch {}
+    }
+  };
+}
+
+/**
+ * The normal clean-quit path clears `child` only after it has verified every
+ * captured descendant has exited. On an error path, preserve the disposable
+ * fixture unless this fallback can make the same process-tree claim.
+ */
+export async function finalizeSyntheticFixture({
+  child,
+  fixture,
+  captureDescendants = descendantsOf,
+  isAlive = processAlive,
+  createExitWaiter = prepareChildExitWaiter,
+  removeDirectory = (directory) => rm(directory, { recursive: true, force: true }),
+  shutdownTimeoutMs = 2_000,
+} = {}) {
+  if (child !== null) {
+    if (!Number.isSafeInteger(child?.pid) || child.pid <= 0 || childHasExited(child)) {
+      return Object.freeze({ shutdownConfirmed: false, fixtureRemoved: false });
+    }
+    const descendants = captureDescendants(child.pid);
+    if (!Array.isArray(descendants)) return Object.freeze({ shutdownConfirmed: false, fixtureRemoved: false });
+    const waitForExit = createExitWaiter(child);
+    let signaled = false;
+    try { signaled = child.kill("SIGTERM") === true; } catch {}
+    if (!signaled || await waitForExit(shutdownTimeoutMs) !== true
+        || isAlive(child.pid) || descendants.some((pid) => isAlive(pid))) {
+      return Object.freeze({ shutdownConfirmed: false, fixtureRemoved: false });
+    }
+  }
+  if (fixture === null) return Object.freeze({ shutdownConfirmed: true, fixtureRemoved: false });
+  try {
+    await removeDirectory(fixture.root);
+    return Object.freeze({ shutdownConfirmed: true, fixtureRemoved: true });
+  } catch {
+    return Object.freeze({ shutdownConfirmed: true, fixtureRemoved: false });
+  }
 }
 
 function nativeHandoffError(reason) {
@@ -1040,15 +1116,11 @@ async function runNativeCuaHandoff(args) {
     throw error;
   } finally {
     cdp?.close();
-    if (child?.exitCode === null && child?.signalCode === null) {
-      try { child.kill("SIGTERM"); } catch {}
-      await Promise.race([once(child, "exit").catch(() => null), wait(2_000)]);
-    }
-    await Promise.all([
+    const cleanup = await finalizeSyntheticFixture({ child, fixture });
+    if (cleanup.shutdownConfirmed) await Promise.all([
       rm(join(handoffDirectory, "ready.json"), { force: true }).catch(() => {}),
       rm(join(handoffDirectory, "acknowledgement.json"), { force: true }).catch(() => {}),
     ]);
-    if (fixture !== null) await rm(fixture.root, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -1160,11 +1232,7 @@ async function runPageParity(args) {
     throw error;
   } finally {
     cdp?.close();
-    if (child?.exitCode === null && child?.signalCode === null) {
-      try { child.kill("SIGTERM"); } catch {}
-      await Promise.race([once(child, "exit").catch(() => null), wait(2_000)]);
-    }
-    if (fixture !== null) await rm(fixture.root, { recursive: true, force: true }).catch(() => {});
+    await finalizeSyntheticFixture({ child, fixture });
   }
 }
 
@@ -1214,7 +1282,15 @@ async function main() {
       });
     }
   }
-  if (args !== null && destinationPrepared) await writeReceipt(args.receiptPath, receipt);
+  if (args !== null && destinationPrepared) {
+    try {
+      await writeReceipt(args.receiptPath, receipt);
+    } catch {
+      process.stdout.write("failed\n");
+      process.exitCode = 1;
+      return;
+    }
+  }
   process.stdout.write(`${receipt.status}\n`);
   process.exitCode = receipt.status === "failed" ? 1 : 0;
 }

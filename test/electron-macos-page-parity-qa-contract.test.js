@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,9 +15,11 @@ import { refreshReplaySafeAccountingCache } from "../src/replay-safe-accounting-
 import {
   buildClosedPageParityReceipt,
   buildClosedNativeTrayReceipt,
+  finalizeSyntheticFixture,
   PAGE_PARITY_STATUSES,
   parsePageParityArguments,
   seedSyntheticCacheLinkSources,
+  writeReceipt,
 } from "../scripts/qa-electron-macos-page-parity.mjs";
 
 const SOURCE = "a".repeat(40);
@@ -127,6 +129,83 @@ test("native tray receipt requires every physical interaction before it passes",
   assert.equal(unavailable.status, "incomplete");
   assert.equal(unavailable.nativeTray.reason, "cua_bridge_unavailable");
   assert.equal(JSON.stringify(unavailable).includes("/private/"), false);
+});
+
+test("fallback fixture cleanup preserves the profile when TERM cannot prove the owned tree exited", async () => {
+  const order = [];
+  let removed = false;
+  const child = {
+    pid: 51,
+    exitCode: null,
+    signalCode: null,
+    kill(signal) { order.push(`signal:${signal}`); return true; },
+  };
+  const result = await finalizeSyntheticFixture({
+    child,
+    fixture: { root: "/synthetic-fixture" },
+    captureDescendants(pid) { assert.equal(pid, 51); order.push("descendants"); return [52]; },
+    createExitWaiter(candidate) {
+      assert.equal(candidate, child);
+      order.push("listener");
+      return async (timeoutMs) => { order.push(`wait:${timeoutMs}`); return false; };
+    },
+    isAlive: () => true,
+    removeDirectory: async () => { removed = true; },
+  });
+  assert.deepEqual(order, ["descendants", "listener", "signal:SIGTERM", "wait:2000"]);
+  assert.deepEqual(result, { shutdownConfirmed: false, fixtureRemoved: false });
+  assert.equal(removed, false);
+});
+
+test("fallback fixture cleanup removes a profile only after captured processes exit", async () => {
+  const order = [];
+  let onExit = null;
+  let removed = null;
+  const child = {
+    pid: 61,
+    exitCode: null,
+    signalCode: null,
+    once(event, listener) { assert.equal(event, "exit"); order.push("listener"); onExit = listener; },
+    removeListener(event, listener) { assert.equal(event, "exit"); assert.equal(listener, onExit); },
+    kill(signal) {
+      assert.equal(signal, "SIGTERM");
+      order.push("signal");
+      this.exitCode = 0;
+      onExit();
+      return true;
+    },
+  };
+  const result = await finalizeSyntheticFixture({
+    child,
+    fixture: { root: "/synthetic-fixture" },
+    captureDescendants(pid) { assert.equal(pid, 61); order.push("descendants"); return [62]; },
+    isAlive: () => false,
+    removeDirectory: async (directory) => { removed = directory; },
+  });
+  assert.deepEqual(order, ["descendants", "listener", "signal"]);
+  assert.deepEqual(result, { shutdownConfirmed: true, fixtureRemoved: true });
+  assert.equal(removed, "/synthetic-fixture");
+});
+
+test("receipt publication cannot overwrite a concurrent final destination", async () => {
+  const root = await mkdtemp(join(tmpdir(), "page-parity-receipt-"));
+  const destination = join(root, "receipt.json");
+  try {
+    const outcomes = await Promise.allSettled([
+      writeReceipt(destination, { writer: "one" }),
+      writeReceipt(destination, { writer: "two" }),
+    ]);
+    const fulfilled = outcomes.filter((outcome) => outcome.status === "fulfilled");
+    const rejected = outcomes.filter((outcome) => outcome.status === "rejected");
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.equal(rejected[0].reason?.reason, "arguments_invalid");
+    const persisted = JSON.parse(await readFile(destination, "utf8"));
+    assert.ok(["one", "two"].includes(persisted.writer));
+    assert.deepEqual(await readdir(root), ["receipt.json"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("synthetic cache fixture reaches the ordinary local index-to-link path", async () => {
