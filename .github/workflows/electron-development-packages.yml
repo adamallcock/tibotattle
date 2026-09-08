@@ -175,10 +175,9 @@ jobs:
           $smokeReceipt = Join-Path $packageRoot 'accountless-storage-smoke.json'
           node scripts/smoke-electron-windows-accountless.mjs --app $appPath --staged-app $stagedApp --package-receipt $packageReceipt --source-revision $env:GITHUB_SHA --receipt $smokeReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_ACCOUNTLESS_PACKAGED_SMOKE_FAILED' }
-      # upload-artifact excludes dotfiles by default. Before an explicit
-      # inclusion can be reviewed, prove the only such staged inputs are these
-      # two pinned dependency metadata files and that neither tree has a
-      # reparse point which could escape its fixed upload root.
+      # Retain only the two inspected, pinned dependency dotfiles. Refuse
+      # other hidden content and reparse points before enabling their upload
+      # from these exact staging/distribution roots.
       - name: Validate exact retained Windows artifact inputs
         id: validate-win32-retained-inputs
         run: |
@@ -274,6 +273,7 @@ jobs:
             .release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/
             .release-build/electron-dev/win32-x64/app/
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 14
 
   # The fixed FD4 Credential Manager record intentionally survives for the

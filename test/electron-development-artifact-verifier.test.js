@@ -94,6 +94,7 @@ const SHELL_FILES = [
   "apps/electron/errors.js",
   "apps/electron/linux-qualification.js",
   "apps/electron/linux-secret-service-qualification-smoke-child.mjs",
+  "apps/electron/linux-account-observation-qualification-smoke-child.mjs",
   "apps/electron/linux-secret-service-qualification-smoke.js",
   "apps/electron/loopback-policy.js",
   "apps/electron/main.js",

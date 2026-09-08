@@ -138,6 +138,7 @@ test("the development workflow builds each target on a static native runner with
   assert.ok(windowsLifecycleJob);
   assert.match(windowsPackageJob, /outputs:\n\s+development-artifact-id: \$\{\{ steps\.retain-win32-development\.outputs\.artifact-id \}\}/u);
   assert.match(windowsPackageJob, /id: retain-win32-development/u);
+  assert.match(windowsPackageJob, /include-hidden-files: true/u);
   assert.match(windowsPackageJob, /\.release-build\/electron-dev\/win32-x64\/app\//u);
   assert.match(windowsPackageJob, /id: validate-win32-retained-inputs/u);
   assert.match(windowsPackageJob, /WINDOWS_RETAINED_ARTIFACT_REPARSE_POINT/u);
