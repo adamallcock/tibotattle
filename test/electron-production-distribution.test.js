@@ -276,6 +276,8 @@ test("production builder source config binds app identity, target-specific build
     } else if (target === "win32-x64") {
       assert.deepEqual(config.win.target, [{ target: "nsis", arch: ["x64"] }]);
       assert.equal(config.win.verifyUpdateCodeSignature, true);
+      assert.equal(config.win.signExecutable, true);
+      assert.equal(config.win.signAndEditExecutable, true);
       assert.equal(config.extraMetadata.shortVersion, config.buildVersion);
       assert.equal(config.extraMetadata.shortVersionWindows, config.buildVersion);
       assertWindowsResourceVersion(config.buildVersion);

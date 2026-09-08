@@ -873,7 +873,7 @@ async function freeLoopbackPort({ createLoopbackServer = createServer } = {}) {
   }
 }
 
-async function jsonFetch(url, {
+export async function jsonFetch(url, {
   fetchImpl = fetch,
   timeoutMs = OPERATION_TIMEOUT_MS,
 } = {}) {
@@ -890,10 +890,10 @@ async function jsonFetch(url, {
   });
   try {
     const response = await Promise.race([
-      fetchImpl(url, { signal: controller.signal }),
+      fetchImpl(url, { signal: controller.signal, redirect: "error" }),
       timeout,
     ]);
-    if (!response?.ok || typeof response.json !== "function") {
+    if (!response?.ok || response.redirected === true || typeof response.json !== "function") {
       throw new Error("loopback response unavailable");
     }
     return await Promise.race([response.json(), timeout]);
@@ -1668,6 +1668,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
       fail("DASHBOARD_INVALID");
     }
     const optOutRetained = await verifyOptOut(seed);
+    if (optOutRetained !== true) fail("PROTECTED_OPT_OUT_UNAVAILABLE");
     journey = Object.freeze({
       dashboardRendered: first.dashboardRendered === true && second.dashboardRendered === true,
       localRefreshObserved: first.localRefreshObserved === true,

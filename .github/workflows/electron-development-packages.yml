@@ -305,6 +305,93 @@ jobs:
           include-hidden-files: true
           retention-days: 14
 
+  # This fresh hosted account never runs the credential qualification probes.
+  # Normal credentials and preferences belong only to its disposable lifetime.
+  win32-x64-normal-candidate:
+    name: win32-x64 unsigned normal app journey
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies and verify native target
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_INSTALL_FAILED' }
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_ENABLE_FAILED' }
+          corepack prepare pnpm@11.9.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw 'PNPM_PREPARE_FAILED' }
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='win32'||process.arch!=='x64')process.exit(1)"
+          if ($LASTEXITCODE -ne 0) { throw 'NATIVE_RUNTIME_REQUIRED' }
+          pnpm install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }
+      - name: Check normal-candidate contracts without native credentials
+        run: |
+          node --test test/electron-windows-normal-candidate.test.js apps/electron/test/windows-normal-quit-control.test.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_CONTRACT_FAILED' }
+      - name: Build the reviewed Windows filesystem binding
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $npmCommand = (Get-Command npm.cmd).Source
+          $nodeRoot = Split-Path $npmCommand -Parent
+          $nodeGypScript = Join-Path $nodeRoot 'node_modules/npm/node_modules/node-gyp/bin/node-gyp.js'
+          if (-not (Test-Path -LiteralPath $nodeGypScript -PathType Leaf)) { throw 'WINDOWS_BINDING_BUILDER_UNAVAILABLE' }
+          node $nodeGypScript rebuild --directory native/windows-filesystem
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_BUILD_FAILED' }
+          node scripts/build-windows-filesystem-manifest.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_MANIFEST_FAILED' }
+      - name: Prepare the unsigned Windows normal-startup candidate without publication
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/package-electron-production.mjs --target win32-x64 --source-revision $env:GITHUB_SHA --build-number $env:GITHUB_RUN_NUMBER --replace-staging
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_PREPARATION_FAILED' }
+          $env:TIBOTATTLE_ELECTRON_TARGET = 'win32-x64'
+          $env:TIBOTATTLE_ELECTRON_SOURCE_REVISION = $env:GITHUB_SHA
+          $env:TIBOTATTLE_ELECTRON_BUILD_NUMBER = $env:GITHUB_RUN_NUMBER
+          $env:TIBOTATTLE_ELECTRON_VERSION = node -p 'require("./package.json").version'
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_VERSION_FAILED' }
+          # Overrides apply only to this runner-only unpacked test candidate.
+          # The release configuration still requires signing and updater trust.
+          pnpm exec electron-builder --config apps/electron/electron-builder.production.config.cjs --win dir --x64 --publish never -c.forceCodeSigning=false -c.win.signExecutable=false
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_BUILD_FAILED' }
+      - name: Exercise normal Windows startup with outbound traffic blocked
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64'
+          $appPath = Join-Path $candidateRoot 'artifacts/win-unpacked/TiboTattle.exe'
+          $stagedApp = Join-Path $candidateRoot 'app'
+          $sourceCandidate = Join-Path $candidateRoot 'production-source-candidate.json'
+          $smokeReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-windows-normal-candidate/normal-candidate-smoke.json'
+          node scripts/smoke-electron-windows-normal-candidate.mjs --app $appPath --staged-app $stagedApp --source-candidate $sourceCandidate --source-revision $env:GITHUB_SHA --receipt $smokeReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_SMOKE_FAILED' }
+      - name: Retain only the Windows normal-candidate receipt
+        if: ${{ !cancelled() && hashFiles('.release-build/electron-windows-normal-candidate/normal-candidate-smoke.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-windows-normal-candidate-${{ github.sha }}
+          path: .release-build/electron-windows-normal-candidate/normal-candidate-smoke.json
+          if-no-files-found: error
+          retention-days: 14
+
   # The fixed FD4 Credential Manager record intentionally survives for the
   # disposable runner account lifetime. Run the installed lifecycle in a fresh
   # hosted account so it never shares the packaged-smoke record above.

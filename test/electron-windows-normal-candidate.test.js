@@ -15,6 +15,7 @@ import {
   buildWindowsNormalCandidateFirewallCreateArguments,
   buildWindowsNormalCandidateFirewallRemoveArguments,
   createWindowsNormalCandidateQuitProtocol,
+  jsonFetch,
   parseWindowsNormalCandidateSmokeArguments,
   runWindowsNormalCandidateSmoke,
   selectWindowsNormalCandidateDashboardTarget,
@@ -28,6 +29,22 @@ const STAGED_APP_PATH = String.raw`C:\candidate\app`;
 const SOURCE_CANDIDATE_PATH = String.raw`C:\candidate\production-source-candidate.json`;
 const RECEIPT_PATH = String.raw`C:\workspace\.release-build\electron-windows-normal-candidate\normal-candidate-smoke.json`;
 const FIREWALL_RULE = "tibotattle-normal-candidate-550e8400-e29b-41d4-a716-446655440000";
+
+test("normal candidate loopback requests refuse redirects and bound response waits", async () => {
+  let options;
+  await assert.rejects(jsonFetch("http://127.0.0.1:12345/api/local/health", {
+    fetchImpl: async (_url, selected) => {
+      options = selected;
+      return { ok: true, redirected: true, json: async () => ({ status: "ready" }) };
+    },
+  }), /loopback response unavailable/u);
+  assert.equal(options.redirect, "error");
+  assert.equal(options.signal.aborted, true);
+  await assert.rejects(jsonFetch("http://127.0.0.1:12345/api/local/health", {
+    timeoutMs: 10,
+    fetchImpl: async () => ({ ok: true, json: () => new Promise(() => {}) }),
+  }), /loopback response unavailable/u);
+});
 
 function smokeOptions() {
   return {

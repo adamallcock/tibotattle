@@ -248,8 +248,8 @@ export function productionElectronCandidatePlan({
         hostedUploads: "disabled",
       }),
     }),
-    // The current Windows runtime still requires a separate qualification
-    // context. Source staging does not turn this into a launch claim.
+    // Source staging does not establish Windows normal-runtime or signed-release
+    // qualification. Those require separate candidate and release evidence.
     windowsRuntimeQualification: target === "win32-x64" ? "required" : "not_applicable",
   });
 }

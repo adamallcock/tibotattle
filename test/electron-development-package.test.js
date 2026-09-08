@@ -117,8 +117,8 @@ test("the development workflow builds each target on a static native runner with
   }
   assert.doesNotMatch(workflow, /Add the (?:Windows|Linux) development launch handoff/u,
     "handoff assembly belongs to the common local/CI packaging command");
-  assert.equal((workflow.match(/persist-credentials: false/gu) ?? []).length, 5);
-  assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 5);
+  assert.equal((workflow.match(/persist-credentials: false/gu) ?? []).length, 6);
+  assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 6);
   assert.match(workflow, /WINDOWS_BINDING_BUILD_FAILED/u);
   assert.match(workflow, /LINUX_CREDENTIAL_MUTEX_NODE_GYP_UNAVAILABLE/u);
   assert.match(workflow, /rebuild --directory native\/linux-credential-mutex/u);
@@ -216,6 +216,74 @@ test("the Linux normal candidate stays on the runner and executes only in the is
   assert.match(dockerfile, /COPY test\/fixtures\/linux-packaged-codex\/codex \/opt\/tibotattle-linux-packaged-smoke\/bin\/codex/u);
   assert.match(dockerfile, /chmod 4755 .*\/linux-unpacked\/chrome-sandbox/u);
   assert.match(dockerfile, /USER node\nENTRYPOINT/u);
+});
+
+test("normal Windows CI keeps unsigned candidate bytes private and preserves the release configuration", async () => {
+  const workflow = await readFile(new URL("../.github/workflows/electron-development-packages.yml", import.meta.url), "utf8");
+  const jobs = workflow.split(/\n(?= {2}[a-z][a-z0-9-]+:\n)/u);
+  const job = jobs.find((section) => section.startsWith("  win32-x64-normal-candidate:\n"));
+  assert.ok(job);
+  assert.match(job, /runs-on: windows-2025/u);
+  assert.doesNotMatch(job, /needs:|download-artifact|secrets\.|qualification-smoke|accountless-storage-smoke/u,
+    "normal credentials start in an independent disposable account");
+  assert.match(job, /rebuild --directory native\/windows-filesystem/u);
+  assert.match(job, /node scripts\/build-windows-filesystem-manifest\.mjs/u);
+  const prepare = job.slice(job.indexOf("- name: Prepare the unsigned Windows"),
+    job.indexOf("- name: Exercise normal Windows"));
+  const preparationLine = prepare.match(/^\s+node scripts\/package-electron-production\.mjs (.+)$/mu)?.[1];
+  assert.ok(preparationLine);
+  const expanded = preparationLine.replaceAll("$env:GITHUB_SHA", sourceRevision)
+    .replaceAll("$env:GITHUB_RUN_NUMBER", "1234567");
+  const parsed = parseProductionCandidateArguments(expanded.split(/\s+/u));
+  assert.equal(parsed.target, "win32-x64");
+  assert.equal(parsed.sourceRevision, sourceRevision);
+  assert.equal(parsed.buildNumber, "1234567");
+  assert.doesNotMatch(prepare, /GITHUB_RUN_ID|TIBOTATTLE_ELECTRON_REHEARSAL/u);
+  const builderArguments = prepare.match(/^\s+pnpm exec electron-builder (.+)$/mu)?.[1].split(/\s+/u);
+  assert.deepEqual(builderArguments, [
+    "--config", "apps/electron/electron-builder.production.config.cjs",
+    "--win", "dir", "--x64", "--publish", "never",
+    "-c.forceCodeSigning=false", "-c.win.signExecutable=false",
+  ]);
+  const script = [
+    'const { createRequire } = require("node:module");',
+    'const req = createRequire(require.resolve("electron-builder"));',
+    'const builder = req("./builder.js");',
+    'const { getConfig, validateConfiguration } = req("app-builder-lib/out/util/config/config.js");',
+    'const { DebugLogger } = req("builder-util");',
+    `const options = builder.normalizeOptions(builder.configureBuildCommand(req("yargs/yargs")(${JSON.stringify(builderArguments)})).parseSync());`,
+    '(async () => {',
+    'const config = await getConfig(process.cwd(), null, options.config);',
+    'await validateConfiguration(config, new DebugLogger(false));',
+    'process.stdout.write(JSON.stringify({ config, publish: options.publish, targets: [...options.targets].map(([platform, arches]) => ({ platform: platform.nodeName, arches: [...arches] })) }));',
+    '})().catch(() => { process.exitCode = 1; });',
+  ].join("\n");
+  const releaseVersion = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version;
+  const output = execFileSync(process.execPath, ["-e", script], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("TIBOTATTLE_ELECTRON_"))),
+      TIBOTATTLE_ELECTRON_TARGET: "win32-x64", TIBOTATTLE_ELECTRON_SOURCE_REVISION: sourceRevision,
+      TIBOTATTLE_ELECTRON_BUILD_NUMBER: "1234567", TIBOTATTLE_ELECTRON_VERSION: releaseVersion,
+    },
+  });
+  const result = JSON.parse(output.trim().split(/\r?\n/u).at(-1));
+  assert.equal(result.config.forceCodeSigning, false);
+  assert.equal(result.config.win.signExecutable, false);
+  assert.equal(result.config.win.signAndEditExecutable, true);
+  assert.equal(result.config.win.verifyUpdateCodeSignature, true);
+  assert.equal(result.config.extraMetadata.tibotattleDistribution.channel, "stable");
+  assert.equal(result.config.extraMetadata.tibotattleDistribution.sourceRevision, sourceRevision);
+  assert.equal(result.config.extraMetadata.tibotattleDistribution.target, "win32-x64");
+  assert.equal(result.publish, "never");
+  assert.deepEqual(result.targets, [{ platform: "win32", arches: [[1, ["dir"]]] }]);
+  const execute = job.slice(job.indexOf("- name: Exercise normal Windows"), job.indexOf("- name: Retain only"));
+  assert.match(execute, /smoke-electron-windows-normal-candidate\.mjs --app .* --staged-app .* --source-candidate .* --source-revision \$env:GITHUB_SHA --receipt/u);
+  assert.doesNotMatch(execute, /ELECTRON_RUN_AS_NODE|--no-sandbox|QUALIFICATION|TEST_LANE/u);
+  const upload = job.slice(job.indexOf("- name: Retain only"));
+  assert.match(upload, /path: \.release-build\/electron-windows-normal-candidate\/normal-candidate-smoke\.json/u);
+  assert.doesNotMatch(upload, /electron-production|include-hidden-files|win-unpacked|\*\*/u,
+    "only the closed receipt leaves the disposable candidate runner");
 });
 
 test("common packaging assembles usable, hashed handoffs without a source checkout", async () => {

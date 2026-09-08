@@ -34,8 +34,9 @@ one. The Mac daily-use tester is available; that is not full cutover readiness.
    Linux's packaged native credential journey now passes, including its read
    deadline and fixed observation IPC. Its normal packaged production launch
    is next. Windows now passes guarded artifact transfer, both installed
-   launches under a fresh account, credential persistence and uninstaller
-   settlement. The final registry cleanup probe needs a valid result.
+   launches under a fresh account, synthetic credential checks, settled
+   uninstall and verified app-root/registry removal. Normal Windows app
+   behavior and signed installed updates remain separate gates.
 3. Complete one authorized hosted contribution rehearsal and explicit
    accountless public-sample/overlapping-history decisions. Preserve accepted
    automatic-sharing and persistent opt-out behavior throughout.
@@ -66,7 +67,70 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest combined result: `c70b5af7` in
+Latest combined result: `57e82e63` in
+[run 34249261605](https://github.com/adamallcock/tibotattle/actions/runs/34249261605)
+passes both Mac package jobs, the Windows producer and the fresh Windows NSIS
+installed lifecycle. The exact unsigned installer completes installation, two
+distinct app launches and uninstall. The documented in-place command leaves
+only its unchanged uninstaller; the strictly bounded residue removal succeeds,
+and independent checks confirm both the app root and uninstall registrations
+are absent. Receipt SHA-256:
+`7db8283d97abd9f519dfa8c36878be5cb8e990b22554babf59f9893597bcddf7`.
+This closes the development-installer cleanup blocker. It does not qualify
+normal Windows dashboard/refresh/settings, general credential persistence,
+all descendant-process cleanup, signed releases or installed updates.
+
+Linux again passes native credentials and normal-candidate preparation. Its
+retained normal-app receipt confirms every allowlisted renderer module loaded
+with a successful response. The readiness marker remains false; no JavaScript
+exception is observed, no primary local API response is observed, and four
+bounded direct probes return `request_failed`. Source inspection subsequently
+finds that the diagnostic observer may retain the same target's initial
+`about:blank` origin after it navigates to loopback. That possibility limits
+companion-liveness inference from unobserved APIs; correct the observer before
+changing product behavior. Failed receipt SHA-256:
+`b9b6b8573e8a38fa69b54ef617e7e66b413a42645721e4b04e19a370a9307527`.
+Both exact receipts are privately retained. Normal Linux startup is still open.
+
+The corrected selected-origin observer is pushed at `cbddccb8` in
+[run 34252011615](https://github.com/adamallcock/tibotattle/actions/runs/34252011615).
+All 31 owning Linux harness tests pass. Its native normal-app receipt still
+reports the same readiness failure and failed direct probes, so the observer
+repair is not a product fix. The old receipt's successful asset responses also
+mean an opaque origin was only a possible flaw, not the established cause.
+The corrected receipt is privately retained with SHA-256
+`d112846d0ce9790605bbc8d882b6e3a5c8214a7f33cd91d902603da8edff9344`.
+The next diagnostic at `6d78d4dc` polls the existing snapshot-independent
+health route during the unchanged readiness window. It retains only the last
+validated snapshot state and bounded machine-readable error code, with a new
+versioned receipt. This is diagnostic instrumentation, not a startup fix.
+The same run's Mac arm64 build and validation pass, but GitHub refuses artifact
+finalization with HTTP 403; that is an artifact-retention failure, not an app
+build failure.
+
+The next Windows test uses a separate disposable runner account and an unpacked
+unsigned candidate with the exact normal distribution metadata. It must prove
+rendered dashboard, refresh, protected setting persistence and restart after
+seeding a synthetic durable sharing opt-out and enforcing a per-app outbound
+block. Candidate bytes stay on the runner; only a closed receipt is retained.
+The harness is integrated at `618f9064`: both launches verify the running app's
+sharing opt-out, visible Data & privacy settings persist across restart, refresh
+reaches a bounded terminal result, and the ordinary quit path finishes before
+exact-process absence allows firewall/profile cleanup. Source preparation and
+local tests are not passing native runtime or release evidence.
+The fixed Windows parent-pipe quit control is implemented at `c59e7a98`:
+one exact message and flushed acknowledgement call the ordinary lifecycle quit
+path. It requires explicit `quit-v1`, a primary Windows instance and an inherited
+connected pipe; qualification lanes and all other messages are refused. It adds
+no renderer, storage or HTTP command. Four owning cases plus the shell suite
+pass 70 cases. The isolated workflow/parser checks pass 24 cases and release
+trust passes 78 cases; the normal native Windows journey is still untested. The combined
+Linux/Windows harness, quit-control, workflow and production-distribution check
+passes 108 tests with five expected Windows-only cases skipped locally.
+Architecture, documentation and preflight checks pass. The new Windows job
+runs its portable contracts before building any native credential binding.
+
+Previous combined result: `c70b5af7` in
 [run 34245534377](https://github.com/adamallcock/tibotattle/actions/runs/34245534377)
 passes both Mac package jobs and the Windows producer. Windows again proves
 installation, two launches and credential persistence. The longer registry
@@ -96,7 +160,8 @@ and success predicates remain unchanged. Integrated source, staging, verifier,
 gate and credential tests pass 119 cases with seven native/artifact-only cases
 deferred. Architecture, documentation and preflight checks pass. The owning
 runtime suite separately passes 43 cases with synthetic loopback enabled.
-These repairs still need native proof.
+The later `57e82e63` result above proves the Windows cleanup repair; Linux
+normal startup remains open.
 
 Previous combined result: `b356656c` in
 [run 34242621490](https://github.com/adamallcock/tibotattle/actions/runs/34242621490)
