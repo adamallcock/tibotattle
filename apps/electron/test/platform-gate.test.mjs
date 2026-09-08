@@ -45,7 +45,7 @@ async function withRuntimePlatform({ platform, architecture }, callback) {
   }
 }
 
-test("Linux development remains available while every stable packaged selection fails before composition", () => {
+test("Linux permits development and an exact stable x64 source candidate without claiming release readiness", () => {
   assert.deepEqual(assertElectronPlatformGate({
     platform: "linux",
     architecture: "x64",
@@ -65,18 +65,30 @@ test("Linux development remains available while every stable packaged selection 
     architecture: "x64",
   }), productionDistribution);
 
-  assert.throws(
-    () => assertElectronPlatformGate({
-      platform: "linux",
-      architecture: "x64",
-      qualificationContext: { developmentOnly: true },
-      productionDistribution,
-    }),
-    refusal("linux_readiness_unavailable"),
-  );
+  assert.deepEqual(assertElectronPlatformGate({
+    platform: "linux",
+    architecture: "x64",
+    productionDistribution,
+  }), { platform: "linux", architecture: "x64", windowsProductionReady: false });
+
+  for (const override of [
+    { architecture: "arm64" },
+    { qualificationContext: { developmentOnly: true } },
+    { environment: { USAGE_MONITOR_TEST_LANE: "local-qa" } },
+    { environment: { USAGE_MONITOR_TEST_LANE: "" } },
+    { productionDistribution: {} },
+    { productionDistribution: { ...productionDistribution, target: "win32-x64" } },
+    { productionDistribution: { ...productionDistribution, channel: "native-to-electron-handover-v1" } },
+    { productionDistribution: { ...productionDistribution, updateFeed: "https://example.invalid" } },
+    { productionDistribution: { ...productionDistribution, unexpected: true } },
+  ]) {
+    assert.throws(() => assertElectronPlatformGate({
+      platform: "linux", architecture: "x64", productionDistribution, ...override,
+    }), refusal("linux_readiness_unavailable"));
+  }
 });
 
-test("a packaged Linux stable manifest quits before companion or credential composition", async () => {
+test("an invalid packaged Linux manifest quits before companion or credential composition", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-linux-production-gate-"));
   const productionDistribution = createProductionDistributionMetadata({
     target: "linux-x64",
@@ -85,7 +97,7 @@ test("a packaged Linux stable manifest quits before companion or credential comp
   });
   try {
     await writeFile(join(root, "package.json"), JSON.stringify({
-      tibotattleDistribution: productionDistribution,
+      tibotattleDistribution: { ...productionDistribution, target: "win32-x64" },
     }));
     const app = new EventEmitter();
     app.isPackaged = true;
@@ -97,7 +109,7 @@ test("a packaged Linux stable manifest quits before companion or credential comp
     await withRuntimePlatform({ platform: "linux", architecture: "x64" }, async () => {
       await assert.rejects(
         launchElectronShell({ electron: { app }, environment: {} }),
-        refusal("linux_readiness_unavailable"),
+        refusal("electron_configuration_invalid"),
       );
     });
     assert.equal(app.quitCalls, 1);

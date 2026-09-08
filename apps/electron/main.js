@@ -672,9 +672,8 @@ export async function launchElectronShell({
       notificationBackend,
     });
     // Read and validate the packaged selection before constructing any
-    // companion or platform service. In particular, a Linux stable metadata
-    // record remains source-only until its real credential/identity and
-    // installed lifecycle gates are qualified.
+    // companion or platform service. Linux candidates require an exact stable
+    // Linux/x64 selection; installed lifecycle evidence remains a separate gate.
     const productionDistribution = await readProductionDistribution({ app });
     const accountlessHostedRehearsal = await readAccountlessHostedRehearsal({ app });
     assertElectronPlatformGate({

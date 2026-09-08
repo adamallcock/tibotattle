@@ -181,6 +181,28 @@ test("the development workflow builds each target on a static native runner with
   assert.doesNotMatch(windowsLifecycleJob, /smoke-electron-windows-accountless\.mjs/u);
 });
 
+test("the Linux normal candidate stays on the runner and executes only in the isolated GUI container", async () => {
+  const workflow = await readFile(new URL("../.github/workflows/electron-development-packages.yml", import.meta.url), "utf8");
+  const linux = workflow.slice(workflow.indexOf("\n  linux-x64:\n"));
+  assert.match(linux, /package-electron-production\.mjs --target linux-x64/u);
+  assert.match(linux, /--source-revision "\$GITHUB_SHA" --build-number "\$GITHUB_RUN_ID"/u);
+  assert.match(linux, /--linux dir --x64 --publish never/u);
+  const execution = linux.slice(linux.indexOf("- name: Exercise normal packaged Linux startup"),
+    linux.indexOf("- name: Retain verified development packages and receipts"));
+  assert.match(execution, /--cap-add=SYS_ADMIN --network none/u);
+  assert.match(execution, /--entrypoint xvfb-run/u);
+  assert.match(execution, /-nolisten tcp/u);
+  assert.equal((execution.match(/rw,noexec,nosuid/gu) ?? []).length, 2);
+  assert.match(execution, /node scripts\/smoke-electron-linux-packaged\.mjs/u);
+  assert.doesNotMatch(execution, /ELECTRON_RUN_AS_NODE|--no-sandbox|--privileged|--volume|--mount|--network host/u);
+  const upload = linux.slice(linux.indexOf("- name: Retain verified development packages and receipts"));
+  assert.doesNotMatch(upload, /electron-production/u, "production candidates are not authorized for artifact upload");
+  const dockerfile = await readFile(new URL("../containers/electron-linux-packaged/Dockerfile", import.meta.url), "utf8");
+  assert.match(dockerfile, /COPY test\/fixtures\/linux-packaged-codex\/codex \/opt\/tibotattle-linux-packaged-smoke\/bin\/codex/u);
+  assert.match(dockerfile, /chmod 4755 .*\/linux-unpacked\/chrome-sandbox/u);
+  assert.match(dockerfile, /USER node\nENTRYPOINT/u);
+});
+
 test("common packaging assembles usable, hashed handoffs without a source checkout", async () => {
   for (const target of ["darwin-arm64", "darwin-x64", "win32-x64", "linux-x64"]) {
     const outputDirectory = await mkdtemp(join(tmpdir(), "electron-development-handoff-"));

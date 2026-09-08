@@ -23,6 +23,12 @@ COPY test/linux-account-observation-credential-native.test.js ./test/linux-accou
 COPY .release-build/electron-dev/linux-x64/app/native/linux-credential-mutex/build/qualification ./native/linux-credential-mutex/build/qualification
 COPY .release-build/electron-candidates/${TIBOTATTLE_QUALIFICATION_REVISION}/linux-x64/distribution/linux-unpacked ./.release-build/electron-candidates/${TIBOTATTLE_QUALIFICATION_REVISION}/linux-x64/distribution/linux-unpacked
 COPY .release-build/electron-candidates/${TIBOTATTLE_QUALIFICATION_REVISION}/linux-x64/distribution/development-package.json ./.release-build/electron-candidates/${TIBOTATTLE_QUALIFICATION_REVISION}/linux-x64/distribution/development-package.json
+COPY .release-build/electron-production/linux-x64/app ./.release-build/electron-production/linux-x64/app
+COPY .release-build/electron-production/linux-x64/production-source-candidate.json ./.release-build/electron-production/linux-x64/production-source-candidate.json
+COPY .release-build/electron-production/linux-x64/artifacts/linux-unpacked ./.release-build/electron-production/linux-x64/artifacts/linux-unpacked
+# Only the static synthetic CLI is executable; private runtime/profile mounts
+# remain noexec. The ordinary app reaches this fixture through its normal PATH.
+COPY test/fixtures/linux-packaged-codex/codex /opt/tibotattle-linux-packaged-smoke/bin/codex
 
 # Preserve byte identity and executable intent while allowing USER node to
 # traverse the normally private generated directories. Native provenance
@@ -31,7 +37,10 @@ RUN find /workspace/native/linux-credential-mutex -type d -exec chmod 0755 {} + 
   && find /workspace/native/linux-credential-mutex -type f -exec chmod 0444 {} + \
   && find /workspace/.release-build -type d -exec chmod 0755 {} + \
   && find /workspace/.release-build -type f -perm /111 -exec chmod 0555 {} + \
-  && find /workspace/.release-build -type f ! -perm /111 -exec chmod 0444 {} +
+  && find /workspace/.release-build -type f ! -perm /111 -exec chmod 0444 {} + \
+  && chmod 0555 /opt/tibotattle-linux-packaged-smoke/bin/codex \
+  && chown root:root /workspace/.release-build/electron-production/linux-x64/artifacts/linux-unpacked/chrome-sandbox \
+  && chmod 4755 /workspace/.release-build/electron-production/linux-x64/artifacts/linux-unpacked/chrome-sandbox
 
 USER node
 ENTRYPOINT ["node", "/workspace/scripts/smoke-electron-linux-secret-service.mjs"]

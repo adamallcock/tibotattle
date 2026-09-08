@@ -33,8 +33,9 @@ one. The Mac daily-use tester is available; that is not full cutover readiness.
    required production credential/trust composition and installed updates.
    Linux's packaged native credential journey now passes, including its read
    deadline and fixed observation IPC. Its normal packaged production launch
-   is next. Windows needs the guarded artifact transfer repaired so the
-   installed journey can run under a fresh account.
+   is next. Windows now passes guarded artifact transfer and its first installed
+   launch under a fresh account; the repaired second launch and uninstall need
+   a new native result.
 3. Complete one authorized hosted contribution rehearsal and explicit
    accountless public-sample/overlapping-history decisions. Preserve accepted
    automatic-sharing and persistent opt-out behavior throughout.
@@ -49,7 +50,29 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest native results: `f09e504e` in
+Latest native results: `e65aacac` in
+[run 34232097779](https://github.com/adamallcock/tibotattle/actions/runs/34232097779)
+pass all four package jobs, including the repaired Windows artifact transfer.
+The fresh Windows installed job completes installation, exact-byte checks and
+its first whole-app launch, both credential checks and clean exit. The second
+launch fails; cleanup runs but its postconditions are not verified. Source
+inspection shows the harness generated a new test identity and repeated an
+empty-store/create check on that restart. The integrated repair retains one
+identity and checks the first launch's exact existing credential without
+adopting or deleting an unknown record. Its focused checks pass (32 tests,
+five Windows-only cases deferred). Preserve the failed receipt until a new
+native run proves the repaired restart and uninstall boundaries.
+
+The approved Linux normal candidate is integrated with fixed credential
+adapters and strict stable Linux/x64 metadata selection. Its packaged harness
+reuses the existing renderer, refresh, reload and clean-quit checks; it adds
+fresh and unavailable Secret Service journeys using raw synthetic input. The
+combined harness and workflow checks pass 63 local tests. The normal candidate
+stays on the disposable runner with external networking disabled; only its
+bounded receipt joins the existing development artifact. Actual normal Linux
+execution remains pending the combined CI run.
+
+Preceding native results: `f09e504e` in
 [run 34229064795](https://github.com/adamallcock/tibotattle/actions/runs/34229064795)
 pass both Mac jobs and Linux. Linux now proves the new fixed observation
 parent/child IPC route against the native store inside the packaged artifact,
@@ -100,17 +123,14 @@ coexistence check. The packaged native observation journey now passes at
 launch remain the next gates. No source or native-only result establishes
 installed Linux readiness.
 
-The Linux production startup block remains intact. Automatic approval review
-refused replacing it before installed-artifact evidence existed and separately
-refused the dormant credential-composition patch, citing the earlier read-only
-assignment. No such source edits were applied. The next reviewable slice is
-the fixed FD3 and observation composition plus an ordinary packaged launch
-harness. The explicit approval question now covers those source changes and
-enabling the narrowly
-validated stable Linux/x64 candidate for an isolated, network-disabled CI run
-needs explicit approval; it must continue to refuse malformed metadata,
-other targets, rehearsal selections and mixed test/qualification lanes.
-This candidate test would not publish a release or enable a public update feed.
+The user explicitly approved the isolated Linux candidate work on 2026-09-08,
+resolving the earlier automatic-review refusals. This covers connecting the
+fixed credential adapters, replacing the unconditional startup block with
+strict stable Linux/x64 validation, and running the candidate in disposable CI
+with external networking disabled. Malformed metadata, other targets,
+rehearsal selections and mixed test/qualification lanes remain refused.
+The source change and ordinary packaged launch harness are being integrated;
+no candidate runtime result, release or public update-feed change is implied.
 
 The preceding four-target results: `a648cf2b` in
 [run 34222727976](https://github.com/adamallcock/tibotattle/actions/runs/34222727976)

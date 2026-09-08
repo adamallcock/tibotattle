@@ -4,6 +4,9 @@
 !test/
 !test/linux-credential-mutex-native.test.js
 !test/linux-account-observation-credential-native.test.js
+!test/fixtures/
+!test/fixtures/linux-packaged-codex/
+!test/fixtures/linux-packaged-codex/codex
 !.release-build/
 !.release-build/electron-dev/
 !.release-build/electron-dev/linux-x64/
@@ -16,3 +19,11 @@
 !.release-build/electron-candidates/*/linux-x64/distribution/linux-unpacked/
 !.release-build/electron-candidates/*/linux-x64/distribution/linux-unpacked/**
 !.release-build/electron-candidates/*/linux-x64/distribution/development-package.json
+!.release-build/electron-production/
+!.release-build/electron-production/linux-x64/
+!.release-build/electron-production/linux-x64/app/
+!.release-build/electron-production/linux-x64/app/**
+!.release-build/electron-production/linux-x64/production-source-candidate.json
+!.release-build/electron-production/linux-x64/artifacts/
+!.release-build/electron-production/linux-x64/artifacts/linux-unpacked/
+!.release-build/electron-production/linux-x64/artifacts/linux-unpacked/**

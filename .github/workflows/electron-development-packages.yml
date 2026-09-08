@@ -425,10 +425,22 @@ jobs:
           node scripts/qualify-linux-credential-mutex.mjs
       - name: Validate private Linux credential channel and identity selection
         run: node --test apps/electron/test/desktop-linux-secret-service-broker.test.mjs apps/electron/test/desktop-linux-secret-service-composition.test.mjs test/linux-credential-state.test.js test/export-identity-production.test.js test/account-observation-secret.test.js test/linux-account-observation-credential.test.js
+      - name: Validate the normal Linux candidate and packaged harness contracts
+        run: node --test apps/electron/test/platform-gate.test.mjs test/linux-portability-workflow.test.js test/electron-linux-normal-packaged-smoke.test.js
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target linux-x64 --format distribution --replace-staging
+      - name: Prepare the approved Linux normal-startup candidate without publication
+        run: |
+          node scripts/package-electron-production.mjs --target linux-x64 \
+            --source-revision "$GITHUB_SHA" --build-number "$GITHUB_RUN_ID" --replace-staging
+          export TIBOTATTLE_ELECTRON_TARGET=linux-x64
+          export TIBOTATTLE_ELECTRON_SOURCE_REVISION="$GITHUB_SHA"
+          export TIBOTATTLE_ELECTRON_BUILD_NUMBER="$GITHUB_RUN_ID"
+          export TIBOTATTLE_ELECTRON_VERSION="$(node -p 'require("./package.json").version')"
+          pnpm exec electron-builder --config apps/electron/electron-builder.production.config.cjs \
+            --linux dir --x64 --publish never
       - name: Exercise packaged Linux credentials in disposable Secret Service
         run: |
           set -euo pipefail
@@ -515,6 +527,34 @@ jobs:
             --package-receipt "$package_root/development-package.json" \
             --source-revision "$GITHUB_SHA" \
             --receipt /run/user/1000/packaged-credential-receipt.json \
+            > "$host_receipt"
+      - name: Exercise normal packaged Linux startup with external networking disabled
+        run: |
+          candidate_root=/workspace/.release-build/electron-production/linux-x64
+          host_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/normal-packaged-smoke.json"
+          # Reuse the existing GUI container's sandbox capability. No host
+          # paths are mounted and both profile roots remain private/noexec.
+          # The production candidate stays inside this runner; only its bounded
+          # test receipt joins the already-authorized development artifacts.
+          docker run --rm --init --platform=linux/amd64 --cap-add=SYS_ADMIN --network none \
+            --tmpfs /home/node:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 \
+            --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config \
+            --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share \
+            --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            --env USAGE_MONITOR_LINUX_IMAGE_PLATFORM=linux/amd64 \
+            --env USAGE_MONITOR_LINUX_NETWORK_BOUNDARY=network-none \
+            --entrypoint xvfb-run tibotattle-electron-linux-packaged:test \
+            --auto-servernum --server-args='-screen 0 1280x900x24 -nolisten tcp' \
+            node scripts/smoke-electron-linux-packaged.mjs \
+            --app "$candidate_root/artifacts/linux-unpacked/tibotattle" \
+            --staged-app "$candidate_root/app" \
+            --source-candidate "$candidate_root/production-source-candidate.json" \
+            --source-revision "$GITHUB_SHA" \
+            --receipt /run/user/1000/linux-normal-packaged-smoke.json \
             > "$host_receipt"
       - name: Retain verified development packages and receipts
         if: ${{ !cancelled() }}

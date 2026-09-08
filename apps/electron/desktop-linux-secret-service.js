@@ -209,8 +209,8 @@ function createLinuxProductionCredentialHandoverWithDependencies({
 }
 
 /**
- * The only production-facing construction path. Native loaders run only when
- * an authentic Linux qualification context matches this Linux/x64 process.
+ * Generic Secret Service construction stays qualification-only. Native loaders
+ * run only when an authentic context matches this Linux/x64 process.
  */
 export function createLinuxQualificationSecretServiceHandover(options = {}) {
   const source = exactOptions(options, PRODUCTION_OPTION_KEYS);

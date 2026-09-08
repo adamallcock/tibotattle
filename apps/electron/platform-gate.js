@@ -4,15 +4,18 @@ import {
 
 import { shellError } from "./errors.js";
 import {
+  validateProductionDistributionMetadata,
+} from "./desktop-updater.js";
+import {
   assertWindowsElectronQualificationContext,
 } from "./windows-qualification.js";
 
 /**
  * Electron does not authorize Windows production storage. On Windows the
  * shell may launch only after the same branded readiness attestation used by
- * the credential consumers is supplied. Linux development remains available
- * for shared-shell work, but a packaged Linux production selection must stop
- * before it reaches companion, credential, network, or updater composition.
+ * the credential consumers is supplied. Linux source candidates select the
+ * fixed native composition through exact stable packaged metadata. This
+ * selection does not establish installed lifecycle or release evidence.
  */
 export function assertElectronPlatformGate({
   platform = process.platform,
@@ -20,14 +23,22 @@ export function assertElectronPlatformGate({
   readiness = null,
   qualificationContext = null,
   productionDistribution = null,
+  environment = {},
 } = {}) {
-  // The current Linux receipt and Secret Service foundations are explicitly
-  // development-only and dormant. They are not authority to run a stable
-  // packaged candidate while its production credential/identity adapters and
-  // native lifecycle gates remain unqualified.
   if (platform === "linux"
       && productionDistribution !== null && productionDistribution !== undefined) {
-    throw shellError("linux_readiness_unavailable");
+    try {
+      if (architecture !== "x64" || qualificationContext !== null
+          || environment?.USAGE_MONITOR_TEST_LANE !== undefined) {
+        throw new Error("Mixed Linux candidate selection");
+      }
+      validateProductionDistributionMetadata(productionDistribution, {
+        platform,
+        architecture,
+      });
+    } catch {
+      throw shellError("linux_readiness_unavailable");
+    }
   }
   if (platform !== "win32") {
     return Object.freeze({
