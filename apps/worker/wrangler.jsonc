@@ -228,13 +228,13 @@
         {
           "binding": "USAGE_MONITOR_DB",
           "database_name": "app-usagemonitor-staging",
-          "database_id": "00000000-0000-4000-8000-000000000010",
+          "database_id": "e06da65e-a20a-4acf-a3f8-8a0199610c2c",
           "migrations_dir": "migrations"
         },
         {
           "binding": "DELETION_LEDGER",
           "database_name": "app-usagemonitor-staging-deletion-ledger",
-          "database_id": "00000000-0000-4000-8000-000000000011",
+          "database_id": "0b79b775-62c1-4060-aa42-6af2c26c67bd",
           "migrations_dir": "deletion-ledger-migrations"
         }
       ],
