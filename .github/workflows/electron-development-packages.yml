@@ -371,7 +371,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_VERSION_FAILED' }
           # Overrides apply only to this runner-only unpacked test candidate.
           # The release configuration still requires signing and updater trust.
-          pnpm exec electron-builder --config apps/electron/electron-builder.production.config.cjs --win dir --x64 --publish never -c.forceCodeSigning=false -c.win.signExecutable=false
+          pnpm exec electron-builder --config apps/electron/electron-builder.production.config.cjs --win dir --x64 --publish never --config.forceCodeSigning=false --config.win.signExecutable=false
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NORMAL_CANDIDATE_BUILD_FAILED' }
       - name: Exercise normal Windows startup with outbound traffic blocked
         run: |

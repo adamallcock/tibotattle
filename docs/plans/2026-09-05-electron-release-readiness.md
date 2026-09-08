@@ -67,7 +67,7 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest combined result: `57e82e63` in
+Earlier combined result: `57e82e63` in
 [run 34249261605](https://github.com/adamallcock/tibotattle/actions/runs/34249261605)
 passes both Mac package jobs, the Windows producer and the fresh Windows NSIS
 installed lifecycle. The exact unsigned installer completes installation, two
@@ -107,6 +107,29 @@ versioned receipt. This is diagnostic instrumentation, not a startup fix.
 The same run's Mac arm64 build and validation pass, but GitHub refuses artifact
 finalization with HTTP 403; that is an artifact-retention failure, not an app
 build failure.
+
+The first normal Windows run at `e2c4836a`,
+[34255349512](https://github.com/adamallcock/tibotattle/actions/runs/34255349512),
+passes both Mac package/artifact jobs, the Windows producer and a third fresh
+NSIS lifecycle. Normal Windows source staging and native binding compilation
+pass, but electron-builder treats the short dotted signing override as a
+configuration filename; the app has not launched. Replace those two candidate
+arguments with the documented long `--config` forms and exercise the actual CLI
+entrypoint in the contract test. Release signing remains required.
+
+The same run's Linux receipt observes snapshot `building` with no error code,
+then the same renderer-readiness failure and failed direct read probes. Receipt
+SHA-256: `a4494ca73c0954b6a6cf87769a80e7b709aa2a19d040316553ddf77705aa19c6`.
+It does not prove whether snapshot construction threw or the child terminated
+for another reason. A separate fixture review at `bc5a16f8` corrects the raw
+session to the app's selected disposable `HOME/.codex` and removes the erroneous
+extra `.usage-monitor` segment from the expected state-file path. These are
+post-readiness test corrections, not a claimed fix for the current startup
+failure. Local offline emulation builds a fresh snapshot under plain Node, but
+the emulated Electron invocation exits 137 without a result; neither qualifies
+native Linux. The existing Mac tester's exact Electron/ASAR snapshot build
+succeeds with an isolated empty synthetic profile. Native packaged Linux needs
+its own fixed snapshot-build error before application behavior is changed.
 
 The next Windows test uses a separate disposable runner account and an unpacked
 unsigned candidate with the exact normal distribution metadata. It must prove

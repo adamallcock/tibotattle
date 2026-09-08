@@ -243,20 +243,22 @@ test("normal Windows CI keeps unsigned candidate bytes private and preserves the
   assert.deepEqual(builderArguments, [
     "--config", "apps/electron/electron-builder.production.config.cjs",
     "--win", "dir", "--x64", "--publish", "never",
-    "-c.forceCodeSigning=false", "-c.win.signExecutable=false",
+    "--config.forceCodeSigning=false", "--config.win.signExecutable=false",
   ]);
   const script = [
     'const { createRequire } = require("node:module");',
     'const req = createRequire(require.resolve("electron-builder"));',
+    `process.argv = [process.execPath, "electron-builder", ...${JSON.stringify(builderArguments)}];`,
     'const builder = req("./builder.js");',
     'const { getConfig, validateConfiguration } = req("app-builder-lib/out/util/config/config.js");',
     'const { DebugLogger } = req("builder-util");',
-    `const options = builder.normalizeOptions(builder.configureBuildCommand(req("yargs/yargs")(${JSON.stringify(builderArguments)})).parseSync());`,
-    '(async () => {',
+    'builder.build = async (rawOptions) => {',
+    'const options = builder.normalizeOptions(rawOptions);',
     'const config = await getConfig(process.cwd(), null, options.config);',
     'await validateConfiguration(config, new DebugLogger(false));',
     'process.stdout.write(JSON.stringify({ config, publish: options.publish, targets: [...options.targets].map(([platform, arches]) => ({ platform: platform.nodeName, arches: [...arches] })) }));',
-    '})().catch(() => { process.exitCode = 1; });',
+    '};',
+    'req("./cli/cli.js");',
   ].join("\n");
   const releaseVersion = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version;
   const output = execFileSync(process.execPath, ["-e", script], {
