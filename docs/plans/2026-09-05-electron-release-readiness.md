@@ -14,15 +14,17 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Current gate: the `2abe5448` run passes both Mac packages and the formerly
-failing native Windows channel tests, but catches a Linux startup regression
-before packaging. The corrected supervisor is integrated at `394996f5` and
-passes all 123 affected Windows/Linux/Mac broker, shell and runner tests with
-one native-only exclusion. Windows's packaged journey also stops before storage
-because its ordinary companion has the same no-IPC shape. The corrected full
-rerun is pending. Linux's first-install credential proof remains the earlier
-`eeb74786` artifact. Production selection and release remain gated. The daily
-Mac tester remains the verified `1f74bbb6` artifact described below.
+Current gate: all four development packages pass at `82cd7a1f` in
+[run 34187627525](https://github.com/adamallcock/tibotattle/actions/runs/34187627525).
+The downloaded Windows and Linux packages match their content-free runtime
+receipts. Windows proves both credential channels and retained records in new
+children; Linux proves native default-state setup and packaged Secret Service
+first launch. These do not establish production selection, installed lifecycle,
+or release readiness. The next source integrates the Windows companion's
+parent-owned observation selector and Linux fixed-installation-record recovery.
+The daily Mac launcher still selects verified `1f74bbb6`; the newer `e2c4a784`
+app passes full copied-history qualification, while its separate synthetic
+restart test needs a readiness-order correction before promotion.
 
 The earlier all-four development packaging baseline passes at
 `f26146aaf7fe34845ed7192ae0100e88b9d9b660` in
@@ -71,7 +73,7 @@ default native test log records one pass and zero skips. Its standalone
 workflow now requires a fixed success marker emitted after all assertions.
 An executed-program regression verifies real TAP line endings and rejects
 skips, duplicate or absent markers, nonzero exits and process failures; a zero
-exit alone cannot qualify the check. This later marker is awaiting native CI. The repaired source-level Linux guard
+exit alone cannot qualify the check. The marker is subsequently verified in the `793f6ed9` and `82cd7a1f` native runs. The repaired source-level Linux guard
 now checks the exact qualification dependency closure and proves that ordinary
 launch options expose no broker while production Linux selection stays closed;
 all 119 portable foundation tests pass (five expected native/optional skips). An owner-bit-masking umask deliberately
@@ -173,6 +175,72 @@ The further regression at `3bddf9a8` spawns a real plain child without IPC,
 observes `connected: false`, reaches readiness and stops it cleanly. Windows CI
 now runs the full shell-core suite before packaging, so ordinary companion
 startup is tested alongside the credential channels. Native rerun is pending.
+
+The corrected `793f6ed9` run
+[34187366354](https://github.com/adamallcock/tibotattle/actions/runs/34187366354)
+passes both Mac packages and Linux. Linux's exact native success marker is
+observed once and its downloaded ASAR matches the package and passed v2 smoke
+receipt at `ceed9ff1f63ac5f300ef59b41c881e691f3b38f13f5d8b8c34e82724ab58ba06`.
+Windows passes the real ordinary-child startup and shared credential IPC tests.
+The newly included full shell suite exposes one older fixture expecting a
+literal Mac path on a Windows host. `82cd7a1f` supplies a native absolute fixture
+path and preserves the exact final `app.asar/package.json` assertion; all 63
+shell tests pass locally. The `82cd7a1f` rerun passes all four targets.
+The downloaded Windows ASAR is
+`61d9f19dd9edeae7bd8b805cb3f7ee04eb7dd4ad49c7580b7f8d0073fa09d345`;
+both packaged credential journeys, child retention, status and owned-process
+cleanup pass. Its receipt explicitly leaves whole-application restart,
+installation, hosted upload and production readiness unqualified. The Linux
+ASAR remains `ceed9ff1f63ac5f300ef59b41c881e691f3b38f13f5d8b8c34e82724ab58ba06`,
+with matching passed default-bootstrap/credential-lifecycle/cleanup evidence.
+
+The fresh unsigned Mac package from frozen `793f6ed9` is independently bound to
+ASAR `514228a25e373c1b74acde83253711b3bd749c993a4c6971d06759d37caed771`.
+Its v5 synthetic smoke passes startup refresh, Usage/Community presentation,
+five Settings tabs, persisted sharing/refresh controls, tray customize/preview/
+undo/default/reopen/process relaunch, Share and clean quit. The dashboard and
+tray captures were visually inspected. Its copied-history run fails the timer
+gate: once file counting starts, the product label omits elapsed time. The failed
+receipt is retained. `e2c4a784` adds elapsed time to both loaded-summary and
+file-count progress labels and preserves completed startup/control-plane
+probe evidence when another probe fails. All 280 focused and 564 UI tests pass.
+
+The new frozen `e2c4a784` Mac app has ASAR
+`2681d9547e4980932539ee35bc78121c5ff8df851c23c8d4d8d82ca58329ea05`.
+Its full copied-history run passes with an advancing rendered timer, one
+successful startup refresh, Usage/Community parity, and clean quit. Both
+endpoints pass 20 active samples each with p95 1 ms; their maxima are 455 and
+456 ms, retained against the existing 3,000 ms per-request and 250 ms p95 gates.
+Cancellation mode separately accepts both cancel requests and a new refresh
+on retry, but the overall run fails its timer gate; its original receipt is
+preserved. The sampler remains active across cancellation and the retry's
+reset elapsed counter, so generation-scoped sampling needs investigation before
+this can qualify cancellation end to end. Copied-history relaunch is a separate
+mode. The fresh
+synthetic test passes initial settings, persisted controls, and tray editing,
+but its restart fails at `settings_target`. Review finds the test invokes the
+settings bridge before lifecycle startup finishes; the first-launch test already
+waits for the app-owned rendered-ready marker. The proposed correction uses
+that same predicate before the one relaunch invocation, without retries or
+changed deadlines. The failed receipt is preserved; launcher promotion waits.
+
+The Windows production observation selector at `8789b50c` now accepts only the
+explicit parent-owned read/create IPC adapter in the accountless companion.
+Existing-only upload reads cannot create a root, unavailable adapters retain
+unknown attribution, and no legacy fallback is activated. All 32 selector and
+332 local companion tests pass. Production platform selection remains closed.
+
+Linux fixed-installation-record recovery at `c1a07397` uses a canonical fixed
+v2 intent, exact candidate/expected bytes, no-replace create publication,
+exact-value delete quarantine, pinned directory checks, durable reconciliation,
+and the legacy refusal latch for unsafe or uncertain states. Independent review
+found and resolved intent-removal and credential-directory durability gaps.
+Recovery-state tests cover interrupted create/delete and malformed, mismatched,
+or unsafe residues. These model on-disk interruption states, not actual power
+loss. All 120 portable foundation tests pass with six expected native exclusions,
+plus 36 packaging tests with two optional artifact exclusions and architecture
+checks. Native compilation and recovery execution require the next CI run.
+Linux's narrow observation adapter and final production composition remain open.
 
 The accountless production companion profile is now integrated at `b3643991`.
 It requires the exact production mode/origin and a connected private IPC
