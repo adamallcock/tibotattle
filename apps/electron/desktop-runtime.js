@@ -541,6 +541,7 @@ export async function launchDesktopRuntime({
   accountlessHostedRehearsal,
   productionDistribution,
   prepareNativeHandover,
+  loadProductionUpdater = () => import("electron-updater"),
 } = {}) {
   assertObject(runtime, "runtime");
   if (!app || typeof app.on !== "function") throw new TypeError("app is required");
@@ -643,7 +644,8 @@ export async function launchDesktopRuntime({
     }
     if (app.isPackaged !== true || app.getName?.() !== "TiboTattle"
         || environment.USAGE_MONITOR_TEST_LANE !== undefined
-        || qualificationContext !== null || platformServices !== undefined) {
+        || qualificationContext !== null || platformServices !== undefined
+        || typeof loadProductionUpdater !== "function") {
       throw shellError("electron_configuration_invalid");
     }
   }
@@ -1528,10 +1530,11 @@ export async function launchDesktopRuntime({
     }
     await lifecycle.start();
     if (productionDistribution !== undefined) {
-      // Load the third-party native updater only in the selected production
-      // package, after Electron readiness and ownership of the child lifecycle.
-      const updaterModule = runtime.autoUpdater ? null : await import("electron-updater");
-      const autoUpdater = runtime.autoUpdater ?? updaterModule.autoUpdater ?? updaterModule.default?.autoUpdater;
+      // Electron's built-in autoUpdater has no supported Linux implementation
+      // and lacks electron-updater's explicit download contract on every
+      // platform. The selected package consistently uses the pinned updater.
+      const updaterModule = await loadProductionUpdater();
+      const autoUpdater = updaterModule?.autoUpdater ?? updaterModule?.default?.autoUpdater;
       updater = createProductionDesktopUpdater({
         app, autoUpdater, distributionMetadata: productionDistribution,
         platform, architecture,

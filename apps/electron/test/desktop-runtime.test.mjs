@@ -347,6 +347,7 @@ async function launchFixture({
   accountlessHostedRehearsal,
   productionDistribution,
   prepareNativeHandover,
+  loadProductionUpdater,
   sharingBackend,
   sharingInstallationState,
   ownedCompanionScript,
@@ -389,6 +390,7 @@ async function launchFixture({
     accountlessHostedRehearsal,
     productionDistribution,
     prepareNativeHandover,
+    loadProductionUpdater,
     sharingBackend,
     sharingInstallationState,
     ...(hostedRehearsal ? {} : { settingsBackend: backend }),
@@ -419,13 +421,18 @@ async function launchFixture({
 }
 
 test("normal desktop cannot enable accountless uploads through environment variables", async () => {
+  let productionUpdaterLoads = 0;
   const fixture = await launchFixture({ load: async () => null, environment: {
     HOME: "/Users/adam", USAGE_MONITOR_CENTRAL_ORIGIN: "https://tibotattle.com",
     USAGE_MONITOR_ACCOUNTLESS_ORIGIN: "https://tibotattle.com",
+  }, loadProductionUpdater: async () => {
+    productionUpdaterLoads += 1;
+    return { autoUpdater: null };
   } });
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_CENTRAL_ORIGIN, undefined);
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, undefined);
   assert.deepEqual(fixture.spawnCalls[0].options.stdio, ["ignore", "pipe", "pipe"]);
+  assert.equal(productionUpdaterLoads, 0, "ordinary desktop startup never loads the production updater");
   await fixture.desktop.lifecycle.requestQuit();
 });
 
@@ -531,6 +538,9 @@ test("macOS production runtime connects updater controls to protected preference
   app.getPath = () => profile;
   app.getVersion = () => "0.1.18";
   const autoUpdater = new EventEmitter();
+  const nativeAutoUpdater = new EventEmitter();
+  nativeAutoUpdater.checkForUpdates = () => {};
+  nativeAutoUpdater.quitAndInstall = () => {};
   let checks = 0;
   let installs = 0;
   let rejectInstall = true;
@@ -561,10 +571,11 @@ test("macOS production runtime connects updater controls to protected preference
     return null;
   },
     environment: { HOME: profile },
-    runtimeOverrides: { autoUpdater, dialog: {
+    runtimeOverrides: { autoUpdater: nativeAutoUpdater, dialog: {
       showMessageBox: async (options) => { firstRunDisclosures.push(options); return { response: 0 }; },
       showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
     } },
+    loadProductionUpdater: async () => ({ autoUpdater }),
     productionDistribution: createProductionDistributionMetadata({
       target: `darwin-${process.arch}`, sourceRevision: "a".repeat(40), buildNumber: "20260906",
     }),
@@ -579,6 +590,7 @@ test("macOS production runtime connects updater controls to protected preference
   assert.doesNotMatch(firstRunDisclosures[0].detail, /Uploads are not available|development build/u);
   assert.equal(autoUpdater.autoInstallOnAppQuit, false);
   assert.equal(autoUpdater.autoDownload, true);
+  assert.equal(nativeAutoUpdater.listenerCount("checking-for-update"), 0);
   await fixture.desktop.controller.handlers.setAutomaticDownload({ enabled: false });
   assert.equal(autoUpdater.autoDownload, false);
   const saved = JSON.parse(await readFile(join(profile, "desktop-settings", "update-preferences-v1.json"), "utf8"));
@@ -599,6 +611,46 @@ test("macOS production runtime connects updater controls to protected preference
   assert.equal(fixture.desktop.lifecycle.state.preparingForUpdate, true);
   assert.equal(fixture.desktop.supervisor.state.hasChild, false);
   assert.equal(app.quitCalls, 0);
+});
+
+test("Linux production runtime loads electron-updater instead of a native-shaped updater", async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "linux-production-updater-runtime-"));
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  app.getPath = () => profile;
+  app.getVersion = () => "0.1.18";
+  const nativeAutoUpdater = new EventEmitter();
+  nativeAutoUpdater.checkForUpdates = () => {};
+  nativeAutoUpdater.quitAndInstall = () => {};
+  const updater = new EventEmitter();
+  updater.checkForUpdates = async () => null;
+  updater.downloadUpdate = async () => [];
+  updater.quitAndInstall = () => {};
+  let updaterLoads = 0;
+  let fixture;
+  t.after(async () => {
+    await fixture?.desktop.lifecycle.requestQuit();
+    await rm(profile, { recursive: true, force: true });
+  });
+  fixture = await launchFixture({
+    app,
+    load: async () => null,
+    environment: { HOME: profile },
+    platform: "linux",
+    architecture: "x64",
+    runtimeOverrides: { autoUpdater: nativeAutoUpdater },
+    loadProductionUpdater: async () => {
+      updaterLoads += 1;
+      return { default: { autoUpdater: updater } };
+    },
+    productionDistribution: createProductionDistributionMetadata({
+      target: "linux-x64", sourceRevision: "f".repeat(40), buildNumber: "20260909",
+    }),
+  });
+  assert.equal(updaterLoads, 1);
+  assert.equal(nativeAutoUpdater.listenerCount("checking-for-update"), 0);
+  assert.equal(updater.autoInstallOnAppQuit, false);
 });
 
 test("native handover blocks before settings writes and companion start when existing data cannot move", {
@@ -688,6 +740,9 @@ test("handover rehearsal keeps the packaged updater but omits the FD3 accountles
   app.getName = () => "TiboTattle";
   app.getPath = () => profile;
   const autoUpdater = new EventEmitter();
+  const nativeAutoUpdater = new EventEmitter();
+  nativeAutoUpdater.checkForUpdates = () => {};
+  nativeAutoUpdater.quitAndInstall = () => {};
   let checks = 0;
   autoUpdater.checkForUpdates = async () => {
     checks += 1;
@@ -705,12 +760,13 @@ test("handover rehearsal keeps the packaged updater but omits the FD3 accountles
     load: async () => null,
     environment: { HOME: profile },
     runtimeOverrides: {
-      autoUpdater,
+      autoUpdater: nativeAutoUpdater,
       dialog: {
         showMessageBox: async () => ({ response: 0 }),
         showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
       },
     },
+    loadProductionUpdater: async () => ({ autoUpdater }),
     productionDistribution: createProductionDistributionMetadata({
       target: `darwin-${process.arch}`,
       sourceRevision: "c".repeat(40),
