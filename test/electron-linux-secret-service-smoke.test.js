@@ -261,7 +261,10 @@ test("packaged Electron creates the isolated context only after the default-proo
     executable: APP,
     environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
-    async verifyNativeBindings() {},
+    async verifyNativeBindings(appPath) {
+      assert.equal(appPath, APP);
+      calls.push(["native-loaders"]);
+    },
     electronProcess,
     async canonicalize(path) { return path; },
     async digest(path) {
@@ -297,7 +300,7 @@ test("packaged Electron creates the isolated context only after the default-proo
   });
   assert.deepEqual(result, innerReceipt());
   assert.deepEqual(calls.map(([name]) => name), [
-    "digest", "daemon", "qualification", "smoke", "context", "run",
+    "digest", "daemon", "qualification", "smoke", "native-loaders", "context", "run",
   ]);
   const context = calls.find(([name]) => name === "context")[1];
   assert.equal(context.credentialStoreMode, "isolated-secret-service");
@@ -306,6 +309,30 @@ test("packaged Electron creates the isolated context only after the default-proo
   assert.deepEqual(asarModeChanges, [true, false]);
   assert.equal(noAsar, false);
   assert.deepEqual(Object.getOwnPropertyDescriptor(electronProcess, "noAsar"), originalNoAsarDescriptor);
+});
+
+test("packaged credential failures retain only closed stage categories", async () => {
+  for (const [code, suffix] of [
+    ["linux_secret_service_qualification_smoke_create_failed", "CREDENTIAL_CREATE_FAILED"],
+    ["linux_secret_service_qualification_smoke_backend_setup_failed", "BACKEND_SETUP_FAILED"],
+    ["linux_secret_service_qualification_smoke_child_execution_failed", "CHILD_EXECUTION_FAILED"],
+    ["private-error-code-canary", "NATIVE_ROUND_TRIP_FAILED"],
+  ]) {
+    const runtime = successfulInsideRuntime({
+      electronProcess: {},
+      digest: async () => ASAR,
+    });
+    const importModule = runtime.importModule;
+    runtime.importModule = async (url) => url.endsWith("linux-secret-service-qualification-smoke.js")
+      ? { async runLinuxSecretServiceQualificationSmoke() {
+        throw Object.assign(new Error("private-path-and-value-canary"), { code });
+      } }
+      : importModule(url);
+    await assert.rejects(runLinuxPackagedSecretServiceSmokeInside({
+      appPath: APP, sourceRevision: REVISION, artifactSha256: ARTIFACT,
+    }, runtime), { code: `ELECTRON_LINUX_SECRET_SERVICE_SMOKE_${suffix}`,
+      message: `ELECTRON_LINUX_SECRET_SERVICE_SMOKE_${suffix}` });
+  }
 });
 
 test("packaged Electron emits bounded runtime and isolation stage failures before context construction", async () => {

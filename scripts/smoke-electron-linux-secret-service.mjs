@@ -92,6 +92,15 @@ const QUALIFICATION_EXECUTABLES = new Set([
   "/usr/bin/dbus-daemon",
   "/usr/bin/gnome-keyring-daemon",
 ]);
+const CREDENTIAL_STAGE_FAILURES = new Map([
+  ["backend_setup", "BACKEND_SETUP"], ["child_execution", "CHILD_EXECUTION"],
+  ["create", "CREDENTIAL_CREATE"], ["read", "CREDENTIAL_READ"],
+  ["replace", "CREDENTIAL_REPLACE"], ["delete", "CREDENTIAL_DELETE"],
+  ["absence", "CREDENTIAL_ABSENCE"], ["channel", "CREDENTIAL_CHANNEL"],
+  ["shutdown", "COMPANION_SHUTDOWN"],
+].map(([source, target]) => [
+  `linux_secret_service_qualification_smoke_${source}_failed`, `${target}_FAILED`,
+]));
 const INNER_STAGE_FAILURE_CODES = new Set([
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_RUNTIME_IDENTITY_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_ARTIFACT_IDENTITY_FAILED",
@@ -100,6 +109,9 @@ const INNER_STAGE_FAILURE_CODES = new Set([
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_MUTEX_LOAD_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_KEYTAR_LOAD_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_NATIVE_ROUND_TRIP_FAILED",
+  ...[...CREDENTIAL_STAGE_FAILURES.values()].map(
+    (suffix) => `ELECTRON_LINUX_SECRET_SERVICE_SMOKE_${suffix}`,
+  ),
 ]);
 const NODE_MODULE_LOAD_ERROR_CODES = new Set([
   "ERR_INVALID_MODULE_SPECIFIER",
@@ -872,7 +884,8 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
     fail("MODULE_LOAD_FAILED");
   }
   await verifyNativeBindings(options.appPath, importModule);
-  const outcome = await innerStage("NATIVE_ROUND_TRIP_FAILED", async () => {
+  let outcome;
+  try {
     const context = qualification.createLinuxQualificationContext({
       platform: "linux",
       architecture: "x64",
@@ -888,8 +901,14 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
       qualificationContext: context,
     });
     if (result?.status !== "passed") fail("NATIVE_ROUND_TRIP_FAILED");
-    return result;
-  });
+    outcome = result;
+  } catch (error) {
+    // Translate only closed source-owned categories. No child output or
+    // native error text is retained by this packaged-artifact receipt.
+    let suffix;
+    try { suffix = CREDENTIAL_STAGE_FAILURES.get(error?.code); } catch { /* Fixed fallback. */ }
+    fail(suffix ?? "NATIVE_ROUND_TRIP_FAILED");
+  }
   if (outcome?.status !== "passed") fail("NATIVE_ROUND_TRIP_FAILED");
   return Object.freeze({
     schemaVersion: RECEIPT_SCHEMA,

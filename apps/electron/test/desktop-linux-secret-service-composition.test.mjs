@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { Duplex } from "node:stream";
 import test from "node:test";
@@ -297,11 +298,17 @@ test("Linux main composition preserves an existing isolated record when the smok
   });
   existing.fill(0);
   const h = handover(context({ credentialStoreMode: "isolated-secret-service" }), native);
+  let childExitCode = null;
   const supervisor = createCompanionSupervisor({
     command: process.execPath,
     args: [CHILD_PATH],
     startupTimeoutMs: 1_000,
     shutdownTimeoutMs: 1_000,
+    spawnChild(command, args, options) {
+      const child = spawn(command, args, options);
+      child.once("exit", (code) => { childExitCode = code; });
+      return child;
+    },
     attachLinuxSecretServiceBroker: h.attachLinuxSecretServiceBroker,
   });
   try {
@@ -313,6 +320,7 @@ test("Linux main composition preserves an existing isolated record when the smok
     await supervisor.stop();
   }
   assert.deepEqual(native.acquired, [0]);
+  assert.equal(childExitCode, 21, "the fixed create stage reports refusal without secret output");
   assert.deepEqual(native.released, [0]);
   assert.deepEqual(native.abandonedLeases, []);
   assert.deepEqual([...native.values.values()], [encoded]);
