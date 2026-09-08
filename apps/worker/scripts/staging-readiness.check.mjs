@@ -22,12 +22,13 @@ import {
 import {
   checkedInConfig,
   provisionedConfig,
+  unprovisionedConfig,
   successSpawn,
   workerDirectory,
 } from "./staging-test-fixtures.mjs";
 
-test("checked-in staging configuration is closed and intentionally unprovisioned", () => {
-  const result = assessStagingConfiguration(checkedInConfig);
+test("unprovisioned staging remains closed and cannot claim live readiness", () => {
+  const result = assessStagingConfiguration(unprovisionedConfig());
   assert.equal(result.state, "safe_unprovisioned");
   assert.equal(result.collectionAuthorized, false);
   assert.equal(result.evidenceType, STAGING_PROOF_TYPES.STATIC_CONFIGURATION);
@@ -50,6 +51,17 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
     "STAGING_RESOURCE_IDENTIFIERS_NOT_CONFIGURED",
   ]);
   assert.equal(JSON.stringify(result).includes("app-usagemonitor-staging"), false);
+});
+
+test("checked-in staging resources remain closed and require live qualification", () => {
+  const result = assessStagingConfiguration(checkedInConfig);
+  assert.equal(result.state, "configured_unverified");
+  assert.equal(result.checks.resourceIdentifiersConfigured, true);
+  assert.equal(result.collectionAuthorized, false);
+  assert.equal(result.liveProof, false);
+  assert.equal(result.checks.enrollmentDisabled, true);
+  assert.equal(result.checks.accountlessAdmissionDisabled, true);
+  assert.equal(result.checks.accountScopedIngestDisabled, true);
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {

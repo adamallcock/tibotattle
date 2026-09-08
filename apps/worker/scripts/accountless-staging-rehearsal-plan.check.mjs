@@ -5,13 +5,13 @@ import {
   HOSTED_REHEARSAL_ACKNOWLEDGEMENT,
   planAccountlessStagingRehearsal,
 } from "./accountless-staging-rehearsal-plan.mjs";
-import { checkedInConfig, provisionedConfig } from "./staging-test-fixtures.mjs";
+import { checkedInConfig, provisionedConfig, unprovisionedConfig } from "./staging-test-fixtures.mjs";
 
 const SOURCE_COMMIT = "45fde21ec4de8a1edd9f7508e6bacaaad94bf6cb";
 
 test("accountless hosted rehearsal plan fixes one origin and stays blocked before provisioning", () => {
   const plan = planAccountlessStagingRehearsal({
-    config: checkedInConfig,
+    config: unprovisionedConfig(),
     sourceCommit: SOURCE_COMMIT,
   });
   assert.equal(plan.state, "blocked_unprovisioned");

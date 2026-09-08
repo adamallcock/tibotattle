@@ -31,7 +31,7 @@ import {
   runRemotePilotSql,
 } from "./pilot-operations-lib.mjs";
 import {
-  checkedInConfig,
+  unprovisionedConfig,
   provisionedConfig,
   workerDirectory,
 } from "./staging-test-fixtures.mjs";
@@ -568,7 +568,7 @@ test("local path and configured-resource gates fail before remote inspection", a
     const unprovisioned = await runRemoteInvitationOperation({
       action: "issue",
       confirmation: INVITATION_CONFIRMATIONS.issue,
-      config: checkedInConfig,
+      config: unprovisionedConfig(),
       invitationFile: join(root, "unprovisioned.secret"),
       receiptFile: join(root, "unprovisioned.receipt.json"),
       origin: STAGING_ORIGIN,
