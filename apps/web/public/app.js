@@ -12259,7 +12259,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         : processed !== null && selected !== null
         ? selected > 0 && processed >= selected
           ? `Calculating usage and allowance… ${elapsedLabel}`
-          : `Analyzing ${processed}/${selected} files…`
+          : `Analyzing ${processed}/${selected} files… ${elapsedLabel}`
         : pollCount < 3 ? "Analyzing local evidence…" : `Analyzing… ${elapsedLabel}`;
       if (refreshNeedsContinuation({
         outcome,

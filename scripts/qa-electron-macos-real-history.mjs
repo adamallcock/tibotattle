@@ -1566,6 +1566,28 @@ function samplerEvidence(error, key) {
     : {};
 }
 
+/** Retain completed startup observations even when one parallel probe fails. */
+export function settleStartupRefreshProbes({
+  startup,
+  timerResult,
+  timerError,
+  controlPlaneResult,
+  controlPlaneError,
+}) {
+  const evidence = Object.freeze({
+    startup,
+    timer: timerResult ?? samplerEvidence(timerError, "timer"),
+    controlPlane: controlPlaneResult ?? samplerEvidence(controlPlaneError, "controlPlane"),
+  });
+  const reason = timerError ?? controlPlaneError;
+  if (reason !== null && reason !== undefined) {
+    const error = reason instanceof Error ? reason : new Error("real-history QA sampler failed");
+    attachQaEvidence(error, evidence);
+    throw error;
+  }
+  return evidence;
+}
+
 /**
  * Run the renderer timer and direct loopback control-plane probes together.
  * A timer failure must not cancel the health/status probes: the resulting
@@ -1945,10 +1967,7 @@ async function waitForStartupRefresh(
     });
     throw completionError;
   }
-  if (timerError !== null) throw timerError;
-  if (controlPlaneError !== null) throw controlPlaneError;
-  session.observer.seal();
-  return Object.freeze({
+  const startup = Object.freeze({
     requestCount: 1,
     refreshIdChanged: true,
     terminalStatus: terminal,
@@ -1956,8 +1975,15 @@ async function waitForStartupRefresh(
     quickResultObserved: quickResultDurationObservedMs !== null,
     quickResultDurationMs: quickResultDurationObservedMs,
     degradedFailureCode,
-    timer: timerResult,
-    controlPlane: controlPlaneResult,
+  });
+  const probes = settleStartupRefreshProbes({
+    startup, timerResult, timerError, controlPlaneResult, controlPlaneError,
+  });
+  session.observer.seal();
+  return Object.freeze({
+    ...startup,
+    timer: probes.timer,
+    controlPlane: probes.controlPlane,
     // Deliberately private: callers use it to fence relaunch IDs, but the
     // receipt builder below never copies it.
     refreshId,

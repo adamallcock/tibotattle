@@ -367,12 +367,14 @@ export function refreshQuickResultStatus({
   dashboardLoaded = false,
   elapsedLabel = "",
 } = {}) {
-  if (dashboardLoaded) {
-    return "Local summary updated · checking full history…";
-  }
   const boundedElapsedLabel = typeof elapsedLabel === "string"
     ? elapsedLabel.trim()
     : "";
+  if (dashboardLoaded) {
+    return boundedElapsedLabel.length > 0
+      ? `Local summary updated · checking full history… ${boundedElapsedLabel}`
+      : "Local summary updated · checking full history…";
+  }
   return boundedElapsedLabel.length > 0
     ? `Preparing local summary… ${boundedElapsedLabel}`
     : "Preparing local summary…";

@@ -33,6 +33,7 @@ import {
   releaseRealHistoryRefreshGate,
   runLaunchGate,
   sampleTimerAndControlPlaneConcurrently,
+  settleStartupRefreshProbes,
   waitForLaunchGate,
   waitFor,
   waitForUsageParitySnapshot,
@@ -1267,6 +1268,40 @@ test("timer and control-plane probes run concurrently and retain safe evidence o
   assert.deepEqual(receipt.timer, timerError.qaEvidence.timer);
   assert.deepEqual(receipt.controlPlane, controlPlane);
   assert.equal(JSON.stringify(receipt).includes("private timer detail"), false);
+});
+
+test("full-refresh probe failure retains completed startup and both probe summaries", () => {
+  const startup = { requestCount: 1, refreshIdChanged: true, terminalStatus: "succeeded",
+    terminalEvaluated: true, quickResultObserved: true, quickResultDurationMs: 1_000,
+    degradedFailureCode: null };
+  const timer = { sampleCount: 4, uniqueCount: 3, advanced: false };
+  const controlPlane = qualifyingV2ControlPlane();
+  const error = Object.assign(new Error("private probe detail"), {
+    qaEvidence: { timer }, qaStage: "refresh", qaReason: "timer_stalled",
+  });
+  assert.throws(() => settleStartupRefreshProbes({
+    startup, timerError: error, controlPlaneResult: controlPlane,
+  }), (observed) => {
+    assert.equal(observed, error);
+    const receipt = buildRealHistoryReceipt({ status: "failed", failureStage: "refresh",
+      failureReason: "timer_stalled", ...observed.qaEvidence });
+    assert.equal(receipt.status, "failed");
+    assert.equal(receipt.startupRefresh.terminalStatus, "succeeded");
+    assert.equal(receipt.startupRefresh.terminalEvaluated, true);
+    assert.deepEqual(receipt.timer, timer);
+    assert.equal(receipt.controlPlane.sampleCount, 20);
+    assert.equal(JSON.stringify(receipt).includes("private probe detail"), false);
+    return true;
+  });
+  const controlError = Object.assign(new Error("private control detail"), { qaEvidence: { controlPlane } });
+  assert.throws(() => settleStartupRefreshProbes({ startup, timerResult: timer,
+    controlPlaneError: controlError }), (observed) => {
+    assert.equal(observed, controlError);
+    assert.deepEqual(observed.qaEvidence, { startup, timer, controlPlane });
+    return true;
+  });
+  assert.deepEqual(settleStartupRefreshProbes({ startup, timerResult: timer,
+    controlPlaneResult: controlPlane }), { startup, timer, controlPlane });
 });
 
 test("control-plane observer retains only exact loopback route response metadata", () => {

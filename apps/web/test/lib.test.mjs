@@ -1077,7 +1077,7 @@ test("quick-result progress never turns a loaded no-numbers overview into a head
       dashboardLoaded: true,
       elapsedLabel: "7s",
     }),
-    "Local summary updated · checking full history…",
+    "Local summary updated · checking full history… 7s",
   );
   assert.equal(
     refreshQuickResultStatus({
@@ -1085,6 +1085,14 @@ test("quick-result progress never turns a loaded no-numbers overview into a head
       elapsedLabel: "7s",
     }),
     "Preparing local summary… 7s",
+  );
+  assert.equal(
+    refreshQuickResultStatus({ dashboardLoaded: true, elapsedLabel: "1m 2s" }),
+    "Local summary updated · checking full history… 1m 2s",
+  );
+  assert.equal(
+    refreshQuickResultStatus({ dashboardLoaded: true }),
+    "Local summary updated · checking full history…",
   );
 });
 
