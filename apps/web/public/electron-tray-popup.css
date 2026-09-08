@@ -7,6 +7,7 @@
   --tray-rule: #e6e6e6;
   --tray-track: #e6e6e6;
   --tray-accent: #174f45;
+  --tray-critical: #e52b21;
   --tray-accent-solid: rgba(23, 79, 69, .82);
   --tray-accent-partial-fill: rgba(23, 79, 69, .22);
   --tray-accent-partial-border: rgba(23, 79, 69, .8);
@@ -227,10 +228,9 @@ body {
 }
 
 .electron-tray-popup-pace-heading {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 2px;
 }
 
 .electron-tray-popup-pace-heading p {
@@ -238,17 +238,29 @@ body {
 }
 
 #pace-state {
+  min-width: 0;
   color: var(--tray-ink);
   font-size: 11.5px;
   font-weight: 600;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
 }
 
 #pace-outlook {
   min-width: 0;
-  overflow: hidden;
-  text-align: right;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  text-align: start;
+  white-space: normal;
+}
+
+.electron-tray-popup-pace[data-pace-tone="critical"] #pace-state,
+.electron-tray-popup-pace[data-pace-tone="critical"] #pace-rate {
+  color: var(--tray-critical);
+}
+
+.electron-tray-popup-pace[data-pace-tone="critical"] .electron-tray-popup-pace-fill,
+.electron-tray-popup-pace[data-pace-tone="critical"] .electron-tray-popup-pace-active-marker {
+  background: var(--tray-critical);
 }
 
 .electron-tray-popup-pace-metrics {
@@ -574,6 +586,7 @@ button:focus-visible {
     --tray-rule: rgba(237, 242, 237, .18);
     --tray-track: rgba(237, 242, 237, .2);
     --tray-accent: #76aa9c;
+    --tray-critical: #ff867d;
     --tray-accent-solid: rgba(118, 170, 156, .82);
     --tray-accent-partial-fill: rgba(118, 170, 156, .22);
     --tray-accent-partial-border: rgba(118, 170, 156, .8);

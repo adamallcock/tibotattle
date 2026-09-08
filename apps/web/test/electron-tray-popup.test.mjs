@@ -463,6 +463,7 @@ test("weekly pace renders only for a current allowance bound to its valid outloo
   renderTrayPopup(documentRef, createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" }));
   assert.equal(documentRef.getElementById("pace-section").hidden, false);
   assert.equal(documentRef.getElementById("pace-state").textContent, "Under sustainable pace");
+  assert.equal(documentRef.getElementById("pace-section").dataset.paceTone, "under");
   assert.equal(documentRef.getElementById("pace-track").attributes.get("aria-valuenow"), "100");
 
   const stale = fixture();
@@ -499,6 +500,24 @@ test("weekly pace explains a verified zero-observation state without estimating"
   assert.equal(documentRef.getElementById("pace-state").textContent, "Insufficient evidence");
   assert.equal(documentRef.getElementById("pace-metrics").hidden, true);
   assert.equal(documentRef.getElementById("pace-track").hidden, true);
+});
+
+test("critical weekly pace uses the dedicated urgency treatment", async () => {
+  const css = await readFile(new URL("../public/electron-tray-popup.css", import.meta.url), "utf8");
+  const base = createTrayPopupProjection(fixture(), { now: NOW, timeZone: "UTC" });
+  const projection = {
+    ...base,
+    weeklyPace: {
+      ...base.weeklyPace,
+      outlook: { ...base.weeklyPace.outlook, standing: "over", critical: true },
+    },
+  };
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, projection);
+  assert.equal(documentRef.getElementById("pace-section").dataset.paceTone, "critical");
+  assert.match(css, /data-pace-tone="critical"[\s\S]*#pace-state/u);
+  assert.match(css, /data-pace-tone="critical"[\s\S]*pace-fill/u);
+  assert.match(css, /#pace-outlook[\s\S]*overflow-wrap:\s*anywhere/u);
 });
 
 test("allowance claims require each lane's live fresh observation and future reset", () => {

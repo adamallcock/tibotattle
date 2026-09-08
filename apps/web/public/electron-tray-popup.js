@@ -1209,10 +1209,17 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
   setHidden(documentRef, "pace-track", !available);
   if (!available) {
     if (insufficient) {
+      if (section) section.dataset.paceTone = "insufficient";
       setElementText(documentRef, "pace-state", t("weekly.headline.insufficient"));
       setElementText(documentRef, "pace-outlook", "");
     }
     return;
+  }
+
+  if (section) {
+    section.dataset.paceTone = pace.outlook.critical
+      ? "critical"
+      : pace.outlook.standing;
   }
 
   const standingKey = pace.outlook.critical
