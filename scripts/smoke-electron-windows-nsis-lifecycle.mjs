@@ -8,7 +8,7 @@
 // observation credential is scoped to the disposable runner account lifetime.
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdtemp, open, readFile, rm } from "node:fs/promises";
+import { lstat, mkdtemp, open, readFile, readdir, rmdir, rm, unlink } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
 import { performance } from "node:perf_hooks";
@@ -324,8 +324,7 @@ export function parseWindowsNsisLifecycleArguments(argv) {
   return Object.freeze(result);
 }
 
-/** The special NSIS /D switch is final and receives a closed, space-free path. */
-export function buildWindowsNsisInstallArguments(installationRoot) {
+function normalizedWindowsNsisInstallationRoot(installationRoot) {
   // Validate before resolution: Windows would otherwise turn a relative
   // target into a valid-looking path under the runner's current directory.
   if (typeof installationRoot !== "string"
@@ -333,8 +332,17 @@ export function buildWindowsNsisInstallArguments(installationRoot) {
       || installationRoot.split("\\").some((part) => part === "." || part === "..")) {
     fail("INSTALL_ROOT_INVALID");
   }
-  const normalized = win32.resolve(installationRoot);
-  return Object.freeze(["/S", `/D=${normalized}`]);
+  return win32.resolve(installationRoot);
+}
+
+/** The special NSIS /D switch is final and receives a closed, space-free path. */
+export function buildWindowsNsisInstallArguments(installationRoot) {
+  return Object.freeze(["/S", `/D=${normalizedWindowsNsisInstallationRoot(installationRoot)}`]);
+}
+
+/** NSIS requires the in-place uninstaller's exact _?= target to be final. */
+export function buildWindowsNsisUninstallArguments(installationRoot) {
+  return Object.freeze(["/S", `_?=${normalizedWindowsNsisInstallationRoot(installationRoot)}`]);
 }
 
 /**
@@ -370,13 +378,17 @@ export async function assertPinnedNsisSilentInstallDoesNotAutoRun({
   let targetSource;
   let multiUser;
   let installer;
+  let installUtil;
+  let uninstaller;
   try {
-    [metadata, installSection, targetSource, multiUser, installer] = await Promise.all([
+    [metadata, installSection, targetSource, multiUser, installer, installUtil, uninstaller] = await Promise.all([
       readText(packagePath),
       readText(join(packageRoot, "templates", "nsis", "installSection.nsh")),
       readText(join(packageRoot, "out", "targets", "nsis", "NsisTarget.js")),
       readText(join(packageRoot, "templates", "nsis", "multiUser.nsh")),
       readText(join(packageRoot, "templates", "nsis", "include", "installer.nsh")),
+      readText(join(packageRoot, "templates", "nsis", "include", "installUtil.nsh")),
+      readText(join(packageRoot, "templates", "nsis", "uninstaller.nsh")),
     ]);
     metadata = JSON.parse(metadata);
   } catch {
@@ -385,6 +397,7 @@ export async function assertPinnedNsisSilentInstallDoesNotAutoRun({
   if (metadata?.name !== "app-builder-lib" || metadata.version !== APP_BUILDER_LIB_VERSION
       || typeof installSection !== "string" || typeof targetSource !== "string"
       || typeof multiUser !== "string" || typeof installer !== "string"
+      || typeof installUtil !== "string" || typeof uninstaller !== "string"
       // The generator must reserve force-run as an explicit command-line
       // switch, rather than making it a default installer action.
       || !/\.flags\(\["updated",\s*"force-run"/u.test(targetSource)
@@ -396,11 +409,23 @@ export async function assertPinnedNsisSilentInstallDoesNotAutoRun({
       // The per-user install key is intentionally separate from the uninstall
       // record and is where electron-builder persists InstallLocation.
       || !/!define\s+\/ifndef\s+INSTALL_REGISTRY_KEY\s+"Software\\\$\{APP_GUID\}"/u.test(multiUser)
-      || !/!macro registryAddInstallInfo[\s\S]*?WriteRegStr\s+SHELL_CONTEXT\s+"\$\{INSTALL_REGISTRY_KEY\}"\s+InstallLocation\s+"\$INSTDIR"/u.test(installer)) {
+      || !/!macro registryAddInstallInfo[\s\S]*?WriteRegStr\s+SHELL_CONTEXT\s+"\$\{INSTALL_REGISTRY_KEY\}"\s+InstallLocation\s+"\$INSTDIR"/u.test(installer)
+      // The pinned updater uses the in-place uninstaller with the exact root
+      // final. Its template removes the app tree and both fixed registry keys;
+      // the lifecycle runner may finish only that unchanged in-place executable
+      // with unlink + a non-recursive rmdir, then independently rechecks both.
+      || !installUtil.includes('ExecWait \'"$uninstallerFileName" /S /KEEP_APP_DATA $0 _?=$installationDir\' $R0')
+      || !uninstaller.includes("SetOutPath $TEMP")
+      || !uninstaller.includes("RMDir /r $INSTDIR")
+      || !uninstaller.includes('DeleteRegKey SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}"')
+      || !uninstaller.includes('DeleteRegKey SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}"')) {
     fail("NSIS_TEMPLATE_UNVERIFIED");
   }
   const argumentsForEmptyRoot = buildWindowsNsisInstallArguments("C:\\runner\\tmp\\app");
-  if (argumentsForEmptyRoot.length !== 2 || argumentsForEmptyRoot.some((value) => /force-run/iu.test(value))) {
+  const argumentsForInPlaceUninstall = buildWindowsNsisUninstallArguments("C:\\runner\\tmp\\app");
+  if (argumentsForEmptyRoot.length !== 2 || argumentsForEmptyRoot.some((value) => /force-run/iu.test(value))
+      || argumentsForInPlaceUninstall.length !== 2
+      || argumentsForInPlaceUninstall[1] !== "_?=C:\\runner\\tmp\\app") {
     fail("NSIS_TEMPLATE_UNVERIFIED");
   }
   return true;
@@ -867,11 +892,76 @@ async function defaultExecuteInstaller({ installerPath, installationRoot, enviro
 }
 
 async function defaultAssertUninstaller(uninstallerPath) {
-  await regularFile(uninstallerPath);
+  return digestRegularFile(uninstallerPath);
 }
 
-async function defaultExecuteUninstaller({ uninstallerPath, environment, runProgram }) {
-  const result = await runProgram(uninstallerPath, ["/S"], {
+function sameDigest(left, right) {
+  return validDigest(left) && validDigest(right)
+    && left.bytes === right.bytes
+    && left.sha256 === right.sha256;
+}
+
+/**
+ * NSIS' in-place `_?=` mode can leave only its running executable behind.
+ * The generated template has already removed the app and registry records;
+ * complete that one exact, unchanged file only after rechecking those facts.
+ * This never recursively removes an installation root.
+ */
+async function completeInPlaceUninstallerResidue({
+  installationRoot,
+  uninstallerPath,
+  uninstallerIdentity,
+  environment,
+  runProgram,
+  isMissing,
+  inspectRegistry,
+}) {
+  if (await isMissing(installationRoot)) return false;
+  if (!validDigest(uninstallerIdentity)
+      || resolve(uninstallerPath) !== join(resolve(installationRoot), UNINSTALLER)) {
+    fail("UNINSTALLER_RESIDUE_UNSAFE");
+  }
+  const registry = await inspectRegistry({
+    environment,
+    runProgram,
+    expectedInstallationRoot: installationRoot,
+  });
+  if (registry !== REGISTRY_ABSENT) fail("UNINSTALLER_RESIDUE_UNSAFE");
+  let metadata;
+  let entries;
+  try {
+    [metadata, entries] = await Promise.all([
+      lstat(installationRoot),
+      readdir(installationRoot, { withFileTypes: true }),
+    ]);
+  } catch {
+    fail("UNINSTALLER_RESIDUE_UNSAFE");
+  }
+  if (!metadata.isDirectory() || metadata.isSymbolicLink()
+      || entries.length !== 1 || entries[0]?.name !== UNINSTALLER
+      || !entries[0].isFile() || entries[0].isSymbolicLink()) {
+    fail("UNINSTALLER_RESIDUE_UNSAFE");
+  }
+  let residueIdentity;
+  try {
+    residueIdentity = await digestRegularFile(uninstallerPath);
+  } catch {
+    fail("UNINSTALLER_RESIDUE_UNSAFE");
+  }
+  if (!sameDigest(uninstallerIdentity, residueIdentity)) fail("UNINSTALLER_RESIDUE_UNSAFE");
+  try {
+    await unlink(uninstallerPath);
+    await rmdir(installationRoot);
+  } catch {
+    // A concurrent entry or replacement leaves the owned root intact. Do not
+    // fall back to a recursive removal that could hide that uncertainty.
+    fail("UNINSTALLER_RESIDUE_UNSAFE");
+  }
+  return true;
+}
+
+async function defaultExecuteUninstaller({ uninstallerPath, installationRoot, environment, runProgram }) {
+  const result = await runProgram(uninstallerPath, buildWindowsNsisUninstallArguments(installationRoot), {
     timeoutMs: UNINSTALLER_TIMEOUT_MS,
     environment,
   });
@@ -1689,6 +1779,7 @@ function lifecycleReceipt({
   uninstallationAttempted,
   uninstallationPerformed,
   uninstallerSettled,
+  inPlaceUninstallerResidueRemoved,
   installRootAbsent,
   uninstallRegistryAbsent,
   postUninstallDiagnostic,
@@ -1748,6 +1839,10 @@ function lifecycleReceipt({
     uninstallationAttempted,
     uninstallationPerformed,
     uninstallerSettled,
+    // Only true when the runner removed one digest-matched in-place
+    // uninstaller and then removed its otherwise-empty install directory.
+    // The final root/registry checks below remain the cleanup authority.
+    inPlaceUninstallerResidueRemoved: inPlaceUninstallerResidueRemoved === true,
     installRootAbsent,
     uninstallRegistryAbsent,
     postUninstallPhase: boundedPostUninstall.phase,
@@ -1818,6 +1913,7 @@ export async function runWindowsNsisLifecycle(options, {
   let ownedRoot = null;
   let installationRoot = null;
   let uninstallerPath = null;
+  let uninstallerIdentity = null;
   let errorCode = null;
   let installationAttempted = false;
   let installationPerformed = false;
@@ -1833,6 +1929,7 @@ export async function runWindowsNsisLifecycle(options, {
   let uninstallationAttempted = false;
   let uninstallationPerformed = false;
   let uninstallerSettled = null;
+  let inPlaceUninstallerResidueRemoved = false;
   let installRootAbsent = false;
   let uninstallRegistryAbsent = false;
   let postUninstallDiagnostic = postUninstallResult("not_attempted");
@@ -1873,7 +1970,7 @@ export async function runWindowsNsisLifecycle(options, {
       fail("INSTALL_REGISTRY_INVALID");
     }
     const appPath = join(installationRoot, APP_EXECUTABLE);
-    await assertUninstaller(uninstallerPath);
+    uninstallerIdentity = await assertUninstaller(uninstallerPath);
     const profile = await prepareProfile({
       appPath,
       profilePath: join(ownedRoot, "profile"),
@@ -1936,12 +2033,28 @@ export async function runWindowsNsisLifecycle(options, {
     }
 
     uninstallationAttempted = true;
-    const uninstallerOutcome = await executeUninstaller({ uninstallerPath, environment, runProgram });
+    const uninstallerOutcome = await executeUninstaller({
+      uninstallerPath,
+      installationRoot,
+      environment,
+      runProgram,
+    });
     uninstallerSettled = uninstallerOutcome?.settled === true;
     const checkedUninstallerOutcome = assertProgramExecutionOutcome(uninstallerOutcome, "UNINSTALLER");
     if (!checkedUninstallerOutcome.settled) fail("UNINSTALLER_UNSETTLED");
     if (!checkedUninstallerOutcome.succeeded) fail("UNINSTALLER_FAILED");
     uninstallationPerformed = true;
+    if (validDigest(uninstallerIdentity)) {
+      inPlaceUninstallerResidueRemoved = await completeInPlaceUninstallerResidue({
+        installationRoot,
+        uninstallerPath,
+        uninstallerIdentity,
+        environment,
+        runProgram,
+        isMissing,
+        inspectRegistry,
+      });
+    }
   } catch (error) {
     if (firstLaunchDiagnostic.phase !== "not_reached"
         && firstLaunchDiagnostic.phase !== "completed"
@@ -1970,10 +2083,11 @@ export async function runWindowsNsisLifecycle(options, {
           expectedInstallationRoot: installationRoot,
         })) !== REGISTRY_ABSENT;
         if (partialAppPresent || partialRegistryPresent) {
-          await assertUninstaller(uninstallerPath);
+          uninstallerIdentity = await assertUninstaller(uninstallerPath);
           uninstallationAttempted = true;
           const cleanupUninstallerOutcome = await executeUninstaller({
             uninstallerPath,
+            installationRoot,
             environment,
             runProgram,
           });
@@ -1986,6 +2100,17 @@ export async function runWindowsNsisLifecycle(options, {
             fail("CLEANUP_UNCONFIRMED");
           }
           uninstallationPerformed = true;
+          if (validDigest(uninstallerIdentity)) {
+            inPlaceUninstallerResidueRemoved = await completeInPlaceUninstallerResidue({
+              installationRoot,
+              uninstallerPath,
+              uninstallerIdentity,
+              environment,
+              runProgram,
+              isMissing,
+              inspectRegistry,
+            });
+          }
         } else {
           installRootAbsent = true;
           uninstallRegistryAbsent = true;
@@ -2043,6 +2168,7 @@ export async function runWindowsNsisLifecycle(options, {
       uninstallationAttempted,
       uninstallationPerformed,
       uninstallerSettled,
+      inPlaceUninstallerResidueRemoved,
       installRootAbsent,
       uninstallRegistryAbsent,
       postUninstallDiagnostic,

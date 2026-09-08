@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -18,6 +18,7 @@ import {
   assertWindowsProcessTreeExited,
   buildWindowsExactExecutableProcessQueryArguments,
   buildWindowsNsisInstallArguments,
+  buildWindowsNsisUninstallArguments,
   buildWindowsNsisRegistryInspectionArguments,
   buildWindowsOwnedProcessSnapshotQueryArguments,
   defaultLaunchAndExercise,
@@ -77,6 +78,75 @@ function profile(root) {
   });
 }
 
+const IN_PLACE_UNINSTALLER_CONTENT = "unchanged in-place uninstaller\n";
+
+function runInPlaceUninstallerResidueScenario({
+  root,
+  receiptPath,
+  mutate = async () => {},
+  waitForCleanupPoll,
+  monotonicNow,
+  uninstallPostconditionBudgetMs,
+  uninstallProgramTerminationGraceMs,
+  removeOwnedRoot,
+}) {
+  const ownedRoot = join(root, "owned");
+  const installationRoot = join(ownedRoot, "app");
+  const uninstallerPath = join(installationRoot, "Uninstall TiboTattle Dev.exe");
+  const state = { registryQueries: 0, uninstallerInstallationRoot: null };
+  const optionalDependencies = {};
+  if (waitForCleanupPoll !== undefined) optionalDependencies.waitForCleanupPoll = waitForCleanupPoll;
+  if (monotonicNow !== undefined) optionalDependencies.monotonicNow = monotonicNow;
+  if (uninstallPostconditionBudgetMs !== undefined) {
+    optionalDependencies.uninstallPostconditionBudgetMs = uninstallPostconditionBudgetMs;
+  }
+  if (uninstallProgramTerminationGraceMs !== undefined) {
+    optionalDependencies.uninstallProgramTerminationGraceMs = uninstallProgramTerminationGraceMs;
+  }
+  if (removeOwnedRoot !== undefined) optionalDependencies.removeOwnedRoot = removeOwnedRoot;
+  const operation = runWindowsNsisLifecycle({
+    installerPath: join(root, "installer.exe"),
+    stagedAppPath: join(root, "staged"),
+    packageReceiptPath: join(root, "development-package.json"),
+    sourceRevision: revision,
+    receiptPath,
+  }, {
+    platform: "win32",
+    architecture: "x64",
+    environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: root, SystemRoot: "C:\\Windows" },
+    verifyInstaller: async () => ({ sourceRevision: revision, installerBytes: 123, installerSha256: "b".repeat(64) }),
+    verifySilentNsisTemplate: async () => true,
+    createOwnedRoot: async () => ownedRoot,
+    inspectRegistry: async () => {
+      state.registryQueries += 1;
+      return state.registryQueries === 2 ? "expected-v1" : "absent-v1";
+    },
+    executeInstaller: async () => {
+      await mkdir(installationRoot, { recursive: true });
+      await writeFile(uninstallerPath, IN_PLACE_UNINSTALLER_CONTENT);
+      return { settled: true, succeeded: true };
+    },
+    verifyInstalledPackage: async () => installedIdentity,
+    prepareProfile: async ({ profilePath }) => profile(profilePath),
+    prepareFirstRun: async () => {},
+    launchAndExercise: async ({ launchOrdinal }) => ({
+      pid: launchOrdinal === 1 ? 1001 : 1002,
+      observedProcessTreeExited: true,
+      installedExecutableAbsentAtPreLaunchSnapshot: true,
+      installedExecutableAbsentAtPostExitSnapshot: true,
+      storageJourneyCompleted: true,
+    }),
+    executeUninstaller: async ({ uninstallerPath: selectedUninstallerPath, installationRoot: selectedInstallationRoot }) => {
+      assert.equal(selectedUninstallerPath, uninstallerPath);
+      state.uninstallerInstallationRoot = selectedInstallationRoot;
+      await mutate(installationRoot, uninstallerPath);
+      return { settled: true, succeeded: true };
+    },
+    ...optionalDependencies,
+  });
+  return { operation, ownedRoot, installationRoot, uninstallerPath, state };
+}
+
 test("Windows NSIS lifecycle runner accepts only its five exact absolute inputs", () => {
   const argv = [
     "--installer", resolve("TiboTattle-Dev-0.1.18-win-x64.exe"),
@@ -98,10 +168,14 @@ test("Windows NSIS lifecycle runner accepts only its five exact absolute inputs"
   }
 });
 
-test("NSIS command keeps /D final and rejects whitespace or quote-bearing install roots", () => {
+test("NSIS commands keep their exact installation root final and reject unsafe roots", () => {
   assert.deepEqual(
     buildWindowsNsisInstallArguments("C:\\runner\\tmp\\tibotattle-nsis\\app"),
     ["/S", "/D=C:\\runner\\tmp\\tibotattle-nsis\\app"],
+  );
+  assert.deepEqual(
+    buildWindowsNsisUninstallArguments("C:\\runner\\tmp\\tibotattle-nsis\\app"),
+    ["/S", "_?=C:\\runner\\tmp\\tibotattle-nsis\\app"],
   );
   for (const path of [
     "C:\\runner temp\\app",
@@ -112,6 +186,7 @@ test("NSIS command keeps /D final and rejects whitespace or quote-bearing instal
     "C:\\runner\\..\\app",
   ]) {
     assert.throws(() => buildWindowsNsisInstallArguments(path), /INSTALL_ROOT_INVALID/u);
+    assert.throws(() => buildWindowsNsisUninstallArguments(path), /INSTALL_ROOT_INVALID/u);
   }
 });
 
@@ -145,6 +220,16 @@ test("pinned NSIS source proves a silent install cannot start the app without fo
     '  WriteRegStr SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}" InstallLocation "$INSTDIR"',
     "!macroend",
   ].join("\n");
+  const installUtil = [
+    "OneMoreAttempt:",
+    "  ExecWait '\"$uninstallerFileName\" /S /KEEP_APP_DATA $0 _?=$installationDir' $R0",
+  ].join("\n");
+  const uninstaller = [
+    "SetOutPath $TEMP",
+    "RMDir /r $INSTDIR",
+    'DeleteRegKey SHELL_CONTEXT "${UNINSTALL_REGISTRY_KEY}"',
+    'DeleteRegKey SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}"',
+  ].join("\n");
   await assert.doesNotReject(assertPinnedNsisSilentInstallDoesNotAutoRun({
     resolveModule: (specifier) => {
       assert.equal(specifier, "electron-builder");
@@ -162,6 +247,8 @@ test("pinned NSIS source proves a silent install cannot start the app without fo
       if (path === join(packageRoot, "out", "targets", "nsis", "NsisTarget.js")) return target;
       if (path === join(packageRoot, "templates", "nsis", "multiUser.nsh")) return multiUser;
       if (path === join(packageRoot, "templates", "nsis", "include", "installer.nsh")) return installer;
+      if (path === join(packageRoot, "templates", "nsis", "include", "installUtil.nsh")) return installUtil;
+      if (path === join(packageRoot, "templates", "nsis", "uninstaller.nsh")) return uninstaller;
       throw new Error("unexpected source");
     },
   }));
@@ -1078,6 +1165,83 @@ test("lifecycle binds installed bytes, uses two distinct top-level processes in 
     assert.equal(receipt.productionReady, false);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("in-place NSIS residue cleanup removes only the unchanged generated uninstaller", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-in-place-residue-"));
+  const receiptPath = join(root, "receipt.json");
+  try {
+    const scenario = runInPlaceUninstallerResidueScenario({ root, receiptPath });
+    const result = await scenario.operation;
+    assert.equal(scenario.state.uninstallerInstallationRoot, scenario.installationRoot);
+    assert.equal(result.status, "passed");
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.inPlaceUninstallerResidueRemoved, true);
+    assert.equal(receipt.installRootAbsent, true);
+    assert.equal(receipt.uninstallRegistryAbsent, true);
+    assert.equal(receipt.cleanupConfirmed, true);
+    await assert.rejects(lstat(scenario.uninstallerPath), { code: "ENOENT" });
+    await assert.rejects(lstat(scenario.installationRoot), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("in-place NSIS residue cleanup refuses extra or changed entries", async (t) => {
+  const cases = [
+    {
+      name: "extra entry",
+      mutate: async (installationRoot, uninstallerPath) => {
+        await writeFile(join(installationRoot, "unexpected.bin"), "unexpected\n");
+      },
+      verify: async (installationRoot, uninstallerPath) => {
+        assert.equal(await readFile(join(installationRoot, "unexpected.bin"), "utf8"), "unexpected\n");
+        assert.equal(await readFile(uninstallerPath, "utf8"), IN_PLACE_UNINSTALLER_CONTENT);
+      },
+    },
+    {
+      name: "changed uninstaller",
+      mutate: async (_installationRoot, uninstallerPath) => {
+        await writeFile(uninstallerPath, "replaced in-place uninstaller\n");
+      },
+      verify: async (_installationRoot, uninstallerPath) => {
+        assert.equal(await readFile(uninstallerPath, "utf8"), "replaced in-place uninstaller\n");
+      },
+    },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-unsafe-residue-"));
+      const receiptPath = join(root, "receipt.json");
+      let rootRemovals = 0;
+      try {
+        const lifecycle = runInPlaceUninstallerResidueScenario({
+          root,
+          receiptPath,
+          mutate: scenario.mutate,
+          waitForCleanupPoll: async () => {},
+          monotonicNow: () => 0,
+          uninstallPostconditionBudgetMs: 10_001,
+          uninstallProgramTerminationGraceMs: 10_000,
+          removeOwnedRoot: async () => { rootRemovals += 1; },
+        });
+        await assert.rejects(lifecycle.operation, /UNINSTALLER_RESIDUE_UNSAFE/u);
+        assert.equal(rootRemovals, 0);
+        await scenario.verify(lifecycle.installationRoot, lifecycle.uninstallerPath);
+        const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+        assert.equal(receipt.inPlaceUninstallerResidueRemoved, false);
+        assert.equal(receipt.installRootAbsent, false);
+        // The boolean is the all-postconditions result; the fixed phase is
+        // the content-free evidence that the registry was already absent.
+        assert.equal(receipt.uninstallRegistryAbsent, false);
+        assert.equal(receipt.postUninstallPhase, "install_root_present");
+        assert.equal(receipt.cleanupConfirmed, false);
+        assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NSIS_LIFECYCLE_UNINSTALLER_RESIDUE_UNSAFE");
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
   }
 });
 
