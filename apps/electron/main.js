@@ -46,6 +46,8 @@ const DEFAULT_RESOURCE_ROOT = resolve(MODULE_DIRECTORY, "../..");
 const ELECTRON_SMOKE_CONTROL = "quit-v1";
 export const ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX =
   "TIBOTATTLE_ELECTRON_COMPANION_PROCESS ";
+export const ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX =
+  "TIBOTATTLE_ELECTRON_DASHBOARD_FAILURE ";
 export const MACOS_ELECTRON_LOCAL_QA_TEST_LANE =
   "macos-electron-local-qa-v1";
 const MACOS_ELECTRON_SMOKE_OBSERVE_MESSAGE_TYPE =
@@ -250,6 +252,31 @@ function isCompanionProcessLifecycleEvent(value) {
         || value.outcome === "signal_other");
 }
 
+function isDashboardFailureEvent(value) {
+  if (value === null
+      || typeof value !== "object"
+      || Array.isArray(value)
+      || Object.getPrototypeOf(value) !== Object.prototype
+      || Reflect.ownKeys(value).length !== 2
+      || !Object.hasOwn(value, "stage")
+      || !Object.hasOwn(value, "reason")) {
+    return false;
+  }
+  if (value.stage === "load_url" || value.stage === "did_fail_load") {
+    return value.reason === null
+      || Number.isInteger(value.reason) && value.reason >= -999 && value.reason <= -1;
+  }
+  return value.stage === "render_process_gone"
+    && (value.reason === "clean-exit"
+      || value.reason === "abnormal-exit"
+      || value.reason === "killed"
+      || value.reason === "crashed"
+      || value.reason === "oom"
+      || value.reason === "launch-failed"
+      || value.reason === "integrity-failure"
+      || value.reason === "unknown");
+}
+
 /**
  * Emit only fixed companion process lifecycle facts for the exact Linux
  * normal-candidate smoke control. This observer neither changes child
@@ -278,6 +305,39 @@ export function createLinuxSmokeCompanionProcessObserver({
     };
     try {
       writeDiagnostic(`${ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX}${JSON.stringify(value)}\n`);
+    } catch {
+      // Diagnostic delivery must never affect the normal desktop lifecycle.
+    }
+  };
+}
+
+/**
+ * Emit closed dashboard load failures from the exact Linux normal-candidate
+ * smoke control. The lifecycle reports at most one failure for a given
+ * dashboard window and remains solely responsible for recovery and shutdown.
+ */
+export function createLinuxSmokeDashboardFailureObserver({
+  environment = process.env,
+  platform = process.platform,
+  architecture = process.arch,
+  writeDiagnostic = process.stderr?.write?.bind(process.stderr),
+} = {}) {
+  if (environment === null || typeof environment !== "object"
+      || platform !== "linux"
+      || architecture !== "x64"
+      || environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL !== ELECTRON_SMOKE_CONTROL
+      || Object.hasOwn(environment, "USAGE_MONITOR_TEST_LANE")
+      || typeof writeDiagnostic !== "function") {
+    return undefined;
+  }
+  return (event) => {
+    if (!isDashboardFailureEvent(event)) return;
+    const value = {
+      stage: event.stage,
+      reason: event.reason,
+    };
+    try {
+      writeDiagnostic(`${ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX}${JSON.stringify(value)}\n`);
     } catch {
       // Diagnostic delivery must never affect the normal desktop lifecycle.
     }
@@ -821,6 +881,12 @@ export async function launchElectronShell({
       architecture: process.arch,
       writeDiagnostic,
     });
+    const linuxSmokeDashboardFailureObserver = createLinuxSmokeDashboardFailureObserver({
+      environment,
+      platform: process.platform,
+      architecture: process.arch,
+      writeDiagnostic,
+    });
     // readProductionDistribution has already validated the package-local
     // target against this process. Keep the fixed Linux handover dormant for
     // every development, rehearsal, test-lane, non-x64, and non-stable path.
@@ -881,6 +947,9 @@ export async function launchElectronShell({
         appName: productionDistribution !== null || !isPackagedElectronApp(app)
           ? "TiboTattle" : "TiboTattle Dev",
         ...lifecycleOptions,
+        ...(linuxSmokeDashboardFailureObserver === undefined ? {} : {
+          onDashboardLoadFailure: linuxSmokeDashboardFailureObserver,
+        }),
       },
       firstRunReceiptBackend,
       ownedDownloadsRegistry,

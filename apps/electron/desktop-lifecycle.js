@@ -66,6 +66,20 @@ const DASHBOARD_SECTIONS = Object.freeze([
   "community",
 ]);
 
+const RENDER_PROCESS_GONE_REASONS = new Set([
+  "clean-exit",
+  "abnormal-exit",
+  "killed",
+  "crashed",
+  "oom",
+  "launch-failed",
+  "integrity-failure",
+]);
+
+function chromiumFailureCode(value) {
+  return Number.isInteger(value) && value >= -999 && value <= -1 ? value : null;
+}
+
 function assertFunction(value, label) {
   if (typeof value !== "function") throw new TypeError(`${label} is required`);
 }
@@ -105,6 +119,7 @@ export function createDesktopLifecycle({
   singleInstanceLockAcquired = false,
   onDashboardReady,
   onDashboardInvalidated,
+  onDashboardLoadFailure,
   onDesktopStatus,
   desktopStatusMonitorOptions = {},
   openDashboardExternal,
@@ -139,6 +154,10 @@ export function createDesktopLifecycle({
   if (onDashboardInvalidated !== undefined
       && typeof onDashboardInvalidated !== "function") {
     throw new TypeError("onDashboardInvalidated must be a function");
+  }
+  if (onDashboardLoadFailure !== undefined
+      && typeof onDashboardLoadFailure !== "function") {
+    throw new TypeError("onDashboardLoadFailure must be a function");
   }
   if (openDashboardExternal !== undefined
       && typeof openDashboardExternal !== "function") {
@@ -864,8 +883,22 @@ export function createDesktopLifecycle({
     return true;
   }
 
-  function handleDashboardLoadFailure(state) {
+  function dashboardLoadFailure(stage, reason = null) {
+    return Object.freeze({
+      stage,
+      reason: stage === "render_process_gone"
+        ? RENDER_PROCESS_GONE_REASONS.has(reason) ? reason : "unknown"
+        : chromiumFailureCode(reason),
+    });
+  }
+
+  function handleDashboardLoadFailure(state, failure) {
     if (dashboardLoadState !== state || state.failed) return false;
+    try {
+      onDashboardLoadFailure?.(failure);
+    } catch {
+      // A fixed diagnostic callback must not change renderer recovery.
+    }
     settleDashboardLoadFailure(state);
     if (state.failureHandled || !started || startupInProgress || quitting) return true;
     state.failureHandled = true;
@@ -993,12 +1026,15 @@ export function createDesktopLifecycle({
       loadState.readyToShow = true;
       revealDashboardWhenLoaded(loadState);
     };
-    const onDidFailLoad = (_event, _errorCode, _errorDescription, _validatedURL, isMainFrame) => {
+    const onDidFailLoad = (_event, errorCode, _errorDescription, _validatedURL, isMainFrame) => {
       if (isMainFrame === false) return;
-      handleDashboardLoadFailure(loadState);
+      handleDashboardLoadFailure(loadState, dashboardLoadFailure("did_fail_load", errorCode));
     };
-    const onRenderProcessGone = () => {
-      handleDashboardLoadFailure(loadState);
+    const onRenderProcessGone = (_event, details) => {
+      handleDashboardLoadFailure(
+        loadState,
+        dashboardLoadFailure("render_process_gone", details?.reason),
+      );
     };
     window.once?.("ready-to-show", onReadyToShow);
     webContents?.on?.("did-fail-load", onDidFailLoad);
@@ -1020,8 +1056,8 @@ export function createDesktopLifecycle({
     let loadResult;
     try {
       loadResult = window.loadURL?.(`${ready.origin}/`);
-    } catch {
-      handleDashboardLoadFailure(loadState);
+    } catch (error) {
+      handleDashboardLoadFailure(loadState, dashboardLoadFailure("load_url", error?.errno));
       throw shellError("companion_spawn_failed");
     }
     Promise.resolve(loadResult).then(
@@ -1032,8 +1068,8 @@ export function createDesktopLifecycle({
         loadState.resolve();
         revealDashboardWhenLoaded(loadState);
       },
-      () => {
-        handleDashboardLoadFailure(loadState);
+      (error) => {
+        handleDashboardLoadFailure(loadState, dashboardLoadFailure("load_url", error?.errno));
       },
     );
     return window;

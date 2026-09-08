@@ -35,9 +35,11 @@ import {
   installWindowsSmokeControlForTest,
   launchElectronShell,
   createLinuxSmokeCompanionProcessObserver,
+  createLinuxSmokeDashboardFailureObserver,
   readAccountlessHostedRehearsal,
   readProductionDistribution,
   ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX,
+  ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX,
   MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
 } from "../main.js";
 import { createProductionDistributionMetadata } from "../desktop-updater.js";
@@ -1560,6 +1562,58 @@ test("Linux companion lifecycle diagnostic is scoped to the normal quit smoke ma
   assert.equal(writes.length, 2, "ordinary and non-Linux launches remain quiet");
 });
 
+test("Linux dashboard failure diagnostic is scoped to the normal quit smoke marker", () => {
+  const writes = [];
+  const observer = createLinuxSmokeDashboardFailureObserver({
+    environment: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1" },
+    platform: "linux",
+    architecture: "x64",
+    writeDiagnostic(value) { writes.push(value); },
+  });
+  assert.equal(typeof observer, "function");
+  observer({ stage: "load_url", reason: null });
+  observer({ stage: "did_fail_load", reason: -2 });
+  observer({ stage: "render_process_gone", reason: "crashed" });
+  observer({ stage: "did_fail_load", reason: 0 });
+  observer({ stage: "render_process_gone", reason: "private renderer detail" });
+  observer({ stage: "load_url", reason: null, private: "must-not-write" });
+  assert.deepEqual(writes, [
+    `${ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX}{"stage":"load_url","reason":null}\n`,
+    `${ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX}{"stage":"did_fail_load","reason":-2}\n`,
+    `${ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX}{"stage":"render_process_gone","reason":"crashed"}\n`,
+  ]);
+
+  const throwingObserver = createLinuxSmokeDashboardFailureObserver({
+    environment: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1" },
+    platform: "linux",
+    architecture: "x64",
+    writeDiagnostic() { throw new Error("synthetic diagnostic failure"); },
+  });
+  assert.doesNotThrow(() => throwingObserver({ stage: "load_url", reason: null }));
+
+  for (const options of [
+    { environment: {} },
+    { environment: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "other-v1" } },
+    {
+      environment: {
+        USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1",
+        USAGE_MONITOR_TEST_LANE: undefined,
+      },
+    },
+    { environment: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1" }, platform: "darwin" },
+    { environment: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1" }, architecture: "arm64" },
+  ]) {
+    const blocked = createLinuxSmokeDashboardFailureObserver({
+      platform: "linux",
+      architecture: "x64",
+      writeDiagnostic(value) { writes.push(value); },
+      ...options,
+    });
+    assert.equal(blocked, undefined);
+  }
+  assert.equal(writes.length, 3, "ordinary and non-Linux launches remain quiet");
+});
+
 test("platform gate leaves macOS/Linux available and refuses unqualified Windows readiness", () => {
   assert.deepEqual(assertElectronPlatformGate({ platform: "darwin", architecture: "arm64" }), {
     platform: "darwin",
@@ -2865,7 +2919,7 @@ test("desktop lifecycle settles a never-ending startup load after an exit and ke
   assert.equal(supervisor.stops, 3);
 });
 
-test("dashboard load rejection keeps startup in fixed recovery and a later Retry can succeed", async () => {
+test("dashboard load failure keeps startup in fixed recovery and a later Retry can succeed", async () => {
   const app = new FakeApp();
   const windows = [];
   const supervisor = {
@@ -2878,6 +2932,7 @@ test("dashboard load rejection keeps startup in fixed recovery and a later Retry
     async stop() {},
   };
   let rejectDashboard = true;
+  const dashboardFailures = [];
   class LoadFailWindow extends FakeWindow {
     constructor(options) {
       super(options);
@@ -2888,7 +2943,9 @@ test("dashboard load rejection keeps startup in fixed recovery and a later Retry
       this.loaded.push(url);
       if (url.endsWith("/") && rejectDashboard) {
         rejectDashboard = false;
-        return Promise.reject(new Error("private renderer load detail"));
+        throw Object.assign(new Error("private renderer load detail"), {
+          errno: -2,
+        });
       }
       return Promise.resolve();
     }
@@ -2901,6 +2958,9 @@ test("dashboard load rejection keeps startup in fixed recovery and a later Retry
     icon: "empty-icon",
     preloadPath: "/private/preload.cjs",
     supervisor,
+    onDashboardLoadFailure(value) {
+      dashboardFailures.push(value);
+    },
   });
 
   const initial = await lifecycle.start();
@@ -2912,6 +2972,8 @@ test("dashboard load rejection keeps startup in fixed recovery and a later Retry
   assert.equal(lifecycle.state.started, false);
   assert.equal(lifecycle.state.hasWindow, false);
   assert.equal(lifecycle.state.recoveryWindowVisible, true);
+  assert.deepEqual(dashboardFailures, [{ stage: "load_url", reason: -2 }]);
+  assert.equal(Object.isFrozen(dashboardFailures[0]), true);
   assert.equal(windows.filter((candidate) => candidate.options.show === false).at(-1).destroyed, true);
   assert.doesNotMatch(
     decodeURIComponent(windows.find((candidate) => candidate.options.show === true).loaded.at(-1)),
@@ -2949,6 +3011,7 @@ for (const failureEvent of ["did-fail-load", "render-process-gone"]) {
       }
     }
     let invalidations = 0;
+    const dashboardFailures = [];
     const lifecycle = createDesktopLifecycle({
       app,
       BrowserWindow: RuntimeFailWindow,
@@ -2959,6 +3022,9 @@ for (const failureEvent of ["did-fail-load", "render-process-gone"]) {
       supervisor,
       onDashboardInvalidated: () => {
         invalidations += 1;
+      },
+      onDashboardLoadFailure(value) {
+        dashboardFailures.push(value);
       },
     });
 
@@ -2990,6 +3056,11 @@ for (const failureEvent of ["did-fail-load", "render-process-gone"]) {
     assert.equal(lifecycle.state.hasWindow, false);
     assert.equal(lifecycle.state.origin, null);
     assert.equal(lifecycle.state.recoveryWindowVisible, true);
+    assert.deepEqual(dashboardFailures, [failureEvent === "did-fail-load"
+      ? { stage: "did_fail_load", reason: -2 }
+      : { stage: "render_process_gone", reason: "crashed" },
+    ]);
+    assert.equal(Object.isFrozen(dashboardFailures[0]), true);
 
     await withTestTimeout((async () => {
       while (supervisor.starts < 2 || !lifecycle.state.started) await nextTick();
@@ -2998,6 +3069,65 @@ for (const failureEvent of ["did-fail-load", "render-process-gone"]) {
     await lifecycle.dispose();
   });
 }
+
+test("dashboard failure diagnostic retains its first closed failure and ignores callback errors", async () => {
+  const app = new FakeApp();
+  const windows = [];
+  let rejectDashboardLoad;
+  const supervisor = {
+    setUnexpectedExitHandler() {},
+    async start() {
+      return { origin: "http://127.0.0.1:4079" };
+    },
+    async stop() {},
+  };
+  class DeferredDashboardWindow extends FakeWindow {
+    constructor(options) {
+      super(options);
+      windows.push(this);
+    }
+
+    loadURL(url) {
+      this.loaded.push(url);
+      return new Promise((_resolve, reject) => {
+        rejectDashboardLoad = reject;
+      });
+    }
+  }
+  const dashboardFailures = [];
+  const lifecycle = createDesktopLifecycle({
+    app,
+    BrowserWindow: DeferredDashboardWindow,
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    icon: "empty-icon",
+    preloadPath: "/private/preload.cjs",
+    supervisor,
+    onDashboardLoadFailure(value) {
+      dashboardFailures.push(value);
+      throw new Error("synthetic diagnostic failure");
+    },
+  });
+
+  const starting = lifecycle.start();
+  await nextTick();
+  const dashboard = dashboardWindowsForTest(windows)[0];
+  assert.notEqual(dashboard, undefined);
+  dashboard.webContents.emit("render-process-gone", {}, {
+    reason: "private renderer reason",
+  });
+  rejectDashboardLoad(Object.assign(new Error("private renderer load detail"), { errno: -2 }));
+
+  assert.deepEqual(await starting, {
+    status: "recovery",
+    origin: null,
+    failure: "companion_spawn_failed",
+  });
+  assert.deepEqual(dashboardFailures, [
+    { stage: "render_process_gone", reason: "unknown" },
+  ]);
+  await lifecycle.dispose();
+});
 
 for (const failureMode of ["loadURL", "did-fail-load", "render-process-gone"]) {
   test(`Settings ${failureMode} destroys the failed window and permits a fresh retry`, async () => {
