@@ -49,8 +49,10 @@ lane uses separate disposable homes for the absent passwd-home native test
 and packaged credential journey; its v2 receipt requires absent default state
 before the app and a verified protected tree afterward. All 32 focused
 composition/smoke tests and 52 packaging/native contracts pass locally (six
-expected native/optional skips), plus 78 release-trust tests. Native build and
-first-run execution remain pending. An owner-bit-masking umask deliberately
+expected native/optional skips), plus 78 release-trust tests. The first native run at `993a711b`,
+[run 34183824959](https://github.com/adamallcock/tibotattle/actions/runs/34183824959),
+catches one C++ call passing a string where a character pointer is required.
+That call is corrected; native build and first-run execution await the rerun. An owner-bit-masking umask deliberately
 fails closed and can leave a refused partial directory; the native child test
 verifies that edge without changing the parent umask. Production flags remain closed. Real installed desktop
 session, locked collection, lifecycle and updater evidence remains separate.

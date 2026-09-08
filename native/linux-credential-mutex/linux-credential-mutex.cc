@@ -423,7 +423,7 @@ int PrepareConfiguredStateBaseDirectory(const std::string& state_base) {
   if (!SplitNormalizedAbsolutePath(state_base, &parent, &leaf)) return -1;
   const int parent_fd = OpenSafeStateBaseParent(parent);
   if (parent_fd < 0) return -1;
-  const int base_fd = EnsureVerifiedDirectoryAt(parent_fd, leaf, false, true);
+  const int base_fd = EnsureVerifiedDirectoryAt(parent_fd, leaf.c_str(), false, true);
   const bool parent_closed = close(parent_fd) == 0;
   if (base_fd < 0 || !parent_closed) {
     if (base_fd >= 0) close(base_fd);
