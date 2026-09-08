@@ -320,9 +320,11 @@ test("Linux dormant production handover carries only fixed FD3 and observation r
   });
   const accountlessOptions = Object.freeze({ legacyCredentialProbe: () => "absent" });
   const accountlessCalls = [];
+  const preparationCalls = [];
   const handover = createLinuxProductionCredentialHandoverForTest({
     platform: "linux",
     architecture: "x64",
+    prepareState(options) { preparationCalls.push(options); },
     createAccountlessCredentialBackend(options) {
       accountlessCalls.push(options);
       return accountlessBackend;
@@ -344,6 +346,7 @@ test("Linux dormant production handover carries only fixed FD3 and observation r
     accountlessBackend,
   );
   assert.deepEqual(accountlessCalls, [accountlessOptions]);
+  assert.deepEqual(preparationCalls, [{ platform: "linux", architecture: "x64" }]);
 
   const supervisor = createCompanionSupervisor({
     command: process.execPath,
@@ -356,6 +359,10 @@ test("Linux dormant production handover carries only fixed FD3 and observation r
   try {
     await supervisor.start();
     assert.deepEqual(native.calls, ["read", "create", "read"]);
+    assert.deepEqual(preparationCalls, [
+      { platform: "linux", architecture: "x64" },
+      { platform: "linux", architecture: "x64" },
+    ]);
   } finally {
     try { await supervisor.stop(); } finally { native.dispose(); }
   }
@@ -372,6 +379,7 @@ test("Linux dormant production handover rejects non-Linux, non-x64, and injected
       () => createLinuxProductionCredentialHandoverForTest({
         platform: "linux",
         architecture: "x64",
+        prepareState() { factoryCalls += 1; },
         createAccountlessCredentialBackend() { factoryCalls += 1; },
         createAccountObservationCredentialBackend() { factoryCalls += 1; },
         ...overrides,

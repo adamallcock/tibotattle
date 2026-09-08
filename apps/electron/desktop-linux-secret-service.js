@@ -38,6 +38,7 @@ const LINUX_PRODUCTION_TEST_OPTION_KEYS = Object.freeze([
   "createAccountlessCredentialBackend",
   "createAccountObservationCredentialBackend",
   "platform",
+  "prepareState",
 ]);
 const TEST_OPTION_KEYS = Object.freeze([
   "qualificationContext",
@@ -189,20 +190,32 @@ function createLinuxProductionCredentialHandoverWithDependencies({
   architecture,
   createAccountlessCredentialBackend,
   createAccountObservationCredentialBackend,
+  prepareState,
 }) {
   if (platform !== "linux" || architecture !== "x64"
       || typeof createAccountlessCredentialBackend !== "function"
-      || typeof createAccountObservationCredentialBackend !== "function") {
+      || typeof createAccountObservationCredentialBackend !== "function"
+      || typeof prepareState !== "function") {
     fail();
   }
+  // The native fixed-record operations require their owner-only state tree to
+  // exist before their first read/create. Qualification previously prepared a
+  // separate disposable HOME, which does not prepare a normal app's fresh
+  // profile. Keep this in Electron's parent before either fixed production
+  // backend is constructed; the child still receives only its narrow broker.
+  const prepareCredentialState = () => prepareState({ platform, architecture });
   return Object.freeze({
     createAccountlessCredentialBackend(options) {
+      prepareCredentialState();
       return createAccountlessCredentialBackend(options);
     },
     attachLinuxAccountObservationBroker(channel) {
       return attachDesktopLinuxAccountObservationBroker({
         channel,
-        createBackend: createAccountObservationCredentialBackend,
+        createBackend() {
+          prepareCredentialState();
+          return createAccountObservationCredentialBackend();
+        },
       });
     },
   });
@@ -255,6 +268,7 @@ export function createLinuxProductionCredentialHandover() {
     architecture: process.arch,
     createAccountlessCredentialBackend: createDesktopLinuxAccountlessCredentialBackend,
     createAccountObservationCredentialBackend: createLinuxAccountObservationCredentialBackend,
+    prepareState: prepareLinuxCredentialState,
   });
 }
 
