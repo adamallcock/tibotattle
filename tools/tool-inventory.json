@@ -36,7 +36,7 @@
       "stableAlias": null,
       "stableAliasReason": "Private operation durability and local mutex support; not a standalone command.",
       "additionalAliases": [],
-      "callers": ["scripts/macos-release-journal.js", "scripts/release-agent.mjs", "apps/worker/scripts/production-deploy.mjs", "test/release-operation.test.js"],
+      "callers": ["scripts/macos-release-journal.js", "scripts/macos-release-core.js", "scripts/release-agent.mjs", "apps/worker/scripts/production-deploy.mjs", "apps/worker/scripts/production-deployment-lock.mjs", "apps/worker/scripts/production-deploy.check.mjs", "test/release-agent.test.js", "test/macos-release-journal.test.js", "test/release-operation.test.js"],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/runbooks/agent-release-operations.md",
       "provenanceReason": null,
@@ -803,6 +803,7 @@
       "stableAliasReason": "Internal Apple bundle-version grammar, migration epoch, and comparator shared by macOS release tools; it is not a standalone command.",
       "additionalAliases": [],
       "callers": [
+        "scripts/release-agent.mjs",
         "scripts/build-macos-app.js",
         "scripts/generate-sparkle-appcast.js",
         "scripts/macos-release-core.js",
@@ -824,6 +825,8 @@
       "stableAliasReason": "Shared release module is imported by macOS release commands and tests, not invoked directly.",
       "additionalAliases": [],
       "callers": [
+        "scripts/release-agent.mjs",
+        "test/macos-release-journal.test.js",
         "scripts/build-macos-app.js",
         "scripts/validate-macos-replacement.js",
         "scripts/package-macos-dmg.js",

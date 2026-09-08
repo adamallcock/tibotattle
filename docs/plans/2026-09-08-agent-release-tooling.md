@@ -2,7 +2,7 @@
 title: Agent release tooling implementation and follow-on plans
 date: 2026-09-08
 type: plan
-status: in-progress
+status: recommendations-1-3-implemented
 ---
 
 # Scope
@@ -36,7 +36,13 @@ not authorize signing, notarization, production writes or publication.
 - [x] Implement native phase resume and tests.
 - [x] Update maintained operational documentation.
 - [x] Write reviewable plans for recommendations 4–5.
-- [ ] Run owning checks and review the integrated diff.
+- [x] Run owning checks and review the integrated diff.
+
+Recommendations 1–3 are implemented locally; no external publication occurred.
+The [validation record](../reviews/2026-09-08-agent-release-tooling-validation.md)
+separates passing recovery/native/Worker checks from the pre-existing R7
+receipt mismatch. Recommendations 4–5 below remain planned, retaining this
+document as their implementation boundary.
 
 ## Follow-on 4: publication reconciliation
 
