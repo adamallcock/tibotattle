@@ -185,6 +185,15 @@ function rehearsalActions(sourceCommit) {
       ),
     }),
     Object.freeze({
+      kind: "admit_staging_v11_transport",
+      schemaVersion: "telemetry-contribution-v1.1",
+      expectedLifecycle: "staged",
+      temporaryLifecycle: "accepted",
+      requiredLiveRevision: "read immediately before mutation",
+      requiredPublication: false,
+      environment: "staging",
+    }),
+    Object.freeze({
       kind: "run_synthetic_hosted_client",
       command: command(
         "env",
@@ -205,6 +214,12 @@ function rehearsalActions(sourceCommit) {
         state: "contained",
         uploadRegistration: false,
       }),
+    }),
+    Object.freeze({
+      kind: "restore_staging_v11_transport",
+      schemaVersion: "telemetry-contribution-v1.1",
+      requiredLifecycle: "staged",
+      environment: "staging",
     }),
     Object.freeze({
       kind: "restore_checked_in_disabled_staging",

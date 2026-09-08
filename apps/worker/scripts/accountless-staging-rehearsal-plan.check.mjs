@@ -70,6 +70,14 @@ test("accountless hosted rehearsal plan fixes one origin and stays blocked befor
     (step) => step.kind === "run_synthetic_hosted_client",
   );
   assert.equal(hostedClient.proofScope, "hosted_client_only");
+  const kinds = plan.requiredRemoteActions.map((step) => step.kind);
+  const transportAdmission = plan.requiredRemoteActions.find((step) => step.kind === "admit_staging_v11_transport");
+  assert.equal(transportAdmission.expectedLifecycle, "staged");
+  assert.equal(transportAdmission.temporaryLifecycle, "accepted");
+  assert.equal(transportAdmission.requiredPublication, false);
+  assert.equal(kinds.indexOf("admit_staging_v11_transport") < kinds.indexOf("run_synthetic_hosted_client"), true);
+  assert.equal(kinds.indexOf("restore_containment") < kinds.indexOf("restore_staging_v11_transport"), true);
+  assert.equal(kinds.indexOf("restore_staging_v11_transport") < kinds.indexOf("restore_checked_in_disabled_staging"), true);
   assert.equal(JSON.stringify(plan).includes("ENVELOPE_PRIVATE_JWK='"), false);
 });
 
