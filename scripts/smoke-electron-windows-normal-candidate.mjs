@@ -861,19 +861,30 @@ function firewallRulePrelude() {
   return `${expectedAppPrelude()}$name=[Environment]::GetEnvironmentVariable('${FIREWALL_NAME_ENVIRONMENT}','Process');if($name -isnot [string] -or $name -notmatch '^${FIREWALL_RULE_PREFIX}[0-9a-f-]{36}$'){throw 'rule'};`;
 }
 
+// NetSecurity cmdlets use a CIM-backed provider. Use the public firewall COM
+// policy surface directly so the temporary candidate block does not depend on
+// that provider's startup path.
+function firewallPolicyPrelude() {
+  return `$policy=New-Object -ComObject HNetCfg.FwPolicy2;$rules=$policy.Rules;`;
+}
+
+function firewallRuleMatches() {
+  return `$ownedRules=@();foreach($candidate in $rules){if([string]::Equals([string]$candidate.Name,$name,[System.StringComparison]::Ordinal)){$ownedRules+=,$candidate}};`;
+}
+
 function firewallRuleOwnershipAssertion() {
-  return `$rules=@(Get-NetFirewallRule -Name $name -ErrorAction Stop);if($rules.Count -ne 1){throw 'rule'};$rule=$rules[0];if([string]$rule.Name -ne $name -or [string]$rule.Direction -ne 'Outbound' -or [string]$rule.Action -ne 'Block' -or [string]$rule.Enabled -ne 'True'){throw 'rule'};$filters=@(Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $rule -ErrorAction Stop);if($filters.Count -ne 1 -or -not [string]::Equals([System.IO.Path]::GetFullPath([string]$filters[0].Program),$expected,[System.StringComparison]::OrdinalIgnoreCase)){throw 'rule'};`;
+  return `${firewallRuleMatches()}if($ownedRules.Count -ne 1){throw 'rule'};$rule=$ownedRules[0];$program=[string]$rule.ApplicationName;if(-not [string]::Equals([string]$rule.Name,$name,[System.StringComparison]::Ordinal) -or [int]$rule.Direction -ne 2 -or [int]$rule.Action -ne 0 -or $rule.Enabled -ne $true -or [int64]$rule.Profiles -ne 2147483647 -or [int]$rule.Protocol -ne 256 -or [string]::IsNullOrWhiteSpace($program) -or -not [string]::Equals([System.IO.Path]::GetFullPath($program),$expected,[System.StringComparison]::OrdinalIgnoreCase)){throw 'rule'};`;
 }
 
 /** Build a fixed PowerShell command that creates and reads back one app-scoped outbound block. */
 export function buildWindowsNormalCandidateFirewallCreateArguments() {
-  const script = `$ErrorActionPreference='Stop';${firewallRulePrelude()}$existing=@(Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue);if($existing.Count -ne 0){throw 'dirty'};New-NetFirewallRule -Name $name -DisplayName $name -Direction Outbound -Action Block -Program $expected -Profile Any -Enabled True -ErrorAction Stop|Out-Null;${firewallRuleOwnershipAssertion()}[Console]::Out.Write('verified')`;
+  const script = `$ErrorActionPreference='Stop';${firewallRulePrelude()}${firewallPolicyPrelude()}${firewallRuleMatches()}if($ownedRules.Count -ne 0){throw 'dirty'};$rule=New-Object -ComObject HNetCfg.FWRule;$rule.Name=$name;$rule.Description=$name;$rule.ApplicationName=$expected;$rule.Direction=2;$rule.Action=0;$rule.Protocol=256;$rule.Profiles=2147483647;$rule.Enabled=$true;$rules.Add($rule);${firewallRuleOwnershipAssertion()}[Console]::Out.Write('verified')`;
   return Object.freeze(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]);
 }
 
 /** Build a fixed PowerShell command that removes and rechecks only this runner's firewall rule. */
 export function buildWindowsNormalCandidateFirewallRemoveArguments() {
-  const script = `$ErrorActionPreference='Stop';${firewallRulePrelude()}${firewallRuleOwnershipAssertion()}Remove-NetFirewallRule -Name $name -ErrorAction Stop;$remaining=@(Get-NetFirewallRule -Name $name -ErrorAction SilentlyContinue);if($remaining.Count -ne 0){throw 'rule'};[Console]::Out.Write('removed')`;
+  const script = `$ErrorActionPreference='Stop';${firewallRulePrelude()}${firewallPolicyPrelude()}${firewallRuleOwnershipAssertion()}$rules.Remove($name);${firewallRuleMatches()}if($ownedRules.Count -ne 0){throw 'rule'};[Console]::Out.Write('removed')`;
   return Object.freeze(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script]);
 }
 

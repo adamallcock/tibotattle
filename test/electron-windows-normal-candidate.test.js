@@ -527,7 +527,7 @@ test("normal candidate launcher keeps only the private profile, unified mode, an
   }
 });
 
-test("normal candidate firewall scripts use only fixed child environment values and recheck ownership before removal", () => {
+test("normal candidate firewall scripts use the direct COM policy and recheck exact ownership before removal", () => {
   const create = buildWindowsNormalCandidateFirewallCreateArguments();
   const remove = buildWindowsNormalCandidateFirewallRemoveArguments();
   assert.equal(create.length, 5);
@@ -535,13 +535,26 @@ test("normal candidate firewall scripts use only fixed child environment values 
   for (const command of [create[4], remove[4]]) {
     assert.match(command, /USAGE_MONITOR_WINDOWS_NORMAL_CANDIDATE_APP/u);
     assert.match(command, /USAGE_MONITOR_WINDOWS_NORMAL_CANDIDATE_FIREWALL_RULE/u);
-    assert.match(command, /Get-NetFirewallApplicationFilter/u);
+    assert.match(command, /HNetCfg\.FwPolicy2/u);
     assert.doesNotMatch(command, /C:\\candidate|tibotattle-normal-candidate-550e/u);
+    assert.doesNotMatch(command, /(?:Get|New|Remove)-NetFirewall|CimSession/u);
   }
-  assert.match(create[4], /-Direction Outbound -Action Block/u);
-  assert.ok(remove[4].indexOf("Get-NetFirewallApplicationFilter") < remove[4].indexOf("Remove-NetFirewallRule"));
-  assert.match(remove[4], /\$rule\.Name -ne \$name/u);
-  assert.match(remove[4], /\$filters\.Count -ne 1/u);
+  assert.match(create[4], /HNetCfg\.FWRule/u);
+  assert.match(create[4], /\$rule\.ApplicationName=\$expected/u);
+  assert.match(create[4], /\$rule\.Direction=2/u);
+  assert.match(create[4], /\$rule\.Action=0/u);
+  assert.match(create[4], /\$rule\.Protocol=256/u);
+  assert.match(create[4], /\$rule\.Profiles=2147483647/u);
+  assert.match(create[4], /\$rule\.Enabled=\$true/u);
+  assert.match(create[4], /\$rules\.Add\(\$rule\)/u);
+  assert.match(create[4], /\[int\]\$rule\.Direction -ne 2/u);
+  assert.match(create[4], /\[int\]\$rule\.Action -ne 0/u);
+  assert.match(create[4], /\[int64\]\$rule\.Profiles -ne 2147483647/u);
+  assert.match(create[4], /\[int\]\$rule\.Protocol -ne 256/u);
+  assert.ok(remove[4].indexOf("$rules.Remove($name)") > remove[4].indexOf("$ownedRules.Count -ne 1"));
+  assert.match(remove[4], /\$ownedRules\.Count -ne 0/u);
+  assert.doesNotMatch(create[4], /\$matches/u);
+  assert.doesNotMatch(remove[4], /\$matches/u);
 });
 
 test("normal candidate firewall setup and cleanup use their dedicated bounded budget", async () => {
@@ -726,11 +739,16 @@ test("normal candidate runner retains the outbound block and profile when proces
 
 test("normal candidate refuses to launch before the outbound block is verified", async () => {
   let launched = false;
+  let firewallCalls = 0;
   let receipt = null;
   await assert.rejects(runWindowsNormalCandidateSmoke(smokeOptions(), {
     platform: "win32",
     architecture: "x64",
-    environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: String.raw`C:\runner\temp` },
+    environment: {
+      GITHUB_ACTIONS: "true",
+      RUNNER_TEMP: String.raw`C:\runner\temp`,
+      SystemRoot: String.raw`C:\Windows`,
+    },
     ensureReceiptParent: async () => {},
     reserveReceipt: async () => ({
       writeFile: async (value) => { receipt = JSON.parse(value); },
@@ -742,11 +760,18 @@ test("normal candidate refuses to launch before the outbound block is verified",
     prepareProfile: async () => ({ root: String.raw`C:\runner\temp\owned\profile` }),
     seedProfile: async () => ({ shareBackend: {} }),
     assertProcessAbsence: async () => true,
-    installFirewall: async () => {
-      throw Object.assign(new Error("firewall"), {
-        code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_FIREWALL_UNAVAILABLE",
-      });
-    },
+    installFirewall: (options) => installOutboundFirewallBlock({
+      ...options,
+      runProgram: async () => {
+        firewallCalls += 1;
+        return Object.freeze({
+          settled: true,
+          timedOut: false,
+          exitCode: 0,
+          output: "unverified",
+        });
+      },
+    }),
     launchJourney: async () => {
       launched = true;
       return passedJourney();
@@ -757,6 +782,7 @@ test("normal candidate refuses to launch before the outbound block is verified",
   }), {
     code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_FIREWALL_UNAVAILABLE",
   });
+  assert.equal(firewallCalls, 1);
   assert.equal(launched, false);
   assert.equal(receipt.outboundFirewallRuleVerified, false);
   assert.equal(receipt.packagedElectronExecutionVerified, false);
