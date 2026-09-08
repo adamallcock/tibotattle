@@ -44,6 +44,22 @@ const UUID_PATTERN =
 const MAXIMUM_BINDING_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_MANIFEST_BYTES = 1 * 1024 * 1024;
 const MAXIMUM_RUNTIME_PAYLOAD_BYTES = 512 * 1024 * 1024;
+const QUALIFICATION_PROFILE_PATHS = Object.freeze([
+  Object.freeze(["TEMP", "tmp"]),
+  Object.freeze(["TMP", "tmp"]),
+  Object.freeze(["TMPDIR", "tmp"]),
+  Object.freeze(["USERPROFILE", "home"]),
+  Object.freeze(["HOME", "home"]),
+  Object.freeze(["APPDATA", "appdata"]),
+  Object.freeze(["LOCALAPPDATA", "localappdata"]),
+  Object.freeze(["CODEX_HOME", "codex"]),
+  Object.freeze(["CLAUDE_CONFIG_DIR", "claude"]),
+  Object.freeze(["XDG_CONFIG_HOME", "config"]),
+  Object.freeze(["XDG_DATA_HOME", "data"]),
+  Object.freeze(["XDG_CACHE_HOME", "cache"]),
+  Object.freeze(["XDG_RUNTIME_DIR", "runtime"]),
+  Object.freeze(["USAGE_MONITOR_STATE_ROOT", "state"]),
+]);
 const RUNTIME_INVENTORY_KINDS = new Set([
   "companion_source",
   "electron_shell",
@@ -118,6 +134,75 @@ function exactObjectKeys(value, keys) {
     && !Array.isArray(value)
     && JSON.stringify(Object.keys(value).sort(comparePathBytes))
       === JSON.stringify([...keys].sort(comparePathBytes));
+}
+
+function normalizeWindowsProfilePath(value) {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    fail("ACCOUNTLESS_PROFILE_INVALID");
+  }
+  const raw = value.replaceAll("/", "\\");
+  if (!/^[A-Za-z]:\\/u.test(raw) || raw.startsWith("\\\\")) {
+    fail("ACCOUNTLESS_PROFILE_INVALID");
+  }
+  const root = win32.parse(raw).root;
+  const components = raw.slice(root.length).split("\\");
+  if (components.some((component) => component === "." || component === "..")) {
+    fail("ACCOUNTLESS_PROFILE_INVALID");
+  }
+  let normalized;
+  try {
+    normalized = win32.normalize(raw);
+  } catch {
+    fail("ACCOUNTLESS_PROFILE_INVALID");
+  }
+  if (!win32.isAbsolute(normalized)
+      || !/^[A-Za-z]:\\/u.test(normalized)
+      || normalized === win32.parse(normalized).root
+      || normalized.endsWith("\\")) {
+    fail("ACCOUNTLESS_PROFILE_INVALID");
+  }
+  return normalized;
+}
+
+function sameWindowsProfilePath(left, right) {
+  return left.toLowerCase() === right.toLowerCase();
+}
+
+/**
+ * The standard qualification launcher owns a fixed disposable profile layout.
+ * Do not infer a broader root from an arbitrary parent path: every profile
+ * value must first prove the launcher's exact sibling layout. The returned
+ * object is used only to construct a private platform context; the Electron
+ * process environment itself remains unchanged.
+ */
+function accountlessQualificationEnvironment(environment) {
+  if (environment === null || typeof environment !== "object"
+      || Array.isArray(environment)) {
+    fail("ACCOUNTLESS_PROFILE_INVALID");
+  }
+  if (!Object.hasOwn(environment, "TEMP")) fail("ACCOUNTLESS_PROFILE_INVALID");
+  const temporaryPath = normalizeWindowsProfilePath(environment.TEMP);
+  if (win32.basename(temporaryPath).toLowerCase() !== "tmp") {
+    fail("ACCOUNTLESS_PROFILE_INVALID");
+  }
+  const profileRoot = win32.dirname(temporaryPath);
+  if (profileRoot === win32.parse(profileRoot).root) {
+    fail("ACCOUNTLESS_PROFILE_INVALID");
+  }
+  for (const [key, child] of QUALIFICATION_PROFILE_PATHS) {
+    if (!Object.hasOwn(environment, key)) fail("ACCOUNTLESS_PROFILE_INVALID");
+    const value = normalizeWindowsProfilePath(environment[key]);
+    if (!sameWindowsProfilePath(value, win32.join(profileRoot, child))) {
+      fail("ACCOUNTLESS_PROFILE_INVALID");
+    }
+  }
+  return Object.freeze({
+    ...environment,
+    // Windows qualification requires all disposable paths below TEMP. The
+    // normal launcher intentionally keeps its tmp and state siblings; bind a
+    // separate, private context to the verified profile root instead.
+    TEMP: profileRoot,
+  });
 }
 
 function packagedResourcePath(appPath, relativePath, { unpacked = false } = {}) {
@@ -611,9 +696,18 @@ export async function runWindowsElectronQualificationCredentialCommandForTest({
  * production credential route or accepts a caller-controlled root, secret,
  * binding, capability, or origin.
  */
-export async function createWindowsElectronQualificationAccountlessCredentialBackend(options = {}) {
+async function createWindowsElectronQualificationAccountlessCredentialBackendWithDependencies(options, {
+  createAdapter = createWindowsFilesystemAdapter,
+  createQualificationContext = createWindowsQualificationModeContext,
+  createDesktopBackend = null,
+} = {}) {
   try {
     if (!exactObjectKeys(options, ["context", "environment", "runId"])) {
+      fail("ACCOUNTLESS_BACKEND_INVALID");
+    }
+    if (typeof createAdapter !== "function"
+        || typeof createQualificationContext !== "function"
+        || (createDesktopBackend !== null && typeof createDesktopBackend !== "function")) {
       fail("ACCOUNTLESS_BACKEND_INVALID");
     }
     const { context, environment, runId } = options;
@@ -623,24 +717,25 @@ export async function createWindowsElectronQualificationAccountlessCredentialBac
       architecture: WINDOWS_BINDING_ARCHITECTURE,
     });
     const selectedRunId = validateWindowsElectronQualificationRunId(runId);
-    const adapter = createWindowsFilesystemAdapter({
+    const privateEnvironment = accountlessQualificationEnvironment(environment);
+    const adapter = createAdapter({
       platform: WINDOWS_BINDING_PLATFORM,
       architecture: WINDOWS_BINDING_ARCHITECTURE,
     });
-    const windowsQualificationModeContext = createWindowsQualificationModeContext({
+    const windowsQualificationModeContext = createQualificationContext({
       platform: WINDOWS_BINDING_PLATFORM,
       architecture: WINDOWS_BINDING_ARCHITECTURE,
       adapter,
-      environment,
+      environment: privateEnvironment,
       resourceRoot: context.resourceRoot,
     });
-    const { createDesktopWindowsAccountlessCredentialBackend } = await import(
+    const selectedCreateDesktopBackend = createDesktopBackend ?? (await import(
       "./desktop-windows-accountless-credential.js"
-    );
-    if (typeof createDesktopWindowsAccountlessCredentialBackend !== "function") {
+    )).createDesktopWindowsAccountlessCredentialBackend;
+    if (typeof selectedCreateDesktopBackend !== "function") {
       fail("ACCOUNTLESS_BACKEND_INVALID");
     }
-    return createDesktopWindowsAccountlessCredentialBackend({
+    return selectedCreateDesktopBackend({
       platform: WINDOWS_BINDING_PLATFORM,
       architecture: WINDOWS_BINDING_ARCHITECTURE,
       adapter,
@@ -655,6 +750,26 @@ export async function createWindowsElectronQualificationAccountlessCredentialBac
   } catch {
     fail("ACCOUNTLESS_BACKEND_UNAVAILABLE");
   }
+}
+
+export async function createWindowsElectronQualificationAccountlessCredentialBackend(options = {}) {
+  return createWindowsElectronQualificationAccountlessCredentialBackendWithDependencies(options);
+}
+
+/** Dependency-injected seam for the packaged qualification composition test. */
+export async function createWindowsElectronQualificationAccountlessCredentialBackendForTest(
+  options = {},
+  dependencies = {},
+) {
+  return createWindowsElectronQualificationAccountlessCredentialBackendWithDependencies(
+    options,
+    dependencies,
+  );
+}
+
+/** Expose the fixed profile derivation for the Windows launcher contract test. */
+export function accountlessQualificationEnvironmentForTest(environment) {
+  return accountlessQualificationEnvironment(environment);
 }
 
 /** Run the existing random-namespace probe against the exact packaged keytar. */

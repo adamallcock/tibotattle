@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { resolve } from "node:path";
+import {
+  mkdtemp,
+  rm,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import {
   parseWindowsAccountlessSmokeArguments,
@@ -10,6 +15,13 @@ import {
   observeWindowsSmokeStderr,
   prepareWindowsAccountlessSmokeFirstRunAcknowledgementForTest,
 } from "../scripts/smoke-electron-windows-accountless.mjs";
+import {
+  buildWindowsDevelopmentLaunchSpec,
+  prepareWindowsDevelopmentProfile,
+} from "../scripts/launch-electron-windows-development.mjs";
+import {
+  accountlessQualificationEnvironmentForTest,
+} from "../apps/electron/windows-qualification.js";
 
 const type = "windows-electron-smoke-v1";
 const state = { type, message: "state-v1", started: true, primary: true, window: true, visible: true, tray: true };
@@ -140,6 +152,31 @@ test("Windows smoke prepares and readbacks only the fixed first-run receipt in i
     acknowledged: true,
   });
   assert.deepEqual(calls[5], ["load"]);
+});
+
+test("Windows accountless factory derives its private context from the actual launcher profile", {
+  skip: process.platform !== "win32",
+}, async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-accountless-profile-"));
+  try {
+    const appPath = join(root, "candidate", "TiboTattle Dev.exe");
+    const profile = await prepareWindowsDevelopmentProfile({
+      appPath,
+      profilePath: join(root, "profile"),
+    });
+    const spec = buildWindowsDevelopmentLaunchSpec({ appPath, profile });
+    const privateEnvironment = accountlessQualificationEnvironmentForTest(
+      spec.options.env,
+    );
+    assert.equal(spec.options.env.TEMP, profile.tmp);
+    assert.equal(privateEnvironment.TEMP, profile.root);
+    assert.equal(privateEnvironment.USAGE_MONITOR_STATE_ROOT, profile.state);
+    assert.equal(privateEnvironment.USERPROFILE, profile.home);
+    assert.equal(privateEnvironment.CODEX_HOME, profile.codex);
+    assert.notEqual(privateEnvironment, spec.options.env);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Windows smoke refuses an unauthenticated first-run context before it writes a receipt", async () => {

@@ -46,8 +46,10 @@ import {
   assertElectronPlatformGate,
 } from "../platform-gate.js";
 import {
+  accountlessQualificationEnvironmentForTest,
   assertWindowsElectronQualificationContext,
   createWindowsElectronQualificationAccountlessCredentialBackend,
+  createWindowsElectronQualificationAccountlessCredentialBackendForTest,
   createWindowsElectronQualificationContext,
   runWindowsElectronQualificationCredentialCommandForTest,
 } from "../windows-qualification.js";
@@ -64,9 +66,11 @@ import {
   parseCompanionReadyLine,
 } from "../ready-line.js";
 import {
+  createWindowsQualificationModeContext,
   WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS,
 } from "../../../src/platform/windows-qualification-mode.js";
 import {
+  createWindowsFilesystemAdapter,
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../../../src/platform/windows-filesystem.js";
 import {
@@ -97,6 +101,62 @@ function syntheticWindowsFilesystemBinding() {
       WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS.map((method) => [method, () => undefined]),
     ),
   };
+}
+
+const WINDOWS_QUALIFICATION_IDENTITY = Object.freeze({
+  volumeSerialNumber: "0000000000000001",
+  fileId: "00112233445566778899aabbccddeeff",
+  linkCount: 1,
+});
+
+function qualificationFilesystemAdapter() {
+  const bindingBytes = Buffer.from("synthetic Windows qualification binding\n");
+  const binding = {
+    ...syntheticWindowsFilesystemBinding(),
+    inspectPath() {
+      return {
+        identity: WINDOWS_QUALIFICATION_IDENTITY,
+        isDirectory: true,
+        isRegularFile: false,
+        isReparsePoint: false,
+        finalPathResolved: true,
+      };
+    },
+  };
+  return createWindowsFilesystemAdapter({
+    platform: "win32",
+    architecture: "x64",
+    bindingPath: "C:\\qualification\\native\\windows-filesystem\\build\\Release\\windows_filesystem.node",
+    resolveBinding: (path) => path,
+    readManifest: () => JSON.stringify(createWindowsFilesystemBindingManifest({
+      bytes: bindingBytes,
+      binding,
+    })),
+    readBindingBytes: () => bindingBytes,
+    requireBinding: () => binding,
+  });
+}
+
+function qualificationProfileEnvironment(root = "C:\\qualification-profile") {
+  return Object.freeze({
+    USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-v1",
+    USAGE_MONITOR_TEST_LANE: "windows-electron-smoke",
+    USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
+    TEMP: `${root}\\tmp`,
+    TMP: `${root}\\tmp`,
+    TMPDIR: `${root}\\tmp`,
+    USERPROFILE: `${root}\\home`,
+    HOME: `${root}\\home`,
+    APPDATA: `${root}\\appdata`,
+    LOCALAPPDATA: `${root}\\localappdata`,
+    CODEX_HOME: `${root}\\codex`,
+    CLAUDE_CONFIG_DIR: `${root}\\claude`,
+    XDG_CONFIG_HOME: `${root}\\config`,
+    XDG_DATA_HOME: `${root}\\data`,
+    XDG_CACHE_HOME: `${root}\\cache`,
+    XDG_RUNTIME_DIR: `${root}\\runtime`,
+    USAGE_MONITOR_STATE_ROOT: `${root}\\state`,
+  });
 }
 
 function nextTick() {
@@ -1184,6 +1244,84 @@ test("Windows accountless smoke bridge accepts no caller-selected root or creden
         runId: "550e8400-e29b-41d4-a716-446655440000",
         rootPath: "C:\\caller-controlled",
       }),
+      /Windows Electron qualification is unavailable/u,
+    );
+  });
+});
+
+test("Windows accountless factory derives a private platform context from the authenticated launcher profile", async () => {
+  await withWindowsQualificationFixture(async ({ context }) => {
+    const environment = qualificationProfileEnvironment();
+    const backend = Object.freeze({
+      async read() { return null; },
+      async createIfMissing() { return "created"; },
+      async deleteExact() { return "deleted"; },
+    });
+    let createdAdapter = null;
+    let desktopOptions = null;
+    const result = await createWindowsElectronQualificationAccountlessCredentialBackendForTest({
+      context,
+      environment,
+      runId: "550e8400-e29b-41d4-a716-446655440000",
+    }, {
+      createAdapter(options) {
+        assert.deepEqual(options, { platform: "win32", architecture: "x64" });
+        createdAdapter = qualificationFilesystemAdapter();
+        return createdAdapter;
+      },
+      createQualificationContext: (options) => {
+        assert.equal(options.environment.TEMP, "C:\\qualification-profile");
+        assert.equal(options.environment.USAGE_MONITOR_STATE_ROOT,
+          "C:\\qualification-profile\\state");
+        assert.equal(environment.TEMP, "C:\\qualification-profile\\tmp");
+        return createWindowsQualificationModeContext(options);
+      },
+      createDesktopBackend(options) {
+        desktopOptions = options;
+        return backend;
+      },
+    });
+
+    assert.equal(result, backend);
+    assert.equal(desktopOptions.adapter, createdAdapter);
+    assert.equal(desktopOptions.rootPath,
+      "C:\\qualification-profile\\state\\accountless-fd3-smoke-v1\\550e8400-e29b-41d4-a716-446655440000");
+    assert.equal(desktopOptions.windowsQualificationModeContext.tempRoot,
+      "C:\\qualification-profile");
+    assert.equal(desktopOptions.windowsQualificationModeContext.stateRoot,
+      "C:\\qualification-profile\\state");
+  });
+});
+
+test("Windows accountless factory refuses a profile whose state is not in the fixed launcher layout", async () => {
+  await withWindowsQualificationFixture(async ({ context }) => {
+    const environment = {
+      ...qualificationProfileEnvironment(),
+      USAGE_MONITOR_STATE_ROOT: "C:\\other-profile\\state",
+    };
+    let adapterCalls = 0;
+    await assert.rejects(
+      createWindowsElectronQualificationAccountlessCredentialBackendForTest({
+        context,
+        environment,
+        runId: "550e8400-e29b-41d4-a716-446655440000",
+      }, {
+        createAdapter() {
+          adapterCalls += 1;
+          return qualificationFilesystemAdapter();
+        },
+        createQualificationContext: createWindowsQualificationModeContext,
+        createDesktopBackend: () => ({
+          read: async () => null,
+          createIfMissing: async () => "created",
+          deleteExact: async () => "deleted",
+        }),
+      }),
+      /Windows Electron qualification is unavailable/u,
+    );
+    assert.equal(adapterCalls, 0);
+    assert.throws(
+      () => accountlessQualificationEnvironmentForTest(environment),
       /Windows Electron qualification is unavailable/u,
     );
   });
