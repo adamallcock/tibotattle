@@ -654,6 +654,39 @@ const MAX_ACTIVE_REVIEW_AUTHORIZATIONS = 8;
 const DIAGNOSTICS_LOG_FILE_NAME = "diagnostics-v0.1.log";
 export const LOCAL_DIAGNOSTIC_NOTE_SCHEMA_VERSION =
   "local-diagnostic-note-v0.1";
+// Startup notes are minted by this server only. They are deliberately not part
+// of DIAGNOSTIC_SURFACES, which remains the closed vocabulary for caller POSTs.
+export const LOCAL_STARTUP_DIAGNOSTIC_STEPS = Object.freeze([
+  "data_store",
+  "contribution_start",
+]);
+export const LOCAL_STARTUP_DIAGNOSTIC_DETAILS = Object.freeze([
+  "codex_speed_baseline_unavailable",
+  "collector_invalid_size",
+  "collector_unavailable",
+  "local_collector_projection_aborted",
+  "local_collector_projection_worker_failed",
+  "local_collector_state_corrupt",
+  "local_collector_state_migration_busy",
+  "local_collector_state_schema_invalid",
+  "local_collector_state_unavailable",
+  "local_companion_snapshot_reload_aborted",
+  "local_unified_companion_projection_aborted",
+  "local_unified_companion_projection_worker_failed",
+  "local_unified_index_file_changed",
+  "local_unified_index_generation_mismatch",
+  "local_unified_index_missing",
+  "local_unified_index_schema_invalid",
+  "local_unified_index_schema_newer",
+  "local_unified_index_tool_attestation_mismatch",
+  "local_unified_index_unavailable",
+  "local_unified_index_worker_failed",
+  "snapshot_invalid",
+  "snapshot_unavailable",
+  "syntax_error",
+  "type_error",
+  "unexpected_error",
+]);
 export const LOCAL_CONTRIBUTION_DIAGNOSTICS_SCHEMA_VERSION =
   "local-contribution-diagnostics-v0.1";
 export const LOCAL_CONTRIBUTION_DEVICE_RESET_VERSION =
@@ -662,6 +695,12 @@ export const LOCAL_CONTRIBUTION_DEVICE_DISCONNECT_VERSION =
   "local-contribution-device-disconnect-v0.1";
 const MAX_DIAGNOSTICS_LOG_BYTES = 256 * 1024;
 const DIAGNOSTIC_REFERENCE = /^TT-[0-9A-HJKMNP-TV-Z]{6}$/u;
+const DIAGNOSTIC_REFERENCE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+const LOCAL_STARTUP_DIAGNOSTIC_DETAIL_SET = new Set(
+  LOCAL_STARTUP_DIAGNOSTIC_DETAILS,
+);
+const LOCAL_STARTUP_DIAGNOSTIC_SURFACE = "local_startup";
+const LOCAL_STARTUP_DIAGNOSTIC_CODE = "snapshot_unavailable";
 // Fixed journey names. Anything else is refused, so no free-form label can
 // ever be written to the log.
 const DIAGNOSTIC_SURFACES = new Set([
@@ -701,6 +740,23 @@ const CONTRIBUTION_DEVICE_KEYCHAIN_CAPABILITY =
 const CONTRIBUTION_DEVICE_APP_KEYCHAIN_CAPABILITY =
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.contributionDeviceApp;
 const MAX_CONTRIBUTION_DEVICE_STATE_BYTES = 512;
+
+function createLocalStartupDiagnosticReference() {
+  let reference = "TT-";
+  for (const byte of randomBytes(6)) {
+    reference += DIAGNOSTIC_REFERENCE_ALPHABET[byte & 0b11111];
+  }
+  return reference;
+}
+
+function localStartupDiagnosticDetail(error) {
+  if (LOCAL_STARTUP_DIAGNOSTIC_DETAIL_SET.has(error?.code)) {
+    return error.code;
+  }
+  if (error instanceof TypeError) return "type_error";
+  if (error instanceof SyntaxError) return "syntax_error";
+  return "unexpected_error";
+}
 
 function developmentIdentityConfigurationError() {
   const error = new TypeError(
@@ -3119,6 +3175,7 @@ function createPreparedLocalCompanionServer({
   contributionDeviceCredentialAttributeDelete = null,
   contributionDeviceDisconnectRunner = null,
   diagnosticNoteRecorder = null,
+  diagnosticReferenceFactory = createLocalStartupDiagnosticReference,
   clock = () => Date.now(),
   hostedSignInHandoffController = null,
   contributionSyncNextProvider = null,
@@ -3263,6 +3320,7 @@ function createPreparedLocalCompanionServer({
   if (typeof diagnosticsLogFile !== "string"
       || diagnosticsLogFile.length < 1
       || typeof clock !== "function"
+      || typeof diagnosticReferenceFactory !== "function"
       || (diagnosticNoteRecorder !== null
         && typeof diagnosticNoteRecorder !== "function")) {
     throw new TypeError("local diagnostics controls are invalid");
@@ -3950,6 +4008,7 @@ function createPreparedLocalCompanionServer({
   const buildSnapshot = () => {
     if (snapshotPromise === null) {
       snapshotPromise = (async () => {
+        let startupStep = "data_store";
         try {
           // Publish the bounded startup projection first. The store retains
           // validated prior evidence with its provenance; the normal refresh
@@ -3958,6 +4017,7 @@ function createPreparedLocalCompanionServer({
           // Contribution transport is optional and cannot take local analysis
           // down. The closed accountless production profile starts only its
           // FD3-backed scheduler; legacy scheduling remains absent there.
+          startupStep = "contribution_start";
           if (contributionRuntimeShutdown === null) {
             contributionRuntimeStart = Promise.resolve().then(async () => {
               if (contributionRuntimeShutdown !== null) return;
@@ -3989,6 +4049,22 @@ function createPreparedLocalCompanionServer({
               : "snapshot_unavailable",
           };
           announceSnapshotOutcome();
+          try {
+            const reference = diagnosticReferenceFactory();
+            if (DIAGNOSTIC_REFERENCE.test(reference)) {
+              await recordDiagnosticNote({
+                reference,
+                surface: LOCAL_STARTUP_DIAGNOSTIC_SURFACE,
+                code: LOCAL_STARTUP_DIAGNOSTIC_CODE,
+                requestId: "",
+                step: startupStep,
+                detail: localStartupDiagnosticDetail(error),
+              });
+            }
+          } catch {
+            // Failure retention is best-effort. It cannot change the startup
+            // error or skip its normal contribution-runtime teardown.
+          }
           await shutdownContributionRuntime().catch(() => {});
           throw error;
         }

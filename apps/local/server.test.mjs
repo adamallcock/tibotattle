@@ -78,6 +78,8 @@ import {
   createCentralOutboundFetch,
   createLocalCompanionServer,
   LOCAL_COMPANION_INCREMENTAL_REFRESH_TIMEOUT_MS,
+  LOCAL_STARTUP_DIAGNOSTIC_DETAILS,
+  LOCAL_STARTUP_DIAGNOSTIC_STEPS,
   localCompanionRefreshTimeoutForUnifiedIndex,
   resolveClaudeDesktopShadowConfiguration,
   startLocalCompanionServer,
@@ -1599,6 +1601,177 @@ test("one state root cannot run concurrently while the retirement lock is held",
   } finally {
     await restarted?.close();
     await first?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a startup snapshot failure files one content-free server diagnostic note", async () => {
+  const files = await fixture();
+  const diagnosticsLogFile = join(files.stateRoot, "diagnostics-v0.1.log");
+  const privateMessage = "private startup detail /Users/example/session.jsonl";
+  const initializationError = new Error(privateMessage);
+  initializationError.code = "private_startup_detail";
+  let app;
+  try {
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: {
+        ...fakeStore(),
+        async initialize() {
+          throw initializationError;
+        },
+      },
+      refreshRunner: async () => ({}),
+      diagnosticsLogFile,
+      diagnosticReferenceFactory: () => "TT-4HJ7M2",
+      clock: () => Date.parse("2026-09-08T14:30:00.000Z"),
+      port: 0,
+    });
+
+    await assert.rejects(
+      app.snapshotReady,
+      (error) => error === initializationError,
+    );
+    const recorded = await readFile(diagnosticsLogFile, "utf8");
+    assert.equal(recorded.includes(privateMessage), false);
+    assert.equal(recorded.includes(initializationError.code), false);
+    assert.deepEqual(
+      recorded.trimEnd().split("\n").map((line) => JSON.parse(line)),
+      [{
+        schemaVersion: "local-diagnostic-note-v0.1",
+        recordedAt: "2026-09-08T14:30:00.000Z",
+        reference: "TT-4HJ7M2",
+        surface: "local_startup",
+        code: "snapshot_unavailable",
+        requestId: "",
+        step: "data_store",
+        detail: "unexpected_error",
+      }],
+    );
+    assert.deepEqual(LOCAL_STARTUP_DIAGNOSTIC_STEPS, [
+      "data_store",
+      "contribution_start",
+    ]);
+    assert.equal(
+      LOCAL_STARTUP_DIAGNOSTIC_DETAILS.includes(
+        "local_collector_state_migration_busy",
+      ),
+      true,
+    );
+    assert.equal(
+      LOCAL_STARTUP_DIAGNOSTIC_DETAILS.includes("unexpected_error"),
+      true,
+    );
+  } finally {
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a failed startup diagnostic recorder preserves the original error and shutdown", async () => {
+  const files = await fixture();
+  const initializationError = new Error("private source startup failure");
+  initializationError.code = "collector_invalid_size";
+  let recorderCalls = 0;
+  let stopCalls = 0;
+  let app;
+  const incrementalContributionController = {
+    async start() {},
+    async stop() {
+      stopCalls += 1;
+    },
+    async inspect() {
+      return {};
+    },
+    async approve() {
+      return {};
+    },
+    async resume() {
+      return {};
+    },
+    async pauseForDeviceDisconnect() {
+      return {};
+    },
+    async pauseForDeviceRepair() {
+      return {};
+    },
+    async resumeAfterDeviceRepair() {
+      return {};
+    },
+  };
+  try {
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: {
+        ...fakeStore(),
+        async initialize() {
+          throw initializationError;
+        },
+      },
+      refreshRunner: async () => ({}),
+      diagnosticReferenceFactory: () => "TT-4HJ7M2",
+      diagnosticNoteRecorder: async (note) => {
+        recorderCalls += 1;
+        assert.deepEqual(note, {
+          reference: "TT-4HJ7M2",
+          surface: "local_startup",
+          code: "snapshot_unavailable",
+          requestId: "",
+          step: "data_store",
+          detail: "collector_invalid_size",
+        });
+        throw new Error("private recorder failure");
+      },
+      incrementalContributionController,
+      port: 0,
+    });
+
+    await assert.rejects(
+      app.snapshotReady,
+      (error) => error === initializationError,
+    );
+    assert.equal(recorderCalls, 1);
+    assert.equal(stopCalls, 1);
+    assert.deepEqual(app.snapshotStatus(), {
+      status: "failed",
+      errorCode: "collector_invalid_size",
+    });
+  } finally {
+    await app?.close();
+    await rm(files.root, { recursive: true });
+  }
+});
+
+test("a successful startup does not mint or file a startup diagnostic note", async () => {
+  const files = await fixture();
+  let app;
+  try {
+    app = await startLocalCompanionServer({
+      resourceRoot: files.resourceRoot,
+      stateRoot: files.stateRoot,
+      codexHome: files.codexHome,
+      staticRoot: files.staticRoot,
+      dataStore: fakeStore(),
+      refreshRunner: async () => ({}),
+      diagnosticReferenceFactory: () => {
+        throw new Error("startup diagnostic reference must not be minted");
+      },
+      diagnosticNoteRecorder: async () => {
+        throw new Error("startup diagnostic note must not be recorded");
+      },
+      port: 0,
+    });
+
+    await app.snapshotReady;
+    assert.deepEqual(app.snapshotStatus(), { status: "ready", errorCode: null });
+  } finally {
+    await app?.close();
     await rm(files.root, { recursive: true });
   }
 });
@@ -4839,6 +5012,8 @@ test("diagnostic notes are bounded, fixed-vocabulary, and land in a local log", 
     // masquerading as a code, or an extra member can never be logged.
     for (const invalid of [
       { ...note, surface: "arbitrary_journey" },
+      // Server-minted startup evidence is never a dashboard-selectable route.
+      { ...note, surface: "local_startup" },
       { ...note, reference: "TT-ILLEGAL" },
       { ...note, reference: "not-a-reference" },
       { ...note, code: "Failed reading /Users/private/state.json" },
