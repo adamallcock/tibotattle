@@ -28,11 +28,11 @@ one. The Mac daily-use tester is available; that is not full cutover readiness.
    backup matches all original files. Repair and rebuild this exact blocker,
    then resume data/choice preservation, single ownership, startup and
    credential continuity checks.
-2. Finish the Linux native deadline fixture and the integrated disposable
-   Windows installer journey. Observation creation/recovery now passes; the
-   latest failures remain in the Linux deadline child and Windows process
-   inspection. Diagnose and rerun these observed failures, then complete
+2. Finish the integrated disposable Windows installer journey, then complete
    required production credential/trust composition and installed updates.
+   Linux's packaged native credential journey now passes, including its read
+   deadline. Windows process inspection now passes; its next observed failure
+   occurs during the first installed launch after installation and byte checks.
 3. Complete one authorized hosted contribution rehearsal and explicit
    accountless public-sample/overlapping-history decisions. Preserve accepted
    automatic-sharing and persistent opt-out behavior throughout.
@@ -47,7 +47,19 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest four-target results: `45d5ec15` in
+Latest four-target results: `a648cf2b` in
+[run 34222727976](https://github.com/adamallcock/tibotattle/actions/runs/34222727976)
+passes both Mac jobs and the complete Linux job. The Linux packaged Secret
+Service gate now passes its real native read deadline and cleanup. Windows
+passes both process probes, native contracts, packaging and packaged credential
+journeys. Its NSIS receipt proves installation and the first installed-byte
+check, then records failure during the first launch before a completed launch
+is counted. Cleanup ran the uninstaller, but its two postconditions remain
+false. Preserve those separate failures and add a closed phase diagnostic to
+identify the first-launch cause. Production composition and installed updates
+are not qualified by these development checks.
+
+The preceding four-target results: `45d5ec15` in
 [run 34219167483](https://github.com/adamallcock/tibotattle/actions/runs/34219167483)
 passes both Mac builds, including the real startup-verifier regression. Windows
 still times out in both the exact-executable and Toolhelp native probes, before
@@ -63,14 +75,14 @@ create diagnostic cannot satisfy it. Both original failures and logs remain
 retained. Neither installed Windows lifecycle nor the full Linux credential
 journey is qualified.
 
-The next native rerun includes the fixed system PowerShell module path and
+The `a648cf2b` native rerun includes the fixed system PowerShell module path and
 explicit Utility import used by both Windows process probes. Linux now runs
 its original read against the standard no-response test service on a new
 private D-Bus session, verifies the spawned service owner's PID, and measures
 the native read separately from fixture setup and cleanup. The read must still
 fail as unavailable after at least four seconds and before nine seconds.
-The combined local contracts pass 61 tests, with eight native-only exclusions;
-these repairs await native CI and do not qualify either installed journey.
+The combined local contracts pass 61 tests, with eight native-only exclusions.
+Native CI now passes these repaired prerequisites as described above.
 
 The preceding four-target results: `611200c7` in
 [run 34215345667](https://github.com/adamallcock/tibotattle/actions/runs/34215345667)
