@@ -28,6 +28,7 @@ import {
   createWindowsNormalCandidateQuitProtocol,
   installOutboundFirewallBlock,
   jsonFetch,
+  localNetworkObserver,
   removeOutboundFirewallBlock,
   parseWindowsNormalCandidateSmokeArguments,
   prepareWindowsNormalCandidateProfile,
@@ -53,6 +54,32 @@ const STAGED_APP_PATH = String.raw`C:\candidate\app`;
 const SOURCE_CANDIDATE_PATH = String.raw`C:\candidate\production-source-candidate.json`;
 const RECEIPT_PATH = String.raw`C:\workspace\.release-build\electron-windows-normal-candidate\normal-candidate-smoke.json`;
 const FIREWALL_RULE = "tibotattle-normal-candidate-550e8400-e29b-41d4-a716-446655440000";
+
+test("normal Windows refresh observer counts detailed and returning-profile quick requests", () => {
+  const handlers = new Map();
+  const observer = localNetworkObserver({
+    on(name, handler) { handlers.set(name, handler); return () => handlers.delete(name); },
+  }, "http://127.0.0.1:12345");
+  const emit = (path, method = "POST") => handlers.get("Network.requestWillBeSent")({
+    request: { url: `http://127.0.0.1:12345${path}`, method },
+  });
+  emit("/api/local/refresh");
+  assert.equal(observer.refreshCount(), 1);
+  observer.resetRefreshes();
+  emit("/api/local/refresh/quick");
+  assert.equal(observer.refreshCount(), 1);
+  emit("/api/local/refresh", "GET");
+  emit("/api/local/refresh/cancel");
+  emit("/api/local/refresh/quick-extra");
+  assert.equal(observer.refreshCount(), 1);
+  handlers.get("Network.requestWillBeSent")({ request: {
+    url: "http://127.0.0.1:54321/api/local/refresh/quick", method: "POST",
+  } });
+  assert.equal(observer.refreshCount(), 1);
+  assert.equal(observer.valid(), false);
+  observer.dispose();
+  assert.equal(handlers.size, 0);
+});
 
 test("normal candidate loopback requests refuse redirects and bound response waits", async () => {
   let options;

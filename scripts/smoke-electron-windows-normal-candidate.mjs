@@ -1397,7 +1397,7 @@ async function connectCdp(target, {
   });
 }
 
-function localNetworkObserver(cdp, dashboardOrigin) {
+export function localNetworkObserver(cdp, dashboardOrigin) {
   let invalid = false;
   let refreshes = 0;
   const inspect = (url, method = null) => {
@@ -1411,7 +1411,10 @@ function localNetworkObserver(cdp, dashboardOrigin) {
         && parsed.origin !== dashboardOrigin) {
       invalid = true;
     }
-    if (method === "POST" && parsed.origin === dashboardOrigin && parsed.pathname === "/api/local/refresh") {
+    // Returning profiles use the quick route once a validated projection is
+    // available. Both routes share the same guarded controller and receipt.
+    if (method === "POST" && parsed.origin === dashboardOrigin
+        && ["/api/local/refresh", "/api/local/refresh/quick"].includes(parsed.pathname)) {
       refreshes += 1;
     }
   };
