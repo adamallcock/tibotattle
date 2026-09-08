@@ -290,6 +290,28 @@ async function digestRegularFile(path, options = {}) {
   }
 }
 
+async function digestPhysicalAsar(path, {
+  digest = digestRegularFile,
+  electronProcess = process,
+} = {}) {
+  let originalNoAsar;
+  try {
+    originalNoAsar = electronProcess?.noAsar;
+  } catch {
+    throw new Error("Electron ASAR mode is unreadable");
+  }
+  if (typeof originalNoAsar !== "boolean") return digest(path);
+  let restore = false;
+  try {
+    restore = true;
+    electronProcess.noAsar = true;
+    if (electronProcess.noAsar !== true) throw new Error("Electron ASAR mode is not writable");
+    return await digest(path);
+  } finally {
+    if (restore) electronProcess.noAsar = originalNoAsar;
+  }
+}
+
 async function readSafeJson(path) {
   await safeRegularFile(path, { maxBytes: MAX_PACKAGE_RECEIPT_BYTES });
   let bytes;
@@ -765,6 +787,7 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
   electronVersion = process.versions.electron,
   canonicalize = realpath,
   digest = digestRegularFile,
+  electronProcess = process,
   startDaemon = startLinuxSecretServiceDaemon,
   importModule = (url) => import(url),
 } = {}) {
@@ -786,7 +809,10 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
     canonicalize,
   }));
   const asarPath = join(dirname(options.appPath), "resources", "app.asar");
-  const artifact = await innerStage("ARTIFACT_IDENTITY_FAILED", () => digest(asarPath));
+  const artifact = await innerStage("ARTIFACT_IDENTITY_FAILED", () => digestPhysicalAsar(asarPath, {
+    digest,
+    electronProcess,
+  }));
   if (artifact?.sha256 !== options.artifactSha256) fail("ARTIFACT_IDENTITY_FAILED");
 
   // This is the authoritative isolation proof: it verifies the reviewed

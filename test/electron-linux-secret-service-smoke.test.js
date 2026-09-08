@@ -183,6 +183,15 @@ test("Linux packaged smoke verifies the exact staged/archive/unpacked union befo
 
 test("packaged Electron creates the isolated context only after the default-proof seam starts the daemon", async () => {
   const calls = [];
+  const asarModeChanges = [];
+  let noAsar = false;
+  const electronProcess = {
+    get noAsar() { return noAsar; },
+    set noAsar(value) {
+      asarModeChanges.push(value);
+      noAsar = value;
+    },
+  };
   const result = await runLinuxPackagedSecretServiceSmokeInside({
     appPath: APP,
     sourceRevision: REVISION,
@@ -193,8 +202,10 @@ test("packaged Electron creates the isolated context only after the default-proo
     executable: APP,
     environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    electronProcess,
     async canonicalize(path) { return path; },
     async digest(path) {
+      assert.equal(noAsar, true);
       calls.push(["digest", path]);
       return ASAR;
     },
@@ -232,6 +243,8 @@ test("packaged Electron creates the isolated context only after the default-proo
   assert.equal(context.credentialStoreMode, "isolated-secret-service");
   assert.equal(context.artifactDigest, ARTIFACT);
   assert.equal(context.developmentOnly, true);
+  assert.deepEqual(asarModeChanges, [true, false]);
+  assert.equal(noAsar, false);
 });
 
 test("packaged Electron emits bounded runtime and isolation stage failures before context construction", async () => {
@@ -314,6 +327,39 @@ test("packaged Electron emits bounded module and native round-trip stage failure
       };
     },
   }), smokeError("NATIVE_ROUND_TRIP_FAILED"));
+});
+
+test("packaged Electron restores ASAR mode after a physical archive digest failure", async () => {
+  let noAsar = false;
+  const changes = [];
+  const electronProcess = {
+    get noAsar() { return noAsar; },
+    set noAsar(value) {
+      changes.push(value);
+      noAsar = value;
+    },
+  };
+  await assert.rejects(runLinuxPackagedSecretServiceSmokeInside({
+    appPath: APP,
+    sourceRevision: REVISION,
+    artifactSha256: ARTIFACT,
+  }, {
+    platform: "linux",
+    architecture: "x64",
+    executable: APP,
+    environment: { ELECTRON_RUN_AS_NODE: "1" },
+    electronVersion: "43.2.0",
+    electronProcess,
+    async canonicalize(path) { return path; },
+    async digest() {
+      assert.equal(noAsar, true);
+      throw new Error("private-archive-read-detail");
+    },
+    startDaemon() { assert.fail("archive digest failure must precede daemon startup"); },
+    async importModule() { assert.fail("archive digest failure must precede module loading"); },
+  }), smokeError("ARTIFACT_IDENTITY_FAILED"));
+  assert.deepEqual(changes, [true, false]);
+  assert.equal(noAsar, false);
 });
 
 class SessionChild extends EventEmitter {
