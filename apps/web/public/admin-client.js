@@ -215,8 +215,12 @@ export function projectAdminReconstructionProgress(value) {
   const nullableTime = value => value === null ? null : timestamp(value);
   const nullableCount = value => value === null ? null : count(value, code);
   const nullableEnum = (value, values) => value === null ? null : enumValue(value, new Set(values), code);
-  const progress = closed(value, ["schemaVersion", "generatedAt", "publication", "work", "history"]);
-  if (progress.schemaVersion !== 1) invalid(code);
+  const candidate = record(value, code);
+  if (candidate.schemaVersion !== 1 && candidate.schemaVersion !== 2) invalid(code);
+  const progress = closed(candidate, [
+    "schemaVersion", "generatedAt", "publication", "work", "history",
+    ...(candidate.schemaVersion === 2 ? ["preparation"] : []),
+  ]);
   const publication = closed(progress.publication, [
     "state", "requestedGeneration", "preparedGeneration", "publishedGeneration", "publishedAt",
   ]);
@@ -245,8 +249,27 @@ export function projectAdminReconstructionProgress(value) {
       || projectedHistory.resolvedDays > projectedHistory.requiredDays
       || (projectedHistory.completeAccounts !== null && projectedHistory.requiredAccounts !== null
         && projectedHistory.completeAccounts > projectedHistory.requiredAccounts)) invalid(code);
+  let preparation = null;
+  if (progress.schemaVersion === 2 && progress.preparation !== null) {
+    const source = closed(progress.preparation, [
+      "trackedDays", "completeDays", "buildingDays", "retiringDays", "checkpointSteps",
+      "quotaObservations", "usageEvents",
+    ]);
+    preparation = Object.freeze({
+      trackedDays: count(source.trackedDays, code),
+      completeDays: count(source.completeDays, code),
+      buildingDays: count(source.buildingDays, code),
+      retiringDays: count(source.retiringDays, code),
+      checkpointSteps: count(source.checkpointSteps, code),
+      quotaObservations: count(source.quotaObservations, code),
+      usageEvents: count(source.usageEvents, code),
+    });
+    if (preparation.trackedDays > 10_000
+        || preparation.completeDays + preparation.buildingDays + preparation.retiringDays
+          !== preparation.trackedDays) invalid(code);
+  }
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: progress.schemaVersion,
     generatedAt: timestamp(progress.generatedAt),
     publication: projectedPublication,
     work: Object.freeze({
@@ -257,6 +280,7 @@ export function projectAdminReconstructionProgress(value) {
       restartReason: nullableEnum(work.restartReason, ["input_changed", "lease_expired", "method_changed", "retry"]),
     }),
     history: projectedHistory,
+    ...(progress.schemaVersion === 2 ? { preparation } : {}),
   });
 }
 

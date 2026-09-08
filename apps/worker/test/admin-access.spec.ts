@@ -464,7 +464,7 @@ describe("admin surface hostname gating", () => {
     });
   });
 
-  it("serves closed read-only progress only to the Access owner and rejects query fields", async () => {
+  it("serves closed read-only progress only to the Access owner and negotiates exact preparation detail", async () => {
     const token = await signedAccessJwt();
     const response = await handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/reconstruction-progress`, {
       headers: { "cf-access-jwt-assertion": token },
@@ -473,10 +473,23 @@ describe("admin surface hostname gating", () => {
     expect(response.headers.get("cache-control")).toBe("no-store");
     await expect(response.json()).resolves.toMatchObject({ schemaVersion: 1,
       publication: { publishedGeneration: null }, history: { resolvedDays: 0 } });
-    const badQuery = await handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/reconstruction-progress?participantId=private`, {
+    const detail = await handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/reconstruction-progress?detail=preparation`, {
       headers: { "cf-access-jwt-assertion": token },
     }), adminSurfaceBindings());
-    expect(badQuery.status).toBe(400);
+    expect(detail.status).toBe(200);
+    expect(detail.headers.get("cache-control")).toBe("no-store");
+    await expect(detail.json()).resolves.toMatchObject({ schemaVersion: 2, preparation: {
+      trackedDays: 0, completeDays: 0, buildingDays: 0, retiringDays: 0, checkpointSteps: 0,
+      quotaObservations: 0, usageEvents: 0,
+    } });
+    for (const query of ["participantId=private", "detail=raw", "detail=preparation&extra=1", "detail=preparation&detail=preparation"]) {
+      const badQuery = await handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/reconstruction-progress?${query}`, {
+        headers: { "cf-access-jwt-assertion": token },
+      }), adminSurfaceBindings());
+      expect(badQuery.status, query).toBe(400);
+    }
+    expect((await handleRequest(new Request(`${PUBLIC_ORIGIN}/api/v1/admin/reconstruction-progress?detail=preparation`),
+      adminSurfaceBindings())).status).toBe(404);
     const wrongOwner = await handleRequest(new Request(`${ADMIN_ORIGIN}/api/v1/admin/reconstruction-progress`, {
       headers: { "cf-access-jwt-assertion": await signedAccessJwt({ email: "other@example.test" }) },
     }), adminSurfaceBindings());

@@ -129,6 +129,54 @@ test("generation progress projects a closed, dated aggregate contract with expli
   assert.deepEqual(projectAdminReconstructionProgress(payload), payload);
 });
 
+test("preparation progress accepts the exact v2 aggregate extension without changing legacy v1", async () => {
+  const legacy = await fixture("admin-reconstruction-progress-valid.json");
+  assert.equal(Object.hasOwn(projectAdminReconstructionProgress(legacy), "preparation"), false);
+  const payload = await fixture("admin-reconstruction-preparation-valid.json");
+  const projected = projectAdminReconstructionProgress(payload);
+  assert.deepEqual(projected, payload);
+  assert.equal(Object.isFrozen(projected.preparation), true);
+  assert.deepEqual(projected.history, legacy.history, "source days are not a replacement history denominator");
+  payload.preparation = null;
+  assert.equal(projectAdminReconstructionProgress(payload).preparation, null);
+  payload.preparation = {
+    trackedDays: 0, completeDays: 0, buildingDays: 0, retiringDays: 0,
+    checkpointSteps: 0, quotaObservations: 0, usageEvents: 0,
+  };
+  assert.deepEqual(projectAdminReconstructionProgress(payload).preparation, payload.preparation);
+  payload.preparation.trackedDays = 10_000;
+  payload.preparation.completeDays = 10_000;
+  payload.preparation.checkpointSteps = Number.MAX_SAFE_INTEGER;
+  assert.deepEqual(projectAdminReconstructionProgress(payload).preparation, payload.preparation);
+});
+
+test("preparation progress rejects cross-version fields, unknown fields, invalid counters and inconsistent day totals", async () => {
+  const payload = await fixture("admin-reconstruction-preparation-valid.json");
+  const mutations = [
+    value => { value.schemaVersion = 1; },
+    value => { value.schemaVersion = 3; },
+    value => { delete value.preparation; },
+    value => { value.preparation = []; },
+    value => { value.participantId = "synthetic-unexpected"; },
+    value => { value.preparation.participantId = "synthetic-unexpected"; },
+    value => { value.preparation.trackedDays = 10_001; value.preparation.completeDays = 9_997; },
+    value => { value.preparation.completeDays += 1; },
+    value => { value.preparation.buildingDays += 1; },
+    value => { value.preparation.retiringDays += 1; },
+  ];
+  for (const key of Object.keys(payload.preparation)) {
+    mutations.push(value => { delete value.preparation[key]; });
+    for (const invalidCount of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, Infinity, NaN, "1", null]) {
+      mutations.push(value => { value.preparation[key] = invalidCount; });
+    }
+  }
+  for (const mutate of mutations) {
+    const invalid = structuredClone(payload);
+    mutate(invalid);
+    assert.throws(() => projectAdminReconstructionProgress(invalid), error => error.code === "ADMIN_RECONSTRUCTION_PROGRESS_INVALID");
+  }
+});
+
 function reconstructionPayload() {
   return {
     schemaVersion: "admin-reconstruction-progress-v0.1",

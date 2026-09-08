@@ -137,10 +137,16 @@ graph. It is not permission to retain a graph after a confirmed invalidation.
 The owner-only `GET /api/v1/admin/reconstruction-progress` returns the closed
 metadata contract (`schemaVersion: 1`): requested, prepared and
 published generations; current phase/trigger; and resolved/required historical
-days. Unknown counts stay null. It is read-only, disallows query parameters and
-returns no account IDs or raw evidence. The owner UI polls progress and each
-graph independently with non-overlapping requests every 15 seconds, so a slow
-graph read cannot conceal progress. Access loss clears private state.
+days. The exact optional query `detail=preparation` negotiates schema version 2
+with retained source-day counts, saved preparation steps and prepared quota/usage
+counts. Its single metadata query reads at most 10,001 heads; over-limit,
+unsafe or unavailable counts return null, not an invented total. These are
+retained reusable inputs, not a remaining-work denominator. All other query
+fields and repeated selectors are rejected. Both versions are read-only and
+return no account IDs or raw evidence. The owner UI uses independent,
+non-overlapping reads with a 15-second timeout; automatic polling respects the
+existing user-selected cadence and pauses while hidden/offline. A slow graph
+read cannot conceal progress. Access loss clears private state.
 
 The owner explicitly approved dollar estimates and sample counts even when
 based on one account. This can reveal that contributor's estimated capacity;

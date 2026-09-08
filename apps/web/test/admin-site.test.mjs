@@ -11,7 +11,7 @@ const fixture = async (name) => JSON.parse(await readFile(
 ));
 const ADMIN_READ_PATHS = [
   "/api/v1/admin/overview", "/api/v1/admin/community/allowance-preview",
-  "/api/v1/admin/metrics/history", "/api/v1/admin/reconstruction-progress",
+  "/api/v1/admin/metrics/history", "/api/v1/admin/reconstruction-progress?detail=preparation",
 ];
 
 function metricsHistoryPayload() {
@@ -455,6 +455,91 @@ test("progress refreshes remain independent, retain observed work on errors, and
     assert.match(reconstructionText(documentRef), /52 of 69 days resolved/u);
     assert.match(reconstructionText(documentRef), /prepared: 42/u);
     assert.doesNotMatch(reconstructionText(documentRef), /Progress refresh unavailable/u);
+  });
+});
+
+test("reusable source preparation advances before account completion without changing the selected refresh cadence", async () => {
+  const progress = await fixture("admin-reconstruction-preparation-valid.json");
+  const overview = await fixture("admin-overview-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  await withAdminPage(async path => {
+    if (path === ADMIN_READ_PATHS[0]) return response(overview);
+    if (path === ADMIN_READ_PATHS[1]) return response(preview);
+    if (path === ADMIN_READ_PATHS[3]) return response(structuredClone(progress));
+    return unavailableResponse();
+  }, async (documentRef, preferences) => {
+    const graph = documentRef.byId.get("admin-community-allowance-result").querySelector('svg[role="img"]');
+    assert.ok(graph);
+    const refresh = documentRef.byId.get("auto-refresh-minutes");
+    refresh.value = "5";
+    refresh.listeners.get("change")();
+    const text = reconstructionText(documentRef);
+    assert.match(text, /Reusable source preparation 12 of 16 tracked source days complete/u);
+    assert.match(text, /3 building · 1 retiring/u);
+    assert.match(text, /432 saved checkpoint steps · 72,040 quota observations processed · 31,980 usage events processed/u);
+    assert.match(text, /Source days span retained work, not the remaining historical window/u);
+    assert.match(text, /Preparation can advance before account completion/u);
+    assert.match(text, /Counts can change when work is replaced or retired/u);
+    progress.preparation.completeDays = 13;
+    progress.preparation.buildingDays = 2;
+    progress.preparation.checkpointSteps = 512;
+    progress.preparation.quotaObservations = 75104;
+    progress.preparation.usageEvents = 32300;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    const updated = reconstructionText(documentRef);
+    assert.match(updated, /13 of 16 tracked source days complete/u);
+    assert.match(updated, /512 saved checkpoint steps · 75,104 quota observations processed · 32,300 usage events processed/u);
+    assert.match(updated, /51 of 69 days resolved/u);
+    assert.match(updated, /8 of 15 account calculations complete/u);
+    assert.doesNotMatch(updated, /ETA|\d+%|15 seconds/u);
+    assert.equal(refresh.value, "5");
+    assert.equal(preferences.get("tibotattle-admin-auto-refresh-minutes-v1"), "5");
+    assert.equal(documentRef.byId.get("admin-community-allowance-result").querySelector('svg[role="img"]'), graph);
+  });
+});
+
+test("failed or malformed preparation reads retain observed progress and the published graph", async () => {
+  const progress = await fixture("admin-reconstruction-preparation-valid.json");
+  const overview = await fixture("admin-overview-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  let progressReply = () => response(progress);
+  await withAdminPage(async path => {
+    if (path === ADMIN_READ_PATHS[0]) return response(overview);
+    if (path === ADMIN_READ_PATHS[1]) return response(preview);
+    if (path === ADMIN_READ_PATHS[3]) return progressReply();
+    return unavailableResponse();
+  }, async documentRef => {
+    const graph = documentRef.byId.get("admin-community-allowance-result").querySelector('svg[role="img"]');
+    const malformed = structuredClone(progress);
+    malformed.preparation.retiringDays = -1;
+    for (const next of [() => unavailableResponse(), () => response(malformed)]) {
+      progressReply = next;
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      assert.match(reconstructionText(documentRef), /Progress refresh unavailable/u);
+      assert.match(reconstructionText(documentRef), /12 of 16 tracked source days complete/u);
+      assert.match(reconstructionText(documentRef), /432 saved checkpoint steps/u);
+      assert.ok(reconstructionText(documentRef).includes(formatReportingTime(progress.generatedAt)));
+      assert.equal(documentRef.byId.get("admin-community-allowance-result").querySelector('svg[role="img"]'), graph);
+    }
+    progressReply = () => response(progress);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.doesNotMatch(reconstructionText(documentRef), /Progress refresh unavailable/u);
+  });
+});
+
+test("bounded or unavailable preparation counts stay unknown and legacy progress needs no preparation section", async () => {
+  const progress = await fixture("admin-reconstruction-preparation-valid.json");
+  progress.preparation = null;
+  let progressReply = () => response(progress);
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[3] ? progressReply() : unavailableResponse(), async documentRef => {
+    assert.match(reconstructionText(documentRef), /Reusable source preparation Preparation counters unavailable/u);
+    assert.match(reconstructionText(documentRef), /unavailable or exceed the display limit; they are not zero/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /tracked source days complete|saved checkpoint steps|0 of 0/u);
+    const legacy = await fixture("admin-reconstruction-progress-valid.json");
+    progressReply = () => response(legacy);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.match(reconstructionText(documentRef), /51 of 69 days resolved/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /Reusable source preparation|Preparation counters/u);
   });
 });
 

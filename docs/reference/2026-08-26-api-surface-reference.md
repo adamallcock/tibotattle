@@ -336,7 +336,7 @@ Authority vocabulary:
 | `GET` | `/api/v1/admin/overview` | Admin | Read owner operations state, bounded optional distribution integrations, and failure-isolated reconstruction progress; no calculation on refresh |
 | `GET` | `/api/v1/admin/metrics/history` | Admin | Read cached owner metrics history |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin | Preview the cached owner-only allowance merge without publishing it |
-| `GET` | `/api/v1/admin/reconstruction-progress` | Admin | Read bounded, content-free refresh and publication progress without advancing calculations |
+| `GET` | `/api/v1/admin/reconstruction-progress` | Admin | Read bounded, content-free refresh and publication progress without advancing calculations; exact optional `detail=preparation` adds a capped retained-input census as version 2, while query-free version 1 is unchanged |
 | `POST` | `/api/v1/admin/action` | Admin | Run an allowlisted operations action; explicit owner participant erasure is a task of `run_maintenance`, not a new action or route |
 | `POST` | `/api/v1/me/security-reset` | Session | Rotate participant recovery and session authority |
 | `POST` | `/api/v1/me/device-pairings` | Session | Mint a one-use pairing code for a local collector |

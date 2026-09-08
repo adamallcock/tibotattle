@@ -155,9 +155,22 @@ requested, prepared and published generations, exact historical date/account
 completion, recorded trigger/restart reason and observation time. Unknown
 counts stay null; it never estimates an unmeasured completion time. This GET
 does not start work. Overview, allowance, growth and progress use independent
-15-second, single-flight browser request lanes. Temporary storage/network
-failure preserves the prior validated graph; confirmed invalidation or lost
-owner access clears it. Growth snapshots have no age-only read expiry.
+single-flight browser request lanes with a 15-second request timeout, not a
+15-second polling interval. Automatic polling retains the owner's existing
+cadence and pauses when hidden/offline. Temporary storage/network failure
+preserves the prior validated graph; confirmed invalidation or lost owner
+access clears it. Growth snapshots have no age-only read expiry.
+
+The admin client requests `?detail=preparation` for the backward-compatible
+version-2 progress view. Query-free version 1 remains unchanged. Retained
+prepared-source metadata shows completed/building/retiring days, saved steps,
+quota observations and usage events. Preparation can advance before a legacy
+account checkpoint resumes, so a fixed account-completion count does not imply
+stalled work. Counts are not a total-work denominator and may change after
+replacement or retirement. One bounded metadata census reads at most 10,001
+heads; exceeding the 10,000-head reporting cap or an unavailable/unsafe total
+produces unknown counters without hiding the graph. No source record is read,
+no calculation is triggered, and no throughput or ETA is inferred.
 
 The existing overview's optional compatibility `reconstruction` block reads bounded derived
 metadata: lookup position, acquisition phases, invalidated sources, maintenance

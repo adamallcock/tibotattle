@@ -118,7 +118,12 @@ The independent owner-only `/api/v1/admin/reconstruction-progress` request
 shows exact requested/prepared/published generations and historical progress.
 A temporary storage failure preserves the last validated graph while this lane
 can continue reporting. Confirmed invalidation or revoked owner access clears
-the affected private data. Refresh requests never perform calculations.
+the affected private data. Refresh requests never perform calculations. The
+admin client uses the exact `detail=preparation` selector to add bounded saved
+preparation counters; query-free clients retain the original response. Compare
+those counters when an account count stays flat: reusable source preparation
+can be advancing before the old physical-reader checkpoint resumes. Retained
+source days are not the remaining historical-window denominator.
 
 ### Only one day in the admin "By model" chart
 

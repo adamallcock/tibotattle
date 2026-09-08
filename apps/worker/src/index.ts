@@ -2888,8 +2888,11 @@ async function handleAdminReconstructionProgress(
     }
     await adminSession(request, env);
   }
-  if ([...new URL(request.url).searchParams].length !== 0) throw new ApiError(400, "BODY_INVALID");
-  const progress = await readAdminGraphRefreshProgress(env.USAGE_MONITOR_DB, Date.now(), allowanceReconstructionMode(env));
+  const params = [...new URL(request.url).searchParams];
+  const includePreparation = params.length === 1 && params[0]?.[0] === "detail" && params[0]?.[1] === "preparation";
+  if (params.length !== 0 && !includePreparation) throw new ApiError(400, "BODY_INVALID");
+  const progress = await readAdminGraphRefreshProgress(env.USAGE_MONITOR_DB, Date.now(), allowanceReconstructionMode(env),
+    { includePreparation });
   return jsonResponse(progress, 200, { "cache-control": "no-store", vary: "Cookie" });
 }
 

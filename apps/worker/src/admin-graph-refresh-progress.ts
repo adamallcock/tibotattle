@@ -13,9 +13,43 @@ function iso(value: unknown): string | null {
   return new Date(value).toISOString();
 }
 
+export const PREPARATION_PROGRESS_DAY_LIMIT = 10_000;
+
+/** A fixed-size metadata census, never a source-record scan or preparation
+ * trigger. These are retained reusable inputs, not remaining history work. */
+export async function readAdminPreparationProgress(db: D1Database) {
+  try {
+    const row = await db.prepare(`WITH preparation_heads AS (
+      SELECT phase,progress_revision,quota_count,usage_count
+      FROM community_prepared_source_days ORDER BY participant_id,source_day LIMIT ?1
+    ) SELECT COUNT(*) AS tracked_days,
+      TOTAL(CASE WHEN phase='complete' THEN 1 ELSE 0 END) AS complete_days,
+      TOTAL(CASE WHEN phase IN ('quota','usage') THEN 1 ELSE 0 END) AS building_days,
+      TOTAL(CASE WHEN phase='discarding' THEN 1 ELSE 0 END) AS retiring_days,
+      TOTAL(progress_revision) AS checkpoint_steps,TOTAL(quota_count) AS quota_observations,
+      TOTAL(usage_count) AS usage_events FROM preparation_heads`)
+      .bind(PREPARATION_PROGRESS_DAY_LIMIT + 1).first<{
+        tracked_days: number; complete_days: number; building_days: number; retiring_days: number;
+        checkpoint_steps: number; quota_observations: number; usage_events: number;
+      }>();
+    if (!row || row.tracked_days > PREPARATION_PROGRESS_DAY_LIMIT) return null;
+    const result = { trackedDays: count(row.tracked_days), completeDays: count(row.complete_days),
+      buildingDays: count(row.building_days), retiringDays: count(row.retiring_days),
+      checkpointSteps: count(row.checkpoint_steps), quotaObservations: count(row.quota_observations),
+      usageEvents: count(row.usage_events) };
+    return result.completeDays + result.buildingDays + result.retiringDays === result.trackedDays
+      ? result : null;
+  } catch {
+    // An optional counter outage does not make already verified graph metadata
+    // unavailable. TOTAL avoids SQLite integer overflow; unsafe totals stay null.
+    return null;
+  }
+}
+
 /** Owner-only, closed and content-free. Read-only metadata, not a maintenance
  * trigger or a fit/query fallback. Failure preserves the browser's last read. */
-export async function readAdminGraphRefreshProgress(db: D1Database, nowMs: number, mode: unknown) {
+export async function readAdminGraphRefreshProgress(db: D1Database, nowMs: number, mode: unknown,
+  options: { includePreparation?: boolean } = {}) {
   try {
     const generatedAt = new Date(nowMs).toISOString();
     const row = await db.prepare(`SELECT s.mutation_epoch,s.graph_invalidation_epoch,
@@ -43,6 +77,7 @@ export async function readAdminGraphRefreshProgress(db: D1Database, nowMs: numbe
       }>();
     if (!row) throw new TypeError("refresh metadata absent");
     const history = await readCommunityModelHistoryProgress(db, nowMs);
+    const preparation = options.includePreparation ? await readAdminPreparationProgress(db) : null;
     const after = await db.prepare(`SELECT s.mutation_epoch,p.source_mutation_epoch,p.generated_at
       FROM community_snapshot_mutation_control s LEFT JOIN admin_community_allowance_preview_cache p ON p.singleton=1
         AND p.attribution_method_version=?1 AND p.source_mutation_epoch>=s.graph_invalidation_epoch
@@ -70,7 +105,7 @@ export async function readAdminGraphRefreshProgress(db: D1Database, nowMs: numbe
           : row.current_day !== null && row.current_day !== generatedAt.slice(0, 10) ? "day_boundary" as const : null;
     const restartReason = row.restart_reason === "input_changed" || row.restart_reason === "method_changed"
       || row.restart_reason === "retry" ? row.restart_reason : null;
-    return { schemaVersion: 1 as const, generatedAt,
+    return { ...(options.includePreparation ? { schemaVersion: 2 as const, preparation } : { schemaVersion: 1 as const }), generatedAt,
       publication: { state: publishedGeneration !== null ? "ready" as const
         : row.graph_last_invalidated_at !== null ? "invalidated" as const : "empty" as const,
         requestedGeneration, preparedGeneration: currentComplete && history.resolvedDays === history.requiredDays

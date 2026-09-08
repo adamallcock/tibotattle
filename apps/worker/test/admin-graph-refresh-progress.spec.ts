@@ -1,9 +1,13 @@
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { readAdminGraphRefreshProgress } from "../src/admin-graph-refresh-progress";
+import { readAdminGraphRefreshProgress, readAdminPreparationProgress, PREPARATION_PROGRESS_DAY_LIMIT } from "../src/admin-graph-refresh-progress";
 import { readCommunityRefreshLane, recordCommunityRefreshLane } from "../src/community-refresh-lanes";
 import { COMMUNITY_ATTRIBUTION_METHOD_VERSION } from "../src/community-allowance";
+import { seedModelHistoryFixture, MODEL_HISTORY_TEST_PARTICIPANT, MODEL_HISTORY_TEST_DAY } from "./helpers/model-history";
+import { loadV1SourcePin } from "../src/telemetry-v1-source-selection";
+import { ensurePreparedV1Window } from "../src/prepared-v1-evidence";
+import { modelHistoryWindow } from "../src/model-history-window";
 
 const db = () => env.USAGE_MONITOR_DB;
 const NOW = Date.parse("2026-09-07T12:00:00.000Z");
@@ -13,6 +17,60 @@ beforeEach(async () => {
 });
 
 describe("independent owner refresh progress", () => {
+  it("reports saved preparation independently of completed accounts without advancing it on reads", async () => {
+    await seedModelHistoryFixture();
+    const window = modelHistoryWindow(MODEL_HISTORY_TEST_DAY);
+    const source = await loadV1SourcePin(db(), { participantId: MODEL_HISTORY_TEST_PARTICIPANT,
+      fromDay: window.fromDay, throughDay: window.day }, { includeDayDependencies: true });
+    await ensurePreparedV1Window(db(), source, { maxPages: 1, pageSize: 3, deadlineMs: Date.now() + 60000 });
+    const first = await readAdminPreparationProgress(db());
+    expect(first).toEqual({ trackedDays: 1, completeDays: 0, buildingDays: 1, retiringDays: 0,
+      checkpointSteps: 1, quotaObservations: 3, usageEvents: 0 });
+    const detailed = await readAdminGraphRefreshProgress(db(), NOW, "resumable", { includePreparation: true });
+    expect(detailed).toMatchObject({ schemaVersion: 2, preparation: first, history: { completeAccounts: 0 } });
+    expect(Object.keys(detailed).sort()).toEqual(["generatedAt", "history", "preparation", "publication", "schemaVersion", "work"]);
+    expect(JSON.stringify(detailed)).not.toMatch(/participant|fingerprint|lease|token|accountId|source_day/u);
+    expect(await readAdminPreparationProgress(db())).toEqual(first);
+
+    const prepared = await ensurePreparedV1Window(db(), source, { maxPages: 64, pageSize: 256, deadlineMs: Date.now() + 60000 });
+    expect(prepared.status).toBe("complete");
+    const complete = await readAdminPreparationProgress(db());
+    expect(complete).toMatchObject({ trackedDays: 5, completeDays: 5, buildingDays: 0, retiringDays: 0,
+      quotaObservations: 61, usageEvents: 120 });
+    expect(complete!.checkpointSteps).toBeGreaterThan(first!.checkpointSteps);
+    const statements: string[] = [];
+    const database = new Proxy(db(), { get(target, key) {
+      if (key === "prepare") return (sql: string) => { statements.push(sql); return target.prepare(sql); };
+      const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
+    } });
+    expect(await readAdminPreparationProgress(database)).toEqual(complete);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]).toContain("LIMIT ?1");
+    expect(statements[0]).not.toMatch(/\b(?:telemetry_v1_records|INSERT|UPDATE|DELETE)\b/u);
+    await db().prepare("UPDATE community_prepared_source_days SET phase='discarding' WHERE source_day='2026-09-01'").run();
+    expect(await readAdminPreparationProgress(db())).toMatchObject({ trackedDays: 5, completeDays: 4, retiringDays: 1 });
+  });
+
+  it("keeps preparation unknown on unsafe totals, bounded census or optional storage failure", async () => {
+    const empty = { tracked_days: 0, complete_days: 0, building_days: 0, retiring_days: 0,
+      checkpoint_steps: 0, quota_observations: 0, usage_events: 0 };
+    for (const row of [null, { ...empty, tracked_days: 10001 }, { ...empty, checkpoint_steps: Number.MAX_SAFE_INTEGER + 1 },
+      { ...empty, usage_events: -1 }, { ...empty, quota_observations: Infinity }, { ...empty, building_days: 1 }]) {
+      const bindings: unknown[] = [];
+      const database = { prepare: () => ({ bind: (limit: unknown) => {
+        bindings.push(limit); return { first: async () => row };
+      } }) } as unknown as D1Database;
+      expect(await readAdminPreparationProgress(database)).toBeNull();
+      expect(bindings).toEqual([PREPARATION_PROGRESS_DAY_LIMIT + 1]);
+    }
+    await db().prepare("DROP TABLE community_prepared_source_days").run();
+    const result = await readAdminGraphRefreshProgress(db(), NOW, "resumable", { includePreparation: true });
+    expect(result).toMatchObject({ schemaVersion: 2, preparation: null, history: { resolvedDays: 0 } });
+    const legacy = await readAdminGraphRefreshProgress(db(), NOW, "resumable");
+    expect(legacy.schemaVersion).toBe(1);
+    expect(Object.hasOwn(legacy, "preparation")).toBe(false);
+  });
+
   it("returns closed content-free metadata without advancing or inventing completion", async () => {
     const result = await readAdminGraphRefreshProgress(db(), NOW, "resumable");
     const epoch = (await readCommunityRefreshLane(db(), "current", NOW)).sourceEpoch;

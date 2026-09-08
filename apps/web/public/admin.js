@@ -3116,6 +3116,19 @@ function renderCurrentReconstructionProgress() {
     ? "Account progress not recorded"
     : `${formatNumber(history.completeAccounts)} of ${formatNumber(history.requiredAccounts)} account calculations complete`;
   phaseGroup.append(paragraph(accountText));
+  if (progress.schemaVersion === 2) {
+    const { preparation } = progress;
+    const preparationGroup = metric("Reusable source preparation", preparation === null
+      ? "Preparation counters unavailable"
+      : `${formatNumber(preparation.completeDays)} of ${formatNumber(preparation.trackedDays)} tracked source days complete`);
+    if (preparation === null) {
+      preparationGroup.append(paragraph("Preparation counters are unavailable or exceed the display limit; they are not zero."));
+    } else {
+      preparationGroup.append(paragraph(`${formatNumber(preparation.buildingDays)} building · ${formatNumber(preparation.retiringDays)} retiring`));
+      preparationGroup.append(paragraph(`${formatNumber(preparation.checkpointSteps)} saved checkpoint steps · ${formatNumber(preparation.quotaObservations)} quota observations processed · ${formatNumber(preparation.usageEvents)} usage events processed`));
+      preparationGroup.append(paragraph("Source days span retained work, not the remaining historical window. Preparation can advance before account completion. Counts can change when work is replaced or retired."));
+    }
+  }
   const generation = value => value === null ? "not recorded" : formatNumber(value);
   const publicationGroup = metric("Graph publication", {
     ready: "Available", empty: "Awaiting publication", invalidated: "Invalidated",
@@ -3252,7 +3265,7 @@ const adminReadLanes = {
     },
   }),
   progress: createAdminReadLane({
-    read: async ({ signal }) => projectAdminReconstructionProgress(await request("/api/v1/admin/reconstruction-progress", { signal })),
+    read: async ({ signal }) => projectAdminReconstructionProgress(await request("/api/v1/admin/reconstruction-progress?detail=preparation", { signal })),
     publish: progress => {
       state.reconstructionProgress = progress;
       state.reconstructionProgressFailed = false;
