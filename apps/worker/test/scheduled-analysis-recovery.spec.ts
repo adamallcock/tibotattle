@@ -98,6 +98,14 @@ async function queue() {
     SELECT ?,mutation_epoch,? FROM community_snapshot_mutation_control WHERE singleton_id=1`).bind(DAY, TIME).run();
   return (await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds ORDER BY day").all()).results;
 }
+async function queueCurrentCacheValidation() {
+  // A cache-body write schedules exact validation without changing its parsed
+  // evidence. A missing lane receipt alone no longer probes every account.
+  await db().prepare("UPDATE community_allowance_fit_cache SET fits_json=fits_json||' ' WHERE participant_id=?")
+    .bind(PARTICIPANT).run();
+  expect(await db().prepare("SELECT pending FROM community_current_analysis_queue WHERE participant_id=?")
+    .bind(PARTICIPANT).first()).toEqual({ pending: 1 });
+}
 async function released() {
   expect(await db().prepare("SELECT maintenance_lease_token,maintenance_lease_expires_at FROM retention_state WHERE singleton=1").first())
     .toEqual({ maintenance_lease_token: null, maintenance_lease_expires_at: null });
@@ -248,9 +256,10 @@ describe("actual scheduled resumable analysis recovery", () => {
     await seedQuota(200);
     const setup = observe(); await runScheduledMaintenance(bindings(setup), NOW);
     assertMeter(setup); await released();
-    // Model a missing completion receipt. An intact current lane now skips
-    // account probes altogether, so only recovery needs this expensive probe.
+    // Model a missing completion receipt plus a queued cache validation. The
+    // durable queue correctly skips clean accounts even without that receipt.
     await db().prepare("DELETE FROM community_refresh_lanes WHERE lane='current'").run();
+    await queueCurrentCacheValidation();
     inspection.modelHistory.mockClear();
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     logSpy.mockClear();
@@ -350,10 +359,12 @@ describe("actual scheduled resumable analysis recovery", () => {
     // The current-first slot has no speculative preview/cohort scan. Pin the
     // source/preparation/receipt setup cost even when preview inputs are incomplete.
     expect(second.queries.slice(0, payloadRead).some(entry => entry.sql.includes("FROM admin_community_allowance_preview_cache"))).toBe(false);
-    expect(setupReceipt).toEqual({ fixedSetupQueries: 55, primary: 52, ledger: 3 });
+    // Queue prepare/claim replaces the single census statement with five
+    // bounded statements, adding four queries without growing with membership.
+    expect(setupReceipt).toEqual({ fixedSetupQueries: 59, primary: 56, ledger: 3 });
     // Worst legal 1024-part head:384 reads,3 final pin/head checks,407 finish
     // reserve,24 combined warmer/scheduler headroom. Heavy sustained required
-    // housekeeping can exceed the remaining 27 queries and safely defer finish.
+    // housekeeping can exceed the remaining 23 queries and safely defer finish.
     expect(fixedSetupQueries + 384 + 3 + 407 + 24).toBeLessThanOrEqual(900);
     expect(await db().prepare("SELECT fixed_now,run_id,phase FROM community_analysis_work WHERE participant_id=?").bind(PARTICIPANT).first())
       .toMatchObject({ fixed_now: before!.fixed_now, run_id: before!.run_id, phase: "complete" });
@@ -398,6 +409,7 @@ describe("actual scheduled resumable analysis recovery", () => {
       db().prepare("SELECT * FROM community_allowance_fit_cache ORDER BY participant_id").all(),
       db().prepare("SELECT * FROM community_model_composition_cache ORDER BY participant_id").all(),
     ]).then(results => results.map(result => result.results));
+    await queueCurrentCacheValidation();
     const prior = await readPreview(), caches = await accountCaches();
     expect(prior?.generated_at).toBe(new Date(NOW).toISOString());
     expect(caches.map(rows => rows.length)).toEqual([1, 1]);
@@ -434,9 +446,11 @@ describe("actual scheduled resumable analysis recovery", () => {
     const logs = logSpy.mock.calls.map(([message]) => JSON.parse(String(message)) as { event: string });
     expect(logs).toContainEqual(expect.objectContaining({ event: "scheduled_allowance_reconstruction", outcome: "deferred",
       visited: 1, published: 0, resumed: 0 }));
+    // Captured-cohort metadata and publication authority now participate in the
+    // refresh; pin the complete cost rather than the retired cache-reader path.
     expect(logs).toContainEqual(expect.objectContaining({ event: "admin_allowance_preview_cache", phase: "before_analysis",
       outcome: "success", code: "ALLOWANCE_PREVIEW_CACHE_REFRESHED", elapsedMs: 0, deadlineRemainingMs: 40_000,
-      queriesUsed: expect.any(Number), phaseQueries: 14 }));
+      queriesUsed: expect.any(Number), phaseQueries: 28 }));
     expect(observation.queries.filter(entry => entry.sql.includes("FROM admin_community_allowance_preview_cache"))).toHaveLength(1);
     expect(warnSpy.mock.calls.some(([message]) => String(message).includes("admin_allowance_preview_cache"))).toBe(false);
     expect(logs.filter(log => log.event === "scheduled_model_history")).toEqual([
@@ -466,6 +480,7 @@ describe("actual scheduled resumable analysis recovery", () => {
     // metrics until their atomic replacement is ready.
     expect(await readCachedAdminMetricsHistory(db(), currentTime)).toEqual(prior);
     await db().prepare("DELETE FROM community_refresh_lanes WHERE lane='current'").run();
+    await queueCurrentCacheValidation();
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const metricsAtProbe: { generatedAt?: string; capturedAt?: string } = {};
     const observation = observe(async (entry, moment) => {

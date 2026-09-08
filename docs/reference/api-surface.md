@@ -118,7 +118,11 @@ writes state, accepts cohort filters or exposes the private admin response.
 All three graph views use the same published snapshot; immutable daily rows
 are not rewritten or relabelled to achieve this. Generation/evidence dates are
 preserved, with no additional "last good" label or age-only expiration. New
-publications still require the exact current epoch and complete cached inputs.
+publications use complete cached inputs from one immutable captured generation,
+with its hard authorization epoch checked at promotion. Ordinary uploads queue
+the next generation without requiring a quiet interval across every account;
+capture start is not presented as a latest-live source revision. Daily
+activity/spend retains separate exact source guards.
 The browser continues to understand v1.0 breakdowns, refreshes visible pages
 once a minute with non-overlapping, timed requests, and backs off on failures.
 Transient failures preserve the displayed result; authoritative invalidation or
@@ -139,7 +143,8 @@ metadata contract (`schemaVersion: 1`): requested, prepared and
 published generations; current phase/trigger; and resolved/required historical
 days. The exact optional query `detail=preparation` negotiates schema version 2
 with retained source-day counts, saved preparation steps and prepared quota/usage
-counts. Its single metadata query reads at most 10,001 heads; over-limit,
+counts. With migration 0056 its single metadata query reads one maintained
+aggregate row, independent of contributor/day count. Missing schema, inexact,
 unsafe or unavailable counts return null, not an invented total. These are
 retained reusable inputs, not a remaining-work denominator. All other query
 fields and repeated selectors are rejected. Both versions are read-only and

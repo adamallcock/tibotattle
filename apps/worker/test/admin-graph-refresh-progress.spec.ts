@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
-import { readAdminGraphRefreshProgress, readAdminPreparationProgress, PREPARATION_PROGRESS_DAY_LIMIT } from "../src/admin-graph-refresh-progress";
+import { readAdminGraphRefreshProgress, readAdminPreparationProgress } from "../src/admin-graph-refresh-progress";
 import { readCommunityRefreshLane, recordCommunityRefreshLane } from "../src/community-refresh-lanes";
 import { COMMUNITY_ATTRIBUTION_METHOD_VERSION } from "../src/community-allowance";
 import { seedModelHistoryFixture, MODEL_HISTORY_TEST_PARTICIPANT, MODEL_HISTORY_TEST_DAY } from "./helpers/model-history";
@@ -45,25 +45,28 @@ describe("independent owner refresh progress", () => {
     } });
     expect(await readAdminPreparationProgress(database)).toEqual(complete);
     expect(statements).toHaveLength(1);
-    expect(statements[0]).toContain("LIMIT ?1");
-    expect(statements[0]).not.toMatch(/\b(?:telemetry_v1_records|INSERT|UPDATE|DELETE)\b/u);
+    expect(statements[0]).toContain("FROM community_preparation_progress_counters WHERE singleton_id=1");
+    expect(statements[0]).not.toMatch(/\b(?:community_prepared_source_days|telemetry_v1_records|INSERT|UPDATE|DELETE)\b/u);
     await db().prepare("UPDATE community_prepared_source_days SET phase='discarding' WHERE source_day='2026-09-01'").run();
     expect(await readAdminPreparationProgress(db())).toMatchObject({ trackedDays: 5, completeDays: 4, retiringDays: 1 });
   });
 
-  it("keeps preparation unknown on unsafe totals, bounded census or optional storage failure", async () => {
-    const empty = { tracked_days: 0, complete_days: 0, building_days: 0, retiring_days: 0,
+  it("keeps preparation unknown on unsafe totals, inexact metadata or optional storage failure", async () => {
+    const empty = { is_exact: 1, tracked_days: 0, complete_days: 0, building_days: 0, retiring_days: 0,
       checkpoint_steps: 0, quota_observations: 0, usage_events: 0 };
-    for (const row of [null, { ...empty, tracked_days: 10001 }, { ...empty, checkpoint_steps: Number.MAX_SAFE_INTEGER + 1 },
+    for (const row of [null, { ...empty, is_exact: 0 }, { ...empty, checkpoint_steps: Number.MAX_SAFE_INTEGER + 1 },
       { ...empty, usage_events: -1 }, { ...empty, quota_observations: Infinity }, { ...empty, building_days: 1 }]) {
-      const bindings: unknown[] = [];
-      const database = { prepare: () => ({ bind: (limit: unknown) => {
-        bindings.push(limit); return { first: async () => row };
-      } }) } as unknown as D1Database;
+      const database = new Proxy(db(), { get(target, key) {
+        if (key === "prepare") return (sql: string) => new Proxy(target.prepare(sql), { get(statement, method) {
+          if (method === "first") return async () => row;
+          const value = Reflect.get(statement, method, statement);
+          return typeof value === "function" ? value.bind(statement) : value;
+        } });
+        const value = Reflect.get(target, key, target); return typeof value === "function" ? value.bind(target) : value;
+      } });
       expect(await readAdminPreparationProgress(database)).toBeNull();
-      expect(bindings).toEqual([PREPARATION_PROGRESS_DAY_LIMIT + 1]);
     }
-    await db().prepare("DROP TABLE community_prepared_source_days").run();
+    await db().prepare("DROP TABLE community_preparation_progress_counters").run();
     const result = await readAdminGraphRefreshProgress(db(), NOW, "resumable", { includePreparation: true });
     expect(result).toMatchObject({ schemaVersion: 2, preparation: null, history: { resolvedDays: 0 } });
     const legacy = await readAdminGraphRefreshProgress(db(), NOW, "resumable");

@@ -2,7 +2,7 @@ import { SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
 import { advanceCommunityAnalysisRun } from "./community-analysis-runner";
 import type { CommunityAnalysisWorkIdentity } from "./community-analysis-work";
 import {
-  COMMUNITY_PARTICIPANT_PAGE_CTE, communityAnalysisCachesCurrent, completedCommunityAnalysisCachesCurrent,
+  communityAnalysisCachesCurrent, completedCommunityAnalysisCachesCurrent,
   loadCommunitySourcePin, publishCommunityAnalysisCaches,
   type CommunityAnalysisCacheIdentity, type CommunityModelCacheReadBudget,
 } from "./community-allowance";
@@ -15,21 +15,11 @@ import { accountScopedModelCompositionV11, accountScopedQuotaAnalysisV11 } from 
 import type { D1InvocationBudget } from "./d1-invocation-budget";
 import { readCommunityRefreshLane, recordCommunityRefreshLane } from "./community-refresh-lanes";
 import { ensurePreparedV1Window, createPreparedV1EvidenceReader, canPrepareV1Window } from "./prepared-v1-evidence";
+import { acknowledgeCurrentAnalysisJob, claimCurrentAnalysisJob, prepareCurrentAnalysisQueue,
+  retireEmptyCurrentAnalysisJob } from "./community-analysis-queue";
 
 const DAY_MS = 86_400_000;
-const PAGE_SIZE = 64;
-const MAX_CENSUS_PAGES = 16;
-const MAX_PARTICIPANTS_PER_PASS = 4;
 const FINAL_RESERVE = 12;
-
-interface Candidate {
-  participant_id: string;
-  has_v1: number;
-  has_v11: number;
-  has_legacy: number;
-  legacy_overlap: number;
-  input_revision: number | null;
-}
 export interface CommunityAnalysisWarmResult {
   status: "complete" | "deferred" | "unavailable";
   visited: number;
@@ -37,11 +27,9 @@ export interface CommunityAnalysisWarmResult {
   resumed: number;
 }
 
-const CANDIDATE_PAGE_SQL = `${COMMUNITY_PARTICIPANT_PAGE_CTE}
-SELECT s.id AS participant_id, s.has_v1, s.has_v11, s.has_legacy, versions.revision AS input_revision,
-  CASE WHEN s.has_v11=0 AND s.has_v1=1 AND s.has_legacy=1 THEN EXISTS (
+const LEGACY_OVERLAP_SQL = `SELECT EXISTS (
     SELECT 1 FROM telemetry_records r INDEXED BY telemetry_records_participant_time
-    WHERE r.participant_id=s.id AND r.observed_at>=?3 AND r.record_kind='quota'
+    WHERE r.participant_id=?1 AND r.observed_at>=?2 AND r.record_kind='quota'
       AND r.provider='openai_codex' AND r.limit_id='codex'
       AND EXISTS (
         SELECT 1 FROM telemetry_contribution_occurrences o INDEXED BY telemetry_contribution_occurrences_record
@@ -50,10 +38,7 @@ SELECT s.id AS participant_id, s.has_v1, s.has_v11, s.has_legacy, versions.revis
           AND o.occurrence_id=r.occurrence_id AND c.status='accepted'
           AND c.transport_schema_version='telemetry-contribution-v0.2'
       )
-  ) ELSE 0 END AS legacy_overlap
-FROM sources s
-LEFT JOIN community_analytical_input_versions versions ON versions.participant_id = s.id
-ORDER BY s.id`;
+  ) AS legacy_overlap`;
 
 function validBudget(budget: CommunityModelCacheReadBudget, required: number): boolean {
   const now=(budget.now??Date.now)();
@@ -77,69 +62,57 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
   const fromDay=new Date(nowMs-V1_ANALYSIS_WINDOW_DAYS*DAY_MS).toISOString().slice(0,10);
   const observedAtCutoff=`${fromDay}T00:00:00.000Z`;
   const resetsAtCutoff=new Date(Date.parse(observedAtCutoff)+SEVEN_DAY_WINDOW_MINUTES*60_000).toISOString();
-  const candidates: Candidate[]=[];
-  let cursor="", complete=false;
-  for(let page=0;page<MAX_CENSUS_PAGES;page++) {
-    if(options.meter.remainingQueries<FINAL_RESERVE+1 || Date.now()>=options.deadlineMs) return result;
-    const rows=(await db.prepare(CANDIDATE_PAGE_SQL).bind(cursor,PAGE_SIZE+1,observedAtCutoff).all<Candidate>()).results;
-    if(!Array.isArray(rows)||rows.length>PAGE_SIZE+1) return {...result,status:"unavailable"};
-    let previous=cursor;
-    for(const row of rows) {
-      if(typeof row.participant_id!=="string"||row.participant_id<=previous||row.participant_id.length>128
-        ||![row.has_v1,row.has_v11,row.has_legacy,row.legacy_overlap].every(value=>value===0||value===1)) return {...result,status:"unavailable"};
-      previous=row.participant_id;
-    }
-    for(const row of rows.slice(0,PAGE_SIZE)) {
-      cursor=row.participant_id;
-      if(row.has_v1||row.has_v11||row.has_legacy) candidates.push(row);
-    }
-    if(rows.length<=PAGE_SIZE) {complete=true;break;}
-  }
-  if(!complete) return result;
-  if(candidates.length===0) {
-    const completed = await recordCommunityRefreshLane(db, lane, true, nowMs, options.maintenanceLease);
-    return {...result,status:completed ? "complete" : "deferred"};
-  }
-  // Rotate over a stable participant-ID census: a large or continuously changing
-  // first account cannot monopolize every pass. No participant ID enters logs.
-  const start=Math.floor(nowMs/60_000)%candidates.length;
-  let deferred=false, attempted=0;
-  // Current-cache probes remain metered, but do not consume useful-work slots.
-  // Scan at most the bounded census once in the same rotating order; a prefix
-  // of already-finished accounts must not hide unfinished work on an idle pass.
-  // This is still sequential and does not increase the shared time/query limits.
-  for(let index=0;index<candidates.length&&attempted<MAX_PARTICIPANTS_PER_PASS;index++) {
-    if(options.meter.remainingQueries<FINAL_RESERVE+20 || Date.now()>=options.deadlineMs) {deferred=true;break;}
-    const candidate=candidates[(start+index)%candidates.length]!;
-    const source=candidate.has_v11?"v1.1":candidate.has_v1?candidate.has_legacy?"mixed":"v1":"v0.2";
+  const pass = await prepareCurrentAnalysisQueue(db, lane.day, lane.method, options.maintenanceLease);
+  if (!pass) return result;
+  // The durable queue is ordered by actual service, not the scheduled minute.
+  // Claiming moves a job to the back before any expensive work. The initial
+  // sequence admits each account at most once here; SQL/time budgets, not an
+  // arbitrary account count, determine useful throughput.
+  while(options.meter.remainingQueries>=FINAL_RESERVE+22 && Date.now()<options.deadlineMs) {
+    const candidate=await claimCurrentAnalysisJob(db,pass,options.maintenanceLease);
+    if(!candidate) break;
     result.visited++;
-    if (source === "v1" && candidate.input_revision !== null
-        && await completedCommunityAnalysisCachesCurrent(db, candidate.participant_id, candidate.input_revision, fromDay)) continue;
-    const {sourcePin,fingerprint}=await loadCommunitySourcePin(db,candidate.participant_id,fromDay,source,
+    if (!candidate.hasV1 && !candidate.hasV11 && !candidate.hasLegacy) {
+      await retireEmptyCurrentAnalysisJob(db,candidate,options.maintenanceLease);
+      continue;
+    }
+    const source=candidate.hasV11?"v1.1":candidate.hasV1?candidate.hasLegacy?"mixed":"v1":"v0.2";
+    if (source === "v1"
+        && await completedCommunityAnalysisCachesCurrent(db, candidate.participantId, candidate.inputRevision, fromDay)) {
+      await acknowledgeCurrentAnalysisJob(db,candidate,options.maintenanceLease);
+      continue;
+    }
+    const legacyOverlap = source === "mixed" ? await db.prepare(LEGACY_OVERLAP_SQL)
+      .bind(candidate.participantId,observedAtCutoff).first<{legacy_overlap:number}>() : null;
+    if (source === "mixed" && (!legacyOverlap || ![0,1].includes(legacyOverlap.legacy_overlap))) return {...result,status:"unavailable"};
+    const {sourcePin,fingerprint}=await loadCommunitySourcePin(db,candidate.participantId,fromDay,source,
       { includeDayDependencies: true });
-    const identity: CommunityAnalysisCacheIdentity = {participantId:candidate.participant_id,source,sourcePin,
-      fitFingerprint:fingerprint,fromDay,compositionSupported:source!=="v0.2"&&!candidate.legacy_overlap};
-    if(await communityAnalysisCachesCurrent(db,identity)) continue;
-    attempted++;
+    if (sourcePin.inputRevision !== candidate.inputRevision) continue;
+    const identity: CommunityAnalysisCacheIdentity = {participantId:candidate.participantId,source,sourcePin,
+      fitFingerprint:fingerprint,fromDay,compositionSupported:source!=="v0.2"&&!legacyOverlap?.legacy_overlap};
+    if(await communityAnalysisCachesCurrent(db,identity)) {
+      await acknowledgeCurrentAnalysisJob(db,candidate,options.maintenanceLease);
+      continue;
+    }
     const allocation: CommunityModelCacheReadBudget = {remainingQueries:Math.max(0,options.meter.remainingQueries-FINAL_RESERVE),deadlineMs:options.deadlineMs};
     const analyses: {source:"v0.2"|"v1"|"v1.1";analysis:object}[]=[];
     let composition: V1ModelCompositionResult|null=null;
     if("source" in sourcePin && sourcePin.source==="v1.1") {
       // The successor adapter already uses bounded daily usage pages; it is
       // never sent through the legacy quota projection. Activation is unchanged.
-      if(!validBudget(allocation,640)) {deferred=true;continue;}
-      analyses.push({source:"v1.1",analysis:await accountScopedQuotaAnalysisV11(db,candidate.participant_id,{nowMs,sourcePin})});
-      composition=await accountScopedModelCompositionV11(db,candidate.participant_id,{nowMs,sourcePin});
+      if(!validBudget(allocation,640)) continue;
+      analyses.push({source:"v1.1",analysis:await accountScopedQuotaAnalysisV11(db,candidate.participantId,{nowMs,sourcePin})});
+      composition=await accountScopedModelCompositionV11(db,candidate.participantId,{nowMs,sourcePin});
     } else if(source!=="v0.2") {
       if(!("scope" in sourcePin) || sourcePin.inputRevision===null) throw new TypeError("v1 analysis source unavailable");
       const previous=await db.prepare(`SELECT fixed_now,input_revision,input_fingerprint,source_method_version,observed_at_cutoff,resets_at_cutoff
-        FROM community_analysis_work WHERE participant_id=?`).bind(candidate.participant_id)
+        FROM community_analysis_work WHERE participant_id=?`).bind(candidate.participantId)
         .first<{fixed_now:string;input_revision:number;input_fingerprint:string;source_method_version:string;observed_at_cutoff:string;resets_at_cutoff:string}>();
       allocation.remainingQueries=Math.max(0,options.meter.remainingQueries-FINAL_RESERVE);
       const reuse=previous && previous.input_revision===sourcePin.inputRevision && previous.input_fingerprint===sourcePin.fingerprint
         && previous.source_method_version===V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION
         && previous.observed_at_cutoff===observedAtCutoff && previous.resets_at_cutoff===resetsAtCutoff;
-      const workIdentity: CommunityAnalysisWorkIdentity = {participantId:candidate.participant_id,inputRevision:sourcePin.inputRevision,
+      const workIdentity: CommunityAnalysisWorkIdentity = {participantId:candidate.participantId,inputRevision:sourcePin.inputRevision,
         inputFingerprint:sourcePin.fingerprint,sourceKind:"v1",sourceMethodVersion:V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
         fixedNow:reuse?previous.fixed_now:new Date(nowMs).toISOString(),observedAtCutoff,resetsAtCutoff,
         windowMinutes:SEVEN_DAY_WINDOW_MINUTES,maxQuotaRows:MAX_DOWNSAMPLED_QUOTA_ROWS};
@@ -147,7 +120,7 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
       if (canPrepareV1Window(sourcePin)) {
         const preparation = await ensurePreparedV1Window(db, sourcePin,
           { maxPages: 64, deadlineMs: options.deadlineMs, budget: allocation });
-        if (preparation.status !== "complete" || !validBudget(allocation, 1)) { deferred=true; continue; }
+        if (preparation.status !== "complete" || !validBudget(allocation, 1)) continue;
         allocation.remainingQueries -= 1;
         preparedEvidence = await createPreparedV1EvidenceReader(db, sourcePin);
       }
@@ -165,24 +138,24 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
         // Refresh from actual usage: acquisition's conservative reservations
         // must not be confused with statements actually sent to the database.
         allocation.remainingQueries=Math.max(0,options.meter.remainingQueries-FINAL_RESERVE);
-        if(!validBudget(allocation,finishReserve)) {deferred=true;continue;}
-        const finished=await finishAccountScopedAnalysesV1(db,candidate.participant_id,acquired.evidence,allocation,
+        if(!validBudget(allocation,finishReserve)) continue;
+        const finished=await finishAccountScopedAnalysesV1(db,candidate.participantId,acquired.evidence,allocation,
           {nowMs:Date.parse(workIdentity.fixedNow),sourcePin,preparedEvidence});
-        if(finished.status!=="complete") {deferred=true;continue;}
+        if(finished.status!=="complete") continue;
         analyses.push({source:"v1",analysis:finished.quotaAnalysis});
         if(identity.compositionSupported) composition=finished.modelComposition;
-      } else {deferred=true;continue;}
+      } else continue;
     }
     if(source==="mixed"||source==="v0.2") {
-      if(options.meter.remainingQueries<FINAL_RESERVE+5) {deferred=true;continue;}
-      analyses.push({source:"v0.2",analysis:await accountScopedQuotaAnalysis(db,candidate.participant_id)});
+      if(options.meter.remainingQueries<FINAL_RESERVE+5) continue;
+      analyses.push({source:"v0.2",analysis:await accountScopedQuotaAnalysis(db,candidate.participantId)});
     }
-    if(options.meter.remainingQueries<FINAL_RESERVE) {deferred=true;continue;}
-    if(await publishCommunityAnalysisCaches(db,identity,analyses,composition,options.maintenanceLease)) result.published++;
-    else deferred=true;
+    if(options.meter.remainingQueries<FINAL_RESERVE) continue;
+    if(await publishCommunityAnalysisCaches(db,identity,analyses,composition,options.maintenanceLease,candidate)) result.published++;
   }
-  const completeResult = !deferred && result.visited === candidates.length;
+  // Completion is an atomic queue-empty/source/lease check, not a census or
+  // a count of how many jobs happened to finish in this invocation.
   const recorded = options.meter.remainingQueries > FINAL_RESERVE && Date.now() < options.deadlineMs
-    && await recordCommunityRefreshLane(db, lane, completeResult, nowMs, options.maintenanceLease);
-  return {...result,status:completeResult && recorded ? "complete":"deferred"};
+    && await recordCommunityRefreshLane(db, lane, true, nowMs, options.maintenanceLease);
+  return {...result,status:recorded ? "complete":"deferred"};
 }

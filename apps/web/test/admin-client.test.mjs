@@ -144,8 +144,8 @@ test("preparation progress accepts the exact v2 aggregate extension without chan
     checkpointSteps: 0, quotaObservations: 0, usageEvents: 0,
   };
   assert.deepEqual(projectAdminReconstructionProgress(payload).preparation, payload.preparation);
-  payload.preparation.trackedDays = 10_000;
-  payload.preparation.completeDays = 10_000;
+  payload.preparation.trackedDays = 169_000;
+  payload.preparation.completeDays = 169_000;
   payload.preparation.checkpointSteps = Number.MAX_SAFE_INTEGER;
   assert.deepEqual(projectAdminReconstructionProgress(payload).preparation, payload.preparation);
 });
@@ -159,7 +159,6 @@ test("preparation progress rejects cross-version fields, unknown fields, invalid
     value => { value.preparation = []; },
     value => { value.participantId = "synthetic-unexpected"; },
     value => { value.preparation.participantId = "synthetic-unexpected"; },
-    value => { value.preparation.trackedDays = 10_001; value.preparation.completeDays = 9_997; },
     value => { value.preparation.completeDays += 1; },
     value => { value.preparation.buildingDays += 1; },
     value => { value.preparation.retiringDays += 1; },

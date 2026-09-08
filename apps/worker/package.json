@@ -41,6 +41,7 @@
     "staging:prepare": "node ./scripts/prepare-disabled-staging.mjs",
     "staging:ready": "node ./scripts/staging-readiness.mjs --mode live",
     "test": "vitest run",
+    "test:scale": "vitest run test/calculator-scale.spec.ts --reporter=default --reporter=./test/helpers/scale-reporter.mjs",
     "typecheck": "tsc --noEmit",
     "types": "wrangler types worker-configuration.d.ts --env-file .dev.vars.example",
     "types:check": "wrangler types worker-configuration.d.ts --env-file .dev.vars.example --check"

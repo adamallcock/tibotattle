@@ -2,7 +2,8 @@ import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const readers = vi.hoisted(() => ({ fits: vi.fn(), corpus: vi.fn(), models: vi.fn(), rawFits: vi.fn(), rawModels: vi.fn() }));
+const readers = vi.hoisted(() => ({ fits: vi.fn(), corpus: vi.fn(), models: vi.fn(), rawFits: vi.fn(), rawModels: vi.fn(),
+  capture:vi.fn(),advance:vi.fn() }));
 vi.mock("../src/community-allowance", async (original) => ({
   ...await original<typeof import("../src/community-allowance")>(),
   readCachedCommunityAllowanceFits: readers.fits,
@@ -11,8 +12,13 @@ vi.mock("../src/community-allowance", async (original) => ({
   collectCommunityAllowanceFits: readers.rawFits,
   collectCommunityModelCompositions: readers.rawModels,
 }));
+vi.mock("../src/community-publication",async(original)=>({
+  ...await original<typeof import("../src/community-publication")>(),
+  readCapturedCommunityPublication:readers.capture,
+  advanceCommunityPublication:readers.advance,
+}));
 
-import { summarizeCommunityAllowanceDay } from "../src/community-allowance";
+import { summarizeCommunityAllowanceDay,COMMUNITY_ATTRIBUTION_METHOD_VERSION } from "../src/community-allowance";
 import { rebuildPendingCommunityDailyAggregates } from "../src/community-daily-aggregates";
 import { buildAdminCommunityAllowancePreview, buildAdminCommunityAllowancePreviewFromSource,
   buildCommunityModelCompositionDay, warmAdminCommunityAllowancePreviewCache } from "../src/admin-community-allowance";
@@ -28,6 +34,26 @@ const collection = { compositions: [], v1ParticipantCount: 1, unsupportedSourceP
 const recovery = (remainingQueries = 800) => ({ mode: "cache-only" as const,
   budget: { remainingQueries, deadlineMs: 1, now: () => 0 } });
 const activityRecovery = () => ({ ...recovery(100), mode: "activity-only" as const });
+
+// These are publication-composition unit tests: the captured-reader boundary
+// is isolated, while every downstream authority/transaction predicate runs on
+// real D1. The independent community-publication suite covers physical member
+// capture, cache validation, replay and real source races end to end.
+async function capturedFixture() {
+  const source=await db().prepare("SELECT mutation_epoch,graph_invalidation_epoch FROM community_snapshot_mutation_control WHERE singleton_id=1")
+    .first<{mutation_epoch:number;graph_invalidation_epoch:number}>();
+  await db().prepare(`INSERT INTO community_publication_generation
+    (singleton,generation,utc_day,from_day,method_version,source_epoch,hard_epoch,cache_revision,membership_watermark,
+      capture_cursor,load_cursor,phase,published,member_count,prepared_count,payload_bytes,progress_revision,created_at)
+    SELECT 1,'00000000-0000-4000-8000-000000000001',?1,'2026-05-24',?2,?3,?4,
+      (SELECT revision FROM community_publication_changes WHERE singleton=1),0,0,0,'ready',0,1,1,1,0,?5
+    WHERE 1 ON CONFLICT(singleton) DO NOTHING`)
+    .bind(DAY,COMMUNITY_ATTRIBUTION_METHOD_VERSION,source!.mutation_epoch,source!.graph_invalidation_epoch,new Date(NOW).toISOString()).run();
+  const head=await db().prepare("SELECT generation,source_epoch,hard_epoch FROM community_publication_generation WHERE singleton=1")
+    .first<{generation:string;source_epoch:number;hard_epoch:number}>();
+  return {generation:head!.generation,sourceEpoch:head!.source_epoch,hardEpoch:head!.hard_epoch,
+    corpus:{fits,participantIds:fits.map(row=>row.participantId)},compositions:collection};
+}
 
 async function usageDay() {
   const time = new Date(NOW).toISOString(), future = "2027-01-01T00:00:00.000Z";
@@ -101,13 +127,15 @@ beforeEach(async () => {
   readers.fits.mockResolvedValue(fits);
   readers.corpus.mockResolvedValue({ fits,participantIds: fits.map(row => row.participantId) });
   readers.models.mockResolvedValue(collection);
+  readers.capture.mockImplementation(capturedFixture);
+  readers.advance.mockImplementation(async()=>({status:"ready",...await capturedFixture()}));
   readers.rawFits.mockImplementation(() => { throw new Error("raw allowance analysis forbidden in recovery"); });
   readers.rawModels.mockImplementation(() => { throw new Error("raw composition analysis forbidden in recovery"); });
 });
 
 describe("cache-only graph recovery publication", () => {
   it("defers a missing fit cohort before drift/readiness writes or source queue drain", async () => {
-    await queue(); readers.fits.mockResolvedValue(null);
+    await queue(); readers.capture.mockResolvedValue(null);readers.advance.mockResolvedValue({status:"deferred"});
     const prior = await snapshot(), observation = observed();
     expect(await rebuildPendingCommunityDailyAggregates(observation.database,NOW,1,{chunks:8},recovery()))
       .toEqual({processed:0,remaining:true,aggregateIds:[],deferred:true});
@@ -123,17 +151,18 @@ describe("cache-only graph recovery publication", () => {
     const payload = JSON.parse(row!.payload_json);
     expect(payload.allowance).toEqual(summarizeCommunityAllowanceDay(fits,DAY));
     expect(payload.totals.usageEvents).toBe(0); expect(payload.apiEquivalentSpend.knownCostUsd).toBe(0);
-    expect(readers.fits).toHaveBeenCalledWith(expect.anything(),NOW,{budget:options.budget});
+    expect(readers.capture).toHaveBeenCalledWith(expect.anything(),NOW,{budget:options.budget});
     expect(readers.rawFits).not.toHaveBeenCalled();
   });
 
   it("a mutation during complete-cohort acquisition defers without any graph mutations", async () => {
     await queue(); let afterMutation: Awaited<ReturnType<typeof snapshot>> | undefined;
-    readers.fits.mockImplementation(async () => {
+    readers.capture.mockImplementation(async () => {
       await db().prepare("UPDATE community_snapshot_mutation_control SET mutation_epoch=mutation_epoch+1 WHERE singleton_id=1").run();
       afterMutation = await snapshot();
-      return fits;
+      return null;
     });
+    readers.advance.mockResolvedValue({status:"deferred"});
     const observation = observed();
     expect(await rebuildPendingCommunityDailyAggregates(observation.database,NOW,1,{chunks:8},recovery()))
       .toMatchObject({processed:0,deferred:true});
@@ -145,7 +174,7 @@ describe("cache-only graph recovery publication", () => {
     await queue(); const prior = await snapshot(); const options = recovery(50);
     const observation = observed();
     expect(await rebuildPendingCommunityDailyAggregates(observation.database,NOW,1,{chunks:8},options)).toMatchObject({deferred:true});
-    expect(readers.fits).not.toHaveBeenCalled(); expect(await snapshot()).toEqual(prior);
+    expect(readers.capture).not.toHaveBeenCalled(); expect(await snapshot()).toEqual(prior);
     expect(observation.prepared).toHaveLength(1);
     expect(observation.prepared[0]).toContain("community_refresh_lanes");
     expect(observation.mutations).toEqual([]);
@@ -153,7 +182,7 @@ describe("cache-only graph recovery publication", () => {
   });
 
   it("missing model composition defers the admin graph without an empty model-day substitute", async () => {
-    readers.models.mockResolvedValue(null); const prior = await snapshot(), observation = observed();
+    readers.capture.mockResolvedValue(null); const prior = await snapshot(), observation = observed();
     expect(await warmAdminCommunityAllowancePreviewCache(observation.database,NOW,recovery()))
       .toEqual({code:"ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE"});
     expect(observation.mutations).toEqual([]);expect(await snapshot()).toEqual(prior);
@@ -165,7 +194,7 @@ describe("cache-only graph recovery publication", () => {
     // New source evidence, not age alone, is what requires a new cohort.
     await db().prepare(`UPDATE community_snapshot_mutation_control
       SET mutation_epoch=mutation_epoch+1,graph_append_epoch=mutation_epoch+1 WHERE singleton_id=1`).run();
-    const prior = await snapshot(); readers.corpus.mockResolvedValue(null);
+    const prior = await snapshot(); readers.capture.mockResolvedValue(null);
     expect(await warmAdminCommunityAllowancePreviewCache(db(),NOW+3_600_000,recovery()))
       .toEqual({code:"ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE"});
     expect(await snapshot()).toEqual(prior);expect(readers.rawModels).not.toHaveBeenCalled();
@@ -173,19 +202,19 @@ describe("cache-only graph recovery publication", () => {
 
   it("does not rebuild an unchanged admin cohort merely because an hour elapsed", async () => {
     expect((await warmAdminCommunityAllowancePreviewCache(db(),NOW,recovery())).code).toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
-    const prior = await snapshot(); readers.corpus.mockClear(); readers.models.mockClear();
+    const prior = await snapshot(); readers.capture.mockClear(); readers.advance.mockClear();
     expect(await warmAdminCommunityAllowancePreviewCache(db(),NOW+3_600_000,recovery()))
       .toEqual({code:"ALLOWANCE_PREVIEW_CACHE_CURRENT"});
-    expect(readers.corpus).not.toHaveBeenCalled();expect(readers.models).not.toHaveBeenCalled();
+    expect(readers.capture).not.toHaveBeenCalled();expect(readers.advance).not.toHaveBeenCalled();
     expect(await snapshot()).toEqual(prior);
   });
 
   it("valid admin cache payloads preserve scalar and model-day parity and publish together", async () => {
     const options = recovery(), observation = observed();
     expect((await warmAdminCommunityAllowancePreviewCache(observation.database,NOW,options)).code).toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
-    // Cache readers are isolated spies here; all six surrounding source/history/
-    // publication statements are accounted separately from those readers.
-    expect(observation.prepared).toHaveLength(6);
+    // The captured reader is isolated; five surrounding cache/history/write
+    // statements retain a conservative six-statement allocation.
+    expect(observation.prepared).toHaveLength(5);
     expect(options.budget.remainingQueries).toBe(794);
     const row = await db().prepare("SELECT payload_json,source_mutation_epoch FROM admin_community_allowance_preview_cache").first<{payload_json:string;source_mutation_epoch:number}>();
     const preview = JSON.parse(row!.payload_json);
@@ -208,10 +237,10 @@ describe("cache-only graph recovery publication", () => {
 
   it("a source mutation after acquisition prevents both admin publications", async () => {
     let afterMutation: Awaited<ReturnType<typeof snapshot>> | undefined;
-    readers.models.mockImplementation(async () => {
+    readers.capture.mockImplementation(async () => {
       await db().prepare("UPDATE community_snapshot_mutation_control SET mutation_epoch=mutation_epoch+1 WHERE singleton_id=1").run();
       afterMutation = await snapshot();
-      return collection;
+      return null;
     });
     const observation = observed();
     expect((await warmAdminCommunityAllowancePreviewCache(observation.database,NOW,recovery())).code).toBe("ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE");
@@ -237,13 +266,13 @@ describe("cache-only graph recovery publication", () => {
   });
 
   it("the explicit source builder also refuses missing cached models without raw fallback", async () => {
-    readers.models.mockResolvedValue(null);const observation = observed();
+    readers.capture.mockResolvedValue(null);const observation = observed();
     expect(await buildAdminCommunityAllowancePreviewFromSource(observation.database,NOW,recovery())).toBeNull();
     expect(observation.mutations).toEqual([]);expect(readers.rawModels).not.toHaveBeenCalled();
   });
 
   it("activity-only publishes exact tokens/spend without allowance and durably rehydrates later", async () => {
-    const price = await usageDay(); readers.fits.mockResolvedValue(null);
+    const price = await usageDay(); readers.capture.mockResolvedValue(null);
     const queued = (await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds").all()).results;
     const options = activityRecovery(), observation = observed();
     expect(await rebuildPendingCommunityDailyAggregates(observation.database,NOW,1,{chunks:8},options))
@@ -259,11 +288,11 @@ describe("cache-only graph recovery publication", () => {
     expect(payload.apiEquivalentSpend).toMatchObject({coverage:"complete",usageEvents:1,
       knownCostUsd:Number((BigInt(price.costNanousd)+50_000n)/100_000n)/10_000});
     expect((await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds").all()).results).toEqual(queued);
-    expect(readers.fits).not.toHaveBeenCalled();expect(readers.rawFits).not.toHaveBeenCalled();
+    expect(readers.capture).not.toHaveBeenCalled();expect(readers.rawFits).not.toHaveBeenCalled();
     expect(await rebuildPendingCommunityDailyAggregates(db(),NOW+1000,1,{chunks:8},activityRecovery()))
       .toMatchObject({processed:0,remaining:true});
     expect((await db().prepare("SELECT COUNT(*) AS n FROM community_daily_aggregates").first())?.n).toBe(1);
-    readers.fits.mockResolvedValue(fits);
+    readers.capture.mockImplementation(capturedFixture);
     expect(await rebuildPendingCommunityDailyAggregates(db(),NOW+2000,1,{chunks:8},recovery()))
       .toMatchObject({processed:1,remaining:false});
     const complete = await db().prepare("SELECT revision,payload_json FROM community_daily_aggregates WHERE day=? ORDER BY revision DESC LIMIT 1")
@@ -281,7 +310,7 @@ describe("cache-only graph recovery publication", () => {
     expect(await db().prepare("SELECT * FROM community_daily_aggregates WHERE day=?").bind(DAY).first()).toEqual(original);
     expect((await db().prepare("SELECT day FROM community_daily_aggregate_rebuilds ORDER BY day").all()).results)
       .toEqual([{day:DAY},{day:"2026-09-02"}]);
-    expect(readers.fits).not.toHaveBeenCalled();expect(readers.rawFits).not.toHaveBeenCalled();
+    expect(readers.capture).not.toHaveBeenCalled();expect(readers.rawFits).not.toHaveBeenCalled();
   });
 
   it("activity-only keeps the request and publishes nothing when the final source epoch changes", async () => {
@@ -303,6 +332,6 @@ describe("cache-only graph recovery publication", () => {
     expect(raced).toBe(true);
     expect((await db().prepare("SELECT * FROM community_daily_aggregates").all()).results).toEqual([]);
     expect((await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds").all()).results).toEqual(queued);
-    expect(readers.fits).not.toHaveBeenCalled();expect(readers.rawFits).not.toHaveBeenCalled();
+    expect(readers.capture).not.toHaveBeenCalled();expect(readers.rawFits).not.toHaveBeenCalled();
   });
 });

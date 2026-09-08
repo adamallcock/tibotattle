@@ -10,6 +10,8 @@ import {
   summarizeCommunityAllowanceDay,
 } from "./community-allowance";
 import type { CommunityAllowanceFit, CommunityModelCacheReadBudget } from "./community-allowance";
+import { advanceCommunityPublication, readCapturedCommunityPublication,communityPublicationAuthoritySql,
+  type CapturedCommunityPublication } from "./community-publication";
 import { COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL, PREVIEW_CACHE_JSON_LIMIT_BYTES } from "./admin-community-allowance";
 import type { PublicAllowanceBreakdownsCacheRow } from "./public-allowance-breakdowns";
 import { sha256Hex } from "./crypto";
@@ -107,7 +109,10 @@ interface DailyCellRow {
  * (participant deletion) invalidates the cache and the next build recollects
  * against the surviving corpus.
  */
-type AllowanceFitsForEpoch = (epoch: number) => Promise<CommunityAllowanceFit[] | null>;
+type PublicationIdentity = Pick<CapturedCommunityPublication,"generation"|"sourceEpoch"|"hardEpoch">;
+type AllowanceFitsForEpoch = ((epoch: number) => Promise<CommunityAllowanceFit[] | null>) & {
+  captured?: PublicationIdentity;
+};
 
 export interface CommunityDailyCacheRecovery {
   /** Activity-only admits new/unpublished days and retains their rebuild journal. */
@@ -120,8 +125,15 @@ function memoizedAllowanceFits(
   db: D1Database,
   nowMs: number,
   recovery?: CommunityDailyCacheRecovery,
-  initial?: { epoch: number; fits: CommunityAllowanceFit[] },
+  initial?: { epoch: number; fits: CommunityAllowanceFit[];captured?:PublicationIdentity },
 ): AllowanceFitsForEpoch {
+  if(initial?.captured) {
+    // Captured allowance inputs are independent of the raw activity epoch.
+    // Every downstream publication statement includes this generation's hard
+    // authority fence, so a later withdrawal cannot reuse these fits.
+    const read:AllowanceFitsForEpoch=async()=>initial.fits;
+    read.captured=initial.captured;return read;
+  }
   let cached: { epoch: number; fits: CommunityAllowanceFit[] } | null = initial ?? null;
   return async (epoch: number) => {
     if (cached === null || cached.epoch !== epoch) {
@@ -223,15 +235,17 @@ async function enqueueCommunityAllowanceDriftRebuilds(
   // This singleton is the only global cutover evidence public requests read.
   // The WHERE clause avoids rewriting it every hour: it changes only with the
   // state, basis, or UTC safe window (normally once per day when settled).
+  const captured=allowanceFitsForEpoch.captured;
+  const capturedValues=captured?[captured.generation,captured.sourceEpoch,captured.hardEpoch,COMMUNITY_ATTRIBUTION_METHOD_VERSION]:[];
   await db.prepare(
     `INSERT INTO community_allowance_publication_state (
        singleton, publication_state, expected_basis,
        safe_from_day, safe_to_day, changed_at, attribution_method_version
      ) SELECT 1, ?1, ?2, ?3, ?4, ?5, ?7
-       WHERE EXISTS (
+       WHERE ${captured?communityPublicationAuthoritySql(8):`EXISTS (
          SELECT 1 FROM community_snapshot_mutation_control
           WHERE singleton_id = 1 AND mutation_epoch = ?6
-       )
+       )`}
      ON CONFLICT(singleton) DO UPDATE SET
        publication_state = excluded.publication_state,
        expected_basis = excluded.expected_basis,
@@ -257,18 +271,20 @@ async function enqueueCommunityAllowanceDriftRebuilds(
     new Date(nowMs).toISOString(),
     reconcileEpoch,
     COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+    ...capturedValues,
   ).run();
   for (const day of drifted) {
     await db.prepare(
       `INSERT INTO community_daily_aggregate_rebuilds (
         day, requested_epoch, requested_at
       ) SELECT ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-        WHERE EXISTS (SELECT 1 FROM community_snapshot_mutation_control
-          WHERE singleton_id = 1 AND mutation_epoch = ?2)
+        WHERE ${captured?communityPublicationAuthoritySql(3):`EXISTS (SELECT 1 FROM community_snapshot_mutation_control
+          WHERE singleton_id = 1 AND mutation_epoch = ?2)`}
       ON CONFLICT(day) DO UPDATE SET
         requested_epoch = excluded.requested_epoch,
-        requested_at = excluded.requested_at`,
-    ).bind(day, reconcileEpoch).run();
+        requested_at = excluded.requested_at
+      WHERE community_daily_aggregate_rebuilds.requested_epoch<=excluded.requested_epoch`,
+    ).bind(day, reconcileEpoch,...capturedValues).run();
   }
   return true;
 }
@@ -490,7 +506,8 @@ async function buildCommunityDailyAggregate(
         AND EXISTS (SELECT 1 FROM community_daily_aggregates WHERE day = ? AND release_state = 'published')
       ))
       AND (? = 0 OR NOT EXISTS (SELECT 1 FROM community_daily_aggregates
-        WHERE day = ? AND release_state = 'published'))`,
+        WHERE day = ? AND release_state = 'published'))
+      AND ${allowanceFitsForEpoch.captured?communityPublicationAuthoritySql(17):"1"}`,
     ).bind(
       aggregateId,
       day,
@@ -508,6 +525,8 @@ async function buildCommunityDailyAggregate(
       day,
       activityOnly ? 1 : 0,
       day,
+      ...(allowanceFitsForEpoch.captured?[allowanceFitsForEpoch.captured.generation,
+        allowanceFitsForEpoch.captured.sourceEpoch,allowanceFitsForEpoch.captured.hardEpoch,COMMUNITY_ATTRIBUTION_METHOD_VERSION]:[]),
     ),
     // Clear exactly the request this build answered, and only when this
     // build's revision actually published. A cancelled build leaves the row
@@ -564,7 +583,7 @@ export async function rebuildPendingCommunityDailyAggregates(
   const deferred = { processed: 0, remaining: true, aggregateIds: [], deferred: true } as const;
   const activityOnly = recovery?.mode === "activity-only";
   let lane: CommunityRefreshLanePin | undefined;
-  let initialFits: { epoch: number; fits: CommunityAllowanceFit[] } | undefined;
+  let initialFits: { epoch: number; fits: CommunityAllowanceFit[];captured?:PublicationIdentity } | undefined;
   if (recovery) {
     const budget = recovery.budget;
     const now = (budget.now ?? Date.now)();
@@ -580,27 +599,24 @@ export async function rebuildPendingCommunityDailyAggregates(
     }
     const fixedQueries = activityOnly ? 2 : 77;
     if (!activityOnly) {
-      // Read the COMPLETE cohort before allocating optional days/chunks. A
-      // fixed 18-query buffer cannot cover the per-participant blob reads and
-      // would indefinitely starve even 16 otherwise-current participants.
+      // Read the COMPLETE captured cohort in bounded multi-account pages before
+      // allocating optional days/chunks. Ordinary newer inputs queue the next
+      // generation; the immutable selected fits need no per-account raw reads.
       // Keep only the fixed publication work and one day in reserve while the
-      // cache reader charges its actual queries. These two outer epoch checks
-      // are separately paid before I/O, including on a deferred cache result.
+      // cache reader charges its actual queries. Its final generation/hard
+      // fence replaces the old whole-corpus global quiet-period requirement.
       const minimumPublicationQueries = fixedQueries + 12;
-      if (budget.remainingQueries - reserve < minimumPublicationQueries + 2) return { ...deferred, aggregateIds: [] };
-      budget.remainingQueries -= 2;
+      if (budget.remainingQueries - reserve < minimumPublicationQueries) return { ...deferred, aggregateIds: [] };
       const originalReserve = budget.reserveQueries;
       budget.reserveQueries = reserve + minimumPublicationQueries;
       try {
-        const first = await db.prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1")
-          .first<{ mutation_epoch: number }>();
-        if (!Number.isSafeInteger(first?.mutation_epoch) || first!.mutation_epoch < 0) return { ...deferred, aggregateIds: [] };
-        const fits = await readCachedCommunityAllowanceFits(db, scheduledTime, { budget });
-        if (fits === null) return { ...deferred, aggregateIds: [] };
-        const current = await db.prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1")
-          .first<{ mutation_epoch: number }>();
-        if (current?.mutation_epoch !== first!.mutation_epoch) return { ...deferred, aggregateIds: [] };
-        initialFits = { epoch: first!.mutation_epoch, fits };
+        let captured = await readCapturedCommunityPublication(db,scheduledTime,{budget});
+        if (!captured) {
+          if ((await advanceCommunityPublication(db,scheduledTime,{budget})).status !== "ready") return { ...deferred, aggregateIds: [] };
+          captured = await readCapturedCommunityPublication(db,scheduledTime,{budget});
+        }
+        if (!captured) return { ...deferred, aggregateIds: [] };
+        initialFits = { epoch: captured.sourceEpoch, fits: [...captured.corpus.fits],captured };
       } catch {
         return { ...deferred, aggregateIds: [] };
       } finally {

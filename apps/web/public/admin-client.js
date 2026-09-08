@@ -264,8 +264,7 @@ export function projectAdminReconstructionProgress(value) {
       quotaObservations: count(source.quotaObservations, code),
       usageEvents: count(source.usageEvents, code),
     });
-    if (preparation.trackedDays > 10_000
-        || preparation.completeDays + preparation.buildingDays + preparation.retiringDays
+    if (preparation.completeDays + preparation.buildingDays + preparation.retiringDays
           !== preparation.trackedDays) invalid(code);
   }
   return Object.freeze({

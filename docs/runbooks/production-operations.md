@@ -80,16 +80,19 @@ not establish a database, memory or application-level cause.
 
 One physical-statement meter covers both D1 bindings and all scheduled phases
 (900 statements, with lease-release headroom). Required maintenance runs
-first. Optional calculation has a 40-second admission deadline, rotates
-participants, and yields durable progress when it cannot finish. Already-current
-accounts are checked within the same budget but do not consume the four
-unfinished-analysis slots. This improves useful-work selection without adding
-parallel database or pricing work. A completed
+first. Optional calculation has a 40-second admission deadline and yields durable
+progress when it cannot finish. Migration 0054 replaces the current lane's
+whole-account polling and four-attempt cap with an indexed, coalescing dirty
+queue. Claiming moves an account to the back before work begins; revision,
+window and lease checks make completion restart-safe. The actual remaining
+statement/time budget governs attempts. An unchanged completed lane performs
+one metadata read and no source scan or write. This does not add parallel
+database or pricing work. A completed
 head is admitted before rehydration only if its entire read and the shared
 usage-finishing reserve fit. Sustained required-work saturation may defer
 large accounts; it is not permission to lower evidence caps.
 
-Public and admin graph rebuilds consume only complete, source-current caches.
+Public and admin graph rebuilds consume only complete, source-authorized caches.
 The minute cron rotates optional priority over three UTC-minute slots: shared
 preview first, current-account reconstruction first, then historical models first.
 This gives ready graphs an early refresh opportunity without letting a large
@@ -99,13 +102,19 @@ reconciliation. Migration 0050 extends preserved publication to validated v1
 corrections and newly elected devices, using a one-use marker inside the same
 atomic upload transaction. The hard-invalidation epoch still excludes
 withdrawals, erasure, source-format transitions, policy changes and unrecognized
-direct mutations. New publications require the exact current input epoch.
+direct mutations. With migration 0055, new previews pin an immutable captured
+generation and its hard-invalidation epoch, not a globally quiet upload epoch.
+Each captured member must supply a complete cache revision at least as new as
+its captured requirement. The source epoch identifies capture start; it must
+not be relabelled as the latest live revision. Ordinary later uploads queue the
+next generation while the complete captured one can publish. Daily activity
+and spend retain their separate exact source/revision guards.
 Elapsed time alone does not rebuild or expire an allowance preview. Changed
 inputs, UTC days and newly completed model dates trigger a successor. A replacement
 cannot drop model dates still awaiting reconstruction. Public aggregate/plan/
 model charts use one snapshot, separate from immutable activity/spend revisions.
 
-Completed pure-v1 account caches are checked through one indexed joined read
+Claimed pure-v1 account caches are checked through one indexed joined read
 per account, using the existing work fingerprint, current journal revision,
 method/window keys and strict payload validation. Only changed accounts enter
 source-vector acquisition and calculation. Legacy/mixed/successor and unfinished
@@ -128,6 +137,26 @@ stores exact epoch/day/method completion receipts for current and daily lanes.
 An unchanged completed lane needs one metadata lookup, not a fresh account or
 raw-evidence scan. Queued corrections prevent a daily receipt from being reused.
 Preparation, reconstruction and publication still share the existing budget.
+
+Migration 0055 freezes publication membership behind a finite queue watermark,
+then copies validated cache payloads in restartable 64-member, byte-bounded
+pages. A complete authorized capture promotes atomically; unfinished captures
+never replace saved graphs. Retirement deletes derived members in bounded
+pages, not telemetry. Capture and direct cohort readers batch payload reads
+instead of issuing one query per contributor. Final exact medians still require
+the complete captured cohort; they are not additive per-account totals.
+
+The isolated `npm --prefix apps/worker run test:scale` qualification measures
+100/500/1,000 synthetic contributors without hosted traffic. Read its receipt
+for workload-specific throughput: local drain time omits scheduled waiting and
+is not production CPU or latency. The unchanged one-minute cron and shared
+mandatory-work budget limit cold-start catch-up. History still enumerates a
+bounded complete eligible cohort (at most 1,024 contributors, excluding empty
+or inactive registrations), and its final exact-date epoch check can defer on
+concurrent mutation. Do not infer sustained 1,000-user upload throughput from
+a population-scale or two-date history test. More parallel D1 calls do not
+remove these bottlenecks; qualify arrival rate and background scheduling before
+claiming that capacity.
 
 Preview-first passes also admit owner gauge capture and growth-history cache
 refresh after the allowance preview but before reconstruction. Each retains its
@@ -167,9 +196,12 @@ prepared-source metadata shows completed/building/retiring days, saved steps,
 quota observations and usage events. Preparation can advance before a legacy
 account checkpoint resumes, so a fixed account-completion count does not imply
 stalled work. Counts are not a total-work denominator and may change after
-replacement or retirement. One bounded metadata census reads at most 10,001
-heads; exceeding the 10,000-head reporting cap or an unavailable/unsafe total
-produces unknown counters without hiding the graph. No source record is read,
+replacement or retirement. Migration 0056 initializes one aggregate row from
+the existing head ledger, then maintains exact counters on head transitions.
+The progress read touches that row, not every account/day. Missing migration,
+an unavailable row, or an inexact/unsafe counter produces unknown counters
+without hiding the graph; there is no 10,000-head preparation reporting ceiling.
+The older overview checkpoint census below is separate. No source record is read,
 no calculation is triggered, and no throughput or ETA is inferred.
 
 The existing overview's optional compatibility `reconstruction` block reads bounded derived

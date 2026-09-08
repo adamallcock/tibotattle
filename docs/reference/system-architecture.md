@@ -175,9 +175,14 @@ account key by itself does not discard coherent legacy plan history.
 
 Hosted legacy quota, usage, daily totals and model composition share one pinned
 winning-device/day vector. Its exact journal fingerprint and participant input
-revision accompany existing fit/composition caches; the global mutation epoch
-fences the existing publication singleton and admin preview. Changed input
-invalidates publication atomically. Fragment selection occurs after fit/coverage
+revision accompany existing fit/composition caches. The current lane coalesces
+changed participants into a durable fair queue; unchanged participants need
+no reconstruction. Publication captures finite membership and complete cache
+versions in bounded restartable pages. Ordinary newer uploads queue a successor;
+the hard-invalidation epoch still fences the captured generation and saved
+admin/public preview on erasure, consent and source-policy changes. Capture
+start is not relabelled as a latest-live epoch. Raw daily activity and spend
+retain their own exact source/revision guards. Fragment selection occurs after fit/coverage
 gates and cannot give one reset multiple votes. Public Pro-equivalent conversion
 and existing cohort limits are unchanged.
 

@@ -188,10 +188,10 @@ export async function ensurePreparedV1Window(db: D1Database, pin: V1SourcePin, o
             AND ${retiringGuard}`).bind(...bindings, V1_PREPARATION_PAGE_SIZE))];
         batch.push(db.prepare(`DELETE FROM community_prepared_source_days WHERE participant_id=?1 AND source_day=?3
           AND generation=?4 AND ${retiringGuard} ${TABLES.map(table => `AND NOT EXISTS (SELECT 1 FROM ${table}
-            WHERE participant_id=?1 AND source_day=?3 AND generation=?4)`).join(" ")}`).bind(...bindings));
+            WHERE participant_id=?1 AND source_day=?3 AND generation=?4)`).join(" ")} RETURNING 1 AS applied`).bind(...bindings));
         spend(batch.length);
         const deleted = await db.batch(batch); pagesRun += 1;
-        if (deleted.at(-1)!.meta.changes === 1) head = undefined;
+        if (deleted.at(-1)!.results.length === 1) head = undefined;
         else if (deleted.slice(1).every(item => item.meta.changes === 0)) return result("deferred");
       }
       if (!head) {
@@ -207,10 +207,12 @@ export async function ensurePreparedV1Window(db: D1Database, pin: V1SourcePin, o
           (participant_id,source_day,generation,source_fingerprint,method_version,device_id,phase,progress_revision,
            cursor_time,cursor_id,quota_count,usage_count,plan_count,fit_count,fragment_count,control_json,control_sha256)
           SELECT ?1,?3,?4,?5,?6,?7,'quota',0,?8,0,0,0,0,0,0,?9,?10 WHERE ${SOURCE_GUARD}
-          ON CONFLICT(participant_id,source_day) DO NOTHING`)
+          ON CONFLICT(participant_id,source_day) DO NOTHING RETURNING 1 AS applied`)
           .bind(participantId, pin.inputRevision, day.day, day.generation, day.fingerprint,
             V1_PREPARATION_METHOD_VERSION, day.deviceId, head.cursor_time, control, head.control_sha256).run();
-        if (created.meta.changes !== 1) return result("deferred");
+        // RETURNING acknowledges only the guarded head mutation. D1's change
+        // count also includes transactional preparation-counter trigger writes.
+        if (created.results.length !== 1) return result("deferred");
       }
       while (head.phase !== "complete") {
         if (pagesRun >= options.maxPages) return result("deferred");
@@ -263,12 +265,12 @@ export async function ensurePreparedV1Window(db: D1Database, pin: V1SourcePin, o
         head.control_json = canonicalJson(runs); head.control_sha256 = await sha256Hex(head.control_json);
         outputs.push(db.prepare(`UPDATE community_prepared_source_days SET phase=?7,progress_revision=?8,cursor_time=?9,cursor_id=?10,
           quota_count=?11,usage_count=?12,plan_count=?13,fit_count=?14,fragment_count=?15,control_json=?16,control_sha256=?17
-          WHERE participant_id=?1 AND source_day=?3 AND generation=?4 AND ${HEAD_GUARD}`)
+          WHERE participant_id=?1 AND source_day=?3 AND generation=?4 AND ${HEAD_GUARD} RETURNING 1 AS applied`)
           .bind(...bindings, head.phase, head.progress_revision, head.cursor_time, head.cursor_id, head.quota_count, head.usage_count,
             head.plan_count, head.fit_count, head.fragment_count, head.control_json, head.control_sha256));
         spend(outputs.length);
         const written = await db.batch(outputs);
-        if (written.at(-1)!.meta.changes !== 1) return result("deferred");
+        if (written.at(-1)!.results.length !== 1) return result("deferred");
         pagesRun += 1;
       }
       daysComplete += 1;

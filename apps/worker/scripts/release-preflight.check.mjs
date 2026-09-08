@@ -31,6 +31,9 @@ import {
   ATTRIBUTION_SCHEMA_OBJECTS,
   ATTRIBUTION_SCHEMA_PROBE_SQL,
   EXPECTED_STAGING_MIGRATIONS,
+  SCALE_SCHEMA_COLUMNS,
+  SCALE_SCHEMA_OBJECTS,
+  SCALE_SCHEMA_PROBE_SQL,
 } from "./staging-readiness-lib.mjs";
 
 const workerDirectory = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -181,6 +184,7 @@ async function standardFixture({
   schemaMismatch = null,
   schemaObjectMissing = null,
   attributionSchemaRows = [{ attribution_objects: 1, attribution_columns: 1 }],
+  scaleSchemaRows = [{ scale_objects: 1, scale_columns: 1 }],
 } = {}) {
   const calls = [];
   const primaryMigrations = await migrationNames("migrations");
@@ -236,6 +240,9 @@ async function standardFixture({
     }
     if (sql.includes("AS attribution_objects")) {
       return { status: 0, stdout: jsonRows(attributionSchemaRows) };
+    }
+    if (sql.includes("AS scale_objects")) {
+      return { status: 0, stdout: jsonRows(scaleSchemaRows) };
     }
     if (sql.includes("sqlite_master")) {
       return {
@@ -319,7 +326,7 @@ test("release preflight applies both local migration streams, checks schema, and
   assert.equal(result.checks.deletionLedgerSchemaPresent, true);
   assert.equal(result.checks.collectionControlsCoherent, true);
   assert.equal(result.checks.isolatedStateCleaned, true);
-  assert.equal(result.evidence.migrationWindow, "0001-0053");
+  assert.equal(result.evidence.migrationWindow, "0001-0056");
   assert.ok(statePath);
   await assert.rejects(access(statePath));
   assert.equal(calls.filter((args) => args.includes("migrations")).length, 4);
@@ -514,6 +521,64 @@ test("release preflight refuses absent or incomplete attribution column proof", 
   }
 });
 
+test("release preflight independently requires every scale object and exact metadata proof", async () => {
+  for (const [type, name] of SCALE_SCHEMA_OBJECTS) {
+    const { spawn } = await standardFixture({ schemaObjectMissing: `${type}:${name}` });
+    const result = await runReleasePreflight({
+      config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+      createState: disposableState, cleanupState: removeState,
+    });
+    assert.equal(result.checks.primaryMigrationsAppliedInOrder, true, name);
+    assert.equal(result.checks.requiredSchemaPresent, false, name);
+    assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"], name);
+    assert.equal(result.collectionAuthorized, false, name);
+    assert.equal(result.checks.isolatedStateCleaned, true, name);
+  }
+  for (const scaleSchemaRows of [[], [{}], [{ scale_objects: 1, scale_columns: 0 }],
+    [{ scale_objects: 0, scale_columns: 1 }], [{ scale_objects: true, scale_columns: true }],
+    [{ scale_objects: 1, scale_columns: 1 }, { scale_objects: 1, scale_columns: 1 }]]) {
+    const { calls, spawn } = await standardFixture({ scaleSchemaRows });
+    const result = await runReleasePreflight({
+      config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+      createState: disposableState, cleanupState: removeState,
+    });
+    assert.equal(result.checks.primaryMigrationsAppliedInOrder, true);
+    assert.equal(result.checks.requiredSchemaPresent, false);
+    assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"]);
+    assert.equal(result.collectionAuthorized, false);
+    assert.equal(calls.filter(args => args.includes(SCALE_SCHEMA_PROBE_SQL)).length, 1);
+    assert.equal(calls.filter(args => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
+    assert.equal(calls.some(args => args.includes("--remote") || args.includes("deploy")), false);
+  }
+});
+
+test("release preflight uses the real independent scale column proof, including the nullable predecessor publication field", async () => {
+  const database = new DatabaseSync(":memory:");
+  try {
+    for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
+      database.exec(await readFile(join(workerDirectory, "migrations", name), "utf8"));
+    }
+    for (const [table, column] of Object.entries(SCALE_SCHEMA_COLUMNS).flatMap(([table, columns]) =>
+      columns.map(column => [table, column]))) {
+      database.exec(`SAVEPOINT missing_scale_column;
+        ALTER TABLE ${table} RENAME COLUMN ${column} TO synthetic_missing_column;`);
+      const actualProbe = { ...database.prepare(SCALE_SCHEMA_PROBE_SQL).get() };
+      assert.equal(actualProbe.scale_columns, 0, `${table}.${column}`);
+      const { spawn } = await standardFixture({ scaleSchemaRows: [actualProbe] });
+      const result = await runReleasePreflight({
+        config: safeConfig(), workerDirectory, wrangler: "fake-wrangler", spawn,
+        createState: disposableState, cleanupState: removeState,
+      });
+      assert.equal(result.checks.requiredSchemaPresent, false, `${table}.${column}`);
+      assert.deepEqual(result.blockers, ["LOCAL_SCHEMA_INCOMPLETE"], `${table}.${column}`);
+      assert.equal(result.collectionAuthorized, false);
+      database.exec("ROLLBACK TO missing_scale_column; RELEASE missing_scale_column;");
+    }
+  } finally {
+    database.close();
+  }
+});
+
 test("release preflight requires every staged checkpoint column without authorizing collection", async () => {
   const database = new DatabaseSync(":memory:");
   try {
@@ -593,6 +658,9 @@ test("missing deletion-ledger schema blocks the gate with a separate blocker", a
         attribution_objects: 1,
         attribution_columns: 1,
       }]) };
+    }
+    if (sql.includes("AS scale_objects")) {
+      return { status: 0, stdout: jsonRows([{ scale_objects: 1, scale_columns: 1 }]) };
     }
     if (sql.includes("sqlite_master")) {
       return {

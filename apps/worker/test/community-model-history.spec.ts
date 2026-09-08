@@ -11,6 +11,7 @@ import { createUploadAuthorizationMaterial, storeUploadAuthorization, claimUploa
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from "@app-usagemonitor/telemetry-contract";
 import { sha256Hex } from "../src/crypto";
+import { loadV1SourcePin } from "../src/telemetry-v1-source-selection";
 
 const db = () => env.USAGE_MONITOR_DB;
 const DAY = MODEL_HISTORY_TEST_DAY, NOW = Date.parse("2026-09-06T12:00:00.000Z");
@@ -205,17 +206,32 @@ describe("historical model warmer and retrospective publication", () => {
     expect(row!.payload_json).not.toContain("history-b");
   });
 
-  it("defers an incomplete physical census rather than treating its prefix as an empty cohort", async () => {
+  it("does not let unrelated physical participants exhaust the contributor census", async () => {
     await db().prepare(`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1025)
       INSERT INTO participants(id,access_token_id,access_token_hash,recovery_token_id,recovery_token_hash,
         state,consent_version,consented_at,created_at)
       SELECT 'history-census-'||printf('%04d',x),'access-'||x,zeroblob(32),'recovery-'||x,zeroblob(32),
         'active','privacy-safe-telemetry-v0.1',?,? FROM n`).bind(TIME, TIME).run();
     const run = await warm(40);
-    expect(run.progress).toEqual({ status: "deferred", day: DAY, requiredAccounts: 0, resolvedAccounts: 0, publishedDays: 0 });
+    expect(run.progress).toEqual({ status: "deferred", day: DAY, requiredAccounts: 0, resolvedAccounts: 0, publishedDays: 1 });
+    expect(run.observation.queries.filter(sql => sql === MODEL_HISTORY_CENSUS_SQL)).toHaveLength(1);
+    expect(JSON.parse((await dayRow())!.payload_json)).toMatchObject({ fittedParticipantCount: 0,
+      unsupportedSourceParticipantCount: 0, refusedParticipantCount: 0, values: [] });
+  });
+
+  it("defers an incomplete contributor census rather than publishing its prefix", async () => {
+    // Real synthetic source/grant fixtures exercise contributor-first admission,
+    // including the lookahead beyond the retained sixteen-page census bound.
+    for (let account = 0; account < 1025; account++) {
+      await participant(`history-overflow-${String(account).padStart(4, "0")}`);
+    }
+    const run = await warm(40);
+    expect(run.progress).toEqual({ status: "deferred", day: DAY, requiredAccounts: 1024,
+      resolvedAccounts: 0, publishedDays: 0 });
     expect(run.observation.queries.filter(sql => sql === MODEL_HISTORY_CENSUS_SQL)).toHaveLength(16);
     expect(await dayRow()).toBeNull();
-  });
+    expect(await db().prepare("SELECT COUNT(*) AS n FROM community_model_history_work").first()).toEqual({ n: 0 });
+  }, 30_000);
 
   it("preserves a current-method forward snapshot, including a writer racing historical publication", async () => {
     await participant("history-forward"); await cache("history-forward");
@@ -268,6 +284,84 @@ describe("historical model warmer and retrospective publication", () => {
       .toEqual({ n: 3 });
     expect(JSON.parse((await dayRow())!.payload_json)).toMatchObject({ fittedParticipantCount: 0, refusedParticipantCount: 3 });
     expect(run.meter.queriesUsed).toBeLessThanOrEqual(888);
+  });
+
+  it("rebinds more than sixteen cheap historical jobs within the shared query and time budget", async () => {
+    const accounts = 24;
+    for (let account = 0; account < accounts; account++) {
+      const fixture = await participant(`history-cheap-rebind-${String(account).padStart(2, "0")}`);
+      const pin = await cache(fixture.participantId);
+      const legacy = await loadV1SourcePin(db(), pin.scope, { legacyInputRevisions: [pin.inputRevision!] });
+      const fingerprint = legacy.legacyFingerprints![String(pin.inputRevision)]!;
+      // A pre-upgrade terminal result needs the exact legacy digest bridge
+      // after a later upload, even though its closed-window evidence is unchanged.
+      await db().prepare(`UPDATE community_model_history_results SET input_fingerprint=?,result_json=?
+        WHERE participant_id=? AND day=?`)
+        .bind(fingerprint, JSON.stringify(ready(fingerprint)), fixture.participantId, DAY).run();
+      await insertModelHistoryRecords(fixture, "after-window", [{ stream: "quota",
+        observedAt: "2026-09-06T12:00:00.000Z", usedPercent: 6, resetsAt: "2026-09-08T00:00:00.000Z" }]);
+    }
+    const observation = observed(async sql => {
+      if (/telemetry_v1_records|telemetry_v1_quota_fit_rows|community_prepared_/u.test(sql)) {
+        throw new Error("historical terminal rebinding must not reacquire evidence");
+      }
+    });
+    const startedAt = Date.now(), deadlineMs = startedAt + 40_000;
+    const run = await warm(900, observation, NOW, deadlineMs);
+    expect(run.progress).toMatchObject({ day: DAY, requiredAccounts: accounts,
+      resolvedAccounts: accounts, publishedDays: 1 });
+    expect(observation.queries.filter(sql => sql.includes("INSERT INTO community_model_history_results")))
+      .toHaveLength(accounts);
+    expect(run.meter.queriesUsed).toBeLessThanOrEqual(888);
+    expect(Date.now()).toBeLessThan(deadlineMs);
+    expect(await db().prepare("SELECT COUNT(*) AS n FROM community_model_history_work").first()).toEqual({ n: 0 });
+    expect(JSON.parse((await dayRow())!.payload_json)).toMatchObject({ fittedParticipantCount: accounts,
+      values: [["gpt-6-astra", 1000, accounts]] });
+  });
+
+  it.each([16, 31])("preserves completed cohort progress when the final recheck has only %i queries left", async headroom => {
+    const accounts = 65;
+    for (let account = 0; account < accounts; account++) {
+      const fixture = await participant(`history-final-budget-${String(account).padStart(2, "0")}`);
+      const pin = await cache(fixture.participantId);
+      if (account !== accounts - 1) continue;
+      const legacy = await loadV1SourcePin(db(), pin.scope, { legacyInputRevisions: [pin.inputRevision!] });
+      const fingerprint = legacy.legacyFingerprints![String(pin.inputRevision)]!;
+      await db().prepare(`UPDATE community_model_history_results SET input_fingerprint=?,result_json=?
+        WHERE participant_id=? AND day=?`)
+        .bind(fingerprint, JSON.stringify(ready(fingerprint)), fixture.participantId, DAY).run();
+      await insertModelHistoryRecords(fixture, "after-window", [{ stream: "quota",
+        observedAt: "2026-09-06T12:00:00.000Z", usedPercent: 6, resetsAt: "2026-09-08T00:00:00.000Z" }]);
+    }
+    const meter = createD1InvocationBudget(100);
+    let reachedBoundary = false;
+    const observation = observed(async (sql, moment) => {
+      if (reachedBoundary || moment !== "after" || !sql.includes("INSERT INTO community_model_history_results")) return;
+      reachedBoundary = true;
+      // Reproduce a busy pass without enough budget for the full bounded
+      // census plus mandatory headroom. These statements consume the real
+      // shared meter, not a mock allowance; publication waits for the next pass.
+      const remainingWork = meter.remainingQueries - headroom;
+      expect(remainingWork).toBeGreaterThan(0);
+      await database.batch(Array.from({ length: remainingWork },
+        () => database.prepare("SELECT 1 AS synthetic_shared_budget_work")));
+      expect(meter.remainingQueries).toBe(headroom);
+    });
+    const database = meter.wrap(observation.database);
+    const progress = await warmCommunityModelHistory(database, NOW,
+      { meter, deadlineMs: Date.now() + 40_000, maintenanceLease: LEASE });
+    expect(reachedBoundary).toBe(true);
+    expect(progress).toEqual({ status: "deferred", day: DAY, requiredAccounts: accounts,
+      resolvedAccounts: accounts, publishedDays: 0 });
+    expect(meter.queriesUsed).toBe(observation.queries.length);
+    expect(meter.remainingQueries).toBe(headroom);
+    expect(observation.queries.filter(sql => sql === MODEL_HISTORY_CENSUS_SQL)).toHaveLength(2);
+    expect(await dayRow()).toBeNull();
+    const next = await warm();
+    expect(next.progress).toMatchObject({ day: DAY, requiredAccounts: accounts,
+      resolvedAccounts: accounts, publishedDays: 1 });
+    expect(next.observation.queries.some(sql => /community_model_history_work|community_prepared_/u.test(sql)
+      && /INSERT|UPDATE/u.test(sql))).toBe(false);
   });
 
   it("rotates all accounts across three-minute history-priority slots under a tight budget", async () => {

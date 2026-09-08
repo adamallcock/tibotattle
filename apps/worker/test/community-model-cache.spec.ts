@@ -30,6 +30,7 @@ async function fixture() {
     CREATE TABLE community_snapshot_mutation_control(singleton_id INTEGER PRIMARY KEY,mutation_epoch INTEGER NOT NULL);
     INSERT INTO community_snapshot_mutation_control VALUES(1,1);
     CREATE TABLE community_analytical_input_versions(participant_id TEXT PRIMARY KEY,revision INTEGER);
+    CREATE TABLE community_current_analysis_queue(id INTEGER PRIMARY KEY,participant_id TEXT UNIQUE);
     CREATE TABLE telemetry_contributions(id TEXT PRIMARY KEY,participant_id TEXT,status TEXT,transport_schema_version TEXT,created_at TEXT);
     CREATE INDEX telemetry_contributions_participant_created ON telemetry_contributions(participant_id,created_at);
     CREATE TABLE telemetry_v1_chunks(id TEXT PRIMARY KEY,participant_id TEXT,device_id TEXT,stream TEXT,chunk_day TEXT,chunk_seq INTEGER,superseded_at TEXT);
@@ -47,6 +48,7 @@ async function participant(id: string, source: "v1" | "legacy" | "mixed" | "v1.1
   await db().batch([
     db().prepare("INSERT INTO participants VALUES(?,?)").bind(id,state),
     db().prepare("INSERT INTO community_analytical_input_versions VALUES(?,1)").bind(id),
+    db().prepare("INSERT INTO community_current_analysis_queue(participant_id) VALUES(?)").bind(id),
   ]);
   if (["v1", "mixed", "v1.1"].includes(source)) await db().prepare("INSERT INTO telemetry_v1_chunks VALUES(?,?,'device','quota','2026-08-01',0,NULL)").bind(`chunk:${id}`,id).run();
   if (["legacy", "mixed", "v1.1"].includes(source)) await db().prepare("INSERT INTO telemetry_contributions VALUES(?,?,'accepted','telemetry-contribution-v0.2','2026-08-01')").bind(`legacy:${id}`,id).run();
@@ -107,7 +109,7 @@ describe("bounded SELECT-only community composition cache", () => {
     const result=await readCachedCommunityModelCompositions(database,NOW,{budget:shared,pageSize:3});
     expect(result).toMatchObject({v1ParticipantCount:4,unsupportedSourceParticipantCount:2,refusedParticipantCount:1,storeAvailable:true});
     expect(result?.compositions.map(row=>row.participantId)).toEqual(["a-ready","e-disjoint","f-successor"]);
-    expect(queries).toHaveLength(5); expect(shared.remainingQueries).toBe(13);
+    expect(queries).toHaveLength(4); expect(shared.remainingQueries).toBe(14);
   });
 
   it("requires final epoch proof even for an empty or wholly unsupported cohort", async () => {
@@ -181,24 +183,21 @@ describe("bounded SELECT-only community composition cache", () => {
     await db().prepare("UPDATE community_model_composition_cache SET composition_json=?").bind(oversized).run();
     const row=(await db().prepare(CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL).bind("",65,FROM+"T00:00:00.000Z",16*1024).all<{composition_json:string|null}>()).results[0];
     expect(row?.composition_json).toBeNull();expect(await readCachedCommunityModelCompositions(db(),NOW)).toBeNull();
-    await cache("a");await participant("b");await cache("b");await participant("c","none");
+    await cache("a");await participant("b");await cache("b");await participant("c");await cache("c");
     expect(await readCachedCommunityModelCompositions(db(),NOW,{pageSize:1,maxPages:2})).toBeNull();
     expect(await readCachedCommunityModelCompositions(db(),NOW,{maxBytes:1})).toBeNull();
     expect(await readCachedCommunityModelCompositions(db(),NOW,{budget:budget(2)})).toBeNull();
-    expect((await readCachedCommunityModelCompositions(db(),NOW,{pageSize:1,maxPages:3}))?.compositions).toHaveLength(2);
+    expect((await readCachedCommunityModelCompositions(db(),NOW,{pageSize:1,maxPages:3}))?.compositions).toHaveLength(3);
   });
 
-  it("bounds physical noncontributor prefixes and observes the exact 18-statement maximum", async () => {
+  it("excludes physical noncontributor prefixes before the eligible-account page limit", async () => {
     await fixture();
     await db().prepare(`WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1025)
       INSERT INTO participants SELECT printf('participant-%04d',x),'active' FROM n`).run();
-    let observer=monitored(); const exhausted=budget();
-    expect(await readCachedCommunityModelCompositions(observer.database,NOW,{budget:exhausted})).toBeNull();
-    expect(observer.queries).toHaveLength(17);expect(exhausted.remainingQueries).toBe(1);
-    await db().prepare("DELETE FROM participants WHERE id='participant-1025'").run();
-    observer=monitored();const complete=budget();
+    await db().prepare("INSERT INTO community_current_analysis_queue(participant_id) SELECT id FROM participants").run();
+    const observer=monitored(),complete=budget();
     expect((await readCachedCommunityModelCompositions(observer.database,NOW,{budget:complete}))?.compositions).toEqual([]);
-    expect(observer.queries).toHaveLength(COMMUNITY_MODEL_CACHE_MAX_QUERIES);expect(complete.remainingQueries).toBe(0);
+    expect(observer.queries).toHaveLength(3);expect(complete.remainingQueries).toBe(COMMUNITY_MODEL_CACHE_MAX_QUERIES-3);
   });
 
   it("does not read a large unrelated source history before restricting the physical page", async () => {
@@ -254,11 +253,11 @@ describe("bounded SELECT-only community composition cache", () => {
     const plan=(await db().prepare("EXPLAIN QUERY PLAN "+CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL)
       .bind("synthetic-cursor",65,FROM+"T00:00:00.000Z",16*1024).all<{detail:string}>()).results.map(row=>row.detail);
     expect(plan.some(line=>line.includes("MATERIALIZE participant_page"))).toBe(true);
-    expect(plan.some(line=>/SEARCH participants .*\(id>\?\)/u.test(line))).toBe(true);
+    expect(plan.some(line=>/SEARCH q .*\(participant_id>\?\)/u.test(line)),plan.join("\n")).toBe(true);
     for(const alias of ["c","h","r","o","versions","cache"]){expect(plan.some(line=>new RegExp(`SEARCH ${alias} USING (?:COVERING )?INDEX`).test(line)),plan.join("\n")).toBe(true);}
     expect(plan.filter(line=>/SCAN (?:participants|c|h|r|o|versions|cache)\b/u.test(line))).toEqual([]);
     expect(CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL).not.toContain("telemetry_analytical_");
-    expect(CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL.indexOf("LIMIT ?2")).toBeLessThan(CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL.indexOf("FROM telemetry_contributions"));
+    expect(CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL.indexOf("LIMIT ?2")).toBeLessThan(CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL.indexOf("), sources AS MATERIALIZED"));
     const result=await readCachedCommunityModelCompositions(db(),NOW,{budget:budget()});
     expect(result?.compositions).toEqual([]);
   });

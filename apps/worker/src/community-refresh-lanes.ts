@@ -16,6 +16,22 @@ export function communityRefreshLaneMethod(lane: CommunityRefreshLane): string {
     : communityAnalysisCacheVersion();
 }
 
+// Only the current lane requires 0054. Daily callers can still inspect their
+// own receipt before that migration; current callers fail closed if it is
+// missing. Indexed queue metadata replaces the physical-participant census.
+function currentQueuePending(day: string, method: string): string {
+  return `(EXISTS (SELECT 1 FROM community_current_analysis_queue
+      INDEXED BY community_current_analysis_queue_ready WHERE pending=1 LIMIT 1)
+    OR EXISTS (SELECT 1 FROM community_current_analysis_queue_state s WHERE s.singleton_id=1 AND (
+      EXISTS (SELECT 1 FROM community_current_analysis_queue q
+        WHERE q.window_generation<s.window_generation LIMIT 1)
+      OR EXISTS (SELECT 1 FROM community_current_analysis_queue q
+        WHERE q.window_generation>s.window_generation LIMIT 1)
+      OR ((s.utc_day IS NOT ${day} OR s.method_version IS NOT ${method})
+        AND EXISTS (SELECT 1 FROM community_current_analysis_queue LIMIT 1))))
+    OR NOT EXISTS (SELECT 1 FROM community_current_analysis_queue_state WHERE singleton_id=1))`;
+}
+
 /** One indexed metadata read on a no-change invocation. Completion never
  * depends on time elapsed and cannot skip a newly queued correction. */
 export async function readCommunityRefreshLane(db: D1Database, lane: CommunityRefreshLane,
@@ -23,9 +39,10 @@ export async function readCommunityRefreshLane(db: D1Database, lane: CommunityRe
   const day = new Date(nowMs).toISOString().slice(0, 10);
   const method = communityRefreshLaneMethod(lane);
   const row = await db.prepare(`SELECT s.mutation_epoch,l.source_epoch,l.utc_day,l.method_version,l.state,
-      CASE WHEN ?1='daily' THEN EXISTS(SELECT 1 FROM community_daily_aggregate_rebuilds LIMIT 1) ELSE 0 END AS pending
+      ${lane === "current" ? currentQueuePending("?2", "?3")
+        : "EXISTS(SELECT 1 FROM community_daily_aggregate_rebuilds LIMIT 1)"} AS pending
     FROM community_snapshot_mutation_control s LEFT JOIN community_refresh_lanes l ON l.lane=?1
-    WHERE s.singleton_id=1`).bind(lane).first<{
+    WHERE s.singleton_id=1`).bind(...(lane === "current" ? [lane, day, method] : [lane])).first<{
       mutation_epoch: number; source_epoch: number | null; utc_day: string | null;
       method_version: string | null; state: string | null; pending: number;
     }>();
@@ -49,6 +66,7 @@ export async function recordCommunityRefreshLane(db: D1Database, pin: CommunityR
       AND (?8 IS NULL OR EXISTS(SELECT 1 FROM retention_state WHERE singleton=1
         AND maintenance_lease_token=?8 AND maintenance_lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')))
       AND (?1!='daily' OR ?5!='complete' OR NOT EXISTS(SELECT 1 FROM community_daily_aggregate_rebuilds LIMIT 1))
+      ${pin.lane === "current" ? `AND (?5!='complete' OR NOT ${currentQueuePending("?3", "?4")})` : ""}
     ON CONFLICT(lane) DO UPDATE SET source_epoch=excluded.source_epoch,utc_day=excluded.utc_day,
       method_version=excluded.method_version,state=excluded.state,updated_at=excluded.updated_at,
       completed_at=excluded.completed_at,

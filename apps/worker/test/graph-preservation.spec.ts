@@ -552,25 +552,43 @@ describe("preserved graph successor publisher on local D1", () => {
     expect(await cache()).toEqual(previous); expect(await modelRows()).toEqual(priorDays); expect(await control()).toEqual(source);
   });
 
-  it("an append immediately before publication fences both replacement writes while retaining the previous snapshot", async () => {
+  it.each(["append", "withdrawal"])("a captured replacement distinguishes %s immediately before final publication", async change => {
     const { fixture } = await seedInput(); await seedPublication(); await seedModelDay();
     await insertTelemetryV1Chunk(db(), await prepareChunk(fixture, { sequence: 1 })); await warmSource(NOW + 60_000);
     const racedAppend = await prepareChunk(fixture, { sequence: 2 });
-    const previous = await cache(), priorDays = await modelRows(), source = await control();
+    const source = await control(),finalStatements=new WeakSet<D1PreparedStatement>();
     let batchCalls = 0;
     const database = new Proxy(db(), { get(target, property) {
+      if(property==="prepare")return(sql:string)=>{
+        const statement=target.prepare(sql);
+        if(!sql.includes("INSERT INTO admin_community_allowance_preview_cache"))return statement;
+        return new Proxy(statement,{get(item,key){
+          if(key==="bind")return(...values:unknown[])=>{const bound=item.bind(...values);finalStatements.add(bound);return bound;};
+          const value:unknown=Reflect.get(item,key);return typeof value==="function"?value.bind(item):value;
+        }});
+      };
       if (property === "batch") return async (statements: D1PreparedStatement[]) => {
-        batchCalls += 1; expect(statements).toHaveLength(2);
-        await insertTelemetryV1Chunk(db(), racedAppend);
+        if(statements.some(statement=>finalStatements.has(statement))) {
+          batchCalls += 1; expect(statements).toHaveLength(3);
+          if(change==="append")await insertTelemetryV1Chunk(db(), racedAppend);
+          else await db().prepare("UPDATE participants SET state='deleting' WHERE id=?").bind(PARTICIPANT).run();
+        }
         return target.batch(statements);
       };
       const value = Reflect.get(target, property, target);
       return typeof value === "function" ? value.bind(target) : value;
     } });
     expect(await warmAdminCommunityAllowancePreviewCache(database, NOW + 60_000, recovery()))
-      .toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" });
-    expect(batchCalls).toBe(1); expect((await control()).mutation_epoch).toBe(source.mutation_epoch + 1);
-    expect(await cache()).toEqual(previous); expect(await modelRows()).toEqual(priorDays);
-    expect((await publicGraph()).graph?.breakdowns.generatedAt).toBe(new Date(NOW).toISOString());
+      .toEqual({ code: change==="append"?"ALLOWANCE_PREVIEW_CACHE_REFRESHED":"ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" });
+    expect(batchCalls).toBe(1);
+    if(change==="append") {
+      expect((await control()).mutation_epoch).toBe(source.mutation_epoch + 1);
+      expect((await control()).graph_invalidation_epoch).toBe(source.graph_invalidation_epoch);
+      expect(await cache()).toMatchObject({source_mutation_epoch:source.mutation_epoch,generated_at:new Date(NOW+60_000).toISOString()});
+      expect((await publicGraph()).graph?.breakdowns.generatedAt).toBe(new Date(NOW+60_000).toISOString());
+    } else {
+      expect(await cache()).toBeNull();expect(await modelRows()).toEqual([]);
+      expect((await publicGraph()).graph).toBeNull();
+    }
   });
 });

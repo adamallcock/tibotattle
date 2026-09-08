@@ -18,6 +18,8 @@ import { createUploadAuthorizationMaterial, storeUploadAuthorization, claimUploa
 import { activateTelemetryV11Domain, createTelemetryV11DomainPredecessor } from "../src/telemetry-v11-domain";
 import { telemetryV11DomainManifestDigestInput, type TelemetryV11DomainManifest } from "@app-usagemonitor/telemetry-contract";
 import { sha256Hex } from "../src/crypto";
+import { beginCommunityAnalysisWork, type CommunityAnalysisWorkIdentity } from "../src/community-analysis-work";
+import { V1_QUOTA_ACQUISITION_VERSION } from "../src/quota-analysis-v1-reader";
 
 const db = () => env.USAGE_MONITOR_DB;
 const NOW = Date.parse("2026-09-01T12:00:00.000Z"), DAY = "2026-08-01";
@@ -159,6 +161,31 @@ async function warm(queries=900,nowMs=NOW,observation=observer()) {
 }
 
 describe("scheduled analysis warmer and atomic cache promotion",()=>{
+  it("forward-migrates populated 0053 without changing sources, caches or an unfinished raw checkpoint",async()=>{
+    const all=(env as Env & {TEST_MIGRATIONS:D1Migration[]}).TEST_MIGRATIONS;
+    await reset(); await applyD1Migrations(db(),all.filter(migration=>migration.name<"0054"));
+    await db().prepare("UPDATE retention_state SET maintenance_lease_token=?,maintenance_lease_expires_at='2027-01-01T00:00:00.000Z'")
+      .bind(LEASE).run();
+    await seed("migrated-participant",9); const pin=await identity("migrated-participant");
+    expect(await publishCommunityAnalysisCaches(db(),pin,[{source:"v1",analysis:refusal}],refusal,LEASE)).toBe(true);
+    const work:CommunityAnalysisWorkIdentity={participantId:pin.participantId,inputRevision:pin.sourcePin.inputRevision!,
+      inputFingerprint:pin.sourcePin.fingerprint,sourceKind:"v1",sourceMethodVersion:V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+      fixedNow:new Date(NOW).toISOString(),observedAtCutoff:`${FROM}T00:00:00.000Z`,
+      resetsAtCutoff:new Date(Date.parse(`${FROM}T00:00:00.000Z`)+7*86_400_000).toISOString(),windowMinutes:10080,maxQuotaRows:60000};
+    expect((await beginCommunityAnalysisWork(db(),work,{version:V1_QUOTA_ACQUISITION_VERSION,phase:"plan",
+      cursor:{observedAt:work.observedAtCutoff,resetsAt:work.resetsAtCutoff,id:0},planTime:null,reset:null},allocation())).status).toBe("ready");
+    const tables=["telemetry_v1_chunks","telemetry_v1_records","community_allowance_fit_cache",
+      "community_model_composition_cache","community_analysis_work","participants"];
+    const snapshot=()=>Promise.all(tables.map(async table=>(await db().prepare(`SELECT * FROM ${table}`).all()).results));
+    const before=await snapshot();
+    await applyD1Migrations(db(),all);
+    expect(await snapshot()).toEqual(before);
+    expect(await db().prepare("SELECT participant_id,pending FROM community_current_analysis_queue").all().then(value=>value.results))
+      .toEqual([{participant_id:"migrated-participant",pending:1}]);
+    expect((await warm()).result).toEqual({status:"complete",visited:1,published:0,resumed:0});
+    expect(await snapshot()).toEqual(before);
+  });
+
   it("uses one generation receipt without scanning unchanged accounts and rebuilds only the changed account",async()=>{
     for (let n=0;n<5;n++) await seed(`incremental-${n}`,9);
     await warm();await warm();
@@ -174,7 +201,7 @@ describe("scheduled analysis warmer and atomic cache promotion",()=>{
     await db().prepare("UPDATE telemetry_v1_chunks SET chunk_digest=? WHERE participant_id='incremental-2'")
       .bind("f".repeat(64)).run();
     const changed=await warm();
-    expect(changed.result).toEqual({status:"complete",visited:5,published:1,resumed:1});
+    expect(changed.result).toEqual({status:"complete",visited:1,published:1,resumed:1});
     const unchanged=(rows:Awaited<ReturnType<typeof cacheRows>>)=>rows.map(table=>table.filter(row=>row.participant_id!=="incremental-2"));
     expect(unchanged(await cacheRows())).toEqual(unchanged(before));
   });
@@ -412,15 +439,55 @@ describe("scheduled analysis warmer and atomic cache promotion",()=>{
       .toEqual({expires:"2027-01-01T00:00:00.000Z"});
   });
 
-  it("rotates bounded work fairly and leaves a spent invocation unchanged",async()=>{
+  it("uses available budget beyond four accounts and leaves a spent invocation unchanged",async()=>{
     for(let n=0;n<5;n++)await seed(`warmer-${n}`,1);
-    const first=await warm();expect(first.result).toMatchObject({visited:4,resumed:4,published:4,status:"deferred"});
-    // The next rotation checks current entries without spending its work slots.
-    const second=await warm(900,NOW+60_000);expect(second.result).toMatchObject({visited:5,resumed:1,published:1,status:"complete"});
+    const first=await warm();expect(first.result).toMatchObject({visited:5,resumed:5,published:5,status:"complete"});
+    // Completion stays query-only and does not revisit the five healthy jobs.
+    const second=await warm(900,NOW+60_000);expect(second.result).toMatchObject({visited:0,resumed:0,published:0,status:"complete"});
     expect((await cacheRows()).map(rows=>rows.length)).toEqual([5,5]);
     const prior=await cacheRows(),spent=await warm(12);
     expect(spent.result).toMatchObject({status:"deferred",visited:0,published:0});expect(spent.meter.queriesUsed).toBe(0);
     expect(await cacheRows()).toEqual(prior);
+  });
+
+  it("finishes cold accounts when the first hot account changes before its atomic acknowledgement",async()=>{
+    await seed("hot-current-account",9);
+    await seed("cold-current-account-a",9); await seed("cold-current-account-b",9);
+    let changed=false;
+    const observed=observer(async(sql,moment)=>{
+      if(changed||moment!=="before"||!sql.includes("INSERT INTO community_allowance_fit_cache"))return;
+      changed=true;
+      await db().prepare("UPDATE telemetry_v1_chunks SET chunk_digest=? WHERE participant_id='hot-current-account'")
+        .bind("e".repeat(64)).run();
+    });
+    const run=await warm(900,NOW,observed);
+    expect(changed).toBe(true);
+    expect(run.result).toEqual({status:"deferred",visited:3,published:2,resumed:3});
+    expect((await cacheRows()).map(rows=>rows.map(row=>row.participant_id)))
+      .toEqual([["cold-current-account-a","cold-current-account-b"],["cold-current-account-a","cold-current-account-b"]]);
+    const work=await db().prepare(`SELECT w.input_revision,v.revision AS live_revision FROM community_analysis_work w
+      JOIN community_analytical_input_versions v ON v.participant_id=w.participant_id
+      WHERE w.participant_id='hot-current-account'`).first<{input_revision:number;live_revision:number}>();
+    expect(work!.input_revision).toBeLessThan(work!.live_revision);
+    expect(await db().prepare("SELECT participant_id FROM community_current_analysis_queue WHERE pending=1").all()
+      .then(result=>result.results)).toEqual([{participant_id:"hot-current-account"}]);
+  });
+
+  it("cannot acknowledge cache damage racing an already-valid cache probe",async()=>{
+    await seed(); await warm();
+    // A harmless representation change queues a validation-only attempt.
+    await db().prepare("UPDATE community_allowance_fit_cache SET fits_json=fits_json||' '").run();
+    let damaged=false;
+    const observed=observer(async(sql,moment)=>{
+      if(damaged||moment!=="before"||!sql.includes("SET pending=0,completed_day=?1,completed_method=?2"))return;
+      damaged=true; await db().prepare("UPDATE community_allowance_fit_cache SET fits_json='{}'").run();
+    });
+    expect((await warm(900,NOW,observed)).result).toEqual({status:"deferred",visited:1,published:0,resumed:0});
+    expect(damaged).toBe(true);
+    expect((await db().prepare("SELECT pending FROM community_current_analysis_queue").first())?.pending).toBe(1);
+    expect(await communityAnalysisCachesCurrent(db(),await identity())).toBe(false);
+    expect((await warm()).result).toMatchObject({status:"complete",published:1});
+    expect(await communityAnalysisCachesCurrent(db(),await identity())).toBe(true);
   });
 
   it("reaches both unfinished accounts beyond a thirteen-account current prefix",async()=>{
@@ -442,7 +509,7 @@ describe("scheduled analysis warmer and atomic cache promotion",()=>{
     expect(next.observation.raw()).toEqual([]);expect(await cacheRows()).toEqual(after);
   });
 
-  it("keeps the four stale-analysis ceiling after skipping a current prefix and rotates remaining work",async()=>{
+  it("uses the remaining budget for every small stale job after acknowledging a current prefix",async()=>{
     const ids=Array.from({length:12},(_,n)=>`useful-work-${String(n).padStart(2,"0")}`);
     for(const id of ids)await seed(id,1);
     const start=Math.floor(NOW/60_000)%ids.length;
@@ -450,11 +517,11 @@ describe("scheduled analysis warmer and atomic cache promotion",()=>{
     for(const id of order.slice(0,6))expect(await publishCommunityAnalysisCaches(db(),await identity(id),
       [{source:"v1",analysis:refusal}],refusal,LEASE)).toBe(true);
     const first=await warm();
-    expect(first.result).toMatchObject({status:"deferred",visited:10,resumed:4,published:4});
+    expect(first.result).toMatchObject({status:"complete",visited:12,resumed:6,published:6});
     expect((await db().prepare("SELECT participant_id FROM community_analysis_work ORDER BY participant_id").all()).results)
-      .toEqual(order.slice(6,10).sort().map(participant_id=>({participant_id})));
+      .toEqual(order.slice(6).sort().map(participant_id=>({participant_id})));
     const second=await warm(900,NOW+60_000);
-    expect(second.result).toMatchObject({status:"complete",visited:12,resumed:2,published:2});
+    expect(second.result).toMatchObject({status:"complete",visited:0,resumed:0,published:0});
     expect((await cacheRows()).map(rows=>rows.length)).toEqual([12,12]);
   });
 
@@ -472,15 +539,16 @@ describe("scheduled analysis warmer and atomic cache promotion",()=>{
 
   it("uses the current-chunk and time-range indexes while preserving legacy overlap parity",async()=>{
     const fixture=await seed();await legacy(fixture,true);
-    const candidateSql=(await warm(20)).observation.queries.find(sql=>sql.includes("SELECT s.id AS participant_id"))!;
+    const candidateSql=(await warm()).observation.queries.find(sql=>sql.startsWith("SELECT EXISTS (")
+      && sql.includes("telemetry_records r INDEXED BY telemetry_records_participant_time"))!;
     expect(candidateSql).toBeDefined();
     for(const [sql,bindings]of[
       [CACHED_COMMUNITY_ALLOWANCE_PAGE_SQL,["",65]],
       [CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL,["",65,`${FROM}T00:00:00.000Z`,16*1024]],
-      [candidateSql,["",65,`${FROM}T00:00:00.000Z`]],
+      [candidateSql,[fixture.participantId,`${FROM}T00:00:00.000Z`]],
     ] as const){
       const plan=(await db().prepare("EXPLAIN QUERY PLAN "+sql).bind(...bindings).all<{detail:string}>()).results.map(row=>row.detail);
-      expect(plan.some(row=>row.includes("SEARCH c USING INDEX telemetry_v1_chunks_current_identity")),plan.join("\n")).toBe(true);
+      if(sql!==candidateSql)expect(plan.some(row=>row.includes("SEARCH c USING INDEX telemetry_v1_chunks_current_identity")),plan.join("\n")).toBe(true);
       if(sql===CACHED_COMMUNITY_ALLOWANCE_PAGE_SQL)continue;
       expect(plan.some(row=>row.includes("telemetry_records_participant_time")&&row.includes("participant_id=? AND observed_at>?")),plan.join("\n")).toBe(true);
       expect(plan.some(row=>row.includes("telemetry_contribution_occurrences_record")&&row.includes("occurrence_id=?")),plan.join("\n")).toBe(true);
@@ -503,12 +571,12 @@ describe("scheduled analysis warmer and atomic cache promotion",()=>{
       expect(prior?.overlap).toBe(expected);
       const cached=(await db().prepare(CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL)
         .bind("",65,`${FROM}T00:00:00.000Z`,16*1024).all<{legacy_overlap:number}>()).results[0]!;
-      const candidate=(await db().prepare(candidateSql).bind("",65,`${FROM}T00:00:00.000Z`).all<{legacy_overlap:number}>()).results[0]!;
+      const candidate=(await db().prepare(candidateSql).bind(fixture.participantId,`${FROM}T00:00:00.000Z`).all<{legacy_overlap:number}>()).results[0]!;
       expect([cached.legacy_overlap,candidate.legacy_overlap]).toEqual([prior!.overlap,prior!.overlap]);
     }
   });
 
-  it("reads 16 complete participant caches before sizing a 500-query daily publication phase",async()=>{
+  it("reads all 16 captured participants before sizing a 500-query daily publication phase",async()=>{
     for(let n=0;n<16;n++)await seed(`daily-budget-${n.toString().padStart(2,"0")}`,1);
     for(let pass=0;pass<4;pass++)await warm(900,NOW+pass*4*60_000);
     expect((await cacheRows()).map(rows=>rows.length)).toEqual([16,16]);
@@ -518,16 +586,24 @@ describe("scheduled analysis warmer and atomic cache promotion",()=>{
     expect(queued).toHaveLength(1);
     const target="daily-budget-15";
     await db().prepare("UPDATE community_allowance_fit_cache SET fits_json='{}' WHERE participant_id=?").bind(target).run();
+    const missingCaches=await cacheRows();
     const missing=observer(),missingMeter=createD1InvocationBudget(500),missingBudget=allocation(500);
     expect(await rebuildPendingCommunityDailyAggregates(missingMeter.wrap(missing.database),NOW,24,undefined,
       {mode:"cache-only",budget:missingBudget})).toMatchObject({processed:0,deferred:true});
-    expect(missing.queries.filter(sql=>/^\s*(?:INSERT|UPDATE|DELETE|REPLACE)\b/u.test(sql))).toEqual([]);
+    // Incomplete immutable capture may stage derived publication metadata, but
+    // must not mutate telemetry, calculated caches or any daily publication.
+    const mutations=missing.queries.flatMap(sql=>[...sql.matchAll(/\b(?:INSERT INTO|UPDATE|DELETE FROM|REPLACE INTO)\s+([a-z_]+)/gu)]
+      .map(match=>match[1]));
+    expect(mutations.length).toBeGreaterThan(0);
+    expect([...new Set(mutations)].sort()).toEqual(["community_publication_generation","community_publication_members"]);
+    expect(missing.raw()).toEqual([]);
+    expect(await cacheRows()).toEqual(missingCaches);
     expect((await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds").all()).results).toEqual(queued);
     await db().prepare("UPDATE community_allowance_fit_cache SET fits_json='[]' WHERE participant_id=?").bind(target).run();
     const observed=observer(),meter=createD1InvocationBudget(500),budget=allocation(500);
     expect(await rebuildPendingCommunityDailyAggregates(meter.wrap(observed.database),NOW,24,undefined,
       {mode:"cache-only",budget})).toMatchObject({processed:1,remaining:false});
-    expect(observed.queries.filter(sql=>sql.includes("THEN fits_json ELSE NULL END AS fits_json FROM community_allowance_fit_cache"))).toHaveLength(16);
+    expect(observed.queries.filter(sql=>sql.includes("SELECT m.* FROM weighted w JOIN community_publication_members"))).toHaveLength(1);
     expect(meter.queriesUsed).toBe(observed.queries.length);expect(meter.queriesUsed).toBeLessThanOrEqual(500);
     expect(budget.remainingQueries).toBeGreaterThanOrEqual(0);expect(Object.hasOwn(budget,"reserveQueries")).toBe(false);
     expect(await db().prepare("SELECT count(*) AS n FROM community_daily_aggregate_rebuilds").first()).toEqual({n:0});

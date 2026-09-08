@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { reset } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
-import { COMMUNITY_ATTRIBUTION_METHOD_VERSION, readCachedCommunityAllowanceCorpus } from "../src/community-allowance";
+import { CACHED_COMMUNITY_ALLOWANCE_PAYLOADS_SQL,COMMUNITY_ATTRIBUTION_METHOD_VERSION, readCachedCommunityAllowanceCorpus } from "../src/community-allowance";
 import { SERVER_PRICING_METHOD_VERSION } from "../src/server-pricing";
 import { createD1InvocationBudget } from "../src/d1-invocation-budget";
 
@@ -16,6 +16,7 @@ async function fixture() {
     "CREATE TABLE community_snapshot_mutation_control(singleton_id INTEGER PRIMARY KEY,mutation_epoch INTEGER)",
     "INSERT INTO community_snapshot_mutation_control VALUES(1,1)",
     "CREATE TABLE community_analytical_input_versions(participant_id TEXT PRIMARY KEY,revision INTEGER)",
+    "CREATE TABLE community_current_analysis_queue(id INTEGER PRIMARY KEY,participant_id TEXT UNIQUE)",
     "CREATE TABLE telemetry_contributions(participant_id TEXT,status TEXT,transport_schema_version TEXT)",
     "CREATE INDEX legacy_participant ON telemetry_contributions(participant_id)",
     "CREATE TABLE telemetry_v1_chunks(participant_id TEXT,superseded_at TEXT)",
@@ -27,7 +28,8 @@ async function fixture() {
 function fit(participantId: string) { return {participantId,planType:"pro",capacityNanousd:123_000_000_000,lastObservedAt:"2026-08-20T00:00:00.000Z"}; }
 async function participant(id: string, source="v1", state="active") {
   const statements = [db().prepare("INSERT INTO participants VALUES(?,?)").bind(id,state),
-    db().prepare("INSERT INTO community_analytical_input_versions VALUES(?,1)").bind(id)];
+    db().prepare("INSERT INTO community_analytical_input_versions VALUES(?,1)").bind(id),
+    db().prepare("INSERT INTO community_current_analysis_queue(participant_id) VALUES(?)").bind(id)];
   if (["v1","mixed","v1.1"].includes(source)) statements.push(db().prepare("INSERT INTO telemetry_v1_chunks VALUES(?,NULL)").bind(id));
   if (["v0.2","mixed","v1.1"].includes(source)) statements.push(db().prepare("INSERT INTO telemetry_contributions VALUES(?,'accepted','telemetry-contribution-v0.2')").bind(id));
   if (source==="v1.1") statements.push(db().prepare("INSERT INTO telemetry_v11_domain_heads VALUES(?)").bind(id));
@@ -45,7 +47,7 @@ describe("bounded cache-only scalar fit corpus",()=>{
     const allocation=budget(), meter=createD1InvocationBudget(30);
     const result=await readCachedCommunityAllowanceCorpus(meter.wrap(db()),NOW,{budget:allocation,pageSize:2});
     expect(result).toEqual(reference); expect(result?.participantIds).toEqual(["a","b","c","d"]);
-    expect(meter.queriesUsed).toBe(9); expect(allocation.remainingQueries).toBe(21);
+    expect(meter.queriesUsed).toBe(6); expect(allocation.remainingQueries).toBe(24);
   });
   it("returns no partial cohort when a later cache is missing, stale or corrupt",async()=>{
     await participant("a"); await participant("b");
@@ -64,7 +66,7 @@ describe("bounded cache-only scalar fit corpus",()=>{
     const bytes=new TextEncoder().encode(JSON.stringify([fit("a")])).byteLength;
     expect(await readCachedCommunityAllowanceCorpus(db(),NOW,{budget:budget(),maxBytes:bytes})).toBeNull();
     expect(await readCachedCommunityAllowanceCorpus(db(),NOW,{budget:budget(),pageSize:1,maxPages:1})).toBeNull();
-    expect(await readCachedCommunityAllowanceCorpus(db(),NOW,{budget:budget(4)})).toBeNull();
+    expect(await readCachedCommunityAllowanceCorpus(db(),NOW,{budget:budget(3)})).toBeNull();
     const expired=budget(); expired.deadlineMs=0;
     expect(await readCachedCommunityAllowanceCorpus(db(),NOW,{budget:expired})).toBeNull();
     expect(expired.remainingQueries).toBe(30);
@@ -79,12 +81,12 @@ describe("bounded cache-only scalar fit corpus",()=>{
     const monitored=new Proxy(db(),{get(target,property){
       if(property==="prepare") return (sql:string)=>{
         const statement=target.prepare(sql);
-        if(!sql.startsWith("SELECT CASE")) return statement;
+        if(sql!==CACHED_COMMUNITY_ALLOWANCE_PAYLOADS_SQL) return statement;
         const wrap=(original:D1PreparedStatement):D1PreparedStatement=>new Proxy(original,{get(item,key){
           if(key==="bind") return (...values:unknown[])=>wrap(item.bind(...values));
-          if(key==="first") return async()=>{
+          if(key==="all") return async()=>{
             if(!mutated){ mutated=true; await db().prepare("UPDATE community_snapshot_mutation_control SET mutation_epoch=2").run(); }
-            return item.first();
+            return item.all();
           };
           const value:unknown=Reflect.get(item,key); return typeof value==="function"?value.bind(item):value;
         }});

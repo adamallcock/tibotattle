@@ -12,7 +12,6 @@ import {
   COMMUNITY_ALLOWANCE_TRAILING_DAYS,
   collectCommunityModelCompositions,
   readCachedCommunityAllowanceCorpus,
-  readCachedCommunityModelCompositions,
   summarizeCommunityAllowanceFits,
 } from "./community-allowance";
 import type {
@@ -21,6 +20,8 @@ import type {
   CommunityModelCacheReadBudget,
 } from "./community-allowance";
 import { ApiError } from "./errors";
+import { advanceCommunityPublication, readCapturedCommunityPublication, communityPublicationAuthoritySql,
+  markCommunityPublicationPublished, type CapturedCommunityPublication } from "./community-publication";
 
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 const MINIMUM_FITS_FOR_BAND = 3;
@@ -534,24 +535,28 @@ function prepareCommunityModelCompositionDay(
   db: D1Database,
   payload: AdminCommunityModelCompositionDay,
   sourceMutationEpoch: number,
+  captured?: CapturedCommunityPublication,
 ): D1PreparedStatement | null {
   const payloadJson = JSON.stringify(payload);
   if (new TextEncoder().encode(payloadJson).byteLength
       > MODEL_COMPOSITION_DAY_JSON_LIMIT_BYTES) {
     return null;
   }
-  return db.prepare(
+  const statement = db.prepare(
     `INSERT INTO community_model_composition_days (
        day, payload_json, computed_at, attribution_method_version, source_mutation_epoch
      ) SELECT ?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?3, ?4
-       WHERE EXISTS (SELECT 1 FROM community_snapshot_mutation_control
-         WHERE singleton_id = 1 AND mutation_epoch = ?4)
+       WHERE ${captured ? communityPublicationAuthoritySql(5) : `EXISTS (SELECT 1 FROM community_snapshot_mutation_control
+         WHERE singleton_id = 1 AND mutation_epoch = ?4)`}
      ON CONFLICT(day) DO UPDATE SET
        payload_json = excluded.payload_json,
        computed_at = excluded.computed_at,
        attribution_method_version = excluded.attribution_method_version,
        source_mutation_epoch = excluded.source_mutation_epoch`,
-  ).bind(payload.day, payloadJson, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourceMutationEpoch);
+  );
+  const values = [payload.day, payloadJson, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourceMutationEpoch];
+  return captured ? statement.bind(...values,captured.generation,captured.sourceEpoch,captured.hardEpoch,COMMUNITY_ATTRIBUTION_METHOD_VERSION)
+    : statement.bind(...values);
 }
 
 async function upsertCommunityModelCompositionDay(
@@ -726,14 +731,11 @@ function reserveRecoveryStatements(recovery: AdminCommunityCacheRecovery, count:
 /** Build the entire recovery publication before preparing any mutation. */
 async function prepareCachedAdminPreview(
   db: D1Database, nowMs: number, recovery: AdminCommunityCacheRecovery,
-): Promise<{ preview: AdminCommunityAllowancePreview; modelDay: D1PreparedStatement; sourceEpoch: number } | null> {
-  const source = await db.prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1")
-    .first<{ mutation_epoch: number }>();
-  if (!Number.isSafeInteger(source?.mutation_epoch) || source!.mutation_epoch < 0) return null;
-  const corpus = await readCachedCommunityAllowanceCorpus(db, nowMs, { budget: recovery.budget });
-  if (corpus === null) return null;
-  const collection = await readCachedCommunityModelCompositions(db, nowMs, { budget: recovery.budget });
-  if (collection === null) return null;
+): Promise<{ preview: AdminCommunityAllowancePreview; modelDay: D1PreparedStatement; sourceEpoch: number;
+  captured: CapturedCommunityPublication } | null> {
+  const captured = await readCapturedCommunityPublication(db,nowMs,{budget:recovery.budget});
+  if (!captured) return null;
+  const {corpus,compositions:collection} = captured;
   const today = new Date(nowMs).toISOString().slice(0, 10);
   const day = buildCommunityModelCompositionDay(collection, today);
   const retained = await readCommunityModelCompositionDays(db, today);
@@ -744,11 +746,8 @@ async function prepareCachedAdminPreview(
       days: Object.freeze(modelDays) }));
   if (!validCachedAdminCommunityAllowancePreview(preview, preview.generatedAt, nowMs)
       || new TextEncoder().encode(JSON.stringify(preview)).byteLength > PREVIEW_CACHE_JSON_LIMIT_BYTES) return null;
-  const current = await db.prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1")
-    .first<{ mutation_epoch: number }>();
-  if (current?.mutation_epoch !== source!.mutation_epoch) return null;
-  const modelDay = prepareCommunityModelCompositionDay(db, day, source!.mutation_epoch);
-  return modelDay === null ? null : { preview, modelDay, sourceEpoch: source!.mutation_epoch };
+  const modelDay = prepareCommunityModelCompositionDay(db, day, captured.sourceEpoch,captured);
+  return modelDay === null ? null : { preview, modelDay, sourceEpoch: captured.sourceEpoch,captured };
 }
 
 export async function buildAdminCommunityAllowancePreviewFromSource(
@@ -759,6 +758,7 @@ export async function buildAdminCommunityAllowancePreviewFromSource(
   if (recovery) {
     try {
       if (!reserveRecoveryStatements(recovery, 4)) return null;
+      if ((await advanceCommunityPublication(db,nowMs,{budget:recovery.budget})).status !== "ready") return null;
       const prepared = await prepareCachedAdminPreview(db, nowMs, recovery);
       if (prepared === null || (await prepared.modelDay.run()).meta.changes !== 1) return null;
       return prepared.preview;
@@ -815,10 +815,15 @@ function previewCacheUnavailable(): never {
 }
 
 /** Same bounded, hard-invalidation-fenced snapshot for public and owner reads.
- * Source epochs stay internal; only exact-current epochs may publish a successor.
+ * Captured source epochs stay internal and never claim to be the live revision.
  */
 export const COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL = `SELECT cache.generated_at, cache.payload_json,
-    cache.source_mutation_epoch, source.mutation_epoch
+    cache.source_mutation_epoch, source.mutation_epoch, cache.publication_generation,
+    CASE WHEN cache.publication_generation IS NULL THEN 1 ELSE EXISTS (
+      SELECT 1 FROM community_publication_generation g,community_publication_changes c
+      WHERE g.generation=cache.publication_generation AND g.singleton=1 AND g.phase='ready' AND g.published=1
+        AND c.singleton=1 AND c.revision=g.cache_revision
+    ) END AS captured_current
   FROM admin_community_allowance_preview_cache cache
   JOIN community_snapshot_mutation_control source ON source.singleton_id = 1
     AND cache.source_mutation_epoch >= source.graph_invalidation_epoch
@@ -892,7 +897,8 @@ export async function warmAdminCommunityAllowancePreviewCache(
     if (recovery && !reserveRecoveryStatements(recovery, 6)) return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
     const existing = await db.prepare(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL)
       .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
-      .first<{ generated_at: string; payload_json: string; source_mutation_epoch: number; mutation_epoch: number }>();
+      .first<{ generated_at: string; payload_json: string; source_mutation_epoch: number; mutation_epoch: number;
+        publication_generation?: string | null }>();
     let previousPreview: AdminCommunityAllowancePreview | null = null;
     if (existing !== null
         && typeof existing.generated_at === "string"
@@ -909,6 +915,7 @@ export async function warmAdminCommunityAllowancePreviewCache(
       const existingEpoch = Date.parse(existing.generated_at);
       if (validCachedAdminCommunityAllowancePreview(parsed, existing.generated_at, nowEpoch)) previousPreview = parsed;
       if (previousPreview !== null && existing.source_mutation_epoch === existing.mutation_epoch
+          && (!recovery || !existing.publication_generation || (existing as {captured_current?:number}).captured_current===1)
           && existing.generated_at.slice(0, 10) === new Date(nowEpoch).toISOString().slice(0, 10)
           && Number.isFinite(existingEpoch)
           && validCachedAdminCommunityAllowancePreview(
@@ -935,6 +942,9 @@ export async function warmAdminCommunityAllowancePreviewCache(
       }
     }
 
+    if(recovery && (await advanceCommunityPublication(db,nowEpoch,{budget:recovery.budget})).status!=="ready") {
+      return {code:"ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE"};
+    }
     const prepared = recovery ? await prepareCachedAdminPreview(db, nowEpoch, recovery) : undefined;
     if (prepared === null) return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
     const epochRow = prepared ? { mutation_epoch: prepared.sourceEpoch } : await db.prepare(
@@ -967,19 +977,25 @@ export async function warmAdminCommunityAllowancePreviewCache(
         )) {
       return { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };
     }
-    const statement = db.prepare(
+    const unbound = db.prepare(
       `INSERT INTO admin_community_allowance_preview_cache (
-         singleton, generated_at, payload_json, attribution_method_version, source_mutation_epoch
-       ) SELECT 1, ?1, ?2, ?3, ?4
-         WHERE EXISTS (SELECT 1 FROM community_snapshot_mutation_control
-           WHERE singleton_id = 1 AND mutation_epoch = ?4)
+         singleton, generated_at, payload_json, attribution_method_version, source_mutation_epoch, publication_generation
+       ) SELECT 1, ?1, ?2, ?3, ?4, ?5
+         WHERE ${prepared ? communityPublicationAuthoritySql(6) : `EXISTS (SELECT 1 FROM community_snapshot_mutation_control
+           WHERE singleton_id = 1 AND mutation_epoch = ?4)`}
        ON CONFLICT(singleton) DO UPDATE SET
          generated_at = excluded.generated_at,
          payload_json = excluded.payload_json,
          attribution_method_version = excluded.attribution_method_version,
-         source_mutation_epoch = excluded.source_mutation_epoch`,
-    ).bind(preview.generatedAt, payloadJson, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourceEpoch);
-    const write = prepared ? (await db.batch([prepared.modelDay, statement]))[1]! : await statement.run();
+         source_mutation_epoch = excluded.source_mutation_epoch,
+         publication_generation = excluded.publication_generation`,
+    );
+    const values = [preview.generatedAt,payloadJson,COMMUNITY_ATTRIBUTION_METHOD_VERSION,sourceEpoch,
+      prepared?.captured.generation ?? null];
+    const statement = prepared ? unbound.bind(...values,prepared.captured.generation,prepared.captured.sourceEpoch,
+      prepared.captured.hardEpoch,COMMUNITY_ATTRIBUTION_METHOD_VERSION) : unbound.bind(...values);
+    const write = prepared ? (await db.batch([prepared.modelDay,statement,
+      markCommunityPublicationPublished(db,prepared.captured)]))[1]! : await statement.run();
     return write.meta.changes === 1
       ? { code: "ALLOWANCE_PREVIEW_CACHE_REFRESHED" }
       : { code: "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE" };

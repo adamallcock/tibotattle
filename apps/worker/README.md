@@ -47,7 +47,7 @@ latest verified external state.
 - Daily activity and allowance estimates have no minimum account count or
   per-account cap. The owner-approved optional plan/model projection includes
   dollar estimates and sample counts even for one account, without identifiers
-  or admin diagnostics. It uses only fresh, source-matched cached evidence and
+  or admin diagnostics. It uses only complete, source-authorized cached evidence and
   closed, requested, published dates; missing evidence is omitted, never fitted
   during a public request. See the [public contract](../../docs/reference/api-surface.md#public-allowance-breakdowns).
 - Unknown routes and wrong methods fail closed with bounded content-free errors.
@@ -56,6 +56,36 @@ latest verified external state.
 
 The maintained field, storage, retention, and deletion inventory is in the
 [local data and privacy reference](../../docs/reference/local-data-and-privacy.md).
+
+## Calculation and scale boundary
+
+Migrations 0054–0056 add a fair dirty-account queue, restartable captured-cohort
+publication, and constant-size preparation counters. Unchanged current work is
+a metadata check, not an account scan. New inputs coalesce per account, and a
+claimed account goes to the back of the queue before work starts so interruption
+or a busy contributor cannot monopolize current calculation. Each publication
+selects complete authorized versions for its captured membership; ordinary
+uploads queue a successor without discarding an unfinished capture or a saved
+graph. Erasure, consent and source-policy changes retain the hard fence.
+
+Run the isolated synthetic calculator qualification with `npm run test:scale`.
+It exercises real local Workers/D1 evidence at 100, 500 and 1,000 contributors,
+exact reference fits, cold imports, no-change and single-account updates,
+historical prepared-input reuse, public reads and a busy-account scenario.
+The JSON report includes physical statement counts, rows, response bytes and
+local elapsed time; it contains no real participant data. It does not send
+traffic to a hosted environment. The
+[1,000-contributor qualification review](../../docs/reviews/2026-09-08-thousand-contributor-qualification.md)
+records the workload, measurements and unqualified capacity boundaries.
+
+The shared 900-statement budget, 40-second optional-work admission deadline and
+one-minute scheduled cadence are unchanged. A population of 1,000 is not a
+claim of 1,000 simultaneous imports or 1,000 full recalculations per minute.
+Historical cohort readers still cap eligible contributors at 1,024 and retain
+exact-date publication guards; larger cohorts and sustained arrival rates need
+separate qualification. See the [operations boundary](../../docs/runbooks/production-operations.md)
+before migration or deployment. Source implementation and local scale results
+do not establish production activation, latency, CPU or memory capacity.
 
 ## Install and local development
 

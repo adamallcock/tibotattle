@@ -17,6 +17,10 @@ import {
   PRE_INCREMENTAL_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL,
   PREPARED_SOURCE_DAY_SCHEMA_PROBE_SQL,
   REFRESH_LANE_SCHEMA_PROBE_SQL,
+  SCALE_SCHEMA_COLUMNS,
+  SCALE_SCHEMA_OBJECTS,
+  SCALE_SCHEMA_PROBE_SQL,
+  scaleSchemaComplete,
   attributionSchemaComplete,
   EXPECTED_STAGING_MIGRATIONS,
   GENERATED_WORKER_ASSET_DIRECTORY,
@@ -47,8 +51,8 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
   assert.equal(result.checks.assetsClosed, true);
   assert.equal(result.checks.migrationInventorySafe, true);
   assert.deepEqual(
-    result.migrationInventory.USAGE_MONITOR_DB.slice(-11),
-    EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-11),
+    result.migrationInventory.USAGE_MONITOR_DB.slice(-14),
+    EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-14),
   );
   assert.deepEqual(
     result.migrationInventory.DELETION_LEDGER,
@@ -62,7 +66,7 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
 });
 
 test("migration inventory is exact and rejects missing or unreviewed files", () => {
-  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-11), [
+  assert.deepEqual(EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(-14), [
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
@@ -74,6 +78,9 @@ test("migration inventory is exact and rejects missing or unreviewed files", () 
     "0051_historical_window_dependencies.sql",
     "0052_prepared_source_days.sql",
     "0053_refresh_lane_watermarks.sql",
+    "0054_current_analysis_queue.sql",
+    "0055_captured_community_publication.sql",
+    "0056_preparation_progress_counters.sql",
   ]);
   const inventory = structuredClone(EXPECTED_STAGING_MIGRATIONS);
   assert.deepEqual(validateStagingMigrationInventory(inventory), {
@@ -134,10 +141,10 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0045_attribution_domain_activation.sql": "89f0df9e95eb98fa7ae8cb00dc82fe19f8933689a8002e647e638fdc870990fe",
   };
   const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
-  assert.equal(names.length, 53);
+  assert.equal(names.length, 56);
   assert.deepEqual(names.slice(40, 45), Object.keys(expectedDigests));
   assert.deepEqual(names.map((name) => name.slice(0, 4)),
-    Array.from({ length: 53 }, (_, index) => String(index + 1).padStart(4, "0")));
+    Array.from({ length: 56 }, (_, index) => String(index + 1).padStart(4, "0")));
   // Unique numeric prefixes make staging, production and Wrangler ordering
   // agree; never admit two differently authored migrations numbered 0041.
   assert.deepEqual([...names].sort(), [...names].sort((a, b) => a.localeCompare(b, "en")));
@@ -226,6 +233,25 @@ test("reviewed incremental migrations are byte-pinned and retain literal-safe re
     assert.equal(triggers.some(trigger => /(?<!\()\bCASE\b/u.test(trigger)), false, name);
   }
   assert.ok(Buffer.byteLength(ATTRIBUTION_SCHEMA_PROBE_SQL) < 100_000, "one bounded metadata query remains below 100 KB");
+});
+
+test("reviewed scale migrations are independently byte-pinned and separately bounded", () => {
+  const reviewed = {
+    "0054_current_analysis_queue.sql": "d7b4dd1adf22c4955d608a3092d03199b72fa6eee1fdb7f880cdfe3cc3a24736",
+    "0055_captured_community_publication.sql": "88079f0860c2d8cbc2122d743d94e77032707cae6f8389cc26a78732fe6065d6",
+    "0056_preparation_progress_counters.sql": "109c8179fac6b9fcca913b9097d8f313c244261e3370cfd30aec2dc4e7045508",
+  };
+  for (const [name, digest] of Object.entries(reviewed)) {
+    const bytes = readFileSync(join(workerDirectory, "migrations", name));
+    assert.equal(createHash("sha256").update(bytes).digest("hex"), digest, name);
+    const triggers = [...bytes.toString("utf8").matchAll(/CREATE TRIGGER\b[\s\S]*?END;/gu)].map(match => match[0]);
+    assert.equal(triggers.some(trigger => /--|\/\*/u.test(trigger)), false, name);
+    assert.equal(triggers.some(trigger => /(?<!\()\bCASE\b/u.test(trigger)), false, name);
+  }
+  assert.ok(Buffer.byteLength(ATTRIBUTION_SCHEMA_PROBE_SQL) < 100_000);
+  assert.ok(Buffer.byteLength(SCALE_SCHEMA_PROBE_SQL) < 100_000);
+  assert.ok(Buffer.byteLength(ATTRIBUTION_SCHEMA_PROBE_SQL + SCALE_SCHEMA_PROBE_SQL) > 100_000,
+    "the two independent required proofs must not be concatenated into one oversized query");
 });
 
 test("historical production prefix upgrades forward without losing source rows or legacy schema", () => {
@@ -328,7 +354,7 @@ test("fresh reconciled schema and attribution metadata probe cover every new gua
       database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
     }
     assert.deepEqual(objectNames().filter((name) => !oldObjects.has(name)).sort(),
-      ATTRIBUTION_SCHEMA_OBJECTS.map(([type, name]) => `${type}:${name}`).sort());
+      [...ATTRIBUTION_SCHEMA_OBJECTS, ...SCALE_SCHEMA_OBJECTS].map(([type, name]) => `${type}:${name}`).sort());
     assert.deepEqual({ ...database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get() }, {
       attribution_objects: 1,
       attribution_columns: 1,
@@ -457,7 +483,7 @@ test("quota projection readiness retains predecessor gates and requires the comp
     apply(names[48]);
     assert.equal(database.prepare(PRE_INCREMENTAL_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL).get().community_graph_preservation_schema, 1);
     assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), false);
-    for (const name of names.slice(49)) {
+    for (const name of names.slice(49, 53)) {
       apply(name);
       assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), name === names[52], name);
     }
@@ -518,6 +544,184 @@ function inSchemaObject(name, change) {
     return sql.slice(0, match.index) + change(sql.slice(match.index, end)) + sql.slice(end);
   };
 }
+
+test("scale schema requires the complete forward prefix, every exact object and every progress/publication column", () => {
+  const database = new DatabaseSync(":memory:");
+  const apply = name => database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+  try {
+    const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
+    for (const name of names.slice(0, 53)) apply(name);
+    const oldObjects = new Set(database.prepare("SELECT type,name FROM sqlite_master WHERE sql IS NOT NULL")
+      .all().map(({ type, name }) => `${type}:${name}`));
+    assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+    assert.equal(scaleSchemaComplete(database.prepare(SCALE_SCHEMA_PROBE_SQL).get()), false,
+      "an exact 0053 predecessor is not sufficient for the scale release");
+    for (const name of names.slice(53)) {
+      apply(name);
+      assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true, name);
+      assert.equal(scaleSchemaComplete(database.prepare(SCALE_SCHEMA_PROBE_SQL).get()), name === names[55], name);
+    }
+    assert.deepEqual(database.prepare("SELECT type,name FROM sqlite_master WHERE sql IS NOT NULL")
+      .all().map(({ type, name }) => `${type}:${name}`).filter(name => !oldObjects.has(name)).sort(),
+    SCALE_SCHEMA_OBJECTS.map(([type, name]) => `${type}:${name}`).sort());
+    const changesBefore = database.prepare("SELECT total_changes() AS n").get().n;
+    assert.deepEqual({ ...database.prepare(SCALE_SCHEMA_PROBE_SQL).get() }, { scale_objects: 1, scale_columns: 1 });
+    assert.equal(database.prepare("SELECT total_changes() AS n").get().n, changesBefore,
+      "readiness may inspect schema metadata but cannot repair or read telemetry");
+    for (const [type, name] of SCALE_SCHEMA_OBJECTS) {
+      database.exec(`SAVEPOINT scale_object; DROP ${type} ${name};`);
+      assert.equal(database.prepare(SCALE_SCHEMA_PROBE_SQL).get().scale_objects, 0, name);
+      database.exec("ROLLBACK TO scale_object; RELEASE scale_object;");
+    }
+    for (const [table, columns] of Object.entries(SCALE_SCHEMA_COLUMNS)) {
+      for (const column of columns) {
+        database.exec(`SAVEPOINT scale_column; ALTER TABLE ${table} RENAME COLUMN ${column} TO synthetic_missing_column;`);
+        assert.equal(database.prepare(SCALE_SCHEMA_PROBE_SQL).get().scale_columns, 0, `${table}.${column}`);
+        database.exec("ROLLBACK TO scale_column; RELEASE scale_column;");
+      }
+    }
+    for (const row of [undefined, {}, { scale_objects: true, scale_columns: true },
+      { scale_objects: 1, scale_columns: 0 }, { scale_objects: 0, scale_columns: 1 }]) {
+      assert.equal(scaleSchemaComplete(row), false);
+    }
+    assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+  } finally {
+    database.close();
+  }
+});
+
+test("scale schema rejects weakened queue, cohort, aggregate and semantic-change guards", () => {
+  const variants = [
+    ["0054_current_analysis_queue.sql", "queue membership IDs recycled", inSchemaObject("community_current_analysis_queue",
+      sql => sql.replace("PRIMARY KEY AUTOINCREMENT", "PRIMARY KEY"))],
+    ["0054_current_analysis_queue.sql", "queue owner erasure blocked", sql => sql.replace("ON DELETE CASCADE", "ON DELETE RESTRICT")],
+    ["0054_current_analysis_queue.sql", "queue dirty generations may be zero", sql => sql.replace("dirty_generation > 0", "dirty_generation >= 0")],
+    ["0054_current_analysis_queue.sql", "queue pending vocabulary widened", sql => sql.replace("pending IN (0, 1)", "pending IN (0, 1, 2)")],
+    ["0054_current_analysis_queue.sql", "queue fairness seek reordered", sql => sql.replace("window_generation, last_served_sequence, id", "window_generation, id, last_served_sequence")],
+    ["0054_current_analysis_queue.sql", "queue pending partial index removed", sql => sql.replace(" WHERE pending = 1;", ";")],
+    ["0055_captured_community_publication.sql", "cohort owner erasure blocked", sql => sql.replaceAll("ON DELETE CASCADE", "ON DELETE RESTRICT")],
+    ["0055_captured_community_publication.sql", "cohort participant identity duplicated", sql => sql.replace("UNIQUE (generation, participant_id),", "")],
+    ["0055_captured_community_publication.sql", "cohort hard floor widened", sql => sql.replace("hard_epoch <= source_epoch", "hard_epoch <= source_epoch + 1")],
+    ["0055_captured_community_publication.sql", "cohort unfinished state called complete", sql => sql.replace("prepared_count <= member_count", "prepared_count <= member_count + 1")],
+    ["0055_captured_community_publication.sql", "cohort payload limit widened", sql => sql.replaceAll("<= 16777216", "<= 16777217")],
+    ["0055_captured_community_publication.sql", "cohort stale selected revision admitted", sql => sql.replace("selected_revision >= minimum_revision", "selected_revision >= 0")],
+    ["0055_captured_community_publication.sql", "cohort missing composition gate", sql => sql.replace("composition_supported = 1 OR", "composition_supported IN (0, 1) OR")],
+    ["0055_captured_community_publication.sql", "cohort pending seek reversed", sql => sql.replace("WHERE selected_revision IS NULL;", "WHERE selected_revision IS NOT NULL;")],
+    ["0055_captured_community_publication.sql", "preview publication column wrong affinity", sql => sql.replace("ADD COLUMN publication_generation TEXT;", "ADD COLUMN publication_generation INTEGER;")],
+    ["0055_captured_community_publication.sql", "preview publication column wrong default", sql => sql.replace("ADD COLUMN publication_generation TEXT;", "ADD COLUMN publication_generation TEXT DEFAULT '';")],
+    ["0055_captured_community_publication.sql", "preview publication column cannot represent predecessor", sql => sql.replace("ADD COLUMN publication_generation TEXT;", "ADD COLUMN publication_generation TEXT NOT NULL;")],
+    ["0056_preparation_progress_counters.sql", "aggregate unsafe integers admitted", sql => sql.replaceAll("BETWEEN 0 AND 9007199254740991", "BETWEEN 0 AND 9007199254740992")],
+    ["0056_preparation_progress_counters.sql", "aggregate phases need not reconcile", sql => sql.replace("CHECK (complete_days + building_days + retiring_days = tracked_days)", "CHECK (complete_days + building_days + retiring_days >= tracked_days)")],
+    ["0056_preparation_progress_counters.sql", "aggregate unknown baseline advertised exact", sql => sql.replaceAll("WHERE singleton_id=1 AND is_exact=1;", "WHERE singleton_id=1;")],
+    ["0056_preparation_progress_counters.sql", "aggregate checkpoint double-counted", sql => sql.replace("checkpoint_steps=checkpoint_steps-OLD.progress_revision+NEW.progress_revision", "checkpoint_steps=checkpoint_steps+NEW.progress_revision")],
+    ...SCALE_SCHEMA_OBJECTS.filter(([type]) => type === "trigger").map(([, name]) => [
+      name.startsWith("community_current_analysis_") ? "0054_current_analysis_queue.sql"
+        : name.startsWith("community_publication_") ? "0055_captured_community_publication.sql"
+          : "0056_preparation_progress_counters.sql",
+      `no-op ${name}`, inSchemaObject(name, sql => sql.replace(/BEGIN[\s\S]*END;/u, "BEGIN SELECT 1; END;")),
+    ]),
+  ];
+  for (const [migration, label, change] of variants) {
+    const database = new DatabaseSync(":memory:");
+    try {
+      const original = readFileSync(join(workerDirectory, "migrations", migration), "utf8");
+      const changed = change(original);
+      assert.notEqual(changed, original, label);
+      for (const name of EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB) {
+        database.exec(name === migration ? changed : readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+      }
+      assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true, label);
+      assert.equal(scaleSchemaComplete(database.prepare(SCALE_SCHEMA_PROBE_SQL).get()), false, label);
+    } finally {
+      database.close();
+    }
+  }
+});
+
+test("0054–0056 populated forward and rollback rehearsal preserves publications, authority and checkpoints", () => {
+  const database = new DatabaseSync(":memory:");
+  const apply = name => database.exec(readFileSync(join(workerDirectory, "migrations", name), "utf8"));
+  const rows = sql => database.prepare(sql).all().map(row => ({ ...row }));
+  const timestamp = "2026-09-08T12:00:00.000Z";
+  const fingerprint = "a".repeat(64);
+  try {
+    const names = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB;
+    for (const name of names.slice(0, 53)) apply(name);
+    database.prepare(`INSERT INTO participants (id,access_token_id,access_token_hash,recovery_token_id,
+      recovery_token_hash,consent_version,consented_at,created_at)
+      VALUES ('fixture-scale-upgrade','fixture-access',X'01','fixture-recovery',X'02','fixture-consent',?,?)`)
+      .run(timestamp, timestamp);
+    for (const table of ["community_analysis_work", "community_model_history_work"]) {
+      database.prepare(`INSERT INTO ${table} (participant_id,run_id,input_revision,input_fingerprint,
+        source_kind,source_method_version,fixed_now,observed_at_cutoff,resets_at_cutoff,window_minutes,
+        max_quota_rows,phase,progress_revision,control_json,manifest_json,state_sha256,reader_policy)
+        VALUES ('fixture-scale-upgrade','fixture-run',1,?,'v1','fixture-method',?,?,?,10080,60000,'plan',3,'{}','[]',?,'prepared-source-days-1')`)
+        .run(fingerprint, timestamp, timestamp, timestamp, fingerprint);
+    }
+    ["quota", "usage", "complete", "discarding"].forEach((phase, index) => {
+      database.prepare(`INSERT INTO community_prepared_source_days
+        (participant_id,source_day,generation,source_fingerprint,method_version,device_id,phase,progress_revision,
+         cursor_time,cursor_id,quota_count,usage_count,plan_count,fit_count,fragment_count,control_json,control_sha256)
+        VALUES ('fixture-scale-upgrade',?,?,?,'fixture-method','fixture-device',?,?,?,0,?,?,0,0,0,'{}',?)`)
+        .run(`2026-09-0${index + 1}`, fingerprint, fingerprint, phase, index + 1, timestamp,
+          (index + 1) * 2, (index + 1) * 3, fingerprint);
+    });
+    database.prepare(`INSERT INTO community_allowance_fit_cache
+      (participant_id,cache_key,fits_json,computed_at,input_fingerprint,source_method_version,model_observations_json)
+      VALUES ('fixture-scale-upgrade','fixture-fit','[]',?,?,'fixture-method','[]')`).run(timestamp, fingerprint);
+    database.prepare(`INSERT INTO community_model_composition_cache
+      (participant_id,cache_key,composition_json,computed_at,input_fingerprint,source_method_version)
+      VALUES ('fixture-scale-upgrade','fixture-model','{}',?,?,'fixture-method')`).run(timestamp, fingerprint);
+    database.prepare(`INSERT INTO admin_community_allowance_preview_cache
+      (singleton,generated_at,payload_json,attribution_method_version,source_mutation_epoch)
+      SELECT 1,?,'{"fixture":"published"}','fixture-method',mutation_epoch FROM community_snapshot_mutation_control`).run(timestamp);
+    database.exec("UPDATE community_allowance_publication_state SET publication_state='ready' WHERE singleton=1;");
+    for (const lane of ["current", "daily"]) {
+      database.prepare(`INSERT INTO community_refresh_lanes
+        (lane,source_epoch,utc_day,method_version,state,updated_at,completed_at,restart_reason)
+        VALUES (?,1,'2026-09-08','fixture-method','complete',?,?,NULL)`).run(lane, timestamp, timestamp);
+    }
+    const preserved = ["participants", "collection_controls", "telemetry_transport_formats",
+      "telemetry_transport_participant_floors", "telemetry_v1_device_consents", "telemetry_v11_device_consents",
+      "telemetry_v11_domain_heads", "community_snapshot_mutation_control", "community_allowance_publication_state",
+      "community_analysis_work", "community_model_history_work", "community_prepared_source_days",
+      "community_allowance_fit_cache", "community_model_composition_cache"];
+    const before = Object.fromEntries(preserved.map(table => [table, rows(`SELECT * FROM ${table}`)]));
+    const previewBefore = rows("SELECT * FROM admin_community_allowance_preview_cache");
+    const lanesBefore = rows("SELECT * FROM community_refresh_lanes ORDER BY lane");
+    const schemaBefore = rows("SELECT type,name,sql FROM sqlite_master ORDER BY type,name");
+    for (const rollback of [true, false]) {
+      if (rollback) database.exec("SAVEPOINT scale_upgrade;");
+      for (const name of names.slice(53)) apply(name);
+      assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
+      assert.equal(scaleSchemaComplete(database.prepare(SCALE_SCHEMA_PROBE_SQL).get()), true);
+      for (const table of preserved) assert.deepEqual(rows(`SELECT * FROM ${table}`), before[table], table);
+      assert.deepEqual(rows("SELECT * FROM admin_community_allowance_preview_cache"),
+        previewBefore.map(row => ({ ...row, publication_generation: null })));
+      assert.deepEqual(rows("SELECT * FROM community_refresh_lanes ORDER BY lane"), lanesBefore.map(row => row.lane === "current"
+        ? { ...row, state: "queued", completed_at: null, restart_reason: "retry" } : row));
+      assert.deepEqual(rows("SELECT * FROM community_preparation_progress_counters"), [{
+        singleton_id: 1, is_exact: 1, tracked_days: 4, complete_days: 1, building_days: 2,
+        retiring_days: 1, checkpoint_steps: 10, quota_observations: 20, usage_events: 30,
+      }]);
+      assert.deepEqual(rows("SELECT * FROM community_publication_changes"), [{ singleton: 1, revision: 0 }]);
+      assert.deepEqual(rows("SELECT * FROM community_publication_generation"), []);
+      assert.deepEqual(rows("SELECT * FROM community_publication_members"), []);
+      assert.deepEqual(database.prepare("PRAGMA foreign_key_check").all(), []);
+      if (rollback) {
+        assert.throws(() => database.exec("UPDATE participants SET state='fixture-invalid-state'"), /CHECK constraint failed/u);
+        database.exec("ROLLBACK TO scale_upgrade; RELEASE scale_upgrade;");
+        assert.deepEqual(rows("SELECT type,name,sql FROM sqlite_master ORDER BY type,name"), schemaBefore);
+        for (const table of preserved) assert.deepEqual(rows(`SELECT * FROM ${table}`), before[table], table);
+        assert.deepEqual(rows("SELECT * FROM admin_community_allowance_preview_cache"), previewBefore);
+        assert.deepEqual(rows("SELECT * FROM community_refresh_lanes ORDER BY lane"), lanesBefore);
+        assert.equal(scaleSchemaComplete(database.prepare(SCALE_SCHEMA_PROBE_SQL).get()), false);
+      }
+    }
+  } finally {
+    database.close();
+  }
+});
 
 test("authorized graph schema rejects altered capability, identity, epoch, cleanup and hard-floor guards", () => {
   const trigger = name => inSchemaObject(name, sql => sql.replace(/BEGIN[\s\S]*END;/u, "BEGIN SELECT 1; END;"));
@@ -638,7 +842,7 @@ test("0050–0053 upgrade and rollback preserve publications, source authority a
       "the deployed 0049 predecessor is not a complete schema for this release");
     for (const rollback of [true, false]) {
       if (rollback) database.exec("SAVEPOINT incremental_upgrade;");
-      for (const name of names.slice(49)) apply(name);
+      for (const name of names.slice(49, 53)) apply(name);
       assert.equal(attributionSchemaComplete(database.prepare(ATTRIBUTION_SCHEMA_PROBE_SQL).get()), true);
       for (const table of preserved) assert.deepEqual(rows(`SELECT * FROM ${table}`), before[table], table);
       for (const [table, original] of Object.entries(workBefore)) assert.deepEqual(rows(`SELECT * FROM ${table}`),
@@ -1244,6 +1448,23 @@ test("current migration labels do not hide missing attribution metadata in stagi
   assert.equal(result.collectionAuthorized, false);
 });
 
+test("current migration labels cannot substitute for the separate scale schema proof", () => {
+  const config = provisionedConfig();
+  const calls = [];
+  const result = probeStagingLive({
+    config, wrangler: "/fake/wrangler", workerDirectory,
+    spawn: successSpawn(config, calls, { missingScaleSchema: true }),
+  });
+  assert.equal(result.state, "blocked");
+  assert.equal(result.checks.remoteMigrationInventoryCurrent, true);
+  assert.equal(result.checks.attributionSchemaCurrent, false);
+  assert.equal(result.blockers.includes("REMOTE_ATTRIBUTION_SCHEMA_INCOMPLETE"), true);
+  assert.equal(result.collectionAuthorized, false);
+  assert.equal(calls.filter(args => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
+  assert.equal(calls.filter(args => args.includes(SCALE_SCHEMA_PROBE_SQL)).length, 1);
+  assert.equal(calls.some(args => args.includes("apply") || args.includes("deploy")), false);
+});
+
 test("staging requires pending attribution migrations before its schema probe", () => {
   const config = provisionedConfig();
   const calls = [];
@@ -1267,7 +1488,7 @@ test("staging requires pending attribution migrations before its schema probe", 
   assert.equal(calls.some((args) => args.includes("apply")), false);
 });
 
-test("staging blocks incomplete 0045–0052 prefixes and unreviewed 0046–0053 before schema probing", () => {
+test("staging blocks incomplete 0045–0055 prefixes and unreviewed 0046–0056 before schema probing", () => {
   const config = provisionedConfig();
   const through45 = EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 45);
   assert.equal(through45.at(-1), "0045_attribution_domain_activation.sql");
@@ -1276,13 +1497,13 @@ test("staging blocks incomplete 0045–0052 prefixes and unreviewed 0046–0053 
     [[...through45, "0046_v1_quota_fit_projection.sql"], "REMOTE_MIGRATIONS_PENDING"],
     [EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 47), "REMOTE_MIGRATIONS_PENDING"],
     [EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 48), "REMOTE_MIGRATIONS_PENDING"],
-    ...[49, 50, 51, 52].map(count => [EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, count), "REMOTE_MIGRATIONS_PENDING"]),
+    ...[49, 50, 51, 52, 53, 54, 55].map(count => [EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, count), "REMOTE_MIGRATIONS_PENDING"]),
     [[...through45, "0046_unreviewed_quota_index.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
     [[...through45, "0046_v1_quota_fit_cursor.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
     [[...through45, "0046_v1_quota_fit_projection.sql", "0047_unreviewed_work.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
     [[...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 47), "0048_unreviewed_model_history.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
     [[...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 48), "0049_unreviewed_graph_preservation.sql"], "REMOTE_MIGRATION_INVENTORY_DRIFT"],
-    ...[50, 51, 52, 53].map(number => [[...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, number - 1),
+    ...[50, 51, 52, 53, 54, 55, 56].map(number => [[...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, number - 1),
       `${String(number).padStart(4, "0")}_unreviewed.sql`], "REMOTE_MIGRATION_INVENTORY_DRIFT"]),
   ]) {
     const calls = [];
@@ -1304,6 +1525,7 @@ test("staging blocks incomplete 0045–0052 prefixes and unreviewed 0046–0053 
     assert.equal(result.collectionAuthorized, false);
     assert.equal(calls.some((args) => args.includes("apply")), false);
     assert.equal(calls.some((args) => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)), false);
+    assert.equal(calls.some((args) => args.includes(SCALE_SCHEMA_PROBE_SQL)), false);
   }
 });
 
@@ -1479,8 +1701,9 @@ test("live readiness proves resources, secrets, migrations, and containment", ()
     true,
   );
   assert.deepEqual(result.blockers, []);
-  assert.equal(calls.filter((args) => args[0] === "d1").length, 8);
+  assert.equal(calls.filter((args) => args[0] === "d1").length, 9);
   assert.equal(calls.filter((args) => args.includes(ATTRIBUTION_SCHEMA_PROBE_SQL)).length, 1);
+  assert.equal(calls.filter((args) => args.includes(SCALE_SCHEMA_PROBE_SQL)).length, 1);
   assert.equal(calls.some((args) => args.includes("migrations")), false);
   assert.equal(
     calls.filter((args) => args.some((value) =>

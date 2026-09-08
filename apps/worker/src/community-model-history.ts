@@ -21,7 +21,7 @@ import { ensurePreparedV1Window, createPreparedV1EvidenceReader } from "./prepar
 export const COMMUNITY_MODEL_HISTORY_METHOD = `${COMPOSITION_CACHE_KEY_SUFFIX}:${MODEL_HISTORY_METHOD_VERSION}`;
 export const COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES = 3;
 const PAGE_SIZE = 64, MAX_PAGES = 16, MAX_RESULT_BYTES = 16 * 1024;
-const FINAL_RESERVE = 12, MAX_ATTEMPTS = 16;
+const FINAL_RESERVE = 12;
 const encoder = new TextEncoder();
 
 export interface CommunityModelHistoryProgress {
@@ -50,7 +50,7 @@ interface Candidate {
   result_json: string | null;
 }
 
-// Physical census first, including a lookahead row. Only compact terminal
+// Active contributor census first, including a lookahead row. Only compact terminal
 // results are joined; this never runs a history fit in an interactive request.
 export const MODEL_HISTORY_CENSUS_SQL = `${COMMUNITY_PARTICIPANT_PAGE_CTE}
 SELECT s.id AS participant_id, s.state, s.has_v1, s.has_v11, s.has_legacy,
@@ -184,9 +184,9 @@ async function publishResult(db: D1Database, day: string, sourcePin: V1SourcePin
       COMMUNITY_MODEL_HISTORY_METHOD, json, lease, dependency.revision).run()).meta.changes === 1;
 }
 
-/** Restartable backfill of missing closed UTC days. One date per
- * invocation and at most sixteen account attempts; pages and all follow-on work
- * share the scheduler's actual query meter. Completed historical days are
+/** Restartable backfill of missing closed UTC days. One date per invocation,
+ * attempting each pending account at most once while the scheduler's shared
+ * query meter and deadline admit more work. Completed historical days are
  * separate from forward-recorded snapshots, and affected corrections enqueue
  * them again through 0048's bounded day invalidation triggers.
  */
@@ -199,10 +199,12 @@ export async function warmCommunityModelHistory(db: D1Database, nowMs: number, o
   // Re-read that same date once, within the SAME budget, rather than waiting a
   // cron interval. This second pass may publish, but cannot acquire more work
   // or switch to another date if a concurrent writer has already published it.
+  // Reserve schema/source/date reads, every bounded census page and publication.
+  // A partial recheck must not replace the completed cohort's progress with zero.
   if (finishedCohort && progress.day !== null && progress.requiredAccounts > 0
       && progress.resolvedAccounts === progress.requiredAccounts
       && progress.publishedDays === 0 && progress.status === "deferred"
-      && admitted(options, 4)) {
+      && admitted(options, MAX_PAGES + 4)) {
     return advanceModelHistoryDay(db, nowMs, options, progress.day);
   }
   return progress;
@@ -319,7 +321,7 @@ async function advanceModelHistoryDay(db: D1Database, nowMs: number, options: {
   // three minutes can repeatedly select only 1/3 of a three-divisible cohort
   // when the first large account consumes the invocation's available time.
   const start = Math.floor(nowMs / (60_000 * COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES)) % pending.length;
-  for (let attempt = 0; attempt < Math.min(MAX_ATTEMPTS, pending.length); attempt++) {
+  for (let attempt = 0; attempt < pending.length; attempt++) {
     if (!admitted(options, 40)) break;
     const row = pending[(start + attempt) % pending.length]!;
     const allocation = { remainingQueries: Math.max(0, options.meter.remainingQueries - FINAL_RESERVE), deadlineMs: options.deadlineMs };

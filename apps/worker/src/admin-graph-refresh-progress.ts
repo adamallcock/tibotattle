@@ -13,26 +13,18 @@ function iso(value: unknown): string | null {
   return new Date(value).toISOString();
 }
 
-export const PREPARATION_PROGRESS_DAY_LIMIT = 10_000;
-
-/** A fixed-size metadata census, never a source-record scan or preparation
- * trigger. These are retained reusable inputs, not remaining history work. */
+/** One indexed aggregate read regardless of contributor/source-day count.
+ * The transactional head ledger describes retained reusable inputs, not
+ * remaining history work. Reading never scans or advances preparation. */
 export async function readAdminPreparationProgress(db: D1Database) {
   try {
-    const row = await db.prepare(`WITH preparation_heads AS (
-      SELECT phase,progress_revision,quota_count,usage_count
-      FROM community_prepared_source_days ORDER BY participant_id,source_day LIMIT ?1
-    ) SELECT COUNT(*) AS tracked_days,
-      TOTAL(CASE WHEN phase='complete' THEN 1 ELSE 0 END) AS complete_days,
-      TOTAL(CASE WHEN phase IN ('quota','usage') THEN 1 ELSE 0 END) AS building_days,
-      TOTAL(CASE WHEN phase='discarding' THEN 1 ELSE 0 END) AS retiring_days,
-      TOTAL(progress_revision) AS checkpoint_steps,TOTAL(quota_count) AS quota_observations,
-      TOTAL(usage_count) AS usage_events FROM preparation_heads`)
-      .bind(PREPARATION_PROGRESS_DAY_LIMIT + 1).first<{
-        tracked_days: number; complete_days: number; building_days: number; retiring_days: number;
+    const row = await db.prepare(`SELECT is_exact,tracked_days,complete_days,building_days,retiring_days,
+      checkpoint_steps,quota_observations,usage_events
+      FROM community_preparation_progress_counters WHERE singleton_id=1`).first<{
+        is_exact: number; tracked_days: number; complete_days: number; building_days: number; retiring_days: number;
         checkpoint_steps: number; quota_observations: number; usage_events: number;
       }>();
-    if (!row || row.tracked_days > PREPARATION_PROGRESS_DAY_LIMIT) return null;
+    if (!row || row.is_exact !== 1) return null;
     const result = { trackedDays: count(row.tracked_days), completeDays: count(row.complete_days),
       buildingDays: count(row.building_days), retiringDays: count(row.retiring_days),
       checkpointSteps: count(row.checkpoint_steps), quotaObservations: count(row.quota_observations),
@@ -40,8 +32,8 @@ export async function readAdminPreparationProgress(db: D1Database) {
     return result.completeDays + result.buildingDays + result.retiringDays === result.trackedDays
       ? result : null;
   } catch {
-    // An optional counter outage does not make already verified graph metadata
-    // unavailable. TOTAL avoids SQLite integer overflow; unsafe totals stay null.
+    // No census fallback: missing pre-migration storage, an unavailable ledger,
+    // or unsafe metadata affects only these optional counters, never the graph.
     return null;
   }
 }
