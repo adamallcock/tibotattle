@@ -277,11 +277,31 @@ export async function runDisabledStagingDeployment({
         code: "STAGING_SOURCE_REVISION_UNAVAILABLE",
       };
     }
+    let bootstrapSecrets = [];
+    if (secretsFile !== null) {
+      const installed = spawn(wrangler, ["secret", "list", "--env", "staging"], {
+        cwd: workerDirectory, encoding: "utf8", maxBuffer: 1024 * 1024,
+      });
+      // Only first creation may install this file. Existing Workers retain
+      // their installed keys; an uncertain inventory must never rotate them.
+      const absent = !installed.error && installed.status !== 0
+        && /\b10007\b/u.test(`${installed.stdout ?? ""}\n${installed.stderr ?? ""}`);
+      if (installed.error || (installed.status !== 0 && !absent)) {
+        return { ok: false, code: "STAGING_SECRET_INVENTORY_FAILED" };
+      }
+      if (absent) {
+        if (!await validStagingSecretsFile(secretsFile)) {
+          return { ok: false, code: "STAGING_SECRETS_FILE_INVALID" };
+        }
+        bootstrapSecrets = ["--secrets-file", secretsFile];
+      }
+    }
     const deployment = spawn(
       wrangler,
       [
         "deploy", "--env", "staging", "--strict",
         "--var", `DEPLOYMENT_SOURCE_COMMIT:${sourceCommit}`,
+        ...bootstrapSecrets,
       ],
       {
         cwd: workerDirectory,
