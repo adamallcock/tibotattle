@@ -175,14 +175,18 @@ function assertDisposableTmpfs(path) {
 }
 
 /**
- * Prove this process is inside the reviewed qualification container and that
- * both credential-bearing user roots are distinct tmpfs mounts. An
- * environment marker alone is never accepted as isolation authority.
+ * Read-only proof that this process is inside the reviewed container and both
+ * credential-bearing user roots are distinct tmpfs mounts. It deliberately
+ * does not require a D-Bus session address, so an outer harness can establish
+ * containment before it creates or inventories a private session.
  */
-function proveNativeQualificationIsolation(environment) {
-  qualificationEnvironment(environment);
+export function proveLinuxSecretServiceContainerIsolation({
+  environment = process.env,
+} = {}) {
+  let isolated;
   let selected;
   try {
+    isolated = environment?.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED;
     selected = {
       home: environment.HOME,
       runtime: environment.XDG_RUNTIME_DIR,
@@ -194,6 +198,7 @@ function proveNativeQualificationIsolation(environment) {
   } catch {
     fail("invalid_configuration");
   }
+  if (isolated !== "1") fail("isolation_required");
   if (selected.home !== DISPOSABLE_HOME
       || selected.runtime !== DISPOSABLE_RUNTIME
       || selected.temporary !== DISPOSABLE_RUNTIME
@@ -207,6 +212,11 @@ function proveNativeQualificationIsolation(environment) {
   assertDisposableTmpfs(DISPOSABLE_HOME);
   assertDisposableTmpfs(DISPOSABLE_RUNTIME);
   return Object.freeze({ status: "isolated" });
+}
+
+function proveNativeQualificationIsolation(environment) {
+  qualificationEnvironment(environment);
+  return proveLinuxSecretServiceContainerIsolation({ environment });
 }
 
 function daemonEnvironment(environment) {
