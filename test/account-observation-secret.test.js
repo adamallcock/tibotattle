@@ -516,7 +516,7 @@ test("Windows x64 account-observation production selection remains fail closed",
   assert.equal(constructions, 0);
 });
 
-test("Linux account selection preserves its separate brokered identity and read-only absence", async () => {
+test("Linux account selection preserves generic broker compatibility and read-only absence", async () => {
   const root = await mkdtemp(join(tmpdir(), "linux-account-broker-selection-"));
   const backend = { ...memoryBackend(Buffer.alloc(32, 81)),
     replaceExact: async () => "replaced", deleteExact: async () => "deleted",
@@ -550,8 +550,51 @@ test("Linux account selection preserves its separate brokered identity and read-
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("Linux account selection refuses missing, malformed and cross-capability backends without fallback", () => {
-  for (const createLinuxBackend of [null, () => null, () => ({ get() {}, set() {}, delete() {} }), () => { throw new Error("private-native-detail"); }]) {
+test("Linux account selection accepts the narrow observation backend contract", async () => {
+  const root = await mkdtemp(join(tmpdir(), "linux-account-narrow-selection-"));
+  const narrow = memoryBackend();
+  const existingOnlyCalls = [];
+  const existingOnly = {
+    async read(capability) {
+      existingOnlyCalls.push(capability);
+      return Buffer.alloc(32, 82);
+    },
+  };
+  try {
+    const creating = selectProductionAccountObservationSecret({
+      platform: "linux", architecture: "x64", operationLockFile: join(root, "create.lock"),
+      createLinuxBackend: () => narrow,
+    });
+    const created = await creating.loadAccountObservationSecret();
+    assert.equal(created.byteLength, 32);
+    created.fill(0);
+    assert.deepEqual(narrow.calls.map(([operation, capability]) => [operation, capability]), [
+      ["read", ACCOUNT_CAPABILITY],
+      ["createIfMissing", ACCOUNT_CAPABILITY],
+      ["read", ACCOUNT_CAPABILITY],
+    ]);
+
+    const existingOnlySelection = selectProductionAccountObservationSecret({
+      platform: "linux", architecture: "x64", createIfMissing: false,
+      operationLockFile: join(root, "existing-only.lock"),
+      createLinuxBackend: () => existingOnly,
+    });
+    const existing = await existingOnlySelection.loadAccountObservationSecret();
+    assert.deepEqual(existing, Buffer.alloc(32, 82));
+    existing.fill(0);
+    assert.deepEqual(existingOnlyCalls, [ACCOUNT_CAPABILITY]);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("Linux account selection refuses unsupported contracts, capabilities, and architectures before fallback", () => {
+  for (const createLinuxBackend of [
+    null,
+    () => null,
+    () => ({ get() {}, set() {}, delete() {} }),
+    () => ({ async read() { return null; } }),
+    () => ({ async createIfMissing() { return "created"; } }),
+    () => { throw new Error("private-native-detail"); },
+  ]) {
     assert.throws(() => selectProductionAccountObservationSecret({
       platform: "linux", architecture: "x64", createLinuxBackend,
     }), (error) => error.code === "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE"
@@ -562,6 +605,14 @@ test("Linux account selection refuses missing, malformed and cross-capability ba
       platform: "linux", architecture: "x64", keychainCapability,
       createLinuxBackend: () => { throw new Error("Must refuse before construction"); },
     }), { code: "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_INVALID" });
+  }
+  for (const architecture of ["arm64", "ia32", "x86_64", "", null]) {
+    let constructions = 0;
+    assert.throws(() => selectProductionAccountObservationSecret({
+      platform: "linux", architecture,
+      createLinuxBackend() { constructions += 1; return memoryBackend(); },
+    }), { code: "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE" });
+    assert.equal(constructions, 0);
   }
 });
 

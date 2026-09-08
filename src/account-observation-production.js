@@ -48,7 +48,7 @@ export function selectProductionAccountObservationSecret({
     try {
       backend = createLinuxBackend();
       if (backend === null || typeof backend !== "object"
-          || ["read", "createIfMissing", "replaceExact", "deleteExact", "describe"].some(
+          || ["read", ...(createIfMissing ? ["createIfMissing"] : [])].some(
             (method) => typeof backend[method] !== "function")) {
         throw new Error("Unavailable broker");
       }
