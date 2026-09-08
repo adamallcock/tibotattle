@@ -331,6 +331,7 @@ test("native Linux account-observation credential refuses an absent retained int
   // The native deadline is exercised through a closed child invocation with a
   // local D-Bus socket that accepts connections but never replies. This does
   // not contact a real account service or expose secret material.
+  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_SERVICE_DEADLINE");
   const blackholePaths = await prepareOwnerPrivateState(blackholeStateBase);
   const closeBlackholeBus = await startBlackholeSessionBus(blackholeSocket);
   try {
