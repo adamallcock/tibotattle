@@ -16,47 +16,65 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-08 (supersedes the historical entries below):
 
-- Native run [34281557310](https://github.com/adamallcock/tibotattle/actions/runs/34281557310)
-  reached Windows ordinary startup refresh and Linux credential observation.
-  Windows attempted the manual Refresh button while automatic startup refresh
-  was still active. The integrated repair separately observes and qualifies
-  automatic refresh, then requires an enabled manual button and a distinct
-  accepted/completed refresh. Linux ordinary startup lacked native credential
-  state preparation in the normal profile; it now invokes the existing safe
-  preparation routine before constructing either credential backend. Combined
-  Windows, Linux and staging bootstrap checks pass 80/80 at `06c4a126`.
-  These changes are running with the latest tray integration at `3485a504` in
-  [34283753736](https://github.com/adamallcock/tibotattle/actions/runs/34283753736).
-  Linux's packaged credentials and ordinary startup journey now pass in that
-  run, including its isolated no-network normal-app check. Windows development
-  packaging passes; its normal-app result exposed the observer race below.
-  That run then identified an observer timing race: the Windows renderer can
-  POST before CDP attaches. The next repair uses the existing one-shot preload
-  barrier under the normal candidate's exact smoke control, releases it only
-  after network observation is enabled, and retains both automatic and manual
-  completion requirements. Its 24 owning checks pass. Optional manual
-  Windows/Linux runtime selections reuse the same jobs in an independent
-  concurrency group; every push and default manual run still executes the full
-  matrix. Workflow lint and 21 package/Linux workflow checks pass. The Linux
-  container test now explicitly lists the already-approved production closure
-  and synthetic executable instead of its stale seven-copy expectation.
+- Hosted client qualification passed against isolated staging, including real
+  enrollment, ownership, encrypted upload, activation, deliberately lost-response
+  recovery, duplicate-free repeated synchronization, confirmed disconnect and
+  zero-request opt-out. Five synthetic authorities are revoked; three contributing
+  installations retained nine chunks/fifteen records across preserved attempts.
+  Usage/quota installation, provider, time and available plan context match;
+  unknown accounts remain unknown and quotas have no invented session UUID.
+  There are zero public aggregates. Final deployed source is `4bb08ca6`; collection
+  revision 8 has all four controls off, accountless runtime disabled and v1.1
+  format restored to staged. Root independently checked live health and preserved
+  redacted receipts under the project's ignored `hosted-staging-4bb08ca6` directory.
+  Production is unchanged. The packaged scheduler remains open: the unsigned
+  isolated rehearsal app could not create its encrypted safeStorage record.
+- The staging preparation omissions are repaired: all three independent test
+  secrets are required, the exact staging public origin is pinned, and temporary
+  v1.1 admission/restoration is explicit. The combined source, including the
+  parallel dependency security patch, passes 197 script checks and 581 Worker
+  tests plus both dry-deployment/staging checks. An initial local dry-run failure
+  was stale generated public assets; rebuilding those assets resolved it.
+- Linux ordinary packaged startup, credential lifecycle and cleanup passed at
+  `3485a504` in [34283753736](https://github.com/adamallcock/tibotattle/actions/runs/34283753736).
+  The `ab59d4c0` rerun timed out during reload refresh, so current qualification
+  remains open. Source-smoke timeouts had lost the acceptance/completion subphase
+  before the outer wrapper. The integrated diagnostic retains only phase, bounded
+  request count and closed status through every wrapper, with unchanged limits.
+- Windows development packaging and installed NSIS lifecycle passed at `3485a504`.
+  Normal startup now requires observed automatic refresh followed by a separate
+  manual refresh. An exact smoke-only preload barrier and bounded bridge wait
+  prevent the automatic request outrunning observation. The affected shell/runtime
+  suites pass 98/98; [targeted run 34286896264](https://github.com/adamallcock/tibotattle/actions/runs/34286896264)
+  at `196931d0` still fails and is being diagnosed. No normal Windows pass is claimed.
+- Manual Windows/Linux diagnostics reuse the exact existing jobs with separate
+  concurrency groups. Every push/default manual run still selects all six jobs,
+  including NSIS. Workflow lint and selector truth-table tests pass. Integrated
+  Linux, Mac policy/dual-architecture compilation and staging-plan checks pass
+  89/89; architecture boundaries pass with zero approved debt.
 - All four private Mac `.3`/`.4` installers from frozen `82122044` have Apple
   acceptance, stapling and finalization receipts. Final DMG/ZIP bytes and
   metadata are preserved under the project's ignored `signed-handover-82122044`
   directory. Strict verification failures were caused by the restricted
   execution context: controls, predecessor and candidate pass outside it.
-  The next guarded installed rehearsal then stopped at `BACKUP_CHANGED`, before
-  replacement, because native state changed while the stopped-state copy was
-  verified. The native app remains 0.1.18 build1026 and was relaunched unchanged;
-  the partial backup is preserved. Writer quiescence is being diagnosed.
-  Installed handover and the subsequent signed update remain unqualified.
-- The isolated staging Worker is deployed from `9951627d` at
-  `https://app-usagemonitor-staging.adamallcock.workers.dev`, with the explicitly
-  approved staging-only encryption keys and all collection capabilities off.
-  Its 48 primary and two deletion-ledger migrations completed. The packaged
-  synthetic contribution journey is in progress; real profiles and public
-  aggregates remain outside this rehearsal. Worker validation passed 581 tests
-  and 195 script checks, plus both dry deployments and staging checks.
+  After a shutdown-settling backup failure, two matching inventories allowed the
+  guarded r3 installation. The candidate exited before migration; rollback
+  restored native 0.1.18/build1026 and verified state against the fresh backup.
+  An observed HTTPS attempt is not evidence of usage upload; its historical
+  destination remains unclassified. A no-GUI probe identified a false lock guard:
+  the readable standard System keychain lacks the unlock bit. The reviewed fix
+  exempts it only from post-not-found absence proof; new credential creation still
+  requires an unlocked, readable default keychain. The repaired probe then found
+  legacy export/Claude capabilities blocking an overbroad startup preflight,
+  while current account/contribution capabilities were present. Required-capability
+  composition now preflights only current account/contribution capabilities,
+  retaining optional export/Claude migration guards at actual use and accountless
+  main-only access on demand. The integrated Mac suite passes 68/68, including
+  both architecture builds. A corrected private handover pair is being prepared;
+  these source checks do not qualify installation. The released native
+  secure-upgrade UI exists but exposes only actually
+  pending broker requests; no approval or credential write was performed through
+  that UI. Installed handover and subsequent signed update remain unqualified.
 - The daily Mac tester still uses `98a5256d`; the signed migration fixtures and
   latest source are distinct artifacts. No public feed or release was changed.
 
