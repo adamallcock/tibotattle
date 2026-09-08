@@ -29,6 +29,7 @@ import {
   installOutboundFirewallBlock,
   jsonFetch,
   localNetworkObserver,
+  normalizeStartupFailureDiagnostic,
   removeOutboundFirewallBlock,
   parseWindowsNormalCandidateSmokeArguments,
   prepareWindowsNormalCandidateProfile,
@@ -54,6 +55,18 @@ const STAGED_APP_PATH = String.raw`C:\candidate\app`;
 const SOURCE_CANDIDATE_PATH = String.raw`C:\candidate\production-source-candidate.json`;
 const RECEIPT_PATH = String.raw`C:\workspace\.release-build\electron-windows-normal-candidate\normal-candidate-smoke.json`;
 const FIREWALL_RULE = "tibotattle-normal-candidate-550e8400-e29b-41d4-a716-446655440000";
+
+test("startup failure diagnostics retain only fixed categories and booleans", () => {
+  const value = { launch: "restart", requests: "zero", refreshStatus: "idle",
+    onboarding: "ready", electronMarked: true, refreshDisabled: false,
+    sourceReadable: true, rolloutPresent: true, stateWritable: true };
+  assert.deepEqual(normalizeStartupFailureDiagnostic(value), value);
+  for (const changed of [null, { ...value, raw: "private" },
+    { ...value, refreshStatus: "private" }, { ...value, sourceReadable: "private" },
+    { ...value, requests: 42 }, { ...value, launch: "private" }]) {
+    assert.equal(normalizeStartupFailureDiagnostic(changed), null);
+  }
+});
 
 test("normal Windows refresh observer counts detailed and returning-profile quick requests", () => {
   const handlers = new Map();
@@ -1123,6 +1136,9 @@ test("normal candidate runner orders firewall coverage around both ordinary laun
 
 test("normal candidate runner retains the outbound block and profile when process cleanup is uncertain", async () => {
   let receipt = null;
+  const startupDiagnostic = { launch: "first", requests: "zero", refreshStatus: "idle",
+    onboarding: "ready", electronMarked: true, refreshDisabled: true,
+    sourceReadable: true, rolloutPresent: true, stateWritable: true };
   let removedFirewall = false;
   let removedProfile = false;
   await assert.rejects(() => runWindowsNormalCandidateSmoke(smokeOptions(), {
@@ -1146,6 +1162,7 @@ test("normal candidate runner retains the outbound block and profile when proces
       candidateState.quiescent = false;
       throw Object.assign(new Error("dashboard"), {
         code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_DASHBOARD_UNAVAILABLE",
+        startupDiagnostic,
       });
     },
     verifyOptOut: async () => true,
@@ -1160,6 +1177,7 @@ test("normal candidate runner retains the outbound block and profile when proces
   assert.equal(receipt.outboundFirewallRuleRemoved, false);
   assert.equal(receipt.ownedProfileRemoved, false);
   assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_OWNED_PROCESS_REMAINS");
+  assert.deepEqual(receipt.startupDiagnostic, startupDiagnostic);
 });
 
 test("normal candidate refuses to launch before the outbound block is verified", async () => {

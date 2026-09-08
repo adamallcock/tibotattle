@@ -1710,7 +1710,21 @@ async function connectDashboard({ port, fetchImpl, WebSocketConstructor }) {
   return Object.freeze({ cdp, endpoint, target });
 }
 
-async function assertDashboard({ cdp, target, fetchImpl }) {
+export function normalizeStartupFailureDiagnostic(value) {
+  if (!exactObject(value) || Object.keys(value).length !== 9
+      || !["first", "restart"].includes(value.launch)
+      || !["zero", "one", "multiple"].includes(value.requests)
+      || !["idle", "running", "succeeded", "degraded", "failed", "cancelled", "other"].includes(value.refreshStatus)
+      || !["ready", "needs_attention", "other"].includes(value.onboarding)
+      || !["electronMarked", "refreshDisabled", "sourceReadable", "rolloutPresent", "stateWritable"].every((key) => typeof value[key] === "boolean")) return null;
+  return Object.freeze({ launch: value.launch, requests: value.requests,
+    refreshStatus: value.refreshStatus, onboarding: value.onboarding,
+    electronMarked: value.electronMarked, refreshDisabled: value.refreshDisabled,
+    sourceReadable: value.sourceReadable, rolloutPresent: value.rolloutPresent,
+    stateWritable: value.stateWritable });
+}
+
+async function assertDashboard({ cdp, target, fetchImpl, launch }) {
   const dashboard = exactLoopbackRootPage(target.url);
   if (dashboard === null) fail("DASHBOARD_INVALID");
   const observer = localNetworkObserver(cdp, dashboard.origin);
@@ -1755,7 +1769,33 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
       });
       return decision.status === "accepted" ? decision : null;
     }, STARTUP_TIMEOUT_MS);
-    if (accepted === null) fail("LOCAL_STARTUP_REFRESH_UNAVAILABLE");
+    if (accepted === null) {
+      let diagnostic = null;
+      try {
+        const [onboarding, status, renderer] = await Promise.all([
+          jsonFetch(new URL("/api/local/onboarding", dashboard), { fetchImpl }),
+          jsonFetch(refreshEndpoint, { fetchImpl }),
+          cdp.evaluate(`(() => ({
+            electronMarked: document.documentElement.classList.contains("electron-dashboard")
+              || document.body?.classList.contains("electron-dashboard") === true,
+            refreshDisabled: document.querySelector("#refresh-button")?.disabled === true
+          }))()`),
+        ]);
+        diagnostic = normalizeStartupFailureDiagnostic({
+          launch, requests: observer.refreshCount() === 0 ? "zero" : observer.refreshCount() === 1 ? "one" : "multiple",
+          refreshStatus: ["idle", "running", "succeeded", "degraded", "failed", "cancelled"].includes(status?.refresh?.status) ? status.refresh.status : "other",
+          onboarding: ["ready", "needs_attention"].includes(onboarding?.status) ? onboarding.status : "other",
+          electronMarked: renderer?.electronMarked === true,
+          refreshDisabled: renderer?.refreshDisabled === true,
+          sourceReadable: onboarding?.source?.sessionsReadable === true || onboarding?.source?.archivedSessionsReadable === true,
+          rolloutPresent: onboarding?.source?.rolloutFilesPresent === true,
+          stateWritable: onboarding?.state?.writable === true,
+        });
+      } catch { /* A failed diagnostic must preserve the original failure. */ }
+      throw Object.assign(new Error(`${PREFIX}LOCAL_STARTUP_REFRESH_UNAVAILABLE`), {
+        code: `${PREFIX}LOCAL_STARTUP_REFRESH_UNAVAILABLE`, startupDiagnostic: diagnostic,
+      });
+    }
     const terminal = await waitFor(async () => {
       if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
       const decision = classifyAutomaticStartupRefreshReceipt({
@@ -2003,7 +2043,8 @@ async function launchAndRenderCandidate({
     quitProtocol = createQuitProtocol(child);
     const connected = await connectDashboard({ port, fetchImpl, WebSocketConstructor });
     cdp = connected.cdp;
-    const dashboard = await assertDashboard({ cdp, target: connected.target, fetchImpl });
+    const dashboard = await assertDashboard({ cdp, target: connected.target, fetchImpl,
+      launch: changeSettings ? "first" : "restart" });
     observer = dashboard.observer;
     const sharingOptOutRetained = await assertRenderedSharingOptOut(cdp);
     tracked = await processProof({
@@ -2121,7 +2162,7 @@ async function ensureWindowsNormalCandidateReceiptParent(receiptPath) {
   return parent;
 }
 
-function candidateReceipt({ sourceRevision, identity = null, journey = null, errorCode = null, cleanup = {} } = {}) {
+function candidateReceipt({ sourceRevision, identity = null, journey = null, errorCode = null, cleanup = {}, startupDiagnostic = null } = {}) {
   return Object.freeze({
     schemaVersion: RECEIPT_SCHEMA,
     status: errorCode === null ? "passed" : "failed",
@@ -2144,6 +2185,9 @@ function candidateReceipt({ sourceRevision, identity = null, journey = null, err
     outboundFirewallRuleRemoved: cleanup.firewallRemoved === true,
     ownedProfileRemoved: cleanup.profileRemoved === true,
     errorCode,
+    ...(normalizeStartupFailureDiagnostic(startupDiagnostic) === null ? {} : {
+      startupDiagnostic: normalizeStartupFailureDiagnostic(startupDiagnostic),
+    }),
     productionReady: false,
   });
 }
@@ -2194,6 +2238,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
   let firewallName = null;
   let journey = null;
   let errorCode = null;
+  let startupDiagnostic = null;
   const cleanup = { firewallInstalled: false, firewallRemoved: false, profileRemoved: false };
   const candidateState = { quiescent: false, tracked: null };
   try {
@@ -2241,6 +2286,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
     });
   } catch (error) {
     errorCode = fixedCode(error);
+    startupDiagnostic = normalizeStartupFailureDiagnostic(error?.startupDiagnostic);
   } finally {
     if (firewallName !== null && candidateState.quiescent === true) {
       cleanup.firewallRemoved = await removeFirewall({
@@ -2267,6 +2313,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
       journey,
       errorCode,
       cleanup,
+      startupDiagnostic,
     });
     try {
       await receiptHandle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`);
