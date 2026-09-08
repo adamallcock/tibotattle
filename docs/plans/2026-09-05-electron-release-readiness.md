@@ -14,14 +14,22 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Latest completed native run: `b103ef6d` in
-[run 34197062178](https://github.com/adamallcock/tibotattle/actions/runs/34197062178)
-passes both Macs and Windows. Linux stops at compilation because the new timeout
-watchdog used C++ exception handling under the existing no-exceptions build. Its
-fixed compiler-failure record is retained; this run never reached credential
-execution or produced a Linux package. The repair keeps that build policy and
-uses GLib’s fallible thread constructor, with deadline timing anchored to the
-operation and expiry checked before normal settlement. Native proof is pending.
+Latest completed native run: `bff275fb` in
+[run 34198393332](https://github.com/adamallcock/tibotattle/actions/runs/34198393332)
+passes both Macs and Windows. Linux now compiles and packages, then refuses
+account-observation creation with the closed diagnostic
+`CREATE_MUTATION_UNAVAILABLE`. Initial reads and the default-state probe pass;
+the failure precedes the retained mutation intent. The five-second service
+deadline fixture is later in the journey and has not yet executed. Its original
+failure log and source-bound fixed receipt remain preserved. A read-only test
+probe now distinguishes default-collection absence, lock and availability before
+another native run; it adds no product API or credential mutation.
+
+The preceding `b103ef6d` run stopped at compilation because the timeout watchdog
+used C++ exceptions under the existing no-exceptions build. The GLib repair keeps
+that build policy, anchors the deadline to operation start and checks expiry
+before normal settlement. `bff275fb` verifies native compilation of that repair.
+The original compiler failure remains preserved.
 
 The preceding native run: `90486dc6` in
 [run 34194270068](https://github.com/adamallcock/tibotattle/actions/runs/34194270068)
