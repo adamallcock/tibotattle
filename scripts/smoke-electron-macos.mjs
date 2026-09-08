@@ -2184,9 +2184,10 @@ async function assertTrayProcessRelaunch({ executable, appPath, environment, fix
     await runRelaunchPhase(
       "settings_bridge",
       () => waitFor(
-        () => dashboard.evaluate('typeof globalThis.tibotattleDesktop?.openTraySettings === "function"'),
+        () => dashboard.evaluate(`(() => document.documentElement?.dataset?.localDashboardReady === "true"
+          && typeof globalThis.tibotattleDesktop?.openTraySettings === "function")()`),
         MAX_STARTUP_MS,
-        "relaunch settings bridge",
+        "relaunch dashboard readiness and settings bridge",
       ),
     );
     await runRelaunchPhase(

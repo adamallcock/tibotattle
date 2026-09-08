@@ -177,6 +177,19 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.doesNotMatch(source.replace(settingsDeepLinkReload, ""), /Page\.reload/u);
   assert.match(source, /Page\.getFrameTree/u);
   assert.match(source, /localDashboardReady/u);
+  const relaunchStart = source.indexOf("async function assertTrayProcessRelaunch");
+  const relaunchEnd = source.indexOf("\nasync function", relaunchStart + 1);
+  assert.ok(relaunchStart >= 0 && relaunchEnd > relaunchStart);
+  const relaunchSource = source.slice(relaunchStart, relaunchEnd);
+  assert.match(
+    relaunchSource,
+    /document\.documentElement\?\.dataset\?\.localDashboardReady === "true"\s+&& typeof globalThis\.tibotattleDesktop\?\.openTraySettings === "function"/u,
+  );
+  const relaunchReadiness = "relaunch dashboard readiness and settings bridge";
+  const traySettingsInvocation = "dashboard.evaluate('globalThis.tibotattleDesktop.openTraySettings()')";
+  assert.ok(relaunchSource.indexOf(relaunchReadiness) >= 0);
+  assert.ok(relaunchSource.indexOf(traySettingsInvocation) > relaunchSource.indexOf(relaunchReadiness));
+  assert.equal(relaunchSource.split(traySettingsInvocation).length, 2);
   assert.match(source, /assertDashboardData/u);
   assert.match(source, /assertDashboardParitySurfaces/u);
   assert.match(source, /#accounting-component-counts/u);
