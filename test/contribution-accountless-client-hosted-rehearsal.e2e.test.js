@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import {
@@ -204,7 +205,7 @@ test("hosted synthetic cleanup retains private recovery state after an uncertain
 });
 
 test("synthetic hosted accountless client proof uses the one reviewed staging origin and disconnects", {
-  timeout: 90_000,
+  timeout: 420_000,
   skip: enabled
     ? false
     : "set the explicit hosted rehearsal gate and acknowledgement to run against the reviewed staging Worker",
@@ -236,7 +237,7 @@ test("synthetic hosted accountless client proof uses the one reviewed staging or
   });
 
   await writeAttributionFixture(indexFile, { observedAtMs: Date.now() });
-  const result = await runAccountlessContributionSyncOnce({
+  const options = {
     backend,
     fetchImpl: async (url, request) => {
       const parsed = new URL(url);
@@ -261,7 +262,18 @@ test("synthetic hosted accountless client proof uses the one reviewed staging or
     rehearsal: true,
     requestTimeoutMilliseconds: 10_000,
     stateFile,
-  });
+  };
+  let result = await runAccountlessContributionSyncOnce(options);
+  let retries = 0;
+  while (result.status === "failed" && result.failure?.retryable === true
+      && Number.isSafeInteger(result.failure.retryAfterMilliseconds)
+      && result.failure.retryAfterMilliseconds > 0
+      && result.failure.retryAfterMilliseconds <= 60_000 && retries < 4) {
+    t.diagnostic(`Hosted service requested retry after ${result.failure.retryAfterMilliseconds} ms`);
+    await delay(result.failure.retryAfterMilliseconds + 1_000);
+    retries += 1;
+    result = await runAccountlessContributionSyncOnce(options);
+  }
   assert.equal(result.status, "complete", JSON.stringify({
     status: result.status,
     failure: result.failure,
@@ -271,6 +283,9 @@ test("synthetic hosted accountless client proof uses the one reviewed staging or
   assert.equal(requests.some(({ path }) => path === "/api/v1/accountless/enrollment"), true);
   assert.equal(requests.some(({ path }) => path === "/api/v1/accountless/ownership"), true);
   assert.equal(requests.some(({ path }) => path === "/api/v1/contributions"), true);
+  t.diagnostic(JSON.stringify({ status: result.status, retries,
+    daysSynced: result.daysSynced, chunksUploaded: result.chunksUploaded,
+    recordsUploaded: result.recordsUploaded, requests }));
 
   disconnectAttempted = true;
   await disconnectSyntheticDevice({ backend, origin, stateFile });
@@ -285,4 +300,5 @@ test("synthetic hosted accountless client proof uses the one reviewed staging or
     stateFile,
   });
   assert.equal(optOut.failure?.code, "preference_ineligible");
+  t.diagnostic("Remote disconnect confirmed; opted-out client refused further work");
 });
