@@ -1,8 +1,48 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
+
+test("the exact embedded Linux proof accepts real TAP lines and refuses zero-exit skips", async () => {
+  const workflow = await read(".github/workflows/electron-development-packages.yml");
+  const blocks = [...workflow.matchAll(/--input-type=module --eval '([\s\S]*?)^\s*'/gmu)];
+  assert.equal(blocks.length, 1);
+  const script = blocks[0][1];
+  const imports = script.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("import "));
+  assert.deepEqual(imports, [
+    'import { spawnSync } from "node:child_process";',
+    'import { proveLinuxSecretServiceContainerIsolation } from "./scripts/qualify-linux-secret-service.mjs";',
+  ]);
+  const program = script.split("\n").filter((line) => !line.trim().startsWith("import ")).join("\n");
+  const marker = "# LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_BOOTSTRAP_PASSED";
+  const passed = { status: 0, signal: null, stdout: `${marker}\n`, stderr: "" };
+  const cases = [
+    [passed, true],
+    [{ ...passed, stdout: `TAP version 13\r\n${marker}\r\nok 1 - fixed native test\r\n` }, true],
+    [{ ...passed, stdout: "ok 1 - fixed native test # SKIP\n" }, false],
+    [{ ...passed, stdout: "" }, false],
+    [{ ...passed, stdout: `${marker}\n${marker}\n` }, false],
+    [{ ...passed, stdout: `${marker}\\n` }, false],
+    [{ ...passed, status: 1, stderr: "private-error-canary" }, false],
+    [{ ...passed, signal: "SIGTERM" }, false],
+    [{ ...passed, error: { message: "private-error-canary" } }, false],
+  ];
+  for (const [result, expectedPass] of cases) {
+    const execution = spawnSync(process.execPath, ["--input-type=module", "--eval", `
+      const spawnSync = () => (${JSON.stringify(result)});
+      const proveLinuxSecretServiceContainerIsolation = () => ({ status: "isolated" });
+      delete process.env.XDG_STATE_HOME;
+      ${program}
+    `], { encoding: "utf8", maxBuffer: 16 * 1024, timeout: 5_000, shell: false });
+    assert.equal(execution.error, undefined);
+    assert.equal(execution.signal, null);
+    assert.equal(execution.status, expectedPass ? 0 : 1);
+    assert.equal(execution.stdout, expectedPass ? "LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_EVIDENCE_PASSED\n" : "");
+    assert.equal(execution.stderr, expectedPass ? "" : "LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_EVIDENCE_FAILED\n");
+  }
+});
 
 test("packaged Linux image admits only the chosen app and verifier inputs", async () => {
   const dockerfile = await read("containers/electron-linux-packaged/Dockerfile");

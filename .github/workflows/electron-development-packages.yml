@@ -260,7 +260,7 @@ jobs:
               import { spawnSync } from "node:child_process";
               import { proveLinuxSecretServiceContainerIsolation } from "./scripts/qualify-linux-secret-service.mjs";
               const fail = () => {
-                process.stderr.write("LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_EVIDENCE_FAILED\\n");
+                process.stderr.write("LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_EVIDENCE_FAILED\n");
                 process.exit(1);
               };
               try {
@@ -279,11 +279,11 @@ jobs:
                 });
                 const marker = "# LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_BOOTSTRAP_PASSED";
                 const markers = typeof result.stdout === "string"
-                  ? result.stdout.split(/\\r?\\n/u).filter((line) => line === marker)
+                  ? result.stdout.split(/\r?\n/u).filter((line) => line === marker)
                   : [];
                 if (result.error || result.signal !== null || result.status !== 0
                     || markers.length !== 1) fail();
-                process.stdout.write("LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_EVIDENCE_PASSED\\n");
+                process.stdout.write("LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_EVIDENCE_PASSED\n");
               } catch {
                 fail();
               }
