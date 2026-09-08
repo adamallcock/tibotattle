@@ -478,6 +478,29 @@ test("weekly pace renders only for a current allowance bound to its valid outloo
   assert.equal(mismatchedDocument.getElementById("pace-section").hidden, true);
 });
 
+test("weekly pace explains a verified zero-observation state without estimating", () => {
+  const data = fixture();
+  const outlook = data.weekly.paceOutlook;
+  outlook.status = "unavailable";
+  outlook.standing = null;
+  outlook.remainingPercent = null;
+  outlook.resetsAt = null;
+  outlook.observationCount = 0;
+  outlook.elapsedHours = null;
+  outlook.rates = Object.fromEntries(Object.keys(outlook.rates).map((key) => [key, null]));
+  outlook.projection = Object.fromEntries(Object.keys(outlook.projection).map((key) => [key, null]));
+  outlook.track = Object.fromEntries(Object.keys(outlook.track).map((key) => [key, null]));
+  const projection = createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" });
+  assert.equal(projection.weeklyPace.status, "insufficient_observations");
+
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, projection);
+  assert.equal(documentRef.getElementById("pace-section").hidden, false);
+  assert.equal(documentRef.getElementById("pace-state").textContent, "Insufficient evidence");
+  assert.equal(documentRef.getElementById("pace-metrics").hidden, true);
+  assert.equal(documentRef.getElementById("pace-track").hidden, true);
+});
+
 test("allowance claims require each lane's live fresh observation and future reset", () => {
   const data = fixture();
   data.quotaWindows[0].usedPercent = 24.4;

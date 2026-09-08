@@ -582,6 +582,54 @@ function buildWeeklyPace(
       && [activeRate, overallRate, headlineRate, sustainableRate, ratio,
         coveredHours, dryHours, sparePercent, projectedExhaustionAt,
         coveredFraction, activeExhaustionFraction].every((value) => value === null);
+    // A freshly installed companion has a current weekly allowance before it
+    // has recorded a comparison point. This exact empty shape is evidence of
+    // that normal collecting state, rather than a malformed forecast. Keep it
+    // distinct so the tray can explain the absence of a pace card without
+    // displaying any invented estimate.
+    const insufficientObservations = status === "unavailable"
+      && standing === null
+      && outlook.critical === false
+      && outlook.earlyEstimate === false
+      && observationCount === 0
+      && elapsedHours === null
+      && remainingPercent === null
+      && resetsAt === null
+      && [activeRate, overallRate, headlineRate, sustainableRate, ratio,
+        hoursToReset, coveredHours, dryHours, sparePercent, projectedExhaustionAt,
+        coveredFraction, activeExhaustionFraction].every((value) => value === null);
+    if (insufficientObservations && weeklyLane !== undefined) {
+      return Object.freeze({
+        status: "insufficient_observations",
+        currentUsedPercent: null,
+        remainingPercent: null,
+        resetsAt: null,
+        observationCount,
+        etaAt: null,
+        hoursToExhaustion: null,
+        hoursToReset: null,
+        pace: Object.freeze({
+          method: null,
+          sampleCount: 0,
+          elapsedHours: null,
+          movementPp: null,
+          activePercentagePointsPerHour: null,
+          overallPercentagePointsPerHour: null,
+        }),
+        outlook: Object.freeze({
+          kind: "unavailable",
+          standing: null,
+          critical: false,
+          earlyEstimate: false,
+          projectedExhaustionAt: null,
+          coveredHours: null,
+          dryHours: null,
+          sparePercent: null,
+          coveredFraction: null,
+          activeExhaustionFraction: null,
+        }),
+      });
+    }
     const expectedActiveFraction = activeRate !== null && activeRate > 0
       && coveredHours !== null
       && remainingPercent !== null
@@ -1154,8 +1202,18 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
   const available = pace.status === "available"
     && hasBoundOutlook
     && resetMatches;
-  setHidden(documentRef, "pace-section", !available);
-  if (!available) return;
+  const insufficient = pace.status === "insufficient_observations"
+    && weeklyAllowance !== undefined;
+  setHidden(documentRef, "pace-section", !available && !insufficient);
+  setHidden(documentRef, "pace-metrics", !available);
+  setHidden(documentRef, "pace-track", !available);
+  if (!available) {
+    if (insufficient) {
+      setElementText(documentRef, "pace-state", t("weekly.headline.insufficient"));
+      setElementText(documentRef, "pace-outlook", "");
+    }
+    return;
+  }
 
   const standingKey = pace.outlook.critical
     ? "electron.trayPopover.paceCritical"
