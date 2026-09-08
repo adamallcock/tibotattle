@@ -19,6 +19,20 @@ Do not add cosmetic work, optional platform abstractions, or broader audits.
 Change only a reproduced cutover blocker or the smallest test needed to resolve
 one. The Mac daily-use tester is available; that is not full cutover readiness.
 
+Latest completed native candidate: `d523068d`,
+[run 34258700354](https://github.com/adamallcock/tibotattle/actions/runs/34258700354).
+Both Mac package/artifact jobs pass. Windows development packaging and a fourth
+fresh NSIS lifecycle pass. The normal Windows candidate builds, but package
+verification fails before app launch; closed package-stage diagnostics are now
+integrated. Linux passes the exact packaged startup-store probe, including its
+persistence attempt (the probe does not independently verify saved bytes), then
+still fails ordinary dashboard readiness. Its last observed snapshot state is
+`building`. The preserved failed Linux receipt has SHA-256
+`a319496152dd39ba76dc0a08c35bf4d586534d542cd9363d2d3f1612724aae74`.
+The next candidate retains a bounded server-minted startup failure in the
+existing local journal and exports only its fixed step/detail in the test
+receipt. These diagnostic changes do not close either normal-app gate.
+
 1. Close the real native Mac -> signed Electron -> next signed Electron
    installed rehearsal. The original signed private fixtures exposed the
    startup verifier defect; corrected unsigned replacements are prepared.

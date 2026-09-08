@@ -9,7 +9,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, open, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -45,6 +46,8 @@ const RENDERER_READINESS_DIAGNOSTIC_SCHEMA =
   "tibotattle-electron-linux-normal-packaged-renderer-readiness-diagnostic-v2";
 const SNAPSHOT_DIAGNOSTIC_SCHEMA =
   "tibotattle-electron-linux-normal-packaged-snapshot-diagnostic-v1";
+const STARTUP_FAILURE_DIAGNOSTIC_SCHEMA =
+  "tibotattle-electron-linux-normal-packaged-startup-failure-v1";
 const CLI_FAILURE = "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_FAILED";
 const MAX_JSON_BYTES = 1_048_576;
 // Two source-smoke journeys each retain their existing 30s startup, two 45s
@@ -92,6 +95,63 @@ const SNAPSHOT_DIAGNOSTIC_CODES = new Set([
   ...Object.values(SNAPSHOT_FAILURE_CODES),
   ...SNAPSHOT_DOMAIN_ERROR_CODES.values(),
 ]);
+// Kept equal to the companion's server-minted journal vocabulary by the owning
+// contract test. Only these two fixed fields leave the disposable fixture.
+export const LINUX_STARTUP_DIAGNOSTIC_STEPS = Object.freeze(["data_store", "contribution_start"]);
+export const LINUX_STARTUP_DIAGNOSTIC_DETAILS = Object.freeze([
+  ...SNAPSHOT_DOMAIN_ERROR_CODES.keys(),
+  "codex_speed_baseline_unavailable",
+  "local_unified_companion_projection_aborted",
+  "local_unified_companion_projection_worker_failed",
+  "local_unified_index_missing",
+  "local_unified_index_unavailable",
+  "local_unified_index_file_changed",
+  "local_unified_index_generation_mismatch",
+  "local_unified_index_schema_invalid",
+  "local_unified_index_schema_newer",
+  "local_unified_index_tool_attestation_mismatch",
+  "local_unified_index_worker_failed",
+  "type_error", "syntax_error", "unexpected_error",
+]);
+
+function validateStartupFailure(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && Reflect.ownKeys(value).length === 2
+    && LINUX_STARTUP_DIAGNOSTIC_STEPS.includes(value.step)
+    && LINUX_STARTUP_DIAGNOSTIC_DETAILS.includes(value.detail)
+    ? Object.freeze({ step: value.step, detail: value.detail }) : null;
+}
+
+/** Read a fixed server note after a failed ordinary launch; never export log text. */
+export async function readLinuxNormalStartupFailure(userData) {
+  if (absolutePath(userData) === null) return null;
+  let handle;
+  try {
+    const file = join(userData, "companion-state", "diagnostics-v0.1.log");
+    const before = await lstat(file);
+    if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
+        || before.uid !== process.getuid() || (before.mode & 0o777) !== 0o600
+        || before.size < 1 || before.size > 256 * 1024) return null;
+    handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const opened = await handle.stat();
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino
+        || opened.nlink !== 1 || opened.size !== before.size) return null;
+    const bytes = Buffer.alloc(before.size + 1);
+    const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+    if (bytesRead !== before.size) return null;
+    const matches = [];
+    for (const line of bytes.subarray(0, bytesRead).toString("utf8").split("\n")) {
+      let value;
+      try { value = JSON.parse(line); } catch { continue; }
+      if (value?.schemaVersion !== "local-diagnostic-note-v0.1"
+          || value.surface !== "local_startup" || value.code !== "snapshot_unavailable") continue;
+      const selected = validateStartupFailure({ step: value.step, detail: value.detail });
+      if (selected !== null) matches.push(selected);
+    }
+    return matches.length === 1 ? matches[0] : null;
+  } catch { return null; }
+  finally { await handle?.close().catch(() => {}); }
+}
 const SOURCE_SMOKE_STAGE_CODES = Object.freeze({
   startup: "SOURCE_SMOKE_STARTUP_FAILED",
   target: "SOURCE_SMOKE_TARGET_FAILED",
@@ -530,10 +590,14 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
   let smokeFailureStage = null;
   let rendererReadinessDiagnostics = null;
   let result;
+  let ownedFixture = null;
   try {
     result = await runSmoke({
       binary: appPath,
-      fixtureFactory: createLinuxNormalPackagedSmokeFixture,
+      fixtureFactory: async () => {
+        ownedFixture = await createLinuxNormalPackagedSmokeFixture();
+        return ownedFixture;
+      },
       launchArguments: ({ fixture, port }) => [
         `--user-data-dir=${fixture.userData}`,
         `--remote-debugging-port=${port}`,
@@ -565,6 +629,8 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
       const classified = validateRendererReadinessDiagnostics(rendererReadinessDiagnostics);
       const fixed = failure(stageCode);
       if (classified !== null) fixed.rendererReadinessDiagnostics = classified;
+      const startupFailure = await readLinuxNormalStartupFailure(ownedFixture?.userData);
+      if (startupFailure !== null) fixed.companionStartupFailure = startupFailure;
       throw fixed;
     }
     throw error;
@@ -645,13 +711,16 @@ export async function runExactAsarSnapshot(identity, {
 } = {}) {
   const base = absolutePath(environment.XDG_RUNTIME_DIR);
   if (base === null) fail(SNAPSHOT_FAILURE_CODES.fixture);
-  const root = await mkdtemp(join(base, "tibotattle-snapshot-"));
-  await chmod(root, 0o700);
+  let root = null;
   let child = null;
   let stopped = true;
   let output = Buffer.alloc(0);
   let oversized = false;
   try {
+    try {
+      root = await mkdtemp(join(base, "tibotattle-snapshot-"));
+      await chmod(root, 0o700);
+    } catch { fail(SNAPSHOT_FAILURE_CODES.fixture); }
     const selected = sessionEnvironment(environment);
     selected.ELECTRON_RUN_AS_NODE = "1";
     selected.HOME = root;
@@ -695,7 +764,10 @@ export async function runExactAsarSnapshot(identity, {
       try { stopped = await stopChild(child); } catch { stopped = false; }
     }
     if (!stopped) fail(SNAPSHOT_FAILURE_CODES.cleanup);
-    await rm(root, { recursive: true, force: false });
+    if (root !== null) {
+      try { await rm(root, { recursive: true, force: false }); }
+      catch { fail(SNAPSHOT_FAILURE_CODES.cleanup); }
+    }
   }
 }
 
@@ -855,9 +927,15 @@ function classifiedInnerFailure(stderr) {
       ? validateRendererReadinessDiagnostics(value.rendererReadinessDiagnostics)
       : null
   )).filter((value) => value !== null);
+  const startupFailures = lines.map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).map((value) => value?.schemaVersion === STARTUP_FAILURE_DIAGNOSTIC_SCHEMA
+    ? validateStartupFailure(value.companionStartupFailure) : null)
+    .filter((value) => value !== null);
   return Object.freeze({
     code: matches[0],
     rendererReadinessDiagnostics: diagnostics.length === 1 ? diagnostics[0] : null,
+    companionStartupFailure: startupFailures.length === 1 ? startupFailures[0] : null,
   });
 }
 
@@ -894,6 +972,9 @@ export async function runLinuxNormalPackagedSmokeSession(identity, {
       if (innerFailure.rendererReadinessDiagnostics !== null) {
         error.rendererReadinessDiagnostics = innerFailure.rendererReadinessDiagnostics;
       }
+      if (innerFailure.companionStartupFailure !== null) {
+        error.companionStartupFailure = innerFailure.companionStartupFailure;
+      }
       throw error;
     }
     fail("SESSION_EXECUTION_FAILED");
@@ -929,6 +1010,7 @@ function outerReceipt({
   inner = null,
   errorCode = null,
   rendererReadinessDiagnostics = null,
+  companionStartupFailure = null,
 }) {
   const diagnostic = validateRendererReadinessDiagnostics(rendererReadinessDiagnostics);
   const receipt = {
@@ -941,6 +1023,8 @@ function outerReceipt({
     sessionCleanupConfirmed: inner?.cleanup === "owned_apps_stopped", errorCode, productionReady: false,
   };
   if (diagnostic !== null) receipt.rendererReadinessDiagnostics = diagnostic;
+  const startupFailure = validateStartupFailure(companionStartupFailure);
+  if (startupFailure !== null) receipt.companionStartupFailure = startupFailure;
   return Object.freeze(receipt);
 }
 
@@ -958,6 +1042,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
   let inner = null;
   let errorCode = null;
   let rendererReadinessDiagnostics = null;
+  let companionStartupFailure = null;
   try {
     identity = await verifyPackage(options);
     inner = await runSession(identity, { appPath: options.appPath, environment });
@@ -966,6 +1051,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
     rendererReadinessDiagnostics = validateRendererReadinessDiagnostics(
       error?.rendererReadinessDiagnostics,
     );
+    companionStartupFailure = validateStartupFailure(error?.companionStartupFailure);
   }
   const receipt = outerReceipt({
     sourceRevision: options.sourceRevision,
@@ -973,6 +1059,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
     inner,
     errorCode,
     rendererReadinessDiagnostics,
+    companionStartupFailure,
   });
   await write(handle, receipt);
   return receipt;
@@ -1003,6 +1090,11 @@ if (resolve(process.argv[1] ?? "") === SCRIPT_FILE) {
     process.stderr.write(`${code}\n`);
     const diagnostic = diagnosticEnvelope(error?.rendererReadinessDiagnostics);
     if (diagnostic !== null) process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
+    const startupFailure = validateStartupFailure(error?.companionStartupFailure);
+    if (startupFailure !== null) process.stderr.write(`${JSON.stringify({
+      schemaVersion: STARTUP_FAILURE_DIAGNOSTIC_SCHEMA,
+      companionStartupFailure: startupFailure,
+    })}\n`);
     process.exitCode = 1;
   });
 }

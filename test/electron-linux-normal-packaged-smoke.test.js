@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { chmod, link, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -14,6 +14,9 @@ import {
   createLinuxNormalPackagedSmokeFixture,
   normalPackagedSmokeEnvironment,
   normalPackagedSmokeFailureStageCode,
+  LINUX_STARTUP_DIAGNOSTIC_DETAILS,
+  LINUX_STARTUP_DIAGNOSTIC_STEPS,
+  readLinuxNormalStartupFailure,
   runLinuxNormalPackagedSmoke,
   runExactAsarSnapshot,
   runExactAsarSnapshotInside,
@@ -34,6 +37,77 @@ const SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567";
 const ARTIFACT_SHA256 = "a".repeat(64);
 const APP_PATH = "/private/tmp/tibotattle-linux-unpacked/tibotattle";
 const FIXTURE_BINARY = resolve("test/fixtures/linux-packaged-codex/codex");
+
+test("Linux failure receipt vocabulary matches the server's closed startup journal", async () => {
+  const server = await import("../apps/local/server.js");
+  assert.deepEqual([...LINUX_STARTUP_DIAGNOSTIC_STEPS].sort(),
+    [...server.LOCAL_STARTUP_DIAGNOSTIC_STEPS].sort());
+  assert.deepEqual([...LINUX_STARTUP_DIAGNOSTIC_DETAILS].sort(),
+    [...server.LOCAL_STARTUP_DIAGNOSTIC_DETAILS].sort());
+});
+
+test("Linux startup journal reader exports only one fixed failure and rejects unsafe files", async () => {
+  const userData = await mkdtemp(join(tmpdir(), "linux-startup-journal-"));
+  const state = join(userData, "companion-state");
+  const file = join(state, "diagnostics-v0.1.log");
+  const note = {
+    schemaVersion: "local-diagnostic-note-v0.1", recordedAt: "2026-09-08T00:00:00.000Z",
+    reference: "TT-123ABC", surface: "local_startup", code: "snapshot_unavailable",
+    requestId: "", step: "data_store", detail: "local_collector_projection_worker_failed",
+  };
+  try {
+    await mkdir(state, { mode: 0o700 });
+    assert.equal(await readLinuxNormalStartupFailure(userData), null);
+    await writeFile(file, `${JSON.stringify(note)}\n`, { mode: 0o600 });
+    assert.deepEqual(await readLinuxNormalStartupFailure(userData), {
+      step: "data_store", detail: "local_collector_projection_worker_failed",
+    });
+    await writeFile(file, `${JSON.stringify({ ...note, detail: "private_payload" })}\n`);
+    assert.equal(await readLinuxNormalStartupFailure(userData), null);
+    await writeFile(file, `${JSON.stringify(note)}\n${JSON.stringify(note)}\n`);
+    assert.equal(await readLinuxNormalStartupFailure(userData), null);
+    await writeFile(file, `${JSON.stringify(note)}\n`);
+    await chmod(file, 0o644);
+    assert.equal(await readLinuxNormalStartupFailure(userData), null);
+    await chmod(file, 0o600);
+    const alias = join(state, "private-alias");
+    await link(file, alias);
+    assert.equal(await readLinuxNormalStartupFailure(userData), null);
+    await rm(file);
+    await symlink(alias, file);
+    assert.equal(await readLinuxNormalStartupFailure(userData), null);
+  } finally { await rm(userData, { recursive: true, force: true }); }
+});
+
+test("Linux session and outer receipt preserve a fixed startup failure without widening renderer results", async () => {
+  const child = sessionChild();
+  const failure = { step: "data_store", detail: "type_error" };
+  const emitFailure = () => queueMicrotask(() => {
+    child.stdout.end();
+    child.stderr.write("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_TRUE_FAILED\n");
+    child.stderr.write(`${JSON.stringify({
+      schemaVersion: "tibotattle-electron-linux-normal-packaged-startup-failure-v1",
+      companionStartupFailure: failure,
+    })}\n`);
+    child.stderr.end();
+    child.exitCode = 1;
+    child.emit("exit", 1, null);
+  });
+  const identity = { sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256 };
+  const receipt = await runLinuxNormalPackagedSmoke({
+    sourceRevision: SOURCE_REVISION, receiptPath: "/private/tmp/linux-startup-receipt.json",
+  }, {
+    verifyPackage: async () => identity,
+    runSession: () => runLinuxNormalPackagedSmokeSession(identity, {
+      appPath: APP_PATH, spawnSession: () => { emitFailure(); return child; },
+    }),
+    reserve: async () => ({}), write: async () => {},
+  });
+  assert.equal(receipt.status, "failed");
+  assert.equal(receipt.packagedElectronExecutionVerified, false);
+  assert.deepEqual(receipt.companionStartupFailure, failure);
+  assert.equal(receipt.rendererReadinessDiagnostics, undefined);
+});
 
 function productionMetadata(sourceRevision = SOURCE_REVISION) {
   return createProductionDistributionMetadata({
@@ -691,4 +765,18 @@ test("exact ASAR diagnostic retains its private fixture when timeout cleanup can
     }), { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SNAPSHOT_CLEANUP_UNCONFIRMED" });
     assert.equal((await stat(fixture)).mode & 0o777, 0o700);
   } finally { await rm(runtime, { recursive: true, force: true }); }
+});
+
+test("exact ASAR diagnostic classifies fixture creation failure without exposing its path", async () => {
+  const runtime = await mkdtemp(join(tmpdir(), "linux-snapshot-missing-root-"));
+  await rm(runtime, { recursive: true });
+  await assert.rejects(runExactAsarSnapshot({
+    sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256,
+  }, {
+    appPath: APP_PATH, environment: { XDG_RUNTIME_DIR: runtime },
+    spawnChild: () => assert.fail("a missing fixture must never launch Electron"),
+  }), {
+    code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SNAPSHOT_FIXTURE_INVALID",
+    message: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SNAPSHOT_FIXTURE_INVALID",
+  });
 });
