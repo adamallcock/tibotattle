@@ -115,8 +115,8 @@ test("the development workflow builds each target on a static native runner with
   }
   assert.doesNotMatch(workflow, /Add the (?:Windows|Linux) development launch handoff/u,
     "handoff assembly belongs to the common local/CI packaging command");
-  assert.equal((workflow.match(/persist-credentials: false/gu) ?? []).length, 4);
-  assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 4);
+  assert.equal((workflow.match(/persist-credentials: false/gu) ?? []).length, 5);
+  assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 5);
   assert.match(workflow, /WINDOWS_BINDING_BUILD_FAILED/u);
   assert.match(workflow, /LINUX_CREDENTIAL_MUTEX_NODE_GYP_UNAVAILABLE/u);
   assert.match(workflow, /rebuild --directory native\/linux-credential-mutex/u);
@@ -131,6 +131,31 @@ test("the development workflow builds each target on a static native runner with
     workflow.indexOf("build-linux-credential-mutex-manifest.mjs")
       < workflow.indexOf("qualify-linux-credential-mutex.mjs"),
   );
+
+  const windowsPackageJob = jobs.find((section) => section.startsWith("  win32-x64:\n"));
+  const windowsLifecycleJob = jobs.find((section) => section.startsWith("  win32-x64-nsis-lifecycle:\n"));
+  assert.ok(windowsPackageJob);
+  assert.ok(windowsLifecycleJob);
+  assert.match(windowsPackageJob, /outputs:\n\s+development-artifact-id: \$\{\{ steps\.retain-win32-development\.outputs\.artifact-id \}\}/u);
+  assert.match(windowsPackageJob, /id: retain-win32-development/u);
+  assert.match(windowsPackageJob, /\.release-build\/electron-dev\/win32-x64\/app\//u);
+  assert.ok(
+    windowsPackageJob.indexOf("Exercise synthetic upload and account-observation storage")
+      < windowsPackageJob.indexOf("Retain verified Windows package, staging tree, and receipts"),
+  );
+  assert.doesNotMatch(windowsPackageJob, /Exercise unsigned NSIS install/u);
+
+  assert.match(windowsLifecycleJob, /needs: win32-x64/u);
+  assert.match(windowsLifecycleJob, /runs-on: windows-2025/u);
+  assert.match(windowsLifecycleJob, /persist-credentials: false/u);
+  assert.match(windowsLifecycleJob, /pnpm install --frozen-lockfile --ignore-scripts/u);
+  assert.match(windowsLifecycleJob, /actions\/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093/u);
+  assert.match(windowsLifecycleJob, /artifact-ids: \$\{\{ needs\.win32-x64\.outputs\.development-artifact-id \}\}/u);
+  assert.match(windowsLifecycleJob, /merge-multiple: true/u);
+  assert.match(windowsLifecycleJob, /\.release-build\/electron-dev\/win32-x64\/app/u);
+  assert.match(windowsLifecycleJob, /smoke-electron-windows-nsis-lifecycle\.mjs/u);
+  assert.match(windowsLifecycleJob, /Retain Windows NSIS lifecycle receipt/u);
+  assert.doesNotMatch(windowsLifecycleJob, /smoke-electron-windows-accountless\.mjs/u);
 });
 
 test("common packaging assembles usable, hashed handoffs without a source checkout", async () => {

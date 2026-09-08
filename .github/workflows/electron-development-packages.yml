@@ -108,6 +108,8 @@ jobs:
     name: win32-x64 unsigned development packages
     runs-on: windows-2025
     timeout-minutes: 45
+    outputs:
+      development-artifact-id: ${{ steps.retain-win32-development.outputs.artifact-id }}
     defaults:
       run:
         shell: pwsh
@@ -173,6 +175,69 @@ jobs:
           $smokeReceipt = Join-Path $packageRoot 'accountless-storage-smoke.json'
           node scripts/smoke-electron-windows-accountless.mjs --app $appPath --staged-app $stagedApp --package-receipt $packageReceipt --source-revision $env:GITHUB_SHA --receipt $smokeReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_ACCOUNTLESS_PACKAGED_SMOKE_FAILED' }
+      - name: Retain verified Windows package, staging tree, and receipts
+        if: ${{ !cancelled() }}
+        id: retain-win32-development
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-development-win32-x64-${{ github.sha }}
+          # Keep the exact staged tree with the package receipt. The isolated
+          # lifecycle job revalidates both against the installed application.
+          path: |
+            .release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/
+            .release-build/electron-dev/win32-x64/app/
+          if-no-files-found: error
+          retention-days: 14
+
+  # The fixed FD4 Credential Manager record intentionally survives for the
+  # disposable runner account lifetime. Run the installed lifecycle in a fresh
+  # hosted account so it never shares the packaged-smoke record above.
+  win32-x64-nsis-lifecycle:
+    name: win32-x64 unsigned NSIS installed lifecycle
+    needs: win32-x64
+    runs-on: windows-2025
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CI: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - name: Check out this exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up pinned Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked dependencies without lifecycle scripts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_INSTALL_FAILED' }
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_ENABLE_FAILED' }
+          corepack prepare pnpm@11.9.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw 'PNPM_PREPARE_FAILED' }
+          node -e "if(process.version!=='v26.2.0'||process.platform!=='win32'||process.arch!=='x64')process.exit(1)"
+          if ($LASTEXITCODE -ne 0) { throw 'NATIVE_RUNTIME_REQUIRED' }
+          pnpm install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'DEPENDENCY_INSTALL_FAILED' }
+      - name: Download the exact retained Windows package inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ needs.win32-x64.outputs.development-artifact-id }}
+          path: .release-build
+          # v4 extracts ID-selected artifacts into a name subdirectory unless
+          # this is explicit. Preserve the producer's verified layout.
+          merge-multiple: true
       - name: Exercise unsigned NSIS install, whole-app restart and owned uninstall
         run: |
           $ErrorActionPreference = 'Stop'
@@ -186,12 +251,12 @@ jobs:
           $lifecycleReceipt = Join-Path $packageRoot 'nsis-lifecycle-smoke.json'
           node scripts/smoke-electron-windows-nsis-lifecycle.mjs --installer $installerPath --staged-app $stagedApp --package-receipt $packageReceipt --source-revision $env:GITHUB_SHA --receipt $lifecycleReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NSIS_LIFECYCLE_SMOKE_FAILED' }
-      - name: Retain verified development packages and receipts
+      - name: Retain Windows NSIS lifecycle receipt
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: electron-development-win32-x64-${{ github.sha }}
-          path: .release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/
+          name: electron-development-win32-x64-nsis-lifecycle-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/nsis-lifecycle-smoke.json
           if-no-files-found: error
           retention-days: 14
 
