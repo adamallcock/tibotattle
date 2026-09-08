@@ -63,7 +63,10 @@ import {
   readIncrementalContributionV11Capabilities,
   readIncrementalContributionV11Review,
 } from "../../src/contribution-incremental-sync.js";
-import { createLocalAccountlessContribution } from "./accountless-contribution.js";
+import {
+  createLocalAccountlessContribution,
+  selectLocalAccountlessProductionProfile,
+} from "./accountless-contribution.js";
 import { readLocalCollectorCheckpoint } from "../../src/local-collector-state.js";
 import {
   HostedSignInHandoffError,
@@ -787,6 +790,15 @@ const API_ROUTES = new Set([
   "/api/local/contribution/incremental-approve",
   "/api/local/contribution/incremental-run",
 ]);
+
+// The production-v1 accountless companion keeps local collection and its
+// retained account-observation evidence, but it never exposes a legacy
+// contribution route or hosted sign-in. A prefix fence keeps future legacy
+// contribution routes closed too; diagnostics remains outside this prefix.
+function isAccountlessProductionClosedLocalRoute(path) {
+  return path === "/api/local/identity/hosted-signin-handoff"
+    || path.startsWith("/api/local/contribution/");
+}
 
 // Routes that do not read the Codex dashboard snapshot must answer while that
 // snapshot is still being built (or even if it fails): readiness and
@@ -2726,6 +2738,14 @@ export function createLocalCompanionServer(options = {}) {
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
   }
+  const accountlessChannel = options.accountlessChannel ?? process;
+  // This is a closed selection, not an environment feature toggle: production
+  // accountless mode requires the live inherited private channel before any
+  // legacy contribution path is accepted or normalized.
+  const accountlessProductionProfile = selectLocalAccountlessProductionProfile({
+    environment,
+    channel: accountlessChannel,
+  });
   const semanticOpenTarget = configuredSemanticOpenTarget(environment);
   const parentWatchdogPid = configuredParentWatchdogPid(environment);
   const homeDirectory = configuredHomeDirectory(environment);
@@ -2772,70 +2792,76 @@ export function createLocalCompanionServer(options = {}) {
       ?? environment.CODEX_HOME
       ?? join(homeDirectory, ".codex"),
   );
-  const contributionQueueFile = assertLocalStatePath(
-    installation.stateRoot,
-    options.contributionQueueFile
-      ?? environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
-      ?? installation.paths.contributionQueueFile,
-  );
+  const contributionQueueFile = accountlessProductionProfile
+    ? null
+    : assertLocalStatePath(
+      installation.stateRoot,
+      options.contributionQueueFile
+        ?? environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE
+        ?? installation.paths.contributionQueueFile,
+    );
   const diagnosticsLogFile = assertLocalStatePath(
     installation.stateRoot,
     options.diagnosticsLogFile
       ?? join(installation.stateRoot, DIAGNOSTICS_LOG_FILE_NAME),
   );
-  const legacyContributionDeviceStateCandidate = Object.hasOwn(
-    options,
-    "legacyContributionDeviceStateFile",
-  )
-    ? options.legacyContributionDeviceStateFile
-    : process.platform === "darwin"
-        && !Object.hasOwn(options, "contributionDeviceBackendFactory")
-      ? join(
-        homeDirectory,
-        "Library",
-        "Application Support",
-        "app-usagemonitor",
-        "contribution-device-binding-v1.json",
-      )
-      : null;
+  const legacyContributionDeviceStateCandidate = accountlessProductionProfile
+    ? null
+    : Object.hasOwn(options, "legacyContributionDeviceStateFile")
+      ? options.legacyContributionDeviceStateFile
+      : process.platform === "darwin"
+          && !Object.hasOwn(options, "contributionDeviceBackendFactory")
+        ? join(
+          homeDirectory,
+          "Library",
+          "Application Support",
+          "app-usagemonitor",
+          "contribution-device-binding-v1.json",
+        )
+        : null;
   const legacyContributionDeviceStateFile =
     legacyContributionDeviceStateCandidate === null
       ? null
       : assertLocalAbsolutePath(legacyContributionDeviceStateCandidate);
-  const preparedCandidate = Object.hasOwn(
-    options,
-    "preparedContributionDirectory",
-  )
-    ? options.preparedContributionDirectory
-    : Object.hasOwn(environment, "USAGE_MONITOR_PREPARED_DIRECTORY")
-      ? environment.USAGE_MONITOR_PREPARED_DIRECTORY
-      : installation.paths.preparedSpoolDirectory;
+  const preparedCandidate = accountlessProductionProfile
+    ? null
+    : Object.hasOwn(options, "preparedContributionDirectory")
+      ? options.preparedContributionDirectory
+      : Object.hasOwn(environment, "USAGE_MONITOR_PREPARED_DIRECTORY")
+        ? environment.USAGE_MONITOR_PREPARED_DIRECTORY
+        : installation.paths.preparedSpoolDirectory;
   const preparedContributionDirectory = preparedCandidate === null
     ? null
     : assertLocalStatePath(installation.stateRoot, preparedCandidate);
-  const contributionPreparationOptions =
-    options.contributionPreparationOptions ?? {};
-  if (!contributionPreparationOptions
-      || typeof contributionPreparationOptions !== "object"
-      || Array.isArray(contributionPreparationOptions)) {
+  const contributionPreparationOptions = accountlessProductionProfile
+    ? null
+    : options.contributionPreparationOptions ?? {};
+  if (contributionPreparationOptions !== null
+      && (!contributionPreparationOptions
+        || typeof contributionPreparationOptions !== "object"
+        || Array.isArray(contributionPreparationOptions))) {
     throw new TypeError("contributionPreparationOptions must be an object");
   }
-  const selectedPreparationOptions = {
-    ...contributionPreparationOptions,
-    activityFile: assertLocalStatePath(
-      installation.stateRoot,
-      contributionPreparationOptions.activityFile
-        ?? installation.paths.activityMarkersFile,
-    ),
-    reviewArchiveDirectory: assertLocalStatePath(
-      installation.stateRoot,
-      contributionPreparationOptions.reviewArchiveDirectory
-        ?? installation.paths.reviewArchiveDirectory,
-    ),
-  };
+  const selectedPreparationOptions = accountlessProductionProfile
+    ? Object.freeze({})
+    : {
+      ...contributionPreparationOptions,
+      activityFile: assertLocalStatePath(
+        installation.stateRoot,
+        contributionPreparationOptions.activityFile
+          ?? installation.paths.activityMarkersFile,
+      ),
+      reviewArchiveDirectory: assertLocalStatePath(
+        installation.stateRoot,
+        contributionPreparationOptions.reviewArchiveDirectory
+          ?? installation.paths.reviewArchiveDirectory,
+      ),
+    };
   return createPreparedLocalCompanionServer({
     ...options,
     environment,
+    accountlessChannel,
+    accountlessProductionProfile,
     resourceRoot: installation.resourceRoot,
     stateRoot: installation.stateRoot,
     statePaths: installation.paths,
@@ -2846,6 +2872,10 @@ export function createLocalCompanionServer(options = {}) {
     legacyContributionDeviceStateFile,
     preparedContributionDirectory,
     contributionPreparationOptions: selectedPreparationOptions,
+    centralOrigin: accountlessProductionProfile ? null : options.centralOrigin,
+    contributionServiceOrigin: accountlessProductionProfile
+      ? null
+      : options.contributionServiceOrigin,
     parentWatchdogPid,
     homeDirectory,
     semanticOpenTarget,
@@ -2855,6 +2885,8 @@ export function createLocalCompanionServer(options = {}) {
 
 function createPreparedLocalCompanionServer({
   environment,
+  accountlessChannel = process,
+  accountlessProductionProfile = false,
   resourceRoot,
   stateRoot,
   statePaths,
@@ -3081,6 +3113,8 @@ function createPreparedLocalCompanionServer({
   incrementalContributionRunner = runIncrementalContributionSyncOnce,
   incrementalAttributionCapabilitiesProvider = null,
   incrementalAttributionReviewProvider = null,
+  accountlessContributionRunner = undefined,
+  accountlessSchedulerOptions = undefined,
   loadExistingAccountObservationSecret = async () => selectProductionAccountObservationSecret({
     operationLockFile: statePaths.accountObservationLockFile,
     createKeychainBackend: () => createAppAwareKeychainBackend(environment),
@@ -3098,6 +3132,21 @@ function createPreparedLocalCompanionServer({
   if (!environment || typeof environment !== "object"
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
+  }
+  if (typeof accountlessProductionProfile !== "boolean") {
+    throw new TypeError("accountlessProductionProfile must be a boolean");
+  }
+  if (accountlessProductionProfile
+      && (!selectLocalAccountlessProductionProfile({
+        environment,
+        channel: accountlessChannel,
+      })
+        || contributionQueueFile !== null
+        || preparedContributionDirectory !== null
+        || legacyContributionDeviceStateFile !== null
+        || centralOrigin !== null
+        || contributionServiceOrigin !== null)) {
+    throw new TypeError("Invalid accountless contribution configuration");
   }
   if ([incrementalContributionRunner, loadExistingAccountObservationSecret, readContributionAccountMarkers]
     .some((value) => typeof value !== "function")
@@ -3137,20 +3186,32 @@ function createPreparedLocalCompanionServer({
       "contributionPreparationCreateKeychainBackend must be a function",
     );
   }
-  const developmentIdentity = resolveDevelopmentIdentityConfiguration({
-    file: developmentExportSecretFile,
-    optIn: developmentIdentityOptIn,
-    environmentExportSecretPresent:
-      Object.hasOwn(environment, EXPORT_IDENTITY_ENV),
-  });
+  if ((accountlessContributionRunner !== undefined
+        && typeof accountlessContributionRunner !== "function")
+      || (accountlessSchedulerOptions !== undefined
+        && (!accountlessSchedulerOptions
+          || typeof accountlessSchedulerOptions !== "object"
+          || Array.isArray(accountlessSchedulerOptions)))) {
+    throw new TypeError("accountless contribution controls are invalid");
+  }
+  const developmentIdentity = accountlessProductionProfile
+    ? Object.freeze({ explicitSecretFile: null, mode: null })
+    : resolveDevelopmentIdentityConfiguration({
+      file: developmentExportSecretFile,
+      optIn: developmentIdentityOptIn,
+      environmentExportSecretPresent:
+        Object.hasOwn(environment, EXPORT_IDENTITY_ENV),
+    });
   if (typeof contributionSyncStatusProvider !== "function") {
     throw new TypeError("contributionSyncStatusProvider must be a function");
   }
-  if (typeof contributionQueueFile !== "string"
-      || contributionQueueFile.length < 1) {
+  if ((!accountlessProductionProfile
+        && (typeof contributionQueueFile !== "string"
+          || contributionQueueFile.length < 1))
+      || (accountlessProductionProfile && contributionQueueFile !== null)) {
     throw new TypeError("contributionQueueFile must be a non-empty string");
   }
-  if (preparedContributionDirectory !== null
+  if (!accountlessProductionProfile && preparedContributionDirectory !== null
       && typeof preparedContributionDirectory !== "string") {
     throw new TypeError("preparedContributionDirectory must be a string or null");
   }
@@ -3200,7 +3261,9 @@ function createPreparedLocalCompanionServer({
       || typeof automaticContributionRetirementLockAcquirer !== "function") {
     throw new TypeError("contribution sync controls are invalid");
   }
-  const nextContribution = contributionSyncNextProvider
+  const nextContribution = accountlessProductionProfile
+    ? async () => null
+    : contributionSyncNextProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
       : () => inspectNextContributionSyncUpload({
@@ -3242,7 +3305,9 @@ function createPreparedLocalCompanionServer({
     }
     return false;
   };
-  const pairContributionDevice = contributionDevicePairingProvider
+  const pairContributionDevice = accountlessProductionProfile
+    ? null
+    : contributionDevicePairingProvider
     ?? (contributionServiceOrigin === null
       ? null
       : async ({ pairingCode }) => {
@@ -3281,7 +3346,9 @@ function createPreparedLocalCompanionServer({
   // 2026-08-10: the signed native binding failed its integrity pin, so even
   // constructing the backend threw), the repair proceeds by attribute delete
   // rather than refusing to run.
-  const resetContributionDeviceCredential =
+  const resetContributionDeviceCredential = accountlessProductionProfile
+    ? null
+    :
     contributionDeviceCredentialResetRunner
     ?? (async () => {
       let backend = null;
@@ -3305,7 +3372,9 @@ function createPreparedLocalCompanionServer({
   // initial idle check and remote revocation.
   let contributionDeviceDisconnectInProgress = false;
   let contributionReconnectInProgress = 0;
-  const disconnectContributionDevice = contributionDeviceDisconnectRunner
+  const disconnectContributionDevice = accountlessProductionProfile
+    ? null
+    : contributionDeviceDisconnectRunner
     ?? (contributionServiceOrigin === null
       ? null
       : async () => {
@@ -3364,12 +3433,16 @@ function createPreparedLocalCompanionServer({
       note,
       now: clock(),
     }));
-  const hostedSignInHandoff = hostedSignInHandoffController
+  const hostedSignInHandoff = accountlessProductionProfile
+    ? null
+    : hostedSignInHandoffController
     ?? createHostedSignInHandoffController({
       handoffFile: statePaths.hostedSignInHandoffFile,
       now: clock,
     });
-  const reviewExactContribution = contributionSyncExactReviewProvider
+  const reviewExactContribution = accountlessProductionProfile
+    ? async () => null
+    : contributionSyncExactReviewProvider
     ?? (preparedContributionDirectory === null
       ? async () => null
       : () => inspectExactNextContributionSyncUpload({
@@ -3381,15 +3454,19 @@ function createPreparedLocalCompanionServer({
       paused,
       queueFile: contributionQueueFile,
     }));
-  const syncPreviewConfigured = preparedContributionDirectory !== null
-    || contributionSyncNextProvider !== null;
+  const syncPreviewConfigured = !accountlessProductionProfile
+    && (preparedContributionDirectory !== null
+      || contributionSyncNextProvider !== null);
   const contributionDevicePairingConfigured =
-    pairContributionDevice !== null;
+    !accountlessProductionProfile && pairContributionDevice !== null;
   const contributionDeviceDisconnectConfigured =
-    disconnectContributionDevice !== null;
-  const syncExactReviewConfigured = preparedContributionDirectory !== null
-    || contributionSyncExactReviewProvider !== null;
-  const runContributionPreparation = contributionPreparationRunner
+    !accountlessProductionProfile && disconnectContributionDevice !== null;
+  const syncExactReviewConfigured = !accountlessProductionProfile
+    && (preparedContributionDirectory !== null
+      || contributionSyncExactReviewProvider !== null);
+  const runContributionPreparation = accountlessProductionProfile
+    ? null
+    : contributionPreparationRunner
     ?? createLocalContributionPreparationRunner({
       ...contributionPreparationOptions,
       coverageProvider: () => (
@@ -3417,7 +3494,14 @@ function createPreparedLocalCompanionServer({
   });
   let contributionPreparationInProgress = false;
   let contributionSyncInProgress = false;
-  const runSupersededContributionRetirement =
+  const runSupersededContributionRetirement = accountlessProductionProfile
+    ? async () => ({
+      retiredSets: 0,
+      retiredJobs: 0,
+      interrupted: false,
+      networkActivity: false,
+    })
+    :
     supersededContributionRetirementRunner
     ?? (preparedContributionDirectory === null
       ? async () => ({
@@ -3475,7 +3559,9 @@ function createPreparedLocalCompanionServer({
   // v0.1 prepared-set path. Configured only when a contribution service
   // origin exists; the health capability additionally requires the unified
   // index file to be present, because the index is the upload source.
-  const incrementalContribution = incrementalContributionController
+  const incrementalContribution = accountlessProductionProfile
+    ? null
+    : incrementalContributionController
     ?? (contributionServiceOrigin === null
       ? null
       : createIncrementalContributionSyncController({
@@ -3706,12 +3792,20 @@ function createPreparedLocalCompanionServer({
   let contributionRuntimeShutdown = null;
   const accountlessContribution = createLocalAccountlessContribution({
     environment, stateRoot, indexFile: statePaths.unifiedIndexFile,
+    channel: accountlessChannel,
     readAccountMarkers: readContributionAccountMarkers,
     loadExistingAccountObservationSecret,
+    ...(accountlessContributionRunner === undefined
+      ? {}
+      : { runner: accountlessContributionRunner }),
+    ...(accountlessSchedulerOptions === undefined
+      ? {}
+      : { schedulerOptions: accountlessSchedulerOptions }),
   });
   let supersededContributionRetirementPending = null;
   let supersededContributionRetirementRequested = false;
   const maybeRetireSupersededPreparedSets = () => {
+    if (accountlessProductionProfile) return Promise.resolve();
     if (contributionRuntimeShutdown !== null) return Promise.resolve();
     supersededContributionRetirementRequested = true;
     if (supersededContributionRetirementPending === null) {
@@ -3796,6 +3890,7 @@ function createPreparedLocalCompanionServer({
           await automaticContributionRetirementLockAcquirer({
             lockFile: statePaths.automaticContributionLockFile,
           });
+        if (accountlessProductionProfile) return;
         try {
           automaticContributionRetirement =
             await automaticContributionStateRetirementRunner({
@@ -3826,8 +3921,9 @@ function createPreparedLocalCompanionServer({
           // validated prior evidence with its provenance; the normal refresh
           // supplies the subsequent quick and full projections.
           await dataStore.initialize({ purpose: "startup" });
-          // The legacy scheduler and the explicitly injected accountless lab
-          // keep independent failures. Neither can take local analysis down.
+          // Contribution transport is optional and cannot take local analysis
+          // down. The closed accountless production profile starts only its
+          // FD3-backed scheduler; legacy scheduling remains absent there.
           if (contributionRuntimeShutdown === null) {
             contributionRuntimeStart = Promise.resolve().then(async () => {
               if (contributionRuntimeShutdown !== null) return;
@@ -3915,6 +4011,19 @@ function createPreparedLocalCompanionServer({
     fetchImpl: centralOutbound.fetch,
   });
   const readLocalContributionDiagnostics = async () => {
+    if (accountlessProductionProfile) {
+      return localContributionDiagnosticsProjection({
+        queue: syncStatusProjection(null),
+        incremental: incrementalSyncStatusProjection(null, {
+          configured: false,
+          keychainPrompt: "none",
+        }),
+        configured: false,
+        pairingObserved: false,
+        paired: false,
+        recentDiagnosticReferences: [],
+      });
+    }
     let queueValue = null;
     let incrementalValue = null;
     let pairingObserved = false;
@@ -4017,6 +4126,11 @@ function createPreparedLocalCompanionServer({
         sendError(response, 400, "invalid_request");
         return;
       }
+      if (accountlessProductionProfile
+          && isAccountlessProductionClosedLocalRoute(path)) {
+        sendError(response, 404, "not_found");
+        return;
+      }
       if (centralProxy.handles(path)) {
         if (request.method !== "GET" && !sameOrigin(request)) {
           sendError(response, 403, "central_request_not_authorized");
@@ -4117,17 +4231,27 @@ function createPreparedLocalCompanionServer({
           capabilities: {
             localDashboard: true,
             explicitRefresh: true,
-            contributionPreparation: true,
+            contributionPreparation: !accountlessProductionProfile,
             contributionPreparationIdentityMode:
-              developmentIdentity.mode,
-            contributionSyncStatus: true,
-            contributionSyncNext: syncPreviewConfigured,
+              accountlessProductionProfile ? null : developmentIdentity.mode,
+            contributionSyncStatus: !accountlessProductionProfile,
+            contributionSyncNext: accountlessProductionProfile
+              ? false
+              : syncPreviewConfigured,
             contributionDevicePairing:
-              contributionDevicePairingConfigured,
+              accountlessProductionProfile
+                ? false
+                : contributionDevicePairingConfigured,
             contributionDeviceDisconnect:
-              contributionDeviceDisconnectConfigured,
-            contributionSyncExactReview: syncExactReviewConfigured,
-            incrementalContributionSync: incrementalSyncCapability,
+              accountlessProductionProfile
+                ? false
+                : contributionDeviceDisconnectConfigured,
+            contributionSyncExactReview: accountlessProductionProfile
+              ? false
+              : syncExactReviewConfigured,
+            incrementalContributionSync: accountlessProductionProfile
+              ? false
+              : incrementalSyncCapability,
             centralServiceProxy: centralProxy.enabled,
             centralParticipantRelay: participantRelay.enabled,
             arbitraryPathAccess: false,
