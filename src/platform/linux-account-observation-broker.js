@@ -9,10 +9,10 @@ import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "./keychain-capabilities.js";
 
-// This source-only child facade is dormant until an Electron composition root
-// explicitly supplies the inherited Node IPC marker. It never loads libsecret,
+// The explicit Linux qualification composition supplies the inherited Node IPC
+// marker. Normal production selection remains closed. This never loads libsecret,
 // Keytar, the generic Linux broker, or a native binding.
-export const LINUX_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS = "dormant";
+export const LINUX_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS = "qualification_only";
 export const LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV =
   "USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BROKER_IPC";
 export const LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER = "1";

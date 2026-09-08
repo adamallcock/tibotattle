@@ -76,6 +76,10 @@ import {
   WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS,
 } from "../../../src/platform/windows-filesystem.js";
 import {
+  LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+  LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+} from "../../../src/platform/linux-account-observation-broker.js";
+import {
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
 } from "../../../src/platform/windows-account-observation-broker.js";
@@ -941,82 +945,91 @@ test("companion supervisor restricts file identity selection to complete local M
   }
 });
 
-test("companion supervisor announces only its composed Windows observation IPC and keeps accountless traffic separate", async () => {
-  for (const withPrivateChannel of [false, true]) {
-    const child = new FakeChild();
-    let selected;
-    let observationDisposed = false;
-    let privateDisposed = false;
-    let privateInvalidated = false;
-    const attachments = [];
-    const supervisor = createCompanionSupervisor({
-      environment: {
-        USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD: "99",
-        USAGE_MONITOR_KEYCHAIN_BROKER_FD: "98",
-        USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD: "97",
-      },
-      spawnChild(_command, _args, options) { selected = options; return child; },
-      attachWindowsAccountObservationBroker(channel) {
-        attachments.push(["observation", channel]);
-        assert.equal(channel, child);
-        return { dispose() { observationDisposed = true; } };
-      },
-      ...(withPrivateChannel ? {
-        attachPrivateChannel(channel) {
-          attachments.push(["accountless", channel]);
-          assert.equal(channel, child);
-          return {
-            invalidate() { privateInvalidated = true; },
-            dispose() { privateDisposed = true; },
-          };
+for (const [platformName, factoryName, markerKey, markerValue, otherMarkerKey] of [
+  ["Windows", "attachWindowsAccountObservationBroker", WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+    WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER, LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV],
+  ["Linux", "attachLinuxAccountObservationBroker", LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+    LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER, WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV],
+]) {
+  test(`companion supervisor announces only its composed ${platformName} observation IPC and keeps accountless traffic separate`, async () => {
+    for (const withPrivateChannel of [false, true]) {
+      const child = new FakeChild();
+      let selected;
+      let observationDisposed = false;
+      let privateDisposed = false;
+      let privateInvalidated = false;
+      const attachments = [];
+      const supervisor = createCompanionSupervisor({
+        environment: {
+          [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: "hostile",
+          [LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: "hostile",
+          USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD: "99",
+          USAGE_MONITOR_KEYCHAIN_BROKER_FD: "98",
+          USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD: "97",
         },
-      } : {}),
-    });
-    const started = supervisor.start();
-    child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
-    await started;
-    assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", "ipc"]);
-    assert.equal(selected.env[WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV],
-      WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER);
-    assert.equal(selected.env.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD, undefined);
-    assert.equal(selected.env.USAGE_MONITOR_KEYCHAIN_BROKER_FD, undefined);
-    assert.equal(selected.env.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD, undefined);
-    assert.deepEqual(attachments.map(([kind, channel]) => [kind, channel === child]),
-      withPrivateChannel
-        ? [["observation", true], ["accountless", true]]
-        : [["observation", true]]);
-    const stopped = supervisor.stop();
-    child.emit("exit", 0, null);
-    await stopped;
-    assert.equal(observationDisposed, true);
-    assert.equal(privateDisposed, withPrivateChannel);
-    assert.equal(privateInvalidated, withPrivateChannel);
-  }
-});
-
-test("companion supervisor refuses a pre-disconnected Windows IPC child before broker construction", async () => {
-  const child = new FakeChild();
-  child.connected = false;
-  child.exitCode = null;
-  child.signalCode = null;
-  child.kill = (signal) => {
-    child.kills.push(signal);
-    queueMicrotask(() => child.emit("exit", null, signal));
-    return true;
-  };
-  let brokerConstructed = false;
-  const supervisor = createCompanionSupervisor({
-    spawnChild() { return child; },
-    attachWindowsAccountObservationBroker() {
-      brokerConstructed = true;
-      return { dispose() {} };
-    },
+        spawnChild(_command, _args, options) { selected = options; return child; },
+        [factoryName](channel) {
+          attachments.push(["observation", channel]);
+          assert.equal(channel, child);
+          return { dispose() { observationDisposed = true; } };
+        },
+        ...(withPrivateChannel ? {
+          attachPrivateChannel(channel) {
+            attachments.push(["accountless", channel]);
+            assert.equal(channel, child);
+            return {
+              invalidate() { privateInvalidated = true; },
+              dispose() { privateDisposed = true; },
+            };
+          },
+        } : {}),
+      });
+      const started = supervisor.start();
+      child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
+      await started;
+      assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe", "ipc"]);
+      assert.equal(selected.env[markerKey], markerValue);
+      assert.equal(selected.env[otherMarkerKey], undefined);
+      assert.equal(selected.env.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD, undefined);
+      assert.equal(selected.env.USAGE_MONITOR_KEYCHAIN_BROKER_FD, undefined);
+      assert.equal(selected.env.USAGE_MONITOR_LINUX_SECRET_SERVICE_BROKER_FD, undefined);
+      assert.deepEqual(attachments.map(([kind, channel]) => [kind, channel === child]),
+        withPrivateChannel
+          ? [["observation", true], ["accountless", true]]
+          : [["observation", true]]);
+      const stopped = supervisor.stop();
+      child.emit("exit", 0, null);
+      await stopped;
+      assert.equal(observationDisposed, true);
+      assert.equal(privateDisposed, withPrivateChannel);
+      assert.equal(privateInvalidated, withPrivateChannel);
+    }
   });
-  await assert.rejects(supervisor.start(), errorCode("companion_exit_before_ready"));
-  assert.equal(brokerConstructed, false);
-  assert.deepEqual(child.kills, ["SIGKILL"]);
-  assert.equal(supervisor.state.state, "stopped");
-});
+
+  test(`companion supervisor refuses a pre-disconnected ${platformName} IPC child before broker construction`, async () => {
+    const child = new FakeChild();
+    child.connected = false;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.kill = (signal) => {
+      child.kills.push(signal);
+      queueMicrotask(() => child.emit("exit", null, signal));
+      return true;
+    };
+    let brokerConstructed = false;
+    const supervisor = createCompanionSupervisor({
+      spawnChild() { return child; },
+      [factoryName]() {
+        brokerConstructed = true;
+        return { dispose() {} };
+      },
+    });
+    await assert.rejects(supervisor.start(), errorCode("companion_exit_before_ready"));
+    assert.equal(brokerConstructed, false);
+    assert.deepEqual(child.kills, ["SIGKILL"]);
+    assert.equal(supervisor.state.state, "stopped");
+  });
+}
 
 test("companion supervisor refuses an exited FD4-only child before broker construction", async () => {
   const child = new FakeChild();
@@ -1099,26 +1112,34 @@ test("companion supervisor starts a live plain child without Node IPC", async (t
   assert.equal(supervisor.state.state, "stopped");
 });
 
-test("companion supervisor rejects competing credential factories and ambient Windows channel authority", async () => {
+test("companion supervisor rejects competing credential factories and ambient channel authority", async () => {
   const factory = () => ({ dispose() {} });
-  for (const other of ["attachCredentialBroker", "attachLinuxSecretServiceBroker"]) {
-    assert.throws(() => createCompanionSupervisor({
-      [other]: factory, attachWindowsAccountObservationBroker: factory,
-    }), /mutually exclusive/u);
+  const factories = ["attachCredentialBroker", "attachLinuxSecretServiceBroker",
+    "attachWindowsAccountObservationBroker", "attachLinuxAccountObservationBroker"];
+  for (const selected of factories) {
+    for (const other of factories.filter((name) => name !== selected)) {
+      assert.throws(() => createCompanionSupervisor({
+        [other]: factory, [selected]: factory,
+      }), /mutually exclusive/u);
+    }
+    assert.throws(() => createCompanionSupervisor({ [selected]: {} }), /factory is invalid/u);
   }
-  assert.throws(() => createCompanionSupervisor({
-    attachWindowsAccountObservationBroker: {},
-  }), /factory is invalid/u);
   const child = new FakeChild();
   let selected;
   const supervisor = createCompanionSupervisor({
-    environment: { USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD: "4" },
+    environment: {
+      USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD: "4",
+      [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: "1",
+      [LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: "1",
+    },
     spawnChild(_command, _args, options) { selected = options; return child; },
   });
   const started = supervisor.start();
   child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4545/\n"));
   await started;
   assert.equal(selected.env.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD, undefined);
+  assert.equal(selected.env[WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV], undefined);
+  assert.equal(selected.env[LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV], undefined);
   assert.deepEqual(selected.stdio, ["ignore", "pipe", "pipe"]);
   const stopped = supervisor.stop();
   child.emit("exit", 0, null);

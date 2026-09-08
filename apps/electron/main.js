@@ -16,7 +16,7 @@ import { runProductionNativeMacHandover } from "./desktop-native-migration-macos
 import { attachDesktopKeychainBroker } from "./desktop-keychain-broker.js";
 import { loadDesktopMacOSCredentialBackends } from "./desktop-macos-keychain.js";
 import {
-  createLinuxQualificationSecretServiceHandover,
+  createLinuxQualificationAccountObservationHandover,
 } from "./desktop-linux-secret-service.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
 import { assertElectronPlatformGate } from "./platform-gate.js";
@@ -613,27 +613,20 @@ export function createProductionMacCredentialHandover({
 
 /**
  * Qualification-only main-process wiring.  Normal Electron entry never
- * supplies this context; an external packaged credential smoke can instead
- * import the dedicated handover module under ELECTRON_RUN_AS_NODE.
+ * supplies this context. The packaged credential smoke exercises this same
+ * narrow parent/child route under ELECTRON_RUN_AS_NODE on an isolated bus.
  */
 export function createLinuxQualificationSupervisorOptions({
   linuxQualificationContext = null,
 } = {}) {
   if (linuxQualificationContext === null) return Object.freeze({});
-  let handover;
   try {
-    handover = createLinuxQualificationSecretServiceHandover({
+    return createLinuxQualificationAccountObservationHandover({
       qualificationContext: linuxQualificationContext,
     });
   } catch {
     throw shellError("electron_configuration_invalid");
   }
-  if (!handover || typeof handover.attachLinuxSecretServiceBroker !== "function") {
-    throw shellError("electron_configuration_invalid");
-  }
-  return Object.freeze({
-    attachLinuxSecretServiceBroker: handover.attachLinuxSecretServiceBroker,
-  });
 }
 
 /**

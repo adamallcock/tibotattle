@@ -10,8 +10,8 @@ import {
   isLinuxAccountObservationCredentialError,
 } from "../../src/platform/linux-account-observation-credential.js";
 
-// This is a dormant composition seam. Only a later Electron main composition
-// may attach the already-loaded fixed Linux facade to inherited Node IPC.
+// The explicit Linux qualification composition attaches the fixed native
+// facade to inherited Node IPC. Normal production selection remains closed.
 export const LINUX_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS = PLATFORM_INTEGRATION_STATUS;
 
 function fail(code) {

@@ -150,9 +150,9 @@ function equalSecret(actual, expected) {
   assert.equal(Buffer.compare(actual, expected), 0);
 }
 
-test("Linux observation IPC is dormant, fixed, and rejects generic broker announcements", async () => {
-  assert.equal(PARENT_INTEGRATION_STATUS, "dormant");
-  assert.equal(CHILD_INTEGRATION_STATUS, "dormant");
+test("Linux observation IPC is qualification-only, fixed, and rejects generic broker announcements", async () => {
+  assert.equal(PARENT_INTEGRATION_STATUS, "qualification_only");
+  assert.equal(CHILD_INTEGRATION_STATUS, "qualification_only");
   assert.equal(linuxAccountObservationBrokerConfiguration({}), null);
   assert.deepEqual(linuxAccountObservationBrokerConfiguration({
     [LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,

@@ -4,6 +4,9 @@ import {
 } from "../../src/platform/linux-credential-mutation-lease.js";
 import { prepareLinuxCredentialState } from "../../src/platform/linux-credential-state.js";
 import {
+  createLinuxAccountObservationCredentialBackend,
+} from "../../src/platform/linux-account-observation-credential.js";
+import {
   createLinuxSecretServiceBackend,
   isLinuxSecretServiceError,
 } from "../../src/platform/linux-secret-service.js";
@@ -11,6 +14,9 @@ import {
 import {
   attachDesktopLinuxSecretServiceBroker,
 } from "./desktop-linux-secret-service-broker.js";
+import {
+  attachDesktopLinuxAccountObservationBroker,
+} from "./desktop-linux-account-observation-broker.js";
 import {
   assertLinuxNativeQualificationReceipt,
   createLinuxQualificationReceipt,
@@ -183,6 +189,23 @@ export function createLinuxQualificationSecretServiceHandover(options = {}) {
     createLeaseContext: createLinuxCredentialMutationLeaseContext,
     createSecretServiceBackend: createLinuxSecretServiceBackend,
     isSecretServiceError: isLinuxSecretServiceError,
+  });
+}
+
+/** The fixed observation route shared by shell and packaged qualification. */
+export function createLinuxQualificationAccountObservationHandover(options = {}) {
+  const source = exactOptions(options, PRODUCTION_OPTION_KEYS);
+  const receipt = qualifiedLinuxContext(source.qualificationContext);
+  if (process.platform !== "linux" || process.arch !== "x64"
+      || !["isolated-secret-service", "native-secret-service"]
+        .includes(receipt.credentialStoreMode)) fail();
+  return Object.freeze({
+    attachLinuxAccountObservationBroker(channel) {
+      return attachDesktopLinuxAccountObservationBroker({
+        channel,
+        createBackend: createLinuxAccountObservationCredentialBackend,
+      });
+    },
   });
 }
 

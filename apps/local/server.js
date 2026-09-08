@@ -147,6 +147,7 @@ import {
   createLinuxSecretServiceBrokerBackendFromEnvironment,
 } from "../../src/platform/linux-secret-service-broker.js";
 import {
+  createLinuxAccountObservationBrokerBackendFromEnvironment,
   createWindowsAccountObservationBrokerBackendFromEnvironment,
 } from "../../src/platform/index.js";
 import {
@@ -3009,7 +3010,7 @@ function createPreparedLocalCompanionServer({
           createKeychainBackend: () =>
             createAppAwareKeychainBackend(environment),
           createLinuxBackend: () =>
-            createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
+            createLinuxAccountObservationBrokerBackendFromEnvironment(environment),
           createWindowsBrokerBackend: () =>
             createWindowsAccountObservationBrokerBackendFromEnvironment(environment),
         })
@@ -3141,7 +3142,7 @@ function createPreparedLocalCompanionServer({
     return selectProductionAccountObservationSecret({
       operationLockFile: statePaths.accountObservationLockFile,
       createKeychainBackend: () => createAppAwareKeychainBackend(environment),
-      createLinuxBackend: () => createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
+      createLinuxBackend: () => createLinuxAccountObservationBrokerBackendFromEnvironment(environment),
       createWindowsBrokerBackend: () =>
         createWindowsAccountObservationBrokerBackendFromEnvironment(environment),
       createIfMissing: false,

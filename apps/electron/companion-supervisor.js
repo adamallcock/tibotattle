@@ -1,6 +1,8 @@
 import { spawn as nodeSpawn } from "node:child_process";
 
 import {
+  LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+  LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
 } from "../../src/platform/index.js";
@@ -115,6 +117,10 @@ function companionEnvironment(environment, parentPid, credentialBrokerKind = nul
     selected[WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV] =
       WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER;
   }
+  if (credentialBrokerKind === "linux_account_observation") {
+    selected[LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV] =
+      LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER;
+  }
   return selected;
 }
 
@@ -138,6 +144,7 @@ export function createCompanionSupervisor({
   attachCredentialBroker,
   attachLinuxSecretServiceBroker,
   attachWindowsAccountObservationBroker,
+  attachLinuxAccountObservationBroker,
 } = {}) {
   if (typeof spawnChild !== "function") throw new TypeError("spawnChild is required");
   if (typeof command !== "string" || command.length === 0) {
@@ -163,7 +170,12 @@ export function createCompanionSupervisor({
       && typeof attachWindowsAccountObservationBroker !== "function") {
     throw new TypeError("Windows account-observation broker factory is invalid");
   }
-  if ([attachCredentialBroker, attachLinuxSecretServiceBroker, attachWindowsAccountObservationBroker]
+  if (attachLinuxAccountObservationBroker !== undefined
+      && typeof attachLinuxAccountObservationBroker !== "function") {
+    throw new TypeError("Linux account-observation broker factory is invalid");
+  }
+  if ([attachCredentialBroker, attachLinuxSecretServiceBroker,
+    attachWindowsAccountObservationBroker, attachLinuxAccountObservationBroker]
     .filter((factory) => factory !== undefined).length > 1) {
     throw new TypeError("credential broker factories are mutually exclusive");
   }
@@ -186,12 +198,14 @@ export function createCompanionSupervisor({
   let privateChannel = null;
   let credentialBroker = null;
   const selectedCredentialBroker = attachCredentialBroker ?? attachLinuxSecretServiceBroker;
-  const selectedWindowsAccountObservationBroker = attachWindowsAccountObservationBroker;
+  const selectedAccountObservationBroker = attachWindowsAccountObservationBroker
+    ?? attachLinuxAccountObservationBroker;
   const requiresNodeIpc = attachPrivateChannel !== undefined
-    || selectedWindowsAccountObservationBroker !== undefined;
+    || selectedAccountObservationBroker !== undefined;
   const credentialBrokerKind = attachCredentialBroker !== undefined ? "macos_keychain"
     : attachLinuxSecretServiceBroker !== undefined ? "linux_secret_service"
-      : attachWindowsAccountObservationBroker !== undefined ? "windows_account_observation" : null;
+      : attachWindowsAccountObservationBroker !== undefined ? "windows_account_observation"
+        : attachLinuxAccountObservationBroker !== undefined ? "linux_account_observation" : null;
 
   function stateSnapshot() {
     return Object.freeze({
@@ -324,7 +338,7 @@ export function createCompanionSupervisor({
           // their existing FD4 pipe contracts unchanged.
           stdio: selectedCredentialBroker
             ? ["ignore", "pipe", "pipe", attachPrivateChannel ? "ipc" : "ignore", "pipe"]
-            : (attachPrivateChannel || selectedWindowsAccountObservationBroker)
+            : (attachPrivateChannel || selectedAccountObservationBroker)
               ? ["ignore", "pipe", "pipe", "ipc"] : ["ignore", "pipe", "pipe"],
           windowsHide: true,
         });
@@ -350,8 +364,8 @@ export function createCompanionSupervisor({
           }
           credentialBroker = currentCredentialBroker;
         }
-        if (selectedWindowsAccountObservationBroker) {
-          currentCredentialBroker = selectedWindowsAccountObservationBroker(currentChild);
+        if (selectedAccountObservationBroker) {
+          currentCredentialBroker = selectedAccountObservationBroker(currentChild);
           if (typeof currentCredentialBroker?.dispose !== "function") {
             throw new TypeError("credential broker is invalid");
           }

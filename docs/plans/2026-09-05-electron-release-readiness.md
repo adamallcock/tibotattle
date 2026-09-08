@@ -47,7 +47,27 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest four-target results: `a648cf2b` in
+Latest four-target results: `3136144f` in
+[run 34225779614](https://github.com/adamallcock/tibotattle/actions/runs/34225779614)
+pass both Mac jobs and Linux. Windows reaches its first installed launch and
+fails specifically during the account-observation credential check over the
+private parent/child channel. Installation, file verification, startup and the
+separate accountless credential check precede that failure. The closed phase
+is `ACCOUNT_OBSERVATION_STORAGE_PRIVATE_IPC`; uninstall runs but both recorded
+postconditions remain false. Repair the installed-versus-packaged discrepancy,
+then repeat the same complete installer journey without weakening its gates.
+
+The unsigned installed-scheduler rehearsal is frozen at `3136144f` and built
+for Mac arm64 using the existing TiboTattle Dev identity. Its compiled profile
+fixes the staging destination and confines settings, sources and installation
+credentials to a separate subtree. No app launch or hosted request has occurred.
+Its package verifier passes; focused runtime, scheduler and packaging checks
+pass, as do all 333 owning companion tests. The staging Worker is separately
+frozen at `086ae315`, with a source-only plan and no remote provisioning.
+This keeps hosted approval concrete while leaving normal development packages
+and the separately prepared signed Mac migration pair unchanged.
+
+The preceding four-target results: `a648cf2b` in
 [run 34222727976](https://github.com/adamallcock/tibotattle/actions/runs/34222727976)
 passes both Mac jobs and the complete Linux job. The Linux packaged Secret
 Service gate now passes its real native read deadline and cleanup. Windows
