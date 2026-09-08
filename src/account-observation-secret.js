@@ -3,6 +3,9 @@ import { constants } from "node:fs";
 import { lstat, mkdir, open, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { defaultExportStateDirectory } from "./export-identity.js";
+import {
+  isWindowsAccountObservationBrokerBackend,
+} from "./platform/index.js";
 
 const SECRET_BYTES = 32;
 const LOCK_SCHEMA_VERSION = "account-observation-operation-v1";
@@ -58,6 +61,7 @@ async function invokeBackend(backend, method, ...args) {
     }
     if (code === "export_identity_keychain_locked"
         || code === "windows_credential_manager_locked"
+        || code === "windows_account_observation_broker_locked"
         || code === "linux_secret_service_broker_locked") {
       fail("account_observation_credential_locked");
     }
@@ -332,7 +336,8 @@ export function createAccountObservationSecretLoader({
   backend,
   capability,
   createIfMissing = true,
-  operationLockFile = defaultAccountObservationOperationLockFile(),
+  operationLockFile = undefined,
+  parentAuthoritativeMutationLease = false,
   generateSecret = () => randomBytes(SECRET_BYTES),
   clock = () => Date.now(),
   processExists = (processId) => {
@@ -349,21 +354,36 @@ export function createAccountObservationSecretLoader({
 } = {}) {
   assertBackend(backend, capability, { createIfMissing });
   if (typeof createIfMissing !== "boolean"
+      || typeof parentAuthoritativeMutationLease !== "boolean"
       || typeof generateSecret !== "function" || typeof clock !== "function" || typeof processExists !== "function"
       || !Number.isSafeInteger(processId) || processId < 1
       || !Number.isFinite(staleLockMilliseconds) || staleLockMilliseconds < 1
       || (operationHook !== null && typeof operationHook !== "function")) {
     fail("account_observation_credential_invalid");
   }
+  if (parentAuthoritativeMutationLease) {
+    if (operationLockFile !== undefined || operationHook !== null
+        || !isWindowsAccountObservationBrokerBackend(backend)) {
+      fail("account_observation_credential_invalid");
+    }
+  }
+  const selectedOperationLockFile = parentAuthoritativeMutationLease
+    ? null
+    : operationLockFile === undefined
+      ? defaultAccountObservationOperationLockFile()
+      : operationLockFile;
 
   return async function loadAccountObservationSecret() {
-    const lease = await acquireOperationLease(operationLockFile, {
-      clock,
-      processExists,
-      processId,
-      staleLockMilliseconds,
-      operationHook,
-    });
+    const lease = parentAuthoritativeMutationLease ? null : await acquireOperationLease(
+      selectedOperationLockFile,
+      {
+        clock,
+        processExists,
+        processId,
+        staleLockMilliseconds,
+        operationHook,
+      },
+    );
     let generated = null;
     let generatedValue = null;
     let persisted = null;
@@ -397,7 +417,7 @@ export function createAccountObservationSecretLoader({
       if (Buffer.isBuffer(generatedValue)) generatedValue.fill(0);
       generated?.fill(0);
       if (Buffer.isBuffer(persisted)) persisted.fill(0);
-      await releaseOperationLease(operationLockFile, lease);
+      if (lease !== null) await releaseOperationLease(selectedOperationLockFile, lease);
     }
   };
 }

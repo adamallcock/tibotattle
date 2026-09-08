@@ -50,6 +50,29 @@ export {
   isWindowsFilesystemIdentity,
 } from "./windows-filesystem.js";
 export {
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD_ENV,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+  WindowsAccountObservationBrokerError,
+  createWindowsAccountObservationBrokerBackend,
+  createWindowsAccountObservationBrokerBackendFromEnvironment,
+  createWindowsAccountObservationBrokerTransport,
+  decodeWindowsAccountObservationBrokerSecret,
+  encodeWindowsAccountObservationBrokerSecret,
+  isWindowsAccountObservationBrokerBackend,
+  isWindowsAccountObservationBrokerError,
+  windowsAccountObservationBrokerConfiguration,
+} from "./windows-account-observation-broker.js";
+export {
+  WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_INTEGRATION_STATUS,
+  WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_PRODUCTION_SAFE,
+  WindowsAccountObservationCredentialError,
+  createWindowsAccountObservationCredentialBackend,
+  isWindowsAccountObservationCredentialBackend,
+  isWindowsAccountObservationCredentialError,
+} from "./windows-account-observation-credential.js";
+export {
   assertWindowsQualificationResourceAuthority,
   createWindowsQualificationModeContext,
   isWindowsQualificationModeContext,
