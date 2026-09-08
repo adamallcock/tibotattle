@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { createCompanionSupervisor } from "./companion-supervisor.js";
 import {
+  createLinuxQualificationAccountObservationHandover,
   createLinuxQualificationSecretServiceHandover,
 } from "./desktop-linux-secret-service.js";
 import {
@@ -14,16 +15,30 @@ const CHILD_PATH = fileURLToPath(new URL(
   "./linux-secret-service-qualification-smoke-child.mjs",
   import.meta.url,
 ));
+const ACCOUNT_OBSERVATION_CHILD_PATH = fileURLToPath(new URL(
+  "./linux-account-observation-qualification-smoke-child.mjs",
+  import.meta.url,
+));
 
 const CHILD_FAILURE_STAGES = new Map([
   [21, "create"], [22, "read"], [23, "replace"], [24, "delete"],
   [25, "absence"], [26, "channel"],
+]);
+const ACCOUNT_OBSERVATION_CHILD_FAILURE_STAGES = new Map([
+  [31, "initial_read"], [32, "create"], [33, "readback"], [34, "channel"],
 ]);
 
 function smokeFailure(stage = null) {
   const error = new Error("Linux Secret Service qualification smoke failed");
   error.code = stage === null ? "linux_secret_service_qualification_smoke_failed"
     : `linux_secret_service_qualification_smoke_${stage}_failed`;
+  return error;
+}
+
+function accountObservationSmokeFailure(stage = null) {
+  const error = new Error("Linux account-observation qualification smoke failed");
+  error.code = stage === null ? "linux_account_observation_qualification_smoke_failed"
+    : `linux_account_observation_qualification_smoke_${stage}_failed`;
   return error;
 }
 
@@ -89,6 +104,52 @@ export async function runLinuxSecretServiceQualificationSmoke({
     await supervisor.stop();
   } catch {
     throw smokeFailure("shutdown");
+  }
+  return Object.freeze({ status: "passed" });
+}
+
+/**
+ * Exercise the fixed account-observation read/create route after the legacy
+ * FD4 smoke completes. This launches a separate companion, so the fixed
+ * Node-IPC marker never coexists with the legacy generic FD announcement.
+ */
+export async function runLinuxAccountObservationQualificationSmoke({
+  qualificationContext,
+} = {}) {
+  let handover;
+  try {
+    assertIsolatedQualificationContext(qualificationContext);
+    handover = createLinuxQualificationAccountObservationHandover({ qualificationContext });
+  } catch {
+    throw accountObservationSmokeFailure();
+  }
+  let supervisor;
+  let childExitCode = null;
+  let backendSetupFailed = false;
+  try {
+    supervisor = createCompanionSupervisor({
+      command: process.execPath,
+      args: [ACCOUNT_OBSERVATION_CHILD_PATH],
+      spawnChild(command, args, options) {
+        const child = spawn(command, args, options);
+        child.once("exit", (code) => { childExitCode = code; });
+        return child;
+      },
+      attachLinuxAccountObservationBroker(channel) {
+        try { return handover.attachLinuxAccountObservationBroker(channel); }
+        catch { backendSetupFailed = true; throw accountObservationSmokeFailure("backend_setup"); }
+      },
+    });
+    await supervisor.start();
+  } catch {
+    try { await supervisor?.stop?.(); } catch { /* Fixed smoke failure below is authoritative. */ }
+    throw accountObservationSmokeFailure(backendSetupFailed ? "backend_setup"
+      : ACCOUNT_OBSERVATION_CHILD_FAILURE_STAGES.get(childExitCode) ?? "child_execution");
+  }
+  try {
+    await supervisor.stop();
+  } catch {
+    throw accountObservationSmokeFailure("shutdown");
   }
   return Object.freeze({ status: "passed" });
 }

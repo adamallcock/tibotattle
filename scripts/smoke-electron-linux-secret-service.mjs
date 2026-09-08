@@ -44,7 +44,7 @@ const MAX_RECEIPT_BYTES = 16 * 1024;
 const MAX_PACKAGE_RECEIPT_BYTES = 256 * 1024;
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024;
 const SESSION_DEADLINE_MS = 45_000;
-const RECEIPT_SCHEMA = "tibotattle-electron-linux-secret-service-smoke-v2";
+const RECEIPT_SCHEMA = "tibotattle-electron-linux-secret-service-smoke-v3";
 const SHA256 = /^[0-9a-f]{64}$/u;
 const REVISION = /^[0-9a-f]{40}$/u;
 const INNER_KEYS = Object.freeze([
@@ -59,6 +59,7 @@ const INNER_KEYS = Object.freeze([
   "statePreparation",
   "capabilities",
   "lifecycle",
+  "accountObservationLifecycle",
   "cleanup",
   "productionReady",
 ]);
@@ -72,6 +73,7 @@ const OUTER_KEYS = Object.freeze([
   "packageArtifactVerified",
   "packagedElectronExecutionVerified",
   "credentialLifecycleVerified",
+  "accountObservationLifecycleVerified",
   "defaultStateBootstrapVerified",
   "sessionCleanupConfirmed",
   "errorCode",
@@ -105,6 +107,22 @@ const CREDENTIAL_STAGE_FAILURES = new Map([
 ].map(([source, target]) => [
   `linux_secret_service_qualification_smoke_${source}_failed`, `${target}_FAILED`,
 ]));
+const ACCOUNT_OBSERVATION_STAGE_FAILURES = new Map([
+  ["backend_setup", "OBSERVATION_BACKEND_SETUP"],
+  ["child_execution", "OBSERVATION_CHILD_EXECUTION"],
+  ["initial_read", "OBSERVATION_INITIAL_READ"],
+  ["create", "OBSERVATION_CREATE"],
+  ["readback", "OBSERVATION_READBACK"],
+  ["channel", "OBSERVATION_CHANNEL"],
+  ["shutdown", "OBSERVATION_COMPANION_SHUTDOWN"],
+].map(([source, target]) => [
+  `linux_account_observation_qualification_smoke_${source}_failed`, `${target}_FAILED`,
+]));
+const ACCOUNT_OBSERVATION_INNER_FAILURE_CODES = new Set(
+  [...ACCOUNT_OBSERVATION_STAGE_FAILURES.values()].map(
+    (suffix) => `ELECTRON_LINUX_SECRET_SERVICE_SMOKE_${suffix}`,
+  ),
+);
 const INNER_STAGE_FAILURE_CODES = new Set([
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_RUNTIME_IDENTITY_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_ARTIFACT_IDENTITY_FAILED",
@@ -117,6 +135,7 @@ const INNER_STAGE_FAILURE_CODES = new Set([
   ...[...CREDENTIAL_STAGE_FAILURES.values()].map(
     (suffix) => `ELECTRON_LINUX_SECRET_SERVICE_SMOKE_${suffix}`,
   ),
+  ...ACCOUNT_OBSERVATION_INNER_FAILURE_CODES,
 ]);
 const NODE_MODULE_LOAD_ERROR_CODES = new Set([
   "ERR_INVALID_MODULE_SPECIFIER",
@@ -571,6 +590,7 @@ function expectedInnerReceipt(value, identity) {
       || receipt.statePreparation !== "absent_default_state_created"
       || receipt.capabilities !== 2
       || receipt.lifecycle !== "two_capability_round_trip_absence_confirmed"
+      || receipt.accountObservationLifecycle !== "read_create_readback_confirmed"
       || receipt.cleanup !== "owned_companion_stopped"
       || receipt.productionReady !== false) {
     return null;
@@ -731,6 +751,8 @@ function outerReceipt({
   identity,
   executionVerified,
   lifecycleVerified,
+  accountObservationLifecycleVerified,
+  defaultStateBootstrapVerified,
   cleanupConfirmed,
   errorCode,
   sourceRevision,
@@ -745,7 +767,8 @@ function outerReceipt({
     packageArtifactVerified: identity !== null,
     packagedElectronExecutionVerified: executionVerified,
     credentialLifecycleVerified: lifecycleVerified,
-    defaultStateBootstrapVerified: lifecycleVerified,
+    accountObservationLifecycleVerified,
+    defaultStateBootstrapVerified,
     sessionCleanupConfirmed: cleanupConfirmed,
     errorCode,
     productionReady: false,
@@ -767,6 +790,8 @@ export async function runLinuxPackagedSecretServiceSmoke(options, {
   let identity = null;
   let executionVerified = false;
   let lifecycleVerified = false;
+  let accountObservationLifecycleVerified = false;
+  let defaultStateBootstrapVerified = false;
   let cleanupConfirmed = false;
   let errorCode = null;
   try {
@@ -774,15 +799,23 @@ export async function runLinuxPackagedSecretServiceSmoke(options, {
     await runSession(identity, { appPath: options.appPath, environment });
     executionVerified = true;
     lifecycleVerified = true;
+    accountObservationLifecycleVerified = true;
+    defaultStateBootstrapVerified = true;
     cleanupConfirmed = true;
   } catch (error) {
     errorCode = fixedCode(error);
     cleanupConfirmed = hasProvenSessionCleanup(error);
+    // Fixed observation errors arise only after the legacy two-capability
+    // child returned its passed result. Preserve that narrower completed
+    // proof while the overall packaged qualification remains failed.
+    lifecycleVerified = ACCOUNT_OBSERVATION_INNER_FAILURE_CODES.has(errorCode);
   }
   const receipt = outerReceipt({
     identity,
     executionVerified,
     lifecycleVerified,
+    accountObservationLifecycleVerified,
+    defaultStateBootstrapVerified,
     cleanupConfirmed,
     errorCode,
     sourceRevision: options.sourceRevision,
@@ -931,11 +964,13 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
     ])),
   ]));
   if (typeof qualification?.createLinuxQualificationContext !== "function"
-      || typeof smoke?.runLinuxSecretServiceQualificationSmoke !== "function") {
+      || typeof smoke?.runLinuxSecretServiceQualificationSmoke !== "function"
+      || typeof smoke?.runLinuxAccountObservationQualificationSmoke !== "function") {
     fail("MODULE_LOAD_FAILED");
   }
   await verifyNativeBindings(options.appPath, importModule);
-  let outcome;
+  let legacyOutcome;
+  let accountObservationOutcome;
   try {
     const context = qualification.createLinuxQualificationContext({
       platform: "linux",
@@ -952,15 +987,27 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
       qualificationContext: context,
     });
     if (result?.status !== "passed") fail("NATIVE_ROUND_TRIP_FAILED");
-    outcome = result;
+    legacyOutcome = result;
+    // This is a separate supervisor and child. The legacy generic FD4
+    // announcement is therefore gone before the fixed Node-IPC route starts.
+    const observationResult = await smoke.runLinuxAccountObservationQualificationSmoke({
+      qualificationContext: context,
+    });
+    if (observationResult?.status !== "passed") fail("NATIVE_ROUND_TRIP_FAILED");
+    accountObservationOutcome = observationResult;
   } catch (error) {
     // Translate only closed source-owned categories. No child output or
     // native error text is retained by this packaged-artifact receipt.
     let suffix;
-    try { suffix = CREDENTIAL_STAGE_FAILURES.get(error?.code); } catch { /* Fixed fallback. */ }
+    try {
+      suffix = CREDENTIAL_STAGE_FAILURES.get(error?.code)
+        ?? ACCOUNT_OBSERVATION_STAGE_FAILURES.get(error?.code);
+    } catch { /* Fixed fallback. */ }
     fail(suffix ?? "NATIVE_ROUND_TRIP_FAILED");
   }
-  if (outcome?.status !== "passed") fail("NATIVE_ROUND_TRIP_FAILED");
+  if (legacyOutcome?.status !== "passed" || accountObservationOutcome?.status !== "passed") {
+    fail("NATIVE_ROUND_TRIP_FAILED");
+  }
   await innerStage("STATE_BOOTSTRAP_FAILED", () => assertCredentialState({ prepared: true }));
   return Object.freeze({
     schemaVersion: RECEIPT_SCHEMA,
@@ -974,6 +1021,7 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
     statePreparation: "absent_default_state_created",
     capabilities: 2,
     lifecycle: "two_capability_round_trip_absence_confirmed",
+    accountObservationLifecycle: "read_create_readback_confirmed",
     cleanup: "owned_companion_stopped",
     productionReady: false,
   });

@@ -8,11 +8,15 @@ import {
   createCompanionSupervisor,
 } from "../companion-supervisor.js";
 import {
+  attachDesktopLinuxAccountObservationBroker,
+} from "../desktop-linux-account-observation-broker.js";
+import {
   createLinuxQualificationSecretServiceHandover,
   createLinuxQualificationSecretServiceHandoverForTest,
   LINUX_SECRET_SERVICE_MAIN_COMPOSITION_STATUS,
 } from "../desktop-linux-secret-service.js";
 import {
+  runLinuxAccountObservationQualificationSmoke,
   runLinuxSecretServiceQualificationSmoke,
 } from "../linux-secret-service-qualification-smoke.js";
 import {
@@ -26,6 +30,9 @@ import {
   createLinuxCredentialMutationMutexContext,
 } from "../../../src/platform/linux-credential-mutation-lease.js";
 import {
+  createLinuxAccountObservationCredentialBackend,
+} from "../../../src/platform/linux-account-observation-credential.js";
+import {
   LINUX_SECRET_SERVICE_CAPABILITIES,
   createLinuxSecretServiceBackend,
   isLinuxSecretServiceError,
@@ -35,6 +42,10 @@ const REVISION = "a".repeat(40);
 const DIGEST = "b".repeat(64);
 const CHILD_PATH = fileURLToPath(new URL(
   "../linux-secret-service-qualification-smoke-child.mjs",
+  import.meta.url,
+));
+const ACCOUNT_OBSERVATION_CHILD_PATH = fileURLToPath(new URL(
+  "../linux-account-observation-qualification-smoke-child.mjs",
   import.meta.url,
 ));
 
@@ -125,6 +136,66 @@ function syntheticNative({ abandoned = false, existingRecords = [] } = {}) {
   });
 }
 
+function syntheticAccountObservationNative(existing = null) {
+  let stored = existing === null ? null : Buffer.from(existing);
+  const calls = [];
+  const binding = Object.freeze({
+    credentialMutexContractVersion: "linux-credential-mutex-v1",
+    credentialMutexCrossProcessSafe: true,
+    credentialMutexSameNetworkNamespaceOnly: true,
+    credentialMutexDurableMarker: true,
+    productionSafe: false,
+    async readAccountObservationCredential() {
+      calls.push("read");
+      return stored === null ? null : Buffer.from(stored);
+    },
+    async createAccountObservationCredentialIfMissing(candidate) {
+      assert.equal(Buffer.isBuffer(candidate), true);
+      assert.equal(candidate.byteLength, 32);
+      calls.push("create");
+      if (stored !== null) return "existing";
+      stored = Buffer.from(candidate);
+      return "created";
+    },
+  });
+  return Object.freeze({
+    binding,
+    calls,
+    readStored() { return stored === null ? null : Buffer.from(stored); },
+    dispose() {
+      stored?.fill(0);
+      stored = null;
+    },
+  });
+}
+
+function observationSupervisor(native, captureExit = null) {
+  const backend = createLinuxAccountObservationCredentialBackend({
+    platform: "linux",
+    architecture: "x64",
+    binding: native.binding,
+  });
+  return createCompanionSupervisor({
+    command: process.execPath,
+    args: [ACCOUNT_OBSERVATION_CHILD_PATH],
+    startupTimeoutMs: 1_000,
+    shutdownTimeoutMs: 1_000,
+    ...(captureExit === null ? {} : {
+      spawnChild(command, args, options) {
+        const child = spawn(command, args, options);
+        child.once("exit", (code) => { captureExit.value = code; });
+        return child;
+      },
+    }),
+    attachLinuxAccountObservationBroker(channel) {
+      return attachDesktopLinuxAccountObservationBroker({
+        channel,
+        createBackend: () => backend,
+      });
+    },
+  });
+}
+
 function handover(qualificationContext, native) {
   return createLinuxQualificationSecretServiceHandoverForTest({
     qualificationContext,
@@ -171,12 +242,17 @@ function recoveredChildSource() {
   `;
 }
 
-test("Linux main composition authenticates an L0 context before any native construction", () => {
+test("Linux main composition authenticates an L0 context before any native construction", async () => {
   assert.equal(LINUX_SECRET_SERVICE_MAIN_COMPOSITION_STATUS, "qualification_only");
   assert.deepEqual(createLinuxQualificationSupervisorOptions(), {});
   assert.throws(
     () => createLinuxQualificationSecretServiceHandover(),
     compositionError,
+  );
+  await assert.rejects(
+    runLinuxAccountObservationQualificationSmoke(),
+    (error) => error?.code === "linux_account_observation_qualification_smoke_failed"
+      && error?.message === "Linux account-observation qualification smoke failed",
   );
 
   let factoryCalls = 0;
@@ -227,6 +303,53 @@ test("Linux qualification smoke refuses a non-isolated context before native loa
     (error) => error?.code === "linux_secret_service_qualification_smoke_failed"
       && error?.message === "Linux Secret Service qualification smoke failed",
   );
+  await assert.rejects(
+    runLinuxAccountObservationQualificationSmoke({ qualificationContext: context() }),
+    (error) => error?.code === "linux_account_observation_qualification_smoke_failed"
+      && error?.message === "Linux account-observation qualification smoke failed",
+  );
+});
+
+test("Linux observation qualification child starts absent and completes fixed read/create/readback over inherited IPC", async () => {
+  const native = syntheticAccountObservationNative();
+  const supervisor = observationSupervisor(native);
+  const expected = Buffer.alloc(32, 93);
+  let stored = null;
+  try {
+    await supervisor.start();
+    stored = native.readStored();
+    assert.equal(Buffer.isBuffer(stored), true);
+    assert.equal(Buffer.compare(stored, expected), 0);
+    assert.deepEqual(native.calls, ["read", "create", "read"]);
+  } finally {
+    stored?.fill(0);
+    expected.fill(0);
+    try { await supervisor.stop(); } finally { native.dispose(); }
+  }
+});
+
+test("Linux observation qualification child refuses retained fixed state before creating", async () => {
+  const existing = Buffer.alloc(32, 101);
+  const native = syntheticAccountObservationNative(existing);
+  const childExit = { value: null };
+  const supervisor = observationSupervisor(native, childExit);
+  let stored = null;
+  try {
+    await assert.rejects(
+      supervisor.start(),
+      (error) => error?.code === "electron_shell_companion_exit_before_ready",
+    );
+    await supervisor.stop();
+    stored = native.readStored();
+    assert.equal(childExit.value, 31);
+    assert.equal(Buffer.isBuffer(stored), true);
+    assert.equal(Buffer.compare(stored, existing), 0);
+    assert.deepEqual(native.calls, ["read"]);
+  } finally {
+    existing.fill(0);
+    stored?.fill(0);
+    native.dispose();
+  }
 });
 
 test("Linux handover closes its injected lease context when the owned FD4 stream ends", () => {

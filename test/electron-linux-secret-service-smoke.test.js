@@ -81,7 +81,7 @@ function identity() {
 
 function innerReceipt(overrides = {}) {
   return {
-    schemaVersion: "tibotattle-electron-linux-secret-service-smoke-v2",
+    schemaVersion: "tibotattle-electron-linux-secret-service-smoke-v3",
     status: "passed",
     scope: "development_only",
     target: "linux-x64",
@@ -92,6 +92,7 @@ function innerReceipt(overrides = {}) {
     statePreparation: "absent_default_state_created",
     capabilities: 2,
     lifecycle: "two_capability_round_trip_absence_confirmed",
+    accountObservationLifecycle: "read_create_readback_confirmed",
     cleanup: "owned_companion_stopped",
     productionReady: false,
     ...overrides,
@@ -153,6 +154,7 @@ function successfulInsideRuntime({ electronProcess, digest }) {
       if (url.endsWith("linux-secret-service-qualification-smoke.js")) {
         return {
           async runLinuxSecretServiceQualificationSmoke() { return { status: "passed" }; },
+          async runLinuxAccountObservationQualificationSmoke() { return { status: "passed" }; },
         };
       }
       assert.fail(`unexpected import ${url}`);
@@ -324,7 +326,11 @@ test("packaged Electron creates the isolated context only after the default-proo
         calls.push(["smoke"]);
         return {
           async runLinuxSecretServiceQualificationSmoke({ qualificationContext }) {
-            calls.push(["run", qualificationContext]);
+            calls.push(["legacy-run", qualificationContext]);
+            return { status: "passed" };
+          },
+          async runLinuxAccountObservationQualificationSmoke({ qualificationContext }) {
+            calls.push(["observation-run", qualificationContext]);
             return { status: "passed" };
           },
         };
@@ -334,7 +340,7 @@ test("packaged Electron creates the isolated context only after the default-proo
   });
   assert.deepEqual(result, innerReceipt());
   assert.deepEqual(calls.map(([name]) => name), [
-    "digest", "daemon", "absent-state", "qualification", "smoke", "native-loaders", "context", "run", "prepared-state",
+    "digest", "daemon", "absent-state", "qualification", "smoke", "native-loaders", "context", "legacy-run", "observation-run", "prepared-state",
   ]);
   const context = calls.find(([name]) => name === "context")[1];
   assert.equal(context.credentialStoreMode, "isolated-secret-service");
@@ -346,11 +352,15 @@ test("packaged Electron creates the isolated context only after the default-proo
 });
 
 test("packaged credential failures retain only closed stage categories", async () => {
-  for (const [code, suffix] of [
-    ["linux_secret_service_qualification_smoke_create_failed", "CREDENTIAL_CREATE_FAILED"],
-    ["linux_secret_service_qualification_smoke_backend_setup_failed", "BACKEND_SETUP_FAILED"],
-    ["linux_secret_service_qualification_smoke_child_execution_failed", "CHILD_EXECUTION_FAILED"],
-    ["private-error-code-canary", "NATIVE_ROUND_TRIP_FAILED"],
+  for (const [route, code, suffix] of [
+    ["legacy", "linux_secret_service_qualification_smoke_create_failed", "CREDENTIAL_CREATE_FAILED"],
+    ["legacy", "linux_secret_service_qualification_smoke_backend_setup_failed", "BACKEND_SETUP_FAILED"],
+    ["legacy", "linux_secret_service_qualification_smoke_child_execution_failed", "CHILD_EXECUTION_FAILED"],
+    ["observation", "linux_account_observation_qualification_smoke_initial_read_failed", "OBSERVATION_INITIAL_READ_FAILED"],
+    ["observation", "linux_account_observation_qualification_smoke_create_failed", "OBSERVATION_CREATE_FAILED"],
+    ["observation", "linux_account_observation_qualification_smoke_readback_failed", "OBSERVATION_READBACK_FAILED"],
+    ["observation", "linux_account_observation_qualification_smoke_backend_setup_failed", "OBSERVATION_BACKEND_SETUP_FAILED"],
+    ["legacy", "private-error-code-canary", "NATIVE_ROUND_TRIP_FAILED"],
   ]) {
     const runtime = successfulInsideRuntime({
       electronProcess: {},
@@ -358,9 +368,20 @@ test("packaged credential failures retain only closed stage categories", async (
     });
     const importModule = runtime.importModule;
     runtime.importModule = async (url) => url.endsWith("linux-secret-service-qualification-smoke.js")
-      ? { async runLinuxSecretServiceQualificationSmoke() {
-        throw Object.assign(new Error("private-path-and-value-canary"), { code });
-      } }
+      ? {
+        async runLinuxSecretServiceQualificationSmoke() {
+          if (route === "legacy") {
+            throw Object.assign(new Error("private-path-and-value-canary"), { code });
+          }
+          return { status: "passed" };
+        },
+        async runLinuxAccountObservationQualificationSmoke() {
+          if (route === "observation") {
+            throw Object.assign(new Error("private-path-and-value-canary"), { code });
+          }
+          return { status: "passed" };
+        },
+      }
       : importModule(url);
     await assert.rejects(runLinuxPackagedSecretServiceSmokeInside({
       appPath: APP, sourceRevision: REVISION, artifactSha256: ARTIFACT,
@@ -468,6 +489,9 @@ test("packaged Electron emits bounded module and native round-trip stage failure
       return {
         async runLinuxSecretServiceQualificationSmoke() {
           throw new Error("private-native-detail");
+        },
+        async runLinuxAccountObservationQualificationSmoke() {
+          return { status: "passed" };
         },
       };
     },
@@ -764,8 +788,41 @@ test("outer failure receipt preserves only proved post-session cleanup evidence"
   assert.equal(result.packageArtifactVerified, true);
   assert.equal(result.packagedElectronExecutionVerified, false);
   assert.equal(result.credentialLifecycleVerified, false);
+  assert.equal(result.accountObservationLifecycleVerified, false);
   assert.equal(result.sessionCleanupConfirmed, true);
   assert.equal(JSON.stringify(written).includes("private-preamble"), false);
+});
+
+test("outer receipt retains a completed legacy lifecycle only for closed observation failures", async () => {
+  const handle = Object.freeze({ kind: "receipt" });
+  let written = null;
+  const result = await runLinuxPackagedSecretServiceSmoke({
+    appPath: APP,
+    stagedAppPath: STAGED,
+    packageReceiptPath: PACKAGE_RECEIPT,
+    sourceRevision: REVISION,
+    receiptPath: OUTPUT_RECEIPT,
+  }, {
+    async reserve() { return handle; },
+    async verifyPackage() { return identity(); },
+    async runSession() {
+      throw Object.assign(new Error("private-observation-canary"), {
+        code: "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_OBSERVATION_INITIAL_READ_FAILED",
+      });
+    },
+    async write(receiptHandle, receipt) {
+      assert.equal(receiptHandle, handle);
+      written = receipt;
+    },
+  });
+  assert.equal(result.status, "failed");
+  assert.equal(result.errorCode, "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_OBSERVATION_INITIAL_READ_FAILED");
+  assert.equal(result.credentialLifecycleVerified, true);
+  assert.equal(result.accountObservationLifecycleVerified, false);
+  assert.equal(result.packagedElectronExecutionVerified, false);
+  assert.equal(result.defaultStateBootstrapVerified, false);
+  assert.equal(result.sessionCleanupConfirmed, false);
+  assert.equal(JSON.stringify(written).includes("private-observation-canary"), false);
 });
 
 test("outer smoke persists only a content-free failure receipt when package verification fails", async () => {
@@ -799,7 +856,7 @@ test("outer smoke persists only a content-free failure receipt when package veri
   assert.equal(JSON.stringify(written).includes("private-canary"), false);
   assert.deepEqual(Object.keys(written).sort(), [
     "schemaVersion", "status", "scope", "target", "sourceRevision", "artifactSha256",
-    "packageArtifactVerified", "packagedElectronExecutionVerified", "credentialLifecycleVerified", "defaultStateBootstrapVerified",
+    "packageArtifactVerified", "packagedElectronExecutionVerified", "credentialLifecycleVerified", "accountObservationLifecycleVerified", "defaultStateBootstrapVerified",
     "sessionCleanupConfirmed", "errorCode", "productionReady",
   ].sort());
 });
