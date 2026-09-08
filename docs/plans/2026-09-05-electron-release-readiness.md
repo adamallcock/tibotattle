@@ -16,6 +16,57 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-08 (supersedes the historical entries below):
 
+Latest continuation checkpoint (source pushed through `1937ea04`):
+
+- Linux targeted run [34288818674](https://github.com/adamallcock/tibotattle/actions/runs/34288818674)
+  passed at `34087112`. Its normal packaged receipt verifies package execution,
+  account-observation lifecycle, unavailable-service response and cleanup;
+  `productionReady` remains false. The receipt is preserved under ignored
+  `linux-normal-34087112`, SHA-256
+  `8530f087a3b964383c2db4c87b3e10a7b17ab74bb95c3445020e1a47ea19483f`.
+- Windows targeted run [34288805086](https://github.com/adamallcock/tibotattle/actions/runs/34288805086)
+  passed the preload gate but failed automatic refresh observation. A reproduced
+  race discarded the one startup pass while the primary dashboard load owned
+  its busy lock. The pushed repair defers that pass until the owner releases
+  the lock, preserves the manual refresh requirement, and adds staged/ASAR
+  preload-manifest integrity checks. Integrated UI tests pass 574/574; focused
+  platform/refresh checks pass 39/39. A new targeted dispatch was rejected by
+  automatic approval review because the account usage limit was reached; no new
+  targeted run was created by that call. Work subsequently resumed with explicit
+  approval. Full run `34290262917` passed Linux and all four development package
+  targets, but still failed Windows automatic observation. The observer counted
+  only the detailed route, missing the legitimate quick route used after a
+  projection exists. The closed route-set repair passes 40 focused tests;
+  targeted run `34290975094` is now verifying it at `1937ea04`. NSIS remained
+  running when the full run was last inspected.
+- Corrected Mac `.5` arm64/x64 and `.6` arm64 from frozen `ba1e7cba` have complete
+  signing, notarization and artifact receipts. `.6` x64 subsequently completed;
+  all four final archives were independently hash-verified and preserved under
+  ignored `signed-handover-ba1e7cba`.
+  The signed `.5` read-only active-credential probe passes. Guarded installed
+  rehearsal r4 passed backup, signature and installation checks, then stopped
+  with a migration warning at journal phase `started`, before state copying or
+  publication. Read-only installed inspection returns `ready`; the helper's
+  contract and bundle-context checks also pass under its exact scrubbed environment.
+  The remaining failure is inside helper preparation or reply validation;
+  helper preparation may have changed login-item registration before failing.
+  Rollback restored native 0.1.18 and verified state against the stopped backup.
+  The blocked candidate and started journal are preserved. Do not remove the
+  journal or assume a changed candidate digest can resume it automatically.
+- The signed staging scheduler remains unqualified. Source review confirms the
+  unsigned hosted profile uses generic safeStorage; reusing the production native
+  binary would share fixed production identity/services. Any native staging proof
+  needs a separately signed, accountless-only staging identity and credential
+  namespace, with no native migration or FD4 access. This is a design finding,
+  not an implemented or approved production change.
+- Agent execution and privileged approval review temporarily stopped at the
+  account usage limit. No usage-reset credit was requested or consumed. The
+  user approved continuation; privileged tools and both Mac investigation agents
+  resumed. The Windows agent remained unavailable, so root implemented and
+  validated the quick-route observer fix directly. Mac read-only preparation
+  diagnostics and preference-validation ordering are being implemented before
+  another signed installed trial. No new trial has run yet.
+
 - Hosted client qualification passed against isolated staging, including real
   enrollment, ownership, encrypted upload, activation, deliberately lost-response
   recovery, duplicate-free repeated synchronization, confirmed disconnect and
