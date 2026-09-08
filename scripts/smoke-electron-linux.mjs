@@ -41,6 +41,7 @@ const MAX_NETWORK_EVIDENCE_URLS = 512;
 const MAX_NETWORK_EVIDENCE_URL_LENGTH = 2_048;
 const MAX_JSON_RESPONSE_BYTES = 1_048_576;
 const MAX_CDP_PAGE_TARGETS = 16;
+const RENDERER_READINESS_DIAGNOSTIC_PROBE_MS = 2_000;
 const CLI_FAILURE_STATUS = "ELECTRON_LINUX_SMOKE_FAILED";
 const NETWORK_BOUNDARY = "network-none";
 const PLATFORM_ARCHITECTURES = Object.freeze({
@@ -122,10 +123,13 @@ const RENDERER_READINESS_RESPONSE_CLASSES = new Set([
   "unobserved", "1xx", "2xx", "3xx", "4xx", "5xx", "other",
 ]);
 const RENDERER_READINESS_COMPLETIONS = new Set([
-  "unobserved", "finished", "failed",
+  "unobserved", "finished", "failed", "timing_recorded",
 ]);
 const RENDERER_READINESS_EXCEPTION_CLASSES = new Set([
   "unobserved", "syntax", "reference", "type", "other",
+]);
+const RENDERER_READINESS_PROBE_OUTCOMES = new Set([
+  "unobserved", "response", "timeout", "request_failed",
 ]);
 const MAX_RENDERER_DIAGNOSTIC_LINE = 250_000;
 
@@ -192,7 +196,9 @@ export function validateRendererReadinessDiagnostics(value) {
   }
   if (!Array.isArray(value.assets) || value.assets.length !== RENDERER_READINESS_ASSETS.length
       || !Array.isArray(value.primaryApis)
-      || value.primaryApis.length !== RENDERER_READINESS_PRIMARY_ENDPOINTS.length) {
+      || value.primaryApis.length !== RENDERER_READINESS_PRIMARY_ENDPOINTS.length
+      || !Array.isArray(value.primaryProbe)
+      || value.primaryProbe.length !== RENDERER_READINESS_PRIMARY_ENDPOINTS.length) {
     return null;
   }
   const validateRows = (rows, expected, key) => rows.every((row, index) => (
@@ -206,6 +212,12 @@ export function validateRendererReadinessDiagnostics(value) {
         RENDERER_READINESS_PRIMARY_ENDPOINTS.map((endpoint) => endpoint.name), "endpoint")) {
     return null;
   }
+  if (!value.primaryProbe.every((row, index) => (
+    row && typeof row === "object" && !Array.isArray(row)
+      && row.endpoint === RENDERER_READINESS_PRIMARY_ENDPOINTS[index].name
+      && RENDERER_READINESS_RESPONSE_CLASSES.has(row.responseClass)
+      && RENDERER_READINESS_PROBE_OUTCOMES.has(row.outcome)
+  ))) return null;
   return Object.freeze({
     exception: Object.freeze({
       observed: exception.observed,
@@ -223,7 +235,52 @@ export function validateRendererReadinessDiagnostics(value) {
       responseClass: row.responseClass,
       completion: row.completion,
     }))),
+    primaryProbe: Object.freeze(value.primaryProbe.map((row) => Object.freeze({
+      endpoint: row.endpoint,
+      responseClass: row.responseClass,
+      outcome: row.outcome,
+    }))),
   });
+}
+
+/** Probe only the fixed split dashboard reads after their original readiness failure. */
+export async function probeRendererReadinessPrimaryApis(origin, {
+  fetchImpl = globalThis.fetch,
+  timeoutMs = RENDERER_READINESS_DIAGNOSTIC_PROBE_MS,
+} = {}) {
+  if (typeof origin !== "string" || typeof fetchImpl !== "function"
+      || !Number.isInteger(timeoutMs) || timeoutMs < 1) {
+    return Object.freeze(RENDERER_READINESS_PRIMARY_ENDPOINTS.map(({ name: endpoint }) => Object.freeze({
+      endpoint, responseClass: "unobserved", outcome: "unobserved",
+    })));
+  }
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const results = await Promise.all(RENDERER_READINESS_PRIMARY_ENDPOINTS.map(async ({ name: endpoint, path }) => {
+      try {
+        const response = await fetchImpl(new URL(path, origin), {
+          redirect: "manual",
+          signal: controller.signal,
+        });
+        try { await response?.body?.cancel?.(); } catch { /* Response data is never read. */ }
+        return Object.freeze({
+          endpoint,
+          responseClass: rendererResponseClass(response?.status),
+          outcome: "response",
+        });
+      } catch {
+        return Object.freeze({
+          endpoint,
+          responseClass: "unobserved",
+          outcome: controller.signal.aborted ? "timeout" : "request_failed",
+        });
+      }
+    }));
+    return Object.freeze(results);
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 export function createRendererReadinessDiagnostics({ cdp, dashboardUrl }) {
@@ -234,6 +291,9 @@ export function createRendererReadinessDiagnostics({ cdp, dashboardUrl }) {
   const primaryApis = new Map(RENDERER_READINESS_PRIMARY_ENDPOINTS.map(({ name }) => [name, {
     responseClass: "unobserved", completion: "unobserved", requestId: null,
   }]));
+  let primaryProbe = RENDERER_READINESS_PRIMARY_ENDPOINTS.map(({ name: endpoint }) => ({
+    endpoint, responseClass: "unobserved", outcome: "unobserved",
+  }));
   const requests = new Map();
   let exception = {
     observed: false, classification: "unobserved", asset: null, line: null,
@@ -249,7 +309,20 @@ export function createRendererReadinessDiagnostics({ cdp, dashboardUrl }) {
     requests.set(requestId, row);
   };
   const observeResponse = ({ requestId, response } = {}) => {
-    const row = requests.get(requestId);
+    let row = requests.get(requestId);
+    // CDP can attach after requestWillBeSent but before responseReceived. Bind
+    // only this first allowlisted response; never retain its URL.
+    if (row === undefined && typeof requestId === "string" && requestId.length > 0) {
+      const target = rendererDiagnosticTarget(response?.url, origin);
+      const rows = target?.kind === "asset" ? assets
+        : target?.kind === "endpoint" ? primaryApis : null;
+      const candidate = rows?.get(target.name);
+      if (candidate?.requestId === null) {
+        candidate.requestId = requestId;
+        requests.set(requestId, candidate);
+        row = candidate;
+      }
+    }
     if (row === undefined) return;
     row.responseClass = rendererResponseClass(response?.status);
   };
@@ -260,12 +333,23 @@ export function createRendererReadinessDiagnostics({ cdp, dashboardUrl }) {
   };
   const observeException = ({ exceptionDetails } = {}) => {
     if (exception.observed) return;
-    const target = rendererDiagnosticTarget(exceptionDetails?.url, origin);
+    const directTarget = rendererDiagnosticTarget(exceptionDetails?.url, origin);
+    const frame = directTarget?.kind === "asset" ? null
+      : Array.isArray(exceptionDetails?.stackTrace?.callFrames)
+        ? exceptionDetails.stackTrace.callFrames.find((candidate) =>
+          rendererDiagnosticTarget(candidate?.url, origin)?.kind === "asset") ?? null
+        : null;
+    const target = directTarget?.kind === "asset"
+      ? directTarget
+      : rendererDiagnosticTarget(frame?.url, origin);
+    if (target?.kind !== "asset") return;
     exception = {
       observed: true,
       classification: rendererExceptionClass(exceptionDetails?.exception?.className),
-      asset: target?.kind === "asset" ? target.name : null,
-      line: target?.kind === "asset" ? rendererDiagnosticLine(exceptionDetails?.lineNumber) : null,
+      asset: target.name,
+      line: rendererDiagnosticLine(
+        directTarget?.kind === "asset" ? exceptionDetails?.lineNumber : frame?.lineNumber,
+      ),
     };
   };
   const listeners = [
@@ -284,7 +368,61 @@ export function createRendererReadinessDiagnostics({ cdp, dashboardUrl }) {
           endpoint: name,
           ...primaryApis.get(name),
         })),
+        primaryProbe,
       });
+    },
+    async snapshotWithTimingAndProbe({ probe = probeRendererReadinessPrimaryApis } = {}) {
+      let timing = null;
+      try {
+        timing = await cdp.evaluate(`(() => {
+          const origin = ${JSON.stringify(origin)};
+          const assets = ${JSON.stringify(RENDERER_READINESS_ASSETS)};
+          const endpoints = ${JSON.stringify(RENDERER_READINESS_PRIMARY_ENDPOINTS)};
+          const classify = (status) => Number.isFinite(status) && status >= 100 && status < 600
+            ? String(Math.floor(status / 100)) + "xx"
+            : "unobserved";
+          const choose = (rows, key, name, status) => {
+            if (rows.some((row) => row[key] === name)) return;
+            rows.push({ [key]: name, responseClass: classify(status), completion: "timing_recorded" });
+          };
+          const result = { assets: [], primaryApis: [] };
+          for (const entry of performance.getEntriesByType("resource")) {
+            let url;
+            try { url = new URL(entry.name); } catch { continue; }
+            if (url.origin !== origin || url.search !== "" || url.hash !== "") continue;
+            const asset = url.pathname.startsWith("/") ? url.pathname.slice(1) : "";
+            if (assets.includes(asset)) {
+              choose(result.assets, "asset", asset, entry.responseStatus);
+              continue;
+            }
+            const endpoint = endpoints.find((candidate) => candidate.path === url.pathname)?.name;
+            if (endpoint !== undefined) choose(result.primaryApis, "endpoint", endpoint, entry.responseStatus);
+          }
+          return result;
+        })()`);
+      } catch {
+        // The existing bounded CDP evaluator remains the only timing bound.
+      }
+      for (const row of Array.isArray(timing?.assets) ? timing.assets : []) {
+        const target = assets.get(row?.asset);
+        if (target === undefined || target.completion !== "unobserved") continue;
+        target.responseClass = RENDERER_READINESS_RESPONSE_CLASSES.has(row.responseClass)
+          ? row.responseClass
+          : "unobserved";
+        target.completion = "timing_recorded";
+      }
+      for (const row of Array.isArray(timing?.primaryApis) ? timing.primaryApis : []) {
+        const target = primaryApis.get(row?.endpoint);
+        if (target === undefined || target.completion !== "unobserved") continue;
+        target.responseClass = RENDERER_READINESS_RESPONSE_CLASSES.has(row.responseClass)
+          ? row.responseClass
+          : "unobserved";
+        target.completion = "timing_recorded";
+      }
+      if (typeof probe === "function") {
+        try { primaryProbe = await probe(origin); } catch { /* Keep the prior unobserved probe. */ }
+      }
+      return this.snapshot();
     },
     dispose() {
       for (const dispose of listeners) dispose();
@@ -1685,7 +1823,10 @@ export async function runSmoke({
     if (isRendererReadinessFailureStage(failureStage)
         && onRendererReadinessDiagnostics !== null) {
       try {
-        onRendererReadinessDiagnostics(rendererReadinessDiagnostics?.snapshot?.() ?? null);
+        const diagnostic = await rendererReadinessDiagnostics?.snapshotWithTimingAndProbe?.()
+          ?? rendererReadinessDiagnostics?.snapshot?.()
+          ?? null;
+        onRendererReadinessDiagnostics(diagnostic);
       } catch {
         // A diagnostic listener must not alter the underlying smoke failure.
       }

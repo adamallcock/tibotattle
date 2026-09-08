@@ -21,6 +21,7 @@ import {
   isLinuxDashboardTarget,
   isLinuxInspectablePageTarget,
   observeLocalRefreshRequests,
+  probeRendererReadinessPrimaryApis,
   reserveLinuxInspectablePageTargets,
   runSmoke,
   selectLinuxDashboardTarget,
@@ -62,6 +63,10 @@ function emitRefresh(cdp, {
 
 test("Linux renderer readiness diagnostics retain only allowlisted module and primary API states", () => {
   const cdp = new FakeCdp();
+  cdp.evaluate = async () => ({
+    assets: [{ asset: "data-client.js", responseClass: "2xx", completion: "timing_recorded" }],
+    primaryApis: [{ endpoint: "quality", responseClass: "5xx", completion: "timing_recorded" }],
+  });
   const diagnostics = createRendererReadinessDiagnostics({
     cdp,
     dashboardUrl: "http://127.0.0.1:45678/",
@@ -70,13 +75,14 @@ test("Linux renderer readiness diagnostics retain only allowlisted module and pr
     requestId,
     request: { url: `http://127.0.0.1:45678/${path}` },
   });
-  const response = (requestId, status) => cdp.emit("Network.responseReceived", {
+  const response = (requestId, status, path) => cdp.emit("Network.responseReceived", {
     requestId,
-    response: { status },
+    response: { status, ...(path === undefined ? {} : { url: `http://127.0.0.1:45678/${path}` }) },
   });
   request("asset-app", "app.js");
   response("asset-app", 200);
   cdp.emit("Network.loadingFinished", { requestId: "asset-app" });
+  response("asset-client", 200, "data-client.js");
   request("overview", "api/local/overview");
   response("overview", 503);
   cdp.emit("Network.loadingFinished", { requestId: "overview" });
@@ -87,9 +93,12 @@ test("Linux renderer readiness diagnostics retain only allowlisted module and pr
   cdp.emit("Network.loadingFailed", { requestId: "weekly" });
   cdp.emit("Runtime.exceptionThrown", {
     exceptionDetails: {
-      url: "http://127.0.0.1:45678/app.js",
-      lineNumber: 23,
+      url: "",
       exception: { className: "TypeError" },
+      stackTrace: { callFrames: [{
+        url: "http://127.0.0.1:45678/app.js",
+        lineNumber: 23,
+      }] },
     },
   });
   // Unknown paths and later exceptions cannot enter the retained diagnostic.
@@ -109,17 +118,69 @@ test("Linux renderer readiness diagnostics retain only allowlisted module and pr
   assert.deepEqual(snapshot.assets.find(({ asset }) => asset === "app.js"), {
     asset: "app.js", responseClass: "2xx", completion: "finished",
   });
+  assert.deepEqual(snapshot.assets.find(({ asset }) => asset === "data-client.js"), {
+    asset: "data-client.js", responseClass: "2xx", completion: "unobserved",
+  });
   assert.deepEqual(snapshot.primaryApis, [
     { endpoint: "overview", responseClass: "5xx", completion: "finished" },
     { endpoint: "gradient", responseClass: "2xx", completion: "finished" },
     { endpoint: "weekly", responseClass: "unobserved", completion: "failed" },
     { endpoint: "quality", responseClass: "unobserved", completion: "unobserved" },
   ]);
+  assert.deepEqual(snapshot.primaryProbe, [
+    { endpoint: "overview", responseClass: "unobserved", outcome: "unobserved" },
+    { endpoint: "gradient", responseClass: "unobserved", outcome: "unobserved" },
+    { endpoint: "weekly", responseClass: "unobserved", outcome: "unobserved" },
+    { endpoint: "quality", responseClass: "unobserved", outcome: "unobserved" },
+  ]);
   assert.equal(JSON.stringify(snapshot).includes("127.0.0.1"), false);
   assert.equal(validateRendererReadinessDiagnostics({
     ...snapshot,
     exception: { ...snapshot.exception, asset: "private-value.js" },
   }), null);
+  diagnostics.dispose();
+});
+
+test("Linux renderer diagnostic probe shares one bounded deadline and timing evidence never claims network completion", async () => {
+  const calls = [];
+  const probe = await probeRendererReadinessPrimaryApis("http://127.0.0.1:45678", {
+    timeoutMs: 20,
+    fetchImpl: async (url, { signal }) => {
+      const endpoint = new URL(url).pathname.split("/").at(-1);
+      calls.push(endpoint);
+      if (endpoint === "overview") return { status: 503 };
+      if (endpoint === "gradient") return { status: 200 };
+      if (endpoint === "weekly") throw new Error("synthetic request failure");
+      return new Promise((resolve, reject) => {
+        signal.addEventListener("abort", () => reject(new Error("synthetic timeout")), { once: true });
+      });
+    },
+  });
+  assert.deepEqual(calls.sort(), ["gradient", "overview", "quality", "weekly"]);
+  assert.deepEqual(probe, [
+    { endpoint: "overview", responseClass: "5xx", outcome: "response" },
+    { endpoint: "gradient", responseClass: "2xx", outcome: "response" },
+    { endpoint: "weekly", responseClass: "unobserved", outcome: "request_failed" },
+    { endpoint: "quality", responseClass: "unobserved", outcome: "timeout" },
+  ]);
+
+  const cdp = new FakeCdp();
+  cdp.evaluate = async () => ({
+    assets: [{ asset: "app.js", responseClass: "2xx", completion: "timing_recorded" }],
+    primaryApis: [{ endpoint: "overview", responseClass: "5xx", completion: "timing_recorded" }],
+  });
+  const diagnostics = createRendererReadinessDiagnostics({
+    cdp,
+    dashboardUrl: "http://127.0.0.1:45678/",
+  });
+  const snapshot = await diagnostics.snapshotWithTimingAndProbe({ probe: async () => probe });
+  assert.deepEqual(snapshot.assets.find(({ asset }) => asset === "app.js"), {
+    asset: "app.js", responseClass: "2xx", completion: "timing_recorded",
+  });
+  assert.deepEqual(snapshot.primaryApis[0], {
+    endpoint: "overview", responseClass: "5xx", completion: "timing_recorded",
+  });
+  assert.deepEqual(snapshot.primaryProbe, probe);
   diagnostics.dispose();
 });
 

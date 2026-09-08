@@ -95,6 +95,12 @@ function validRendererReadinessDiagnostics() {
       { endpoint: "weekly", responseClass: "unobserved", completion: "failed" },
       { endpoint: "quality", responseClass: "unobserved", completion: "unobserved" },
     ],
+    primaryProbe: [
+      { endpoint: "overview", responseClass: "5xx", outcome: "response" },
+      { endpoint: "gradient", responseClass: "2xx", outcome: "response" },
+      { endpoint: "weekly", responseClass: "unobserved", outcome: "request_failed" },
+      { endpoint: "quality", responseClass: "unobserved", outcome: "timeout" },
+    ],
   });
 }
 
