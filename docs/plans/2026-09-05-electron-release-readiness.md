@@ -14,7 +14,38 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Latest integration update: native run
+Current checkpoint, 2026-09-08 (supersedes the historical entries below):
+
+- Native run [34281557310](https://github.com/adamallcock/tibotattle/actions/runs/34281557310)
+  reached Windows ordinary startup refresh and Linux credential observation.
+  Windows attempted the manual Refresh button while automatic startup refresh
+  was still active. The integrated repair separately observes and qualifies
+  automatic refresh, then requires an enabled manual button and a distinct
+  accepted/completed refresh. Linux ordinary startup lacked native credential
+  state preparation in the normal profile; it now invokes the existing safe
+  preparation routine before constructing either credential backend. Combined
+  Windows, Linux and staging bootstrap checks pass 80/80 at `06c4a126`.
+  These changes still require the next native workflow result.
+- All four private Mac `.3`/`.4` installers from frozen `82122044` have Apple
+  acceptance, stapling and finalization receipts. Final DMG/ZIP bytes and
+  metadata are preserved under the project's ignored `signed-handover-82122044`
+  directory. Installed handover is not qualified: a fresh strict verification
+  rejects the predecessor and candidate on this host, despite the predecessor
+  matching all 539 members of the official 0.1.18 bundle. Apple Terminal and
+  unrelated signed apps also fail verification. Host trust and execution
+  context are being diagnosed; no app, writer, credentials or state were
+  changed by this attempt. Historical signing receipts do not close this gate.
+- The isolated staging Worker is deployed from `9951627d` at
+  `https://app-usagemonitor-staging.adamallcock.workers.dev`, with the explicitly
+  approved staging-only encryption keys and all collection capabilities off.
+  Its 48 primary and two deletion-ledger migrations completed. The packaged
+  synthetic contribution journey is in progress; real profiles and public
+  aggregates remain outside this rehearsal. Worker validation passed 581 tests
+  and 195 script checks, plus both dry deployments and staging checks.
+- The daily Mac tester still uses `98a5256d`; the signed migration fixtures and
+  latest source are distinct artifacts. No public feed or release was changed.
+
+Historical integration update: native run
 [34276107974](https://github.com/adamallcock/tibotattle/actions/runs/34276107974)
 passes both Mac packaging jobs, Windows development packaging and the Windows
 NSIS installed lifecycle. Linux now passes initial dashboard readiness: the
