@@ -618,7 +618,6 @@ test("normal candidate package verification binds the staged preload and runtime
       sha256: createHash("sha256").update(preload).digest("hex"),
     }],
   };
-  const runtimeBytes = Buffer.from(JSON.stringify(runtimeManifest), "utf8");
   const nativeManifest = Buffer.from("fixed-native-sidecar", "utf8");
   const nativeDigest = Object.freeze({
     bytes: nativeManifest.byteLength,
@@ -628,45 +627,54 @@ test("normal candidate package verification binds the staged preload and runtime
     bytes: bytes.byteLength,
     sha256: createHash("sha256").update(bytes).digest("hex"),
   });
-  const seenMembers = [];
-  const result = await verifyWindowsNormalCandidateSmokePackage(
-    smokeOptions(),
-    packageVerificationDependencies({
+  const verifyClosure = async ({
+    stagedRuntimeManifest = runtimeManifest,
+    archivedRuntimeBytes = null,
+    archivedPreload = preload,
+  } = {}) => {
+    const stagedRuntimeBytes = Buffer.from(JSON.stringify(stagedRuntimeManifest), "utf8");
+    const selectedArchivedRuntimeBytes = archivedRuntimeBytes ?? stagedRuntimeBytes;
+    return await verifyWindowsNormalCandidateSmokePackage(smokeOptions(), packageVerificationDependencies({
       useNativePair: true,
       useRuntimeClosure: true,
       readJsonFile: async (path, code) => {
         if (code === "SOURCE_CANDIDATE_INVALID") return sourceCandidate();
         if (path.endsWith("package.json")) return { version: "0.1.0", tibotattleDistribution: candidateMetadata() };
-        if (path.endsWith("electron-runtime-manifest.json")) return runtimeManifest;
+        if (path.endsWith("electron-runtime-manifest.json")) return stagedRuntimeManifest;
         throw new Error("unexpected staged member");
       },
       digest: async (path) => path.endsWith("electron-runtime-manifest.json")
-        ? digestFor(runtimeBytes)
+        ? digestFor(stagedRuntimeBytes)
         : /apps[\\/]electron[\\/]preload\.cjs$/u.test(path)
           ? digestFor(preload) : nativeDigest,
       asar: {
         extractFile: (_archive, member) => {
-          seenMembers.push(member);
           if (member === "package.json") return Buffer.from(JSON.stringify({
             version: "0.1.0", tibotattleDistribution: candidateMetadata(),
           }));
-          if (member === "electron-runtime-manifest.json") return runtimeBytes;
-          if (member === String.raw`apps\electron\preload.cjs`) return preload;
+          if (member === "electron-runtime-manifest.json") return selectedArchivedRuntimeBytes;
+          if (member === String.raw`apps\electron\preload.cjs`) return archivedPreload;
           if (member === String.raw`native\windows-filesystem\build\Release\windows_filesystem.node.manifest.json`) {
             return nativeManifest;
           }
           throw new Error("unexpected archive member");
         },
       },
-    }),
-  );
+    }));
+  };
+  const result = await verifyClosure();
   assert.equal(result.target, "win32-x64");
-  assert.deepEqual([...seenMembers].sort(), [
-    "package.json",
-    String.raw`apps\electron\preload.cjs`,
-    "electron-runtime-manifest.json",
-    String.raw`native\windows-filesystem\build\Release\windows_filesystem.node.manifest.json`,
-  ].sort());
+  await assert.rejects(verifyClosure({ archivedPreload: Buffer.from("stale-preload", "utf8") }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_RUNTIME_CLOSURE_INVALID",
+  });
+  await assert.rejects(verifyClosure({ archivedRuntimeBytes: Buffer.from("stale-runtime-manifest", "utf8") }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_RUNTIME_CLOSURE_INVALID",
+  });
+  await assert.rejects(verifyClosure({ stagedRuntimeManifest: {
+    files: [{ path: "apps/electron/preload.cjs", bytes: preload.byteLength + 1, sha256: "f".repeat(64) }],
+  } }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_RUNTIME_CLOSURE_INVALID",
+  });
 });
 
 test("normal candidate protected opt-out seeding retains closed source causes by stage", async () => {
