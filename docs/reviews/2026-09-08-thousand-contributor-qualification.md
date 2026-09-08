@@ -2,16 +2,19 @@
 title: Thousand-contributor calculator qualification
 date: 2026-09-08
 type: review
-status: locally-tested-awaiting-bundle-check
+status: locally-qualified-with-limits
 source_base: f7e39920
+source_commit: 690ab6c0e5f2f9f79fb17017b9244f996e1e9845
 ---
 
 # Scope and claim boundary
 
 This records isolated local Workers/D1 qualification on
-`codex/scale-1000-contributors`, based on `f7e39920`. It is evidence for the
-hosted calculator changes in the commit containing this review, not a production
-deployment, desktop release, completed live backfill or traffic-capacity SLA.
+`codex/scale-1000-contributors`, based on `f7e39920`. The qualified implementation
+and clean-source dry builds are commit `690ab6c0e5f2f9f79fb17017b9244f996e1e9845`;
+the following documentation-only commit records the final evidence. This is not
+a production deployment, desktop release, completed live backfill or
+traffic-capacity SLA.
 Migrations 0054–0056 are prepared and tested locally; none was applied remotely.
 No production data, consent, retention or v1.1 activation setting was changed.
 
@@ -140,9 +143,26 @@ payloads, participant identifiers or real credentials enter the report.
 The final full Worker test run passed all 958 tests in 71 files, with no skips,
 in 534.19 seconds. Package integrity (27 tests), endpoint/type checks, TypeScript
 and all 220 operational-script tests also passed. Its following dry bundle step
-correctly refused the uncommitted checkout; the clean-source bundle checks remain
-to be run after the local commit. The strengthened exact-assertion scale run
-passed separately after its final additional assertions.
+correctly refused the uncommitted checkout. After the local commit, all remaining
+segments passed separately: `npm run deploy:dry`, `npm run staging:check` and
+the additional `npm run production:deploy:dry`. These are local default,
+staging-configured and production-configured bundles, not deployments. The
+staging configuration remains intentionally unprovisioned. No check was bypassed.
+The strengthened exact-assertion scale run passed separately after its final
+additional assertions.
+
+The new worktree initially lacked generated public assets. The normal stager
+verified and reused the prior 23-file generated site after all 17 public-source
+file hashes matched the new clean source. Both existing 0.1.18 installer entries
+and the social image were retained. The private admin bundle comes from the
+current generated source, not that public asset tree. No renewed installer
+native-trust verification is claimed. Each dry bundle reported 1,755.74 KiB
+uncompressed and 367.66 KiB gzip.
+
+Test verdict: **PASS WITH FIXES for the hosted scale scope**, with the explicit
+production-capacity limits below. No success depends on dismissing a flaky
+assertion or skipping a changed-code test. The broad root suite remains failed
+on the two independently reproduced baseline desktop receipt checks below.
 
 Completed supporting checks include:
 
