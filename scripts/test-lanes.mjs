@@ -21,6 +21,9 @@ const SUPPORTED_TEST_REPORTERS = new Set(["dot", "spec", "tap"]);
 // with macOSArtifactTest. The source lane activates that tag's source scope,
 // so a future title edit cannot silently change which test bodies run.
 export const MACOS_SOURCE_TEST_FILES = Object.freeze([
+  "test/release-agent.test.js",
+  "test/release-operation.test.js",
+  "test/macos-release-journal.test.js",
   "test/i18n-foundation.test.js",
   "test/macos-localization.test.js",
   "test/macos-app-bundle.test.js",
@@ -30,6 +33,8 @@ export const MACOS_SOURCE_TEST_FILES = Object.freeze([
 ]);
 
 export const MACOS_ARTIFACT_TEST_FILES = Object.freeze([
+  "test/release-operation.test.js",
+  "test/macos-release-journal.test.js",
   "test/macos-app-bundle.test.js",
   "test/macos-keychain-migration-artifact.test.js",
   "test/macos-keychain-migration-runner.test.js",
@@ -408,6 +413,8 @@ async function runLane(lane) {
     return;
   }
   if (lane === "macos-source") {
+    await runNodeTests(["--test-concurrency=1", "test/release-agent.test.js",
+      "test/release-operation.test.js", "test/macos-release-journal.test.js"]);
     await runNodeTests([
       "--test-concurrency=1",
       "test/i18n-foundation.test.js",
@@ -434,6 +441,8 @@ async function runLane(lane) {
     return;
   }
   if (lane === "macos-artifact") {
+    await runNodeTests(["--test-concurrency=1", "test/release-operation.test.js",
+      "test/macos-release-journal.test.js"]);
     await runCommand(NPM_COMMAND, ["run", "product:macos:updater:prepare"]);
     await runNodeTests([
       "--test-concurrency=1",

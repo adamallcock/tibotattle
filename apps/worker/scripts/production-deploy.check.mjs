@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -20,7 +20,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
 import {
   PRODUCTION_DEPLOY_CONFIRMATION,
@@ -29,9 +29,12 @@ import {
   dependencyTreeDigest,
   determinePendingProductionMigrations,
   runProductionDeployment,
+  reconcileProductionDeployment,
+  parseProductionDeploymentArgs,
   recheckProductionHealth,
   recheckProductionPublicSurface,
 } from "./production-deploy.mjs";
+import { readOperation } from "../../../scripts/lib/release-operation.mjs";
 import { stageProductionAssets } from "./stage-production-assets.mjs";
 import { EXPECTED_STAGING_MIGRATIONS } from "./staging-readiness-lib.mjs";
 import { workerDirectory as checkedInWorkerDirectory } from "./staging-test-fixtures.mjs";
@@ -54,6 +57,51 @@ const FIXTURE_LEDGER_MIGRATION = "0001_fixture_ledger.sql";
 // post-Wrangler reverification passes. Real-snapshot tests override the check
 // with the real digest function instead.
 const FIXTURE_DEPENDENCY_DIGEST = "f".repeat(64);
+const FIXTURE_SOURCE_COMMIT = "c26823c" + "1".repeat(33);
+const FIXTURE_PREVIOUS_COMMIT = "a".repeat(40);
+const FIXTURE_OWNER = "b".repeat(40);
+const operationDirectories = [];
+after(async () => {
+  for (const directory of operationDirectories) await rm(directory, { recursive: true, force: true });
+});
+
+function operationDirectory() {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "production-operation-test-")));
+  operationDirectories.push(directory);
+  return directory;
+}
+
+function coordinationFixture() {
+  let owner = null;
+  const events = [];
+  return {
+    events,
+    status: () => owner,
+    createOwner: () => FIXTURE_OWNER,
+    isAncestor: () => true,
+    acquire(value) {
+      assert.equal(owner, null);
+      owner = value;
+      events.push("acquire");
+    },
+    assertOwned(value) { assert.equal(value, owner); },
+    release(value) {
+      assert.equal(value, owner);
+      owner = null;
+      events.push("release");
+    },
+  };
+}
+
+function assertDeploymentFailure(actual, expected, evidence = {}) {
+  assert.deepEqual(actual, {
+    ...expected,
+    outcome: "not_started",
+    stage: "failed",
+    coordination: "not_acquired",
+    ...evidence,
+  });
+}
 
 function git(root, arguments_) {
   return execFileSync("/usr/bin/git", ["-C", root, ...arguments_], {
@@ -172,6 +220,7 @@ async function immutableSnapshotFixture() {
 function liveOpenHealth() {
   return {
     status: "ok",
+    deployment: { sourceCommit: FIXTURE_SOURCE_COMMIT },
     enrollmentMode: "open",
     collectionControls: { state: "operational" },
   };
@@ -238,12 +287,25 @@ function publicSitemap() {
 }
 
 function options(overrides = {}) {
+  let deployed = false;
+  const lock = coordinationFixture();
+  const sourceCommit = overrides.expectedSourceCommit ?? FIXTURE_SOURCE_COMMIT;
+  const fetchImpl = overrides.fetchImpl ?? (async (url) => {
+    assert.equal(String(url), HEALTH_URL);
+    return jsonHealthResponse({ ...liveOpenHealth(), deployment: {
+      sourceCommit: deployed ? sourceCommit : FIXTURE_PREVIOUS_COMMIT,
+    } });
+  });
+  const spawn = overrides.spawn ?? (() => ({ status: 0, stdout: "", stderr: "" }));
   return {
     confirmation: PRODUCTION_DEPLOY_CONFIRMATION,
     wrangler: "/fake/wrangler",
     workerDirectory: "/worker",
-    expectedSourceCommit: "c26823c",
-    sourceCommitCheck: () => "c26823c",
+    expectedSourceCommit: FIXTURE_SOURCE_COMMIT,
+    expectedPreviousSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+    sourceCommitCheck: () => FIXTURE_SOURCE_COMMIT,
+    operationDirectory: operationDirectory(),
+    coordinationFactory: () => lock,
     sourceTreeCleanCheck: () => true,
     createSourceSnapshot: async () => ({
       repositoryRoot: "/immutable/repository",
@@ -259,14 +321,226 @@ function options(overrides = {}) {
     }),
     migrationGateCheck: { ok: true, code: null, pending: [] },
     log: () => {},
-    fetchImpl: async (url) => {
-      assert.equal(String(url), HEALTH_URL);
-      return jsonHealthResponse();
-    },
     publicSurfaceRecheck: async () => ({ ok: true, code: null }),
     ...overrides,
+    fetchImpl,
+    spawn: (...args) => {
+      if (args[1][0] === "deploy") deployed = true;
+      return spawn(...args);
+    },
   };
 }
+
+function readyOptions(overrides = {}) {
+  return options({ checkWorkspacePackages: async () => {}, checkEndpoints: async () => {},
+    stageAssets: async () => {}, ...overrides });
+}
+
+test("production coordination requires an explicit full predecessor before snapshot or remote operations", async () => {
+  for (const predecessor of [undefined, null, "", "abc1234", "g".repeat(40)]) {
+    const calls = [];
+    const result = await runProductionDeployment(readyOptions({
+      expectedPreviousSourceCommit: predecessor,
+      createSourceSnapshot: async () => calls.push("snapshot"),
+      coordinationFactory: () => calls.push("coordination"),
+      spawn: () => calls.push("deploy"),
+    }));
+    assert.deepEqual(result, { ok: false, code: "PRODUCTION_PREVIOUS_SOURCE_REQUIRED" });
+    assert.deepEqual(calls, []);
+  }
+});
+
+test("nonancestor predecessor is refused before journal creation or lock acquisition", async () => {
+  const lock = coordinationFixture();
+  lock.isAncestor = (previous, source) => {
+    assert.equal(previous, FIXTURE_PREVIOUS_COMMIT);
+    assert.equal(source, FIXTURE_SOURCE_COMMIT);
+    return false;
+  };
+  let calls = 0;
+  const configured = readyOptions({ coordinationFactory: () => lock, spawn: () => { calls += 1; } });
+  assert.deepEqual(await runProductionDeployment(configured), {
+    ok: false, code: "PRODUCTION_PREVIOUS_SOURCE_NOT_ANCESTOR",
+  });
+  assert.equal(calls, 0);
+  assert.deepEqual(lock.events, []);
+  await assert.rejects(readFile(join(configured.operationDirectory, "operation.json")), { code: "ENOENT" });
+});
+
+test("stale or missing live predecessor provenance blocks Wrangler and releases the owned pre-mutation lock", async () => {
+  for (const observed of ["d".repeat(40), null, undefined]) {
+    let spawned = false;
+    const lock = coordinationFixture();
+    const configured = readyOptions({
+      coordinationFactory: () => lock,
+      healthRecheck: async () => ({ ok: true, code: null, sourceCommit: observed }),
+      spawn: () => { spawned = true; return { status: 0 }; },
+    });
+    assertDeploymentFailure(await runProductionDeployment(configured), {
+      ok: false, code: "PRODUCTION_PREVIOUS_SOURCE_MISMATCH",
+    }, { coordination: "released" });
+    assert.equal(spawned, false);
+    assert.deepEqual(lock.events, ["acquire", "release"]);
+    const record = await readOperation(configured.operationDirectory);
+    assert.equal(record.state.outcome, "not_started");
+    assert.equal(record.state.previousSourceCommit, FIXTURE_PREVIOUS_COMMIT);
+    assert.equal(record.state.lock, "released");
+  }
+});
+
+test("source or dependencies changing under the lock are proven pre-mutation failures", async () => {
+  for (const changed of ["source", "dependencies"]) {
+    const lock = coordinationFixture();
+    let underLock = false;
+    const acquire = lock.acquire.bind(lock);
+    lock.acquire = (owner) => { acquire(owner); underLock = true; };
+    let deployed = false;
+    const configured = readyOptions({ coordinationFactory: () => lock,
+      sourceCommitCheck: () => underLock && changed === "source" ? "d".repeat(40) : FIXTURE_SOURCE_COMMIT,
+      dependencyDigestCheck: async () => underLock && changed === "dependencies" ? "d".repeat(64) : FIXTURE_DEPENDENCY_DIGEST,
+      spawn: () => { deployed = true; return { status: 0 }; },
+    });
+    const result = await runProductionDeployment(configured);
+    assert.equal(result.ok, false);
+    assert.equal(result.outcome, "not_started");
+    assert.equal(result.coordination, "released");
+    assert.equal(deployed, false);
+    assert.deepEqual(lock.events, ["acquire", "release"]);
+    assert.equal((await readOperation(configured.operationDirectory)).state.outcome, "not_started");
+  }
+});
+
+test("durable unknown intent precedes Wrangler and unsuccessful provider results retain ownership without replay", async () => {
+  for (const providerResult of [{ status: 1, stderr: "private sentinel must not escape" }, { status: null, error: new Error("uncertain spawn") }]) {
+    const lock = coordinationFixture();
+    const directory = operationDirectory();
+    let deploys = 0;
+    const configured = readyOptions({
+      operationDirectory: directory,
+      coordinationFactory: () => lock,
+      spawn: () => {
+        deploys += 1;
+        const record = JSON.parse(readFileSync(join(directory, "operation.json"), "utf8"));
+        assert.equal(record.state.stage, "deploy");
+        assert.equal(record.state.outcome, "outcome_unknown");
+        assert.equal(record.state.lock, "held");
+        assert.equal(lock.status(), record.state.owner);
+        return providerResult;
+      },
+    });
+    const result = await runProductionDeployment(configured);
+    assertDeploymentFailure(result, { ok: false, code: "PRODUCTION_DEPLOY_FAILED" }, {
+      outcome: "deployed_unverified", coordination: "held",
+    });
+    assert.equal(deploys, 1);
+    assert.deepEqual(lock.events, ["acquire"]);
+    assert.equal(JSON.stringify(result).includes("private sentinel"), false);
+    const record = await readOperation(directory);
+    assert.equal(record.state.outcome, "deployed_unverified");
+    assert.equal(JSON.stringify(record).includes("private sentinel"), false);
+    assert.equal((await runProductionDeployment(configured)).code, "RELEASE_OPERATION_EXISTS_USE_RESUME");
+    assert.equal(deploys, 1, "ordinary retry cannot redeploy an uncertain operation");
+  }
+});
+
+test("post-deploy source mismatch retains shared lock and durable unverified outcome", async () => {
+  let checks = 0;
+  let deploys = 0;
+  const lock = coordinationFixture();
+  const configured = readyOptions({
+    coordinationFactory: () => lock,
+    healthRecheck: async () => ({ ok: true, code: null, sourceCommit: ++checks === 3 ? "d".repeat(40) : FIXTURE_PREVIOUS_COMMIT }),
+    spawn: () => { deploys += 1; return { status: 0 }; },
+  });
+  assertDeploymentFailure(await runProductionDeployment(configured), {
+    ok: false, code: "PRODUCTION_POST_DEPLOY_SOURCE_MISMATCH",
+  }, { outcome: "deployed_unverified", coordination: "held" });
+  assert.equal(deploys, 1);
+  assert.deepEqual(lock.events, ["acquire"]);
+  assert.equal((await readOperation(configured.operationDirectory)).state.outcome, "deployed_unverified");
+});
+
+test("uncertain acquisition never deploys or releases a potentially owned lock", async () => {
+  const lock = coordinationFixture();
+  const acquire = lock.acquire;
+  lock.acquire = (owner) => {
+    acquire(owner);
+    throw Object.assign(new Error("opaque acquisition failure"), { code: "PRODUCTION_COORDINATION_ACQUIRE_UNCERTAIN" });
+  };
+  let deploys = 0;
+  const configured = readyOptions({ coordinationFactory: () => lock, spawn: () => { deploys += 1; return { status: 0 }; } });
+  assertDeploymentFailure(await runProductionDeployment(configured), {
+    ok: false, code: "PRODUCTION_COORDINATION_ACQUIRE_UNCERTAIN",
+  }, { coordination: "uncertain" });
+  assert.equal(deploys, 0);
+  assert.deepEqual(lock.events, ["acquire"]);
+  assert.equal(lock.status(), FIXTURE_OWNER);
+  assert.equal((await readOperation(configured.operationDirectory)).state.lock, "uncertain");
+});
+
+test("ownership loss after provider mutation remains outcome unknown instead of falsely reporting no deployment", async () => {
+  const lock = coordinationFixture();
+  const assertOwned = lock.assertOwned;
+  let deployed = false;
+  lock.assertOwned = (owner) => {
+    if (deployed) throw Object.assign(new Error("ownership unavailable"), { code: "PRODUCTION_COORDINATION_NOT_OWNER" });
+    assertOwned(owner);
+  };
+  const configured = readyOptions({ coordinationFactory: () => lock, spawn: () => { deployed = true; return { status: 0 }; } });
+  assertDeploymentFailure(await runProductionDeployment(configured), {
+    ok: false, code: "PRODUCTION_COORDINATION_NOT_OWNER",
+  }, { outcome: "outcome_unknown", coordination: "held" });
+  assert.equal(deployed, true);
+  assert.deepEqual(lock.events, ["acquire"]);
+  assert.equal((await readOperation(configured.operationDirectory)).state.outcome, "outcome_unknown");
+});
+
+test("reconciliation verifies exact candidate and public surface without invoking deployment", async () => {
+  let deploys = 0;
+  const lock = coordinationFixture();
+  const configured = readyOptions({ coordinationFactory: () => lock, spawn: () => { deploys += 1; return { status: 1 }; } });
+  await runProductionDeployment(configured);
+  const reconcile = {
+    operationDirectory: configured.operationDirectory, workerDirectory: configured.workerDirectory,
+    confirmation: "RECONCILE_PRODUCTION_DEPLOYMENT", executorStopped: true,
+    coordinationFactory: () => lock,
+    healthRecheck: async () => ({ ok: true, code: null, sourceCommit: FIXTURE_SOURCE_COMMIT }),
+    publicSurfaceRecheck: async () => ({ ok: true, code: null }),
+  };
+  assert.deepEqual(await reconcileProductionDeployment({ ...reconcile, executorStopped: false }), {
+    ok: false, code: "RECONCILIATION_CONFIRMATION_REQUIRED",
+  });
+  assert.deepEqual(await reconcileProductionDeployment({ ...reconcile, healthRecheck: async () => ({ ok: true, sourceCommit: FIXTURE_PREVIOUS_COMMIT }) }), {
+    ok: false, code: "PRODUCTION_RECONCILIATION_UNVERIFIED",
+  });
+  assert.deepEqual(await reconcileProductionDeployment({ ...reconcile, publicSurfaceRecheck: async () => ({ ok: false }) }), {
+    ok: false, code: "PRODUCTION_RECONCILIATION_UNVERIFIED",
+  });
+  assert.deepEqual(lock.events, ["acquire"]);
+  assert.deepEqual(await reconcileProductionDeployment(reconcile), {
+    ok: true, code: "PRODUCTION_RECONCILED", outcome: "verified", coordination: "released",
+  });
+  assert.equal(deploys, 1, "reconciliation must never call provider deployment");
+  assert.deepEqual(lock.events, ["acquire", "release"]);
+  assert.equal((await readOperation(configured.operationDirectory)).state.outcome, "verified");
+});
+
+test("deployment CLI separates exact predecessor deployment from stopped-executor reconciliation", () => {
+  assert.deepEqual(parseProductionDeploymentArgs(["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT]), {
+    confirmation: "DEPLOY_PRODUCTION", expectedPreviousSourceCommit: FIXTURE_PREVIOUS_COMMIT,
+  });
+  assert.deepEqual(parseProductionDeploymentArgs(["--confirm", "RECONCILE_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped"]), {
+    confirmation: "RECONCILE_PRODUCTION_DEPLOYMENT", operationDirectory: "/private/operation", executorStopped: true,
+  });
+  for (const args of [[], ["--confirm", "DEPLOY_PRODUCTION"],
+    ["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", "abc1234"],
+    ["--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT, "--executor-stopped"],
+    ["--confirm", "RECONCILE_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation"],
+    ["--confirm", "RECONCILE_PRODUCTION_DEPLOYMENT", "--operation", "/private/operation", "--executor-stopped", "--confirm-migrations", "BINDING:0001_test.sql"],
+    ["--confirm", "DEPLOY_PRODUCTION", "--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT]]) {
+    assert.throws(() => parseProductionDeploymentArgs(args), { code: "PRODUCTION_ARGUMENTS_INVALID" });
+  }
+});
 
 test("dependency digest ignores only root Wrangler runtime state", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-dependency-digest-"));
@@ -344,7 +618,7 @@ test("production deployment creates a real top-level Git snapshot and passes the
     healthRecheck: async ({ timeoutMs }) => {
       healthChecks += 1;
       healthTimeouts.push(timeoutMs);
-      return { ok: true, code: null };
+      return { ok: true, code: null, sourceCommit: healthChecks === 3 ? fixture.sourceCommit : FIXTURE_PREVIOUS_COMMIT };
     },
     checkWorkspacePackages: async () => {},
     checkEndpoints: async () => {},
@@ -371,8 +645,8 @@ test("production deployment creates a real top-level Git snapshot and passes the
   assert.equal(result.code, "PRODUCTION_DEPLOYED");
   assert.equal(result.migrationGate, "no_unapplied_migrations");
   assert.deepEqual(result.pendingMigrations, []);
-  assert.equal(healthChecks, 2);
-  assert.deepEqual(healthTimeouts, [10_000, 10_000]);
+  assert.equal(healthChecks, 3);
+  assert.deepEqual(healthTimeouts, [10_000, 10_000, 10_000]);
   assert.deepEqual(deployArgs, [[
     "deploy",
     "--env",
@@ -405,7 +679,7 @@ test("production deployment creates a real top-level Git snapshot and passes the
   );
 });
 
-test("production deployment fails closed when the snapshot dependency link is repointed before cleanup", async (t) => {
+test("production deployment preserves verified outcome and refuses unsafe cleanup when the dependency link is repointed", async (t) => {
   const fixture = await immutableSnapshotFixture();
   t.after(async () => {
     await rm(fixture.root, { recursive: true, force: true });
@@ -450,11 +724,11 @@ test("production deployment fails closed when the snapshot dependency link is re
       stageAssets: async () => {},
       healthRecheck: async () => {
         healthChecks += 1;
-        if (healthChecks === 2) {
+        if (healthChecks === 3) {
           await rm(dependencyLink);
           await symlink(fixture.workerDirectory, dependencyLink, "dir");
         }
-        return { ok: true, code: null };
+        return { ok: true, code: null, sourceCommit: healthChecks === 3 ? fixture.sourceCommit : FIXTURE_PREVIOUS_COMMIT };
       },
       spawn: () => {
         spawned = true;
@@ -462,12 +736,13 @@ test("production deployment fails closed when the snapshot dependency link is re
       },
     }));
 
-    assert.deepEqual(result, {
-      ok: false,
-      code: "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED",
-    });
+    assert.equal(result.ok, true);
+    assert.equal(result.code, "PRODUCTION_DEPLOYED");
+    assert.equal(result.cleanup, "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED");
+    assert.equal(result.outcome, "verified");
+    assert.equal(result.coordination, "released");
     assert.equal(spawned, true);
-    assert.equal(healthChecks, 2);
+    assert.equal(healthChecks, 3);
     assert.equal(
       await readFile(dependencyMarker, "utf8"),
       "external dependency remains\n",
@@ -506,7 +781,7 @@ test("production deployment fails closed when the dependency tree digest changes
       return { status: 0, stdout: "deployed", stderr: "" };
     },
   }));
-  assert.deepEqual(result, {
+  assertDeploymentFailure(result, {
     ok: false,
     code: "PRODUCTION_DEPENDENCY_TREE_DIGEST_MISMATCH",
   });
@@ -530,7 +805,7 @@ test("production deployment fails closed when the dependency tree cannot be reve
       return { status: 0 };
     },
   }));
-  assert.deepEqual(result, {
+  assertDeploymentFailure(result, {
     ok: false,
     code: "PRODUCTION_DEPENDENCY_TREE_VERIFICATION_FAILED",
   });
@@ -558,7 +833,7 @@ test("production deployment fails closed when generated release output is a syml
       return { status: 0 };
     },
   }));
-  assert.deepEqual(result, {
+  assertDeploymentFailure(result, {
     ok: false,
     code: "PRODUCTION_SOURCE_SNAPSHOT_UNAVAILABLE",
   });
@@ -594,7 +869,7 @@ test("production deployment requires scoped confirmation and a migration confirm
     },
     ...gated,
   }));
-  assert.deepEqual(unconfirmed, {
+  assertDeploymentFailure(unconfirmed, {
     ok: false,
     code: "PRODUCTION_MIGRATIONS_UNCONFIRMED",
     pendingMigrations: ["USAGE_MONITOR_DB:0030_next.sql"],
@@ -613,7 +888,7 @@ test("production deployment fails closed when immutable source snapshot setup or
       return { status: 0 };
     },
   }));
-  assert.deepEqual(creationFailure, {
+  assertDeploymentFailure(creationFailure, {
     ok: false,
     code: "PRODUCTION_SOURCE_SNAPSHOT_UNAVAILABLE",
   });
@@ -634,9 +909,10 @@ test("production deployment fails closed when immutable source snapshot setup or
       },
     }),
   }));
-  assert.deepEqual(cleanupFailure, {
+  assertDeploymentFailure(cleanupFailure, {
     ok: false,
-    code: "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED",
+    code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
+    cleanup: "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED",
   });
 });
 
@@ -663,7 +939,7 @@ test("production deployment refuses an unknown, drifted, mismatched, or unexpect
       migrationGateCheck: { ok: false, code },
       ...gated,
     }));
-    assert.deepEqual(result, { ok: false, code });
+    assertDeploymentFailure(result, { ok: false, code });
   }
 
   const failedDiscovery = await runProductionDeployment(options({
@@ -674,7 +950,7 @@ test("production deployment refuses an unknown, drifted, mismatched, or unexpect
     }),
     ...gated,
   }));
-  assert.deepEqual(failedDiscovery, {
+  assertDeploymentFailure(failedDiscovery, {
     ok: false,
     code: "PRODUCTION_MIGRATION_STATE_UNKNOWN",
   });
@@ -688,7 +964,7 @@ test("production deployment refuses an unknown, drifted, mismatched, or unexpect
     confirmedMigrations: "USAGE_MONITOR_DB:0031_other.sql",
     ...gated,
   }));
-  assert.deepEqual(mismatch, {
+  assertDeploymentFailure(mismatch, {
     ok: false,
     code: "PRODUCTION_MIGRATIONS_CONFIRMATION_MISMATCH",
     pendingMigrations: pending,
@@ -699,7 +975,7 @@ test("production deployment refuses an unknown, drifted, mismatched, or unexpect
     confirmedMigrations: [...pending].reverse().join(","),
     ...gated,
   }));
-  assert.deepEqual(reordered, {
+  assertDeploymentFailure(reordered, {
     ok: false,
     code: "PRODUCTION_MIGRATIONS_CONFIRMATION_MISMATCH",
     pendingMigrations: pending,
@@ -710,7 +986,7 @@ test("production deployment refuses an unknown, drifted, mismatched, or unexpect
     confirmedMigrations: "USAGE_MONITOR_DB:0030_next.sql",
     ...gated,
   }));
-  assert.deepEqual(unexpected, {
+  assertDeploymentFailure(unexpected, {
     ok: false,
     code: "PRODUCTION_MIGRATIONS_CONFIRMATION_UNEXPECTED",
     pendingMigrations: [],
@@ -734,7 +1010,9 @@ test("a no-unapplied-migration deployment routes through local checks and then t
     stageAssets: async () => calls.push("assets"),
     fetchImpl: async (url, request) => {
       healthCalls.push({ url: String(url), request });
-      return jsonHealthResponse();
+      return jsonHealthResponse({ ...liveOpenHealth(), deployment: {
+        sourceCommit: healthCalls.length === 3 ? FIXTURE_SOURCE_COMMIT : FIXTURE_PREVIOUS_COMMIT,
+      } });
     },
     spawn: (_command, args) => {
       calls.push(args);
@@ -754,10 +1032,10 @@ test("a no-unapplied-migration deployment routes through local checks and then t
       "production",
       "--strict",
       "--var",
-      "DEPLOYMENT_SOURCE_COMMIT:c26823c",
+      `DEPLOYMENT_SOURCE_COMMIT:${FIXTURE_SOURCE_COMMIT}`,
     ],
   ]);
-  assert.equal(healthCalls.length, 2);
+  assert.equal(healthCalls.length, 3);
   assert.equal(healthCalls[0].url, HEALTH_URL);
   assert.equal(healthCalls[1].url, HEALTH_URL);
   assert.equal(healthCalls[0].request.method, "GET");
@@ -834,8 +1112,8 @@ test("production deployment does not report success when the post-deploy health 
         fetchCount += 1;
         assert.equal(String(url), HEALTH_URL, name);
         assert.equal(request.method, "GET", name);
-        return fetchCount === 1
-          ? jsonHealthResponse()
+        return fetchCount <= 2
+          ? jsonHealthResponse({ ...liveOpenHealth(), deployment: { sourceCommit: FIXTURE_PREVIOUS_COMMIT } })
           : postDeployFetch();
       },
       spawn: () => {
@@ -844,8 +1122,8 @@ test("production deployment does not report success when the post-deploy health 
       },
     }));
     assert.equal(spawned, true, name);
-    assert.equal(fetchCount, 2, name);
-    assert.deepEqual(result, { ok: false, code: expectedCode }, name);
+    assert.equal(fetchCount, 3, name);
+    assertDeploymentFailure(result, { ok: false, code: expectedCode }, { outcome: "deployed_unverified", coordination: "held" });
   }
 });
 
@@ -861,7 +1139,7 @@ test("production deployment treats release preflight as a hard gate", async () =
     stageAssets: async () => calls.push("assets"),
     spawn: () => calls.push("deploy"),
   }));
-  assert.deepEqual(result, {
+  assertDeploymentFailure(result, {
     ok: false,
     code: "RELEASE_PREFLIGHT_BLOCKED",
     blockers: ["LOCAL_SCHEMA_INCOMPLETE"],
@@ -935,7 +1213,7 @@ test("production deployment rejects source revision movement across the Wrangler
   let sourceMoved = false;
   const spawnCwds = [];
   const result = await runProductionDeployment(options({
-    sourceCommitCheck: () => sourceMoved ? "deadbee" : "c26823c",
+    sourceCommitCheck: () => sourceMoved ? "deadbee" : FIXTURE_SOURCE_COMMIT,
     checkWorkspacePackages: async () => {},
     checkEndpoints: async () => {},
     stageAssets: async () => {},
@@ -946,10 +1224,10 @@ test("production deployment rejects source revision movement across the Wrangler
       return { status: 0, stdout: "deployed", stderr: "" };
     },
   }));
-  assert.deepEqual(result, {
+  assertDeploymentFailure(result, {
     ok: false,
     code: "PRODUCTION_SOURCE_REVISION_CHANGED",
-  });
+  }, { outcome: "deployed_unverified", coordination: "held" });
   assert.equal(spawned, true);
   assert.deepEqual(spawnCwds, ["/immutable/repository/apps/worker"]);
 });
@@ -964,7 +1242,7 @@ test("production health recheck requires the canonical URL and security headers 
       return jsonHealthResponse();
     },
   });
-  assert.deepEqual(result, { ok: true, code: null });
+  assert.deepEqual(result, { ok: true, code: null, sourceCommit: FIXTURE_SOURCE_COMMIT });
   assert.deepEqual(calls.map((call) => call.url), [HEALTH_URL]);
   assert.equal(calls[0].request.headers.accept, "application/json");
 

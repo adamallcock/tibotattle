@@ -17,12 +17,12 @@ The supported one-command install is:
 brew install --cask adamallcock/tap/tibotattle
 ```
 
-The cask installs the same signed, notarized arm64 DMG as the website and
-GitHub Release. It declares `auto_updates true`, preserving the existing signed
+The cask selects the same signed, notarized ARM or Intel DMG as the website and
+GitHub Release for the host architecture. It declares `auto_updates true`, preserving the existing signed
 Sparkle feed as the installed app's update authority. Homebrew is an additional
 install and uninstall route, not a replacement release channel.
 
-The public support floor is macOS 14 (Sonoma) on Apple silicon. The app bundle,
+The public support floor is macOS 14 (Sonoma) on Apple silicon and Intel. The app bundle,
 Swift compiler target, public release-site metadata, release runbook, and cask
 must all carry that same floor. The already-published v0.1.11 binary is more
 permissive at the bundle level; the cask and public support contract still

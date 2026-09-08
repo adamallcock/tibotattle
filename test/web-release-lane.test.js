@@ -247,6 +247,7 @@ test("web-only prepare parsing reserves source selection for the guarded command
 test("web-only deployment delegates the receipt-pinned SHA to the production guard", async () => {
   const repositoryRoot = "/tmp/web-release-candidate";
   const sourceCommit = "a".repeat(40);
+  const baseCommit = "b".repeat(40);
   const receiptPath = "/tmp/web-release-candidate/.release-build/web-release-receipt.json";
   const calls = [];
   const result = await deployWebRelease({
@@ -257,7 +258,7 @@ test("web-only deployment delegates the receipt-pinned SHA to the production gua
       assert.deepEqual(value, { repositoryRoot, receiptPath });
       return {
         receipt: { sourceCommit },
-        scope: { sourceCommit },
+        scope: { sourceCommit, baseCommit },
       };
     },
     runProduction: async (value) => {
@@ -271,6 +272,7 @@ test("web-only deployment delegates the receipt-pinned SHA to the production gua
     confirmation: "DEPLOY_PRODUCTION",
     confirmedMigrations: null,
     expectedSourceCommit: sourceCommit,
+    expectedPreviousSourceCommit: baseCommit,
     workerDirectory: "/tmp/web-release-candidate/apps/worker",
     wrangler: "/tmp/web-release-candidate/apps/worker/node_modules/.bin/wrangler",
   }]);

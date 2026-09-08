@@ -15,6 +15,9 @@ import {
 
 test("lane manifests include every executable macOS test target", () => {
   assert.deepEqual(MACOS_SOURCE_TEST_FILES, [
+    "test/release-agent.test.js",
+    "test/release-operation.test.js",
+    "test/macos-release-journal.test.js",
     "test/i18n-foundation.test.js",
     "test/macos-localization.test.js",
     "test/macos-app-bundle.test.js",
@@ -23,6 +26,8 @@ test("lane manifests include every executable macOS test target", () => {
     "test/macos-keychain-migration-ui.test.js",
   ]);
   assert.deepEqual(MACOS_ARTIFACT_TEST_FILES, [
+    "test/release-operation.test.js",
+    "test/macos-release-journal.test.js",
     "test/macos-app-bundle.test.js",
     "test/macos-keychain-migration-artifact.test.js",
     "test/macos-keychain-migration-runner.test.js",

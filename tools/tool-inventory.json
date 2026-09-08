@@ -4,6 +4,45 @@
   "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
   "records": [
     {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/release-agent.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit node entrypoint for read-only agent release doctor and private operation status.",
+      "additionalAliases": [],
+      "callers": ["test/release-agent.test.js", "docs/runbooks/agent-release-operations.md"],
+      "decision": "retain_as_read_only_release_entrypoint",
+      "provenance": "docs/runbooks/agent-release-operations.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/macos-release-journal.js",
+      "stableAlias": null,
+      "stableAliasReason": "Private phase coordinator called only through native finalization and synthetic tests.",
+      "additionalAliases": [],
+      "callers": ["scripts/macos-release-core.js", "test/macos-release-journal.test.js"],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/agent-release-operations.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/release-operation.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private operation durability and local mutex support; not a standalone command.",
+      "additionalAliases": [],
+      "callers": ["scripts/macos-release-journal.js", "scripts/release-agent.mjs", "apps/worker/scripts/production-deploy.mjs", "test/release-operation.test.js"],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/agent-release-operations.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
       "classification": "reusable_benchmark",
       "owner": "local_analysis",
       "canonicalPath": "scripts/benchmark-detailed-accounting.mjs",

@@ -407,7 +407,8 @@ Only after explicit authorization and green preflight, use the wrapper from
 `apps/worker`:
 
 ```bash
-npm run production:deploy -- --confirm DEPLOY_PRODUCTION
+npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
+  --expected-previous-source <reviewed-full-deployed-source-sha>
 ```
 
 If and only if the wrapper reports a reviewed pending set and the separate
@@ -415,6 +416,7 @@ migration operation has been handled, append its exact comma-separated tokens:
 
 ```bash
 npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
+  --expected-previous-source <reviewed-full-deployed-source-sha> \
   --confirm-migrations BINDING:0000_name.sql
 ```
 
@@ -422,6 +424,34 @@ Capture the structured result. Success means the wrapper observed its named
 pre/post conditions; it is not a release, appcast publication, identity-flow,
 participant-deletion, or admin-UI end-to-end receipt. Compare the health
 `deployment.sourceCommit` with the intended commit and probe the affected route.
+
+The wrapper now makes the exact source comparison itself and requires the
+reviewed predecessor to be an ancestor of the candidate. Both direct and
+web-only deployment participate in a shared, non-expiring Git coordination ref.
+The Git remote must allow that exact coordination branch to be created/deleted;
+the wrapper does not change repository rules. A lock retained after an uncertain
+provider response is a stop, not permission to retry raw Wrangler.
+
+Private operation records default to
+`.release-build/production-operations/<candidate-sha>` in the repository.
+Inspect them using `node scripts/release-agent.mjs status --operation <directory>`
+from the repository root. Only after establishing that the old executor cannot
+still run, use the explicit reconciliation path:
+
+```bash
+npm run production:deploy -- --confirm RECONCILE_PRODUCTION_DEPLOYMENT \
+  --operation <private-operation-directory> --executor-stopped
+```
+
+Reconciliation does not deploy. It verifies the intended source and public
+surface, then releases only the exact recorded owner. If verification is
+unavailable or the old executor might still run, retain the lock and investigate.
+A proven pre-mutation failure with no retained lock can be retried using a new
+`--operation <fresh-private-directory>`, preserving the old evidence. Cleanup
+warnings do not erase a verified deployment outcome. These are cooperative
+guards: raw Wrangler, old checkouts and privileged manual provider actions are
+not fenced and must not be used concurrently. See
+[agent release operations](agent-release-operations.md) for recovery boundaries.
 
 ## Private owner participant erasure
 

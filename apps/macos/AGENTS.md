@@ -72,6 +72,9 @@ Apply the repository root guidance first.
   from accessing private signing material or publishing an update.
 - The release command's `--prepare-candidate` flag continues into signing and
   notarization; it is not a compile-only or dry-run boundary.
+- Start release discovery with `node scripts/release-agent.mjs doctor --json`.
+  Resume an exact journaled finalization with `--resume`; never alter receipts,
+  repeat an uncertain upload, or treat stored completion as fresh native proof.
 - Never run preview installation/reinstallation, signing, notarization, appcast
   publication, system replacement, or stable release commands without explicit
   authorization for that operation and exact target.

@@ -109,11 +109,27 @@ Intel artifact from the same canonical `release-manifest.json`, also supply:
 
 The generator validates Intel source, bytes, trust, architecture and minimum
 macOS independently, including the published download. Omit these flags to
-retain the unavailable Intel tab. The separate Homebrew tap currently selects
-ARM only; do not show a Homebrew command on the Intel tab until that tap has
-an architecture-aware cask and updater workflow, with its own validation.
+retain the unavailable Intel tab. The first-party Homebrew cask selects ARM or
+Intel automatically. Its updater verifies both installers and compares the
+complete rendered cask, including same-version repairs. Verify that independent
+publication before showing the command on either website tab.
 
 ## 0. Version lockstep and preflight
+
+Start with `node scripts/release-agent.mjs doctor --json`. Supply an exact-source
+plan for target-specific checks; see [agent release operations](agent-release-operations.md).
+The doctor reads only local evidence and configured references. It does not
+access signing keys, test Apple authentication, sign, build or publish. A
+configured credential reference is not verified usability; unexercised/manual
+checks remain outstanding.
+
+The release CLI uses a private journal at `<output>.operation` by default.
+An interrupted authorized finalization resumes with the original arguments plus
+`--resume`, never `--prepare-candidate` or `--replace`. Keep the exact candidate,
+source, tools and inputs unchanged. Use `release-agent.mjs status --operation`
+to inspect progress. Known Apple submissions are waited on again; unknown
+submission outcomes require owner reconciliation, not a new upload. Do not
+delete retained staging or alter receipts to make a resume pass.
 
 A version bump is **not** just package.json. Bump or regenerate all of:
 
@@ -900,9 +916,10 @@ Two more traps on the reading side:
 ### Refresh the first-party Homebrew tap
 
 The public [`adamallcock/homebrew-tap`](https://github.com/adamallcock/homebrew-tap)
-workflow polls the latest non-draft GitHub release hourly, verifies the exact
-arm64 DMG asset, updates the cask version and SHA-256, runs the cask gates, and
-commits only when those values changed. It requires no cross-repository token.
+workflow polls the latest non-draft GitHub release hourly, verifies both exact
+ARM and Intel DMG assets, renders the architecture-selecting cask, runs its
+gates, and commits only when the complete desired cask differs. It requires no
+cross-repository token.
 For an immediate release, trigger the same workflow instead of waiting for the
 next scheduled poll:
 
