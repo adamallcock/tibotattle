@@ -37,6 +37,13 @@ path. A process interruption can leave an incomplete directory tree; a later
 preparation reopens and completes only its still-absent fixed components. This
 is not a credential-operation recovery protocol.
 
+Kernel `mkdirat` applies the process umask. An uncommon umask that masks an
+owner permission bit can leave a newly created component below `0700`; the
+immediate validation fails closed, and a later preparation refuses that unsafe
+partial component unchanged rather than chmod-repairing it. This is an
+availability limitation for such a process configuration. It creates no
+credential, journal, or record before that refusal.
+
 Each inherited generic `0..3` lease pins one journal file descriptor and
 fsyncs its `active` state before returning to JavaScript. A normal, explicitly
 settled release writes and fsyncs `normal` through that same descriptor. A

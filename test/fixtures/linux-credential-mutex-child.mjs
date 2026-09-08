@@ -12,7 +12,38 @@ function fixedFailure() {
 
 try {
   const binding = loadLinuxCredentialMutexBinding();
-  if (mode === "accountless-read" || mode === "accountless-create") {
+  if (mode === "prepare-owner-masked-umask") {
+    // This helper has its own process-wide umask. Mask owner write so the
+    // native mkdirat(0700) leaves a synthetic explicit-XDG base at 0500.
+    // The parent process and its real state are never changed.
+    process.umask(0o200);
+    let firstRejected = false;
+    try {
+      binding.prepareLinuxCredentialState();
+    } catch (error) {
+      firstRejected = error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_UNAVAILABLE";
+    }
+    if (!firstRejected) {
+      fixedFailure();
+    } else {
+      // Use a compatible umask for the retry so its refusal proves that the
+      // existing unsafe partial directory was not silently repaired.
+      process.umask(0o022);
+      let retryRejected = false;
+      try {
+        binding.prepareLinuxCredentialState();
+      } catch (error) {
+        retryRejected = error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_UNAVAILABLE";
+      }
+      if (!retryRejected) {
+        fixedFailure();
+      } else {
+        process.stdout.write(
+          "LINUX_CREDENTIAL_MUTEX_CHILD_OWNER_MASKED_UMASK_REFUSED\n",
+        );
+      }
+    }
+  } else if (mode === "accountless-read" || mode === "accountless-create") {
     try {
       if (mode === "accountless-read") {
         const value = binding.readAccountlessInstallationCredential();

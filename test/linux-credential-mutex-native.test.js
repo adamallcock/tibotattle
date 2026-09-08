@@ -10,6 +10,7 @@ import {
   readFile,
   rename,
   rm,
+  rmdir,
   stat,
   symlink,
   writeFile,
@@ -553,6 +554,59 @@ test("native Linux credential state bootstrap creates only fixed absent paths an
     );
     await assertMissing(join(foreignState, "app-usagemonitor"));
   }
+});
+
+test("native Linux credential state bootstrap fails closed for an owner-bit-masking child umask", {
+  skip: !NATIVE_TEST_ENABLED,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-linux-credential-umask-"));
+  const stateBase = join(root, "state");
+  const application = join(stateBase, "app-usagemonitor");
+  const mutexJournal = join(
+    application,
+    "linux-credential-mutex-v1",
+    "journal-0-v1",
+  );
+  const accountlessRecord = join(
+    application,
+    "linux-accountless-installation-credential-v1",
+    "accountless-installation-credential-v1",
+  );
+  t.after(async () => {
+    // The partial directory is intentionally never chmod-repaired. It is
+    // empty, so removing it only needs access to the owned parent directory.
+    try {
+      await rmdir(stateBase);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const child = runChild("prepare-owner-masked-umask", 0, {
+    ...process.env,
+    XDG_STATE_HOME: stateBase,
+  });
+  assert.equal(child.error, undefined);
+  assert.equal(child.signal, null);
+  assert.equal(child.status, 0);
+  assert.equal(
+    child.stdout,
+    "LINUX_CREDENTIAL_MUTEX_CHILD_OWNER_MASKED_UMASK_REFUSED\n",
+  );
+  assert.equal(child.stderr, "");
+
+  // The child retries under a compatible umask. The synthetic base remains
+  // unsafe and unchanged, and no credential operation or durable journal can
+  // have started before this state-root refusal.
+  const metadata = await stat(stateBase);
+  assert.equal(metadata.isDirectory(), true);
+  assert.equal(metadata.mode & 0o777, 0o500);
+  await Promise.all([
+    assertMissing(application),
+    assertMissing(mutexJournal),
+    assertMissing(accountlessRecord),
+  ]);
 });
 
 test("native Linux credential state bootstrap creates the absent passwd-home default only in the isolated lane", {

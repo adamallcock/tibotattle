@@ -42,6 +42,7 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /mkdirat\(parent_fd, child, 0700\)/u);
   assert.doesNotMatch(source, /getenv\("HOME"\)/u);
   assert.doesNotMatch(source, /mkdir\(/u);
+  assert.doesNotMatch(source, /\bumask\(/u);
   assert.match(source, /app-usagemonitor/u);
   assert.match(source, /linux-credential-mutex-v1/u);
   assert.match(source, /AF_UNIX/u);
@@ -95,6 +96,8 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.doesNotMatch(source, /safeStorage/u);
   assert.doesNotMatch(source, /productionSafe", true/u);
   assert.match(readme, /persistent XDG state\s+tree/u);
+  assert.match(readme, /umask that masks an\s+owner permission bit/u);
+  assert.match(readme, /rather than chmod-repairing it/u);
   assert.match(readme, /same Linux network namespace/u);
   assert.match(readme, /recovery_required/u);
   assert.match(readme, /not a\s+selected credential\s+backend/u);
