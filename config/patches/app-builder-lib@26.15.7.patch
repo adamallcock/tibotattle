@@ -25,10 +25,25 @@ index 988ab7f..c6a451d 100644
              return [...res, `-${field}`, `'${escapedValue}'`];
          }, [])
 diff --git a/out/options/winOptions.d.ts b/out/options/winOptions.d.ts
-index d891297..e4c9b73 100644
+index d891297..b32d458 100644
 --- a/out/options/winOptions.d.ts
 +++ b/out/options/winOptions.d.ts
-@@ -160,5 +160,5 @@ export interface WindowsAzureSigningConfiguration {
+@@ -68,6 +68,14 @@ export interface WindowsConfiguration extends PlatformSpecificBuildOptions {
+      * @default null
+      */
+     readonly signExts?: string[] | null;
++    /**
++     * @private Internal evidence root for a reviewed Windows signing operation ledger.
++     */
++    readonly windowsSigningOperationEvidenceRoot?: string | null;
++    /**
++     * @private Internal fixed ledger filename for Windows signing operations.
++     */
++    readonly windowsSigningOperationLedgerLeaf?: string | null;
+ }
+ export type RequestedExecutionLevel = "asInvoker" | "highestAvailable" | "requireAdministrator";
+ export interface WindowsSigntoolConfiguration {
+@@ -160,5 +168,5 @@ export interface WindowsAzureSigningConfiguration {
       * Allow other CLI parameters (verbatim case-sensitive) to `Invoke-TrustedSigning`
       * Note: Key-Value pairs with `undefined`/`null` value are filtered out of the command.
       */
@@ -36,15 +51,18 @@ index d891297..e4c9b73 100644
 +    [k: string]: string | boolean | Nullish;
  }
 diff --git a/out/platformPackager.js b/out/platformPackager.js
-index 8d50874..be3fb62 100644
+index 8d50874..fa4e401 100644
 --- a/out/platformPackager.js
 +++ b/out/platformPackager.js
-@@ -105,8 +105,21 @@ class PlatformPackager {
+@@ -105,8 +105,24 @@ class PlatformPackager {
          this.packageInDistributableFormat(appOutDir, arch, targets, taskManager);
      }
      packageInDistributableFormat(appOutDir, arch, targets, taskManager) {
 +        const finalizeSigningOperationLedger = async () => {
 +            if (this.info.cancellationToken.cancelled) {
++                return;
++            }
++            if (this.platform.buildConfigurationKey !== "win") {
 +                return;
 +            }
 +            if (typeof this.writeWindowsSigningOperationLedger === "function") {
@@ -62,7 +80,7 @@ index 8d50874..be3fb62 100644
              return;
          }
          taskManager.add(async () => {
-@@ -119,6 +132,7 @@ class PlatformPackager {
+@@ -119,6 +135,7 @@ class PlatformPackager {
                      await target.build(appOutDir, arch);
                  }
              }
@@ -70,7 +88,7 @@ index 8d50874..be3fb62 100644
          });
      }
      static buildAsyncTargets(targets, taskManager, appOutDir, arch) {
-@@ -711,4 +725,4 @@ function chooseNotNull(v1, v2) {
+@@ -711,4 +728,4 @@ function chooseNotNull(v1, v2) {
  function capitalizeFirstLetter(text) {
      return text.charAt(0).toUpperCase() + text.slice(1);
  }
@@ -137,7 +155,7 @@ index 12f078a..e3e5483 100644
    fi
  }
 diff --git a/out/winPackager.js b/out/winPackager.js
-index 2e68fb5..cc95076 100644
+index 2e68fb5..f6ef00b 100644
 --- a/out/winPackager.js
 +++ b/out/winPackager.js
 @@ -1,6 +1,6 @@
@@ -310,31 +328,32 @@ index 2e68fb5..cc95076 100644
      }
      get defaultTarget() {
          return ["nsis"];
-@@ -121,6 +269,13 @@ class WinPackager extends platformPackager_1.PlatformPackager {
+@@ -121,6 +269,14 @@ class WinPackager extends platformPackager_1.PlatformPackager {
          return promise;
      }
      async _sign(file) {
 +        const operationClass = classifyWindowsSigningOperation(file);
-+        if (operationClass === "node") {
++        const recordsSigningOperation = this.windowsSigningOperationEvidenceRoot != null;
++        if (recordsSigningOperation && operationClass === "node") {
 +            throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger rejected a native .node signing attempt");
 +        }
-+        if (operationClass !== "exe" && operationClass !== "dll") {
++        if (recordsSigningOperation && operationClass !== "exe" && operationClass !== "dll") {
 +            throw new builder_util_1.InvalidConfigurationError("Windows signing operation ledger rejected an unexpected signing class");
 +        }
          const signOptions = {
              path: file,
              options: this.platformSpecificBuildOptions,
-@@ -129,6 +284,9 @@ class WinPackager extends platformPackager_1.PlatformPackager {
+@@ -129,6 +285,9 @@ class WinPackager extends platformPackager_1.PlatformPackager {
          if (!didSignSuccessfully && this.forceCodeSigning) {
              throw new builder_util_1.InvalidConfigurationError(`App is not signed and "forceCodeSigning" is set to true, please ensure that code signing configuration is correct, please see https://electron.build/code-signing`);
          }
-+        if (didSignSuccessfully) {
++        if (recordsSigningOperation && didSignSuccessfully) {
 +            this.windowsSigningOperationCounts[operationClass] += 1;
 +        }
          return didSignSuccessfully;
      }
      async signAndEditResources(file, arch, outDir, internalName, requestedExecutionLevel) {
-@@ -266,6 +424,35 @@ class WinPackager extends platformPackager_1.PlatformPackager {
+@@ -266,6 +425,35 @@ class WinPackager extends platformPackager_1.PlatformPackager {
      walkSignableFiles(baseDir, ...subpath) {
          return (0, builder_util_1.walk)(path.join(baseDir, ...subpath), (file, stat) => stat.isDirectory() || this.shouldSignFile(file));
      }
@@ -372,3 +391,43 @@ index 2e68fb5..cc95076 100644
 -//# sourceMappingURL=winPackager.js.map
 \ No newline at end of file
 +//# sourceMappingURL=winPackager.js.map
+diff --git a/scheme.json b/scheme.json
+index bee12b6..244353d 100644
+--- a/scheme.json
++++ b/scheme.json
+@@ -8347,6 +8347,7 @@
+       "additionalProperties": {
+         "type": [
+           "null",
++          "boolean",
+           "string"
+         ]
+       },
+@@ -8793,6 +8794,20 @@
+           "default": true,
+           "description": "Whether to verify the signature of an available update before installation.\nThe [publisher name](#publisherName) will be used for the signature verification.",
+           "type": "boolean"
++        },
++        "windowsSigningOperationEvidenceRoot": {
++          "description": "Internal root for the reviewed Windows signing operation ledger.",
++          "type": [
++            "null",
++            "string"
++          ]
++        },
++        "windowsSigningOperationLedgerLeaf": {
++          "description": "Internal fixed filename for the reviewed Windows signing operation ledger.",
++          "type": [
++            "null",
++            "string"
++          ]
+         }
+       },
+       "type": "object"
+@@ -9890,4 +9905,4 @@
+     }
+   },
+   "type": "object"
+-}
+\ No newline at end of file
++}

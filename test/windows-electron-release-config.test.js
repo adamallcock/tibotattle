@@ -49,8 +49,35 @@ async function loadPatchedWinPackagerRuntime() {
       if (request === "./platformPackager") {
         return { PlatformPackager };
       }
+      if (request === "./codeSign/windowsCodeSign") {
+        return { signWindows: async () => true };
+      }
       return unusedDependency;
     },
+    setTimeout,
+  };
+  runInNewContext(source, context, { filename: sourcePath });
+  return module.exports;
+}
+
+async function loadPatchedPlatformPackagerRuntime() {
+  const sourcePath = appBuilderRequire.resolve("./out/platformPackager");
+  const source = await fsPromises.readFile(sourcePath, "utf8");
+  const unusedDependency = new Proxy(function unusedDependency() {}, {
+    apply: () => undefined,
+    construct: () => ({}),
+    get: () => unusedDependency,
+  });
+  const module = { exports: {} };
+  const context = {
+    Buffer,
+    clearTimeout,
+    exports: module.exports,
+    module,
+    process,
+    require: (request) => (
+      request === "builder-util" ? appBuilderRequire("builder-util") : unusedDependency
+    ),
     setTimeout,
   };
   runInNewContext(source, context, { filename: sourcePath });
@@ -99,6 +126,25 @@ function loadReleaseConfig(environment) {
   });
 }
 
+function validateReleaseConfig(environment) {
+  const source = [
+    'const { createRequire } = require("node:module");',
+    'const electronBuilderRequire = createRequire(require.resolve("electron-builder/package.json"));',
+    'const appBuilderRequire = createRequire(electronBuilderRequire.resolve("app-builder-lib/package.json"));',
+    'const { validateConfiguration } = appBuilderRequire("./out/util/config/config");',
+    `const config = require(${JSON.stringify(RELEASE_CONFIG_PATH)});`,
+    'validateConfiguration(config, { isEnabled: false, add() {} }).then(',
+    '  () => process.stdout.write("WINDOWS_RELEASE_BUILDER_SCHEMA_VALID\\n"),',
+    '  () => { process.exitCode = 1; },',
+    ');',
+  ].join("\n");
+  return spawnSync(process.execPath, ["-e", source], {
+    encoding: "utf8",
+    env: environment,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+}
+
 test("Windows release config requires the patched signing runtime contract", async () => {
   const environment = await releaseConfigEnvironment();
   const result = loadReleaseConfig(environment);
@@ -122,6 +168,9 @@ test("Windows release config requires the patched signing runtime contract", asy
   ]) {
     assert.equal(config.azureSignOptions[name], true, name);
   }
+  const validated = validateReleaseConfig(environment);
+  assert.equal(validated.status, 0, validated.stderr);
+  assert.equal(validated.stdout, "WINDOWS_RELEASE_BUILDER_SCHEMA_VALID\n");
 
   const forbidden = loadReleaseConfig(await releaseConfigEnvironment({
     CSC_IDENTITY_AUTO_DISCOVERY: "false",
@@ -199,10 +248,121 @@ test("patched Windows runtime rejects builder .node signing and emits one conten
       /emitted more than once/u,
     );
     await assert.rejects(
-      () => winPackager.WinPackager.prototype._sign.call({}, join(evidenceRoot, "native.node")),
+      () => winPackager.WinPackager.prototype._sign.call({
+        windowsSigningOperationEvidenceRoot: evidenceRoot,
+      }, join(evidenceRoot, "native.node")),
       /rejected a native \.node signing attempt/u,
     );
+    const untrackedCounts = { exe: 0, dll: 0, node: 0, unexpected: 0 };
+    assert.equal(
+      await winPackager.WinPackager.prototype._sign.call({
+        forceCodeSigning: false,
+        platformSpecificBuildOptions: {},
+        windowsSigningOperationCounts: untrackedCounts,
+        windowsSigningOperationEvidenceRoot: null,
+      }, join(evidenceRoot, "native.node")),
+      true,
+    );
+    assert.deepEqual(untrackedCounts, { exe: 0, dll: 0, node: 0, unexpected: 0 });
   } finally {
     await fsPromises.rm(evidenceRoot, { recursive: true, force: true });
   }
+});
+
+test("patched platform finalizer waits for Windows targets and remains inert elsewhere", async () => {
+  const { PlatformPackager } = await loadPatchedPlatformPackagerRuntime();
+  const { AsyncTaskManager } = appBuilderRequire("builder-util");
+  const events = [];
+  let resolveTarget;
+  const targetComplete = new Promise((resolveTargetComplete) => {
+    resolveTarget = resolveTargetComplete;
+  });
+  const cancellationToken = { cancelled: false };
+  const taskManager = new AsyncTaskManager(cancellationToken);
+  const receiver = {
+    info: { cancellationToken },
+    platform: { buildConfigurationKey: "win" },
+    writeWindowsSigningOperationLedger: async () => { events.push("ledger"); },
+  };
+  PlatformPackager.prototype.packageInDistributableFormat.call(receiver, "out", "x64", [{
+    isAsyncSupported: true,
+    build: async () => {
+      events.push("target-start");
+      await targetComplete;
+      events.push("target-complete");
+    },
+  }], taskManager);
+  assert.deepEqual(events, ["target-start"]);
+  resolveTarget();
+  await taskManager.awaitTasks();
+  assert.deepEqual(events, ["target-start", "target-complete", "ledger"]);
+
+  const synchronousEvents = [];
+  let resolveSynchronousTarget;
+  const synchronousTargetComplete = new Promise((resolveTargetComplete) => {
+    resolveSynchronousTarget = resolveTargetComplete;
+  });
+  const synchronousToken = { cancelled: false };
+  const synchronousTasks = new AsyncTaskManager(synchronousToken);
+  PlatformPackager.prototype.packageInDistributableFormat.call({
+    info: { cancellationToken: synchronousToken },
+    platform: { buildConfigurationKey: "win" },
+    writeWindowsSigningOperationLedger: async () => { synchronousEvents.push("ledger"); },
+  }, "out", "x64", [{
+    isAsyncSupported: false,
+    build: async () => {
+      synchronousEvents.push("target-start");
+      await synchronousTargetComplete;
+      synchronousEvents.push("target-complete");
+    },
+  }], synchronousTasks);
+  await new Promise((resolveTurn) => { setImmediate(resolveTurn); });
+  assert.deepEqual(synchronousEvents, ["target-start"]);
+  resolveSynchronousTarget();
+  await synchronousTasks.awaitTasks();
+  assert.deepEqual(synchronousEvents, ["target-start", "target-complete", "ledger"]);
+
+  const cancelledEvents = [];
+  let resolveCancelledTarget;
+  const cancelledTargetComplete = new Promise((resolveCancelledTargetComplete) => {
+    resolveCancelledTarget = resolveCancelledTargetComplete;
+  });
+  let observeCancelledTargetComplete;
+  const cancelledTargetFinished = new Promise((resolveTargetComplete) => {
+    observeCancelledTargetComplete = resolveTargetComplete;
+  });
+  const cancelledToken = { cancelled: false };
+  const cancelledTasks = new AsyncTaskManager(cancelledToken);
+  PlatformPackager.prototype.packageInDistributableFormat.call({
+    info: { cancellationToken: cancelledToken },
+    platform: { buildConfigurationKey: "win" },
+    writeWindowsSigningOperationLedger: async () => { cancelledEvents.push("ledger"); },
+  }, "out", "x64", [{
+    isAsyncSupported: true,
+    build: async () => {
+      cancelledEvents.push("target-start");
+      await cancelledTargetComplete;
+      cancelledEvents.push("target-complete");
+      observeCancelledTargetComplete();
+    },
+  }], cancelledTasks);
+  cancelledToken.cancelled = true;
+  resolveCancelledTarget();
+  await cancelledTargetFinished;
+  await new Promise((resolveTurn) => { setImmediate(resolveTurn); });
+  assert.deepEqual(cancelledEvents, ["target-start", "target-complete"]);
+
+  const nonWindowsEvents = [];
+  const nonWindowsToken = { cancelled: false };
+  const nonWindowsTasks = new AsyncTaskManager(nonWindowsToken);
+  PlatformPackager.prototype.packageInDistributableFormat.call({
+    info: { cancellationToken: nonWindowsToken },
+    platform: { buildConfigurationKey: "linux" },
+    writeWindowsSigningOperationLedger: async () => { nonWindowsEvents.push("ledger"); },
+  }, "out", "x64", [{
+    isAsyncSupported: true,
+    build: async () => { nonWindowsEvents.push("target"); },
+  }], nonWindowsTasks);
+  await nonWindowsTasks.awaitTasks();
+  assert.deepEqual(nonWindowsEvents, ["target"]);
 });
