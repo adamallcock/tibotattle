@@ -16,6 +16,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <libsecret/secret.h>
+
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -38,6 +40,9 @@ constexpr int kLastCapabilityId = 3;
 // capability handle. Slot four is consumed only by the fixed methods below;
 // `acquireCredentialMutex` remains limited to the inherited 0..3 FD4 set.
 constexpr int kAccountlessInstallationCredentialSlot = 4;
+// The observation root has a distinct fixed slot and a native-private API.
+// It never expands the inherited generic 0..3 FD4 capability surface.
+constexpr int kAccountObservationCredentialSlot = 5;
 constexpr char kApplicationDirectory[] = "app-usagemonitor";
 constexpr char kMutexDirectory[] = "linux-credential-mutex-v1";
 constexpr char kAccountlessCredentialDirectory[] =
@@ -53,6 +58,13 @@ constexpr char kAccountlessCreateTemporaryFile[] =
     ".accountless-create-4-v2";
 constexpr char kAccountlessDeleteTemporaryFile[] =
     ".accountless-delete-4-v2";
+constexpr char kAccountObservationOperationJournalFile[] =
+    "account-observation-operation-5-v1";
+constexpr char kAccountObservationService[] =
+    "app-usagemonitor.account-observation.v1";
+constexpr char kAccountObservationAccount[] = "installation";
+constexpr char kAccountObservationLabel[] =
+    "app-usagemonitor.account-observation.v1/installation";
 constexpr char kSocketNamespace[] = "app-usagemonitor/linux-credential-mutex-v1";
 constexpr char kJournalActiveText[] = "linux-credential-mutex-journal-v1:active\n";
 constexpr char kJournalNormalText[] = "linux-credential-mutex-journal-v1:normal\n";
@@ -66,12 +78,35 @@ constexpr std::size_t kAccountlessOperationJournalOperationOffset = 17;
 constexpr std::size_t kAccountlessOperationJournalReservedStart = 18;
 constexpr std::size_t kAccountlessOperationJournalValueOffset = 32;
 constexpr unsigned char kAccountlessOperationJournalVersion = 2;
+constexpr std::size_t kAccountObservationCredentialBytes = 32;
+constexpr std::size_t kAccountObservationOperationJournalBytes = 64;
+constexpr std::size_t kAccountObservationOperationJournalMagicBytes = 16;
+constexpr std::size_t kAccountObservationOperationJournalVersionOffset = 16;
+constexpr std::size_t kAccountObservationOperationJournalOperationOffset = 17;
+constexpr std::size_t kAccountObservationOperationJournalReservedStart = 18;
+constexpr std::size_t kAccountObservationOperationJournalDigestOffset = 32;
+constexpr unsigned char kAccountObservationOperationJournalVersion = 1;
+constexpr unsigned char kAccountObservationOperationCreate = 1;
 // Exact binary bytes: the printable namespace is deliberately terminated and
 // padded instead of relying on a C string's implicit trailing byte.
 constexpr std::array<unsigned char, kAccountlessOperationJournalMagicBytes>
     kAccountlessOperationJournalMagic {{
         'T', 'I', 'B', 'O', 'T', 'A', 'T', 'T',
         'L', 'E', '-', 'F', 'D', '3', '\0', '\0',
+    }};
+// Exact binary bytes: the printable FD4 namespace is terminated and padded
+// explicitly. The intent retains only SHA-256(candidate), never the account
+// observation root itself.
+constexpr std::array<unsigned char, kAccountObservationOperationJournalMagicBytes>
+    kAccountObservationOperationJournalMagic {{
+        'T', 'I', 'B', 'O', 'T', 'A', 'T', 'T',
+        'L', 'E', '-', 'F', 'D', '4', '\0', '\0',
+    }};
+
+const SecretSchema kAccountObservationSecretSchema = {
+    "org.freedesktop.Secret.Generic", SECRET_SCHEMA_NONE, {
+        { "service", SECRET_SCHEMA_ATTRIBUTE_STRING },
+        { "account", SECRET_SCHEMA_ATTRIBUTE_STRING },
     }};
 
 static_assert(
@@ -95,6 +130,12 @@ constexpr char kCodeAccountlessRecoveryRequired[] =
     "LINUX_ACCOUNTLESS_CREDENTIAL_RECOVERY_REQUIRED";
 constexpr char kCodeAccountlessInvalidValue[] =
     "LINUX_ACCOUNTLESS_CREDENTIAL_INVALID_VALUE";
+constexpr char kCodeAccountObservationUnavailable[] =
+    "LINUX_ACCOUNT_OBSERVATION_CREDENTIAL_UNAVAILABLE";
+constexpr char kCodeAccountObservationRecoveryRequired[] =
+    "LINUX_ACCOUNT_OBSERVATION_CREDENTIAL_RECOVERY_REQUIRED";
+constexpr char kCodeAccountObservationInvalidValue[] =
+    "LINUX_ACCOUNT_OBSERVATION_CREDENTIAL_INVALID_VALUE";
 
 struct FileIdentity {
   dev_t device = 0;
@@ -191,7 +232,9 @@ bool IsCapabilityId(int value) {
 }
 
 bool IsInternalCredentialSlot(int value) {
-  return IsCapabilityId(value) || value == kAccountlessInstallationCredentialSlot;
+  return IsCapabilityId(value)
+      || value == kAccountlessInstallationCredentialSlot
+      || value == kAccountObservationCredentialSlot;
 }
 
 bool IsNormalizedAbsolutePath(const char* path) {
@@ -1966,6 +2009,763 @@ bool FinishLease(NativeLease* lease, bool preserve_active) {
   return journal_settled && journal_closed && state_closed && socket_closed;
 }
 
+// FD4 has no generic Linux mutation surface. These helpers implement the one
+// fixed account-observation root as a native-private no-replace operation.
+// The journal carries a digest only: unlike FD3's owner-private filesystem
+// record, persisting an FD4 candidate outside Secret Service would weaken the
+// credential's intended protection boundary.
+enum class AccountObservationRecordState {
+  kAbsent,
+  kPresent,
+  kInvalid,
+  kUnavailable,
+};
+
+struct AccountObservationRecord {
+  std::array<unsigned char, kAccountObservationCredentialBytes> bytes {};
+};
+
+struct AccountObservationOperationJournal {
+  std::array<unsigned char, kAccountObservationCredentialBytes> digest {};
+};
+
+enum class AccountObservationOperationJournalOpenOutcome {
+  kMissing,
+  kOpened,
+  kInvalid,
+};
+
+enum class AccountObservationOperationJournalRemoveOutcome {
+  kRemoved,
+  // unlinkat may have committed before the directory fsync fails. The caller
+  // must retain the legacy active refusal and never recreate a digest intent.
+  kUncertain,
+  kInvalid,
+};
+
+void ClearAccountObservationRecord(AccountObservationRecord* record) {
+  if (record == nullptr) return;
+  record->bytes.fill(0);
+}
+
+void ClearAccountObservationOperationJournal(
+    AccountObservationOperationJournal* journal) {
+  if (journal == nullptr) return;
+  journal->digest.fill(0);
+}
+
+bool EqualAccountObservationCredential(
+    const std::array<unsigned char, kAccountObservationCredentialBytes>& first,
+    const std::array<unsigned char, kAccountObservationCredentialBytes>& second) {
+  unsigned char difference = 0;
+  for (std::size_t index = 0; index < first.size(); ++index) {
+    difference |= static_cast<unsigned char>(first[index] ^ second[index]);
+  }
+  return difference == 0;
+}
+
+bool DigestAccountObservationCredential(
+    const std::array<unsigned char, kAccountObservationCredentialBytes>& value,
+    std::array<unsigned char, kAccountObservationCredentialBytes>* digest) {
+  if (digest == nullptr) return false;
+  digest->fill(0);
+  GChecksum* checksum = g_checksum_new(G_CHECKSUM_SHA256);
+  if (checksum == nullptr) return false;
+  g_checksum_update(checksum, value.data(), value.size());
+  gsize length = digest->size();
+  g_checksum_get_digest(checksum, digest->data(), &length);
+  g_checksum_free(checksum);
+  if (length != digest->size()) {
+    digest->fill(0);
+    return false;
+  }
+  return true;
+}
+
+int Base64UrlValue(char value) {
+  if (value >= 'A' && value <= 'Z') return value - 'A';
+  if (value >= 'a' && value <= 'z') return value - 'a' + 26;
+  if (value >= '0' && value <= '9') return value - '0' + 52;
+  if (value == '-') return 62;
+  if (value == '_') return 63;
+  return -1;
+}
+
+std::array<char, 44> EncodeAccountObservationCredential(
+    const std::array<unsigned char, kAccountObservationCredentialBytes>& value) {
+  constexpr char kBase64Url[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  std::array<char, 44> output {};
+  std::size_t input = 0;
+  std::size_t written = 0;
+  while (input + 3 <= value.size()) {
+    const unsigned int combined = (static_cast<unsigned int>(value[input]) << 16)
+        | (static_cast<unsigned int>(value[input + 1]) << 8)
+        | static_cast<unsigned int>(value[input + 2]);
+    output[written++] = kBase64Url[(combined >> 18) & 0x3f];
+    output[written++] = kBase64Url[(combined >> 12) & 0x3f];
+    output[written++] = kBase64Url[(combined >> 6) & 0x3f];
+    output[written++] = kBase64Url[combined & 0x3f];
+    input += 3;
+  }
+  if (input + 2 == value.size()) {
+    const unsigned int combined = (static_cast<unsigned int>(value[input]) << 16)
+        | (static_cast<unsigned int>(value[input + 1]) << 8);
+    output[written++] = kBase64Url[(combined >> 18) & 0x3f];
+    output[written++] = kBase64Url[(combined >> 12) & 0x3f];
+    output[written++] = kBase64Url[(combined >> 6) & 0x3f];
+  }
+  if (written != output.size() - 1) output.fill(0);
+  return output;
+}
+
+bool DecodeAccountObservationCredential(
+    const char* text,
+    std::array<unsigned char, kAccountObservationCredentialBytes>* value) {
+  if (text == nullptr || value == nullptr) return false;
+  value->fill(0);
+  constexpr std::size_t kEncodedBytes = 43;
+  if (strnlen(text, kEncodedBytes + 1) != kEncodedBytes) return false;
+  std::uint32_t accumulator = 0;
+  int bits = 0;
+  std::size_t output = 0;
+  for (std::size_t index = 0; index < kEncodedBytes; ++index) {
+    const int decoded = Base64UrlValue(text[index]);
+    if (decoded < 0) {
+      value->fill(0);
+      return false;
+    }
+    accumulator = (accumulator << 6) | static_cast<std::uint32_t>(decoded);
+    bits += 6;
+    while (bits >= 8) {
+      bits -= 8;
+      if (output >= value->size()) {
+        value->fill(0);
+        return false;
+      }
+      (*value)[output++] = static_cast<unsigned char>((accumulator >> bits) & 0xff);
+    }
+  }
+  if (output != value->size() || bits != 2 || (accumulator & 0x3u) != 0) {
+    value->fill(0);
+    return false;
+  }
+  std::array<char, 44> canonical = EncodeAccountObservationCredential(*value);
+  const bool valid = std::memcmp(text, canonical.data(), kEncodedBytes) == 0;
+  canonical.fill(0);
+  if (!valid) value->fill(0);
+  return valid;
+}
+
+void FreeAccountObservationItems(GList* items) {
+  for (GList* current = items; current != nullptr; current = current->next) {
+    if (current->data != nullptr) g_object_unref(current->data);
+  }
+  g_list_free(items);
+}
+
+AccountObservationRecordState ReadAccountObservationCredential(
+    AccountObservationRecord* result) {
+  if (result == nullptr) return AccountObservationRecordState::kUnavailable;
+  ClearAccountObservationRecord(result);
+  GHashTable* attributes = g_hash_table_new(g_str_hash, g_str_equal);
+  if (attributes == nullptr) return AccountObservationRecordState::kUnavailable;
+  g_hash_table_insert(
+      attributes,
+      const_cast<char*>("service"),
+      const_cast<char*>(kAccountObservationService));
+  g_hash_table_insert(
+      attributes,
+      const_cast<char*>("account"),
+      const_cast<char*>(kAccountObservationAccount));
+  GError* error = nullptr;
+  GList* items = secret_service_search_sync(
+      nullptr,
+      &kAccountObservationSecretSchema,
+      attributes,
+      static_cast<SecretSearchFlags>(
+          SECRET_SEARCH_ALL | SECRET_SEARCH_LOAD_SECRETS),
+      nullptr,
+      &error);
+  g_hash_table_destroy(attributes);
+  if (error != nullptr) {
+    g_error_free(error);
+    FreeAccountObservationItems(items);
+    return AccountObservationRecordState::kUnavailable;
+  }
+  if (items == nullptr) return AccountObservationRecordState::kAbsent;
+  if (items->next != nullptr || items->data == nullptr) {
+    FreeAccountObservationItems(items);
+    return AccountObservationRecordState::kInvalid;
+  }
+  auto* item = static_cast<SecretItem*>(items->data);
+  if (secret_item_get_locked(item)) {
+    FreeAccountObservationItems(items);
+    return AccountObservationRecordState::kUnavailable;
+  }
+  SecretValue* secret = secret_item_get_secret(item);
+  const char* text = secret == nullptr ? nullptr : secret_value_get_text(secret);
+  const bool decoded = DecodeAccountObservationCredential(text, &result->bytes);
+  if (secret != nullptr) secret_value_unref(secret);
+  FreeAccountObservationItems(items);
+  return decoded
+      ? AccountObservationRecordState::kPresent
+      : AccountObservationRecordState::kInvalid;
+}
+
+SecretCollection* OpenAccountObservationDefaultCollection() {
+  GError* error = nullptr;
+  SecretCollection* collection = secret_collection_for_alias_sync(
+      nullptr,
+      SECRET_COLLECTION_DEFAULT,
+      SECRET_COLLECTION_NONE,
+      nullptr,
+      &error);
+  if (error != nullptr) {
+    g_error_free(error);
+    if (collection != nullptr) g_object_unref(collection);
+    return nullptr;
+  }
+  return collection;
+}
+
+bool CreateAccountObservationCredentialNoReplace(
+    SecretCollection* collection,
+    const std::array<unsigned char, kAccountObservationCredentialBytes>& value) {
+  if (collection == nullptr) return false;
+  std::array<char, 44> encoded = EncodeAccountObservationCredential(value);
+  if (encoded[0] == '\0') return false;
+  GHashTable* attributes = g_hash_table_new(g_str_hash, g_str_equal);
+  if (attributes == nullptr) {
+    encoded.fill(0);
+    return false;
+  }
+  g_hash_table_insert(
+      attributes,
+      const_cast<char*>("service"),
+      const_cast<char*>(kAccountObservationService));
+  g_hash_table_insert(
+      attributes,
+      const_cast<char*>("account"),
+      const_cast<char*>(kAccountObservationAccount));
+  SecretValue* secret = secret_value_new(
+      encoded.data(),
+      static_cast<gssize>(encoded.size() - 1),
+      "text/plain");
+  if (secret == nullptr) {
+    g_hash_table_destroy(attributes);
+    encoded.fill(0);
+    return false;
+  }
+  GError* error = nullptr;
+  // Deliberately use the no-replace creation mode. If another writer adds an
+  // item concurrently, postcondition lookup sees a duplicate and refuses;
+  // this fixed route never updates or deletes a credential item.
+  SecretItem* item = secret_item_create_sync(
+      collection,
+      &kAccountObservationSecretSchema,
+      attributes,
+      kAccountObservationLabel,
+      secret,
+      SECRET_ITEM_CREATE_NONE,
+      nullptr,
+      &error);
+  const bool created = item != nullptr && error == nullptr;
+  if (error != nullptr) g_error_free(error);
+  if (item != nullptr) g_object_unref(item);
+  secret_value_unref(secret);
+  g_hash_table_destroy(attributes);
+  encoded.fill(0);
+  return created;
+}
+
+bool VerifyAccountObservationOperationJournalContinuity(
+    int state_fd,
+    int journal_fd,
+    const FileIdentity& identity) {
+  struct stat opened {};
+  struct stat named {};
+  return VerifyOwnerPrivateDirectory(state_fd)
+      && fstat(journal_fd, &opened) == 0
+      && IsOwnerRegularFile(opened)
+      && MatchesIdentity(opened, identity)
+      && fstatat(
+             state_fd,
+             kAccountObservationOperationJournalFile,
+             &named,
+             AT_SYMLINK_NOFOLLOW) == 0
+      && IsOwnerRegularFile(named)
+      && MatchesIdentity(named, identity);
+}
+
+AccountObservationOperationJournalOpenOutcome OpenAccountObservationOperationJournal(
+    int state_fd,
+    int* journal_fd,
+    FileIdentity* identity) {
+  if (journal_fd == nullptr || identity == nullptr || !VerifyOwnerPrivateDirectory(state_fd)) {
+    return AccountObservationOperationJournalOpenOutcome::kInvalid;
+  }
+  *journal_fd = -1;
+  *identity = FileIdentity {};
+  const int fd = openat(
+      state_fd,
+      kAccountObservationOperationJournalFile,
+      O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
+    return errno == ENOENT
+        ? AccountObservationOperationJournalOpenOutcome::kMissing
+        : AccountObservationOperationJournalOpenOutcome::kInvalid;
+  }
+  if (!CaptureRegularFileIdentity(fd, identity)
+      || !VerifyAccountObservationOperationJournalContinuity(state_fd, fd, *identity)) {
+    close(fd);
+    *identity = FileIdentity {};
+    return AccountObservationOperationJournalOpenOutcome::kInvalid;
+  }
+  *journal_fd = fd;
+  return AccountObservationOperationJournalOpenOutcome::kOpened;
+}
+
+bool ReadAccountObservationOperationJournal(
+    int state_fd,
+    int journal_fd,
+    const FileIdentity& identity,
+    AccountObservationOperationJournal* result) {
+  if (result == nullptr) return false;
+  ClearAccountObservationOperationJournal(result);
+  std::array<unsigned char, kAccountObservationOperationJournalBytes> bytes {};
+  unsigned char trailing = 0;
+  bool valid = false;
+  do {
+    if (!VerifyAccountObservationOperationJournalContinuity(state_fd, journal_fd, identity)
+        || lseek(journal_fd, 0, SEEK_SET) < 0
+        || !ReadAll(
+            journal_fd,
+            reinterpret_cast<char*>(bytes.data()),
+            bytes.size())) {
+      break;
+    }
+    ssize_t trailing_count = 0;
+    do {
+      trailing_count = read(journal_fd, &trailing, 1);
+    } while (trailing_count < 0 && errno == EINTR);
+    if (trailing_count != 0
+        || std::memcmp(
+               bytes.data(),
+               kAccountObservationOperationJournalMagic.data(),
+               kAccountObservationOperationJournalMagic.size()) != 0
+        || bytes[kAccountObservationOperationJournalVersionOffset]
+            != kAccountObservationOperationJournalVersion
+        || bytes[kAccountObservationOperationJournalOperationOffset]
+            != kAccountObservationOperationCreate) {
+      break;
+    }
+    bool reserved_zero = true;
+    for (std::size_t index = kAccountObservationOperationJournalReservedStart;
+         index < kAccountObservationOperationJournalDigestOffset;
+         ++index) {
+      reserved_zero = reserved_zero && bytes[index] == 0;
+    }
+    if (!reserved_zero
+        || !VerifyAccountObservationOperationJournalContinuity(state_fd, journal_fd, identity)) {
+      break;
+    }
+    std::memcpy(
+        result->digest.data(),
+        bytes.data() + kAccountObservationOperationJournalDigestOffset,
+        result->digest.size());
+    valid = true;
+  } while (false);
+  bytes.fill(0);
+  trailing = 0;
+  if (!valid) ClearAccountObservationOperationJournal(result);
+  return valid;
+}
+
+bool CreateAccountObservationOperationJournal(
+    int state_fd,
+    const std::array<unsigned char, kAccountObservationCredentialBytes>& digest,
+    int* journal_fd,
+    FileIdentity* identity) {
+  if (journal_fd == nullptr || identity == nullptr || !VerifyOwnerPrivateDirectory(state_fd)) {
+    return false;
+  }
+  *journal_fd = -1;
+  *identity = FileIdentity {};
+  const int fd = openat(
+      state_fd,
+      kAccountObservationOperationJournalFile,
+      O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+      0600);
+  if (fd < 0) return false;
+  std::array<unsigned char, kAccountObservationOperationJournalBytes> bytes {};
+  std::memcpy(
+      bytes.data(),
+      kAccountObservationOperationJournalMagic.data(),
+      kAccountObservationOperationJournalMagic.size());
+  bytes[kAccountObservationOperationJournalVersionOffset] =
+      kAccountObservationOperationJournalVersion;
+  bytes[kAccountObservationOperationJournalOperationOffset] =
+      kAccountObservationOperationCreate;
+  std::memcpy(
+      bytes.data() + kAccountObservationOperationJournalDigestOffset,
+      digest.data(),
+      digest.size());
+  const bool written = CaptureRegularFileIdentity(fd, identity)
+      && VerifyAccountObservationOperationJournalContinuity(state_fd, fd, *identity)
+      && WriteAll(fd, reinterpret_cast<const char*>(bytes.data()), bytes.size())
+      && fsync(fd) == 0
+      && VerifyAccountObservationOperationJournalContinuity(state_fd, fd, *identity)
+      && fsync(state_fd) == 0
+      && VerifyAccountObservationOperationJournalContinuity(state_fd, fd, *identity);
+  bytes.fill(0);
+  if (!written) {
+    close(fd);
+    *identity = FileIdentity {};
+    return false;
+  }
+  *journal_fd = fd;
+  return true;
+}
+
+AccountObservationOperationJournalRemoveOutcome RemoveAccountObservationOperationJournal(
+    int state_fd,
+    int journal_fd,
+    const FileIdentity& identity) {
+  if (!VerifyAccountObservationOperationJournalContinuity(state_fd, journal_fd, identity)
+      || unlinkat(state_fd, kAccountObservationOperationJournalFile, 0) != 0) {
+    return AccountObservationOperationJournalRemoveOutcome::kInvalid;
+  }
+  return fsync(state_fd) == 0
+      ? AccountObservationOperationJournalRemoveOutcome::kRemoved
+      : AccountObservationOperationJournalRemoveOutcome::kUncertain;
+}
+
+struct AccountObservationLease {
+  int socket_fd = -1;
+  int persistent_state_fd = -1;
+  int journal_fd = -1;
+  FileIdentity journal_identity {};
+  int operation_journal_fd = -1;
+  FileIdentity operation_journal_identity {};
+  bool active_marker_written = false;
+  bool operation_journal_written = false;
+  bool active = true;
+};
+
+enum class AccountObservationLeaseOutcome {
+  kAcquired,
+  kUnavailable,
+  kRecoveryRequired,
+};
+
+enum class AccountObservationOperationRecoveryOutcome {
+  kRecovered,
+  kUnavailable,
+  kAmbiguous,
+  kUncertain,
+};
+
+bool LatchUnissuedAccountObservationRecovery(
+    int state_fd,
+    int journal_fd,
+    const FileIdentity& journal_identity) {
+  return WriteJournalState(
+      state_fd,
+      journal_fd,
+      kAccountObservationCredentialSlot,
+      journal_identity,
+      JournalState::kActive);
+}
+
+bool LatchAccountObservationRecovery(AccountObservationLease* lease) {
+  if (lease == nullptr || !lease->active) return false;
+  if (lease->active_marker_written) {
+    return VerifyJournalContinuity(
+               lease->persistent_state_fd,
+               lease->journal_fd,
+               kAccountObservationCredentialSlot,
+               lease->journal_identity)
+        && ReadJournalState(lease->journal_fd) == JournalState::kActive
+        && VerifyJournalContinuity(
+            lease->persistent_state_fd,
+            lease->journal_fd,
+            kAccountObservationCredentialSlot,
+            lease->journal_identity);
+  }
+  if (!WriteJournalState(
+          lease->persistent_state_fd,
+          lease->journal_fd,
+          kAccountObservationCredentialSlot,
+          lease->journal_identity,
+          JournalState::kActive)) {
+    return false;
+  }
+  lease->active_marker_written = true;
+  return true;
+}
+
+bool FinishAccountObservationLease(
+    AccountObservationLease* lease,
+    bool preserve_active) {
+  if (lease == nullptr) return false;
+  // A retained digest intent must always keep the v1 state active. An intent
+  // that was unlinked before its directory fsync is not a reliable fence, so
+  // callers latch active before reaching this cleanup path.
+  const bool must_preserve = preserve_active || lease->operation_journal_written;
+  const bool operation_journal_retained = !lease->operation_journal_written
+      || (lease->operation_journal_fd >= 0
+          && VerifyAccountObservationOperationJournalContinuity(
+              lease->persistent_state_fd,
+              lease->operation_journal_fd,
+              lease->operation_journal_identity));
+  const bool operation_journal_closed = CloseDescriptor(&lease->operation_journal_fd);
+  bool journal_settled = false;
+  if (must_preserve) {
+    if (!lease->active_marker_written) LatchAccountObservationRecovery(lease);
+    journal_settled = VerifyJournalContinuity(
+            lease->persistent_state_fd,
+            lease->journal_fd,
+            kAccountObservationCredentialSlot,
+            lease->journal_identity)
+        && ReadJournalState(lease->journal_fd) == JournalState::kActive
+        && VerifyJournalContinuity(
+            lease->persistent_state_fd,
+            lease->journal_fd,
+            kAccountObservationCredentialSlot,
+            lease->journal_identity);
+  } else if (!lease->active_marker_written) {
+    journal_settled = VerifyJournalContinuity(
+            lease->persistent_state_fd,
+            lease->journal_fd,
+            kAccountObservationCredentialSlot,
+            lease->journal_identity)
+        && ReadJournalState(lease->journal_fd) == JournalState::kNormal
+        && VerifyJournalContinuity(
+            lease->persistent_state_fd,
+            lease->journal_fd,
+            kAccountObservationCredentialSlot,
+            lease->journal_identity);
+  } else {
+    journal_settled = WriteJournalState(
+        lease->persistent_state_fd,
+        lease->journal_fd,
+        kAccountObservationCredentialSlot,
+        lease->journal_identity,
+        JournalState::kNormal);
+  }
+  const bool journal_closed = CloseDescriptor(&lease->journal_fd);
+  const bool state_closed = CloseDescriptor(&lease->persistent_state_fd);
+  const bool socket_closed = CloseDescriptor(&lease->socket_fd);
+  lease->active = false;
+  delete lease;
+  return operation_journal_retained
+      && operation_journal_closed
+      && journal_settled
+      && journal_closed
+      && state_closed
+      && socket_closed;
+}
+
+AccountObservationLeaseOutcome AcquireAccountObservationLease(
+    AccountObservationLease** result) {
+  if (result == nullptr) return AccountObservationLeaseOutcome::kUnavailable;
+  *result = nullptr;
+  int socket_fd = -1;
+  bool contended = false;
+  if (!AcquireKernelLeaseSocket(
+          kAccountObservationCredentialSlot,
+          &socket_fd,
+          &contended)) {
+    return AccountObservationLeaseOutcome::kUnavailable;
+  }
+  int persistent_state_fd = OpenPersistentStateDirectory();
+  if (persistent_state_fd < 0) {
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, nullptr);
+    return AccountObservationLeaseOutcome::kUnavailable;
+  }
+  int journal_fd = -1;
+  FileIdentity journal_identity {};
+  const JournalOpenOutcome journal = OpenJournal(
+      persistent_state_fd,
+      kAccountObservationCredentialSlot,
+      &journal_fd,
+      &journal_identity);
+  if (journal == JournalOpenOutcome::kFailure) {
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return AccountObservationLeaseOutcome::kRecoveryRequired;
+  }
+  const bool initialized = journal != JournalOpenOutcome::kCreated
+      || WriteJournalState(
+          persistent_state_fd,
+          journal_fd,
+          kAccountObservationCredentialSlot,
+          journal_identity,
+          JournalState::kNormal);
+  const JournalState prior = journal == JournalOpenOutcome::kCreated
+      ? JournalState::kNormal
+      : ReadJournalState(journal_fd);
+  if (!initialized || prior == JournalState::kInvalid) {
+    LatchUnissuedAccountObservationRecovery(
+        persistent_state_fd,
+        journal_fd,
+        journal_identity);
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return AccountObservationLeaseOutcome::kRecoveryRequired;
+  }
+
+  int operation_journal_fd = -1;
+  FileIdentity operation_journal_identity {};
+  const AccountObservationOperationJournalOpenOutcome operation_journal =
+      OpenAccountObservationOperationJournal(
+          persistent_state_fd,
+          &operation_journal_fd,
+          &operation_journal_identity);
+  if (operation_journal == AccountObservationOperationJournalOpenOutcome::kInvalid) {
+    LatchUnissuedAccountObservationRecovery(
+        persistent_state_fd,
+        journal_fd,
+        journal_identity);
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return AccountObservationLeaseOutcome::kRecoveryRequired;
+  }
+  // A newly-created v1 journal cannot safely adopt an existing digest intent:
+  // it might be an orphan from a substituted state directory. An active v1
+  // journal without an intent is likewise a permanent refusal.
+  if ((journal == JournalOpenOutcome::kCreated
+       && operation_journal == AccountObservationOperationJournalOpenOutcome::kOpened)
+      || (prior == JournalState::kActive
+          && operation_journal == AccountObservationOperationJournalOpenOutcome::kMissing)) {
+    LatchUnissuedAccountObservationRecovery(
+        persistent_state_fd,
+        journal_fd,
+        journal_identity);
+    CloseDescriptor(&operation_journal_fd);
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return AccountObservationLeaseOutcome::kRecoveryRequired;
+  }
+
+  auto* lease = new (std::nothrow) AccountObservationLease {};
+  if (lease == nullptr) {
+    if (operation_journal == AccountObservationOperationJournalOpenOutcome::kOpened) {
+      LatchUnissuedAccountObservationRecovery(
+          persistent_state_fd,
+          journal_fd,
+          journal_identity);
+    }
+    CloseDescriptor(&operation_journal_fd);
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return operation_journal == AccountObservationOperationJournalOpenOutcome::kOpened
+        ? AccountObservationLeaseOutcome::kRecoveryRequired
+        : AccountObservationLeaseOutcome::kUnavailable;
+  }
+  lease->socket_fd = socket_fd;
+  lease->persistent_state_fd = persistent_state_fd;
+  lease->journal_fd = journal_fd;
+  lease->journal_identity = journal_identity;
+  lease->operation_journal_fd = operation_journal_fd;
+  lease->operation_journal_identity = operation_journal_identity;
+  lease->active_marker_written = prior == JournalState::kActive;
+  lease->operation_journal_written =
+      operation_journal == AccountObservationOperationJournalOpenOutcome::kOpened;
+  socket_fd = -1;
+  persistent_state_fd = -1;
+  journal_fd = -1;
+  operation_journal_fd = -1;
+  *result = lease;
+  return AccountObservationLeaseOutcome::kAcquired;
+}
+
+bool BeginAccountObservationMutation(
+    AccountObservationLease* lease,
+    const std::array<unsigned char, kAccountObservationCredentialBytes>& value) {
+  if (lease == nullptr
+      || !lease->active
+      || lease->active_marker_written
+      || lease->operation_journal_written
+      || lease->operation_journal_fd >= 0) {
+    return false;
+  }
+  std::array<unsigned char, kAccountObservationCredentialBytes> digest {};
+  int operation_journal_fd = -1;
+  FileIdentity operation_journal_identity {};
+  const bool started = DigestAccountObservationCredential(value, &digest)
+      && CreateAccountObservationOperationJournal(
+          lease->persistent_state_fd,
+          digest,
+          &operation_journal_fd,
+          &operation_journal_identity);
+  digest.fill(0);
+  if (!started) return false;
+  lease->operation_journal_fd = operation_journal_fd;
+  lease->operation_journal_identity = operation_journal_identity;
+  lease->operation_journal_written = true;
+  return LatchAccountObservationRecovery(lease);
+}
+
+AccountObservationOperationJournalRemoveOutcome SettleAccountObservationMutation(
+    AccountObservationLease* lease) {
+  if (lease == nullptr
+      || !lease->active
+      || !lease->operation_journal_written
+      || lease->operation_journal_fd < 0) {
+    return AccountObservationOperationJournalRemoveOutcome::kInvalid;
+  }
+  const AccountObservationOperationJournalRemoveOutcome removal =
+      RemoveAccountObservationOperationJournal(
+          lease->persistent_state_fd,
+          lease->operation_journal_fd,
+          lease->operation_journal_identity);
+  const bool closed = CloseDescriptor(&lease->operation_journal_fd);
+  if (removal == AccountObservationOperationJournalRemoveOutcome::kRemoved && closed) {
+    lease->operation_journal_identity = FileIdentity {};
+    lease->operation_journal_written = false;
+    return AccountObservationOperationJournalRemoveOutcome::kRemoved;
+  }
+  return removal == AccountObservationOperationJournalRemoveOutcome::kRemoved
+      ? AccountObservationOperationJournalRemoveOutcome::kUncertain
+      : removal;
+}
+
+AccountObservationOperationRecoveryOutcome RecoverAccountObservationOperationJournal(
+    AccountObservationLease* lease) {
+  if (lease == nullptr
+      || !lease->active
+      || !lease->operation_journal_written
+      || lease->operation_journal_fd < 0) {
+    return AccountObservationOperationRecoveryOutcome::kAmbiguous;
+  }
+  AccountObservationOperationJournal journal {};
+  if (!ReadAccountObservationOperationJournal(
+          lease->persistent_state_fd,
+          lease->operation_journal_fd,
+          lease->operation_journal_identity,
+          &journal)) {
+    return AccountObservationOperationRecoveryOutcome::kAmbiguous;
+  }
+  AccountObservationRecord record {};
+  const AccountObservationRecordState state = ReadAccountObservationCredential(&record);
+  std::array<unsigned char, kAccountObservationCredentialBytes> digest {};
+  const bool exact = state == AccountObservationRecordState::kPresent
+      && DigestAccountObservationCredential(record.bytes, &digest)
+      && EqualAccountObservationCredential(digest, journal.digest);
+  ClearAccountObservationRecord(&record);
+  digest.fill(0);
+  ClearAccountObservationOperationJournal(&journal);
+  if (!exact) {
+    return state == AccountObservationRecordState::kUnavailable
+        ? AccountObservationOperationRecoveryOutcome::kUnavailable
+        : AccountObservationOperationRecoveryOutcome::kAmbiguous;
+  }
+  const AccountObservationOperationJournalRemoveOutcome settled =
+      SettleAccountObservationMutation(lease);
+  return settled == AccountObservationOperationJournalRemoveOutcome::kRemoved
+      ? AccountObservationOperationRecoveryOutcome::kRecovered
+      : settled == AccountObservationOperationJournalRemoveOutcome::kUncertain
+          ? AccountObservationOperationRecoveryOutcome::kUncertain
+          : AccountObservationOperationRecoveryOutcome::kAmbiguous;
+}
+
 bool AcquireKernelLeaseSocket(int capability_id, int* socket_fd, bool* contended) {
   if (socket_fd == nullptr || contended == nullptr || !IsInternalCredentialSlot(capability_id)) {
     return false;
@@ -2059,6 +2859,304 @@ bool NoArguments(napi_env env, napi_callback_info info) {
              nullptr,
              nullptr) == napi_ok
       && argument_count == 0;
+}
+
+enum class AccountObservationWorkOperation {
+  kRead,
+  kCreate,
+};
+
+enum class AccountObservationWorkResult {
+  kAbsent,
+  kValue,
+  kCreated,
+  kExisting,
+  kUnavailable,
+  kRecoveryRequired,
+};
+
+struct AccountObservationWork {
+  napi_async_work work = nullptr;
+  napi_deferred deferred = nullptr;
+  AccountObservationWorkOperation operation = AccountObservationWorkOperation::kRead;
+  std::array<unsigned char, kAccountObservationCredentialBytes> candidate {};
+  std::array<unsigned char, kAccountObservationCredentialBytes> value {};
+  AccountObservationWorkResult result = AccountObservationWorkResult::kUnavailable;
+};
+
+void ClearAccountObservationWork(AccountObservationWork* work) {
+  if (work == nullptr) return;
+  work->candidate.fill(0);
+  work->value.fill(0);
+}
+
+AccountObservationWorkResult FinishAccountObservationUnavailable(
+    AccountObservationLease* lease) {
+  return FinishAccountObservationLease(lease, false)
+      ? AccountObservationWorkResult::kUnavailable
+      : AccountObservationWorkResult::kRecoveryRequired;
+}
+
+AccountObservationWorkResult FinishAccountObservationRecovery(
+    AccountObservationLease* lease) {
+  if (lease == nullptr) return AccountObservationWorkResult::kRecoveryRequired;
+  LatchAccountObservationRecovery(lease);
+  FinishAccountObservationLease(lease, true);
+  return AccountObservationWorkResult::kRecoveryRequired;
+}
+
+bool ReconcilePendingAccountObservationOperation(AccountObservationLease* lease) {
+  if (lease == nullptr || !lease->operation_journal_written) return lease != nullptr;
+  return RecoverAccountObservationOperationJournal(lease)
+      == AccountObservationOperationRecoveryOutcome::kRecovered;
+}
+
+AccountObservationWorkResult RunAccountObservationRead(AccountObservationWork* work) {
+  if (work == nullptr) return AccountObservationWorkResult::kUnavailable;
+  AccountObservationLease* lease = nullptr;
+  const AccountObservationLeaseOutcome acquired = AcquireAccountObservationLease(&lease);
+  if (acquired == AccountObservationLeaseOutcome::kRecoveryRequired) {
+    return AccountObservationWorkResult::kRecoveryRequired;
+  }
+  if (acquired != AccountObservationLeaseOutcome::kAcquired) {
+    return AccountObservationWorkResult::kUnavailable;
+  }
+  if (!ReconcilePendingAccountObservationOperation(lease)) {
+    return FinishAccountObservationRecovery(lease);
+  }
+  AccountObservationRecord record {};
+  const AccountObservationRecordState state = ReadAccountObservationCredential(&record);
+  if (state == AccountObservationRecordState::kAbsent) {
+    ClearAccountObservationRecord(&record);
+    return FinishAccountObservationLease(lease, false)
+        ? AccountObservationWorkResult::kAbsent
+        : AccountObservationWorkResult::kRecoveryRequired;
+  }
+  if (state == AccountObservationRecordState::kPresent) {
+    work->value = record.bytes;
+    ClearAccountObservationRecord(&record);
+    if (!FinishAccountObservationLease(lease, false)) {
+      work->value.fill(0);
+      return AccountObservationWorkResult::kRecoveryRequired;
+    }
+    return AccountObservationWorkResult::kValue;
+  }
+  ClearAccountObservationRecord(&record);
+  return state == AccountObservationRecordState::kUnavailable
+      ? FinishAccountObservationUnavailable(lease)
+      : FinishAccountObservationRecovery(lease);
+}
+
+AccountObservationWorkResult RunAccountObservationCreate(AccountObservationWork* work) {
+  if (work == nullptr) return AccountObservationWorkResult::kUnavailable;
+  AccountObservationLease* lease = nullptr;
+  const AccountObservationLeaseOutcome acquired = AcquireAccountObservationLease(&lease);
+  if (acquired == AccountObservationLeaseOutcome::kRecoveryRequired) {
+    return AccountObservationWorkResult::kRecoveryRequired;
+  }
+  if (acquired != AccountObservationLeaseOutcome::kAcquired) {
+    return AccountObservationWorkResult::kUnavailable;
+  }
+  if (!ReconcilePendingAccountObservationOperation(lease)) {
+    return FinishAccountObservationRecovery(lease);
+  }
+
+  AccountObservationRecord before {};
+  const AccountObservationRecordState before_state = ReadAccountObservationCredential(&before);
+  if (before_state == AccountObservationRecordState::kPresent) {
+    ClearAccountObservationRecord(&before);
+    return FinishAccountObservationLease(lease, false)
+        ? AccountObservationWorkResult::kExisting
+        : AccountObservationWorkResult::kRecoveryRequired;
+  }
+  ClearAccountObservationRecord(&before);
+  if (before_state == AccountObservationRecordState::kUnavailable) {
+    return FinishAccountObservationUnavailable(lease);
+  }
+  if (before_state != AccountObservationRecordState::kAbsent) {
+    return FinishAccountObservationRecovery(lease);
+  }
+
+  // Obtain the default collection before persisting the digest intent. A
+  // missing or locked collection is a known non-mutation failure, whereas a
+  // later create result is intentionally reconciled through the digest.
+  SecretCollection* collection = OpenAccountObservationDefaultCollection();
+  if (collection == nullptr) return FinishAccountObservationUnavailable(lease);
+  if (!BeginAccountObservationMutation(lease, work->candidate)) {
+    g_object_unref(collection);
+    return FinishAccountObservationRecovery(lease);
+  }
+  CreateAccountObservationCredentialNoReplace(collection, work->candidate);
+  g_object_unref(collection);
+
+  AccountObservationRecord after {};
+  const AccountObservationRecordState after_state = ReadAccountObservationCredential(&after);
+  const bool exact = after_state == AccountObservationRecordState::kPresent
+      && EqualAccountObservationCredential(after.bytes, work->candidate);
+  ClearAccountObservationRecord(&after);
+  if (!exact) {
+    // A no-replace create may still race a non-cooperating same-user writer and
+    // leave a duplicate or foreign item. Retain the digest intent and refuse;
+    // this route never cleans, replaces, or adopts that state.
+    return FinishAccountObservationRecovery(lease);
+  }
+  if (SettleAccountObservationMutation(lease)
+      != AccountObservationOperationJournalRemoveOutcome::kRemoved) {
+    return FinishAccountObservationRecovery(lease);
+  }
+  return FinishAccountObservationLease(lease, false)
+      ? AccountObservationWorkResult::kCreated
+      : AccountObservationWorkResult::kRecoveryRequired;
+}
+
+void ExecuteAccountObservationWork(napi_env /* env */, void* data) {
+  auto* work = static_cast<AccountObservationWork*>(data);
+  if (work == nullptr) return;
+  work->result = work->operation == AccountObservationWorkOperation::kRead
+      ? RunAccountObservationRead(work)
+      : RunAccountObservationCreate(work);
+  work->candidate.fill(0);
+}
+
+const char* AccountObservationWorkErrorCode(AccountObservationWorkResult result) {
+  return result == AccountObservationWorkResult::kRecoveryRequired
+      ? kCodeAccountObservationRecoveryRequired
+      : kCodeAccountObservationUnavailable;
+}
+
+void CompleteAccountObservationWork(
+    napi_env env,
+    napi_status status,
+    void* data) {
+  auto* work = static_cast<AccountObservationWork*>(data);
+  if (work == nullptr) return;
+  const AccountObservationWorkResult result = status == napi_ok
+      ? work->result
+      : AccountObservationWorkResult::kUnavailable;
+  napi_value resolution = nullptr;
+  napi_status settled = napi_generic_failure;
+  if (result == AccountObservationWorkResult::kAbsent) {
+    settled = napi_get_null(env, &resolution) == napi_ok
+        ? napi_resolve_deferred(env, work->deferred, resolution)
+        : napi_generic_failure;
+  } else if (result == AccountObservationWorkResult::kValue) {
+    void* copied = nullptr;
+    settled = napi_create_buffer_copy(
+        env,
+        work->value.size(),
+        work->value.data(),
+        &copied,
+        &resolution) == napi_ok
+        ? napi_resolve_deferred(env, work->deferred, resolution)
+        : napi_generic_failure;
+  } else if (result == AccountObservationWorkResult::kCreated
+      || result == AccountObservationWorkResult::kExisting) {
+    const char* text = result == AccountObservationWorkResult::kCreated
+        ? "created"
+        : "existing";
+    settled = napi_create_string_utf8(env, text, NAPI_AUTO_LENGTH, &resolution) == napi_ok
+        ? napi_resolve_deferred(env, work->deferred, resolution)
+        : napi_generic_failure;
+  } else {
+    napi_value error = MakeFixedError(env, AccountObservationWorkErrorCode(result));
+    if (error != nullptr) {
+      settled = napi_reject_deferred(env, work->deferred, error);
+    }
+  }
+  // The deferred has no caller-visible secret data. If N-API cannot settle it,
+  // the completed native operation remains durable and a later read is the
+  // only safe observation; do not recreate any intent or credential here.
+  static_cast<void>(settled);
+  if (work->work != nullptr) napi_delete_async_work(env, work->work);
+  ClearAccountObservationWork(work);
+  delete work;
+}
+
+bool AccountObservationCredentialArgument(
+    napi_env env,
+    napi_callback_info info,
+    std::array<unsigned char, kAccountObservationCredentialBytes>* value) {
+  if (value == nullptr) return false;
+  std::array<napi_value, 1> arguments {};
+  std::size_t argument_count = arguments.size();
+  bool is_buffer = false;
+  void* bytes = nullptr;
+  std::size_t length = 0;
+  if (napi_get_cb_info(
+          env,
+          info,
+          &argument_count,
+          arguments.data(),
+          nullptr,
+          nullptr) != napi_ok
+      || argument_count != 1
+      || napi_is_buffer(env, arguments[0], &is_buffer) != napi_ok
+      || !is_buffer
+      || napi_get_buffer_info(env, arguments[0], &bytes, &length) != napi_ok
+      || bytes == nullptr
+      || length != value->size()) {
+    return false;
+  }
+  std::memcpy(value->data(), bytes, value->size());
+  return true;
+}
+
+napi_value QueueAccountObservationWork(
+    napi_env env,
+    AccountObservationWorkOperation operation,
+    const std::array<unsigned char, kAccountObservationCredentialBytes>* candidate) {
+  auto* work = new (std::nothrow) AccountObservationWork {};
+  if (work == nullptr) return ThrowFixed(env, kCodeAccountObservationUnavailable);
+  work->operation = operation;
+  if (candidate != nullptr) work->candidate = *candidate;
+  napi_value promise = nullptr;
+  napi_value resource_name = nullptr;
+  if (napi_create_promise(env, &work->deferred, &promise) != napi_ok
+      || napi_create_string_utf8(
+          env,
+          "linuxAccountObservationCredential",
+          NAPI_AUTO_LENGTH,
+          &resource_name) != napi_ok
+      || napi_create_async_work(
+          env,
+          nullptr,
+          resource_name,
+          ExecuteAccountObservationWork,
+          CompleteAccountObservationWork,
+          work,
+          &work->work) != napi_ok
+      || napi_queue_async_work(env, work->work) != napi_ok) {
+    if (work->work != nullptr) napi_delete_async_work(env, work->work);
+    ClearAccountObservationWork(work);
+    delete work;
+    return ThrowFixed(env, kCodeAccountObservationUnavailable);
+  }
+  return promise;
+}
+
+napi_value ReadAccountObservationCredential(
+    napi_env env,
+    napi_callback_info info) {
+  if (!NoArguments(env, info)) {
+    return ThrowFixed(env, kCodeAccountObservationInvalidValue);
+  }
+  return QueueAccountObservationWork(env, AccountObservationWorkOperation::kRead, nullptr);
+}
+
+napi_value CreateAccountObservationCredentialIfMissing(
+    napi_env env,
+    napi_callback_info info) {
+  std::array<unsigned char, kAccountObservationCredentialBytes> candidate {};
+  if (!AccountObservationCredentialArgument(env, info, &candidate)) {
+    candidate.fill(0);
+    return ThrowFixed(env, kCodeAccountObservationInvalidValue);
+  }
+  napi_value result = QueueAccountObservationWork(
+      env,
+      AccountObservationWorkOperation::kCreate,
+      &candidate);
+  candidate.fill(0);
+  return result;
 }
 
 // This is deliberately a zero-argument main-process preparation authority.
@@ -2633,6 +3731,16 @@ napi_value Initialize(napi_env env, napi_value exports) {
           exports,
           "deleteAccountlessInstallationCredentialExact",
           DeleteAccountlessInstallationCredentialExact)
+      || !DefineMethod(
+          env,
+          exports,
+          "readAccountObservationCredential",
+          ReadAccountObservationCredential)
+      || !DefineMethod(
+          env,
+          exports,
+          "createAccountObservationCredentialIfMissing",
+          CreateAccountObservationCredentialIfMissing)
       || !DefineString(
           env,
           exports,

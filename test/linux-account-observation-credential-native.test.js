@@ -1,0 +1,160 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import {
+  EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
+} from "../src/platform/keychain-capabilities.js";
+import {
+  createLinuxAccountObservationCredentialBackend,
+  LinuxAccountObservationCredentialError,
+} from "../src/platform/linux-account-observation-credential.js";
+
+const NATIVE_TEST_ENABLED = process.platform === "linux"
+  && process.arch === "x64"
+  && process.env.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED === "1"
+  && process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST === "1";
+const OPERATION_JOURNAL = "account-observation-operation-5-v1";
+const OPERATION_MAGIC = Buffer.from([
+  0x54, 0x49, 0x42, 0x4f, 0x54, 0x41, 0x54, 0x54,
+  0x4c, 0x45, 0x2d, 0x46, 0x44, 0x34, 0x00, 0x00,
+]);
+
+function operationJournal(value) {
+  assert.equal(Buffer.isBuffer(value), true);
+  assert.equal(value.byteLength, 32);
+  const journal = Buffer.alloc(64);
+  OPERATION_MAGIC.copy(journal, 0);
+  journal[16] = 1;
+  journal[17] = 1;
+  createHash("sha256").update(value).digest().copy(journal, 32);
+  return journal;
+}
+
+function fixturePaths(stateBase) {
+  const applicationDirectory = join(stateBase, "app-usagemonitor");
+  const mutexDirectory = join(applicationDirectory, "linux-credential-mutex-v1");
+  return {
+    applicationDirectory,
+    mutexDirectory,
+    legacyJournal: join(mutexDirectory, "journal-5-v1"),
+    operationJournal: join(mutexDirectory, OPERATION_JOURNAL),
+  };
+}
+
+async function ownerOnlyDirectory(path) {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  await chmod(path, 0o700);
+}
+
+async function writeOwnerOnlyFile(path, bytes) {
+  await writeFile(path, bytes, { mode: 0o600 });
+  await chmod(path, 0o600);
+}
+
+function equalSecret(actual, expected) {
+  assert.equal(Buffer.isBuffer(actual), true);
+  assert.equal(actual.byteLength, 32);
+  assert.equal(Buffer.compare(actual, expected), 0);
+}
+
+function nativeError(code) {
+  return (error) => {
+    assert.equal(error instanceof LinuxAccountObservationCredentialError, true);
+    assert.equal(error.code, `linux_account_observation_credential_${code}`);
+    assert.equal(error.message, "Linux account observation credential backend failed");
+    return true;
+  };
+}
+
+async function assertMissing(path) {
+  try {
+    await lstat(path);
+  } catch (error) {
+    assert.equal(error?.code, "ENOENT");
+    return;
+  }
+  assert.fail("expected fixed native journal to be absent");
+}
+
+test("native Linux account-observation credential creates once, preserves an existing root, and reconciles only a matching digest intent", {
+  skip: !NATIVE_TEST_ENABLED,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-linux-account-observation-"));
+  const stateBase = join(root, "state");
+  const previousState = process.env.XDG_STATE_HOME;
+  const first = Buffer.alloc(32, 71);
+  const different = Buffer.alloc(32, 72);
+  const paths = fixturePaths(stateBase);
+  t.after(async () => {
+    first.fill(0);
+    different.fill(0);
+    if (previousState === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previousState;
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await Promise.all([
+    ownerOnlyDirectory(stateBase),
+    ownerOnlyDirectory(paths.applicationDirectory),
+    ownerOnlyDirectory(paths.mutexDirectory),
+  ]);
+  process.env.XDG_STATE_HOME = stateBase;
+  const backend = createLinuxAccountObservationCredentialBackend();
+  const capability = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
+
+  assert.equal(await backend.read(capability), null);
+  assert.equal(await backend.createIfMissing(capability, first), "created");
+  const stored = await backend.read(capability);
+  equalSecret(stored, first);
+  stored.fill(0);
+  assert.equal(await backend.createIfMissing(capability, different), "existing");
+  const retained = await backend.read(capability);
+  equalSecret(retained, first);
+  retained.fill(0);
+
+  let settled = operationJournal(first);
+  try {
+    await writeOwnerOnlyFile(paths.operationJournal, settled);
+  } finally {
+    settled.fill(0);
+  }
+  const reconciled = await backend.read(capability);
+  equalSecret(reconciled, first);
+  reconciled.fill(0);
+  await assertMissing(paths.operationJournal);
+  assert.equal(
+    await readFile(paths.legacyJournal, "utf8"),
+    "linux-credential-mutex-journal-v1:normal\n",
+  );
+
+  let unresolved = operationJournal(different);
+  try {
+    await writeOwnerOnlyFile(paths.operationJournal, unresolved);
+  } finally {
+    unresolved.fill(0);
+  }
+  await assert.rejects(backend.read(capability), nativeError("recovery_required"));
+  assert.equal(
+    await readFile(paths.legacyJournal, "utf8"),
+    "linux-credential-mutex-journal-v1:active\n",
+  );
+  const retainedIntent = await lstat(paths.operationJournal);
+  assert.equal(retainedIntent.isFile(), true);
+  assert.equal(retainedIntent.mode & 0o777, 0o600);
+
+  // The wrapper accepts this marker only with a zero exit and its exact TAP
+  // comment form, so a skipped or partial test cannot become a passing receipt.
+  console.log("LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED");
+});

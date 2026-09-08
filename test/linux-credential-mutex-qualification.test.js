@@ -14,6 +14,8 @@ function evidenceBinding() {
     readAccountlessInstallationCredential() { return null; },
     createAccountlessInstallationCredentialIfMissing() { return "created"; },
     deleteAccountlessInstallationCredentialExact() { return "deleted"; },
+    readAccountObservationCredential() { return Promise.resolve(null); },
+    createAccountObservationCredentialIfMissing() { return Promise.resolve("created"); },
     credentialMutexContractVersion: "linux-credential-mutex-v1",
     credentialMutexCrossProcessSafe: true,
     credentialMutexSameNetworkNamespaceOnly: true,

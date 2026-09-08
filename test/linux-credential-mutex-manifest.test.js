@@ -36,6 +36,8 @@ function binding(overrides = {}) {
     readAccountlessInstallationCredential: () => null,
     createAccountlessInstallationCredentialIfMissing: () => "created",
     deleteAccountlessInstallationCredentialExact: () => "deleted",
+    readAccountObservationCredential: () => Promise.resolve(null),
+    createAccountObservationCredentialIfMissing: () => Promise.resolve("created"),
     ...overrides,
   };
 }
@@ -61,6 +63,8 @@ test("Linux credential mutex manifest is deterministic, content-free, and produc
       "readAccountlessInstallationCredential",
       "createAccountlessInstallationCredentialIfMissing",
       "deleteAccountlessInstallationCredentialExact",
+      "readAccountObservationCredential",
+      "createAccountObservationCredentialIfMissing",
     ],
     nativeClaims: {
       credentialMutexCrossProcessSafe: true,
@@ -91,6 +95,7 @@ test("Linux credential mutex manifest refuses broadening or malformed native cla
     binding({ abandonCredentialMutex: null }),
     binding({ acquireCredentialMutex: null }),
     binding({ createAccountlessInstallationCredentialIfMissing: null }),
+    binding({ createAccountObservationCredentialIfMissing: null }),
   ]) {
     assert.throws(
       () => createLinuxCredentialMutexBindingManifest({ bytes: BYTES, binding: candidate }),

@@ -146,6 +146,62 @@ desktop session does not make this file unavailable. Those limits are part of
 why `productionSafe` remains false pending separate installed-artifact,
 physical-desktop, and release qualification.
 
+The separate private slot five is reserved for one fixed Linux
+account-observation root. It is not an inherited generic capability: the
+generic lease API still rejects every identifier outside `0..3`, and slot five
+is reachable only through `readAccountObservationCredential()` and
+`createAccountObservationCredentialIfMissing(Buffer32)`. Both methods run
+their synchronous Secret Service calls in a native worker and accept neither a
+capability identifier nor a pathname. There is no slot-five replace, delete,
+export, or generic mutation method.
+
+The fixed item uses the Keytar-compatible `org.freedesktop.Secret.Generic`
+schema with `service=app-usagemonitor.account-observation.v1` and
+`account=installation`. Its 32 raw bytes are represented as exactly 43
+canonical unpadded base64url text bytes in Secret Service. Reads require
+exactly one unlocked, well-formed matching item. Absent is distinct from
+locked/unavailable; duplicate or malformed records refuse instead of choosing
+one.
+
+Under the private slot-five abstract socket, a create first observes the
+singleton state, then records only SHA-256(candidate) in the owner-only
+`account-observation-operation-5-v1` journal and latches `journal-5-v1`
+active before it calls `secret_item_create_sync` with the no-replace creation
+mode. It never calls the Keytar upsert operation. Libsecret may still let an
+outside, non-cooperating same-user writer add a duplicate; the postcondition
+read rejects that result and the binding makes no cross-writer uniqueness
+claim.
+
+The fixed v1 intent is 64 bytes:
+
+- `0..15`: exact `TIBOTATTLE-FD4\0\0` byte array
+- `16`: version `1`
+- `17`: operation `1` (create)
+- `18..31`: zero reserved bytes
+- `32..63`: SHA-256 of the candidate, never the candidate itself
+
+On restart, only one observed item whose digest equals the retained intent can
+settle that intent. A missing item with a retained digest cannot be replayed:
+the candidate was deliberately never persisted outside Secret Service, so the
+binding retains the intent and active refusal. A locked/unavailable service,
+duplicate, malformed record, torn or unsafe intent, failed intent removal, or
+other mismatch likewise stays refused. The state journal makes the local
+intent/recovery boundary durable; it does not prove a remote Secret Service
+write survived a service or storage failure.
+
+The slot-five source and native tests are qualification-only. The native test
+requires an explicitly isolated disposable Secret Service session and emits
+its fixed pass marker only after read/create/readback, existing-value, matching
+digest settlement, and unresolvable-digest refusal assertions. It performs no
+delete, cleanup wire, or real-account credential access; session cleanup is a
+disposable-runner lifetime boundary. It does not model an actual process kill,
+desktop lock transition, service crash, storage loss, or power failure.
+
+Building this fixed path also requires the Linux `libsecret-1` development
+headers and linker metadata (for example, `libsecret-1-dev`). Those packages
+and an isolated Secret Service are CI/runtime prerequisites, not evidence that
+the dormant backend has been selected.
+
 Build and create the adjacent sidecar only on native Linux x86_64:
 
 ```text

@@ -44,6 +44,8 @@ function binding() {
     readAccountlessInstallationCredential: () => null,
     createAccountlessInstallationCredentialIfMissing: () => "created",
     deleteAccountlessInstallationCredentialExact: () => "deleted",
+    readAccountObservationCredential: () => Promise.resolve(null),
+    createAccountObservationCredentialIfMissing: () => Promise.resolve("created"),
   };
 }
 

@@ -41,6 +41,8 @@ function binding(overrides = {}) {
     readAccountlessInstallationCredential: () => null,
     createAccountlessInstallationCredentialIfMissing: () => "created",
     deleteAccountlessInstallationCredentialExact: () => "deleted",
+    readAccountObservationCredential: () => Promise.resolve(null),
+    createAccountObservationCredentialIfMissing: () => Promise.resolve("created"),
     ...overrides,
   };
 }
@@ -62,6 +64,8 @@ function manifest(bytes = BYTES, overrides = {}) {
       "readAccountlessInstallationCredential",
       "createAccountlessInstallationCredentialIfMissing",
       "deleteAccountlessInstallationCredentialExact",
+      "readAccountObservationCredential",
+      "createAccountObservationCredentialIfMissing",
     ],
     nativeClaims: {
       credentialMutexCrossProcessSafe: true,

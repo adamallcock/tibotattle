@@ -42,6 +42,8 @@ export const LINUX_CREDENTIAL_MUTEX_BINDING_REQUIRED_METHODS = Object.freeze([
   "readAccountlessInstallationCredential",
   "createAccountlessInstallationCredentialIfMissing",
   "deleteAccountlessInstallationCredentialExact",
+  "readAccountObservationCredential",
+  "createAccountObservationCredentialIfMissing",
 ]);
 
 const NATIVE_BINDING_PATH = resolve(
@@ -361,6 +363,8 @@ function snapshotBinding(binding) {
   let readAccountlessInstallationCredential;
   let createAccountlessInstallationCredentialIfMissing;
   let deleteAccountlessInstallationCredentialExact;
+  let readAccountObservationCredential;
+  let createAccountObservationCredentialIfMissing;
   let contractVersion;
   let crossProcessSafe;
   let sameNetworkNamespaceOnly;
@@ -376,6 +380,9 @@ function snapshotBinding(binding) {
       binding?.createAccountlessInstallationCredentialIfMissing;
     deleteAccountlessInstallationCredentialExact =
       binding?.deleteAccountlessInstallationCredentialExact;
+    readAccountObservationCredential = binding?.readAccountObservationCredential;
+    createAccountObservationCredentialIfMissing =
+      binding?.createAccountObservationCredentialIfMissing;
     contractVersion = binding?.credentialMutexContractVersion;
     crossProcessSafe = binding?.credentialMutexCrossProcessSafe;
     sameNetworkNamespaceOnly = binding?.credentialMutexSameNetworkNamespaceOnly;
@@ -391,6 +398,8 @@ function snapshotBinding(binding) {
       || typeof readAccountlessInstallationCredential !== "function"
       || typeof createAccountlessInstallationCredentialIfMissing !== "function"
       || typeof deleteAccountlessInstallationCredentialExact !== "function"
+      || typeof readAccountObservationCredential !== "function"
+      || typeof createAccountObservationCredentialIfMissing !== "function"
       || contractVersion !== "linux-credential-mutex-v1"
       || crossProcessSafe !== true
       || sameNetworkNamespaceOnly !== true
@@ -410,6 +419,10 @@ function snapshotBinding(binding) {
         createAccountlessInstallationCredentialIfMissing.bind(binding),
       deleteAccountlessInstallationCredentialExact:
         deleteAccountlessInstallationCredentialExact.bind(binding),
+      readAccountObservationCredential:
+        readAccountObservationCredential.bind(binding),
+      createAccountObservationCredentialIfMissing:
+        createAccountObservationCredentialIfMissing.bind(binding),
       credentialMutexContractVersion: contractVersion,
       credentialMutexCrossProcessSafe: crossProcessSafe,
       credentialMutexSameNetworkNamespaceOnly: sameNetworkNamespaceOnly,
