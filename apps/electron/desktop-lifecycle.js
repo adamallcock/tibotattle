@@ -1107,6 +1107,7 @@ export function createDesktopLifecycle({
       webContents,
       session,
       policy,
+      allowNotificationPermission: true,
     });
     const settingsState = {
       candidate,

@@ -857,8 +857,8 @@ test("loopback session admits only the dashboard same-origin Blob download", () 
   const origin = "http://127.0.0.1:3456";
   const blob = `blob:${origin}/4a4e02e8-2cbf-4dfb-bb2a-4f6e4c0efb90`;
   const session = {
-    setPermissionRequestHandler() {},
-    setPermissionCheckHandler() {},
+    setPermissionRequestHandler(handler) { this.handler = handler; },
+    setPermissionCheckHandler(handler) { this.checkHandler = handler; },
     webRequest: {
       onBeforeRequest(filter, listener) {
         this.filter = filter;
@@ -880,7 +880,15 @@ test("loopback session admits only the dashboard same-origin Blob download", () 
     webContents: settings,
     session,
     policy: createLoopbackNavigationPolicy({ origin }),
+    allowNotificationPermission: true,
   });
+  const permissions = [];
+  session.handler(settings, "notifications", (allowed) => permissions.push(allowed));
+  session.handler(dashboard, "notifications", (allowed) => permissions.push(allowed));
+  session.handler(settings, "geolocation", (allowed) => permissions.push(allowed));
+  assert.deepEqual(permissions, [true, false, false]);
+  assert.equal(session.checkHandler(settings, "notifications"), true);
+  assert.equal(session.checkHandler(dashboard, "notifications"), false);
   const download = {
     url: blob,
     method: "GET",

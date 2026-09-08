@@ -525,6 +525,97 @@ test("Settings restores its saved language when the language bridge rejects", as
   mounted.teardown();
 });
 
+test("Settings asks Electron for notification permission before opening system settings", async () => {
+  const element = () => ({
+    childNodes: [],
+    dataset: {},
+    attributes: new Map(),
+    textContent: "",
+    value: "",
+    checked: false,
+    disabled: false,
+    hidden: false,
+    classList: { toggle() {} },
+    append(...children) { this.childNodes.push(...children); },
+    replaceChildren(...children) { this.childNodes = children; },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    getAttribute(name) { return this.attributes.get(name) ?? null; },
+    addEventListener(type, handler) { this.listeners ??= new Map(); this.listeners.set(type, handler); },
+    removeEventListener(type, handler) { if (this.listeners?.get(type) === handler) this.listeners.delete(type); },
+    click() { this.listeners?.get("click")?.({ preventDefault() {} }); },
+  });
+  const selectors = [
+    "#settings-bridge-status", "#settings-language", "#settings-appearance",
+    "#settings-codex-folder-status", "#settings-codex-roots",
+    "#settings-codex-roots-status", "#settings-add-codex-root",
+    "#settings-use-default-codex-folder", "#settings-refresh-interval",
+    "#settings-start-at-login", "#settings-start-at-login-summary",
+    "#settings-open-login-items", "#settings-refresh-login-status",
+    "#settings-notifications-enabled", "#settings-notifications-detail",
+    "#settings-notification-status", "#settings-open-notification-settings",
+    "#settings-automatic-updates", "#settings-check-for-updates",
+    "#settings-download-update", "#settings-install-update",
+    "#settings-open-dashboard-browser", "#settings-show-diagnostics",
+    "#settings-reveal-local-data", "#settings-version", "#settings-build",
+    "#settings-updates-status", "#settings-operation-status",
+  ];
+  const elements = new Map(selectors.map((selector) => [selector, element()]));
+  const documentRef = {
+    documentElement: { dataset: {}, classList: { toggle() {} } },
+    createElement: element,
+    querySelector(selector) { return elements.get(selector) ?? null; },
+    querySelectorAll() { return []; },
+  };
+  const opened = [];
+  const bridge = {
+    version: "v1",
+    getSettings: async () => ({
+      settings: {
+        language: "en", appearance: "system", refreshIntervalSeconds: 300,
+        codexHomes: { activityRoots: [], primaryRootId: "" },
+        codexFolder: { kind: "default" },
+        startAtLogin: { status: "disabled", canSet: false },
+        notifications: {
+          enabled: false,
+          threshold: "off",
+          canSet: true,
+          state: "ready",
+          delivery: "ready",
+          permission: "unknown",
+        },
+      },
+      about: { version: "0.1.18", build: "test", update: {}, automaticUpdates: {} },
+    }),
+    openSystemSettings: async (target) => opened.push(target),
+  };
+  let permission = "default";
+  let requests = 0;
+  const windowRef = {
+    tibotattleDesktop: bridge,
+    location: { hash: "#notifications" },
+    Notification: {
+      get permission() { return permission; },
+      async requestPermission() {
+        requests += 1;
+        permission = "denied";
+        return permission;
+      },
+    },
+  };
+  const mounted = await mountSettingsPage({ documentRef, windowRef, bridge });
+  const permissionButton = elements.get("#settings-open-notification-settings");
+  assert.equal(permissionButton.textContent, "Allow Notifications");
+  permissionButton.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests, 1);
+  assert.deepEqual(opened, []);
+  assert.equal(permissionButton.textContent, "Open Notification Settings");
+  permissionButton.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(opened, ["notifications"]);
+  mounted.teardown();
+});
+
 test("a successful visible notice receipt keeps its current banner actionable", async () => {
   const source = await readFile(APP_SOURCE_URL, "utf8");
   const functions = [
