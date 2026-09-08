@@ -2016,17 +2016,34 @@ async function uiSnapshot(session) {
   })()`);
 }
 
-async function sampleAdvancingTimer(session) {
+export async function sampleAdvancingTimer(session, {
+  signal = null,
+  readSnapshot = () => uiSnapshot(session),
+  pause = wait,
+  now = Date.now,
+} = {}) {
   const values = [];
-  const deadline = Date.now() + REAL_HISTORY_QA_TIMEOUTS.timerMs;
-  while (Date.now() < deadline && new Set(values).size < 5) {
-    const snapshot = await uiSnapshot(session);
+  const deadline = now() + REAL_HISTORY_QA_TIMEOUTS.timerMs;
+  let advanced = false;
+  while (signal?.aborted !== true && now() < deadline) {
+    const snapshot = await readSnapshot();
+    // The first cancel closes this generation synchronously. A CDP read that
+    // completes afterward cannot add cancellation or retry/reset evidence.
+    if (signal?.aborted === true || now() >= deadline) break;
     const elapsed = elapsedSeconds(snapshot?.refreshText);
-    if (elapsed !== null) values.push(elapsed);
-    await wait(1_000);
+    if (elapsed !== null) {
+      const previous = values.at(-1);
+      if (previous !== undefined && elapsed < previous) break;
+      values.push(elapsed);
+      const unique = [...new Set(values)];
+      advanced = unique.length >= 4 && unique.at(-1) - unique[0] >= 3;
+      // Four distinct values spanning three seconds are the existing gate.
+      // Do not wait for an unnecessary fifth value across a generation change.
+      if (advanced) break;
+    }
+    await pause(1_000);
   }
   const unique = [...new Set(values)];
-  const advanced = unique.length >= 4 && unique.at(-1) - unique[0] >= 3;
   if (!advanced) {
     const error = qaError("REAL_HISTORY_QA_TIMER_STALLED", "refresh", "timer_stalled");
     attachQaEvidence(error, {
@@ -2188,7 +2205,10 @@ async function runCancelMode(session) {
   // in-flight status rounds. Attaching a rejection handler immediately keeps
   // a later cancellation failure classified by its own gate while preserving
   // timer evidence for the receipt.
-  const timerPromise = sampleAdvancingTimer(session).then((result) => {
+  const timerGeneration = new AbortController();
+  const timerPromise = sampleAdvancingTimer(session, {
+    signal: timerGeneration.signal,
+  }).then((result) => {
     timerResult = result;
   }).catch((error) => {
     timerError = error;
@@ -2205,6 +2225,7 @@ async function runCancelMode(session) {
     // a fast optimized run it can turn an otherwise exercisable cancel into
     // terminal completion without improving the latency sample.
     const cancelStartedAt = Date.now();
+    timerGeneration.abort();
     await clickCancel(session);
     await waitCancelAcknowledged(session);
     const acknowledgedMs = Date.now() - cancelStartedAt;
@@ -2305,6 +2326,7 @@ async function runCancelMode(session) {
       }),
     });
   } catch (error) {
+    timerGeneration.abort();
     await timerPromise;
     if (Object.keys(timer).length === 0 && timerResult !== null) timer = timerResult;
     attachQaEvidence(error, {

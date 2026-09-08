@@ -32,6 +32,7 @@ import {
   realHistoryCancelPreQuickBoundaryReady,
   releaseRealHistoryRefreshGate,
   runLaunchGate,
+  sampleAdvancingTimer,
   sampleTimerAndControlPlaneConcurrently,
   settleStartupRefreshProbes,
   waitForLaunchGate,
@@ -1188,6 +1189,89 @@ test("control-plane gate preserves legacy receipts and separates endpoint sample
     failedPhaseCoverageEvidence.controlPlane.endpointLatency.coverage,
     phaseInclusiveEndpointLatency.coverage,
   );
+});
+
+test("timer proof finishes at four advancing first-generation values", async () => {
+  let reads = 0;
+  let clock = 0;
+  const result = await sampleAdvancingTimer(null, {
+    readSnapshot: async () => {
+      reads += 1;
+      assert.ok(reads <= 4, "must finish before any retry/reset sample");
+      return { refreshText: `Analyzing… ${reads}s` };
+    },
+    pause: async (ms) => { clock += ms; },
+    now: () => clock,
+  });
+  assert.deepEqual(result, { sampleCount: 4, uniqueCount: 4, advanced: true });
+  assert.equal(reads, 4);
+  assert.equal(clock, 3_000);
+});
+
+test("timer proof refuses stalled and decreasing elapsed counters", async () => {
+  for (const values of [[1, 1, 1, 1], [2, 3, 0, 4, 5, 6]]) {
+    let reads = 0;
+    let clock = 0;
+    await assert.rejects(sampleAdvancingTimer(null, {
+      readSnapshot: async () => ({
+        refreshText: `Analyzing… ${values[Math.min(reads++, values.length - 1)]}s`,
+      }),
+      pause: async (ms) => { clock += ms; },
+      now: () => clock,
+    }), (error) => {
+      assert.equal(error.qaReason, "timer_stalled");
+      assert.equal(error.qaEvidence.timer.advanced, false);
+      assert.ok(error.qaEvidence.timer.uniqueCount < 4);
+      if (values[0] === 2) {
+        assert.deepEqual(error.qaEvidence.timer, { sampleCount: 2, uniqueCount: 2, advanced: false });
+      }
+      return true;
+    });
+    if (values[0] === 2) assert.equal(reads, 3, "reject reset before later values can qualify it");
+    else assert.equal(clock, REAL_HISTORY_QA_TIMEOUTS.timerMs);
+  }
+});
+
+test("cancel closes timer evidence before an in-flight retry snapshot resolves", async () => {
+  const generation = new AbortController();
+  let reads = 0;
+  let clock = 0;
+  let completeSnapshot;
+  let snapshotStarted;
+  const inFlight = new Promise((resolve) => { snapshotStarted = resolve; });
+  const probe = sampleAdvancingTimer(null, {
+    signal: generation.signal,
+    readSnapshot: async () => {
+      reads += 1;
+      if (reads === 4) {
+        snapshotStarted();
+        return new Promise((resolve) => { completeSnapshot = resolve; });
+      }
+      return { refreshText: `Analyzing… ${reads}s` };
+    },
+    pause: async (ms) => { clock += ms; },
+    now: () => clock,
+  });
+  const refused = assert.rejects(probe, (error) => {
+    assert.equal(error.qaReason, "timer_stalled");
+    assert.deepEqual(error.qaEvidence.timer, { sampleCount: 3, uniqueCount: 3, advanced: false });
+    return true;
+  });
+  await inFlight;
+  generation.abort();
+  completeSnapshot({ refreshText: "Analyzing… 0s" });
+  await refused;
+  assert.equal(reads, 4);
+});
+
+test("cancel mode closes the initial timer directly before its first click", async () => {
+  const source = await readFile(new URL("../scripts/qa-electron-macos-real-history.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("async function runCancelMode(session)");
+  const end = source.indexOf("\nfunction visibleInRenderer", start);
+  const cancelMode = source.slice(start, end);
+  assert.match(cancelMode, /signal: timerGeneration\.signal/u);
+  assert.match(cancelMode, /timerGeneration\.abort\(\);\s+await clickCancel\(session\);/u);
+  assert.match(cancelMode, /catch \(error\) \{\s+timerGeneration\.abort\(\);\s+await timerPromise;/u);
 });
 
 test("cancel mode requires an observed pre-quick refresh boundary", () => {
