@@ -33,9 +33,12 @@ const APP_EXECUTABLE = "TiboTattle Dev.exe";
 const UNINSTALLER = "Uninstall TiboTattle Dev.exe";
 const APP_BUILDER_LIB_VERSION = "26.15.7";
 // UUID v5(appId, electron-builder's pinned NSIS namespace) for the fixed
-// development appId com.adamallcock.tibotattle.electron.dev. This runner
-// checks it only; it never creates, repairs, or removes registry entries.
-const UNINSTALL_REGISTRY_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\962AD905-00AD-56CE-85F1-F2541D787AC7";
+// development appId com.adamallcock.tibotattle.electron.dev. The pinned NSIS
+// template writes InstallLocation to this install key; the distinct Uninstall
+// key contains only uninstall metadata. This runner checks it only; it never
+// creates, repairs, or removes registry entries.
+export const WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY =
+  "Software\\962AD905-00AD-56CE-85F1-F2541D787AC7";
 const PROCESS_SNAPSHOT_TIMEOUT_MS = 20_000;
 const INSTALLER_TIMEOUT_MS = 180_000;
 const UNINSTALLER_TIMEOUT_MS = 120_000;
@@ -164,7 +167,8 @@ export function buildWindowsNsisInstallArguments(installationRoot) {
  * The lifecycle runner must be the first controlled application launch. This
  * source check binds that assumption to the exact pinned NSIS template: its
  * silent branch reaches StartApp only for the explicit force-run flag, which
- * our closed install arguments do not contain.
+ * our closed install arguments do not contain. It also binds the separate
+ * install-registration key to the template's InstallLocation write.
  */
 export async function assertPinnedNsisSilentInstallDoesNotAutoRun({
   resolveModule = (specifier) => require.resolve(specifier),
@@ -190,11 +194,15 @@ export async function assertPinnedNsisSilentInstallDoesNotAutoRun({
   let metadata;
   let installSection;
   let targetSource;
+  let multiUser;
+  let installer;
   try {
-    [metadata, installSection, targetSource] = await Promise.all([
+    [metadata, installSection, targetSource, multiUser, installer] = await Promise.all([
       readText(packagePath),
       readText(join(packageRoot, "templates", "nsis", "installSection.nsh")),
       readText(join(packageRoot, "out", "targets", "nsis", "NsisTarget.js")),
+      readText(join(packageRoot, "templates", "nsis", "multiUser.nsh")),
+      readText(join(packageRoot, "templates", "nsis", "include", "installer.nsh")),
     ]);
     metadata = JSON.parse(metadata);
   } catch {
@@ -202,6 +210,7 @@ export async function assertPinnedNsisSilentInstallDoesNotAutoRun({
   }
   if (metadata?.name !== "app-builder-lib" || metadata.version !== APP_BUILDER_LIB_VERSION
       || typeof installSection !== "string" || typeof targetSource !== "string"
+      || typeof multiUser !== "string" || typeof installer !== "string"
       // The generator must reserve force-run as an explicit command-line
       // switch, rather than making it a default installer action.
       || !/\.flags\(\["updated",\s*"force-run"/u.test(targetSource)
@@ -209,7 +218,11 @@ export async function assertPinnedNsisSilentInstallDoesNotAutoRun({
       // runner is silent and supplies neither force-run spelling.
       || !/!ifdef ONE_CLICK[\s\S]*?!ifdef RUN_AFTER_FINISH[\s\S]*?\$\{ifNot\}\s+\$\{Silent\}[\s\S]*?\$\{orIf\}\s+\$\{isForceRun\}[\s\S]*?!insertmacro doStartApp[\s\S]*?!else[\s\S]*?\$\{if\}\s+\$\{isForceRun\}[\s\S]*?!insertmacro doStartApp[\s\S]*?!endif[\s\S]*?!insertmacro quitSuccess/u.test(installSection)
       // Assisted installers likewise require force-run in their silent path.
-      || !/!else[\s\S]*?\$\{if\}\s+\$\{isForceRun\}[\s\S]*?\$\{andIf\}\s+\$\{Silent\}[\s\S]*?!insertmacro doStartApp/u.test(installSection)) {
+      || !/!else[\s\S]*?\$\{if\}\s+\$\{isForceRun\}[\s\S]*?\$\{andIf\}\s+\$\{Silent\}[\s\S]*?!insertmacro doStartApp/u.test(installSection)
+      // The per-user install key is intentionally separate from the uninstall
+      // record and is where electron-builder persists InstallLocation.
+      || !/!define\s+\/ifndef\s+INSTALL_REGISTRY_KEY\s+"Software\\\$\{APP_GUID\}"/u.test(multiUser)
+      || !/!macro registryAddInstallInfo[\s\S]*?WriteRegStr\s+SHELL_CONTEXT\s+"\$\{INSTALL_REGISTRY_KEY\}"\s+InstallLocation\s+"\$INSTDIR"/u.test(installer)) {
     fail("NSIS_TEMPLATE_UNVERIFIED");
   }
   const argumentsForEmptyRoot = buildWindowsNsisInstallArguments("C:\\runner\\tmp\\app");
@@ -571,7 +584,7 @@ function fixedPowerShellExpectedPathPrelude() {
 /** A fixed, read-only Registry API probe with no raw registry value in stdout. */
 export function buildWindowsNsisRegistryInspectionArguments(expectedInstallationRoot) {
   if (!validAbsolutePath(expectedInstallationRoot)) fail("REGISTRY_UNAVAILABLE");
-  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\962AD905-00AD-56CE-85F1-F2541D787AC7',$false);if($null -eq $key){[Console]::Out.Write('absent-v1');exit 0};try{$value=$key.GetValue('InstallLocation',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($value -isnot [string]){throw 'install-location'};$observed=ConvertTo-CanonicalLifecyclePath($value);if([string]::Equals($observed,$expected,[System.StringComparison]::OrdinalIgnoreCase)){[Console]::Out.Write('expected-v1')}else{[Console]::Out.Write('other-v1')}}finally{$key.Dispose()}`;
+  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('${WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY}',$false);if($null -eq $key){[Console]::Out.Write('absent-v1');exit 0};try{$value=$key.GetValue('InstallLocation',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($value -isnot [string]){throw 'install-location'};$observed=ConvertTo-CanonicalLifecyclePath($value);if([string]::Equals($observed,$expected,[System.StringComparison]::OrdinalIgnoreCase)){[Console]::Out.Write('expected-v1')}else{[Console]::Out.Write('other-v1')}}finally{$key.Dispose()}`;
   return Object.freeze([
     "-NoLogo",
     "-NoProfile",

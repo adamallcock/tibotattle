@@ -21,6 +21,7 @@ import {
   parseWindowsProcessSnapshot,
   runWindowsNsisLifecycleProgram,
   runWindowsNsisLifecycle,
+  WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY,
   WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY,
 } from "../scripts/smoke-electron-windows-nsis-lifecycle.mjs";
 
@@ -129,6 +130,12 @@ test("pinned NSIS source proves a silent install cannot start the app without fo
     "!endif",
   ].join("\n");
   const target = 'scriptGenerator.flags(["updated", "force-run", "keep-shortcuts"]);';
+  const multiUser = '!define /ifndef INSTALL_REGISTRY_KEY "Software\\${APP_GUID}"';
+  const installer = [
+    "!macro registryAddInstallInfo",
+    '  WriteRegStr SHELL_CONTEXT "${INSTALL_REGISTRY_KEY}" InstallLocation "$INSTDIR"',
+    "!macroend",
+  ].join("\n");
   await assert.doesNotReject(assertPinnedNsisSilentInstallDoesNotAutoRun({
     resolveModule: (specifier) => {
       assert.equal(specifier, "electron-builder");
@@ -144,6 +151,8 @@ test("pinned NSIS source proves a silent install cannot start the app without fo
       if (path === packagePath) return JSON.stringify({ name: "app-builder-lib", version: "26.15.7" });
       if (path === join(packageRoot, "templates", "nsis", "installSection.nsh")) return installSection;
       if (path === join(packageRoot, "out", "targets", "nsis", "NsisTarget.js")) return target;
+      if (path === join(packageRoot, "templates", "nsis", "multiUser.nsh")) return multiUser;
+      if (path === join(packageRoot, "templates", "nsis", "include", "installer.nsh")) return installer;
       throw new Error("unexpected source");
     },
   }));
@@ -161,6 +170,8 @@ test("registry and exact-executable probes use fixed read-only PowerShell contra
   const registryArguments = buildWindowsNsisRegistryInspectionArguments(installationRoot);
   assert.equal(registryArguments.includes(installationRoot), false);
   assert.match(registryArguments[4], /Registry\]::CurrentUser\.OpenSubKey/u);
+  assert.ok(registryArguments[4].includes(WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY));
+  assert.doesNotMatch(registryArguments[4], /CurrentVersion\\Uninstall/u);
   assert.match(registryArguments[4], new RegExp(WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY, "u"));
   assert.match(registryArguments[4], /ConvertTo-CanonicalLifecyclePath/u);
   assert.match(registryArguments[4], /\$observed=ConvertTo-CanonicalLifecyclePath\(\$value\)/u);
@@ -237,6 +248,79 @@ test("Windows PowerShell fixed path probe rejects missing and malformed child va
     assert.notEqual(result.status, 0);
     assert.equal(result.stdout, "");
   }
+});
+
+test("Windows hosted CI classifies a disposable present install-location key", {
+  skip: process.platform !== "win32" || process.arch !== "x64" || process.env.GITHUB_ACTIONS !== "true",
+}, () => {
+  const systemRoot = process.env.SystemRoot;
+  const runnerTemp = process.env.RUNNER_TEMP;
+  assert.equal(typeof systemRoot, "string");
+  assert.equal(typeof runnerTemp, "string");
+  const executable = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const expectedPath = join(runnerTemp, "tibotattle-nsis-present-key-probe");
+  const argumentsList = buildWindowsNsisRegistryInspectionArguments(expectedPath);
+  const environment = {
+    ...process.env,
+    [WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY]: expectedPath,
+  };
+  const invoke = (argumentsForProgram) => spawnSync(executable, argumentsForProgram, {
+    encoding: "utf8",
+    timeout: 20_000,
+    shell: false,
+    windowsHide: true,
+    stdio: ["ignore", "pipe", "ignore"],
+    env: environment,
+  });
+  const inspect = () => invoke(argumentsList);
+  const assertSuccess = (result) => {
+    assert.equal(result.error, undefined);
+    assert.equal(result.signal, null);
+    assert.equal(result.status, 0);
+  };
+  const preexisting = inspect();
+  assertSuccess(preexisting);
+  // This test writes only a key proven absent in a disposable hosted runner.
+  // It never replaces an existing development installation record.
+  assert.equal(parseWindowsNsisRegistryInspectionResult(preexisting.stdout), "absent-v1");
+  const expectedPathLookup = `[Environment]::GetEnvironmentVariable('${WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY}','Process')`;
+  const create = [
+    "$ErrorActionPreference='Stop';",
+    `$subKey='${WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY}';`,
+    `$expected=${expectedPathLookup};`,
+    "if($expected -isnot [string] -or [string]::IsNullOrWhiteSpace($expected) -or -not [System.IO.Path]::IsPathRooted($expected)){throw 'expected-path'};",
+    "$existing=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subKey,$false);",
+    "if($null -ne $existing){try{throw 'preexisting'}finally{$existing.Dispose()}};",
+    "$key=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey,$true);",
+    "if($null -eq $key){throw 'create'};",
+    "try{$key.SetValue('InstallLocation',$expected,[Microsoft.Win32.RegistryValueKind]::String)}finally{$key.Dispose()}",
+  ].join("");
+  const remove = [
+    "$ErrorActionPreference='Stop';",
+    `$subKey='${WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY}';`,
+    `$expected=${expectedPathLookup};`,
+    "$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subKey,$true);",
+    "if($null -eq $key){throw 'missing'};",
+    "try{$value=$key.GetValue('InstallLocation',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($value -cne $expected){throw 'ownership'}}finally{$key.Dispose()};",
+    "[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($subKey,$false)",
+  ].join("");
+  let created = false;
+  try {
+    const setup = invoke(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", create]);
+    assertSuccess(setup);
+    created = true;
+    const present = inspect();
+    assertSuccess(present);
+    assert.equal(parseWindowsNsisRegistryInspectionResult(present.stdout), "expected-v1");
+  } finally {
+    if (created) {
+      const cleanup = invoke(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", remove]);
+      assertSuccess(cleanup);
+    }
+  }
+  const absent = inspect();
+  assertSuccess(absent);
+  assert.equal(parseWindowsNsisRegistryInspectionResult(absent.stdout), "absent-v1");
 });
 
 test("a non-closing installer process produces a bounded unsettled result", async () => {
