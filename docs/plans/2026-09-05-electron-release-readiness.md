@@ -38,15 +38,34 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest completed four-target run: `43c59fdd` in
+Latest four-target results: `40c21ade` in
+[run 34204270030](https://github.com/adamallcock/tibotattle/actions/runs/34204270030)
+passes both Mac builds. Windows passes native, companion, packaging, packaged
+credential and installer-contract checks, then the actual NSIS journey fails
+with `ELECTRON_WINDOWS_NSIS_LIFECYCLE_REGISTRY_UNAVAILABLE`. The installer
+completes and settles, then the first post-install registry inspection fails.
+Installed-byte validation, app launch/restart and owned uninstall are not reached;
+this does not establish an installed app failure or qualify the lifecycle.
+Linux compiles and packages, then the direct native diagnostic reports
+`CREATE_MUTATION_NATIVE_COLLECTION_NULL_UNAVAILABLE`: collection resolution
+returns no object or error before intent or credential mutation. Both failures
+remain open pending native reruns. The Linux repair at `214b953f` explicitly
+acquires and retains the default service proxy through collection lookup and
+creation; 21 local focused tests pass, with two native-only exclusions, and
+architecture checks pass. It retains the diagnostic categories until native
+verification. The Windows repair at `db621767` selects the pinned install-registration key
+for `InstallLocation`; absence covers both install and uninstall records, and
+orphaned records are refused. Twenty-three integrated Windows/workflow tests
+pass locally, with two native-only exclusions. This fixes test inspection and
+does not itself qualify app launch or restart.
+
+The preceding `43c59fdd`
 [run 34202605849](https://github.com/adamallcock/tibotattle/actions/runs/34202605849)
-passes both Mac builds and Windows packaged credential checks. Windows's new
-native PowerShell contract passes, but two portable contract cases fail before
+passes both Mac builds and Windows packaged credential checks. Windows's native
+PowerShell contract passes, but two portable contract cases fail before
 installation: relative NSIS targets were resolved into valid-looking Windows
-paths, and the template fixture assumed slash separators. The original failed
-run is preserved. Both repairs pass locally (19 tests, one native-only exclusion),
-and the installer remains unexecuted pending the next native run. Linux still
-fails its credential qualification step.
+paths, and the template fixture assumed slash separators. Both repairs pass in
+the subsequent native run. The original failure remains preserved.
 
 The preceding direct Linux diagnostic run: `7731a6e3` in
 [run 34200413924](https://github.com/adamallcock/tibotattle/actions/runs/34200413924)
