@@ -18,7 +18,7 @@ Latest native run: `90486dc6` in
 [run 34194270068](https://github.com/adamallcock/tibotattle/actions/runs/34194270068)
 passes both Macs and Windows, including the repaired packager's real runtime
 configuration tests. Linux compiles and packages successfully, then fails the new
-fixed account-observation test at the first `CREATE`, after initial read,
+fixed account-observation test in its first `CREATE` phase, after initial read,
 absent-intent refusal and the separate default-state marker pass. The preceding
 `5d57f4e3` failure remains preserved with exact package hashes; the newer fixed
 diagnostic localizes the failure without printing native errors or weakening
@@ -69,7 +69,8 @@ container and requires the success marker after assertions; a skipped test
 cannot qualify it. Portable integration passes 46 tests with one native-only
 exclusion, 32 packaging tests with two artifact exclusions, and architecture
 checks. Native compilation passes; `34194270068` localizes the fixed observation
-execution failure to its first creation. The remaining repair must pass that
+execution failure to its first creation phase, which also contains a preliminary
+read. The remaining repair must pass that
 native journey before any runtime-readiness claim.
 
 Windows signing configuration is repaired at `48da8404` and `261bfa83`. The
@@ -80,6 +81,19 @@ behavior. Nineteen tests pass against the actual installed patch, including real
 configuration validation, target-completion ordering, cancellation and the
 non-Windows path. All four development runners now execute these tests. This
 uses no signing credentials and does not qualify Authenticode or installation.
+
+The next Windows qualification slice is an actual unsigned NSIS install,
+two independent top-level launches in one synthetic profile, and owned uninstall
+with a registry cleanup check on the disposable native runner. It must distinguish
+whole-app restart from retained credential or data continuity. The existing
+credential journey deletes its synthetic installation record before exit.
+Production finalization also needs a signed-resource composition: the development
+loader pins unsigned native hashes and the development product identity. A signer
+alone cannot activate that loader. The source preparer uses `win32-x64` paths and
+target metadata, while the separate Windows signing configuration uses
+`windows-x64` paths and the `win32` target selector. Those inputs need an explicit
+checked mapping in the future finalizer, using existing release-evidence trust
+contracts; no duplicate readiness authority or permissive production flag.
 
 The earlier all-four development packaging baseline passes at
 `f26146aaf7fe34845ed7192ae0100e88b9d9b660` in

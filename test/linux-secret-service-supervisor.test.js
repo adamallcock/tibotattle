@@ -352,6 +352,21 @@ test("native observation proof requires actual success marker and bounded fixed 
     stdout: "# LINUX_ACCOUNT_OBSERVATION_PHASE_INITIAL_READ\n# LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE\nprivate native diagnostic\n",
   }), (error) => error.code === "LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED_CREATE"
     && error.message === "LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED");
+  for (const phase of [
+    "CREATE_PRECHECK", "CREATE_PRECHECK_UNAVAILABLE", "CREATE_PRECHECK_RECOVERY_REQUIRED",
+    "CREATE_PRECHECK_OTHER", "CREATE_MUTATION", "CREATE_MUTATION_UNAVAILABLE",
+    "CREATE_MUTATION_RECOVERY_REQUIRED", "CREATE_MUTATION_OTHER",
+  ]) {
+    assert.throws(() => execute({
+      status: 1, signal: null,
+      stdout: `# LINUX_ACCOUNT_OBSERVATION_PHASE_INITIAL_READ\r\n# LINUX_ACCOUNT_OBSERVATION_PHASE_${phase}\r\nprivate native diagnostic\r\n`,
+    }), (error) => error.code === `LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED_${phase}`
+      && error.message === "LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED");
+  }
+  assert.throws(() => execute({
+    status: 1, signal: null,
+    stdout: "# LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION\n# LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION_PRIVATE_DATA\n",
+  }), (error) => error.code === "LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED_CREATE_MUTATION");
   assert.throws(() => execute({
     status: 1, signal: null,
     stdout: "# LINUX_ACCOUNT_OBSERVATION_PHASE_PRIVATE_DATA\n",
