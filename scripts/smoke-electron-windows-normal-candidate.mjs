@@ -198,10 +198,8 @@ const FAILURE_CODES = new Set([
   "DASHBOARD_UNAVAILABLE",
   "DASHBOARD_INVALID",
   "LOCAL_REFRESH_UNAVAILABLE",
-  "LOCAL_REFRESH_BUTTON_UNAVAILABLE",
-  "LOCAL_REFRESH_REQUEST_UNOBSERVED",
-  "LOCAL_REFRESH_ACCEPTANCE_UNAVAILABLE",
-  "LOCAL_REFRESH_COMPLETION_UNAVAILABLE",
+  "LOCAL_STARTUP_REFRESH_UNAVAILABLE",
+  "LOCAL_STARTUP_REFRESH_COMPLETION_UNAVAILABLE",
   "SETTINGS_UNAVAILABLE",
   "SETTINGS_PERSISTENCE_INVALID",
   "CLEAN_QUIT_INVALID",
@@ -1361,6 +1359,7 @@ function localNetworkObserver(cdp, dashboardOrigin) {
   const removeSocket = cdp.on("Network.webSocketCreated", ({ url } = {}) => inspect(url));
   return Object.freeze({
     resetRefreshes() { refreshes = 0; },
+    refreshCount() { return refreshes; },
     refreshObserved() { return refreshes > 0; },
     valid() { return !invalid; },
     dispose() { removeRequest(); removeSocket(); },
@@ -1512,39 +1511,32 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
     const health = await jsonFetch(new URL("/api/local/health", dashboard), { fetchImpl });
     if (health?.status !== "ready") fail("DASHBOARD_UNAVAILABLE");
     const refreshEndpoint = new URL("/api/local/refresh", dashboard);
-    const beforeRefresh = await jsonFetch(refreshEndpoint, { fetchImpl });
-    const previousRefreshId = beforeRefresh?.refresh?.refreshId ?? null;
-    observer.resetRefreshes();
-    const clicked = await waitFor(() => cdp.evaluate(`(() => {
-      const button = document.querySelector("#refresh-button");
-      if (!button || button.disabled) return false;
-      button.click();
-      return true;
-    })()`), OPERATION_TIMEOUT_MS);
-    if (clicked !== true) fail("LOCAL_REFRESH_BUTTON_UNAVAILABLE");
-    if (await waitFor(() => observer.refreshObserved(), OPERATION_TIMEOUT_MS) !== true) {
-      fail("LOCAL_REFRESH_REQUEST_UNOBSERVED");
-    }
+    // Ordinary Electron runs one launch-time refresh and holds manual Refresh
+    // disabled while it is active. The observer is attached before dashboard
+    // readiness, so require its exact one local POST instead of clicking a
+    // second operation into that intentional busy state.
     const accepted = await waitFor(async () => {
+      if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
       const decision = classifyAutomaticStartupRefreshReceipt({
         phase: "acceptance",
-        requestCount: observer.refreshObserved() ? 1 : 0,
+        requestCount: observer.refreshCount(),
         refresh: (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
-        previousRefreshId,
+        previousRefreshId: null,
       });
       return decision.status === "accepted" ? decision : null;
     }, STARTUP_TIMEOUT_MS);
-    if (accepted === null) fail("LOCAL_REFRESH_ACCEPTANCE_UNAVAILABLE");
+    if (accepted === null) fail("LOCAL_STARTUP_REFRESH_UNAVAILABLE");
     const terminal = await waitFor(async () => {
+      if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
       const decision = classifyAutomaticStartupRefreshReceipt({
         phase: "completion",
-        requestCount: observer.refreshObserved() ? 1 : 0,
+        requestCount: observer.refreshCount(),
         refresh: (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
         expectedRefreshId: accepted.refreshId,
       });
       return decision.status === "completed" ? decision : null;
     }, STARTUP_TIMEOUT_MS);
-    if (terminal === null) fail("LOCAL_REFRESH_COMPLETION_UNAVAILABLE");
+    if (terminal === null) fail("LOCAL_STARTUP_REFRESH_COMPLETION_UNAVAILABLE");
     if (!observer.valid()) fail("DASHBOARD_INVALID");
     return Object.freeze({
       dashboardOrigin: dashboard.origin,
