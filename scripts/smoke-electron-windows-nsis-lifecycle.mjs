@@ -86,6 +86,9 @@ const POST_UNINSTALL_PHASES = new Set([
   "install_root_present",
   "uninstall_registry_present",
   "both_predicates_present",
+  "install_root_probe_unavailable",
+  "uninstall_registry_probe_unavailable",
+  "postcondition_wait_unavailable",
   "postcondition_probe_unavailable",
   "postcondition_budget_exhausted",
 ]);
@@ -93,9 +96,20 @@ const POST_UNINSTALL_FAILURE_CODES = Object.freeze({
   install_root_present: `${PREFIX}POST_UNINSTALL_INSTALL_ROOT_PRESENT`,
   uninstall_registry_present: `${PREFIX}POST_UNINSTALL_UNINSTALL_REGISTRY_PRESENT`,
   both_predicates_present: `${PREFIX}POST_UNINSTALL_PREDICATES_PRESENT`,
+  install_root_probe_unavailable: `${PREFIX}POST_UNINSTALL_INSTALL_ROOT_PROBE_UNAVAILABLE`,
+  uninstall_registry_probe_unavailable: `${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_UNAVAILABLE`,
+  postcondition_wait_unavailable: `${PREFIX}POST_UNINSTALL_WAIT_UNAVAILABLE`,
   postcondition_probe_unavailable: `${PREFIX}POST_UNINSTALL_PROBE_UNAVAILABLE`,
   postcondition_budget_exhausted: `${PREFIX}POST_UNINSTALL_BUDGET_EXHAUSTED`,
 });
+const POST_UNINSTALL_REGISTRY_PROBE_FAILURE_CODES = new Set([
+  `${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_UNAVAILABLE`,
+  `${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_TIMED_OUT`,
+  `${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_UNSETTLED`,
+  `${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_START_UNAVAILABLE`,
+  `${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_EXIT_NONZERO`,
+  `${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_OUTPUT_INVALID`,
+]);
 const FIRST_LAUNCH_FAILURE_CODES = new Set([
   `${PREFIX}FAILED`,
   `${PREFIX}APPLICATION_LAUNCH_UNAVAILABLE`,
@@ -223,13 +237,17 @@ function boundedFirstLaunchDiagnostic(diagnostic) {
   });
 }
 
-function postUninstallResult(phase) {
+function postUninstallResult(phase, failureCode = null) {
   if (!POST_UNINSTALL_PHASES.has(phase)) fail("POST_UNINSTALL_DIAGNOSTIC_INVALID");
+  const selectedFailureCode = phase === "uninstall_registry_probe_unavailable"
+      && POST_UNINSTALL_REGISTRY_PROBE_FAILURE_CODES.has(failureCode)
+    ? failureCode
+    : POST_UNINSTALL_FAILURE_CODES[phase] ?? null;
   return Object.freeze({
     installRootAbsent: phase === "both_predicates_absent",
     uninstallRegistryAbsent: phase === "both_predicates_absent",
     phase,
-    failureCode: POST_UNINSTALL_FAILURE_CODES[phase] ?? null,
+    failureCode: selectedFailureCode,
   });
 }
 
@@ -237,8 +255,7 @@ function boundedPostUninstallDiagnostic(diagnostic) {
   const phase = POST_UNINSTALL_PHASES.has(diagnostic?.phase)
     ? diagnostic.phase
     : "not_attempted";
-  const failureCode = POST_UNINSTALL_FAILURE_CODES[phase] ?? null;
-  return Object.freeze({ phase, failureCode });
+  return postUninstallResult(phase, diagnostic?.failureCode);
 }
 
 function validAbsolutePath(value) {
@@ -769,6 +786,16 @@ export function parseWindowsNsisRegistryInspectionResult(output) {
   fail("REGISTRY_UNAVAILABLE");
 }
 
+function failRegistryUnavailable(postUninstallFailureCode = null) {
+  const error = Object.assign(new Error(`${PREFIX}REGISTRY_UNAVAILABLE`), {
+    code: `${PREFIX}REGISTRY_UNAVAILABLE`,
+  });
+  if (POST_UNINSTALL_REGISTRY_PROBE_FAILURE_CODES.has(postUninstallFailureCode)) {
+    error.postUninstallRegistryProbeFailureCode = postUninstallFailureCode;
+  }
+  throw error;
+}
+
 function fixedPowerShellExpectedPathPrelude() {
   return `function ConvertTo-CanonicalLifecyclePath([string]$path){$full=[System.IO.Path]::GetFullPath($path);$root=[System.IO.Path]::GetPathRoot($full);if([string]::IsNullOrWhiteSpace($root) -or -not [System.IO.Path]::IsPathRooted($full)){throw 'expected-path'};if($full.Length -gt $root.Length){return $full.TrimEnd([System.IO.Path]::DirectorySeparatorChar,[System.IO.Path]::AltDirectorySeparatorChar)};return $full};$expectedPathRaw=[Environment]::GetEnvironmentVariable('${WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY}','Process');if($expectedPathRaw -isnot [string] -or [string]::IsNullOrWhiteSpace($expectedPathRaw) -or -not [System.IO.Path]::IsPathRooted($expectedPathRaw)){throw 'expected-path'};$expected=ConvertTo-CanonicalLifecyclePath($expectedPathRaw);`;
 }
@@ -797,7 +824,7 @@ async function defaultInspectRegistry({
   timeoutMs = PROCESS_SNAPSHOT_TIMEOUT_MS,
 }) {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > PROCESS_SNAPSHOT_TIMEOUT_MS) {
-    fail("REGISTRY_UNAVAILABLE");
+    failRegistryUnavailable();
   }
   const command = systemExecutable(environment, [
     "System32",
@@ -811,9 +838,24 @@ async function defaultInspectRegistry({
     environment,
     fixedProbePath: expectedInstallationRoot,
   });
-  if (!validProgramResult(result, true)) fail("REGISTRY_UNAVAILABLE");
-  if (!result.settled || result.timedOut || result.exitCode !== 0) fail("REGISTRY_UNAVAILABLE");
-  return parseWindowsNsisRegistryInspectionResult(result.stdout);
+  if (!validProgramResult(result, true)) failRegistryUnavailable();
+  if (result.timedOut) {
+    failRegistryUnavailable(`${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_TIMED_OUT`);
+  }
+  if (!result.settled) {
+    failRegistryUnavailable(`${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_UNSETTLED`);
+  }
+  if (result.exitCode === null) {
+    failRegistryUnavailable(`${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_START_UNAVAILABLE`);
+  }
+  if (result.exitCode !== 0) {
+    failRegistryUnavailable(`${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_EXIT_NONZERO`);
+  }
+  try {
+    return parseWindowsNsisRegistryInspectionResult(result.stdout);
+  } catch {
+    failRegistryUnavailable(`${PREFIX}POST_UNINSTALL_REGISTRY_PROBE_OUTPUT_INVALID`);
+  }
 }
 
 async function defaultExecuteInstaller({ installerPath, installationRoot, environment, runProgram }) {
@@ -1579,7 +1621,7 @@ async function observeUninstallPostconditions({
     try {
       installRootAbsent = await isMissing(installationRoot);
     } catch {
-      return postUninstallResult("postcondition_probe_unavailable");
+      return postUninstallResult("install_root_probe_unavailable");
     }
     const remainingBeforeProbe = remainingBudget();
     // runWindowsNsisLifecycleProgram can spend its timeout plus a termination
@@ -1599,8 +1641,11 @@ async function observeUninstallPostconditions({
         expectedInstallationRoot: installationRoot,
         timeoutMs: registryTimeoutMs,
       })) === REGISTRY_ABSENT;
-    } catch {
-      return postUninstallResult("postcondition_probe_unavailable");
+    } catch (error) {
+      return postUninstallResult(
+        "uninstall_registry_probe_unavailable",
+        error?.postUninstallRegistryProbeFailureCode,
+      );
     }
     if (!(remainingBudget() >= 0)) break;
     if (installRootAbsent && uninstallRegistryAbsent) {
@@ -1620,7 +1665,7 @@ async function observeUninstallPostconditions({
       try {
         await waitForCleanupPoll(delayMs);
       } catch {
-        return postUninstallResult("postcondition_probe_unavailable");
+        return postUninstallResult("postcondition_wait_unavailable");
       }
     }
   }

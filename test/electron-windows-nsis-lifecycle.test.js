@@ -1363,6 +1363,150 @@ test("post-uninstall polling uses one monotonic budget across fixed probes", asy
   }
 });
 
+test("post-uninstall receipts isolate fixed probe failures without releasing the owned root", async (t) => {
+  const registryProbeScenario = (name, result, failureCode) => ({
+    name,
+    phase: "uninstall_registry_probe_unavailable",
+    failureCode,
+    isMissing: async () => true,
+    runProgram: (() => {
+      let calls = 0;
+      return async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { settled: true, timedOut: false, exitCode: 0, stdout: "absent-v1" };
+        }
+        if (calls === 2) {
+          return { settled: true, timedOut: false, exitCode: 0, stdout: "expected-v1" };
+        }
+        return result;
+      };
+    })(),
+  });
+  const scenarios = [
+    {
+      name: "install-root read",
+      phase: "install_root_probe_unavailable",
+      failureCode: "ELECTRON_WINDOWS_NSIS_LIFECYCLE_POST_UNINSTALL_INSTALL_ROOT_PROBE_UNAVAILABLE",
+      isMissing: (() => {
+        let calls = 0;
+        return async () => {
+          calls += 1;
+          if (calls === 2) throw new Error("synthetic missing-path refusal");
+          return true;
+        };
+      })(),
+      inspectRegistry: (() => {
+        let calls = 0;
+        return async () => {
+          calls += 1;
+          return calls === 1 ? "absent-v1" : "expected-v1";
+        };
+      })(),
+    },
+    registryProbeScenario(
+      "registry timeout",
+      { settled: false, timedOut: true, exitCode: null, stdout: "" },
+      "ELECTRON_WINDOWS_NSIS_LIFECYCLE_POST_UNINSTALL_REGISTRY_PROBE_TIMED_OUT",
+    ),
+    registryProbeScenario(
+      "unsettled registry child",
+      { settled: false, timedOut: false, exitCode: null, stdout: "" },
+      "ELECTRON_WINDOWS_NSIS_LIFECYCLE_POST_UNINSTALL_REGISTRY_PROBE_UNSETTLED",
+    ),
+    registryProbeScenario(
+      "registry child unavailable at start",
+      { settled: true, timedOut: false, exitCode: null, stdout: "" },
+      "ELECTRON_WINDOWS_NSIS_LIFECYCLE_POST_UNINSTALL_REGISTRY_PROBE_START_UNAVAILABLE",
+    ),
+    registryProbeScenario(
+      "registry child nonzero exit",
+      { settled: true, timedOut: false, exitCode: 1, stdout: "" },
+      "ELECTRON_WINDOWS_NSIS_LIFECYCLE_POST_UNINSTALL_REGISTRY_PROBE_EXIT_NONZERO",
+    ),
+    registryProbeScenario(
+      "registry child invalid output",
+      { settled: true, timedOut: false, exitCode: 0, stdout: "invalid" },
+      "ELECTRON_WINDOWS_NSIS_LIFECYCLE_POST_UNINSTALL_REGISTRY_PROBE_OUTPUT_INVALID",
+    ),
+    {
+      name: "postcondition wait",
+      phase: "postcondition_wait_unavailable",
+      failureCode: "ELECTRON_WINDOWS_NSIS_LIFECYCLE_POST_UNINSTALL_WAIT_UNAVAILABLE",
+      isMissing: (() => {
+        let calls = 0;
+        return async () => {
+          calls += 1;
+          return calls === 1;
+        };
+      })(),
+      inspectRegistry: (() => {
+        let calls = 0;
+        return async () => {
+          calls += 1;
+          return calls === 1 ? "absent-v1" : "expected-v1";
+        };
+      })(),
+      waitForCleanupPoll: async () => { throw new Error("synthetic wait refusal"); },
+    },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-postcondition-diagnostic-test-"));
+      const receiptPath = join(root, "receipt.json");
+      const ownedRoot = join(root, "owned");
+      let removedRoots = 0;
+      try {
+        await assert.rejects(runWindowsNsisLifecycle({
+          installerPath: join(root, "installer.exe"),
+          stagedAppPath: join(root, "staged"),
+          packageReceiptPath: join(root, "development-package.json"),
+          sourceRevision: revision,
+          receiptPath,
+        }, {
+          platform: "win32",
+          architecture: "x64",
+          environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: root, SystemRoot: root },
+          verifyInstaller: async () => ({ sourceRevision: revision, installerBytes: 123, installerSha256: "b".repeat(64) }),
+          verifySilentNsisTemplate: async () => true,
+          createOwnedRoot: async () => ownedRoot,
+          isMissing: scenario.isMissing,
+          ...(scenario.inspectRegistry ? { inspectRegistry: scenario.inspectRegistry } : {}),
+          ...(scenario.runProgram ? { runProgram: scenario.runProgram } : {}),
+          executeInstaller: async () => ({ settled: true, succeeded: true }),
+          assertUninstaller: async () => {},
+          verifyInstalledPackage: async () => installedIdentity,
+          prepareProfile: async ({ profilePath }) => profile(profilePath),
+          prepareFirstRun: async () => {},
+          launchAndExercise: async ({ launchOrdinal }) => ({
+            pid: launchOrdinal === 1 ? 777 : 888,
+            observedProcessTreeExited: true,
+            installedExecutableAbsentAtPreLaunchSnapshot: true,
+            installedExecutableAbsentAtPostExitSnapshot: true,
+            storageJourneyCompleted: true,
+          }),
+          executeUninstaller: async () => ({ settled: true, succeeded: true }),
+          waitForCleanupPoll: scenario.waitForCleanupPoll ?? (async () => {}),
+          removeOwnedRoot: async () => { removedRoots += 1; },
+        }), /CLEANUP_UNCONFIRMED/u);
+        const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+        assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NSIS_LIFECYCLE_CLEANUP_UNCONFIRMED");
+        assert.equal(receipt.installationPerformed, true);
+        assert.equal(receipt.uninstallationPerformed, true);
+        assert.equal(receipt.uninstallerSettled, true);
+        assert.equal(receipt.topLevelLaunches, 2);
+        assert.equal(receipt.postUninstallPhase, scenario.phase);
+        assert.equal(receipt.postUninstallFailureCode, scenario.failureCode);
+        assert.equal(receipt.cleanupConfirmed, false);
+        assert.equal(receipt.ownedTemporaryRootRemoved, false);
+        assert.equal(removedRoots, 0);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
 test("an identity refusal writes the fixed failure receipt before any installer action", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-lifecycle-refusal-"));
   const receiptPath = join(root, "receipt.json");
