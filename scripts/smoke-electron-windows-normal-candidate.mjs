@@ -80,6 +80,9 @@ const STARTUP_TIMEOUT_MS = 30_000;
 const OPERATION_TIMEOUT_MS = 20_000;
 const PROCESS_EXIT_TIMEOUT_MS = 15_000;
 const POWERSHELL_TIMEOUT_MS = 20_000;
+// Firewall setup/readback has an independent bounded preparation budget. The
+// candidate remains ineligible to launch until this command verifies its rule.
+export const WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS = 60_000;
 const CLEANUP_TIMEOUT_MS = 10_000;
 const PROTECTED_OPT_OUT_STAGES = new Set([
   "PROTECTED_OPT_OUT_ADAPTER_UNAVAILABLE",
@@ -879,7 +882,7 @@ function validPowerShellSuccess(value, expected) {
     && value.output === expected;
 }
 
-async function installOutboundFirewallBlock({
+export async function installOutboundFirewallBlock({
   appPath,
   environment,
   name = `${FIREWALL_RULE_PREFIX}${randomUUID()}`,
@@ -891,6 +894,7 @@ async function installOutboundFirewallBlock({
   const result = await runProgram(systemPowerShell(environment), buildWindowsNormalCandidateFirewallCreateArguments(), {
     environment,
     values: { [EXPECTED_APP_ENVIRONMENT]: appPath, [FIREWALL_NAME_ENVIRONMENT]: name },
+    timeoutMs: WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
   });
   if (validPowerShellSuccess(result, "verified")) return name;
   if (result?.settled === true && result?.timedOut === false && result?.exitCode !== 0) {
@@ -899,7 +903,7 @@ async function installOutboundFirewallBlock({
   fail("FIREWALL_UNAVAILABLE");
 }
 
-async function removeOutboundFirewallBlock({ appPath, environment, name, runProgram = runFixedPowerShell } = {}) {
+export async function removeOutboundFirewallBlock({ appPath, environment, name, runProgram = runFixedPowerShell } = {}) {
   if (!exactWindowsPath(appPath) || !FIREWALL_RULE_NAME.test(name) || typeof runProgram !== "function") {
     return false;
   }
@@ -907,6 +911,7 @@ async function removeOutboundFirewallBlock({ appPath, environment, name, runProg
     const result = await runProgram(systemPowerShell(environment), buildWindowsNormalCandidateFirewallRemoveArguments(), {
       environment,
       values: { [EXPECTED_APP_ENVIRONMENT]: appPath, [FIREWALL_NAME_ENVIRONMENT]: name },
+      timeoutMs: WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
     });
     return validPowerShellSuccess(result, "removed");
   } catch {

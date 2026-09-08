@@ -19,7 +19,9 @@ import {
   buildWindowsNormalCandidateFirewallCreateArguments,
   buildWindowsNormalCandidateFirewallRemoveArguments,
   createWindowsNormalCandidateQuitProtocol,
+  installOutboundFirewallBlock,
   jsonFetch,
+  removeOutboundFirewallBlock,
   parseWindowsNormalCandidateSmokeArguments,
   prepareWindowsNormalCandidateProfile,
   runWindowsNormalCandidateSmoke,
@@ -28,6 +30,7 @@ import {
   validateWindowsNormalCandidateSmokeMetadata,
   verifyWindowsNormalCandidateOptOut,
   verifyWindowsNormalCandidateSmokePackage,
+  WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
 } from "../scripts/smoke-electron-windows-normal-candidate.mjs";
 
 const SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567";
@@ -541,6 +544,38 @@ test("normal candidate firewall scripts use only fixed child environment values 
   assert.match(remove[4], /\$filters\.Count -ne 1/u);
 });
 
+test("normal candidate firewall setup and cleanup use their dedicated bounded budget", async () => {
+  const environment = { SystemRoot: String.raw`C:\Windows` };
+  const calls = [];
+  const runProgram = async (_command, _argumentsList, options) => {
+    calls.push(options);
+    return Object.freeze({
+      settled: true,
+      timedOut: false,
+      exitCode: 0,
+      output: calls.length === 1 ? "verified" : "removed",
+    });
+  };
+  const name = await installOutboundFirewallBlock({
+    appPath: APP_PATH,
+    environment,
+    name: FIREWALL_RULE,
+    runProgram,
+  });
+  assert.equal(name, FIREWALL_RULE);
+  assert.equal(await removeOutboundFirewallBlock({
+    appPath: APP_PATH,
+    environment,
+    name,
+    runProgram,
+  }), true);
+  assert.equal(WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS, 60_000);
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.equal(call.timeoutMs, WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS);
+  }
+});
+
 test("normal candidate CDP selection accepts the real trailing-slash root and rejects other origins", () => {
   const targets = [
     {
@@ -687,4 +722,42 @@ test("normal candidate runner retains the outbound block and profile when proces
   assert.equal(receipt.outboundFirewallRuleRemoved, false);
   assert.equal(receipt.ownedProfileRemoved, false);
   assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_OWNED_PROCESS_REMAINS");
+});
+
+test("normal candidate refuses to launch before the outbound block is verified", async () => {
+  let launched = false;
+  let receipt = null;
+  await assert.rejects(runWindowsNormalCandidateSmoke(smokeOptions(), {
+    platform: "win32",
+    architecture: "x64",
+    environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: String.raw`C:\runner\temp` },
+    ensureReceiptParent: async () => {},
+    reserveReceipt: async () => ({
+      writeFile: async (value) => { receipt = JSON.parse(value); },
+      sync: async () => {},
+      close: async () => {},
+    }),
+    verifyPackage: async () => ({ sourceRevision: SOURCE_REVISION, artifactSha256: "a".repeat(64), executableSha256: "b".repeat(64) }),
+    createRoot: async () => String.raw`C:\runner\temp\owned`,
+    prepareProfile: async () => ({ root: String.raw`C:\runner\temp\owned\profile` }),
+    seedProfile: async () => ({ shareBackend: {} }),
+    assertProcessAbsence: async () => true,
+    installFirewall: async () => {
+      throw Object.assign(new Error("firewall"), {
+        code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_FIREWALL_UNAVAILABLE",
+      });
+    },
+    launchJourney: async () => {
+      launched = true;
+      return passedJourney();
+    },
+    verifyOptOut: async () => true,
+    removeFirewall: async () => true,
+    removeProfile: async () => {},
+  }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_FIREWALL_UNAVAILABLE",
+  });
+  assert.equal(launched, false);
+  assert.equal(receipt.outboundFirewallRuleVerified, false);
+  assert.equal(receipt.packagedElectronExecutionVerified, false);
 });
