@@ -199,6 +199,8 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/local-collector-projection.js",
   "src/local-collector-projection-off-main.js",
   "src/local-collector-projection-off-main-worker.js",
+  "src/local-collector-state-integrity-off-main.js",
+  "src/local-collector-state-integrity-off-main-worker.js",
   "src/local-collector-state.js",
   "src/platform/linux-secret-service-broker.js",
   "src/platform/windows-account-observation-broker.js",
