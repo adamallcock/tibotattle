@@ -76,7 +76,7 @@ test("helper preparation preflight refuses a synthetic service context with only
   assert.deepEqual(JSON.parse(result.stdout), {
     schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
     status: "failed",
-    failureStage: "login_item_status",
+    failureStage: "login_item_not_found",
   });
   assert.deepEqual(await readdir(root), before, "preflight must not create a handover state tree");
 });

@@ -225,6 +225,27 @@ test("macOS bridge accepts only closed preparation failure stages and retains le
     nativeAppPath: "/Applications/TiboTattle-old.app", candidate: CANDIDATE,
   }), (error) => error?.code === "native_electron_mac_bridge_prepare_login_item_unregister");
 
+  for (const stage of [
+    "login_item_requires_approval",
+    "login_item_not_found",
+    "login_item_status_unknown",
+    "other_same_identity_running",
+  ]) {
+    const statusFailure = createMacNativeHandoverAdapter({
+      platform: "darwin",
+      helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+      electronApp: app,
+      spawnProcess: responseSpawn({
+        schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+        status: "failed",
+        failureStage: stage,
+      }, [], { exitCode: 1 }),
+    });
+    await assert.rejects(statusFailure.prepareNativeHandover({
+      nativeAppPath: "/Applications/TiboTattle-old.app", candidate: CANDIDATE,
+    }), (error) => error?.code === `native_electron_mac_bridge_prepare_${stage}`);
+  }
+
   const legacyFailure = createMacNativeHandoverAdapter({
     platform: "darwin",
     helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",

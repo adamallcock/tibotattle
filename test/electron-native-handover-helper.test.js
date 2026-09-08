@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,6 +35,24 @@ test("native-to-Electron handover helper compiles and exposes only its no-side-e
     runNativeElectronHandoverHelperContractSmoke({ executable }),
     { status: "contract_ok" },
   );
+});
+
+test("native handover helper classifies selected, unrelated, and other same-identity process fixtures", { skip: SKIP }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-native-handover-process-classifier-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const executable = await compileNativeElectronHandoverHelper({
+    output: join(root, "TiboTattleNativeHandover"),
+    architecture: process.arch,
+  });
+  const result = spawnSync(executable, ["--process-classifier-smoke-test"], {
+    encoding: "utf8", timeout: 10_000, maxBuffer: 8 * 1024,
+    env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+  });
+  assert.equal(result.status, 0);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+    status: "process_classifier_ok",
+  });
 });
 
 test("Apple Silicon source preparation cross-compiles the thin Intel helper", {

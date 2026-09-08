@@ -27,8 +27,24 @@ enum NativeElectronHandoverHelper {
         case nativeVersion
         case loginItemUnregister
         case loginItemStatus
+        case loginItemRequiresApproval
+        case loginItemNotFound
+        case loginItemStatusUnknown
         case nativeWriter
+        case otherSameIdentityRunning
         case preferences
+    }
+
+    private struct RunningApplicationDescriptor {
+        let bundleIdentifier: String?
+        let processIdentifier: pid_t
+        let bundlePath: String?
+    }
+
+    private enum RunningApplicationClassification: Equatable {
+        case ignored
+        case selectedNative
+        case otherSameIdentity
     }
 
     static func main() {
@@ -70,6 +86,9 @@ enum NativeElectronHandoverHelper {
                 "schemaVersion": schemaVersion,
                 "status": "bundle_context_ok",
             ]
+        case "--process-classifier-smoke-test":
+            guard arguments.count == 2 else { throw BridgeFailure.invalidRequest }
+            return try processClassifierSmokeTest()
         case "--prepare":
             guard arguments.count == 4, arguments[2] == "--native-app" else {
                 throw BridgeFailure.invalidRequest
@@ -102,6 +121,7 @@ enum NativeElectronHandoverHelper {
         // old writer or withdraws its login item. A malformed legacy value
         // therefore cannot leave the predecessor partially transitioned.
         let preferences = try readPreferences(startAtLogin: startAtLogin)
+        try assertNoOtherSameIdentityApplications(nativeApplicationPath)
         try stopNativeApplications(nativeApplicationPath)
         // Withdraw the same-identity native main-app request after the old UI
         // has exited, so it cannot relaunch after the copied state is staged. A pending
@@ -146,6 +166,7 @@ enum NativeElectronHandoverHelper {
         try validatePreparationLoginItemStatus(service)
         _ = try readPreferences(startAtLogin: startAtLogin)
         try assertNativeApplicationsStopped(nativeApplicationPath)
+        try assertNoOtherSameIdentityApplications(nativeApplicationPath)
         return [
             "schemaVersion": schemaVersion,
             "status": "preflight_ready",
@@ -156,10 +177,12 @@ enum NativeElectronHandoverHelper {
         switch service.status {
         case .enabled, .notRegistered:
             return
-        case .requiresApproval, .notFound:
-            throw BridgeFailure.loginItemStatus
+        case .requiresApproval:
+            throw BridgeFailure.loginItemRequiresApproval
+        case .notFound:
+            throw BridgeFailure.loginItemNotFound
         @unknown default:
-            throw BridgeFailure.loginItemStatus
+            throw BridgeFailure.loginItemStatusUnknown
         }
     }
 
@@ -211,24 +234,91 @@ enum NativeElectronHandoverHelper {
     }
 
     private static func nativeApplications(_ nativeApplicationPath: String) -> [NSRunningApplication] {
+        NSWorkspace.shared.runningApplications.filter { application in
+            classifyRunningApplication(
+                RunningApplicationDescriptor(
+                    bundleIdentifier: application.bundleIdentifier,
+                    processIdentifier: application.processIdentifier,
+                    bundlePath: application.bundleURL?.standardizedFileURL.path
+                ),
+                nativeApplicationPath: nativeApplicationPath,
+                ownPID: ProcessInfo.processInfo.processIdentifier,
+                parentPID: getppid()
+            ) == .selectedNative
+        }
+    }
+
+    private static func classifyRunningApplication(
+        _ application: RunningApplicationDescriptor,
+        nativeApplicationPath: String,
+        ownPID: pid_t,
+        parentPID: pid_t
+    ) -> RunningApplicationClassification {
         let targetPath = URL(fileURLWithPath: nativeApplicationPath)
             .standardizedFileURL.path
-        let ownPID = ProcessInfo.processInfo.processIdentifier
-        let parentPID = getppid()
-        return NSWorkspace.shared.runningApplications.filter { application in
-            guard application.bundleIdentifier == productIdentifier,
-                  application.processIdentifier != ownPID,
-                  application.processIdentifier != parentPID,
-                  let bundleURL = application.bundleURL
-            else { return false }
-            return bundleURL.standardizedFileURL.path == targetPath
+        guard application.bundleIdentifier == productIdentifier,
+              application.processIdentifier != ownPID,
+              application.processIdentifier != parentPID
+        else { return .ignored }
+        guard application.bundlePath == targetPath else {
+            return .otherSameIdentity
         }
+        return .selectedNative
     }
 
     private static func assertNativeApplicationsStopped(_ nativeApplicationPath: String) throws {
         guard nativeApplications(nativeApplicationPath).isEmpty else {
             throw BridgeFailure.nativeWriter
         }
+    }
+
+    private static func assertNoOtherSameIdentityApplications(_ nativeApplicationPath: String) throws {
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let parentPID = getppid()
+        let hasOther = NSWorkspace.shared.runningApplications.contains { application in
+            classifyRunningApplication(
+                RunningApplicationDescriptor(
+                    bundleIdentifier: application.bundleIdentifier,
+                    processIdentifier: application.processIdentifier,
+                    bundlePath: application.bundleURL?.standardizedFileURL.path
+                ),
+                nativeApplicationPath: nativeApplicationPath,
+                ownPID: ownPID,
+                parentPID: parentPID
+            ) == .otherSameIdentity
+        }
+        guard !hasOther else { throw BridgeFailure.otherSameIdentityRunning }
+    }
+
+    private static func processClassifierSmokeTest() throws -> [String: Any] {
+        let nativePath = "/synthetic/native/TiboTattle.app"
+        let ownPID: pid_t = 41
+        let parentPID: pid_t = 42
+        let selected = RunningApplicationDescriptor(
+            bundleIdentifier: productIdentifier, processIdentifier: 51, bundlePath: nativePath
+        )
+        let unrelated = RunningApplicationDescriptor(
+            bundleIdentifier: "com.example.unrelated", processIdentifier: 52, bundlePath: "/Other.app"
+        )
+        let otherSameIdentity = RunningApplicationDescriptor(
+            bundleIdentifier: productIdentifier, processIdentifier: 53, bundlePath: "/other/TiboTattle.app"
+        )
+        let ownProcess = RunningApplicationDescriptor(
+            bundleIdentifier: productIdentifier, processIdentifier: ownPID, bundlePath: "/other/TiboTattle.app"
+        )
+        let parentProcess = RunningApplicationDescriptor(
+            bundleIdentifier: productIdentifier, processIdentifier: parentPID, bundlePath: "/other/TiboTattle.app"
+        )
+        guard classifyRunningApplication(selected, nativeApplicationPath: nativePath, ownPID: ownPID, parentPID: parentPID) == .selectedNative,
+              classifyRunningApplication(unrelated, nativeApplicationPath: nativePath, ownPID: ownPID, parentPID: parentPID) == .ignored,
+              classifyRunningApplication(otherSameIdentity, nativeApplicationPath: nativePath, ownPID: ownPID, parentPID: parentPID) == .otherSameIdentity,
+              classifyRunningApplication(ownProcess, nativeApplicationPath: nativePath, ownPID: ownPID, parentPID: parentPID) == .ignored,
+              classifyRunningApplication(parentProcess, nativeApplicationPath: nativePath, ownPID: ownPID, parentPID: parentPID) == .ignored
+        else { throw BridgeFailure.invalidRequest }
+        return [
+            "schemaVersion": schemaVersion,
+            "status": "process_classifier_ok",
+        ]
     }
 
     private static func stopNativeApplications(_ nativeApplicationPath: String) throws {
@@ -295,8 +385,16 @@ enum NativeElectronHandoverHelper {
             failureStage = "login_item_unregister"
         case BridgeFailure.loginItemStatus:
             failureStage = "login_item_status"
+        case BridgeFailure.loginItemRequiresApproval:
+            failureStage = "login_item_requires_approval"
+        case BridgeFailure.loginItemNotFound:
+            failureStage = "login_item_not_found"
+        case BridgeFailure.loginItemStatusUnknown:
+            failureStage = "login_item_status_unknown"
         case BridgeFailure.nativeWriter:
             failureStage = "native_writer"
+        case BridgeFailure.otherSameIdentityRunning:
+            failureStage = "other_same_identity_running"
         case BridgeFailure.preferences:
             failureStage = "preferences"
         case BridgeFailure.invalidRequest:
