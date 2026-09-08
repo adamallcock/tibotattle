@@ -19,6 +19,38 @@ const ERROR_CODES = new Set([
   "recovery_required",
   "unavailable",
 ]);
+const QUALIFICATION_PHASES = new Set([
+  "WATCHDOG",
+  "LEASE",
+  "READ",
+  "DEADLINE",
+  "COLLECTION_PRE_CANCELLED",
+  "COLLECTION_ERROR_GIO_CANCELLED",
+  "COLLECTION_ERROR_GIO_TIMED_OUT",
+  "COLLECTION_ERROR_GIO_NOT_FOUND",
+  "COLLECTION_ERROR_GIO_PERMISSION_DENIED",
+  "COLLECTION_ERROR_GIO_INVALID_ARGUMENT",
+  "COLLECTION_ERROR_GIO_NOT_INITIALIZED",
+  "COLLECTION_ERROR_GIO_NOT_SUPPORTED",
+  "COLLECTION_ERROR_GIO_CLOSED",
+  "COLLECTION_ERROR_GIO_DBUS",
+  "COLLECTION_ERROR_GIO_OTHER",
+  "COLLECTION_ERROR_DBUS_SERVICE_UNKNOWN",
+  "COLLECTION_ERROR_DBUS_NO_OWNER",
+  "COLLECTION_ERROR_DBUS_NO_REPLY",
+  "COLLECTION_ERROR_DBUS_ACCESS_DENIED",
+  "COLLECTION_ERROR_DBUS_AUTH_FAILED",
+  "COLLECTION_ERROR_DBUS_TIMEOUT",
+  "COLLECTION_ERROR_DBUS_DISCONNECTED",
+  "COLLECTION_ERROR_DBUS_INVALID_ARGUMENT",
+  "COLLECTION_ERROR_DBUS_NOT_SUPPORTED",
+  "COLLECTION_ERROR_DBUS_NOT_FOUND",
+  "COLLECTION_ERROR_DBUS_OTHER",
+  "COLLECTION_ERROR_OTHER",
+  "COLLECTION_NULL",
+  "COLLECTION_LOCKED",
+  "COLLECTION_POST_CANCELLED",
+]);
 const trustedErrors = new WeakSet();
 
 export class LinuxAccountObservationCredentialError extends Error {
@@ -39,8 +71,31 @@ export function isLinuxAccountObservationCredentialError(error) {
     && Object.getPrototypeOf(error) === LinuxAccountObservationCredentialError.prototype);
 }
 
-function fail(code) {
-  throw new LinuxAccountObservationCredentialError(code);
+function qualificationDiagnosticsEnabled() {
+  try {
+    return process.env.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED === "1"
+      && process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST === "1";
+  } catch {
+    return false;
+  }
+}
+
+function fail(code, qualificationPhase = null) {
+  const error = new LinuxAccountObservationCredentialError(code);
+  if (qualificationDiagnosticsEnabled()
+      && QUALIFICATION_PHASES.has(qualificationPhase)) {
+    try {
+      Object.defineProperty(error, "qualificationPhase", {
+        configurable: false,
+        enumerable: false,
+        value: qualificationPhase,
+        writable: false,
+      });
+    } catch {
+      // The fixed public error outcome remains authoritative.
+    }
+  }
+  throw error;
 }
 
 function assertCapability(capability) {
@@ -69,18 +124,28 @@ function nativeFailure(error) {
   try {
     code = error?.code;
   } catch {
-    return "operation_failed";
+    return Object.freeze({ code: "operation_failed", qualificationPhase: null });
+  }
+  let qualificationPhase = null;
+  if (code === "LINUX_ACCOUNT_OBSERVATION_CREDENTIAL_UNAVAILABLE"
+      && qualificationDiagnosticsEnabled()) {
+    try {
+      const candidate = error?.qualificationPhase;
+      if (QUALIFICATION_PHASES.has(candidate)) qualificationPhase = candidate;
+    } catch {
+      // An untrusted native getter cannot change the public failure outcome.
+    }
   }
   if (code === "LINUX_ACCOUNT_OBSERVATION_CREDENTIAL_RECOVERY_REQUIRED") {
-    return "recovery_required";
+    return Object.freeze({ code: "recovery_required", qualificationPhase: null });
   }
   if (code === "LINUX_ACCOUNT_OBSERVATION_CREDENTIAL_UNAVAILABLE") {
-    return "unavailable";
+    return Object.freeze({ code: "unavailable", qualificationPhase });
   }
   if (code === "LINUX_ACCOUNT_OBSERVATION_CREDENTIAL_INVALID_VALUE") {
-    return "invalid_secret";
+    return Object.freeze({ code: "invalid_secret", qualificationPhase: null });
   }
-  return "operation_failed";
+  return Object.freeze({ code: "operation_failed", qualificationPhase: null });
 }
 
 function snapshotBinding(binding) {
@@ -126,7 +191,8 @@ async function invoke(binding, operation, ...argumentsList) {
     return await binding[operation](...argumentsList);
   } catch (error) {
     if (isLinuxAccountObservationCredentialError(error)) throw error;
-    fail(nativeFailure(error));
+    const failure = nativeFailure(error);
+    fail(failure.code, failure.qualificationPhase);
   }
 }
 

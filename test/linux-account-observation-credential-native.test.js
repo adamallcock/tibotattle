@@ -51,6 +51,38 @@ const CREATE_DIAGNOSTIC_PHASES = new Set([
   "CREATE_NATIVE_READ",
   "CREATE_MUTATION",
 ]);
+const CREATE_NATIVE_UNAVAILABLE_PHASES = new Set([
+  "WATCHDOG",
+  "LEASE",
+  "READ",
+  "DEADLINE",
+  "COLLECTION_PRE_CANCELLED",
+  "COLLECTION_ERROR_GIO_CANCELLED",
+  "COLLECTION_ERROR_GIO_TIMED_OUT",
+  "COLLECTION_ERROR_GIO_NOT_FOUND",
+  "COLLECTION_ERROR_GIO_PERMISSION_DENIED",
+  "COLLECTION_ERROR_GIO_INVALID_ARGUMENT",
+  "COLLECTION_ERROR_GIO_NOT_INITIALIZED",
+  "COLLECTION_ERROR_GIO_NOT_SUPPORTED",
+  "COLLECTION_ERROR_GIO_CLOSED",
+  "COLLECTION_ERROR_GIO_DBUS",
+  "COLLECTION_ERROR_GIO_OTHER",
+  "COLLECTION_ERROR_DBUS_SERVICE_UNKNOWN",
+  "COLLECTION_ERROR_DBUS_NO_OWNER",
+  "COLLECTION_ERROR_DBUS_NO_REPLY",
+  "COLLECTION_ERROR_DBUS_ACCESS_DENIED",
+  "COLLECTION_ERROR_DBUS_AUTH_FAILED",
+  "COLLECTION_ERROR_DBUS_TIMEOUT",
+  "COLLECTION_ERROR_DBUS_DISCONNECTED",
+  "COLLECTION_ERROR_DBUS_INVALID_ARGUMENT",
+  "COLLECTION_ERROR_DBUS_NOT_SUPPORTED",
+  "COLLECTION_ERROR_DBUS_NOT_FOUND",
+  "COLLECTION_ERROR_DBUS_OTHER",
+  "COLLECTION_ERROR_OTHER",
+  "COLLECTION_NULL",
+  "COLLECTION_LOCKED",
+  "COLLECTION_POST_CANCELLED",
+]);
 const OPERATION_MAGIC = Buffer.from([
   0x54, 0x49, 0x42, 0x4f, 0x54, 0x41, 0x54, 0x54,
   0x4c, 0x45, 0x2d, 0x46, 0x44, 0x34, 0x00, 0x00,
@@ -122,6 +154,19 @@ function closedObservationDiagnosticSuffix(error) {
   return "OTHER";
 }
 
+function closedNativeUnavailablePhase(error) {
+  if (!isLinuxAccountObservationCredentialError(error)
+      || error.code !== "linux_account_observation_credential_unavailable") {
+    return null;
+  }
+  try {
+    const phase = error.qualificationPhase;
+    return CREATE_NATIVE_UNAVAILABLE_PHASES.has(phase) ? phase : null;
+  } catch {
+    return null;
+  }
+}
+
 async function runClosedObservationDiagnosticPhase(testContext, phase, operation) {
   if (!CREATE_DIAGNOSTIC_PHASES.has(phase)) {
     throw new TypeError("Unknown closed account-observation diagnostic phase");
@@ -132,9 +177,16 @@ async function runClosedObservationDiagnosticPhase(testContext, phase, operation
   } catch (error) {
     // Keep the runner receipt content-free while preserving the fixed facade
     // outcome that follows this exact native boundary.
-    testContext.diagnostic(
-      `LINUX_ACCOUNT_OBSERVATION_PHASE_${phase}_${closedObservationDiagnosticSuffix(error)}`,
-    );
+    const suffix = closedObservationDiagnosticSuffix(error);
+    testContext.diagnostic(`LINUX_ACCOUNT_OBSERVATION_PHASE_${phase}_${suffix}`);
+    const nativePhase = phase === "CREATE_MUTATION" && suffix === "UNAVAILABLE"
+      ? closedNativeUnavailablePhase(error)
+      : null;
+    if (nativePhase !== null) {
+      testContext.diagnostic(
+        `LINUX_ACCOUNT_OBSERVATION_PHASE_${phase}_NATIVE_${nativePhase}_UNAVAILABLE`,
+      );
+    }
     throw error;
   }
 }
@@ -224,6 +276,19 @@ test("native account-observation CREATE diagnostics retain only closed facade ou
     }),
     nativeError("unavailable"),
   );
+  const collectionError = new LinuxAccountObservationCredentialError("unavailable");
+  Object.defineProperty(collectionError, "qualificationPhase", {
+    configurable: false,
+    enumerable: false,
+    value: "COLLECTION_NULL",
+    writable: false,
+  });
+  await assert.rejects(
+    runClosedObservationDiagnosticPhase(testContext, "CREATE_MUTATION", async () => {
+      throw collectionError;
+    }),
+    nativeError("unavailable"),
+  );
   await assert.rejects(
     runClosedObservationDiagnosticPhase(testContext, "CREATE_MUTATION", async () => {
       throw new LinuxAccountObservationCredentialError("recovery_required");
@@ -242,6 +307,9 @@ test("native account-observation CREATE diagnostics retain only closed facade ou
   assert.deepEqual(diagnostics, [
     "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_PRECHECK",
     "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_PRECHECK_UNAVAILABLE",
+    "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION",
+    "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION_UNAVAILABLE",
+    "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION_NATIVE_COLLECTION_NULL_UNAVAILABLE",
     "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION",
     "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION_RECOVERY_REQUIRED",
     "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION",

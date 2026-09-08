@@ -2023,6 +2023,36 @@ enum class AccountObservationRecordState {
   kUnavailable,
 };
 
+enum class AccountObservationCollectionOpenOutcome {
+  kReady,
+  kPreCancelled,
+  kErrorGioCancelled,
+  kErrorGioTimedOut,
+  kErrorGioNotFound,
+  kErrorGioPermissionDenied,
+  kErrorGioInvalidArgument,
+  kErrorGioNotInitialized,
+  kErrorGioNotSupported,
+  kErrorGioClosed,
+  kErrorGioDbus,
+  kErrorGioOther,
+  kErrorDbusServiceUnknown,
+  kErrorDbusNoOwner,
+  kErrorDbusNoReply,
+  kErrorDbusAccessDenied,
+  kErrorDbusAuthFailed,
+  kErrorDbusTimeout,
+  kErrorDbusDisconnected,
+  kErrorDbusInvalidArgument,
+  kErrorDbusNotSupported,
+  kErrorDbusNotFound,
+  kErrorDbusOther,
+  kErrorOther,
+  kNull,
+  kLocked,
+  kPostCancelled,
+};
+
 struct AccountObservationRecord {
   std::array<unsigned char, kAccountObservationCredentialBytes> bytes {};
 };
@@ -2361,9 +2391,72 @@ AccountObservationRecordState ReadAccountObservationCredential(
       : AccountObservationRecordState::kInvalid;
 }
 
-SecretCollection* OpenAccountObservationDefaultCollection(
-    GCancellable* cancellable) {
-  if (AccountObservationDeadlineCancelled(cancellable)) return nullptr;
+AccountObservationCollectionOpenOutcome ClassifyAccountObservationCollectionError(
+    const GError* error) {
+  if (error == nullptr) return AccountObservationCollectionOpenOutcome::kErrorOther;
+  if (g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+    return AccountObservationCollectionOpenOutcome::kErrorGioCancelled;
+  }
+  if (error->domain == G_IO_ERROR) {
+    switch (error->code) {
+      case G_IO_ERROR_TIMED_OUT:
+        return AccountObservationCollectionOpenOutcome::kErrorGioTimedOut;
+      case G_IO_ERROR_NOT_FOUND:
+        return AccountObservationCollectionOpenOutcome::kErrorGioNotFound;
+      case G_IO_ERROR_PERMISSION_DENIED:
+        return AccountObservationCollectionOpenOutcome::kErrorGioPermissionDenied;
+      case G_IO_ERROR_INVALID_ARGUMENT:
+        return AccountObservationCollectionOpenOutcome::kErrorGioInvalidArgument;
+      case G_IO_ERROR_NOT_INITIALIZED:
+        return AccountObservationCollectionOpenOutcome::kErrorGioNotInitialized;
+      case G_IO_ERROR_NOT_SUPPORTED:
+        return AccountObservationCollectionOpenOutcome::kErrorGioNotSupported;
+      case G_IO_ERROR_CLOSED:
+        return AccountObservationCollectionOpenOutcome::kErrorGioClosed;
+      case G_IO_ERROR_DBUS_ERROR:
+        return AccountObservationCollectionOpenOutcome::kErrorGioDbus;
+      default:
+        return AccountObservationCollectionOpenOutcome::kErrorGioOther;
+    }
+  }
+  if (error->domain == G_DBUS_ERROR) {
+    switch (error->code) {
+      case G_DBUS_ERROR_SERVICE_UNKNOWN:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusServiceUnknown;
+      case G_DBUS_ERROR_NAME_HAS_NO_OWNER:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusNoOwner;
+      case G_DBUS_ERROR_NO_REPLY:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusNoReply;
+      case G_DBUS_ERROR_ACCESS_DENIED:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusAccessDenied;
+      case G_DBUS_ERROR_AUTH_FAILED:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusAuthFailed;
+      case G_DBUS_ERROR_TIMEOUT:
+      case G_DBUS_ERROR_TIMED_OUT:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusTimeout;
+      case G_DBUS_ERROR_DISCONNECTED:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusDisconnected;
+      case G_DBUS_ERROR_INVALID_ARGS:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusInvalidArgument;
+      case G_DBUS_ERROR_NOT_SUPPORTED:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusNotSupported;
+      case G_DBUS_ERROR_FILE_NOT_FOUND:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusNotFound;
+      default:
+        return AccountObservationCollectionOpenOutcome::kErrorDbusOther;
+    }
+  }
+  return AccountObservationCollectionOpenOutcome::kErrorOther;
+}
+
+AccountObservationCollectionOpenOutcome OpenAccountObservationDefaultCollection(
+    GCancellable* cancellable,
+    SecretCollection** result) {
+  if (result == nullptr) return AccountObservationCollectionOpenOutcome::kErrorOther;
+  *result = nullptr;
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    return AccountObservationCollectionOpenOutcome::kPreCancelled;
+  }
   GError* error = nullptr;
   SecretCollection* collection = secret_collection_for_alias_sync(
       nullptr,
@@ -2372,19 +2465,29 @@ SecretCollection* OpenAccountObservationDefaultCollection(
       cancellable,
       &error);
   if (error != nullptr) {
+    const AccountObservationCollectionOpenOutcome outcome =
+        ClassifyAccountObservationCollectionError(error);
     g_error_free(error);
     if (collection != nullptr) g_object_unref(collection);
-    return nullptr;
+    return outcome;
   }
   // Do not create a digest intent or ask libsecret to create an item when the
   // resolved default collection is already locked. The fixed route never
   // calls an unlock API; a lock that races this checked snapshot remains an
   // uncertain postcondition and is handled through the retained intent.
-  if (collection == nullptr || secret_collection_get_locked(collection)) {
-    if (collection != nullptr) g_object_unref(collection);
-    return nullptr;
+  if (collection == nullptr) {
+    return AccountObservationCollectionOpenOutcome::kNull;
   }
-  return collection;
+  if (secret_collection_get_locked(collection)) {
+    g_object_unref(collection);
+    return AccountObservationCollectionOpenOutcome::kLocked;
+  }
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    if (collection != nullptr) g_object_unref(collection);
+    return AccountObservationCollectionOpenOutcome::kPostCancelled;
+  }
+  *result = collection;
+  return AccountObservationCollectionOpenOutcome::kReady;
 }
 
 bool CreateAccountObservationCredentialNoReplace(
@@ -3049,6 +3152,201 @@ enum class AccountObservationWorkResult {
   kRecoveryRequired,
 };
 
+// Temporary names emitted only by the isolated native qualification fixture.
+// They identify a fixed pre-intent boundary without exposing a D-Bus path,
+// GError message, candidate, or general diagnostic API. Remove this seam once
+// the qualification failure has a concrete regression.
+enum class AccountObservationQualificationPhase {
+  kNone,
+  kWatchdog,
+  kLease,
+  kRead,
+  kDeadline,
+  kCollectionPreCancelled,
+  kCollectionErrorGioCancelled,
+  kCollectionErrorGioTimedOut,
+  kCollectionErrorGioNotFound,
+  kCollectionErrorGioPermissionDenied,
+  kCollectionErrorGioInvalidArgument,
+  kCollectionErrorGioNotInitialized,
+  kCollectionErrorGioNotSupported,
+  kCollectionErrorGioClosed,
+  kCollectionErrorGioDbus,
+  kCollectionErrorGioOther,
+  kCollectionErrorDbusServiceUnknown,
+  kCollectionErrorDbusNoOwner,
+  kCollectionErrorDbusNoReply,
+  kCollectionErrorDbusAccessDenied,
+  kCollectionErrorDbusAuthFailed,
+  kCollectionErrorDbusTimeout,
+  kCollectionErrorDbusDisconnected,
+  kCollectionErrorDbusInvalidArgument,
+  kCollectionErrorDbusNotSupported,
+  kCollectionErrorDbusNotFound,
+  kCollectionErrorDbusOther,
+  kCollectionErrorOther,
+  kCollectionNull,
+  kCollectionLocked,
+  kCollectionPostCancelled,
+};
+
+const char* AccountObservationQualificationPhaseName(
+    AccountObservationQualificationPhase phase) {
+  switch (phase) {
+    case AccountObservationQualificationPhase::kWatchdog:
+      return "WATCHDOG";
+    case AccountObservationQualificationPhase::kLease:
+      return "LEASE";
+    case AccountObservationQualificationPhase::kRead:
+      return "READ";
+    case AccountObservationQualificationPhase::kDeadline:
+      return "DEADLINE";
+    case AccountObservationQualificationPhase::kCollectionPreCancelled:
+      return "COLLECTION_PRE_CANCELLED";
+    case AccountObservationQualificationPhase::kCollectionErrorGioCancelled:
+      return "COLLECTION_ERROR_GIO_CANCELLED";
+    case AccountObservationQualificationPhase::kCollectionErrorGioTimedOut:
+      return "COLLECTION_ERROR_GIO_TIMED_OUT";
+    case AccountObservationQualificationPhase::kCollectionErrorGioNotFound:
+      return "COLLECTION_ERROR_GIO_NOT_FOUND";
+    case AccountObservationQualificationPhase::kCollectionErrorGioPermissionDenied:
+      return "COLLECTION_ERROR_GIO_PERMISSION_DENIED";
+    case AccountObservationQualificationPhase::kCollectionErrorGioInvalidArgument:
+      return "COLLECTION_ERROR_GIO_INVALID_ARGUMENT";
+    case AccountObservationQualificationPhase::kCollectionErrorGioNotInitialized:
+      return "COLLECTION_ERROR_GIO_NOT_INITIALIZED";
+    case AccountObservationQualificationPhase::kCollectionErrorGioNotSupported:
+      return "COLLECTION_ERROR_GIO_NOT_SUPPORTED";
+    case AccountObservationQualificationPhase::kCollectionErrorGioClosed:
+      return "COLLECTION_ERROR_GIO_CLOSED";
+    case AccountObservationQualificationPhase::kCollectionErrorGioDbus:
+      return "COLLECTION_ERROR_GIO_DBUS";
+    case AccountObservationQualificationPhase::kCollectionErrorGioOther:
+      return "COLLECTION_ERROR_GIO_OTHER";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusServiceUnknown:
+      return "COLLECTION_ERROR_DBUS_SERVICE_UNKNOWN";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusNoOwner:
+      return "COLLECTION_ERROR_DBUS_NO_OWNER";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusNoReply:
+      return "COLLECTION_ERROR_DBUS_NO_REPLY";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusAccessDenied:
+      return "COLLECTION_ERROR_DBUS_ACCESS_DENIED";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusAuthFailed:
+      return "COLLECTION_ERROR_DBUS_AUTH_FAILED";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusTimeout:
+      return "COLLECTION_ERROR_DBUS_TIMEOUT";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusDisconnected:
+      return "COLLECTION_ERROR_DBUS_DISCONNECTED";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusInvalidArgument:
+      return "COLLECTION_ERROR_DBUS_INVALID_ARGUMENT";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusNotSupported:
+      return "COLLECTION_ERROR_DBUS_NOT_SUPPORTED";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusNotFound:
+      return "COLLECTION_ERROR_DBUS_NOT_FOUND";
+    case AccountObservationQualificationPhase::kCollectionErrorDbusOther:
+      return "COLLECTION_ERROR_DBUS_OTHER";
+    case AccountObservationQualificationPhase::kCollectionErrorOther:
+      return "COLLECTION_ERROR_OTHER";
+    case AccountObservationQualificationPhase::kCollectionNull:
+      return "COLLECTION_NULL";
+    case AccountObservationQualificationPhase::kCollectionLocked:
+      return "COLLECTION_LOCKED";
+    case AccountObservationQualificationPhase::kCollectionPostCancelled:
+      return "COLLECTION_POST_CANCELLED";
+    case AccountObservationQualificationPhase::kNone:
+      return nullptr;
+  }
+  return nullptr;
+}
+
+AccountObservationQualificationPhase AccountObservationCollectionQualificationPhase(
+    AccountObservationCollectionOpenOutcome outcome) {
+  switch (outcome) {
+    case AccountObservationCollectionOpenOutcome::kPreCancelled:
+      return AccountObservationQualificationPhase::kCollectionPreCancelled;
+    case AccountObservationCollectionOpenOutcome::kErrorGioCancelled:
+      return AccountObservationQualificationPhase::kCollectionErrorGioCancelled;
+    case AccountObservationCollectionOpenOutcome::kErrorGioTimedOut:
+      return AccountObservationQualificationPhase::kCollectionErrorGioTimedOut;
+    case AccountObservationCollectionOpenOutcome::kErrorGioNotFound:
+      return AccountObservationQualificationPhase::kCollectionErrorGioNotFound;
+    case AccountObservationCollectionOpenOutcome::kErrorGioPermissionDenied:
+      return AccountObservationQualificationPhase::kCollectionErrorGioPermissionDenied;
+    case AccountObservationCollectionOpenOutcome::kErrorGioInvalidArgument:
+      return AccountObservationQualificationPhase::kCollectionErrorGioInvalidArgument;
+    case AccountObservationCollectionOpenOutcome::kErrorGioNotInitialized:
+      return AccountObservationQualificationPhase::kCollectionErrorGioNotInitialized;
+    case AccountObservationCollectionOpenOutcome::kErrorGioNotSupported:
+      return AccountObservationQualificationPhase::kCollectionErrorGioNotSupported;
+    case AccountObservationCollectionOpenOutcome::kErrorGioClosed:
+      return AccountObservationQualificationPhase::kCollectionErrorGioClosed;
+    case AccountObservationCollectionOpenOutcome::kErrorGioDbus:
+      return AccountObservationQualificationPhase::kCollectionErrorGioDbus;
+    case AccountObservationCollectionOpenOutcome::kErrorGioOther:
+      return AccountObservationQualificationPhase::kCollectionErrorGioOther;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusServiceUnknown:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusServiceUnknown;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusNoOwner:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusNoOwner;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusNoReply:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusNoReply;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusAccessDenied:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusAccessDenied;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusAuthFailed:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusAuthFailed;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusTimeout:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusTimeout;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusDisconnected:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusDisconnected;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusInvalidArgument:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusInvalidArgument;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusNotSupported:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusNotSupported;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusNotFound:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusNotFound;
+    case AccountObservationCollectionOpenOutcome::kErrorDbusOther:
+      return AccountObservationQualificationPhase::kCollectionErrorDbusOther;
+    case AccountObservationCollectionOpenOutcome::kErrorOther:
+      return AccountObservationQualificationPhase::kCollectionErrorOther;
+    case AccountObservationCollectionOpenOutcome::kNull:
+      return AccountObservationQualificationPhase::kCollectionNull;
+    case AccountObservationCollectionOpenOutcome::kLocked:
+      return AccountObservationQualificationPhase::kCollectionLocked;
+    case AccountObservationCollectionOpenOutcome::kPostCancelled:
+      return AccountObservationQualificationPhase::kCollectionPostCancelled;
+    case AccountObservationCollectionOpenOutcome::kReady:
+      return AccountObservationQualificationPhase::kNone;
+  }
+  return AccountObservationQualificationPhase::kNone;
+}
+
+bool AccountObservationQualificationDiagnosticsEnabled() {
+  const char* native_test = getenv(
+      "USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST");
+  const char* isolated = getenv("TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED");
+  return native_test != nullptr
+      && isolated != nullptr
+      && std::strcmp(native_test, "1") == 0
+      && std::strcmp(isolated, "1") == 0;
+}
+
+void AttachAccountObservationQualificationPhase(
+    napi_env env,
+    napi_value error,
+    AccountObservationQualificationPhase phase) {
+  const char* name = AccountObservationQualificationPhaseName(phase);
+  if (env == nullptr || error == nullptr || name == nullptr
+      || !AccountObservationQualificationDiagnosticsEnabled()) {
+    return;
+  }
+  napi_value value = nullptr;
+  if (napi_create_string_utf8(env, name, NAPI_AUTO_LENGTH, &value) == napi_ok) {
+    // This fixed, test-only property is intentionally non-authoritative: a
+    // failure to attach it leaves the public unavailable outcome unchanged.
+    static_cast<void>(napi_set_named_property(env, error, "qualificationPhase", value));
+  }
+}
+
 struct AccountObservationWork {
   napi_async_work work = nullptr;
   napi_deferred deferred = nullptr;
@@ -3056,6 +3354,8 @@ struct AccountObservationWork {
   std::array<unsigned char, kAccountObservationCredentialBytes> candidate {};
   std::array<unsigned char, kAccountObservationCredentialBytes> value {};
   AccountObservationWorkResult result = AccountObservationWorkResult::kUnavailable;
+  AccountObservationQualificationPhase qualification_phase =
+      AccountObservationQualificationPhase::kNone;
 };
 
 void ClearAccountObservationWork(AccountObservationWork* work) {
@@ -3180,15 +3480,18 @@ AccountObservationWorkResult RunAccountObservationCreate(
     return AccountObservationWorkResult::kRecoveryRequired;
   }
   if (acquired != AccountObservationLeaseOutcome::kAcquired) {
+    work->qualification_phase = AccountObservationQualificationPhase::kLease;
     return AccountObservationWorkResult::kUnavailable;
   }
   if (AccountObservationDeadlineCancelled(cancellable)) {
+    work->qualification_phase = AccountObservationQualificationPhase::kDeadline;
     return FinishAccountObservationCancellation(lease);
   }
   if (!ReconcilePendingAccountObservationOperation(lease, cancellable)) {
     return FinishAccountObservationRecovery(lease);
   }
   if (AccountObservationDeadlineCancelled(cancellable)) {
+    work->qualification_phase = AccountObservationQualificationPhase::kDeadline;
     return FinishAccountObservationCancellation(lease);
   }
 
@@ -3199,15 +3502,22 @@ AccountObservationWorkResult RunAccountObservationCreate(
   const bool cancelled_before = AccountObservationDeadlineCancelled(cancellable);
   if (before_state == AccountObservationRecordState::kPresent) {
     ClearAccountObservationRecord(&before);
-    if (cancelled_before) return FinishAccountObservationCancellation(lease);
+    if (cancelled_before) {
+      work->qualification_phase = AccountObservationQualificationPhase::kDeadline;
+      return FinishAccountObservationCancellation(lease);
+    }
     return FinishAccountObservationNormal(
         lease,
         deadline,
         AccountObservationWorkResult::kExisting);
   }
   ClearAccountObservationRecord(&before);
-  if (cancelled_before) return FinishAccountObservationCancellation(lease);
+  if (cancelled_before) {
+    work->qualification_phase = AccountObservationQualificationPhase::kDeadline;
+    return FinishAccountObservationCancellation(lease);
+  }
   if (before_state == AccountObservationRecordState::kUnavailable) {
+    work->qualification_phase = AccountObservationQualificationPhase::kRead;
     return FinishAccountObservationUnavailable(lease);
   }
   if (before_state != AccountObservationRecordState::kAbsent) {
@@ -3217,14 +3527,22 @@ AccountObservationWorkResult RunAccountObservationCreate(
   // Obtain the default collection before persisting the digest intent. A
   // missing or locked collection is a known non-mutation failure, whereas a
   // later create result is intentionally reconciled through the digest.
-  SecretCollection* collection = OpenAccountObservationDefaultCollection(cancellable);
-  if (collection == nullptr) {
+  SecretCollection* collection = nullptr;
+  const AccountObservationCollectionOpenOutcome collection_outcome =
+      OpenAccountObservationDefaultCollection(cancellable, &collection);
+  if (collection_outcome != AccountObservationCollectionOpenOutcome::kReady) {
+    work->qualification_phase =
+        AccountObservationCollectionQualificationPhase(collection_outcome);
+    // Preserve the pre-existing caller-side cancellation fence. The helper's
+    // outcome is diagnostic-only: the watchdog can still fire after any
+    // non-ready return and before this settlement decision.
     return AccountObservationDeadlineCancelled(cancellable)
         ? FinishAccountObservationCancellation(lease)
         : FinishAccountObservationUnavailable(lease);
   }
   if (AccountObservationDeadlineCancelled(cancellable)) {
     g_object_unref(collection);
+    work->qualification_phase = AccountObservationQualificationPhase::kDeadline;
     return FinishAccountObservationCancellation(lease);
   }
   if (!BeginAccountObservationMutation(lease, work->candidate)) {
@@ -3278,6 +3596,7 @@ void ExecuteAccountObservationWork(napi_env /* env */, void* data) {
   if (work == nullptr) return;
   AccountObservationDeadlineGuard deadline;
   if (!deadline.Start()) {
+    work->qualification_phase = AccountObservationQualificationPhase::kWatchdog;
     work->result = AccountObservationWorkResult::kUnavailable;
   } else {
     GCancellable* cancellable = deadline.cancellable();
@@ -3331,6 +3650,13 @@ void CompleteAccountObservationWork(
   } else {
     napi_value error = MakeFixedError(env, AccountObservationWorkErrorCode(result));
     if (error != nullptr) {
+      if (result == AccountObservationWorkResult::kUnavailable
+          && work->operation == AccountObservationWorkOperation::kCreate) {
+        AttachAccountObservationQualificationPhase(
+            env,
+            error,
+            work->qualification_phase);
+      }
       settled = napi_reject_deferred(env, work->deferred, error);
     }
   }

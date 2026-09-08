@@ -183,6 +183,18 @@ lock/unlock transition or prove prompt behavior after a lock race, so those
 runtime details remain required native follow-up work rather than a passing
 claim.
 
+Temporarily, only when both exact isolated-native-test environment markers are set, an
+otherwise ordinary fixed `unavailable` rejection can carry a non-enumerable
+`qualificationPhase` value for the bundled fixture. The value is one of a
+closed lease/read/deadline/watchdog boundary or a closed collection outcome:
+pre-cancelled; null-without-error; locked; post-cancelled; an other-domain
+GError; or a fixed GIO/D-Bus domain-and-code label. It contains no GError
+message, object path, candidate, or credential value. This is not an
+operation, a capability, or a production diagnostic contract; outside that
+exact test lane the public facade remains the same generic `unavailable`
+result. Remove this instrumentation after it establishes the native failure's
+concrete regression.
+
 The fixed v1 intent is 64 bytes:
 
 - `0..15`: exact `TIBOTATTLE-FD4\0\0` byte array

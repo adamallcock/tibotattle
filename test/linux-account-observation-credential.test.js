@@ -258,3 +258,111 @@ test("Linux account-observation credential collapses native failures and invalid
     backendError("invalid_secret"),
   );
 });
+
+test("Linux account-observation qualification metadata is fixed, isolated, and non-enumerable", async () => {
+  const previousIsolated = process.env.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED;
+  const previousNativeTest = process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST;
+  process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST = "1";
+  try {
+    delete process.env.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED;
+    const outsideLaneNativeError = nativeError(
+      "LINUX_ACCOUNT_OBSERVATION_CREDENTIAL_UNAVAILABLE",
+    );
+    Object.defineProperty(outsideLaneNativeError, "qualificationPhase", {
+      configurable: false,
+      enumerable: false,
+      value: "COLLECTION_NULL",
+      writable: false,
+    });
+    const outsideLane = createLinuxAccountObservationCredentialBackend({
+      platform: "linux",
+      architecture: "x64",
+      binding: binding({
+        createAccountObservationCredentialIfMissing() {
+          throw outsideLaneNativeError;
+        },
+      }),
+    });
+    await assert.rejects(
+      outsideLane.createIfMissing(
+        EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
+        SECRET,
+      ),
+      (error) => {
+        assert.equal(error.code, "linux_account_observation_credential_unavailable");
+        assert.equal(Object.hasOwn(error, "qualificationPhase"), false);
+        return true;
+      },
+    );
+
+    process.env.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED = "1";
+    const phasedNativeError = nativeError(
+      "LINUX_ACCOUNT_OBSERVATION_CREDENTIAL_UNAVAILABLE",
+    );
+    Object.defineProperty(phasedNativeError, "qualificationPhase", {
+      configurable: false,
+      enumerable: false,
+      value: "COLLECTION_NULL",
+      writable: false,
+    });
+    const phased = createLinuxAccountObservationCredentialBackend({
+      platform: "linux",
+      architecture: "x64",
+      binding: binding({
+        createAccountObservationCredentialIfMissing() {
+          throw phasedNativeError;
+        },
+      }),
+    });
+    await assert.rejects(
+      phased.createIfMissing(
+        EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
+        SECRET,
+      ),
+      (error) => {
+        assert.equal(error.code, "linux_account_observation_credential_unavailable");
+        assert.equal(error.qualificationPhase, "COLLECTION_NULL");
+        assert.equal(Object.keys(error).includes("qualificationPhase"), false);
+        return true;
+      },
+    );
+
+    const rejectedMetadata = nativeError(
+      "LINUX_ACCOUNT_OBSERVATION_CREDENTIAL_UNAVAILABLE",
+    );
+    Object.defineProperty(rejectedMetadata, "qualificationPhase", {
+      configurable: false,
+      enumerable: false,
+      value: "private_native_detail",
+      writable: false,
+    });
+    const unphased = createLinuxAccountObservationCredentialBackend({
+      platform: "linux",
+      architecture: "x64",
+      binding: binding({
+        createAccountObservationCredentialIfMissing() {
+          throw rejectedMetadata;
+        },
+      }),
+    });
+    await assert.rejects(
+      unphased.createIfMissing(
+        EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
+        SECRET,
+      ),
+      (error) => {
+        assert.equal(error.code, "linux_account_observation_credential_unavailable");
+        assert.equal(Object.hasOwn(error, "qualificationPhase"), false);
+        return true;
+      },
+    );
+  } finally {
+    if (previousIsolated === undefined) delete process.env.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED;
+    else process.env.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED = previousIsolated;
+    if (previousNativeTest === undefined) {
+      delete process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST;
+    } else {
+      process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST = previousNativeTest;
+    }
+  }
+});

@@ -121,6 +121,36 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   );
   assert.match(source, /SECRET_SEARCH_ALL \| SECRET_SEARCH_LOAD_SECRETS/u);
   assert.match(source, /secret_collection_get_locked\(collection\)/u);
+  assert.match(source, /AccountObservationCollectionOpenOutcome/u);
+  assert.match(source, /G_IO_ERROR_CANCELLED/u);
+  assert.match(source, /error->domain == G_DBUS_ERROR/u);
+  assert.match(source, /AccountObservationQualificationDiagnosticsEnabled/u);
+  assert.match(source, /USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST/u);
+  assert.match(source, /qualificationPhase/u);
+  for (const phase of [
+    "COLLECTION_ERROR_GIO_CANCELLED",
+    "COLLECTION_ERROR_GIO_TIMED_OUT",
+    "COLLECTION_ERROR_GIO_NOT_FOUND",
+    "COLLECTION_ERROR_GIO_PERMISSION_DENIED",
+    "COLLECTION_ERROR_GIO_INVALID_ARGUMENT",
+    "COLLECTION_ERROR_GIO_NOT_INITIALIZED",
+    "COLLECTION_ERROR_GIO_NOT_SUPPORTED",
+    "COLLECTION_ERROR_GIO_CLOSED",
+    "COLLECTION_ERROR_DBUS_SERVICE_UNKNOWN",
+    "COLLECTION_ERROR_DBUS_NO_OWNER",
+    "COLLECTION_ERROR_DBUS_NO_REPLY",
+    "COLLECTION_ERROR_DBUS_ACCESS_DENIED",
+    "COLLECTION_ERROR_DBUS_AUTH_FAILED",
+    "COLLECTION_ERROR_DBUS_TIMEOUT",
+    "COLLECTION_ERROR_DBUS_DISCONNECTED",
+    "COLLECTION_ERROR_DBUS_INVALID_ARGUMENT",
+    "COLLECTION_ERROR_DBUS_NOT_SUPPORTED",
+    "COLLECTION_ERROR_DBUS_NOT_FOUND",
+  ]) {
+    assert.match(source, new RegExp(`"${phase}"`, "u"));
+  }
+  assert.doesNotMatch(source, /error->message/u);
+  assert.doesNotMatch(source, /g_dbus_error_get_remote_error/u);
   assert.match(source, /secret_item_create_sync/u);
   assert.match(source, /SECRET_ITEM_CREATE_NONE/u);
   assert.match(source, /kAccountObservationOperationDeadline \{5'000\}/u);
@@ -147,7 +177,7 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /deadline->StopDeadline\(\)/u);
   assert.match(
     source,
-    /OpenAccountObservationDefaultCollection\(cancellable\)[\s\S]*?AccountObservationDeadlineCancelled\(cancellable\)[\s\S]*?BeginAccountObservationMutation/u,
+    /OpenAccountObservationDefaultCollection\(cancellable, &collection\)[\s\S]*?AccountObservationDeadlineCancelled\(cancellable\)[\s\S]*?BeginAccountObservationMutation/u,
   );
   assert.match(
     source,
