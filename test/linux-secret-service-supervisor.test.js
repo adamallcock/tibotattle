@@ -6,6 +6,7 @@ import {
   cleanupLinuxQualificationProcesses,
   parseLinuxProcStartTime,
   runLinuxSecretServiceSupervisor,
+  runLinuxAccountObservationNativeQualification,
   signalLinuxProcessIdentity,
   validateLinuxQualificationSupervisorReceipt,
 } from "../scripts/run-linux-secret-service-qualification.mjs";
@@ -284,4 +285,92 @@ test("Linux Secret Service signaling rejects PID-reused identities", async () =>
   assert.equal(executableChanged, false);
   assert.equal(exactGroup, true);
   assert.deepEqual(signals, [[-42, "SIGKILL"]]);
+});
+
+
+const OBSERVATION_RECEIPT = Object.freeze({
+  schemaVersion: "linux-account-observation-qualification-v1",
+  status: "passed",
+  scope: "development_only",
+  platform: "linux",
+  architecture: "x64",
+  subject: "pinned_native_binding",
+  capability: "account_observation",
+  lifecycle: "read_create_no_replace_and_digest_reconciliation",
+  credentialCleanup: "disposable_container_lifetime",
+  productionSafe: false,
+});
+
+test("observation qualification accepts only its own exact receipt and profile", async () => {
+  assert.deepEqual(validateLinuxQualificationSupervisorReceipt(OBSERVATION_RECEIPT, "account_observation"), OBSERVATION_RECEIPT);
+  assert.equal(validateLinuxQualificationSupervisorReceipt(OBSERVATION_RECEIPT), null);
+  assert.equal(validateLinuxQualificationSupervisorReceipt(RECEIPT, "account_observation"), null);
+  assert.equal(validateLinuxQualificationSupervisorReceipt(OBSERVATION_RECEIPT, "arbitrary-command"), null);
+  assert.equal(validateLinuxQualificationSupervisorReceipt({ ...OBSERVATION_RECEIPT, productionSafe: true }, "account_observation"), null);
+  let spawns = 0;
+  const invalid = await runLinuxSecretServiceSupervisor(isolatedSupervisorRuntime({
+    profile: "arbitrary-command",
+    spawnChild: () => { spawns += 1; throw new Error("must not spawn"); },
+  }));
+  assert.equal(invalid.code, "LINUX_SECRET_SERVICE_SUPERVISOR_PROFILE_INVALID");
+  assert.equal(spawns, 0);
+  const passed = await runLinuxSecretServiceSupervisor(isolatedSupervisorRuntime({
+    profile: "account_observation",
+    spawnChild: () => createQualificationChild({ stdout: JSON.stringify(OBSERVATION_RECEIPT) }),
+  }));
+  assert.deepEqual(passed, { status: "passed", receipt: OBSERVATION_RECEIPT });
+  const crossProfile = await runLinuxSecretServiceSupervisor(isolatedSupervisorRuntime({ profile: "account_observation" }));
+  assert.equal(crossProfile.code, "LINUX_SECRET_SERVICE_SUPERVISOR_RECEIPT_INVALID");
+});
+
+test("native observation proof requires actual success marker and bounded fixed invocation", () => {
+  const environment = { TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED: "1", DBUS_SESSION_BUS_ADDRESS: "unix:path=/synthetic-bus" };
+  const runtime = {
+    platform: "linux", architecture: "x64", environment,
+    proveIsolation: ({ environment: observed }) => {
+      assert.equal(observed, environment);
+      return { status: "isolated" };
+    },
+    startDaemon: () => ({ status: "started" }),
+  };
+  const execute = (outcome) => runLinuxAccountObservationNativeQualification({
+    ...runtime,
+    spawnTest: (executable, args, options) => {
+      assert.equal(executable, process.execPath);
+      assert.deepEqual(args, ["--test", "--test-reporter=tap", "test/linux-account-observation-credential-native.test.js"]);
+      assert.equal(options.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST, "1");
+      assert.equal(options.env.DBUS_SESSION_BUS_ADDRESS, environment.DBUS_SESSION_BUS_ADDRESS);
+      assert.equal(options.timeout, 15_000);
+      assert.equal(options.maxBuffer, 16_384);
+      assert.equal(options.shell, false);
+      assert.deepEqual(options.stdio, ["ignore", "pipe", "pipe"]);
+      return outcome;
+    },
+  });
+  for (const eol of ["\n", "\r\n"]) {
+    assert.deepEqual(execute({ status: 0, signal: null, stdout: `TAP version 13${eol}# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED${eol}` }), OBSERVATION_RECEIPT);
+  }
+  for (const outcome of [
+    { status: 0, signal: null, stdout: "ok 1 - native observation # SKIP\n" },
+    { status: 0, signal: null, stdout: "" },
+    { status: 0, signal: null, stdout: "# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED\n# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED\n" },
+    { status: 1, signal: null, stdout: "# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED\n" },
+    { status: 0, signal: "SIGTERM", stdout: "# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED\n" },
+    { status: 0, signal: null, error: new Error("synthetic failure"), stdout: "# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED\n" },
+  ]) assert.throws(() => execute(outcome), /LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED/u);
+  for (const refusal of [
+    { environment: {} },
+    { platform: "darwin" },
+    { architecture: "arm64" },
+    { proveIsolation: () => ({ status: "not_isolated" }) },
+    { startDaemon: () => ({ status: "failed" }) },
+  ]) {
+    let spawned = false;
+    assert.throws(() => runLinuxAccountObservationNativeQualification({
+      ...runtime,
+      ...refusal,
+      spawnTest: () => { spawned = true; },
+    }), /LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED/u);
+    assert.equal(spawned, false);
+  }
 });

@@ -47,12 +47,13 @@ test("the exact embedded Linux proof accepts real TAP lines and refuses zero-exi
 test("packaged Linux image admits only the chosen app and verifier inputs", async () => {
   const dockerfile = await read("containers/electron-linux-packaged/Dockerfile");
   const copies = dockerfile.split("\n").filter((line) => line.startsWith("COPY "));
-  assert.equal(copies.length, 6);
+  assert.equal(copies.length, 7);
   assert.ok(copies.every((line) => !line.includes("--chown")));
   assert.equal(copies.filter((line) => line.startsWith("COPY scripts ")).length, 1);
   assert.equal(copies.filter((line) => line.startsWith("COPY .release-build/electron-dev/linux-x64/app ")).length, 1);
   assert.deepEqual(copies.filter((line) => line.startsWith("COPY test/")), [
     "COPY test/linux-credential-mutex-native.test.js ./test/linux-credential-mutex-native.test.js",
+    "COPY test/linux-account-observation-credential-native.test.js ./test/linux-account-observation-credential-native.test.js",
   ]);
   assert.deepEqual(copies.filter((line) => line.startsWith(
     "COPY .release-build/electron-dev/linux-x64/app/native/linux-credential-mutex/",
@@ -81,6 +82,7 @@ test("packaged Linux image admits only the chosen app and verifier inputs", asyn
   ]);
   assert.deepEqual(exceptions.filter((line) => line.startsWith("!test")), [
     "!test/", "!test/linux-credential-mutex-native.test.js",
+    "!test/linux-account-observation-credential-native.test.js",
   ]);
   assert.ok(exceptions.every((line) => !/profile|\.git|\.usage-monitor|\.release-deps|darwin|win32/u.test(line)));
 });
@@ -93,7 +95,7 @@ test("packaged Linux default-state and native smoke have no network or user prof
   const step = workflow.slice(start, end);
   assert.equal(
     (step.match(/docker run --rm --init --platform=linux\/amd64 --network none/gu) ?? []).length,
-    2,
+    3,
   );
   for (const mount of ["/home/node", "/run/user/1000"]) {
     assert.equal(
@@ -101,7 +103,7 @@ test("packaged Linux default-state and native smoke have no network or user prof
         `--tmpfs ${mount}:rw,noexec,nosuid,size=\\d+m,uid=1000,gid=1000,mode=0700`,
         "gu",
       )) ?? []).length,
-      2,
+      3,
     );
   }
   assert.doesNotMatch(step, /--privileged|--cap-add|--mount|--volume|\s-v\s|--network[= ]host/u);
@@ -123,5 +125,8 @@ test("packaged Linux default-state and native smoke have no network or user prof
   assert.match(step, /TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1/u);
   assert.match(step, /--staged-app \/workspace\/\.release-build\/electron-dev\/linux-x64\/app/u);
   assert.match(step, /> "\$host_receipt"/u);
+  assert.match(step, /scripts\/run-linux-secret-service-qualification\.mjs --account-observation/u);
+  assert.match(step, /> "\$observation_receipt"/u);
+  assert.match(workflow, /libsecret-1-dev pkg-config/u);
   assert.match(workflow.slice(end), /if: \$\{\{ !cancelled\(\) \}\}/u);
 });

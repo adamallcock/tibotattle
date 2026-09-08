@@ -46,7 +46,7 @@ jobs:
           node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='arm64')process.exit(1)"
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Validate packaging contracts
-        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
       - name: Validate macOS signing-order and final metadata contracts without credentials
         run: node --test test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js
       - name: Build and verify development distributions
@@ -91,7 +91,7 @@ jobs:
           node -e "if(process.version!=='v26.2.0'||process.platform!=='darwin'||process.arch!=='x64')process.exit(1)"
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Validate packaging contracts
-        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
       - name: Validate macOS signing-order and final metadata contracts without credentials
         run: node --test test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js
       - name: Build and verify development distributions
@@ -157,7 +157,7 @@ jobs:
       - name: Check ordinary companion startup and fixed credential channel contracts
         run: node --test test/windows-account-observation-credential.test.js apps/electron/test/shell-core.test.mjs apps/electron/test/desktop-windows-account-observation-broker.test.mjs apps/electron/test/desktop-windows-account-observation-qualification.test.mjs apps/electron/test/windows-account-observation-qualification-smoke.test.mjs apps/electron/test/windows-account-observation-ipc-coexistence.test.mjs
       - name: Validate packaging contracts
-        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target win32-x64 --format distribution --replace-staging
       - name: Exercise synthetic upload and account-observation storage through packaged Electron and inherited IPC
@@ -213,7 +213,7 @@ jobs:
       - name: Install Linux package and desktop prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends libsecret-1-0 libarchive-tools libfuse2t64
+          sudo apt-get install --yes --no-install-recommends libsecret-1-0 libsecret-1-dev pkg-config libarchive-tools libfuse2t64
       - name: Build and qualify the native Linux credential mutex
         run: |
           set -euo pipefail
@@ -227,9 +227,9 @@ jobs:
           node scripts/build-linux-credential-mutex-manifest.mjs
           node scripts/qualify-linux-credential-mutex.mjs
       - name: Validate private Linux credential channel and identity selection
-        run: node --test apps/electron/test/desktop-linux-secret-service-broker.test.mjs apps/electron/test/desktop-linux-secret-service-composition.test.mjs test/linux-credential-state.test.js test/export-identity-production.test.js test/account-observation-secret.test.js
+        run: node --test apps/electron/test/desktop-linux-secret-service-broker.test.mjs apps/electron/test/desktop-linux-secret-service-composition.test.mjs test/linux-credential-state.test.js test/export-identity-production.test.js test/account-observation-secret.test.js test/linux-account-observation-credential.test.js
       - name: Validate packaging contracts
-        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
+        run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target linux-x64 --format distribution --replace-staging
       - name: Exercise packaged Linux credentials in disposable Secret Service
@@ -242,6 +242,7 @@ jobs:
             --tag tibotattle-electron-linux-packaged:test .
           package_root="/workspace/.release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution"
           host_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/secret-service-storage-smoke.json"
+          observation_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/account-observation-native-qualification.json"
           # Prove the absent .local/state fallback in its own fresh home before
           # the separate packaged credential journey. Neither run sees host state.
           docker run --rm --init --platform=linux/amd64 --network none \
@@ -288,6 +289,20 @@ jobs:
                 fail();
               }
             '
+          # The new fixed observation facade gets its own disposable service.
+          # Its exact native test marker is required; a zero-exit skip is refused.
+          docker run --rm --init --platform=linux/amd64 --network none \
+            --tmpfs /home/node:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=16m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 \
+            --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config \
+            --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share \
+            --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            --entrypoint node tibotattle-electron-linux-packaged:test \
+            scripts/run-linux-secret-service-qualification.mjs --account-observation \
+            > "$observation_receipt"
           docker run --rm --init --platform=linux/amd64 --network none \
             --tmpfs /home/node:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=0700 \
             --tmpfs /run/user/1000:rw,noexec,nosuid,size=16m,uid=1000,gid=1000,mode=0700 \

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
   readFile,
@@ -10,6 +10,11 @@ import {
 } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+import {
+  proveLinuxSecretServiceContainerIsolation,
+  startLinuxSecretServiceDaemon,
+} from "./qualify-linux-secret-service.mjs";
 
 const REPOSITORY_ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const DBUS_RUN_SESSION = "/usr/bin/dbus-run-session";
@@ -52,6 +57,31 @@ const EXPECTED_RECEIPT = Object.freeze({
   crashRecoveryComplete: false,
 });
 
+const OBSERVATION_RECEIPT = Object.freeze({
+  schemaVersion: "linux-account-observation-qualification-v1",
+  status: "passed",
+  scope: "development_only",
+  platform: "linux",
+  architecture: "x64",
+  subject: "pinned_native_binding",
+  capability: "account_observation",
+  lifecycle: "read_create_no_replace_and_digest_reconciliation",
+  credentialCleanup: "disposable_container_lifetime",
+  productionSafe: false,
+});
+const QUALIFICATION_PROFILES = Object.freeze({
+  legacy: Object.freeze({
+    helper: QUALIFICATION_HELPER,
+    arguments: Object.freeze([]),
+    receipt: EXPECTED_RECEIPT,
+  }),
+  account_observation: Object.freeze({
+    helper: fileURLToPath(import.meta.url),
+    arguments: Object.freeze(["--account-observation-inner"]),
+    receipt: OBSERVATION_RECEIPT,
+  }),
+});
+
 function wait(durationMs) {
   return new Promise((resolveWait) => setTimeout(resolveWait, durationMs));
 }
@@ -70,18 +100,20 @@ export function parseLinuxProcStartTime(value) {
   return /^\d+$/u.test(startTime ?? "") ? startTime : null;
 }
 
-export function validateLinuxQualificationSupervisorReceipt(value) {
+export function validateLinuxQualificationSupervisorReceipt(value, profile = "legacy") {
+  if (!Object.hasOwn(QUALIFICATION_PROFILES, profile)) return null;
+  const expectedReceipt = QUALIFICATION_PROFILES[profile].receipt;
   if (value === null
       || typeof value !== "object"
       || Array.isArray(value)
       || Object.getPrototypeOf(value) !== Object.prototype
-      || Object.keys(value).length !== Object.keys(EXPECTED_RECEIPT).length) {
+      || Object.keys(value).length !== Object.keys(expectedReceipt).length) {
     return null;
   }
-  for (const [key, expected] of Object.entries(EXPECTED_RECEIPT)) {
+  for (const [key, expected] of Object.entries(expectedReceipt)) {
     if (!Object.hasOwn(value, key) || value[key] !== expected) return null;
   }
-  return Object.freeze({ ...EXPECTED_RECEIPT });
+  return Object.freeze({ ...expectedReceipt });
 }
 
 async function readLinuxProcessIdentity(
@@ -243,13 +275,15 @@ function supervisorFailure(code) {
 }
 
 export async function runLinuxSecretServiceSupervisor({
+  profile = "legacy",
   platform = process.platform,
   architecture = process.arch,
   environment = process.env,
   listProcesses = qualificationProcesses,
   spawnChild = (selectedEnvironment) => spawn(
     DBUS_RUN_SESSION,
-    ["--", process.execPath, QUALIFICATION_HELPER],
+    ["--", process.execPath, QUALIFICATION_PROFILES[profile].helper,
+      ...QUALIFICATION_PROFILES[profile].arguments],
     {
       cwd: REPOSITORY_ROOT,
       detached: true,
@@ -271,6 +305,9 @@ export async function runLinuxSecretServiceSupervisor({
   killCleanupDeadlineMs = KILL_CLEANUP_DEADLINE_MS,
   maxOutputBytes = MAX_OUTPUT_BYTES,
 } = {}) {
+  if (!Object.hasOwn(QUALIFICATION_PROFILES, profile)) {
+    return supervisorFailure("LINUX_SECRET_SERVICE_SUPERVISOR_PROFILE_INVALID");
+  }
   if (platform !== "linux"
       || architecture !== "x64"
       || environment.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED !== "1") {
@@ -336,6 +373,7 @@ export async function runLinuxSecretServiceSupervisor({
   try {
     receipt = validateLinuxQualificationSupervisorReceipt(
       JSON.parse(stdoutBytes.toString("utf8")),
+      profile,
     );
   } catch {
     receipt = null;
@@ -346,8 +384,55 @@ export async function runLinuxSecretServiceSupervisor({
   return Object.freeze({ status: "passed", receipt });
 }
 
+export function runLinuxAccountObservationNativeQualification({
+  platform = process.platform,
+  architecture = process.arch,
+  environment = process.env,
+  proveIsolation = proveLinuxSecretServiceContainerIsolation,
+  startDaemon = startLinuxSecretServiceDaemon,
+  spawnTest = spawnSync,
+} = {}) {
+  const failNative = () => { throw new Error("LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED"); };
+  if (platform !== "linux" || architecture !== "x64"
+      || environment.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED !== "1") failNative();
+  if (proveIsolation({ environment })?.status !== "isolated") failNative();
+  if (startDaemon({ environment })?.status !== "started") failNative();
+  const result = spawnTest(process.execPath, [
+    "--test", "--test-reporter=tap",
+    "test/linux-account-observation-credential-native.test.js",
+  ], {
+    cwd: REPOSITORY_ROOT,
+    env: { ...environment, USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST: "1" },
+    encoding: "utf8",
+    maxBuffer: MAX_OUTPUT_BYTES,
+    timeout: 15_000,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const marker = "# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED";
+  const markers = typeof result?.stdout === "string"
+    ? result.stdout.split(/\r?\n/u).filter((line) => line === marker)
+    : [];
+  if (result?.error || result?.status !== 0 || result?.signal !== null
+      || markers.length !== 1) failNative();
+  return OBSERVATION_RECEIPT;
+}
+
 async function runSupervisor() {
-  const outcome = await runLinuxSecretServiceSupervisor();
+  const args = process.argv.slice(2);
+  if (args.length === 1 && args[0] === "--account-observation-inner") {
+    try {
+      const receipt = runLinuxAccountObservationNativeQualification();
+      process.stdout.write(`${JSON.stringify(receipt)}\n`);
+    } catch {
+      fixedFailure("LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED");
+    }
+    return undefined;
+  }
+  const profile = args.length === 0 ? "legacy"
+    : args.length === 1 && args[0] === "--account-observation" ? "account_observation" : null;
+  if (profile === null) return fixedFailure("LINUX_SECRET_SERVICE_SUPERVISOR_PROFILE_INVALID");
+  const outcome = await runLinuxSecretServiceSupervisor({ profile });
   if (outcome.status === "failed") return fixedFailure(outcome.code);
   process.stdout.write(`${JSON.stringify(outcome.receipt, null, 2)}\n`);
   return undefined;

@@ -93,6 +93,7 @@ const REVIEWED_SOURCE_OWNER_PUBLIC_ENTRYPOINTS = new Set([
   "src/export/set-materialization-runtime.js",
   "src/platform/index.js",
   "src/platform/linux-accountless-installation-credential.js",
+  "src/platform/linux-account-observation-credential.js",
   "src/platform/linux-credential-mutation-lease.js",
   "src/platform/linux-credential-state.js",
   "src/platform/linux-secret-service.js",

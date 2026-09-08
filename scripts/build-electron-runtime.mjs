@@ -235,6 +235,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "apps/electron/windows-account-observation-qualification-smoke.js",
   "apps/electron/windows-qualification.js",
   "src/desktop-shell-status.js",
+  "src/platform/linux-account-observation-credential.js",
   "src/platform/linux-credential-mutex.js",
   "src/platform/linux-credential-mutation-lease.js",
   "src/platform/linux-credential-state.js",

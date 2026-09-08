@@ -108,6 +108,7 @@ const SHELL_FILES = [
   "apps/electron/windows-qualification.js",
   "config/deployment-endpoints.js",
   "src/desktop-shell-status.js",
+  "src/platform/linux-account-observation-credential.js",
   "src/platform/linux-credential-mutex.js",
   "src/platform/linux-credential-mutation-lease.js",
   "src/platform/linux-credential-state.js",

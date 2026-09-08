@@ -175,7 +175,7 @@ jobs:
           node scripts/build-windows-filesystem-manifest.mjs
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BINDING_MANIFEST_FAILED' }
       - name: Validate production source contracts
-        run: node --test test/electron-production-distribution.test.js
+        run: node --test test/electron-production-distribution.test.js test/windows-electron-release-config.test.js
       - name: Prepare unsigned production source only
         run: |
           $ErrorActionPreference = 'Stop'

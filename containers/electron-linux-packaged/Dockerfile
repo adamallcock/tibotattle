@@ -16,9 +16,10 @@ RUN node --input-type=module --eval \
 # this image; installer payloads, private profiles and signing files do not.
 COPY scripts ./scripts
 COPY .release-build/electron-dev/linux-x64/app ./.release-build/electron-dev/linux-x64/app
-# This one native test runs in a separate fresh disposable container against
+# These exact native tests run in separate fresh disposable containers against
 # a copy of the staged native bytes. Keep test files outside the app inventory.
 COPY test/linux-credential-mutex-native.test.js ./test/linux-credential-mutex-native.test.js
+COPY test/linux-account-observation-credential-native.test.js ./test/linux-account-observation-credential-native.test.js
 COPY .release-build/electron-dev/linux-x64/app/native/linux-credential-mutex/build/qualification ./native/linux-credential-mutex/build/qualification
 COPY .release-build/electron-candidates/${TIBOTATTLE_QUALIFICATION_REVISION}/linux-x64/distribution/linux-unpacked ./.release-build/electron-candidates/${TIBOTATTLE_QUALIFICATION_REVISION}/linux-x64/distribution/linux-unpacked
 COPY .release-build/electron-candidates/${TIBOTATTLE_QUALIFICATION_REVISION}/linux-x64/distribution/development-package.json ./.release-build/electron-candidates/${TIBOTATTLE_QUALIFICATION_REVISION}/linux-x64/distribution/development-package.json
