@@ -61,18 +61,42 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest combined result: `7ee7b9b9` in
+Latest combined result: `0fc262cf` in
+[run 34239981348](https://github.com/adamallcock/tibotattle/actions/runs/34239981348)
+passes both Mac package jobs and the Windows producer. The fresh Windows
+receipt proves successful installation, both complete app launches, FD3/FD4
+credential continuity and successful uninstaller settlement. Only the final
+cleanup proof is unavailable (`POSTCONDITION_PROBE_UNAVAILABLE`); distinguish
+which predicate failed before changing behavior or time limits. The preceding
+installer timeout did not repeat, and this result proves the restart repair.
+Linux normal candidate preparation and the packaged Secret Service tests pass.
+The normal Electron journey returns `SESSION_OUTPUT_INVALID` after verified
+artifact binding, without a usable inner phase. Add bounded phase diagnostics
+for actual startup/renderer/refresh/shutdown and session output; retain strict
+success, networking and cleanup requirements. Those diagnostics are integrated
+at `628279fb` (Linux) and `6b0ed7c4` (Windows); 77 focused tests pass with five
+Windows-only cases deferred. The Windows receipt distinguishes registry
+timeout, unsettled/start failure, nonzero exit and invalid output as well as
+filesystem/poll failures. The Linux receipt preserves the app phase and
+distinguishes execution, invalid receipt and stderr-only rejection. No
+existing timeout or success assertion was relaxed.
+
+Previous combined result: `7ee7b9b9` in
 [run 34238600250](https://github.com/adamallcock/tibotattle/actions/runs/34238600250)
 passes both Mac package jobs and the Windows producer. The fresh Windows NSIS
-journey fails again; its bounded receipt is retained and the next missing
-boundary is being classified. Linux's development distribution builds successfully, but normal
+journey fails before installation completes: `INSTALLER_UNSETTLED`, no app
+launches and no uninstall attempt. Its bounded receipt is retained. This run
+cannot assess the restart repair. Linux's development distribution builds
+successfully, but normal
 candidate preparation rejects the 11-digit GitHub run ID against the bounded
 build-number contract. The workflow now uses its shorter workflow run number
 for both preparation and builder metadata. The regression expands the actual
 workflow command and passes its arguments through the real production parser;
 34 parser/distribution/workflow tests and 78 release-trust tests pass. The
-Windows journey has terminated, so this Linux correction can proceed without
-canceling an active installed test.
+Windows journey has terminated. The Linux correction is pushed at `0fc262cf`
+in [run 34239981348](https://github.com/adamallcock/tibotattle/actions/runs/34239981348),
+which also provides another observation of the unchanged Windows installer
+path before any installer-timeout source change.
 
 Previous combined result: `921e9ea8` in
 [run 34238242221](https://github.com/adamallcock/tibotattle/actions/runs/34238242221)
