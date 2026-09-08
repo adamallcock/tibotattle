@@ -324,6 +324,8 @@ test("tray popup assets are local, bounded, and wired as a visual surface", asyn
   assert.match(html, /data-action="open"/u);
   assert.match(html, /data-action="refresh"/u);
   assert.match(html, /data-action="more"/u);
+  assert.match(html, /aria-haspopup="menu"/u);
+  assert.doesNotMatch(html, /Not a subscription bill/u);
   assert.doesNotMatch(html, /Usage overview/u);
   assert.doesNotMatch(html, /https?:\/\//u);
   assert.match(js, /function buildWeeklyPace/u);
@@ -374,7 +376,7 @@ test("header and allowance rows use the compact native wording", () => {
     requiresMainModel: true,
     mainModel: { status: "fresh", refreshEnabled: true },
   });
-  assert.match(updated.getElementById("tray-popup-freshness").textContent, /Live · updated 5 minutes ago/u);
+  assert.match(updated.getElementById("tray-popup-freshness").textContent, /Updated 5 minutes ago/u);
 });
 
 test("content-height reporting follows intrinsic changes through the narrow bridge", () => {
@@ -659,6 +661,11 @@ test("compact history keeps tokens primary and makes partial coverage explicit",
       bar.className.includes("evidence-partial")),
     true,
   );
+  const bar = documentRef.getElementById("history-bars").children.find((candidate) =>
+    candidate.attributes.get("title")?.includes("tokens"));
+  assert.ok(bar);
+  assert.match(bar.attributes.get("title"), /tokens.*\$0\.01/u);
+  assert.equal(bar.attributes.get("tabindex"), "0");
 });
 
 test("unavailable accounting never turns absent history into zero", () => {

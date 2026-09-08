@@ -1278,13 +1278,13 @@ function renderHistory(documentRef, projection, t, numberFormatter, formattingLo
     const bar = documentRef.createElement("span");
     bar.className = `electron-tray-popup-history-bar evidence-${day.evidence}`;
     bar.setAttribute("role", "img");
+    bar.setAttribute("tabindex", "0");
     const label = calendarLabel(day.key, formattingLocale);
     const detail = day.totalTokens === null
       ? t("dashboard.timeline.missingData")
-      : `${t("electron.trayPopover.tokenCount", { count: compact(day.totalTokens) })} · ${t("electron.trayPopover.usageChangesMany", {
-        count: numberFormatter(day.usageEvents ?? 0, { maximumFractionDigits: 0 }),
-      })}`;
+      : `${t("electron.trayPopover.tokenCount", { count: compact(day.totalTokens) })} · ${historyPriceCopy(day, t, numberFormatter)}`;
     bar.setAttribute("aria-label", `${label}: ${detail}`);
+    bar.setAttribute("title", `${label}: ${detail}`);
     const fill = documentRef.createElement("span");
     fill.className = "electron-tray-popup-history-fill";
     if (day.totalTokens !== null) {
@@ -1303,7 +1303,7 @@ function headerFreshnessCopy(freshness, t, mainStatus = null) {
       && freshness.ageSeconds !== null) {
     return freshness.ageSeconds < 90
       ? t("electron.trayPopover.headerLive")
-      : t("electron.trayPopover.headerLiveUpdated", {
+      : t("electron.trayPopover.headerUpdated", {
         age: formatAge(freshness.ageSeconds),
       });
   }

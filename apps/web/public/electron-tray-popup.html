@@ -21,7 +21,8 @@
         </div>
         <button type="button" data-action="more" class="electron-tray-popup-more"
           data-i18n-aria-label="electron.trayPopover.more" aria-label="More actions"
-          data-i18n-title="electron.trayPopover.more" title="More actions">⋯</button>
+          data-i18n-title="electron.trayPopover.more" title="More actions"
+          aria-haspopup="menu">⋯</button>
       </header>
 
       <div id="tray-popup-sections" class="electron-tray-popup-sections">
@@ -98,7 +99,6 @@
           <button type="button" data-action="refresh" data-i18n="electron.trayPopover.refresh">Refresh</button>
         </div>
         <button type="button" data-action="customize" data-i18n="electron.tray.customize">Customize tray…</button>
-        <p class="electron-tray-popup-disclaimer" data-i18n="electron.trayPopover.notSubscriptionBill">Not a subscription bill</p>
       </footer>
       <div class="sr-only" id="tray-popup-live" role="status" aria-live="polite"></div>
     </main>

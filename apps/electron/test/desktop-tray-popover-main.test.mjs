@@ -399,7 +399,7 @@ test("content height fits the popup without reopening it and restores after a sm
   popover.destroy();
 });
 
-test("popover accepts negative display origins, caps to work area, and dismisses on Escape", async () => {
+test("popover accepts negative display origins, caps to work area, and dismisses on focus loss or Escape", async () => {
   const preloadPath = await preloadFixture();
   const windows = [];
   const trayBounds = { x: -1_400, y: -500, width: 24, height: 24 };
@@ -434,6 +434,10 @@ test("popover accepts negative display origins, caps to work area, and dismisses
   assert.ok(x >= -1_440 && x + 400 <= 480, `x=${x}`);
   assert.ok(y >= -900 && y + 436 <= -440, `y=${y}`);
   assert.equal(popover.visible, true);
+  window.emit("blur");
+  assert.equal(popover.visible, false);
+  assert.equal(popover.show(), true);
+  await new Promise((resolve) => setTimeout(resolve, 0));
   window.webContents.emit("before-input-event", {}, { type: "keyDown", key: "Escape" });
   assert.equal(popover.visible, false);
 });
