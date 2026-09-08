@@ -10,6 +10,7 @@ import {
   runLinuxPackagedSecretServiceSmoke,
   runLinuxPackagedSecretServiceSmokeInside,
   verifyLinuxPackagedSecretServiceSmokePackage,
+  verifyLinuxPackagedNativeBindings,
 } from "../scripts/smoke-electron-linux-secret-service.mjs";
 
 const REVISION = "a".repeat(40);
@@ -20,6 +21,35 @@ const APP = "/trusted/linux-unpacked/tibotattle-dev";
 const STAGED = "/trusted/staged-app";
 const PACKAGE_RECEIPT = "/trusted/development-package.json";
 const OUTPUT_RECEIPT = "/tmp/tibotattle-smoke-receipt.json";
+
+test("packaged native preflight calls only the fixed provenance loaders and suppresses raw failures", async () => {
+  const calls = [];
+  const loader = async (url) => {
+    calls.push(url);
+    return {
+      loadLinuxCredentialMutexBinding() { calls.push("mutex"); },
+      loadLinuxSecretServiceBinding() { calls.push("keytar"); },
+    };
+  };
+  await verifyLinuxPackagedNativeBindings(APP, loader);
+  assert.deepEqual(calls, [
+    "file:///trusted/linux-unpacked/resources/app.asar/src/platform/linux-credential-mutex.js",
+    "mutex",
+    "file:///trusted/linux-unpacked/resources/app.asar/src/platform/linux-secret-service-binding.js",
+    "keytar",
+  ]);
+  for (const [method, suffix] of [
+    ["loadLinuxCredentialMutexBinding", "MUTEX_LOAD_FAILED"],
+    ["loadLinuxSecretServiceBinding", "KEYTAR_LOAD_FAILED"],
+  ]) {
+    await assert.rejects(verifyLinuxPackagedNativeBindings(APP, async () => ({
+      loadLinuxCredentialMutexBinding() {},
+      loadLinuxSecretServiceBinding() {},
+      [method]() { throw new Error("private-native-path-canary"); },
+    })), { code: `ELECTRON_LINUX_SECRET_SERVICE_SMOKE_${suffix}`,
+      message: `ELECTRON_LINUX_SECRET_SERVICE_SMOKE_${suffix}` });
+  }
+});
 
 function packageReceipt(overrides = {}) {
   return {
@@ -76,6 +106,7 @@ function successfulInsideRuntime({ electronProcess, digest }) {
     executable: APP,
     environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    async verifyNativeBindings() {},
     electronProcess,
     async canonicalize(path) { return path; },
     digest,
@@ -230,6 +261,7 @@ test("packaged Electron creates the isolated context only after the default-proo
     executable: APP,
     environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    async verifyNativeBindings() {},
     electronProcess,
     async canonicalize(path) { return path; },
     async digest(path) {
@@ -307,6 +339,7 @@ test("packaged Electron emits bounded runtime and isolation stage failures befor
     executable: APP,
     environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    async verifyNativeBindings() {},
     async canonicalize(path) { return path; },
     async digest() { return ASAR; },
     startDaemon() { daemonCalls += 1; throw new Error("canary"); },
@@ -328,6 +361,7 @@ test("packaged Electron emits bounded module and native round-trip stage failure
     executable: APP,
     environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    async verifyNativeBindings() {},
     async canonicalize(path) { return path; },
     async digest() { return ASAR; },
     startDaemon() { return { status: "started" }; },
@@ -379,6 +413,7 @@ test("packaged Electron restores ASAR mode after a physical archive digest failu
     executable: APP,
     environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    async verifyNativeBindings() {},
     electronProcess,
     async canonicalize(path) { return path; },
     async digest() {

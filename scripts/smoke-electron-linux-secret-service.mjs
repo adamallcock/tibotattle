@@ -97,6 +97,8 @@ const INNER_STAGE_FAILURE_CODES = new Set([
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_ARTIFACT_IDENTITY_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_ISOLATION_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_MODULE_LOAD_FAILED",
+  "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_MUTEX_LOAD_FAILED",
+  "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_KEYTAR_LOAD_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_NATIVE_ROUND_TRIP_FAILED",
 ]);
 const NODE_MODULE_LOAD_ERROR_CODES = new Set([
@@ -773,6 +775,22 @@ function asarModuleUrl(appPath, modulePath) {
   return pathToFileURL(join(dirname(appPath), "resources", "app.asar", ...modulePath)).href;
 }
 
+// Load each exact packaged native binding before the broker starts. The
+// loaders verify native provenance without reading or mutating credentials;
+// separate fixed stages keep a loader failure distinct from an FD4 failure.
+export async function verifyLinuxPackagedNativeBindings(appPath, importModule) {
+  for (const [file, method, code] of [
+    ["linux-credential-mutex.js", "loadLinuxCredentialMutexBinding", "MUTEX_LOAD_FAILED"],
+    ["linux-secret-service-binding.js", "loadLinuxSecretServiceBinding", "KEYTAR_LOAD_FAILED"],
+  ]) {
+    await innerStage(code, async () => {
+      const module = await importModule(asarModuleUrl(appPath, ["src", "platform", file]));
+      if (typeof module?.[method] !== "function") fail(code);
+      module[method]();
+    });
+  }
+}
+
 async function assertPackagedElectronNodeRuntime(appPath, {
   platform = process.platform,
   architecture = process.arch,
@@ -809,6 +827,7 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
   electronProcess = process,
   startDaemon = startLinuxSecretServiceDaemon,
   importModule = (url) => import(url),
+  verifyNativeBindings = verifyLinuxPackagedNativeBindings,
 } = {}) {
   if (!options || typeof options !== "object"
       || !absolutePath(options.appPath)
@@ -816,7 +835,7 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
       || !SHA256.test(options.artifactSha256 ?? "")
       || typeof digest !== "function"
       || typeof startDaemon !== "function"
-      || typeof importModule !== "function") {
+      || typeof importModule !== "function" || typeof verifyNativeBindings !== "function") {
     fail("ARGUMENT_INVALID");
   }
   await innerStage("RUNTIME_IDENTITY_FAILED", () => assertPackagedElectronNodeRuntime(options.appPath, {
@@ -852,6 +871,7 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
       || typeof smoke?.runLinuxSecretServiceQualificationSmoke !== "function") {
     fail("MODULE_LOAD_FAILED");
   }
+  await verifyNativeBindings(options.appPath, importModule);
   const outcome = await innerStage("NATIVE_ROUND_TRIP_FAILED", async () => {
     const context = qualification.createLinuxQualificationContext({
       platform: "linux",
