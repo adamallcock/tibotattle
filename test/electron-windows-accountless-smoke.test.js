@@ -26,6 +26,7 @@ import {
 const type = "windows-electron-smoke-v1";
 const state = { type, message: "state-v1", started: true, primary: true, window: true, visible: true, tray: true };
 const storage = { type, message: "credential-v1", operation: "accountless-storage-v1", status: "passed-v1" };
+const observationStorage = { ...storage, operation: "account-observation-storage-v1" };
 const quit = { type, message: "quit-v1", status: "accepted-v1" };
 function fakeChild(reply) {
   const child = new EventEmitter();
@@ -205,13 +206,17 @@ test("Windows smoke refuses an unauthenticated first-run context before it write
   assert.equal(receiptWrites, 0);
 });
 
-test("runner waits for ready then completes only the fixed storage and clean quit sequence", async () => {
+test("runner waits for ready then completes both fixed storage journeys and clean quit in order", async () => {
   const child = fakeChild((target, { command }) => {
-    target.emit("message", command === "status-v1" ? state : command === "accountless-storage-v1" ? storage : quit);
+    target.emit("message", command === "status-v1" ? state : command === "accountless-storage-v1" ? storage : command === "account-observation-storage-v1" ? observationStorage : quit);
     if (command === "quit-v1") setImmediate(() => { target.exitCode = 0; target.emit("exit", 0, null); });
   });
-  await exerciseWindowsAccountlessSmoke(child, { timeoutMs: 1000 });
-  assert.deepEqual(child.commands, ["status-v1", "accountless-storage-v1", "quit-v1"].map((command) => ({ type, message: "command-v1", command })));
+  const observations = {};
+  await exerciseWindowsAccountlessSmoke(child, { timeoutMs: 1000, observations });
+  assert.deepEqual(child.commands, ["status-v1", "accountless-storage-v1", "account-observation-storage-v1", "quit-v1"].map((command) => ({ type, message: "command-v1", command })));
+  assert.equal(observations.storagePassed, true);
+  assert.equal(observations.accountObservationStoragePassed, true);
+  assert.equal(observations.quitAcknowledged, true);
   assert.equal(child.listenerCount("message"), 0);
   assert.equal(child.listenerCount("exit"), 0);
 });
@@ -221,6 +226,42 @@ test("storage failure or extra fields cannot produce a success receipt", async (
     const child = fakeChild((target) => target.emit("message", response));
     const protocol = createWindowsAccountlessSmokeProtocol(child, { timeoutMs: 50 });
     await assert.rejects(protocol.request("accountless-storage-v1"), /STORAGE_FAILED/u);
+    protocol.close();
+  }
+});
+
+test("observation storage rejects failures, extra fields and results from the independent upload credential journey", async () => {
+  for (const response of [{ ...observationStorage, status: "failed-v1" }, { ...observationStorage, privateValue: "unexpected" }, storage]) {
+    const child = fakeChild((target) => target.emit("message", response));
+    const protocol = createWindowsAccountlessSmokeProtocol(child, { timeoutMs: 50 });
+    await assert.rejects(protocol.request("account-observation-storage-v1"), /OBSERVATION_STORAGE_FAILED/u);
+    protocol.close();
+  }
+});
+
+test("observation failure preserves the upload result without claiming the second journey or a clean quit", async () => {
+  const observations = {};
+  const child = fakeChild((target, { command }) => {
+    target.emit("message", command === "status-v1" ? state : command === "accountless-storage-v1" ? storage : { ...observationStorage, status: "failed-v1" });
+  });
+  await assert.rejects(exerciseWindowsAccountlessSmoke(child, { timeoutMs: 100, observations }), /OBSERVATION_STORAGE_FAILED/u);
+  assert.equal(observations.storagePassed, true);
+  assert.equal(observations.accountObservationStorageRequested, true);
+  assert.notEqual(observations.accountObservationStoragePassed, true);
+  assert.notEqual(observations.quitAcknowledged, true);
+  assert.equal(child.commands.some(({ command }) => command === "quit-v1"), false);
+  assert.equal(child.listenerCount("message"), 0);
+});
+
+test("observation failure records only the closed stage enum and never native error detail", async () => {
+  for (const failureStage of ["preparation", "child_create", "child_restart_read", "unavailable", "private native detail"] ) {
+    const observations = { accountObservationFailureStage: null };
+    const child = fakeChild((target) => target.emit("message", {
+      ...observationStorage, status: "failed-v1", failureStage,
+    }));
+    const protocol = createWindowsAccountlessSmokeProtocol(child, { timeoutMs: 50, observations });
+    await assert.rejects(protocol.request("account-observation-storage-v1"), /OBSERVATION_STORAGE_FAILED/u);
+    assert.equal(observations.accountObservationFailureStage, failureStage === "private native detail" ? null : failureStage);
     protocol.close();
   }
 });
@@ -257,6 +298,8 @@ test("startup observation can be retried while a storage request is never replay
   await assert.rejects(protocol.request("accountless-storage-v1"), /TIMEOUT/u);
   assert.equal(child.commands.filter(({ command }) => command === "status-v1").length, 2);
   assert.equal(child.commands.filter(({ command }) => command === "accountless-storage-v1").length, 1);
+  await assert.rejects(protocol.request("account-observation-storage-v1"), /TIMEOUT/u);
+  assert.equal(child.commands.filter(({ command }) => command === "account-observation-storage-v1").length, 1);
   protocol.close();
 });
 

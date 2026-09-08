@@ -28,6 +28,10 @@ import {
 import {
   runWindowsAccountlessQualificationSmoke,
 } from "./windows-accountless-qualification-smoke.js";
+import {
+  classifyWindowsAccountObservationSmokeFailure,
+  runWindowsAccountObservationQualificationSmoke,
+} from "./windows-account-observation-qualification-smoke.js";
 
 const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_COMPANION_SCRIPT = resolve(MODULE_DIRECTORY, "../local/server.js");
@@ -58,6 +62,7 @@ const WINDOWS_ELECTRON_SMOKE_COMMANDS = new Set([
   "credential-read-v1",
   "credential-delete-v1",
   "accountless-storage-v1",
+  "account-observation-storage-v1",
   "quit-v1",
 ]);
 const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS = Object.freeze({
@@ -309,6 +314,7 @@ function installWindowsSmokeControlWithRunners(lifecycle, {
   credentialProbe,
   credentialCommand,
   accountlessStorage,
+  accountObservationStorage,
 } = {}) {
   if (platform !== "win32"
       || environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL
@@ -416,23 +422,28 @@ function installWindowsSmokeControlWithRunners(lifecycle, {
       credentialOperation.catch(() => {});
       return;
     }
-    if (command === "accountless-storage-v1") {
+    if (command === "accountless-storage-v1" || command === "account-observation-storage-v1") {
       credentialOperation = credentialOperation.then(async () => {
         if (!active) return;
         try {
-          if (typeof accountlessStorage !== "function") throw new Error("unavailable");
-          await accountlessStorage({ context: qualificationContext, environment });
+          const runner = command === "accountless-storage-v1" ? accountlessStorage : accountObservationStorage;
+          if (typeof runner !== "function") throw new Error("unavailable");
+          if (command === "account-observation-storage-v1"
+              && (environment.GITHUB_ACTIONS !== "true"
+                || environment.USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION
+                  !== "windows-account-observation-fd4-v1")) throw new Error("unavailable");
+          await runner({ context: qualificationContext, environment });
           if (!active) return;
           send(windowsSmokeCredentialMessage(
-            "accountless-storage-v1",
+            command,
             WINDOWS_ELECTRON_SMOKE_PASSED_STATUS,
           ));
-        } catch {
+        } catch (error) {
           if (!active) return;
-          send(windowsSmokeCredentialMessage(
-            "accountless-storage-v1",
-            WINDOWS_ELECTRON_SMOKE_FAILED_STATUS,
-          ));
+          const failure = windowsSmokeCredentialMessage(command, WINDOWS_ELECTRON_SMOKE_FAILED_STATUS);
+          send(command === "account-observation-storage-v1"
+            ? Object.freeze({ ...failure, failureStage: classifyWindowsAccountObservationSmokeFailure(error) ?? "unavailable" })
+            : failure);
         }
       });
       credentialOperation.catch(() => {});
@@ -489,6 +500,7 @@ export function installWindowsSmokeControl(lifecycle, options = {}) {
     credentialProbe: runWindowsElectronQualificationCredentialProbe,
     credentialCommand: runWindowsElectronQualificationCredentialCommand,
     accountlessStorage: runWindowsAccountlessQualificationSmoke,
+    accountObservationStorage: runWindowsAccountObservationQualificationSmoke,
   });
 }
 
@@ -497,6 +509,7 @@ export function installWindowsSmokeControlForTest(lifecycle, {
   credentialProbe,
   credentialCommand,
   accountlessStorage,
+  accountObservationStorage,
   ...options
 } = {}) {
   if (typeof credentialProbe !== "function"
@@ -507,6 +520,7 @@ export function installWindowsSmokeControlForTest(lifecycle, {
     credentialProbe,
     credentialCommand,
     accountlessStorage,
+    accountObservationStorage,
   });
 }
 

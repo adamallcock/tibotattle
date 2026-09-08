@@ -32,6 +32,7 @@ import {
   WINDOWS_PROTECTED_STATE_STORE_ROOT_BINDING_SAFE,
 } from "../src/platform/windows-protected-state-store.js";
 import {
+  assertWindowsQualificationResourceAuthority,
   createWindowsQualificationModeContext,
   WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS,
 } from "../src/platform/windows-qualification-mode.js";
@@ -228,7 +229,7 @@ function qualificationResourceKind(path) {
   return "electron_shell";
 }
 
-function qualificationResourceManifest() {
+function qualificationResourceManifest(omitPath = null) {
   const bytes = new Map([
     [QUALIFICATION_RESOURCE_BINDING, BINDING_BYTES],
     [QUALIFICATION_RESOURCE_BINDING_MANIFEST, Buffer.from("manifest", "utf8")],
@@ -240,7 +241,7 @@ function qualificationResourceManifest() {
     QUALIFICATION_RESOURCE_BINDING_MANIFEST,
     QUALIFICATION_RESOURCE_KEYTAR,
   ]);
-  const files = [...paths].map((path) => {
+  const files = [...paths].filter((path) => path !== omitPath).map((path) => {
     const value = bytes.get(path) ?? Buffer.from(path, "utf8");
     return Object.freeze({
       bytes: value.byteLength,
@@ -291,6 +292,29 @@ async function withQualificationResourceRoot(run) {
     await rm(root, { recursive: true, force: true });
   }
 }
+
+test("qualification authority refuses a self-consistent manifest missing any observation credential boundary module", async () => {
+  await withQualificationResourceRoot(async (resourceRoot) => {
+    assertWindowsQualificationResourceAuthority({ resourceRoot });
+    for (const omitted of [
+      "apps/electron/desktop-windows-account-observation-broker.js",
+      "apps/electron/desktop-windows-account-observation-qualification.js",
+      "apps/electron/windows-account-observation-qualification-smoke-child.mjs",
+      "apps/electron/windows-account-observation-qualification-smoke.js",
+      "src/platform/windows-account-observation-credential.js",
+      "src/platform/windows-account-observation-broker.js",
+      "src/platform/windows-credential-manager.js",
+      "src/platform/windows-credential-operation-lease.js",
+      "src/platform/windows-credential-mutex.js",
+      "src/platform/windows-credential-operation-audit.js",
+      "src/platform/windows-credential-audit-file-guard.js",
+    ]) {
+      await writeFile(join(resourceRoot, "electron-runtime-manifest.json"), JSON.stringify(qualificationResourceManifest(omitted)));
+      assert.throws(() => assertWindowsQualificationResourceAuthority({ resourceRoot }),
+        { code: "windows_qualification_mode_resource_authority" }, omitted);
+    }
+  });
+});
 
 test("Windows native loader is inert on non-Windows hosts", () => {
   let resolved = false;

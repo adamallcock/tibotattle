@@ -15,8 +15,8 @@ fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
 All four development packaging jobs pass at
-`f86f0f187da06172f930b1ac56b55c077f9fc0fa` in
-[run 34179148807](https://github.com/adamallcock/tibotattle/actions/runs/34179148807):
+`f26146aaf7fe34845ed7192ae0100e88b9d9b660` in
+[run 34179604251](https://github.com/adamallcock/tibotattle/actions/runs/34179604251):
 Apple Silicon Mac, Intel Mac, Windows x64 and Linux x64. Windows passes the
 actual packaged accountless credential journey: create/read, retained record in
 a separate child, deletion, status and clean quit. Linux now passes its actual
@@ -35,6 +35,16 @@ tests pass. Earlier archive-identity, generic-round-trip and create-stage failur
 receipts remain preserved. The successful native rerun establishes this test
 fixture repair; normal Linux first-launch/state setup is still a separate gate.
 
+The follow-up Linux production review identifies three remaining source gates:
+secure native setup when the selected XDG state base does not yet exist;
+durable reconciliation of interrupted generic and separate FD3 credential
+mutations before clearing abandoned markers; and a production composition that
+supplies both reviewed parent-side credential factories. The current container
+receipt proves none of those gates. A bounded first-run native setup repair is
+in progress, using the binding's existing XDG/passwd resolution and refusing
+unsafe existing paths. Production flags remain closed. Real installed desktop
+session, locked collection, lifecycle and updater evidence remains separate.
+
 The later dormant Windows account-observation foundation is integrated at
 `f94161f4`, with packaging/source-export separation at `209a545e`. Its fixed
 read/create-only channel uses the main-owned legacy observation capability and
@@ -45,8 +55,23 @@ include only the child communication module; the native wrapper has its own
 reviewed platform entrypoint. The agent's 87 focused tests, root's 84 shell/
 observation tests, 35 packaging/broker tests (two optional skips), and 75
 architecture/export tests pass. Native Windows Credential Manager continuity
-and activation of this channel remain unqualified; the `f86f0f18` native run
-predates this foundation.
+and activation of this channel remain unqualified: the later `f26146aa` run
+packages the dormant foundation but does not execute its new channel. The
+subsequent local `0e553fb9` change includes its complete native-manager module
+closure and checks every declared shell module's static dependencies. All 33
+focused packaging tests pass, with two optional skips.
+
+The later `1d631abf` source adds the actual qualification-only Windows
+observation composition: an authenticated packaged context constructs the fixed
+Credential Manager facade with its native mutex, durable audit and completed
+startup recovery. The packaged smoke now runs FD3 upload storage followed by
+FD4 observation create/read and a fresh child reading the retained record.
+The new v2 receipt separates their results and fixed failure stages. This is
+confined to a disposable CI account; the fixed observation wire has no delete
+operation, so that synthetic record's cleanup boundary is the runner account's
+lifetime. All 90 integrated shell/credential/runner tests pass (one native-only
+skip), plus 73 resource-authority/shell tests and 36 packaging/export tests
+(two optional skips). Native execution of this new composition is still pending.
 
 The accountless production companion profile is now integrated at `b3643991`.
 It requires the exact production mode/origin and a connected private IPC
@@ -55,16 +80,28 @@ legacy queue/preparation/participant controllers. Current account observations
 and the shared companion single-writer lock remain intact. All 332 local
 companion tests pass, including the new profile's route, startup-failure,
 observation and ownership checks. This is source/local-runtime evidence;
-hosted activation and new packaged-profile qualification remain separate.
+hosted activation remains separate. The new Mac daily tester below also
+qualifies the current packaged Community/accountless-profile presentation.
 
-The current daily Mac tester is frozen `0f03c121ba1102314ae674be23f4b2c009bd3ed5`,
-with ASAR `2216a54ddf6315fcc52c4982542e12ffa5406ce4520c3842b92774054245a3db`.
+The current daily Mac tester is frozen `1f74bbb68f8c0ea88f1610e2da02cee4524f3c86`,
+with ASAR `771c0f16a9936737eb62d249e13c6e4e67d852139447d1b0b8573ba4351ff357`.
 Its synthetic rendered journeys and copied-history Usage/Community, timer,
 active-refresh responsiveness and clean-quit qualification pass. Both endpoints
-have p95 1 ms over 20 active samples each against the unchanged 250 ms limit;
-one 524 ms response is retained. The default durable launcher now selects this
+have p95 and maximum 1 ms over 20 active samples each against the unchanged
+250 ms limit. All 157 focused tests pass. The first synthetic attempt completed
+its page/settings checks but did not qualify the separate-process tray relaunch;
+its failure receipt is retained. An isolated retry against identical source and
+ASAR passed every check. Harness `e9ab4eb69def92589df7d99ae7e53818a6080af5`
+(integrated as `35787e68`) adds a pre-exit descendant barrier, an exit observer
+registered before signaling, fail-closed PID probes and fixed relaunch-stage
+diagnostics. Its 33 focused tests and a fresh native synthetic run against the
+same `1f74bbb6` app pass with clean quit and tray relaunch. The first receipt
+does not establish the underlying cause; it remains preserved.
+The default durable launcher now selects this
 package with hosted contributions disabled and a separate copied profile. Its
-previous d5 launcher is preserved as a versioned backup. No installed native app
+previous `0f03c121` launcher and app/profile are preserved, as is the older d5
+backup. The earlier 0f run's 524 ms response remains in its original receipt.
+No installed native app
 has been replaced. No current source is yet a production replacement.
 
 The earlier four-target successful development build
@@ -113,7 +150,7 @@ The exact `d5dc8025` Mac package subsequently passed settings/About and shared
 sharing-destination inspection, both cache-table pages, refresh cancellation
 with completed results retained, native-menu Quit and restart through the
 durable launcher. Sharing remained off after restart. At that stage the launcher selected
-this package; it now selects the qualified `0f03c121` package described above.
+this package; it now selects the qualified `1f74bbb6` package described above.
 The earlier packages, profiles and versioned launchers remain preserved.
 All 180 active-refresh samples in 45 seconds passed: health and status p95 were
 1 ms, maxima 28 ms, with no failures and the unchanged 250 ms p95 budget.

@@ -26,13 +26,20 @@ import {
   buildWindowsDevelopmentLaunchSpec,
 } from "./launch-electron-windows-development.mjs";
 import { verifyElectronDevelopmentArtifact } from "./verify-electron-development-artifact.mjs";
+import {
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_SMOKE_FAILURE_STAGES,
+} from "../apps/electron/windows-account-observation-qualification-smoke.js";
 
 const require = createRequire(import.meta.url);
 const TYPE = "windows-electron-smoke-v1";
 const PREFIX = "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_";
 const SHA = /^[0-9a-f]{64}$/u;
 const REVISION = /^[0-9a-f]{40}$/u;
-const COMMANDS = new Set(["status-v1", "accountless-storage-v1", "quit-v1"]);
+const COMMANDS = new Set(["status-v1", "accountless-storage-v1", "account-observation-storage-v1", "quit-v1"]);
+const OBSERVATION_FAILURE_STAGES = new Set([
+  ...WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_SMOKE_FAILURE_STAGES,
+  "unavailable",
+]);
 const SEND_ERROR_CODES = new Set(["EPIPE", "ECONNRESET", "ERR_IPC_CHANNEL_CLOSED", "ERR_IPC_DISCONNECTED"]);
 const WINDOWS_STAGED_BINDING_PATH = Object.freeze([
   "native",
@@ -283,8 +290,16 @@ export function createWindowsAccountlessSmokeProtocol(child, { timeoutMs = 60000
       if (observations) observations.statusResponseObserved = true;
       return finish(null, value);
     }
-    if (command === "accountless-storage-v1" && value.message === "credential-v1") {
-      if (Object.keys(value).length !== 4 || value.operation !== command || value.status !== "passed-v1") return finish(failure("STORAGE_FAILED"));
+    if ((command === "accountless-storage-v1" || command === "account-observation-storage-v1") && value.message === "credential-v1") {
+      if (command === "account-observation-storage-v1" && value.status === "failed-v1"
+          && Object.keys(value).length === 5 && value.operation === command
+          && OBSERVATION_FAILURE_STAGES.has(value.failureStage)) {
+        if (observations) observations.accountObservationFailureStage = value.failureStage;
+        return finish(failure("OBSERVATION_STORAGE_FAILED"));
+      }
+      if (Object.keys(value).length !== 4 || value.operation !== command || value.status !== "passed-v1") {
+        return finish(failure(command === "accountless-storage-v1" ? "STORAGE_FAILED" : "OBSERVATION_STORAGE_FAILED"));
+      }
       return finish(null, true);
     }
     if (command === "quit-v1" && value.message === "quit-v1") {
@@ -353,6 +368,9 @@ export async function exerciseWindowsAccountlessSmoke(child, { timeoutMs = 60000
     if (observations) observations.storageRequested = true;
     await protocol.request("accountless-storage-v1");
     if (observations) observations.storagePassed = true;
+    if (observations) observations.accountObservationStorageRequested = true;
+    await protocol.request("account-observation-storage-v1");
+    if (observations) observations.accountObservationStoragePassed = true;
     await protocol.request("quit-v1");
     if (observations) observations.quitAcknowledged = true;
     if (!await waitForChildExit(child, 10000)) fail("QUIT_TIMEOUT");
@@ -391,6 +409,9 @@ async function stopOwnedChild(child) {
 
 export async function runWindowsAccountlessSmoke(options) {
   if (process.platform !== "win32" || process.arch !== "x64") fail("WINDOWS_X64_REQUIRED");
+  // The fixed legacy observation credential is exercised only on the disposable
+  // hosted runner account. A developer's ordinary account is never a test store.
+  if (process.env.GITHUB_ACTIONS !== "true") fail("DISPOSABLE_CI_REQUIRED");
   // Reserve a new receipt before launching; no overwrite of prior evidence.
   const receiptHandle = await open(options.receiptPath, "wx", 0o600);
   let profileRoot = null;
@@ -400,7 +421,9 @@ export async function runWindowsAccountlessSmoke(options) {
   let stopped = true;
   const observations = { entryFailureObserved: false, statusResponseObserved: false,
     firstRunAcknowledgementPrepared: false, storageRequested: false,
-    storagePassed: false, quitAcknowledged: false, sendFailureCode: null };
+    storagePassed: false, accountObservationStorageRequested: false,
+    accountObservationStoragePassed: false, accountObservationFailureStage: null,
+    quitAcknowledged: false, sendFailureCode: null };
   try {
     identity = await verifyWindowsAccountlessSmokePackage(options);
     profileRoot = await mkdtemp(join(tmpdir(), "tibotattle-windows-accountless-smoke-"));
@@ -414,6 +437,8 @@ export async function runWindowsAccountlessSmoke(options) {
     observations.firstRunAcknowledgementPrepared = true;
     child = spawn(spec.command, spec.args, { ...spec.options,
       env: { ...spec.options.env, USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
+        GITHUB_ACTIONS: "true",
+        USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION: "windows-account-observation-fd4-v1",
         USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: randomUUID() },
       stdio: ["ignore", "ignore", "pipe", "ipc"],
     });
@@ -428,12 +453,15 @@ export async function runWindowsAccountlessSmoke(options) {
       catch { errorCode = `${PREFIX}PROFILE_CLEANUP_FAILED`; }
     }
     const receipt = {
-      schemaVersion: "windows-electron-accountless-storage-smoke-v1",
+      schemaVersion: "windows-electron-credential-storage-smoke-v2",
       status: errorCode ? "failed" : "passed", ...identity,
       target: "win32-x64", errorCode,
       packagedApplicationExecuted: child !== null,
-      syntheticCredentialOnly: true, realCredentialAccessed: false,
+      syntheticCredentialOnly: true, nonSyntheticCredentialAccessed: false,
+      nativeCredentialManagerJourneyVerified: observations.accountObservationStoragePassed,
       accountlessStorageAndChildRestartVerified: errorCode === null,
+      accountObservationStorageAndChildRestartVerified: errorCode === null,
+      accountObservationCredentialCleanup: "disposable-runner-account-lifetime",
       fullApplicationRestartVerified: false, hostedUploadPerformed: false,
       installationPerformed: false, productionReady: false,
       ownedProcessStopped: stopped,

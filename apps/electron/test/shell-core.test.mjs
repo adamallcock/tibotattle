@@ -1536,6 +1536,8 @@ test("Windows smoke IPC maps every credential operation to a fixed result", asyn
       ...environment,
       USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
       USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: "550e8400-e29b-41d4-a716-446655440000",
+      GITHUB_ACTIONS: "true",
+      USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION: "windows-account-observation-fd4-v1",
     };
     const cleanup = installWindowsSmokeControlForTest(lifecycle, {
       platform: "win32",
@@ -1559,6 +1561,11 @@ test("Windows smoke IPC maps every credential operation to a fixed result", asyn
         assert.equal(receivedContext, context);
         assert.equal(receivedEnvironment, qualifiedEnvironment);
         operations.push("accountless-storage-v1");
+      },
+      accountObservationStorage({ context: receivedContext, environment: receivedEnvironment }) {
+        assert.equal(receivedContext, context);
+        assert.equal(receivedEnvironment, qualifiedEnvironment);
+        operations.push("account-observation-storage-v1");
       },
       qualificationContext: context,
     });
@@ -1599,16 +1606,59 @@ test("Windows smoke IPC maps every credential operation to a fixed result", asyn
       status: "passed-v1",
     });
     callbacks.at(-1)(new Error("ERR_IPC_CHANNEL_CLOSED"));
+    source.emit("message", {
+      type: "windows-electron-smoke-v1",
+      message: "command-v1",
+      command: "account-observation-storage-v1",
+    });
+    await nextTick();
+    assert.deepEqual(sent.at(-1), {
+      type: "windows-electron-smoke-v1",
+      message: "credential-v1",
+      operation: "account-observation-storage-v1",
+      status: "passed-v1",
+    });
     assert.deepEqual(operations, [
       "probe-v1",
       "create-v1",
       "read-v1",
       "delete-v1",
       "accountless-storage-v1",
+      "account-observation-storage-v1",
     ]);
     cleanup();
     assert.equal(source.listenerCount("message"), 0);
     assert.equal(source.listenerCount("disconnect"), 0);
+  });
+});
+
+test("Windows observation smoke refuses missing or wrong disposable-CI markers before invoking its runner", async () => {
+  await withWindowsQualificationFixture(async ({ context, environment }) => {
+    for (const overrides of [
+      {},
+      { GITHUB_ACTIONS: "true" },
+      { GITHUB_ACTIONS: "false", USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION: "windows-account-observation-fd4-v1" },
+      { GITHUB_ACTIONS: "true", USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION: "unexpected" },
+    ]) {
+      const source = new EventEmitter();
+      const sent = [];
+      let calls = 0;
+      const cleanup = installWindowsSmokeControlForTest({ state: { primaryInstance: true } }, {
+        platform: "win32",
+        environment: { ...environment, USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1", ...overrides },
+        qualificationContext: context,
+        messageSource: source,
+        sendMessage(message) { sent.push(message); },
+        credentialProbe() {},
+        credentialCommand() {},
+        accountObservationStorage() { calls += 1; },
+      });
+      source.emit("message", { type: "windows-electron-smoke-v1", message: "command-v1", command: "account-observation-storage-v1" });
+      await nextTick();
+      assert.equal(calls, 0);
+      assert.deepEqual(sent, [{ type: "windows-electron-smoke-v1", message: "credential-v1", operation: "account-observation-storage-v1", status: "failed-v1", failureStage: "unavailable" }]);
+      cleanup();
+    }
   });
 });
 
