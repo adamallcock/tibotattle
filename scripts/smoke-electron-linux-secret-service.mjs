@@ -294,13 +294,18 @@ async function digestPhysicalAsar(path, {
   digest = digestRegularFile,
   electronProcess = process,
 } = {}) {
+  let originalDescriptor;
   let originalNoAsar;
   try {
-    originalNoAsar = electronProcess?.noAsar;
+    if (electronProcess === null
+        || (typeof electronProcess !== "object" && typeof electronProcess !== "function")) {
+      throw new TypeError("invalid Electron process");
+    }
+    originalDescriptor = Object.getOwnPropertyDescriptor(electronProcess, "noAsar");
+    originalNoAsar = electronProcess.noAsar;
   } catch {
     throw new Error("Electron ASAR mode is unreadable");
   }
-  if (typeof originalNoAsar !== "boolean") return digest(path);
   let restore = false;
   try {
     restore = true;
@@ -308,7 +313,21 @@ async function digestPhysicalAsar(path, {
     if (electronProcess.noAsar !== true) throw new Error("Electron ASAR mode is not writable");
     return await digest(path);
   } finally {
-    if (restore) electronProcess.noAsar = originalNoAsar;
+    if (restore) {
+      try {
+        if (originalDescriptor === undefined) {
+          if (!delete electronProcess.noAsar) throw new Error("Electron ASAR mode is not restorable");
+        } else if (Object.hasOwn(originalDescriptor, "value")) {
+          Object.defineProperty(electronProcess, "noAsar", originalDescriptor);
+        } else {
+          // An accessor descriptor is unchanged by assignment; restore its
+          // observable value through the original setter instead.
+          electronProcess.noAsar = originalNoAsar;
+        }
+      } catch {
+        throw new Error("Electron ASAR mode is not restorable");
+      }
+    }
   }
 }
 

@@ -69,6 +69,33 @@ function smokeError(code) {
   return (error) => error?.code === `ELECTRON_LINUX_SECRET_SERVICE_SMOKE_${code}`;
 }
 
+function successfulInsideRuntime({ electronProcess, digest }) {
+  return {
+    platform: "linux",
+    architecture: "x64",
+    executable: APP,
+    environment: { ELECTRON_RUN_AS_NODE: "1" },
+    electronVersion: "43.2.0",
+    electronProcess,
+    async canonicalize(path) { return path; },
+    digest,
+    startDaemon() { return { status: "started" }; },
+    async importModule(url) {
+      if (url.endsWith("linux-qualification.js")) {
+        return {
+          createLinuxQualificationContext() { return Object.freeze({ private: true }); },
+        };
+      }
+      if (url.endsWith("linux-secret-service-qualification-smoke.js")) {
+        return {
+          async runLinuxSecretServiceQualificationSmoke() { return { status: "passed" }; },
+        };
+      }
+      assert.fail(`unexpected import ${url}`);
+    },
+  };
+}
+
 test("Linux packaged smoke accepts only the closed outer and inner argument contracts", () => {
   assert.deepEqual(parseLinuxPackagedSecretServiceSmokeArguments([
     "--app", APP,
@@ -192,6 +219,7 @@ test("packaged Electron creates the isolated context only after the default-proo
       noAsar = value;
     },
   };
+  const originalNoAsarDescriptor = Object.getOwnPropertyDescriptor(electronProcess, "noAsar");
   const result = await runLinuxPackagedSecretServiceSmokeInside({
     appPath: APP,
     sourceRevision: REVISION,
@@ -245,6 +273,7 @@ test("packaged Electron creates the isolated context only after the default-proo
   assert.equal(context.developmentOnly, true);
   assert.deepEqual(asarModeChanges, [true, false]);
   assert.equal(noAsar, false);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(electronProcess, "noAsar"), originalNoAsarDescriptor);
 });
 
 test("packaged Electron emits bounded runtime and isolation stage failures before context construction", async () => {
@@ -339,6 +368,7 @@ test("packaged Electron restores ASAR mode after a physical archive digest failu
       noAsar = value;
     },
   };
+  const originalNoAsarDescriptor = Object.getOwnPropertyDescriptor(electronProcess, "noAsar");
   await assert.rejects(runLinuxPackagedSecretServiceSmokeInside({
     appPath: APP,
     sourceRevision: REVISION,
@@ -360,6 +390,46 @@ test("packaged Electron restores ASAR mode after a physical archive digest failu
   }), smokeError("ARTIFACT_IDENTITY_FAILED"));
   assert.deepEqual(changes, [true, false]);
   assert.equal(noAsar, false);
+  assert.deepEqual(Object.getOwnPropertyDescriptor(electronProcess, "noAsar"), originalNoAsarDescriptor);
+});
+
+test("packaged Electron deletes an initially absent ASAR override after a physical archive digest", async () => {
+  const electronProcess = {};
+  assert.equal(Object.hasOwn(electronProcess, "noAsar"), false);
+  const result = await runLinuxPackagedSecretServiceSmokeInside({
+    appPath: APP,
+    sourceRevision: REVISION,
+    artifactSha256: ARTIFACT,
+  }, successfulInsideRuntime({
+    electronProcess,
+    async digest() {
+      assert.equal(Object.hasOwn(electronProcess, "noAsar"), true);
+      assert.equal(electronProcess.noAsar, true);
+      return ASAR;
+    },
+  }));
+  assert.deepEqual(result, innerReceipt());
+  assert.equal(Object.hasOwn(electronProcess, "noAsar"), false);
+  assert.equal(electronProcess.noAsar, undefined);
+});
+
+test("packaged Electron deletes an initially absent ASAR override after a physical archive digest failure", async () => {
+  const electronProcess = {};
+  assert.equal(Object.hasOwn(electronProcess, "noAsar"), false);
+  await assert.rejects(runLinuxPackagedSecretServiceSmokeInside({
+    appPath: APP,
+    sourceRevision: REVISION,
+    artifactSha256: ARTIFACT,
+  }, successfulInsideRuntime({
+    electronProcess,
+    async digest() {
+      assert.equal(Object.hasOwn(electronProcess, "noAsar"), true);
+      assert.equal(electronProcess.noAsar, true);
+      throw new Error("private-archive-read-detail");
+    },
+  })), smokeError("ARTIFACT_IDENTITY_FAILED"));
+  assert.equal(Object.hasOwn(electronProcess, "noAsar"), false);
+  assert.equal(electronProcess.noAsar, undefined);
 });
 
 class SessionChild extends EventEmitter {
