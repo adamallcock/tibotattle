@@ -1,14 +1,21 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtemp, realpath, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import test from "node:test";
 
+import { startLocalCompanionServer } from "../apps/local/server.js";
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import { DesktopSettingsBackendError } from "../apps/electron/desktop-settings-backends.js";
 import { createDesktopSharingCoordinator } from "../apps/electron/desktop-sharing.js";
+import { normalizeLocalOnboarding } from "../apps/web/public/data-client.js";
+import {
+  inspectLocalOnboarding,
+  prepareLocalInstallationRoots,
+} from "../src/local-installation-diagnostics.js";
+import { localCodexLogScanner } from "../src/local-node-runtime.js";
 import { WindowsProtectedStateStoreError } from "../src/platform/windows-protected-state-store.js";
 import {
   buildWindowsNormalCandidateEnvironment,
@@ -173,6 +180,7 @@ test("normal candidate adds one content-free Codex source before launch", async 
     codex: String.raw`C:\runner\owned\profile\codex`,
   });
   const calls = [];
+  let fixtureContent = null;
   const fixture = await seedWindowsNormalCandidateCodexFixture({ profile }, {
     createDirectory: async (path, options) => {
       calls.push({ kind: "directory", path, options });
@@ -183,15 +191,26 @@ test("normal candidate adds one content-free Codex source before launch", async 
         isFile: () => true,
         isSymbolicLink: () => false,
         nlink: 1,
-        size: Buffer.byteLength('{"type":"session_meta","id":"synthetic-windows-normal-candidate"}\n'),
+        size: Buffer.byteLength(fixtureContent),
       },
     writeFixture: async (path, value, options) => {
+      fixtureContent = value;
       calls.push({ kind: "file", path, value, options });
     },
   });
   assert.equal(fixture.codexHome, profile.codex);
   assert.equal(fixture.sessions, String.raw`C:\runner\owned\profile\codex\sessions`);
-  assert.equal(fixture.fixture, String.raw`C:\runner\owned\profile\codex\sessions\synthetic-windows-normal-candidate.jsonl`);
+  assert.equal(
+    fixture.fixture,
+    String.raw`C:\runner\owned\profile\codex\sessions\rollout-2026-09-08T00-00-00-70000000-0000-4000-8000-000000000001.jsonl`,
+  );
+  const records = fixtureContent.trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(records.map((record) => record.type), [
+    "session_meta", "turn_context", "event_msg",
+  ]);
+  assert.equal(records[0].payload.id, "70000000-0000-4000-8000-000000000001");
+  assert.equal(records[1].payload.model, "gpt-5.6-sol");
+  assert.equal(records[2].payload.info.total_token_usage.total_tokens, 120);
   assert.deepEqual(calls, [
     {
       kind: "directory",
@@ -201,7 +220,7 @@ test("normal candidate adds one content-free Codex source before launch", async 
     {
       kind: "file",
       path: fixture.fixture,
-      value: '{"type":"session_meta","id":"synthetic-windows-normal-candidate"}\n',
+      value: fixtureContent,
       options: { mode: 0o600, flag: "wx" },
     },
   ]);
@@ -212,6 +231,117 @@ test("normal candidate adds one content-free Codex source before launch", async 
   }), {
     code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_UNAVAILABLE",
   });
+});
+
+test("normal candidate fixture passes Codex discovery, onboarding, and local refresh preflight", async () => {
+  const captured = { content: null, fileName: null };
+  await seedWindowsNormalCandidateCodexFixture({
+    profile: { codex: String.raw`C:\runner\owned\profile\codex` },
+  }, {
+    createDirectory: async () => {},
+    metadata: async (path) => path.endsWith("sessions")
+      ? { isDirectory: () => true, isSymbolicLink: () => false }
+      : {
+        isFile: () => true,
+        isSymbolicLink: () => false,
+        nlink: 1,
+        size: Buffer.byteLength(captured.content),
+      },
+    writeFixture: async (path, value) => {
+      captured.fileName = win32.basename(path);
+      captured.content = value;
+    },
+  });
+  const root = await mkdtemp(join(await realpath(tmpdir()), "tibotattle-windows-normal-fixture-"));
+  const codexHome = join(root, "codex");
+  const rejectedCodexHome = join(root, "rejected-codex");
+  const stateRoot = join(root, "state");
+  const sessions = join(codexHome, "sessions");
+  const rejectedSessions = join(rejectedCodexHome, "sessions");
+  let app = null;
+  try {
+    await mkdir(sessions, { recursive: true, mode: 0o700 });
+    await mkdir(rejectedSessions, { recursive: true, mode: 0o700 });
+    await writeFile(join(sessions, captured.fileName), captured.content, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    // The earlier fixture made onboarding appear ready but could never reach
+    // Codex discovery because its filename was not a canonical rollout name.
+    await writeFile(join(rejectedSessions, "synthetic-windows-normal-candidate.jsonl"),
+      '{"type":"session_meta","id":"synthetic-windows-normal-candidate"}\n',
+      { mode: 0o600, flag: "wx" });
+    prepareLocalInstallationRoots({ resourceRoot: process.cwd(), stateRoot });
+    const rejected = await localCodexLogScanner.discoverCodexRolloutInfos({
+      codexHome: rejectedCodexHome,
+      startAt: "2026-09-01T00:00:00.000Z",
+    });
+    assert.equal(rejected.length, 0);
+    const sources = await localCodexLogScanner.discoverCodexRolloutInfos({
+      codexHome,
+      startAt: "2026-09-01T00:00:00.000Z",
+    });
+    assert.equal(sources.length, 1);
+    const onboarding = await inspectLocalOnboarding({ codexHome, stateRoot });
+    assert.equal(onboarding.status, "ready");
+    const normalized = normalizeLocalOnboarding(onboarding);
+    assert.equal(normalized.state, "ready");
+    assert.equal(normalized.sessionsReadable, true);
+    assert.equal(normalized.rolloutFilesPresent, true);
+    assert.equal(normalized.stateWritable, true);
+    assert.equal(normalized.explicitRefresh, true);
+
+    const serverOptions = {
+      port: 0,
+      resourceRoot: process.cwd(),
+      stateRoot,
+      codexHome,
+      environment: {
+        ...process.env,
+        CODEX_HOME: codexHome,
+        HOME: root,
+        USERPROFILE: root,
+        USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
+        USAGE_MONITOR_RESOURCE_ROOT: process.cwd(),
+        USAGE_MONITOR_STATE_ROOT: stateRoot,
+      },
+    };
+    app = await startLocalCompanionServer(serverOptions);
+    const base = `http://127.0.0.1:${app.port}`;
+    const response = await fetch(`${base}/api/local/onboarding`);
+    assert.equal(response.status, 200);
+    assert.equal(normalizeLocalOnboarding(await response.json()).state, "ready");
+    const refresh = await fetch(`${base}/api/local/refresh`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: base,
+      },
+      body: "{}",
+    });
+    assert.equal(refresh.status, 202);
+    const deadline = Date.now() + 5_000;
+    let terminal = null;
+    while (Date.now() < deadline) {
+      const status = await fetch(`${base}/api/local/refresh`).then((value) => value.json());
+      if (["succeeded", "degraded"].includes(status?.refresh?.status)) {
+        terminal = status.refresh.status;
+        break;
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+    }
+    assert.ok(["succeeded", "degraded"].includes(terminal));
+    await app.close();
+    app = await startLocalCompanionServer(serverOptions);
+    const restartedBase = `http://127.0.0.1:${app.port}`;
+    const restartedOnboarding = await fetch(`${restartedBase}/api/local/onboarding`);
+    assert.equal(restartedOnboarding.status, 200);
+    assert.equal(normalizeLocalOnboarding(await restartedOnboarding.json()).state, "ready");
+  } finally {
+    await app?.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("Windows normal candidate smoke accepts only its exact unpacked invocation", () => {

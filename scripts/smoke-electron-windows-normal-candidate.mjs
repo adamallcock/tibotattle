@@ -66,11 +66,49 @@ const FIRST_RUN_ACKNOWLEDGEMENT = validateDesktopFirstRunReceipt({
   schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
   acknowledged: true,
 });
-const SYNTHETIC_CODEX_SESSION_FILE = "synthetic-windows-normal-candidate.jsonl";
-const SYNTHETIC_CODEX_SESSION = `${JSON.stringify({
-  type: "session_meta",
-  id: "synthetic-windows-normal-candidate",
-})}\n`;
+const SYNTHETIC_CODEX_SESSION_FILE =
+  "rollout-2026-09-08T00-00-00-70000000-0000-4000-8000-000000000001.jsonl";
+const SYNTHETIC_CODEX_SESSION_ID = "70000000-0000-4000-8000-000000000001";
+// This fixed source contains no user content, account identity, or real usage.
+// Its filename and event shape are the smallest accepted by both Codex rollout
+// discovery and the unified local-index refresh path.
+const SYNTHETIC_CODEX_SESSION = `${[
+  {
+    timestamp: "2026-09-08T00:00:00.000Z",
+    type: "session_meta",
+    payload: { id: SYNTHETIC_CODEX_SESSION_ID },
+  },
+  {
+    timestamp: "2026-09-08T00:00:01.000Z",
+    type: "turn_context",
+    payload: { model: "gpt-5.6-sol" },
+  },
+  {
+    timestamp: "2026-09-08T00:01:00.000Z",
+    type: "event_msg",
+    payload: {
+      type: "token_count",
+      info: {
+        total_token_usage: {
+          input_tokens: 100,
+          cached_input_tokens: 40,
+          cache_write_input_tokens: 0,
+          output_tokens: 20,
+          reasoning_output_tokens: 8,
+          total_tokens: 120,
+        },
+        last_token_usage: {
+          input_tokens: 100,
+          cached_input_tokens: 40,
+          cache_write_input_tokens: 0,
+          output_tokens: 20,
+          reasoning_output_tokens: 8,
+          total_tokens: 120,
+        },
+      },
+    },
+  },
+].map((record) => JSON.stringify(record)).join("\n")}\n`;
 const SOURCE_REVISION = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const FIREWALL_RULE_PREFIX = "tibotattle-normal-candidate-";
@@ -160,6 +198,10 @@ const FAILURE_CODES = new Set([
   "DASHBOARD_UNAVAILABLE",
   "DASHBOARD_INVALID",
   "LOCAL_REFRESH_UNAVAILABLE",
+  "LOCAL_REFRESH_BUTTON_UNAVAILABLE",
+  "LOCAL_REFRESH_REQUEST_UNOBSERVED",
+  "LOCAL_REFRESH_ACCEPTANCE_UNAVAILABLE",
+  "LOCAL_REFRESH_COMPLETION_UNAVAILABLE",
   "SETTINGS_UNAVAILABLE",
   "SETTINGS_PERSISTENCE_INVALID",
   "CLEAN_QUIT_INVALID",
@@ -1479,8 +1521,9 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
       button.click();
       return true;
     })()`), OPERATION_TIMEOUT_MS);
-    if (clicked !== true || await waitFor(() => observer.refreshObserved(), OPERATION_TIMEOUT_MS) !== true) {
-      fail("LOCAL_REFRESH_UNAVAILABLE");
+    if (clicked !== true) fail("LOCAL_REFRESH_BUTTON_UNAVAILABLE");
+    if (await waitFor(() => observer.refreshObserved(), OPERATION_TIMEOUT_MS) !== true) {
+      fail("LOCAL_REFRESH_REQUEST_UNOBSERVED");
     }
     const accepted = await waitFor(async () => {
       const decision = classifyAutomaticStartupRefreshReceipt({
@@ -1491,7 +1534,7 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
       });
       return decision.status === "accepted" ? decision : null;
     }, STARTUP_TIMEOUT_MS);
-    if (accepted === null) fail("LOCAL_REFRESH_UNAVAILABLE");
+    if (accepted === null) fail("LOCAL_REFRESH_ACCEPTANCE_UNAVAILABLE");
     const terminal = await waitFor(async () => {
       const decision = classifyAutomaticStartupRefreshReceipt({
         phase: "completion",
@@ -1501,7 +1544,7 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
       });
       return decision.status === "completed" ? decision : null;
     }, STARTUP_TIMEOUT_MS);
-    if (terminal === null) fail("LOCAL_REFRESH_UNAVAILABLE");
+    if (terminal === null) fail("LOCAL_REFRESH_COMPLETION_UNAVAILABLE");
     if (!observer.valid()) fail("DASHBOARD_INVALID");
     return Object.freeze({
       dashboardOrigin: dashboard.origin,
