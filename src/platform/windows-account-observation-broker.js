@@ -1,4 +1,11 @@
 import {
+  attachAccountObservationBrokerIpcServer,
+  createAccountObservationBrokerIpcTransport,
+  decodeAccountObservationBrokerSecret,
+  encodeAccountObservationBrokerSecret,
+  isAccountObservationBrokerIpcChannel,
+} from "./account-observation-broker-ipc.js";
+import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "./keychain-capabilities.js";
 
@@ -15,8 +22,6 @@ export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY =
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
 
 const LEGACY_FD_ENV = "USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD";
-const MAXIMUM_PENDING = 32;
-const SECRET_BYTES = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const ERROR_CODES = new Set([
   "invalid_configuration",
@@ -33,6 +38,12 @@ const RESPONSE_ERROR_CODES = new Set([
   "denied",
   "recovery_required",
 ]);
+const PROTOCOL = Object.freeze({
+  schema: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+  requestKind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND,
+  responseKind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
+  version: WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+});
 const trustedErrors = new WeakSet();
 const trustedBackends = new WeakSet();
 
@@ -64,47 +75,8 @@ function fail(code) {
   throw new WindowsAccountObservationBrokerError(code);
 }
 
-function record(value) {
-  try {
-    return value !== null && typeof value === "object" && !Array.isArray(value);
-  } catch {
-    return false;
-  }
-}
-
-function exact(value, keys) {
-  try {
-    return record(value)
-      && Object.keys(value).length === keys.length
-      && keys.every((key) => Object.hasOwn(value, key));
-  } catch {
-    return false;
-  }
-}
-
-function validId(value) {
-  return Number.isSafeInteger(value) && value > 0 && value <= 1_000_000_000;
-}
-
-function validIpcChannel(channel) {
-  try {
-    return record(channel)
-      && channel.connected !== false
-      && typeof channel.on === "function"
-      && typeof channel.off === "function"
-      && typeof channel.send === "function";
-  } catch {
-    return false;
-  }
-}
-
-function isBrokerMessage(value) {
-  try {
-    return record(value)
-      && value.schemaVersion === WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA;
-  } catch {
-    return false;
-  }
+function createError(code) {
+  return new WindowsAccountObservationBrokerError(code);
 }
 
 /**
@@ -136,77 +108,16 @@ export function windowsAccountObservationBrokerConfiguration(environment = proce
 }
 
 export function encodeWindowsAccountObservationBrokerSecret(value) {
-  if (!Buffer.isBuffer(value) || value.byteLength !== SECRET_BYTES) {
-    fail("invalid_configuration");
-  }
-  const copied = Buffer.from(value);
-  try {
-    return copied.toString("base64url");
-  } finally {
-    copied.fill(0);
-  }
+  return encodeAccountObservationBrokerSecret(value, fail);
 }
 
 export function decodeWindowsAccountObservationBrokerSecret(value) {
-  if (typeof value !== "string" || value.length !== 43) fail("protocol");
-  let decoded;
-  try {
-    decoded = Buffer.from(value, "base64url");
-  } catch {
-    fail("protocol");
-  }
-  if (decoded.byteLength !== SECRET_BYTES || decoded.toString("base64url") !== value) {
-    decoded.fill(0);
-    fail("protocol");
-  }
-  return decoded;
+  return decodeAccountObservationBrokerSecret(value, fail);
 }
 
-function validOperation(operation) {
-  if (!record(operation)
-      || (operation.op !== "read" && operation.op !== "create_if_missing")) {
-    fail("invalid_configuration");
-  }
-  const expected = operation.op === "read" ? ["op"] : ["op", "secret"];
-  if (!exact(operation, expected)
-      || (operation.op === "create_if_missing" && typeof operation.secret !== "string")) {
-    fail("invalid_configuration");
-  }
-}
-
-function validateResponse(response, operation, expectedId) {
-  if (!exact(response, ["schemaVersion", "kind", "v", "id", "ok", "secret"])
-      && !exact(response, ["schemaVersion", "kind", "v", "id", "ok", "status"])
-      && !exact(response, ["schemaVersion", "kind", "v", "id", "ok", "code"])) {
-    return null;
-  }
-  if (response.schemaVersion !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA
-      || response.kind !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND
-      || response.v !== WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION
-      || response.id !== expectedId || typeof response.ok !== "boolean") {
-    return null;
-  }
-  if (response.ok === false) {
-    return Object.keys(response).length === 6
-      && typeof response.code === "string" && RESPONSE_ERROR_CODES.has(response.code)
-      ? Object.freeze({ ok: false, code: response.code })
-      : null;
-  }
-  if (operation.op === "read") {
-    if (Object.keys(response).length !== 6 || !Object.hasOwn(response, "secret")
-        || (response.secret !== null && typeof response.secret !== "string")) return null;
-    if (response.secret !== null) {
-      let decoded = null;
-      try { decoded = decodeWindowsAccountObservationBrokerSecret(response.secret); }
-      catch { return null; }
-      finally { decoded?.fill(0); }
-    }
-    return Object.freeze({ ok: true, secret: response.secret });
-  }
-  return Object.keys(response).length === 6
-    && typeof response.status === "string" && ["created", "existing"].includes(response.status)
-    ? Object.freeze({ ok: true, status: response.status })
-    : null;
+/** Internal channel predicate shared with the Electron-owned server wrapper. */
+export function isWindowsAccountObservationBrokerIpcChannel(channel) {
+  return isAccountObservationBrokerIpcChannel(channel);
 }
 
 /**
@@ -218,79 +129,39 @@ export function createWindowsAccountObservationBrokerTransport({
   channel = null,
   timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS,
 } = {}) {
-  if (!validIpcChannel(channel)
-      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 60_000) {
-    fail("invalid_configuration");
-  }
-  let nextId = 1;
-  let poisonedCode = null;
-  const pending = [];
+  return createAccountObservationBrokerIpcTransport({
+    channel,
+    timeoutMs,
+    protocol: PROTOCOL,
+    errorCodes: ERROR_CODES,
+    responseErrorCodes: RESPONSE_ERROR_CODES,
+    fail,
+    createError,
+    decodeSecret: decodeWindowsAccountObservationBrokerSecret,
+  });
+}
 
-  function poison(code) {
-    if (poisonedCode !== null) return;
-    poisonedCode = ERROR_CODES.has(code) ? code : "unavailable";
-    try { channel.off("message", onMessage); } catch { /* Channel is already closing. */ }
-    try { channel.off("disconnect", onDisconnect); } catch { /* Channel is already closing. */ }
-    while (pending.length > 0) {
-      const entry = pending.shift();
-      clearTimeout(entry.timer);
-      entry.reject(new WindowsAccountObservationBrokerError(poisonedCode));
-    }
-  }
-
-  function onMessage(message) {
-    if (poisonedCode !== null || !isBrokerMessage(message)) return;
-    const entry = pending[0];
-    const normalized = entry === undefined ? null
-      : validateResponse(message, entry.operation, entry.id);
-    if (normalized === null) {
-      poison("protocol");
-      return;
-    }
-    pending.shift();
-    clearTimeout(entry.timer);
-    if (normalized.ok) entry.resolve(normalized);
-    else entry.reject(new WindowsAccountObservationBrokerError(normalized.code));
-  }
-
-  function onDisconnect() {
-    poison("unavailable");
-  }
-
-  channel.on("message", onMessage);
-  channel.on("disconnect", onDisconnect);
-
-  async function request(operation) {
-    validOperation(operation);
-    if (poisonedCode !== null) fail(poisonedCode);
-    if (!validId(nextId) || pending.length >= MAXIMUM_PENDING) fail("unavailable");
-    const id = nextId;
-    const frame = Object.freeze({
-      schemaVersion: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
-      kind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND,
-      v: WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
-      id,
-      ...operation,
-    });
-    nextId += 1;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => poison("timeout"), timeoutMs);
-      timer.unref?.();
-      pending.push({ id, operation, resolve, reject, timer });
-      try {
-        if (channel.connected === false) throw new Error("channel closed");
-        channel.send(frame, (error) => {
-          if (error) poison("unavailable");
-        });
-      } catch {
-        poison("unavailable");
-      }
-    });
-  }
-
-  return Object.freeze({
-    request,
-    dispose() { poison("unavailable"); },
+/**
+ * Internal server adapter for the Electron-owned Windows broker wrapper. It
+ * preserves the fixed schema and error class while sharing only transport
+ * mechanics with the Linux observation wrapper.
+ */
+export function attachWindowsAccountObservationBrokerIpcServer({
+  channel,
+  backend,
+  mapBackendError,
+  disposeBackend = undefined,
+} = {}) {
+  return attachAccountObservationBrokerIpcServer({
+    channel,
+    backend,
+    protocol: PROTOCOL,
+    responseErrorCodes: RESPONSE_ERROR_CODES,
+    fail,
+    encodeSecret: encodeWindowsAccountObservationBrokerSecret,
+    decodeSecret: decodeWindowsAccountObservationBrokerSecret,
+    mapBackendError,
+    ...(disposeBackend === undefined ? {} : { disposeBackend }),
   });
 }
 
@@ -347,7 +218,7 @@ export function createWindowsAccountObservationBrokerBackendFromEnvironment(
 ) {
   const configuration = windowsAccountObservationBrokerConfiguration(environment);
   if (configuration === null) return null;
-  if (configuration.ipc !== true || !validIpcChannel(channel)) {
+  if (configuration.ipc !== true || !isAccountObservationBrokerIpcChannel(channel)) {
     return createWindowsAccountObservationBrokerBackend({
       transport: Object.freeze({ async request() { fail("unavailable"); } }),
       available: false,

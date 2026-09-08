@@ -52,6 +52,7 @@ const QUALIFICATION_PHASES = new Set([
   "COLLECTION_POST_CANCELLED",
 ]);
 const trustedErrors = new WeakSet();
+const trustedBackends = new WeakSet();
 
 export class LinuxAccountObservationCredentialError extends Error {
   constructor(code) {
@@ -69,6 +70,13 @@ export function isLinuxAccountObservationCredentialError(error) {
   return Boolean(error
     && trustedErrors.has(error)
     && Object.getPrototypeOf(error) === LinuxAccountObservationCredentialError.prototype);
+}
+
+/** Recognize only the fixed read/create Linux account-observation facade. */
+export function isLinuxAccountObservationCredentialBackend(backend) {
+  return Boolean(backend
+    && trustedBackends.has(backend)
+    && Object.getPrototypeOf(backend) === Object.prototype);
 }
 
 function qualificationDiagnosticsEnabled() {
@@ -235,7 +243,7 @@ export function createLinuxAccountObservationCredentialBackend(options = {}) {
   }
   const native = snapshotBinding(selectedBinding);
 
-  return Object.freeze({
+  const backend = Object.freeze({
     async read(capability) {
       assertCapability(capability);
       const stored = await invoke(native, "read");
@@ -265,4 +273,6 @@ export function createLinuxAccountObservationCredentialBackend(options = {}) {
       }
     },
   });
+  trustedBackends.add(backend);
+  return backend;
 }

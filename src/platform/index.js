@@ -59,6 +59,7 @@ export {
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_REQUEST_KIND,
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
   WindowsAccountObservationBrokerError,
+  attachWindowsAccountObservationBrokerIpcServer,
   createWindowsAccountObservationBrokerBackend,
   createWindowsAccountObservationBrokerBackendFromEnvironment,
   createWindowsAccountObservationBrokerTransport,
@@ -66,8 +67,20 @@ export {
   encodeWindowsAccountObservationBrokerSecret,
   isWindowsAccountObservationBrokerBackend,
   isWindowsAccountObservationBrokerError,
+  isWindowsAccountObservationBrokerIpcChannel,
   windowsAccountObservationBrokerConfiguration,
 } from "./windows-account-observation-broker.js";
+export {
+  LINUX_ACCOUNT_OBSERVATION_BROKER_CAPABILITY,
+  LINUX_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS,
+  LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+  LINUX_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+  LinuxAccountObservationBrokerError,
+  attachLinuxAccountObservationBrokerIpcServer,
+  createLinuxAccountObservationBrokerBackendFromEnvironment,
+  isLinuxAccountObservationBrokerBackend,
+  isLinuxAccountObservationBrokerIpcChannel,
+} from "./linux-account-observation-broker.js";
 export {
   assertWindowsQualificationResourceAuthority,
   createWindowsQualificationModeContext,
