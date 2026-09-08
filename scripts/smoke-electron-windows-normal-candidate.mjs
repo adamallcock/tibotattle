@@ -199,6 +199,10 @@ const FAILURE_CODES = new Set([
   "DASHBOARD_INVALID",
   "LOCAL_REFRESH_UNAVAILABLE",
   "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE",
+  "LOCAL_STARTUP_REFRESH_GATE_PRELOAD_ACTIVE_GATE_ABSENT",
+  "LOCAL_STARTUP_REFRESH_GATE_ISOLATED_CONTEXT_ENV_MATCH_BRIDGE_ABSENT",
+  "LOCAL_STARTUP_REFRESH_GATE_ISOLATED_CONTEXT_ENV_NOT_MATCHED",
+  "LOCAL_STARTUP_REFRESH_GATE_PRELOAD_CONTEXT_UNAVAILABLE",
   "LOCAL_STARTUP_REFRESH_GATE_ALREADY_RELEASED",
   "LOCAL_STARTUP_REFRESH_GATE_EVALUATION_FAILED",
   "LOCAL_STARTUP_REFRESH_UNAVAILABLE",
@@ -1388,7 +1392,12 @@ export async function inspectWindowsNormalCandidateStartupRefreshGate(cdp) {
     const result = await cdp.evaluate(`(() => {
       const bridge = globalThis.__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__;
       if (!bridge || bridge.version !== "v1" || typeof bridge.releaseStartupRefresh !== "function") {
-        return "unavailable";
+        // This is an existing, ordinary preload bridge. It gives the receipt
+        // one content-free distinction: preload/contextBridge ran, but the
+        // normal smoke-gate branch did not expose its bridge. No environment,
+        // credential, status, or renderer data crosses this boundary.
+        return globalThis.tibotattleDesktop?.version === "v1"
+          ? "preload_active_gate_absent" : "unavailable";
       }
       try {
         return bridge.releaseStartupRefresh() === true ? "released" : "already_released";
@@ -1397,12 +1406,91 @@ export async function inspectWindowsNormalCandidateStartupRefreshGate(cdp) {
       }
     })()`);
     return result === "released" || result === "already_released" || result === "unavailable"
-      || result === "evaluation_failed"
+      || result === "preload_active_gate_absent" || result === "evaluation_failed"
       ? result
       : "evaluation_failed";
   } catch {
     return "evaluation_failed";
   }
+}
+
+const WINDOWS_NORMAL_PRELOAD_CONTEXT_STATES = new Set([
+  "normal_environment_match",
+  "platform_other",
+  "control_other_or_absent",
+  "qualification_or_test_marker_present",
+  "process_unavailable",
+  "evaluation_failed",
+]);
+
+/**
+ * Keep only a bounded normal-environment observation from an isolated CDP
+ * context. Electron does not guarantee that CDP exposes preload's lexical
+ * `process` binding as a global, so this is evidence, never a claim that the
+ * preload gate itself was eligible. It returns no environment values,
+ * credentials, context identifiers, or renderer content.
+ */
+export function classifyWindowsNormalCandidatePreloadContext(value) {
+  return typeof value === "string" && WINDOWS_NORMAL_PRELOAD_CONTEXT_STATES.has(value)
+    ? value : "evaluation_failed";
+}
+
+const WINDOWS_NORMAL_PRELOAD_CONTEXT_EXPRESSION = `(() => {
+  const processRef = typeof process !== "undefined" ? process : null;
+  if (!processRef) return "process_unavailable";
+  if (processRef.platform !== "win32") return "platform_other";
+  if (processRef.env?.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL !== "quit-v1") {
+    return "control_other_or_absent";
+  }
+  return processRef.env?.USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION === undefined
+      && processRef.env?.USAGE_MONITOR_TEST_LANE === undefined
+    ? "normal_environment_match" : "qualification_or_test_marker_present";
+})()`;
+
+/** Observe only isolated execution contexts exposed by the existing CDP target. */
+export function observeWindowsNormalCandidatePreloadContexts(cdp) {
+  if (cdp === null || typeof cdp !== "object" || typeof cdp.on !== "function"
+      || typeof cdp.request !== "function") return null;
+  const contextIds = new Set();
+  const remove = cdp.on("Runtime.executionContextCreated", ({ context } = {}) => {
+    if (context?.auxData?.type === "isolated" && Number.isInteger(context.id) && context.id >= 1) {
+      contextIds.add(context.id);
+    }
+  });
+  return Object.freeze({
+    async inspect() {
+      const states = new Set();
+      for (const contextId of contextIds) {
+        try {
+          const response = await cdp.request("Runtime.evaluate", {
+            expression: WINDOWS_NORMAL_PRELOAD_CONTEXT_EXPRESSION,
+            contextId,
+            awaitPromise: true,
+            returnByValue: true,
+          });
+          states.add(classifyWindowsNormalCandidatePreloadContext(response?.result?.value));
+        } catch {
+          states.add("evaluation_failed");
+        }
+      }
+      return Object.freeze([...states].sort());
+    },
+    dispose() {
+      try { remove?.(); } catch { /* CDP diagnostic cleanup cannot alter the smoke result. */ }
+    },
+  });
+}
+
+export function classifyWindowsNormalCandidateStartupRefreshGateFailure(gate, preloadContexts = []) {
+  if (gate?.failureCode !== "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE") {
+    return gate?.failureCode ?? "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE";
+  }
+  if (!Array.isArray(preloadContexts) || preloadContexts.length === 0) {
+    return "LOCAL_STARTUP_REFRESH_GATE_PRELOAD_CONTEXT_UNAVAILABLE";
+  }
+  return preloadContexts.includes("normal_environment_match")
+    ? "LOCAL_STARTUP_REFRESH_GATE_ISOLATED_CONTEXT_ENV_MATCH_BRIDGE_ABSENT"
+    : "LOCAL_STARTUP_REFRESH_GATE_ISOLATED_CONTEXT_ENV_NOT_MATCHED";
 }
 
 export async function releaseWindowsNormalCandidateStartupRefreshGate(cdp) {
@@ -1437,7 +1525,9 @@ export async function waitForWindowsNormalCandidateStartupRefreshGate(cdp, {
         released: false,
         failureCode: latest === "evaluation_failed"
           ? "LOCAL_STARTUP_REFRESH_GATE_EVALUATION_FAILED"
-          : "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE",
+          : latest === "preload_active_gate_absent"
+            ? "LOCAL_STARTUP_REFRESH_GATE_PRELOAD_ACTIVE_GATE_ABSENT"
+            : "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE",
       });
     }
     await sleep(Math.min(150, Math.max(1, deadline - clock())));
@@ -1572,15 +1662,18 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
   const dashboard = exactLoopbackRootPage(target.url);
   if (dashboard === null) fail("DASHBOARD_INVALID");
   const observer = localNetworkObserver(cdp, dashboard.origin);
+  const preloadContexts = observeWindowsNormalCandidatePreloadContexts(cdp);
   try {
     await cdp.request("Page.enable");
     await cdp.request("Network.enable");
+    await cdp.request("Runtime.enable");
     // The exact normal-candidate preload is now holding automatic refresh at
     // its existing smoke gate. Releasing only after Network.enable closes the
     // fast-renderer race without accepting an unobserved startup POST.
     const startupGate = await waitForWindowsNormalCandidateStartupRefreshGate(cdp);
     if (startupGate.released !== true) {
-      fail(startupGate.failureCode);
+      const contexts = await preloadContexts?.inspect?.() ?? [];
+      fail(classifyWindowsNormalCandidateStartupRefreshGateFailure(startupGate, contexts));
     }
     const ready = await waitFor(async () => {
       const value = await cdp.evaluate(`(() => ({
@@ -1660,6 +1753,7 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
     }, STARTUP_TIMEOUT_MS);
     if (explicitTerminal === null) fail("LOCAL_EXPLICIT_REFRESH_COMPLETION_UNAVAILABLE");
     if (!observer.valid()) fail("DASHBOARD_INVALID");
+    preloadContexts?.dispose?.();
     return Object.freeze({
       dashboardOrigin: dashboard.origin,
       observer,
@@ -1667,6 +1761,7 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
     });
   } catch (error) {
     observer.dispose();
+    preloadContexts?.dispose?.();
     if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
     fail("DASHBOARD_UNAVAILABLE");
   }

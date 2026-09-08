@@ -33,7 +33,10 @@ import {
   prepareWindowsNormalCandidateProfile,
   runWindowsNormalCandidateSmoke,
   releaseWindowsNormalCandidateStartupRefreshGate,
+  classifyWindowsNormalCandidatePreloadContext,
+  classifyWindowsNormalCandidateStartupRefreshGateFailure,
   inspectWindowsNormalCandidateStartupRefreshGate,
+  observeWindowsNormalCandidatePreloadContexts,
   waitForWindowsNormalCandidateStartupRefreshGate,
   seedWindowsNormalCandidateCodexFixture,
   selectWindowsNormalCandidateDashboardTarget,
@@ -78,6 +81,7 @@ test("normal candidate releases its startup gate only through the fixed Windows 
   assert.equal(expressions.length, 1);
   assert.match(expressions[0], /__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__/u);
   assert.match(expressions[0], /releaseStartupRefresh/u);
+  assert.match(expressions[0], /tibotattleDesktop\?\.version === "v1"/u);
   assert.equal(await releaseWindowsNormalCandidateStartupRefreshGate({
     async evaluate() { return false; },
   }), false);
@@ -113,6 +117,53 @@ test("normal candidate waits for its preload gate before releasing the startup r
     async evaluate() { return "evaluation_failed"; },
   }, { timeoutMs: 1, clock: (() => { let tick = 0; return () => tick++; })(), sleep: async () => {} }),
   { released: false, failureCode: "LOCAL_STARTUP_REFRESH_GATE_EVALUATION_FAILED" });
+  assert.deepEqual(await waitForWindowsNormalCandidateStartupRefreshGate({
+    async evaluate() { return "preload_active_gate_absent"; },
+  }, { timeoutMs: 1, clock: (() => { let tick = 0; return () => tick++; })(), sleep: async () => {} }),
+  { released: false, failureCode: "LOCAL_STARTUP_REFRESH_GATE_PRELOAD_ACTIVE_GATE_ABSENT" });
+});
+
+test("normal candidate preload diagnostic retains only closed context observations", async () => {
+  assert.equal(classifyWindowsNormalCandidatePreloadContext("normal_environment_match"), "normal_environment_match");
+  assert.equal(classifyWindowsNormalCandidatePreloadContext("private-env-value"), "evaluation_failed");
+  assert.equal(classifyWindowsNormalCandidateStartupRefreshGateFailure({
+    failureCode: "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE",
+  }, []), "LOCAL_STARTUP_REFRESH_GATE_PRELOAD_CONTEXT_UNAVAILABLE");
+  assert.equal(classifyWindowsNormalCandidateStartupRefreshGateFailure({
+    failureCode: "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE",
+  }, ["control_other_or_absent"]), "LOCAL_STARTUP_REFRESH_GATE_ISOLATED_CONTEXT_ENV_NOT_MATCHED");
+  assert.equal(classifyWindowsNormalCandidateStartupRefreshGateFailure({
+    failureCode: "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE",
+  }, ["normal_environment_match", "private-value"]),
+  "LOCAL_STARTUP_REFRESH_GATE_ISOLATED_CONTEXT_ENV_MATCH_BRIDGE_ABSENT");
+  assert.equal(classifyWindowsNormalCandidateStartupRefreshGateFailure({
+    failureCode: "LOCAL_STARTUP_REFRESH_GATE_EVALUATION_FAILED",
+  }, ["normal_environment_match"]), "LOCAL_STARTUP_REFRESH_GATE_EVALUATION_FAILED");
+});
+
+test("normal candidate preload context observer evaluates only isolated contexts", async () => {
+  const handlers = new Map();
+  const calls = [];
+  const observer = observeWindowsNormalCandidatePreloadContexts({
+    on(method, handler) {
+      handlers.set(method, handler);
+      return () => handlers.delete(method);
+    },
+    async request(method, params) {
+      calls.push({ method, params });
+      return { result: { value: params.contextId === 7 ? "normal_environment_match" : "private-value" } };
+    },
+  });
+  handlers.get("Runtime.executionContextCreated")({ context: { id: 3, auxData: { type: "default" } } });
+  handlers.get("Runtime.executionContextCreated")({ context: { id: 7, auxData: { type: "isolated" } } });
+  handlers.get("Runtime.executionContextCreated")({ context: { id: 9, auxData: { type: "isolated" } } });
+  assert.deepEqual(await observer.inspect(), ["evaluation_failed", "normal_environment_match"]);
+  assert.deepEqual(calls.map(({ params }) => params.contextId), [7, 9]);
+  assert.equal(calls.every(({ method, params }) => method === "Runtime.evaluate"
+    && params.awaitPromise === true && params.returnByValue === true
+    && typeof params.expression === "string" && !params.expression.includes("process.env,")), true);
+  observer.dispose();
+  assert.equal(handlers.has("Runtime.executionContextCreated"), false);
 });
 
 function smokeOptions() {
