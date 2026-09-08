@@ -14,16 +14,17 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Latest completed native run: `bff275fb` in
-[run 34198393332](https://github.com/adamallcock/tibotattle/actions/runs/34198393332)
-passes both Macs and Windows. Linux now compiles and packages, then refuses
-account-observation creation with the closed diagnostic
-`CREATE_MUTATION_UNAVAILABLE`. Initial reads and the default-state probe pass;
-the failure precedes the retained mutation intent. The five-second service
-deadline fixture is later in the journey and has not yet executed. Its original
-failure log and source-bound fixed receipt remain preserved. A read-only test
-probe now distinguishes default-collection absence, lock and availability before
-another native run; it adds no product API or credential mutation.
+Latest completed native run: `7731a6e3` in
+[run 34200413924](https://github.com/adamallcock/tibotattle/actions/runs/34200413924)
+passes both Macs and Windows. Linux compiles and packages, then refuses
+account-observation creation with `CREATE_MUTATION_UNAVAILABLE`. Both read
+boundaries and the read-only default-collection probe pass: the collection
+exists and is unlocked at that snapshot. The remaining failure lies inside
+the native pre-intent creation path. The five-second service-deadline fixture
+is later in the journey and has not yet executed. Its original failure log and
+source-bound fixed receipt remain preserved; the probe adds no product API or
+credential mutation. The preceding `bff275fb` run fails at the same creation
+boundary before this additional prerequisite evidence existed.
 
 The preceding `b103ef6d` run stopped at compilation because the timeout watchdog
 used C++ exceptions under the existing no-exceptions build. The GLib repair keeps
@@ -69,9 +70,36 @@ and health requests reach maxima of 1–2 ms; timers advance. Cancellation is
 acknowledged in 3 ms and settles after mandatory integrity verification in
 5,162 ms. Relaunch retains the dashboard and starts a new successful automatic
 refresh. These fixed receipts bind source and ASAR and contain no session data.
-The regular test launcher now selects this qualified `ad0e1333` package with
-uploads and the updater disabled, using its separate copied profile. The former
-`1f74bbb6` launcher and profile remain preserved; system installation is unchanged.
+At that point the regular test launcher selected `ad0e1333`. It now selects the
+qualified UI update described below. Its versioned launcher and the earlier
+`1f74bbb6` launcher/profile remain preserved.
+
+A supplemental `ad0e1333` packaged page pass verifies Overview, Allowance,
+Trends and Usage routes and visible states, normal cache-link ingestion and
+rendering, Spanish selection/system restoration, and General/Notifications/About
+content. All eight screenshot hashes match the retained v2 receipt. The ordinary
+and worker links keep canonical targets; verified auto-review rows target the
+parent, and unresolved rows stay unavailable. Synthetic links were not opened.
+The receipt remains incomplete only for native menu-bar interaction. Two separate
+native automation attempts timed out; their original failure receipts remain
+unchanged. The exact owned candidate processes were subsequently stopped and
+absence verified. Neither attempt qualifies tray icon appearance or physical
+primary/secondary-click behavior. A zero-comparison cache card also displayed
+misleading 0% metrics. The shared-UI correction at `abbb9323` keeps the heading
+and explicit empty state while hiding unsupported percentages and interpretation;
+observed zero-percent reuse with a positive denominator remains visible. All 565
+web UI tests pass. The fresh frozen `98a5256d` arm64 app binds ASAR
+`d3f2a643824e0a3ab9e199b949d7d1d25a6d6075e2abd02c9631775984eedd24`.
+Its packaged page/cache/settings checks and synthetic tray/settings/restart smoke
+pass; the page receipt remains incomplete only for physical native tray evidence.
+The corrected empty-state screenshot visibly retains the heading and no-eligible
+message and removes the unsupported metrics. Root independently verifies ASAR,
+source receipts and all eight page screenshots. The regular tester launcher now
+selects `98a5256d` with the validated separate copied profile, uploads/updater off.
+Copied-history full/cancel/relaunch receipts remain explicitly `ad0e1333` evidence:
+the only newer Mac product change is this rendering correction; no new history
+journey is claimed. The old launcher remains available. No system installation
+was performed.
 
 The actual accountless client-to-disposable-Worker journey is reverified at
 `5d57f4e3`: enrollment, encrypted upload, renewal, retained identity, no duplicate
@@ -99,11 +127,21 @@ configuration validation, target-completion ordering, cancellation and the
 non-Windows path. All four development runners now execute these tests. This
 uses no signing credentials and does not qualify Authenticode or installation.
 
-The next Windows qualification slice is an actual unsigned NSIS install,
+The integrated Windows qualification slice is an actual unsigned NSIS install,
 two independent top-level launches in one synthetic profile, and owned uninstall
 with a registry cleanup check on the disposable native runner. It must distinguish
 whole-app restart from retained credential or data continuity. The existing
 credential journey deletes its synthetic installation record before exit.
+The runner verifies installer and installed executable/ASAR identity, snapshots
+process absence immediately before both launches, fences mutation/quit behind a
+ready-time process snapshot, checks shutdown, and runs the owned uninstaller only
+once. A failed or unsettled installer/uninstaller cannot trigger a competing
+cleanup mutation. Read-only PowerShell queries take one fixed child-only path;
+registry absence is explicit. Thirty-six focused tests pass on macOS with two
+Windows-only exclusions, and 78 release-trust tests pass. The actual PowerShell
+contract and installer lifecycle are now wired into disposable Windows CI; native
+execution is pending. Receipt fields keep retained application credential state
+and complete arbitrary-descendant cleanup unqualified.
 Production finalization also needs a signed-resource composition: the development
 loader pins unsigned native hashes and the development product identity. A signer
 alone cannot activate that loader. The source preparer uses `win32-x64` paths and
@@ -464,8 +502,9 @@ Use three explicit readiness milestones:
 
 1. **Daily-use tester:** product journeys pass on the packaged Mac candidate,
    copied-profile refresh/cancel/restart are reliable, known limitations are
-   visible, and the original installation is preserved. This is the next
-   short completion target; it can precede hosted contribution activation.
+   visible, and the original installation is preserved. The `98a5256d` tester
+   satisfies the core runtime journeys and is available now; physical menu-bar
+   parity remains unqualified. Hosted contribution activation is separate.
 2. **Release candidate:** real native migration, accountless end-to-end tests,
    production updater/signing and required native platform journeys pass on
    frozen candidates. The next Electron update is part of this milestone.

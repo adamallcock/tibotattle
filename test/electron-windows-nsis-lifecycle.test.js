@@ -873,6 +873,7 @@ test("an identity refusal writes the fixed failure receipt before any installer 
     assert.equal(receipt.status, "failed");
     assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NSIS_LIFECYCLE_INSTALLER_IDENTITY_INVALID");
     assert.equal(receipt.installationPerformed, false);
+    assert.equal(receipt.accountlessSyntheticRecordDeleted, false);
     assert.equal(receipt.productionReady, false);
   } finally {
     await rm(root, { recursive: true, force: true });

@@ -170,6 +170,21 @@ jobs:
           $smokeReceipt = Join-Path $packageRoot 'accountless-storage-smoke.json'
           node scripts/smoke-electron-windows-accountless.mjs --app $appPath --staged-app $stagedApp --package-receipt $packageReceipt --source-revision $env:GITHUB_SHA --receipt $smokeReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_ACCOUNTLESS_PACKAGED_SMOKE_FAILED' }
+      - name: Validate disposable Windows installer lifecycle contracts
+        run: node --test test/electron-windows-nsis-lifecycle.test.js
+      - name: Exercise unsigned NSIS install, whole-app restart and owned uninstall
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packageRoot = Join-Path $env:GITHUB_WORKSPACE ".release-build/electron-candidates/$env:GITHUB_SHA/win32-x64/distribution"
+          $stagedApp = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-dev/win32-x64/app'
+          $packageReceipt = Join-Path $packageRoot 'development-package.json'
+          $packageRecord = Get-Content -LiteralPath $packageReceipt -Raw | ConvertFrom-Json
+          $installerRecords = @($packageRecord.distributions | Where-Object { $_.file -match '^[A-Za-z0-9._-]+\.exe$' })
+          if ($installerRecords.Count -ne 1) { throw 'WINDOWS_NSIS_INSTALLER_SELECTION_INVALID' }
+          $installerPath = Join-Path $packageRoot $installerRecords[0].file
+          $lifecycleReceipt = Join-Path $packageRoot 'nsis-lifecycle-smoke.json'
+          node scripts/smoke-electron-windows-nsis-lifecycle.mjs --installer $installerPath --staged-app $stagedApp --package-receipt $packageReceipt --source-revision $env:GITHUB_SHA --receipt $lifecycleReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NSIS_LIFECYCLE_SMOKE_FAILED' }
       - name: Retain verified development packages and receipts
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

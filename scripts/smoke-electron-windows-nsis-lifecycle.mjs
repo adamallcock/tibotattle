@@ -1091,7 +1091,8 @@ function lifecycleReceipt({
     // disposable runner account, so same-profile relaunch is not evidence of
     // retained application credentials.
     persistentApplicationCredentialStateVerified: false,
-    accountlessSyntheticRecordDeleted: true,
+    accountlessSyntheticRecordDeleted: launches.length === 2
+      && launches.every((launch) => launch.storageJourneyCompleted === true),
     accountObservationCredentialCleanup: "disposable_runner_account_lifetime",
     uninstallationAttempted,
     uninstallationPerformed,
