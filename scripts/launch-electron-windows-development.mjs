@@ -410,7 +410,9 @@ export function buildWindowsNormalCandidateEnvironment({
   selected.TEMP = paths.tmp;
   selected.TMP = paths.tmp;
   selected.TMPDIR = paths.tmp;
-  selected.CODEX_HOME = paths.codex;
+  // Ordinary desktop settings resolve the default source under HOME, rather
+  // than honoring the development lane's separate override directory.
+  selected.CODEX_HOME = join(paths.home, ".codex");
   selected.CLAUDE_CONFIG_DIR = paths.claude;
   selected.XDG_CONFIG_HOME = paths.config;
   selected.XDG_DATA_HOME = paths.data;

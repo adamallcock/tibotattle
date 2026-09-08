@@ -326,6 +326,7 @@ const NORMAL_CANDIDATE_PROFILE = Object.freeze({
 test("normal candidate adds one content-free Codex source before launch", async () => {
   const profile = Object.freeze({
     codex: String.raw`C:\runner\owned\profile\codex`,
+    home: String.raw`C:\runner\owned\profile\home`,
   });
   const calls = [];
   let fixtureContent = null;
@@ -346,11 +347,12 @@ test("normal candidate adds one content-free Codex source before launch", async 
       calls.push({ kind: "file", path, value, options });
     },
   });
-  assert.equal(fixture.codexHome, profile.codex);
-  assert.equal(fixture.sessions, String.raw`C:\runner\owned\profile\codex\sessions`);
+  assert.equal(fixture.codexHome, win32.join(profile.home, ".codex"));
+  assert.notEqual(fixture.codexHome, profile.codex);
+  assert.equal(fixture.sessions, String.raw`C:\runner\owned\profile\home\.codex\sessions`);
   assert.equal(
     fixture.fixture,
-    String.raw`C:\runner\owned\profile\codex\sessions\rollout-2026-09-08T00-00-00-70000000-0000-4000-8000-000000000001.jsonl`,
+    String.raw`C:\runner\owned\profile\home\.codex\sessions\rollout-2026-09-08T00-00-00-70000000-0000-4000-8000-000000000001.jsonl`,
   );
   const records = fixtureContent.trim().split("\n").map((line) => JSON.parse(line));
   assert.deepEqual(records.map((record) => record.type), [
@@ -384,7 +386,7 @@ test("normal candidate adds one content-free Codex source before launch", async 
 test("normal candidate fixture passes Codex discovery, onboarding, and local refresh preflight", async () => {
   const captured = { content: null, fileName: null };
   await seedWindowsNormalCandidateCodexFixture({
-    profile: { codex: String.raw`C:\runner\owned\profile\codex` },
+    profile: { home: String.raw`C:\runner\owned\profile\home` },
   }, {
     createDirectory: async () => {},
     metadata: async (path) => path.endsWith("sessions")
@@ -931,6 +933,8 @@ test("normal candidate launcher keeps only the private profile, unified mode, an
       },
     });
     assert.equal(environment.USAGE_MONITOR_ACCOUNTING_SOURCE_MODE, "unified");
+    assert.equal(environment.CODEX_HOME, join(environment.HOME, ".codex"));
+    assert.notEqual(environment.CODEX_HOME, profile.codex);
     assert.equal(environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL, "quit-v1");
     for (const key of [
       "NODE_OPTIONS",

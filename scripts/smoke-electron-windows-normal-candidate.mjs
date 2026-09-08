@@ -750,11 +750,14 @@ export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
   metadata = lstat,
   writeFixture = writeFile,
 } = {}) {
-  const codexHome = exactWindowsPath(profile?.codex);
-  if (codexHome === null || typeof createDirectory !== "function"
+  const home = exactWindowsPath(profile?.home);
+  if (home === null || typeof createDirectory !== "function"
       || typeof metadata !== "function" || typeof writeFixture !== "function") {
     fail("PROFILE_INVALID");
   }
+  // The normal app's default-root settings select HOME/.codex before spawning
+  // its companion. Seed that actual root, not the development override.
+  const codexHome = win32.join(home, ".codex");
   const sessions = win32.join(codexHome, "sessions");
   const fixture = win32.join(sessions, SYNTHETIC_CODEX_SESSION_FILE);
   try {
