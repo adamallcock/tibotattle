@@ -18,17 +18,27 @@ import {
   attachDesktopLinuxAccountObservationBroker,
 } from "./desktop-linux-account-observation-broker.js";
 import {
+  createDesktopLinuxAccountlessCredentialBackend,
+} from "./desktop-linux-accountless-credential.js";
+import {
   assertLinuxNativeQualificationReceipt,
   createLinuxQualificationReceipt,
 } from "./linux-qualification.js";
 import { shellError } from "./errors.js";
 
-// This composes the existing Linux native boundaries for an explicit
-// qualification run only.  It neither selects Linux production credentials
-// nor changes the platform gate.
+// The generic Linux Secret Service broker is qualification-only. The distinct
+// fixed-record handover below stays dormant until main selects an exact stable
+// Linux production distribution; neither construction changes the platform
+// gate.
 export const LINUX_SECRET_SERVICE_MAIN_COMPOSITION_STATUS = "qualification_only";
 
 const PRODUCTION_OPTION_KEYS = Object.freeze(["qualificationContext"]);
+const LINUX_PRODUCTION_TEST_OPTION_KEYS = Object.freeze([
+  "architecture",
+  "createAccountlessCredentialBackend",
+  "createAccountObservationCredentialBackend",
+  "platform",
+]);
 const TEST_OPTION_KEYS = Object.freeze([
   "qualificationContext",
   "platform",
@@ -174,6 +184,30 @@ function createHandover({
   });
 }
 
+function createLinuxProductionCredentialHandoverWithDependencies({
+  platform,
+  architecture,
+  createAccountlessCredentialBackend,
+  createAccountObservationCredentialBackend,
+}) {
+  if (platform !== "linux" || architecture !== "x64"
+      || typeof createAccountlessCredentialBackend !== "function"
+      || typeof createAccountObservationCredentialBackend !== "function") {
+    fail();
+  }
+  return Object.freeze({
+    createAccountlessCredentialBackend(options) {
+      return createAccountlessCredentialBackend(options);
+    },
+    attachLinuxAccountObservationBroker(channel) {
+      return attachDesktopLinuxAccountObservationBroker({
+        channel,
+        createBackend: createAccountObservationCredentialBackend,
+      });
+    },
+  });
+}
+
 /**
  * The only production-facing construction path. Native loaders run only when
  * an authentic Linux qualification context matches this Linux/x64 process.
@@ -207,6 +241,28 @@ export function createLinuxQualificationAccountObservationHandover(options = {})
       });
     },
   });
+}
+
+/**
+ * Main's exact packaged stable-linux selection is the only normal-runtime
+ * caller. This composes the already-reviewed fixed FD3 installation adapter
+ * with the fixed read/create account-observation IPC broker; it does not
+ * select generic Secret Service capabilities or alter native safety claims.
+ */
+export function createLinuxProductionCredentialHandover() {
+  return createLinuxProductionCredentialHandoverWithDependencies({
+    platform: process.platform,
+    architecture: process.arch,
+    createAccountlessCredentialBackend: createDesktopLinuxAccountlessCredentialBackend,
+    createAccountObservationCredentialBackend: createLinuxAccountObservationCredentialBackend,
+  });
+}
+
+/** Explicit dependency seam for the fixed normal-Linux handover contract. */
+export function createLinuxProductionCredentialHandoverForTest(options = {}) {
+  return createLinuxProductionCredentialHandoverWithDependencies(
+    exactOptions(options, LINUX_PRODUCTION_TEST_OPTION_KEYS),
+  );
 }
 
 /**

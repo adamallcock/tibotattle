@@ -11,6 +11,7 @@ import {
   attachDesktopLinuxAccountObservationBroker,
 } from "../desktop-linux-account-observation-broker.js";
 import {
+  createLinuxProductionCredentialHandoverForTest,
   createLinuxQualificationSecretServiceHandover,
   createLinuxQualificationSecretServiceHandoverForTest,
   LINUX_SECRET_SERVICE_MAIN_COMPOSITION_STATUS,
@@ -308,6 +309,77 @@ test("Linux qualification smoke refuses a non-isolated context before native loa
     (error) => error?.code === "linux_account_observation_qualification_smoke_failed"
       && error?.message === "Linux account-observation qualification smoke failed",
   );
+});
+
+test("Linux dormant production handover carries only fixed FD3 and observation routes", async () => {
+  const native = syntheticAccountObservationNative();
+  const accountlessBackend = Object.freeze({
+    async read() { return null; },
+    async createIfMissing() { return "created"; },
+    async deleteExact() { return "missing"; },
+  });
+  const accountlessOptions = Object.freeze({ legacyCredentialProbe: () => "absent" });
+  const accountlessCalls = [];
+  const handover = createLinuxProductionCredentialHandoverForTest({
+    platform: "linux",
+    architecture: "x64",
+    createAccountlessCredentialBackend(options) {
+      accountlessCalls.push(options);
+      return accountlessBackend;
+    },
+    createAccountObservationCredentialBackend() {
+      return createLinuxAccountObservationCredentialBackend({
+        platform: "linux",
+        architecture: "x64",
+        binding: native.binding,
+      });
+    },
+  });
+  assert.deepEqual(Object.keys(handover).sort(), [
+    "attachLinuxAccountObservationBroker",
+    "createAccountlessCredentialBackend",
+  ]);
+  assert.equal(
+    handover.createAccountlessCredentialBackend(accountlessOptions),
+    accountlessBackend,
+  );
+  assert.deepEqual(accountlessCalls, [accountlessOptions]);
+
+  const supervisor = createCompanionSupervisor({
+    command: process.execPath,
+    args: [ACCOUNT_OBSERVATION_CHILD_PATH],
+    startupTimeoutMs: 1_000,
+    shutdownTimeoutMs: 1_000,
+    attachLinuxAccountObservationBroker:
+      handover.attachLinuxAccountObservationBroker,
+  });
+  try {
+    await supervisor.start();
+    assert.deepEqual(native.calls, ["read", "create", "read"]);
+  } finally {
+    try { await supervisor.stop(); } finally { native.dispose(); }
+  }
+});
+
+test("Linux dormant production handover rejects non-Linux, non-x64, and injected extras", () => {
+  for (const overrides of [
+    { platform: "darwin" },
+    { architecture: "arm64" },
+    { extra: true },
+  ]) {
+    let factoryCalls = 0;
+    assert.throws(
+      () => createLinuxProductionCredentialHandoverForTest({
+        platform: "linux",
+        architecture: "x64",
+        createAccountlessCredentialBackend() { factoryCalls += 1; },
+        createAccountObservationCredentialBackend() { factoryCalls += 1; },
+        ...overrides,
+      }),
+      compositionError,
+    );
+    assert.equal(factoryCalls, 0);
+  }
 });
 
 test("Linux observation qualification child starts absent and completes fixed read/create/readback over inherited IPC", async () => {

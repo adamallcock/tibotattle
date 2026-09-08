@@ -16,6 +16,7 @@ import { runProductionNativeMacHandover } from "./desktop-native-migration-macos
 import { attachDesktopKeychainBroker } from "./desktop-keychain-broker.js";
 import { loadDesktopMacOSCredentialBackends } from "./desktop-macos-keychain.js";
 import {
+  createLinuxProductionCredentialHandover,
   createLinuxQualificationAccountObservationHandover,
 } from "./desktop-linux-secret-service.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
@@ -679,7 +680,8 @@ export async function launchElectronShell({
     assertElectronPlatformGate({
       platform: process.platform,
       architecture: process.arch,
-      qualificationContext,
+      environment,
+      qualificationContext: qualificationContext ?? linuxQualificationContext,
       productionDistribution,
     });
     const paths = resolveCompanionLaunchPaths({
@@ -699,6 +701,14 @@ export async function launchElectronShell({
       && productionDistribution.channel === PRODUCTION_ELECTRON_CHANNEL;
     const linuxQualificationSupervisorOptions =
       createLinuxQualificationSupervisorOptions({ linuxQualificationContext });
+    // readProductionDistribution has already validated the package-local
+    // target against this process. Keep the fixed Linux handover dormant for
+    // every development, rehearsal, test-lane, non-x64, and non-stable path.
+    const linuxProductionCredentialHandover = accountlessProductionEnabled
+      && process.platform === "linux"
+      && process.arch === "x64"
+      && productionDistribution.target === "linux-x64"
+      ? createLinuxProductionCredentialHandover() : null;
     const macCredentialHandover = productionEnabled && process.platform === "darwin"
       ? createProductionMacCredentialHandover({
         app,
@@ -727,6 +737,10 @@ export async function launchElectronShell({
       supervisorOptions: {
         ...supervisorOptions,
         ...linuxQualificationSupervisorOptions,
+        ...(linuxProductionCredentialHandover === null ? {} : {
+          attachLinuxAccountObservationBroker:
+            linuxProductionCredentialHandover.attachLinuxAccountObservationBroker,
+        }),
         ...(macCredentialHandover === null ? {} : {
           attachCredentialBroker: macCredentialHandover.attachCredentialBroker,
         }),
@@ -750,6 +764,10 @@ export async function launchElectronShell({
         ...(macCredentialHandover === null ? {} : {
           createMacOSCredentialBackend:
             macCredentialHandover.createAccountlessCredentialBackend,
+        }),
+        ...(linuxProductionCredentialHandover === null ? {} : {
+          createLinuxCredentialBackend:
+            linuxProductionCredentialHandover.createAccountlessCredentialBackend,
         }),
       } : undefined,
       accountlessHostedRehearsal: accountlessHostedRehearsal ?? undefined,
