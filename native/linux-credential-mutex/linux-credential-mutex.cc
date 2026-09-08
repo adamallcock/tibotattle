@@ -21,7 +21,6 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -31,8 +30,6 @@
 #include <mutex>
 #include <new>
 #include <string>
-#include <system_error>
-#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -2064,88 +2061,110 @@ void ClearAccountObservationOperationJournal(
 // reconciliation; nested calls must never extend that budget.
 class AccountObservationDeadlineGuard {
  public:
-  AccountObservationDeadlineGuard() = default;
+  AccountObservationDeadlineGuard() {
+    g_mutex_init(&mutex_);
+    g_cond_init(&condition_);
+  }
   AccountObservationDeadlineGuard(const AccountObservationDeadlineGuard&) = delete;
   AccountObservationDeadlineGuard& operator=(const AccountObservationDeadlineGuard&) = delete;
 
   ~AccountObservationDeadlineGuard() {
     Finish();
+    g_cond_clear(&condition_);
+    g_mutex_clear(&mutex_);
   }
 
   bool Start() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (finished_ || cancellable_ != nullptr || watchdog_.joinable()) return false;
-    cancellable_ = g_cancellable_new();
-    if (cancellable_ == nullptr) return false;
-    try {
-      watchdog_ = std::thread(&AccountObservationDeadlineGuard::Watch, this);
-    } catch (const std::system_error&) {
-      g_object_unref(cancellable_);
-      cancellable_ = nullptr;
+    g_mutex_lock(&mutex_);
+    if (finished_ || cancellable_ != nullptr || watchdog_ != nullptr) {
+      g_mutex_unlock(&mutex_);
       return false;
     }
+    cancellable_ = g_cancellable_new();
+    if (cancellable_ == nullptr) {
+      g_mutex_unlock(&mutex_);
+      return false;
+    }
+    GError* error = nullptr;
+    GThread* watchdog = g_thread_try_new(
+        "tibotattle-observation-deadline",
+        &AccountObservationDeadlineGuard::Watch,
+        this,
+        &error);
+    if (error != nullptr) g_error_free(error);
+    if (watchdog == nullptr) {
+      g_object_unref(cancellable_);
+      cancellable_ = nullptr;
+      g_mutex_unlock(&mutex_);
+      return false;
+    }
+    watchdog_ = watchdog;
+    g_mutex_unlock(&mutex_);
     return true;
   }
 
   GCancellable* cancellable() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return cancellable_;
+    g_mutex_lock(&mutex_);
+    GCancellable* current = cancellable_;
+    g_mutex_unlock(&mutex_);
+    return current;
   }
 
   // Stop the aggregate deadline before a caller commits an otherwise-normal
   // local settlement. Joining first means an already-expired watchdog is
   // observed while the lease can still be latched as recovery-required.
   bool StopDeadline() noexcept {
-    bool notify = false;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (!finished_) {
-        finished_ = true;
-        notify = true;
-      }
+    g_mutex_lock(&mutex_);
+    if (!finished_) {
+      finished_ = true;
+      g_cond_broadcast(&condition_);
     }
-    if (notify) condition_.notify_all();
-    if (watchdog_.joinable()) watchdog_.join();
-    std::lock_guard<std::mutex> lock(mutex_);
-    return cancellable_ == nullptr || g_cancellable_is_cancelled(cancellable_);
+    GThread* watchdog = watchdog_;
+    watchdog_ = nullptr;
+    g_mutex_unlock(&mutex_);
+    if (watchdog != nullptr) g_thread_join(watchdog);
+    g_mutex_lock(&mutex_);
+    const bool cancelled = cancellable_ == nullptr
+        || g_cancellable_is_cancelled(cancellable_);
+    g_mutex_unlock(&mutex_);
+    return cancelled;
   }
 
   void Finish() noexcept {
     StopDeadline();
     GCancellable* current = nullptr;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      current = cancellable_;
-      cancellable_ = nullptr;
-    }
+    g_mutex_lock(&mutex_);
+    current = cancellable_;
+    cancellable_ = nullptr;
+    g_mutex_unlock(&mutex_);
     if (current != nullptr) g_object_unref(current);
   }
 
  private:
-  void Watch() noexcept {
+  static gpointer Watch(gpointer data) {
+    auto* deadline = static_cast<AccountObservationDeadlineGuard*>(data);
+    if (deadline == nullptr) return nullptr;
     bool timed_out = false;
-    try {
-      std::unique_lock<std::mutex> lock(mutex_);
-      timed_out = !condition_.wait_for(
-          lock,
-          kAccountObservationOperationDeadline,
-          [this]() { return finished_; });
-    } catch (...) {
-      timed_out = true;
+    const gint64 expires_at = g_get_monotonic_time()
+        + static_cast<gint64>(kAccountObservationOperationDeadline.count())
+            * G_TIME_SPAN_MILLISECOND;
+    g_mutex_lock(&deadline->mutex_);
+    while (!deadline->finished_) {
+      if (!g_cond_wait_until(&deadline->condition_, &deadline->mutex_, expires_at)) {
+        timed_out = !deadline->finished_;
+        break;
+      }
     }
-    if (!timed_out) return;
-    GCancellable* current = nullptr;
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      current = cancellable_;
-    }
+    GCancellable* current = timed_out ? deadline->cancellable_ : nullptr;
+    g_mutex_unlock(&deadline->mutex_);
     if (current != nullptr) g_cancellable_cancel(current);
+    return nullptr;
   }
 
-  mutable std::mutex mutex_;
-  std::condition_variable condition_;
+  mutable GMutex mutex_;
+  GCond condition_;
   GCancellable* cancellable_ = nullptr;
-  std::thread watchdog_;
+  GThread* watchdog_ = nullptr;
   bool finished_ = false;
 };
 

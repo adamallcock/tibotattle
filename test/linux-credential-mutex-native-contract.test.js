@@ -29,6 +29,7 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(bindingGyp, /OS!='linux' or target_arch!='x64'/u);
   assert.match(bindingGyp, /pkg-config --cflags libsecret-1/u);
   assert.match(bindingGyp, /pkg-config --libs-only-l libsecret-1/u);
+  assert.doesNotMatch(bindingGyp, /-fexceptions/u);
   assert.match(source, /#include <libsecret\/secret\.h>/u);
   assert.match(source, /SYS_openat2/u);
   assert.match(source, /RESOLVE_NO_SYMLINKS/u);
@@ -126,7 +127,11 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /class AccountObservationDeadlineGuard/u);
   assert.match(source, /g_cancellable_new\(\)/u);
   assert.match(source, /g_cancellable_cancel\(current\)/u);
-  assert.match(source, /std::condition_variable/u);
+  assert.match(source, /g_thread_try_new\(/u);
+  assert.match(source, /g_thread_join\(watchdog\)/u);
+  assert.match(source, /g_cond_wait_until\(/u);
+  assert.doesNotMatch(source, /std::thread/u);
+  assert.doesNotMatch(source, /\bcatch\s*\(/u);
   assert.match(source, /FinishAccountObservationCancellation/u);
   assert.match(source, /FinishAccountObservationNormal/u);
   assert.match(source, /deadline->StopDeadline\(\)/u);
@@ -181,6 +186,7 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(readme, /libsecret-1/u);
   assert.match(readme, /modeled interruption states/u);
   assert.match(readme, /five-second\s+aggregate deadline/u);
+  assert.match(readme, /fallible thread constructor/u);
   assert.match(readme, /never replies/u);
   assert.match(readme, /not a\s+selected credential\s+backend/u);
 });

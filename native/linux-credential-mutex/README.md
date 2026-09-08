@@ -216,13 +216,16 @@ desktop lock transition, service crash, storage loss, or power failure.
 
 Each fixed slot-five worker creates one `GCancellable` with a five-second
 aggregate deadline shared by its search, collection lookup, no-replace create,
-and reconciliation calls. The watchdog joins before that cancellable is
-released. A deadline before any persisted intent returns `unavailable`; after
-the digest intent or v1 `active` marker exists it latches and retains recovery,
-returning `recovery_required` instead of normalizing the local state. The
-focused native qualification includes a closed local D-Bus socket that accepts
-but never replies, and requires the child read to return its fixed unavailable
-outcome inside the broker's larger deadline.
+and reconciliation calls. Its watchdog uses GLib's fallible thread constructor
+rather than C++ exception handling, so an allocation failure returns the fixed
+`unavailable` outcome before a service call or mutation begins. The watchdog
+joins before that cancellable is released. A deadline before any persisted
+intent returns `unavailable`; after the digest intent or v1 `active` marker
+exists it latches and retains recovery, returning `recovery_required` instead
+of normalizing the local state. The focused native qualification includes a
+closed local D-Bus socket that accepts but never replies, and requires the
+child read to return its fixed unavailable outcome inside the broker's larger
+deadline.
 
 This bounds the reviewed libsecret calls, but does not prove universal
 no-prompt behavior: a default collection can lock after the checked snapshot
