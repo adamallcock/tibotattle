@@ -9831,6 +9831,15 @@ function renderAccountingCacheReuseOutcome(impact) {
     cacheReuseSelectedBucketIndex = CACHE_REUSE_DEFAULT_BUCKET_INDEX;
   }
   const total = impact.comparableReturns;
+  // A known empty denominator is neither zero reuse nor unavailable data. The
+  // companion has evaluated the period, but no eligible follow-up can support
+  // a percentage. Keep the explicit empty state and withhold the percentage
+  // cards and their denominator-dependent interpretation.
+  const metrics = outcome.querySelector(".cache-reuse-metrics");
+  if (metrics) metrics.hidden = total === 0;
+  empty.hidden = total !== 0;
+  raster.hidden = total === 0;
+  if (total === 0) return;
   const morePercent = cacheReusePercent(impact.reusedMoreThanHalfReturns, total);
   const lessPercent = cacheReusePercent(impact.reusedHalfOrLessReturns, total);
   setRawText($("#cache-reuse-more-percent"), morePercent);
@@ -9858,9 +9867,6 @@ function renderAccountingCacheReuseOutcome(impact) {
       between: formatCount(impact.reusedBetweenHalfAndPreviousReturns),
     },
   );
-  empty.hidden = total !== 0;
-  raster.hidden = total === 0;
-  if (total === 0) return;
   const markUnit = chooseCacheReuseMarkUnit(total);
   drawCacheReuseRaster(impact, buckets, markUnit);
   ensureCacheReuseResizeObserver();
