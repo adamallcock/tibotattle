@@ -69,6 +69,26 @@ const OBSERVATION_RECEIPT = Object.freeze({
   credentialCleanup: "disposable_container_lifetime",
   productionSafe: false,
 });
+const OBSERVATION_NATIVE_PHASES = Object.freeze([
+  "INITIAL_READ", "ABSENT_INTENT", "CREATE", "READBACK", "NO_REPLACE",
+  "MATCHING_INTENT", "INTERRUPTED_REMOVAL", "MISMATCHED_INTENT",
+]);
+const OBSERVATION_FAILURE_PREFIX = "LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED_";
+const OBSERVATION_FAILURE_CODES = new Set([
+  "BEFORE_TEST", ...OBSERVATION_NATIVE_PHASES,
+].map((phase) => `${OBSERVATION_FAILURE_PREFIX}${phase}`));
+
+function observationNativeFailureStage(output) {
+  let phase = "BEFORE_TEST";
+  if (typeof output !== "string") return phase;
+  for (const line of output.split(/\r?\n/u)) {
+    for (const candidate of OBSERVATION_NATIVE_PHASES) {
+      if (line === `# LINUX_ACCOUNT_OBSERVATION_PHASE_${candidate}`) phase = candidate;
+    }
+  }
+  return phase;
+}
+
 const QUALIFICATION_PROFILES = Object.freeze({
   legacy: Object.freeze({
     helper: QUALIFICATION_HELPER,
@@ -392,7 +412,11 @@ export function runLinuxAccountObservationNativeQualification({
   startDaemon = startLinuxSecretServiceDaemon,
   spawnTest = spawnSync,
 } = {}) {
-  const failNative = () => { throw new Error("LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED"); };
+  const failNative = (phase = "BEFORE_TEST") => {
+    throw Object.assign(new Error("LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED"), {
+      code: `${OBSERVATION_FAILURE_PREFIX}${phase}`,
+    });
+  };
   if (platform !== "linux" || architecture !== "x64"
       || environment.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED !== "1") failNative();
   if (proveIsolation({ environment })?.status !== "isolated") failNative();
@@ -414,7 +438,7 @@ export function runLinuxAccountObservationNativeQualification({
     ? result.stdout.split(/\r?\n/u).filter((line) => line === marker)
     : [];
   if (result?.error || result?.status !== 0 || result?.signal !== null
-      || markers.length !== 1) failNative();
+      || markers.length !== 1) failNative(observationNativeFailureStage(result?.stdout));
   return OBSERVATION_RECEIPT;
 }
 
@@ -424,8 +448,10 @@ async function runSupervisor() {
     try {
       const receipt = runLinuxAccountObservationNativeQualification();
       process.stdout.write(`${JSON.stringify(receipt)}\n`);
-    } catch {
-      fixedFailure("LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED");
+    } catch (error) {
+      const code = error?.code;
+      fixedFailure(OBSERVATION_FAILURE_CODES.has(code)
+        ? code : "LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED");
     }
     return undefined;
   }

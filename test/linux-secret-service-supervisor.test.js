@@ -347,6 +347,15 @@ test("native observation proof requires actual success marker and bounded fixed 
       return outcome;
     },
   });
+  assert.throws(() => execute({
+    status: 1, signal: null,
+    stdout: "# LINUX_ACCOUNT_OBSERVATION_PHASE_INITIAL_READ\n# LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE\nprivate native diagnostic\n",
+  }), (error) => error.code === "LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED_CREATE"
+    && error.message === "LINUX_ACCOUNT_OBSERVATION_QUALIFICATION_FAILED");
+  assert.throws(() => execute({
+    status: 1, signal: null,
+    stdout: "# LINUX_ACCOUNT_OBSERVATION_PHASE_PRIVATE_DATA\n",
+  }), (error) => error.code === "LINUX_SECRET_SERVICE_QUALIFICATION_OBSERVATION_NATIVE_FAILED_BEFORE_TEST");
   for (const eol of ["\n", "\r\n"]) {
     assert.deepEqual(execute({ status: 0, signal: null, stdout: `TAP version 13${eol}# LINUX_ACCOUNT_OBSERVATION_NATIVE_PASSED${eol}` }), OBSERVATION_RECEIPT);
   }
