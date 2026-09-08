@@ -118,7 +118,7 @@ test("the development workflow builds each target on a static native runner with
   assert.doesNotMatch(workflow, /Add the (?:Windows|Linux) development launch handoff/u,
     "handoff assembly belongs to the common local/CI packaging command");
   assert.equal((workflow.match(/persist-credentials: false/gu) ?? []).length, 6);
-  assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 6);
+  assert.equal((workflow.match(/if-no-files-found: error/gu) ?? []).length, 7);
   assert.match(workflow, /WINDOWS_BINDING_BUILD_FAILED/u);
   assert.match(workflow, /LINUX_CREDENTIAL_MUTEX_NODE_GYP_UNAVAILABLE/u);
   assert.match(workflow, /rebuild --directory native\/linux-credential-mutex/u);
@@ -210,7 +210,11 @@ test("the Linux normal candidate stays on the runner and executes only in the is
   assert.equal((execution.match(/rw,noexec,nosuid/gu) ?? []).length, 2);
   assert.match(execution, /node scripts\/smoke-electron-linux-packaged\.mjs/u);
   assert.doesNotMatch(execution, /ELECTRON_RUN_AS_NODE|--no-sandbox|--privileged|--volume|--mount|--network host/u);
-  const upload = linux.slice(linux.indexOf("- name: Retain verified development packages and receipts"));
+  const upload = linux.slice(linux.indexOf("- name: Retain only the Linux normal-candidate receipt"));
+  const smallReceipt = upload.slice(0, upload.indexOf("- name: Retain verified development packages and receipts"));
+  assert.match(smallReceipt, /name: electron-linux-normal-candidate-\$\{\{ github\.sha \}\}/u);
+  assert.match(smallReceipt, /^ {10}path: \.release-build\/electron-candidates\/\$\{\{ github\.sha \}\}\/linux-x64\/distribution\/normal-packaged-smoke\.json$/mu);
+  assert.match(smallReceipt, /!cancelled\(\).*hashFiles\(format\(/u);
   assert.doesNotMatch(upload, /electron-production/u, "production candidates are not authorized for artifact upload");
   const dockerfile = await readFile(new URL("../containers/electron-linux-packaged/Dockerfile", import.meta.url), "utf8");
   assert.match(dockerfile, /COPY test\/fixtures\/linux-packaged-codex\/codex \/opt\/tibotattle-linux-packaged-smoke\/bin\/codex/u);

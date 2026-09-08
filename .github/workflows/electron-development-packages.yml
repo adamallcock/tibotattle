@@ -643,6 +643,14 @@ jobs:
             --source-revision "$GITHUB_SHA" \
             --receipt /run/user/1000/linux-normal-packaged-smoke.json \
             > "$host_receipt"
+      - name: Retain only the Linux normal-candidate receipt
+        if: ${{ !cancelled() && hashFiles(format('.release-build/electron-candidates/{0}/linux-x64/distribution/normal-packaged-smoke.json', github.sha)) != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-linux-normal-candidate-${{ github.sha }}
+          path: .release-build/electron-candidates/${{ github.sha }}/linux-x64/distribution/normal-packaged-smoke.json
+          if-no-files-found: error
+          retention-days: 14
       - name: Retain verified development packages and receipts
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

@@ -46,7 +46,7 @@ test("Linux failure receipt vocabulary matches the server's closed startup journ
     [...server.LOCAL_STARTUP_DIAGNOSTIC_DETAILS].sort());
 });
 
-test("Linux startup journal reader exports only one fixed failure and rejects unsafe files", async () => {
+test("Linux startup journal reader exports the latest fixed failure across retries and rejects unsafe files", async () => {
   const userData = await mkdtemp(join(tmpdir(), "linux-startup-journal-"));
   const state = join(userData, "companion-state");
   const file = join(state, "diagnostics-v0.1.log");
@@ -57,15 +57,19 @@ test("Linux startup journal reader exports only one fixed failure and rejects un
   };
   try {
     await mkdir(state, { mode: 0o700 });
-    assert.equal(await readLinuxNormalStartupFailure(userData), null);
+    const statuses = [];
+    const read = () => readLinuxNormalStartupFailure(userData, { onStatus: (status) => statuses.push(status) });
+    assert.equal(await read(), null);
+    assert.equal(statuses.at(-1), "absent");
     await writeFile(file, `${JSON.stringify(note)}\n`, { mode: 0o600 });
     assert.deepEqual(await readLinuxNormalStartupFailure(userData), {
       step: "data_store", detail: "local_collector_projection_worker_failed",
     });
     await writeFile(file, `${JSON.stringify({ ...note, detail: "private_payload" })}\n`);
     assert.equal(await readLinuxNormalStartupFailure(userData), null);
-    await writeFile(file, `${JSON.stringify(note)}\n${JSON.stringify(note)}\n`);
-    assert.equal(await readLinuxNormalStartupFailure(userData), null);
+    await writeFile(file, `${JSON.stringify(note)}\n${JSON.stringify({ ...note, detail: "type_error" })}\n`);
+    assert.deepEqual(await read(), { step: "data_store", detail: "type_error" });
+    assert.equal(statuses.at(-1), "failure");
     await writeFile(file, `${JSON.stringify(note)}\n`);
     await chmod(file, 0o644);
     assert.equal(await readLinuxNormalStartupFailure(userData), null);
@@ -87,6 +91,7 @@ test("Linux session and outer receipt preserve a fixed startup failure without w
     child.stderr.write("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_TRUE_FAILED\n");
     child.stderr.write(`${JSON.stringify({
       schemaVersion: "tibotattle-electron-linux-normal-packaged-startup-failure-v1",
+      companionStartupJournalStatus: "failure",
       companionStartupFailure: failure,
     })}\n`);
     child.stderr.end();
@@ -106,7 +111,18 @@ test("Linux session and outer receipt preserve a fixed startup failure without w
   assert.equal(receipt.status, "failed");
   assert.equal(receipt.packagedElectronExecutionVerified, false);
   assert.deepEqual(receipt.companionStartupFailure, failure);
+  assert.equal(receipt.companionStartupJournalStatus, "failure");
   assert.equal(receipt.rendererReadinessDiagnostics, undefined);
+  const missingJournal = await runLinuxNormalPackagedSmoke({ sourceRevision: SOURCE_REVISION }, {
+    verifyPackage: async () => identity,
+    runSession: async () => { throw Object.assign(new Error("private content"), {
+      code: receipt.errorCode, companionStartupJournalStatus: "absent",
+    }); },
+    reserve: async () => ({}), write: async () => {},
+  });
+  assert.equal(missingJournal.companionStartupJournalStatus, "absent");
+  assert.equal(missingJournal.companionStartupFailure, undefined);
+  assert.equal(JSON.stringify(missingJournal).includes("private content"), false);
 });
 
 function productionMetadata(sourceRevision = SOURCE_REVISION) {

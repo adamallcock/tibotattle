@@ -33,6 +33,21 @@ The next candidate retains a bounded server-minted startup failure in the
 existing local journal and exports only its fixed step/detail in the test
 receipt. These diagnostic changes do not close either normal-app gate.
 
+The following native candidate, `b5c112e8` in
+[run 34263864178](https://github.com/adamallcock/tibotattle/actions/runs/34263864178),
+narrows Windows to the native-member verifier. Pinned ASAR source and a local
+reproduction establish that the virtual sidecar is addressed with host path
+separators; the runner incorrectly supplied a POSIX member path on Windows.
+That verifier-only repair is integrated at `5cb6b760`. Linux repeats its
+dashboard readiness failure with no exported startup note; receipt SHA-256
+`e6e17730562e841663dc5647a1502bd42e12e0aab51cf2efa30527d79b8fd53b`.
+Absence is inconclusive: the reader discarded multiple notes even though the
+normal lifecycle may retry once. It now retains the latest fixed note and
+reports whether the journal was absent, unreadable, invalid, empty of startup
+failures, or contained a failure. The next workflow also retains the same
+closed Linux receipt separately, avoiding a large development-package download
+for every diagnosis. No normal candidate binaries are added to artifact upload.
+
 1. Close the real native Mac -> signed Electron -> next signed Electron
    installed rehearsal. The original signed private fixtures exposed the
    startup verifier defect; corrected unsigned replacements are prepared.

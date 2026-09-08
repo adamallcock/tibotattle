@@ -48,6 +48,7 @@ const SNAPSHOT_DIAGNOSTIC_SCHEMA =
   "tibotattle-electron-linux-normal-packaged-snapshot-diagnostic-v1";
 const STARTUP_FAILURE_DIAGNOSTIC_SCHEMA =
   "tibotattle-electron-linux-normal-packaged-startup-failure-v1";
+const STARTUP_JOURNAL_STATUSES = new Set(["absent", "unreadable", "invalid", "no_failure", "failure"]);
 const CLI_FAILURE = "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_FAILED";
 const MAX_JSON_BYTES = 1_048_576;
 // Two source-smoke journeys each retain their existing 30s startup, two 45s
@@ -123,22 +124,23 @@ function validateStartupFailure(value) {
 }
 
 /** Read a fixed server note after a failed ordinary launch; never export log text. */
-export async function readLinuxNormalStartupFailure(userData) {
-  if (absolutePath(userData) === null) return null;
+export async function readLinuxNormalStartupFailure(userData, { onStatus = () => {} } = {}) {
+  let status = "unreadable";
   let handle;
   try {
+    if (absolutePath(userData) === null) return null;
     const file = join(userData, "companion-state", "diagnostics-v0.1.log");
     const before = await lstat(file);
     if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1
         || before.uid !== process.getuid() || (before.mode & 0o777) !== 0o600
-        || before.size < 1 || before.size > 256 * 1024) return null;
+        || before.size < 1 || before.size > 256 * 1024) { status = "invalid"; return null; }
     handle = await open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     const opened = await handle.stat();
     if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino
-        || opened.nlink !== 1 || opened.size !== before.size) return null;
+        || opened.nlink !== 1 || opened.size !== before.size) { status = "invalid"; return null; }
     const bytes = Buffer.alloc(before.size + 1);
     const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
-    if (bytesRead !== before.size) return null;
+    if (bytesRead !== before.size) { status = "invalid"; return null; }
     const matches = [];
     for (const line of bytes.subarray(0, bytesRead).toString("utf8").split("\n")) {
       let value;
@@ -148,9 +150,26 @@ export async function readLinuxNormalStartupFailure(userData) {
       const selected = validateStartupFailure({ step: value.step, detail: value.detail });
       if (selected !== null) matches.push(selected);
     }
-    return matches.length === 1 ? matches[0] : null;
-  } catch { return null; }
-  finally { await handle?.close().catch(() => {}); }
+    // The ordinary lifecycle can retry once against this same private profile.
+    // Keep the latest server-minted outcome instead of suppressing both notes.
+    status = matches.length > 0 ? "failure" : "no_failure";
+    return matches.at(-1) ?? null;
+  } catch (error) { status = error?.code === "ENOENT" ? "absent" : "unreadable"; return null; }
+  finally {
+    await handle?.close().catch(() => {});
+    try { onStatus(status); } catch { /* Diagnostics cannot change the smoke failure. */ }
+  }
+}
+
+function startupDiagnosticEnvelope(failureValue, statusValue) {
+  if (!STARTUP_JOURNAL_STATUSES.has(statusValue)) return null;
+  const selected = validateStartupFailure(failureValue);
+  if ((statusValue === "failure") !== (selected !== null)) return null;
+  return Object.freeze({
+    schemaVersion: STARTUP_FAILURE_DIAGNOSTIC_SCHEMA,
+    companionStartupJournalStatus: statusValue,
+    companionStartupFailure: selected,
+  });
 }
 const SOURCE_SMOKE_STAGE_CODES = Object.freeze({
   startup: "SOURCE_SMOKE_STARTUP_FAILED",
@@ -629,7 +648,9 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
       const classified = validateRendererReadinessDiagnostics(rendererReadinessDiagnostics);
       const fixed = failure(stageCode);
       if (classified !== null) fixed.rendererReadinessDiagnostics = classified;
-      const startupFailure = await readLinuxNormalStartupFailure(ownedFixture?.userData);
+      const startupFailure = await readLinuxNormalStartupFailure(ownedFixture?.userData, {
+        onStatus: (status) => { fixed.companionStartupJournalStatus = status; },
+      });
       if (startupFailure !== null) fixed.companionStartupFailure = startupFailure;
       throw fixed;
     }
@@ -930,12 +951,13 @@ function classifiedInnerFailure(stderr) {
   const startupFailures = lines.map((line) => {
     try { return JSON.parse(line); } catch { return null; }
   }).map((value) => value?.schemaVersion === STARTUP_FAILURE_DIAGNOSTIC_SCHEMA
-    ? validateStartupFailure(value.companionStartupFailure) : null)
+    ? startupDiagnosticEnvelope(value.companionStartupFailure, value.companionStartupJournalStatus) : null)
     .filter((value) => value !== null);
   return Object.freeze({
     code: matches[0],
     rendererReadinessDiagnostics: diagnostics.length === 1 ? diagnostics[0] : null,
-    companionStartupFailure: startupFailures.length === 1 ? startupFailures[0] : null,
+    companionStartupFailure: startupFailures.length === 1 ? startupFailures[0].companionStartupFailure : null,
+    companionStartupJournalStatus: startupFailures.length === 1 ? startupFailures[0].companionStartupJournalStatus : null,
   });
 }
 
@@ -975,6 +997,9 @@ export async function runLinuxNormalPackagedSmokeSession(identity, {
       if (innerFailure.companionStartupFailure !== null) {
         error.companionStartupFailure = innerFailure.companionStartupFailure;
       }
+      if (innerFailure.companionStartupJournalStatus !== null) {
+        error.companionStartupJournalStatus = innerFailure.companionStartupJournalStatus;
+      }
       throw error;
     }
     fail("SESSION_EXECUTION_FAILED");
@@ -1011,6 +1036,7 @@ function outerReceipt({
   errorCode = null,
   rendererReadinessDiagnostics = null,
   companionStartupFailure = null,
+  companionStartupJournalStatus = null,
 }) {
   const diagnostic = validateRendererReadinessDiagnostics(rendererReadinessDiagnostics);
   const receipt = {
@@ -1023,8 +1049,11 @@ function outerReceipt({
     sessionCleanupConfirmed: inner?.cleanup === "owned_apps_stopped", errorCode, productionReady: false,
   };
   if (diagnostic !== null) receipt.rendererReadinessDiagnostics = diagnostic;
-  const startupFailure = validateStartupFailure(companionStartupFailure);
-  if (startupFailure !== null) receipt.companionStartupFailure = startupFailure;
+  const startup = startupDiagnosticEnvelope(companionStartupFailure, companionStartupJournalStatus);
+  if (startup !== null) {
+    receipt.companionStartupJournalStatus = startup.companionStartupJournalStatus;
+    if (startup.companionStartupFailure !== null) receipt.companionStartupFailure = startup.companionStartupFailure;
+  }
   return Object.freeze(receipt);
 }
 
@@ -1043,6 +1072,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
   let errorCode = null;
   let rendererReadinessDiagnostics = null;
   let companionStartupFailure = null;
+  let companionStartupJournalStatus = null;
   try {
     identity = await verifyPackage(options);
     inner = await runSession(identity, { appPath: options.appPath, environment });
@@ -1052,6 +1082,8 @@ export async function runLinuxNormalPackagedSmoke(options, {
       error?.rendererReadinessDiagnostics,
     );
     companionStartupFailure = validateStartupFailure(error?.companionStartupFailure);
+    companionStartupJournalStatus = STARTUP_JOURNAL_STATUSES.has(error?.companionStartupJournalStatus)
+      ? error.companionStartupJournalStatus : null;
   }
   const receipt = outerReceipt({
     sourceRevision: options.sourceRevision,
@@ -1060,6 +1092,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
     errorCode,
     rendererReadinessDiagnostics,
     companionStartupFailure,
+    companionStartupJournalStatus,
   });
   await write(handle, receipt);
   return receipt;
@@ -1090,11 +1123,8 @@ if (resolve(process.argv[1] ?? "") === SCRIPT_FILE) {
     process.stderr.write(`${code}\n`);
     const diagnostic = diagnosticEnvelope(error?.rendererReadinessDiagnostics);
     if (diagnostic !== null) process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
-    const startupFailure = validateStartupFailure(error?.companionStartupFailure);
-    if (startupFailure !== null) process.stderr.write(`${JSON.stringify({
-      schemaVersion: STARTUP_FAILURE_DIAGNOSTIC_SCHEMA,
-      companionStartupFailure: startupFailure,
-    })}\n`);
+    const startup = startupDiagnosticEnvelope(error?.companionStartupFailure, error?.companionStartupJournalStatus);
+    if (startup !== null) process.stderr.write(`${JSON.stringify(startup)}\n`);
     process.exitCode = 1;
   });
 }
