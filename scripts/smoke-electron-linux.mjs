@@ -920,7 +920,9 @@ export function validateStartupRefreshTimeoutDiagnostic(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)
       || !STARTUP_REFRESH_TIMEOUT_PHASES.has(value.phase)
       || !STARTUP_REFRESH_TIMEOUT_REQUEST_COUNTS.has(value.requestCount)
-      || !STARTUP_REFRESH_TIMEOUT_STATUSES.has(value.refreshStatus)) return null;
+      || !STARTUP_REFRESH_TIMEOUT_STATUSES.has(value.refreshStatus)
+      || value.requestCount === "zero" && value.refreshStatus !== "not_observed"
+      || value.requestCount !== "zero" && value.refreshStatus === "not_observed") return null;
   return Object.freeze({
     phase: value.phase,
     requestCount: value.requestCount,

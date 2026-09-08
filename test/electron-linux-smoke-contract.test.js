@@ -938,6 +938,9 @@ test("Linux startup refresh timeout diagnostics retain only closed observation c
   assert.equal(validateStartupRefreshTimeoutDiagnostic({
     phase: "completion", requestCount: "zero", refreshStatus: "succeeded-but-private",
   }), null);
+  assert.equal(validateStartupRefreshTimeoutDiagnostic({
+    phase: "completion", requestCount: "zero", refreshStatus: "succeeded",
+  }), null, "absence remains a timeout failure, never a zero-request success");
 });
 
 test("Linux initial dashboard loader waits through a transient null", async () => {
