@@ -20,6 +20,14 @@ const CHILD_FAILURE_STAGES = new Map([
   [43, "child_create"],
   [44, "child_readback"],
   [45, "child_restart_read"],
+  [46, "child_initial_read_existing_record"],
+  [47, "child_initial_read_broker_unavailable"],
+  [48, "child_initial_read_broker_locked"],
+  [49, "child_initial_read_broker_denied"],
+  [50, "child_initial_read_broker_recovery_required"],
+  [51, "child_initial_read_broker_timeout"],
+  [52, "child_initial_read_broker_protocol"],
+  [53, "child_initial_read_broker_invalid_configuration"],
 ]);
 const FAILURE_STAGES = new Set([
   "preparation",

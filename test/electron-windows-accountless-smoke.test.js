@@ -254,7 +254,21 @@ test("observation failure preserves the upload result without claiming the secon
 });
 
 test("observation failure records only the closed stage enum and never native error detail", async () => {
-  for (const failureStage of ["preparation", "child_create", "child_restart_read", "unavailable", "private native detail"] ) {
+  for (const failureStage of [
+    "preparation",
+    "child_create",
+    "child_restart_read",
+    "child_initial_read_existing_record",
+    "child_initial_read_broker_unavailable",
+    "child_initial_read_broker_locked",
+    "child_initial_read_broker_denied",
+    "child_initial_read_broker_recovery_required",
+    "child_initial_read_broker_timeout",
+    "child_initial_read_broker_protocol",
+    "child_initial_read_broker_invalid_configuration",
+    "unavailable",
+    "private native detail",
+  ]) {
     const observations = { accountObservationFailureStage: null };
     const child = fakeChild((target) => target.emit("message", {
       ...observationStorage, status: "failed-v1", failureStage,

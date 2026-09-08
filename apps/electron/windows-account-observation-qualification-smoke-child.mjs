@@ -3,6 +3,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import {
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY,
   createWindowsAccountObservationBrokerBackendFromEnvironment,
+  isWindowsAccountObservationBrokerError,
 } from "../../src/platform/index.js";
 
 const PHASES = new Set(["create-v1", "restart-read-v1"]);
@@ -12,6 +13,25 @@ const RUN_ID =
 // Only fixed stage numbers cross the child-process boundary. Native errors,
 // account identifiers, record values, and descriptor diagnostics stay local.
 let failureExitCode = 41;
+
+const INITIAL_READ_FAILURE_EXIT_CODES = new Map([
+  ["windows_account_observation_broker_unavailable", 47],
+  ["windows_account_observation_broker_locked", 48],
+  ["windows_account_observation_broker_denied", 49],
+  ["windows_account_observation_broker_recovery_required", 50],
+  ["windows_account_observation_broker_timeout", 51],
+  ["windows_account_observation_broker_protocol", 52],
+  ["windows_account_observation_broker_invalid_configuration", 53],
+]);
+
+function initialReadFailureExitCode(error) {
+  try {
+    if (isWindowsAccountObservationBrokerError(error) !== true) return 42;
+    return INITIAL_READ_FAILURE_EXIT_CODES.get(error.code) ?? 42;
+  } catch {
+    return 42;
+  }
+}
 
 function argumentsForQualification() {
   const values = process.argv.slice(2);
@@ -64,8 +84,16 @@ async function run() {
       let existing = null;
       try {
         failureExitCode = 42;
-        existing = await backend.read(WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY);
-        if (existing !== null) throw new Error("unexpected existing synthetic record");
+        try {
+          existing = await backend.read(WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY);
+        } catch (error) {
+          failureExitCode = initialReadFailureExitCode(error);
+          throw error;
+        }
+        if (existing !== null) {
+          failureExitCode = 46;
+          throw new Error("unexpected existing synthetic record");
+        }
       } finally {
         existing?.fill?.(0);
       }
