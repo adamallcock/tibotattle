@@ -325,15 +325,21 @@ function loadAsar() {
   }
 }
 
+/** Electron's ASAR reader indexes members with the packager host's separator. */
+function archiveMemberPath(member, platform = process.platform) {
+  return platform === "win32" ? member.replaceAll("/", win32.sep) : member;
+}
+
 function readArchiveFile(
   archivePath,
   member,
   asar = loadAsar(),
   code = "PACKAGE_IDENTITY_INVALID",
+  platform = process.platform,
 ) {
   let bytes;
   try {
-    bytes = asar.extractFile(archivePath, member);
+    bytes = asar.extractFile(archivePath, archiveMemberPath(member, platform));
   } catch {
     fail(code);
   }
@@ -349,9 +355,10 @@ function readArchiveJson(
   member,
   asar = loadAsar(),
   code = "PACKAGE_IDENTITY_INVALID",
+  platform = process.platform,
 ) {
   try {
-    const value = JSON.parse(readArchiveFile(archivePath, member, asar, code).toString("utf8"));
+    const value = JSON.parse(readArchiveFile(archivePath, member, asar, code, platform).toString("utf8"));
     if (!exactObject(value)) fail(code);
     return value;
   } catch (error) {
@@ -367,9 +374,9 @@ function sameDigest(left, right) {
 async function digestArchiveMember(
   archivePath,
   member,
-  { asar = loadAsar(), code = "PACKAGE_IDENTITY_INVALID" } = {},
+  { asar = loadAsar(), code = "PACKAGE_IDENTITY_INVALID", platform = process.platform } = {},
 ) {
-  const bytes = readArchiveFile(archivePath, member, asar, code);
+  const bytes = readArchiveFile(archivePath, member, asar, code, platform);
   return Object.freeze({
     bytes: bytes.byteLength,
     sha256: createHash("sha256").update(bytes).digest("hex"),
@@ -381,19 +388,21 @@ async function validateNativePair({
   asarPath,
   unpackedPath,
   asar = loadAsar(),
+  digest = digestRegularFile,
   failureCode = "PACKAGE_NATIVE_MEMBERS_INVALID",
+  platform = process.platform,
 } = {}) {
   const relativeBinding = WINDOWS_ELECTRON_BINDING_RELATIVE_PATH;
   const relativeManifest = `${relativeBinding}.manifest.json`;
   const relativeKeytar = WINDOWS_ELECTRON_KEYTAR_RELATIVE_PATH;
   const [stagedBinding, packagedBinding, stagedKeytar, packagedKeytar, stagedManifest, archivedManifest] =
     await Promise.all([
-      digestRegularFile(join(stagedAppPath, ...relativeBinding.split("/")), failureCode),
-      digestRegularFile(join(unpackedPath, ...relativeBinding.split("/")), failureCode),
-      digestRegularFile(join(stagedAppPath, ...relativeKeytar.split("/")), failureCode),
-      digestRegularFile(join(unpackedPath, ...relativeKeytar.split("/")), failureCode),
-      digestRegularFile(join(stagedAppPath, ...relativeManifest.split("/")), failureCode),
-      digestArchiveMember(asarPath, relativeManifest, { asar, code: failureCode }),
+      digest(join(stagedAppPath, ...relativeBinding.split("/")), failureCode),
+      digest(join(unpackedPath, ...relativeBinding.split("/")), failureCode),
+      digest(join(stagedAppPath, ...relativeKeytar.split("/")), failureCode),
+      digest(join(unpackedPath, ...relativeKeytar.split("/")), failureCode),
+      digest(join(stagedAppPath, ...relativeManifest.split("/")), failureCode),
+      digestArchiveMember(asarPath, relativeManifest, { asar, code: failureCode, platform }),
     ]);
   if (!sameDigest(stagedBinding, packagedBinding)
       || !sameDigest(stagedKeytar, packagedKeytar)
@@ -466,6 +475,7 @@ export async function verifyWindowsNormalCandidateSmokePackage(options = {}, {
     "package.json",
     asar,
     "PACKAGE_ARCHIVE_MANIFEST_INVALID",
+    platform,
   );
   const metadata = validateWindowsNormalCandidateSmokeMetadata({
     sourceCandidate, stagedManifest, archiveManifest, sourceRevision: options.sourceRevision,
@@ -475,7 +485,9 @@ export async function verifyWindowsNormalCandidateSmokePackage(options = {}, {
     asarPath,
     unpackedPath,
     asar,
+    digest,
     failureCode: "PACKAGE_NATIVE_MEMBERS_INVALID",
+    platform,
   });
   return Object.freeze({
     sourceRevision: metadata.sourceRevision,

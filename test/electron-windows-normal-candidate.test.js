@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -93,12 +94,14 @@ function packageVerificationDependencies({
   readJsonFile,
   digest = async () => ({ bytes: 1, sha256: "a".repeat(64) }),
   asar,
-  validateNative = async () => ({
-    windowsFilesystemSha256: "b".repeat(64),
-    keytarSha256: "c".repeat(64),
-  }),
+  validateNative,
+  useNativePair = false,
 } = {}) {
   const manifest = { version: "0.1.0", tibotattleDistribution: candidateMetadata() };
+  const selectedValidateNative = validateNative ?? (useNativePair ? undefined : async () => ({
+    windowsFilesystemSha256: "b".repeat(64),
+    keytarSha256: "c".repeat(64),
+  }));
   return {
     platform: "win32",
     architecture: "x64",
@@ -112,7 +115,7 @@ function packageVerificationDependencies({
     asar: asar ?? {
       extractFile: () => Buffer.from(JSON.stringify(manifest)),
     },
-    validateNative,
+    ...(selectedValidateNative === undefined ? {} : { validateNative: selectedValidateNative }),
   };
 }
 
@@ -241,6 +244,38 @@ test("normal candidate package verification keeps its closed failure stages dist
     },
   }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_NATIVE_MEMBERS_INVALID" });
   assert.equal(nativeFailureCode, "PACKAGE_NATIVE_MEMBERS_INVALID");
+});
+
+test("normal candidate package verification uses Windows ASAR separators for the virtual native sidecar", async () => {
+  const nativeManifest = Buffer.from("fixed-native-sidecar", "utf8");
+  const nativeDigest = Object.freeze({
+    bytes: nativeManifest.byteLength,
+    sha256: createHash("sha256").update(nativeManifest).digest("hex"),
+  });
+  const virtualManifest = String.raw`native\windows-filesystem\build\Release\windows_filesystem.node.manifest.json`;
+  const members = [];
+  const result = await verifyWindowsNormalCandidateSmokePackage(
+    smokeOptions(),
+    packageVerificationDependencies({
+      useNativePair: true,
+      digest: async () => nativeDigest,
+      asar: {
+        extractFile: (_archive, member) => {
+          members.push(member);
+          if (member === "package.json") {
+            return Buffer.from(JSON.stringify({
+              version: "0.1.0",
+              tibotattleDistribution: candidateMetadata(),
+            }));
+          }
+          if (member === virtualManifest) return nativeManifest;
+          throw new Error("unexpected archive member");
+        },
+      },
+    }),
+  );
+  assert.equal(result.target, "win32-x64");
+  assert.deepEqual(members, ["package.json", virtualManifest]);
 });
 
 test("normal candidate runner preserves a package stage in its content-free receipt", async () => {
