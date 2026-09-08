@@ -177,9 +177,10 @@ test("macOS Keychain adapter compiler maps both Electron architectures exactly",
 });
 
 test("macOS Keychain adapter source retains the fixed, prompt-free modern policy", async () => {
-  const [source, bindingGyp] = await Promise.all([
+  const [source, bindingGyp, searchScopePolicy] = await Promise.all([
     readFile(MACOS_KEYCHAIN_ADAPTER_SOURCE, "utf8"),
     readFile(new URL("../native/macos-keychain/binding.gyp", import.meta.url), "utf8"),
+    readFile(new URL("../native/macos-keychain/search-scope-policy.h", import.meta.url), "utf8"),
   ]);
 
   for (const service of [
@@ -205,8 +206,10 @@ test("macOS Keychain adapter source retains the fixed, prompt-free modern policy
   assert.match(source, /SecKeychainCopySearchList\(/u);
   assert.match(source, /CFDictionarySetValue\(query, kSecMatchSearchList, search_scope\)/u);
   assert.match(source, /SecKeychainGetStatus\(/u);
+  assert.match(source, /SecKeychainGetPath\(/u);
+  assert.match(source, /ClassifySearchScopeMemberForAbsence/u);
   assert.match(source, /kSecUnlockStateStatus/u);
-  assert.match(source, /kSecReadPermStatus\) == 0\) return ItemStatus::kDenied/u);
+  assert.match(searchScopePolicy, /if \(!readable\) return SearchScopeMemberStatus::kDenied/u);
   assert.match(source, /CFDictionarySetValue\(attributes, kSecUseKeychain, destination_keychain\)/u);
   assert.match(source, /SecTrustedApplicationCreateFromPath\(nullptr/u);
   assert.match(source, /SecAccessCreate\(/u);

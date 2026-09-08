@@ -9,6 +9,9 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <sys/param.h>
+
+#include "search-scope-policy.h"
 
 namespace {
 
@@ -457,6 +460,37 @@ ItemStatus KeychainStatusForAbsenceNoInteraction(SecKeychainRef keychain) {
   SecKeychainStatus keychain_status = 0;
   const OSStatus status = SecKeychainGetStatus(keychain, &keychain_status);
   if (status != errSecSuccess) return ScopeFailureStatus(status);
+  std::array<char, PATH_MAX> path{};
+  UInt32 path_length = static_cast<UInt32>(path.size());
+  const OSStatus path_status = SecKeychainGetPath(keychain, &path_length, path.data());
+  const auto path_kind = path_status == errSecSuccess && path_length < path.size()
+    ? tibotattle::macos_keychain::ClassifySearchScopeMemberPath(path.data(), path_length)
+    : tibotattle::macos_keychain::SearchScopeMemberPath::kUnknown;
+  const auto classification = tibotattle::macos_keychain::ClassifySearchScopeMemberForAbsence(
+      (keychain_status & kSecUnlockStateStatus) != 0,
+      (keychain_status & kSecReadPermStatus) != 0,
+      path_kind);
+  switch (classification) {
+    case tibotattle::macos_keychain::SearchScopeMemberStatus::kPresent:
+      return ItemStatus::kPresent;
+    case tibotattle::macos_keychain::SearchScopeMemberStatus::kLocked:
+      return ItemStatus::kLocked;
+    case tibotattle::macos_keychain::SearchScopeMemberStatus::kDenied:
+      return ItemStatus::kDenied;
+    case tibotattle::macos_keychain::SearchScopeMemberStatus::kUnknown:
+      return ItemStatus::kUnknown;
+  }
+  return ItemStatus::kUnknown;
+}
+
+// Creating a new app-owned item is stricter than proving a completed scoped
+// lookup absent. The destination must itself advertise both unlock and read
+// permission; never apply the readable-System absence exception here.
+ItemStatus DefaultKeychainStatusForNewItemNoInteraction(SecKeychainRef keychain) {
+  if (keychain == nullptr) return ItemStatus::kUnknown;
+  SecKeychainStatus keychain_status = 0;
+  const OSStatus status = SecKeychainGetStatus(keychain, &keychain_status);
+  if (status != errSecSuccess) return ScopeFailureStatus(status);
   if ((keychain_status & kSecUnlockStateStatus) == 0) return ItemStatus::kLocked;
   if ((keychain_status & kSecReadPermStatus) == 0) return ItemStatus::kDenied;
   return ItemStatus::kPresent;
@@ -510,7 +544,7 @@ ItemStatus CaptureDefaultKeychainForNewItemNoInteraction(
     return ItemStatus::kUnknown;
   }
   const ItemStatus keychain_status =
-      KeychainStatusForAbsenceNoInteraction(default_keychain);
+      DefaultKeychainStatusForNewItemNoInteraction(default_keychain);
   if (keychain_status != ItemStatus::kPresent) {
     CFRelease(default_keychain);
     return keychain_status;
