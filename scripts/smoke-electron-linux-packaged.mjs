@@ -344,12 +344,13 @@ export async function createLinuxNormalPackagedSmokeFixture({ runtimeDirectory =
   const runtime = absolutePath(runtimeDirectory);
   if (runtime === null) fail("FIXTURE_INVALID");
   const root = await mkdtemp(join(runtime, "tibotattle-linux-normal-packaged-"));
-  const codexHome = join(root, "codex-home");
+  const home = join(root, "home");
+  const codexHome = join(home, ".codex");
   const claudeHome = join(root, "claude-home");
   const userData = join(root, "user-data");
   const settingsRoot = join(userData, "desktop-settings");
   try {
-    const directories = [codexHome, claudeHome, userData, settingsRoot, join(codexHome, "sessions")];
+    const directories = [home, codexHome, claudeHome, userData, settingsRoot, join(codexHome, "sessions")];
     await Promise.all(directories.map((path) => mkdir(path, { recursive: true, mode: 0o700 })));
     await Promise.all(directories.map((path) => chmod(path, 0o700)));
     await writeFile(join(codexHome, "sessions", "synthetic-linux-smoke.jsonl"),
@@ -361,8 +362,8 @@ export async function createLinuxNormalPackagedSmokeFixture({ runtimeDirectory =
       mode: 0o600, flag: "wx",
     });
     return Object.freeze({
-      claudeHome, codexHome, root, userData,
-      stateFile: join(userData, "companion-state", ".usage-monitor", "local-collector-state-v1.sqlite"),
+      claudeHome, codexHome, home, root, userData,
+      stateFile: join(userData, "companion-state", "local-collector-state-v1.sqlite"),
       unavailableBusAddress: `unix:path=${join(root, "absent-session-bus")}`,
     });
   } catch (error) {
@@ -382,11 +383,14 @@ const BLOCKED_ENVIRONMENT = Object.freeze([
   "XDG_STATE_HOME",
 ]);
 
-/** Keep container HOME/XDG roots; only the raw source and app server are private. */
+/** Bind the desktop's fresh default Codex root to the disposable raw fixture. */
 export function normalPackagedSmokeEnvironment({ environment = process.env, fixture, service } = {}) {
   if (!fixture || typeof fixture !== "object" || !["available", "unavailable"].includes(service)) {
     fail("FIXTURE_INVALID");
   }
+  const home = absolutePath(fixture.home);
+  const codexHome = absolutePath(fixture.codexHome);
+  if (home === null || codexHome !== join(home, ".codex")) fail("FIXTURE_INVALID");
   const selected = { ...environment };
   for (const key of BLOCKED_ENVIRONMENT) delete selected[key];
   for (const key of ["PATH", "HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR"]) {
@@ -395,7 +399,8 @@ export function normalPackagedSmokeEnvironment({ environment = process.env, fixt
     }
   }
   selected.PATH = `${SYNTHETIC_CODEX_DIRECTORY}:${selected.PATH}`;
-  selected.CODEX_HOME = fixture.codexHome;
+  selected.HOME = home;
+  selected.CODEX_HOME = codexHome;
   selected.CLAUDE_CONFIG_DIR = fixture.claudeHome;
   selected.CLAUDE_PROJECT_DIR = fixture.root;
   selected.CLAUDE_PROJECT_DIRECTORY = fixture.root;

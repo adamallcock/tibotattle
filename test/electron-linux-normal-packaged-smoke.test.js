@@ -232,7 +232,8 @@ test("normal packaged Linux smoke uses an image-owned codex fixture and strips i
 
   const fixture = {
     claudeHome: "/private/tmp/private-claude",
-    codexHome: "/private/tmp/private-codex",
+    codexHome: "/private/tmp/private-home/.codex",
+    home: "/private/tmp/private-home",
     root: "/private/tmp/private-root",
     unavailableBusAddress: "unix:path=/private/tmp/private-root/absent-session-bus",
   };
@@ -257,6 +258,7 @@ test("normal packaged Linux smoke uses an image-owned codex fixture and strips i
   });
   assert.equal(selected.PATH, "/opt/tibotattle-linux-packaged-smoke/bin:/usr/bin");
   assert.equal(selected.DBUS_SESSION_BUS_ADDRESS, fixture.unavailableBusAddress);
+  assert.equal(selected.HOME, fixture.home);
   assert.equal(selected.CODEX_HOME, fixture.codexHome);
   assert.equal(selected.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL, "quit-v1");
   for (const key of [
@@ -272,8 +274,25 @@ test("normal packaged Linux smoke fixture keeps raw input private and the app-se
     const fixture = await createLinuxNormalPackagedSmokeFixture({ runtimeDirectory: runtime });
     assert.equal(Object.hasOwn(fixture, "binaryDirectory"), false);
     assert.equal((await stat(fixture.root)).mode & 0o777, 0o700);
+    assert.equal(fixture.codexHome, join(fixture.home, ".codex"));
     assert.equal((await stat(join(fixture.codexHome, "sessions", "synthetic-linux-smoke.jsonl"))).mode & 0o777, 0o600);
     assert.equal((await stat(join(fixture.userData, "desktop-settings", "desktop-first-run-v1.json"))).mode & 0o777, 0o600);
+    assert.equal(fixture.stateFile,
+      join(fixture.userData, "companion-state", "local-collector-state-v1.sqlite"));
+    const selected = normalPackagedSmokeEnvironment({
+      fixture,
+      service: "available",
+      environment: {
+        PATH: "/usr/bin",
+        HOME: join(runtime, "ambient-home"),
+        XDG_CONFIG_HOME: join(runtime, "config"),
+        XDG_CACHE_HOME: join(runtime, "cache"),
+        XDG_DATA_HOME: join(runtime, "data"),
+        XDG_RUNTIME_DIR: runtime,
+      },
+    });
+    assert.equal(selected.HOME, fixture.home);
+    assert.equal(selected.CODEX_HOME, join(selected.HOME, ".codex"));
   } finally {
     await rm(runtime, { recursive: true, force: true });
   }
