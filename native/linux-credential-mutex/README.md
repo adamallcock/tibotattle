@@ -17,8 +17,25 @@ tree:
 When `XDG_STATE_HOME` is unset, the persistent base follows the XDG fallback
 under the current account's home directory. The binding reopens roots with
 Linux handle-based no-symlink checks, validates owner and mode constraints, and
-refuses missing or unsafe roots. It does not accept a caller-selected socket or
-journal path.
+refuses unsafe roots. Credential and journal operations still refuse a missing
+root. Before those operations, the Electron main process may call the fixed,
+zero-argument `prepareLinuxCredentialState` authority. It resolves the same
+native XDG state base: for the passwd-record fallback it may create only the
+known `.local` and `state` components beneath the validated account home; for
+a configured absolute `XDG_STATE_HOME`, it requires a safe existing direct
+parent and may create only that final base. It never reads `HOME` for the
+fallback and never recursively creates arbitrary configured ancestors.
+
+Preparation preflights every existing fixed descendant before it creates any
+new sibling: `app-usagemonitor`, `linux-credential-mutex-v1`, and
+`linux-accountless-installation-credential-v1`. It creates only an absent
+fixed directory with mode `0700`, fsyncs its parent, then reopens and validates
+the full tree through the same no-symlink, owner, and mode checks. An unsafe
+pre-existing base or descendant is rejected without chmod repair, credential
+access, socket acquisition, journal transition, record mutation, or a returned
+path. A process interruption can leave an incomplete directory tree; a later
+preparation reopens and completes only its still-absent fixed components. This
+is not a credential-operation recovery protocol.
 
 Each inherited generic `0..3` lease pins one journal file descriptor and
 fsyncs its `active` state before returning to JavaScript. A normal, explicitly

@@ -37,6 +37,7 @@ function binding() {
     credentialMutexSameNetworkNamespaceOnly: true,
     credentialMutexDurableMarker: true,
     productionSafe: false,
+    prepareLinuxCredentialState: () => {},
     acquireCredentialMutex: () => ({ lease: Object.create(null), abandoned: false }),
     releaseCredentialMutex: () => {},
     abandonCredentialMutex: () => {},

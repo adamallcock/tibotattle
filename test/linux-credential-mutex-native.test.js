@@ -3,11 +3,15 @@ import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import {
   chmod,
+  chown,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
   rename,
   rm,
+  stat,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -34,6 +38,18 @@ const CHILD = fileURLToPath(new URL(
 const NATIVE_TEST_ENABLED = process.platform === "linux"
   && process.arch === "x64"
   && process.env.USAGE_MONITOR_LINUX_CREDENTIAL_MUTEX_NATIVE_TEST === "1";
+// The passwd-home fallback must never be exercised against the GitHub runner
+// or a developer's real home. Root enables this only for the existing
+// network-isolated packaged Docker lane, whose disposable owner-private tmpfs
+// is fixed at /home/node and whose XDG_STATE_HOME is intentionally omitted for
+// this one first-run check.
+const DEFAULT_STATE_TEST_ENABLED = NATIVE_TEST_ENABLED
+  && process.env.USAGE_MONITOR_LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_TEST === "1"
+  && process.env.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED === "1"
+  && process.env.XDG_STATE_HOME === undefined
+  && process.env.HOME === "/home/node"
+  && typeof process.getuid === "function"
+  && process.getuid() === 1_000;
 
 function runChild(mode, capabilityId, environment) {
   return spawnSync(process.execPath, [CHILD, mode, String(capabilityId)], {
@@ -47,6 +63,16 @@ function runChild(mode, capabilityId, environment) {
 async function ownerOnlyDirectory(path) {
   await mkdir(path, { recursive: true, mode: 0o700 });
   await chmod(path, 0o700);
+}
+
+async function assertOwnerOnlyDirectory(path) {
+  const metadata = await stat(path);
+  assert.equal(metadata.isDirectory(), true);
+  assert.equal(metadata.mode & 0o777, 0o700);
+}
+
+async function assertMissing(path) {
+  await assert.rejects(lstat(path), { code: "ENOENT" });
 }
 
 async function startHolder(capabilityId, environment) {
@@ -386,4 +412,181 @@ test("native Linux mutex uses a socket primary lease, preserves crash state, and
     () => binding.acquireCredentialMutex(3),
     (error) => error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_INVALID",
   );
+});
+
+test("native Linux credential state bootstrap creates only fixed absent paths and refuses unsafe state", {
+  skip: !NATIVE_TEST_ENABLED,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-linux-credential-state-"));
+  const previousState = process.env.XDG_STATE_HOME;
+  const previousHome = process.env.HOME;
+  t.after(async () => {
+    if (previousState === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previousState;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const binding = loadLinuxCredentialMutexBinding();
+  const configuredState = join(root, "configured-state");
+  const configuredApplication = join(configuredState, "app-usagemonitor");
+  const configuredMutex = join(configuredApplication, "linux-credential-mutex-v1");
+  const configuredAccountless = join(
+    configuredApplication,
+    "linux-accountless-installation-credential-v1",
+  );
+  process.env.XDG_STATE_HOME = configuredState;
+  process.env.HOME = join(root, "injected-home-must-not-be-used");
+  assert.equal(binding.prepareLinuxCredentialState(), undefined);
+  await Promise.all([
+    assertOwnerOnlyDirectory(configuredState),
+    assertOwnerOnlyDirectory(configuredApplication),
+    assertOwnerOnlyDirectory(configuredMutex),
+    assertOwnerOnlyDirectory(configuredAccountless),
+    assertMissing(join(configuredMutex, "journal-0-v1")),
+    assertMissing(join(configuredAccountless, "accountless-installation-credential-v1")),
+    assertMissing(process.env.HOME),
+  ]);
+  // A safe, already-complete root is only reopened and revalidated.
+  assert.equal(binding.prepareLinuxCredentialState(), undefined);
+  assert.throws(
+    () => binding.prepareLinuxCredentialState("caller-selected-path"),
+    (error) => error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_INVALID",
+  );
+
+  // A previous interruption may leave an owner-private base and application
+  // directory but no fixed descendants. A later call must reopen and complete
+  // only the absent descendants; it does not create a journal or record.
+  const partialState = join(root, "partial-state");
+  const partialApplication = join(partialState, "app-usagemonitor");
+  await ownerOnlyDirectory(partialApplication);
+  process.env.XDG_STATE_HOME = partialState;
+  assert.equal(binding.prepareLinuxCredentialState(), undefined);
+  await Promise.all([
+    assertOwnerOnlyDirectory(join(partialApplication, "linux-credential-mutex-v1")),
+    assertOwnerOnlyDirectory(join(
+      partialApplication,
+      "linux-accountless-installation-credential-v1",
+    )),
+  ]);
+
+  // A configured base may be created only under its safe, existing direct
+  // parent. It never recursively invents arbitrary missing ancestors.
+  const missingParentState = join(root, "missing-parent", "state");
+  process.env.XDG_STATE_HOME = missingParentState;
+  assert.throws(
+    () => binding.prepareLinuxCredentialState(),
+    (error) => error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_UNAVAILABLE",
+  );
+  await assertMissing(join(root, "missing-parent"));
+
+  // An existing configured base still requires its direct parent to be safe;
+  // preparation must not use a private leaf to bypass a replaceable parent.
+  const unsafeParent = join(root, "unsafe-direct-parent");
+  const unsafeParentBase = join(unsafeParent, "existing-state");
+  await ownerOnlyDirectory(unsafeParentBase);
+  await chmod(unsafeParent, 0o777);
+  process.env.XDG_STATE_HOME = unsafeParentBase;
+  assert.throws(
+    () => binding.prepareLinuxCredentialState(),
+    (error) => error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_UNAVAILABLE",
+  );
+  await assertMissing(join(unsafeParentBase, "app-usagemonitor"));
+
+  // An unsafe existing base is refused without repairing its mode or creating
+  // application-owned descendants beneath it.
+  const unsafeBase = join(root, "unsafe-base-state");
+  await ownerOnlyDirectory(unsafeBase);
+  await chmod(unsafeBase, 0o777);
+  process.env.XDG_STATE_HOME = unsafeBase;
+  assert.throws(
+    () => binding.prepareLinuxCredentialState(),
+    (error) => error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_UNAVAILABLE",
+  );
+  assert.equal((await stat(unsafeBase)).mode & 0o777, 0o777);
+  await assertMissing(join(unsafeBase, "app-usagemonitor"));
+
+  // Preflight both fixed descendants before mutation. An unsafe mutex sibling
+  // must leave the otherwise absent accountless sibling absent and unchanged.
+  const unsafeState = join(root, "unsafe-existing-state");
+  const unsafeApplication = join(unsafeState, "app-usagemonitor");
+  const unsafeMutex = join(unsafeApplication, "linux-credential-mutex-v1");
+  const unsafeAccountless = join(
+    unsafeApplication,
+    "linux-accountless-installation-credential-v1",
+  );
+  await ownerOnlyDirectory(unsafeMutex);
+  await chmod(unsafeMutex, 0o755);
+  process.env.XDG_STATE_HOME = unsafeState;
+  assert.throws(
+    () => binding.prepareLinuxCredentialState(),
+    (error) => error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_INVALID",
+  );
+  assert.equal((await stat(unsafeMutex)).mode & 0o777, 0o755);
+  await assertMissing(unsafeAccountless);
+
+  // A no-symlink root check must reject a link before it can create its fixed
+  // descendants in the link target.
+  const symlinkTarget = join(root, "symlink-target");
+  const symlinkState = join(root, "state-link");
+  await ownerOnlyDirectory(symlinkTarget);
+  await symlink(symlinkTarget, symlinkState, "dir");
+  process.env.XDG_STATE_HOME = symlinkState;
+  assert.throws(
+    () => binding.prepareLinuxCredentialState(),
+    (error) => error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_UNAVAILABLE",
+  );
+  await assertMissing(join(symlinkTarget, "app-usagemonitor"));
+
+  // A privileged Linux qualification runner can also prove foreign-owner
+  // refusal directly. Unprivileged runners retain the source-contract check
+  // for OwnerUid and avoid changing any real account-owned state.
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    const foreignState = join(root, "foreign-owner-state");
+    await ownerOnlyDirectory(foreignState);
+    await chown(foreignState, 1, 1);
+    process.env.XDG_STATE_HOME = foreignState;
+    assert.throws(
+      () => binding.prepareLinuxCredentialState(),
+      (error) => error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_UNAVAILABLE",
+    );
+    await assertMissing(join(foreignState, "app-usagemonitor"));
+  }
+});
+
+test("native Linux credential state bootstrap creates the absent passwd-home default only in the isolated lane", {
+  skip: !DEFAULT_STATE_TEST_ENABLED,
+}, async () => {
+  const localDirectory = "/home/node/.local";
+  const stateBase = "/home/node/.local/state";
+  const application = join(stateBase, "app-usagemonitor");
+  const injectedHome = "/home/node/injected-home-must-not-be-used";
+  const previousHome = process.env.HOME;
+  await assertMissing(localDirectory);
+  await assertMissing(stateBase);
+  process.env.HOME = injectedHome;
+  try {
+    const binding = loadLinuxCredentialMutexBinding();
+    assert.equal(binding.prepareLinuxCredentialState(), undefined);
+    await Promise.all([
+      assertOwnerOnlyDirectory(localDirectory),
+      assertOwnerOnlyDirectory(stateBase),
+      assertOwnerOnlyDirectory(application),
+      assertOwnerOnlyDirectory(join(application, "linux-credential-mutex-v1")),
+      assertOwnerOnlyDirectory(join(
+        application,
+        "linux-accountless-installation-credential-v1",
+      )),
+      assertMissing(injectedHome),
+      assertMissing(join(application, "linux-credential-mutex-v1", "journal-0-v1")),
+      assertMissing(join(
+        application,
+        "linux-accountless-installation-credential-v1",
+        "accountless-installation-credential-v1",
+      )),
+    ]);
+  } finally {
+    process.env.HOME = previousHome;
+  }
 });

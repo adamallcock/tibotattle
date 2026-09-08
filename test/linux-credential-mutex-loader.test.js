@@ -34,6 +34,7 @@ function binding(overrides = {}) {
     credentialMutexSameNetworkNamespaceOnly: true,
     credentialMutexDurableMarker: true,
     productionSafe: false,
+    prepareLinuxCredentialState: () => {},
     acquireCredentialMutex: () => ({ lease: Object.create(null), abandoned: false }),
     releaseCredentialMutex: () => {},
     abandonCredentialMutex: () => {},
@@ -54,6 +55,7 @@ function manifest(bytes = BYTES, overrides = {}) {
     sha256: createHash("sha256").update(bytes).digest("hex"),
     contractVersion: "linux-credential-mutex-v1",
     requiredMethods: [
+      "prepareLinuxCredentialState",
       "acquireCredentialMutex",
       "releaseCredentialMutex",
       "abandonCredentialMutex",

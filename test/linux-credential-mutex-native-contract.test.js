@@ -31,6 +31,17 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /RESOLVE_NO_SYMLINKS/u);
   assert.match(source, /O_NOFOLLOW/u);
   assert.match(source, /XDG_STATE_HOME/u);
+  assert.match(source, /prepareLinuxCredentialState/u);
+  assert.match(source, /PrepareLinuxCredentialState/u);
+  assert.match(source, /CurrentAccountHomeDirectory/u);
+  assert.match(source, /getpwuid_r/u);
+  assert.match(source, /PrepareDefaultStateBaseDirectory/u);
+  assert.match(source, /PrepareConfiguredStateBaseDirectory/u);
+  assert.match(source, /PreflightExistingCredentialStateDirectories/u);
+  assert.match(source, /ReopenAndValidateCredentialStateDirectories/u);
+  assert.match(source, /mkdirat\(parent_fd, child, 0700\)/u);
+  assert.doesNotMatch(source, /getenv\("HOME"\)/u);
+  assert.doesNotMatch(source, /mkdir\(/u);
   assert.match(source, /app-usagemonitor/u);
   assert.match(source, /linux-credential-mutex-v1/u);
   assert.match(source, /AF_UNIX/u);

@@ -35,6 +35,7 @@ export const LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_RELATIVE_PATH = Object.free
 export const LINUX_CREDENTIAL_MUTEX_BINDING_MANIFEST_SCHEMA_VERSION =
   "linux-credential-mutex-binding-manifest-v1";
 export const LINUX_CREDENTIAL_MUTEX_BINDING_REQUIRED_METHODS = Object.freeze([
+  "prepareLinuxCredentialState",
   "acquireCredentialMutex",
   "releaseCredentialMutex",
   "abandonCredentialMutex",
@@ -353,6 +354,7 @@ function normalizeBindingPath(path) {
 }
 
 function snapshotBinding(binding) {
+  let prepareLinuxCredentialState;
   let acquireCredentialMutex;
   let releaseCredentialMutex;
   let abandonCredentialMutex;
@@ -365,6 +367,7 @@ function snapshotBinding(binding) {
   let durableAbandonmentMarker;
   let productionSafe;
   try {
+    prepareLinuxCredentialState = binding?.prepareLinuxCredentialState;
     acquireCredentialMutex = binding?.acquireCredentialMutex;
     releaseCredentialMutex = binding?.releaseCredentialMutex;
     abandonCredentialMutex = binding?.abandonCredentialMutex;
@@ -381,7 +384,8 @@ function snapshotBinding(binding) {
   } catch {
     fail("binding_invalid");
   }
-  if (typeof acquireCredentialMutex !== "function"
+  if (typeof prepareLinuxCredentialState !== "function"
+      || typeof acquireCredentialMutex !== "function"
       || typeof releaseCredentialMutex !== "function"
       || typeof abandonCredentialMutex !== "function"
       || typeof readAccountlessInstallationCredential !== "function"
@@ -396,6 +400,7 @@ function snapshotBinding(binding) {
   }
   try {
     return Object.freeze({
+      prepareLinuxCredentialState: prepareLinuxCredentialState.bind(binding),
       acquireCredentialMutex: acquireCredentialMutex.bind(binding),
       releaseCredentialMutex: releaseCredentialMutex.bind(binding),
       abandonCredentialMutex: abandonCredentialMutex.bind(binding),

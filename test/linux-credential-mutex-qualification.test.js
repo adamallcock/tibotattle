@@ -7,6 +7,7 @@ import {
 
 function evidenceBinding() {
   return Object.freeze({
+    prepareLinuxCredentialState() {},
     acquireCredentialMutex() {},
     releaseCredentialMutex() {},
     abandonCredentialMutex() {},

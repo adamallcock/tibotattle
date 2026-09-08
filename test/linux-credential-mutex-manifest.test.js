@@ -29,6 +29,7 @@ function binding(overrides = {}) {
     credentialMutexSameNetworkNamespaceOnly: true,
     credentialMutexDurableMarker: true,
     productionSafe: false,
+    prepareLinuxCredentialState: () => {},
     acquireCredentialMutex: () => ({ lease: Object.create(null), abandoned: false }),
     releaseCredentialMutex: () => {},
     abandonCredentialMutex: () => {},
@@ -53,6 +54,7 @@ test("Linux credential mutex manifest is deterministic, content-free, and produc
     sha256: createHash("sha256").update(BYTES).digest("hex"),
     contractVersion: "linux-credential-mutex-v1",
     requiredMethods: [
+      "prepareLinuxCredentialState",
       "acquireCredentialMutex",
       "releaseCredentialMutex",
       "abandonCredentialMutex",
@@ -85,6 +87,7 @@ test("Linux credential mutex manifest refuses broadening or malformed native cla
     binding({ credentialMutexCrossProcessSafe: false }),
     binding({ credentialMutexSameNetworkNamespaceOnly: false }),
     binding({ credentialMutexDurableMarker: false }),
+    binding({ prepareLinuxCredentialState: null }),
     binding({ abandonCredentialMutex: null }),
     binding({ acquireCredentialMutex: null }),
     binding({ createAccountlessInstallationCredentialIfMissing: null }),

@@ -113,6 +113,12 @@ enum class AccountlessRecordState {
   kUnavailable,
 };
 
+enum class DirectoryOpenOutcome {
+  kOpened,
+  kMissing,
+  kInvalid,
+};
+
 std::mutex g_issued_leases_mutex;
 std::unordered_set<NativeLease*> g_issued_leases;
 
@@ -213,8 +219,13 @@ bool SameFileIdentity(const FileIdentity& first, const FileIdentity& second) {
   return first.device == second.device && first.inode == second.inode;
 }
 
-int OpenNoSymlinkDirectory(const std::string& path) {
-  if (!IsNormalizedAbsolutePath(path.c_str())) return -1;
+int OpenNoSymlinkDirectory(const std::string& path, bool allow_root = false) {
+  // Keep the original state-base guard for every existing caller. Only the
+  // custom-base parent opener may explicitly request a handle for `/`.
+  if ((path == "/" && !allow_root)
+      || (path != "/" && !IsNormalizedAbsolutePath(path.c_str()))) {
+    return -1;
+  }
 #if defined(SYS_openat2)
   struct open_how how {};
   how.flags = static_cast<__u64>(O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -256,14 +267,62 @@ int OpenVerifiedDirectoryAt(int parent_fd, const char* child, bool owner_only) {
   return fd;
 }
 
-int EnsurePrivateDirectoryAt(int parent_fd, const char* child, bool durable) {
+int OpenExistingVerifiedDirectoryPath(
+    const std::string& path,
+    bool owner_only,
+    DirectoryOpenOutcome* outcome) {
+  if (outcome == nullptr) return -1;
+  *outcome = DirectoryOpenOutcome::kInvalid;
+  const int fd = OpenNoSymlinkDirectory(path);
+  if (fd < 0) {
+    if (errno == ENOENT) *outcome = DirectoryOpenOutcome::kMissing;
+    return -1;
+  }
+  struct stat metadata {};
+  if (fstat(fd, &metadata) != 0 || !IsOwnerDirectory(metadata, owner_only)) {
+    close(fd);
+    return -1;
+  }
+  *outcome = DirectoryOpenOutcome::kOpened;
+  return fd;
+}
+
+int OpenExistingVerifiedDirectoryAt(
+    int parent_fd,
+    const char* child,
+    bool owner_only,
+    DirectoryOpenOutcome* outcome) {
+  if (outcome == nullptr) return -1;
+  *outcome = DirectoryOpenOutcome::kInvalid;
+  const int fd = openat(
+      parent_fd,
+      child,
+      O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
+    if (errno == ENOENT) *outcome = DirectoryOpenOutcome::kMissing;
+    return -1;
+  }
+  struct stat metadata {};
+  if (fstat(fd, &metadata) != 0 || !IsOwnerDirectory(metadata, owner_only)) {
+    close(fd);
+    return -1;
+  }
+  *outcome = DirectoryOpenOutcome::kOpened;
+  return fd;
+}
+
+int EnsureVerifiedDirectoryAt(
+    int parent_fd,
+    const char* child,
+    bool owner_only,
+    bool durable) {
   bool created = false;
   if (mkdirat(parent_fd, child, 0700) == 0) {
     created = true;
   } else if (errno != EEXIST) {
     return -1;
   }
-  const int fd = OpenVerifiedDirectoryAt(parent_fd, child, true);
+  const int fd = OpenVerifiedDirectoryAt(parent_fd, child, owner_only);
   if (fd < 0) return -1;
   if (created && durable && fsync(parent_fd) != 0) {
     close(fd);
@@ -272,14 +331,12 @@ int EnsurePrivateDirectoryAt(int parent_fd, const char* child, bool durable) {
   return fd;
 }
 
-bool StateBaseDirectory(std::string* result) {
-  const char* configured = getenv("XDG_STATE_HOME");
-  if (configured != nullptr) {
-    if (!IsNormalizedAbsolutePath(configured)) return false;
-    *result = configured;
-    return true;
-  }
+int EnsurePrivateDirectoryAt(int parent_fd, const char* child, bool durable) {
+  return EnsureVerifiedDirectoryAt(parent_fd, child, true, durable);
+}
 
+bool CurrentAccountHomeDirectory(std::string* result) {
+  if (result == nullptr) return false;
   long requested = sysconf(_SC_GETPW_R_SIZE_MAX);
   if (requested < 0 || requested > static_cast<long>(kMaximumPasswordRecordBytes)) {
     requested = 16 * 1024;
@@ -297,10 +354,241 @@ bool StateBaseDirectory(std::string* result) {
       || !IsNormalizedAbsolutePath(record.pw_dir)) {
     return false;
   }
-  const std::string candidate = std::string(record.pw_dir) + "/.local/state";
+  *result = record.pw_dir;
+  return true;
+}
+
+bool StateBaseDirectory(std::string* result, bool* configured_result = nullptr) {
+  if (result == nullptr) return false;
+  const char* configured = getenv("XDG_STATE_HOME");
+  if (configured != nullptr) {
+    if (!IsNormalizedAbsolutePath(configured)) return false;
+    *result = configured;
+    if (configured_result != nullptr) *configured_result = true;
+    return true;
+  }
+
+  std::string home;
+  if (!CurrentAccountHomeDirectory(&home)) return false;
+  const std::string candidate = home + "/.local/state";
   if (!IsNormalizedAbsolutePath(candidate.c_str())) return false;
   *result = candidate;
+  if (configured_result != nullptr) *configured_result = false;
   return true;
+}
+
+bool SplitNormalizedAbsolutePath(
+    const std::string& path,
+    std::string* parent,
+    std::string* leaf) {
+  if (parent == nullptr
+      || leaf == nullptr
+      || !IsNormalizedAbsolutePath(path.c_str())) {
+    return false;
+  }
+  const std::size_t separator = path.rfind('/');
+  if (separator == std::string::npos || separator + 1 >= path.size()) return false;
+  *parent = separator == 0 ? "/" : path.substr(0, separator);
+  *leaf = path.substr(separator + 1);
+  return !leaf->empty();
+}
+
+bool IsSafeStateBaseParent(const struct stat& metadata) {
+  if (!S_ISDIR(metadata.st_mode)
+      || (metadata.st_uid != OwnerUid() && metadata.st_uid != 0)) {
+    return false;
+  }
+  const mode_t mode = metadata.st_mode & 0777;
+  return (mode & 0700) == 0700 && (mode & 0022) == 0;
+}
+
+int OpenSafeStateBaseParent(const std::string& path) {
+  const int fd = OpenNoSymlinkDirectory(path, true);
+  if (fd < 0) return -1;
+  struct stat metadata {};
+  if (fstat(fd, &metadata) != 0 || !IsSafeStateBaseParent(metadata)) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+int ReopenPreparedStateBaseDirectory(const std::string& state_base) {
+  return OpenVerifiedDirectoryPath(state_base, false);
+}
+
+int PrepareConfiguredStateBaseDirectory(const std::string& state_base) {
+  std::string parent;
+  std::string leaf;
+  if (!SplitNormalizedAbsolutePath(state_base, &parent, &leaf)) return -1;
+  const int parent_fd = OpenSafeStateBaseParent(parent);
+  if (parent_fd < 0) return -1;
+  const int base_fd = EnsureVerifiedDirectoryAt(parent_fd, leaf, false, true);
+  const bool parent_closed = close(parent_fd) == 0;
+  if (base_fd < 0 || !parent_closed) {
+    if (base_fd >= 0) close(base_fd);
+    return -1;
+  }
+  const bool base_closed = close(base_fd) == 0;
+  if (!base_closed) return -1;
+  return ReopenPreparedStateBaseDirectory(state_base);
+}
+
+int PrepareDefaultStateBaseDirectory(const std::string& state_base) {
+  std::string home;
+  if (!CurrentAccountHomeDirectory(&home)) return -1;
+  if (state_base != home + "/.local/state") return -1;
+  const int home_fd = OpenVerifiedDirectoryPath(home, false);
+  if (home_fd < 0) return -1;
+
+  DirectoryOpenOutcome local_outcome = DirectoryOpenOutcome::kInvalid;
+  int local_fd = OpenExistingVerifiedDirectoryAt(
+      home_fd,
+      ".local",
+      false,
+      &local_outcome);
+  if (local_fd < 0 && local_outcome != DirectoryOpenOutcome::kMissing) {
+    close(home_fd);
+    return -1;
+  }
+  if (local_fd < 0) {
+    local_fd = EnsureVerifiedDirectoryAt(home_fd, ".local", false, true);
+  }
+  const bool home_closed = close(home_fd) == 0;
+  if (local_fd < 0 || !home_closed) {
+    if (local_fd >= 0) close(local_fd);
+    return -1;
+  }
+
+  DirectoryOpenOutcome state_outcome = DirectoryOpenOutcome::kInvalid;
+  int state_fd = OpenExistingVerifiedDirectoryAt(
+      local_fd,
+      "state",
+      false,
+      &state_outcome);
+  if (state_fd < 0 && state_outcome != DirectoryOpenOutcome::kMissing) {
+    close(local_fd);
+    return -1;
+  }
+  if (state_fd < 0) {
+    state_fd = EnsureVerifiedDirectoryAt(local_fd, "state", false, true);
+  }
+  const bool local_closed = close(local_fd) == 0;
+  if (state_fd < 0 || !local_closed) {
+    if (state_fd >= 0) close(state_fd);
+    return -1;
+  }
+  const bool state_closed = close(state_fd) == 0;
+  if (!state_closed) return -1;
+  return ReopenPreparedStateBaseDirectory(state_base);
+}
+
+int OpenOrPrepareStateBaseDirectory(std::string* state_base) {
+  if (state_base == nullptr) return -1;
+  bool configured = false;
+  if (!StateBaseDirectory(state_base, &configured)) return -1;
+  DirectoryOpenOutcome outcome = DirectoryOpenOutcome::kInvalid;
+  const int existing = OpenExistingVerifiedDirectoryPath(
+      *state_base,
+      false,
+      &outcome);
+  if (existing >= 0) {
+    // Reopen existing bases through their validated parent. The passwd
+    // fallback has a fixed two-component suffix, and a configured base must
+    // also keep its direct parent safe even when no base creation is needed.
+    if (close(existing) != 0) return -1;
+    return configured
+        ? PrepareConfiguredStateBaseDirectory(*state_base)
+        : PrepareDefaultStateBaseDirectory(*state_base);
+  }
+  if (outcome != DirectoryOpenOutcome::kMissing) return -1;
+  return configured
+      ? PrepareConfiguredStateBaseDirectory(*state_base)
+      : PrepareDefaultStateBaseDirectory(*state_base);
+}
+
+bool PreflightExistingCredentialStateDirectories(int state_base_fd) {
+  DirectoryOpenOutcome application_outcome = DirectoryOpenOutcome::kInvalid;
+  const int application_fd = OpenExistingVerifiedDirectoryAt(
+      state_base_fd,
+      kApplicationDirectory,
+      true,
+      &application_outcome);
+  if (application_fd < 0) return application_outcome == DirectoryOpenOutcome::kMissing;
+
+  DirectoryOpenOutcome mutex_outcome = DirectoryOpenOutcome::kInvalid;
+  const int mutex_fd = OpenExistingVerifiedDirectoryAt(
+      application_fd,
+      kMutexDirectory,
+      true,
+      &mutex_outcome);
+  DirectoryOpenOutcome accountless_outcome = DirectoryOpenOutcome::kInvalid;
+  const int accountless_fd = OpenExistingVerifiedDirectoryAt(
+      application_fd,
+      kAccountlessCredentialDirectory,
+      true,
+      &accountless_outcome);
+  const bool valid = mutex_outcome != DirectoryOpenOutcome::kInvalid
+      && accountless_outcome != DirectoryOpenOutcome::kInvalid;
+  const bool accountless_closed = accountless_fd < 0 || close(accountless_fd) == 0;
+  const bool mutex_closed = mutex_fd < 0 || close(mutex_fd) == 0;
+  const bool application_closed = close(application_fd) == 0;
+  return valid && accountless_closed && mutex_closed && application_closed;
+}
+
+bool PrepareFixedCredentialStateDirectories(int state_base_fd) {
+  int application_fd = EnsurePrivateDirectoryAt(
+      state_base_fd,
+      kApplicationDirectory,
+      true);
+  if (application_fd < 0) return false;
+  int mutex_fd = EnsurePrivateDirectoryAt(application_fd, kMutexDirectory, true);
+  if (mutex_fd < 0) {
+    close(application_fd);
+    return false;
+  }
+  int accountless_fd = EnsurePrivateDirectoryAt(
+      application_fd,
+      kAccountlessCredentialDirectory,
+      true);
+  const bool accountless_closed = accountless_fd >= 0 && close(accountless_fd) == 0;
+  const bool mutex_closed = close(mutex_fd) == 0;
+  const bool application_closed = close(application_fd) == 0;
+  return accountless_fd >= 0
+      && accountless_closed
+      && mutex_closed
+      && application_closed;
+}
+
+bool ReopenAndValidateCredentialStateDirectories(const std::string& state_base) {
+  const int state_base_fd = ReopenPreparedStateBaseDirectory(state_base);
+  if (state_base_fd < 0) return false;
+  const int application_fd = OpenVerifiedDirectoryAt(
+      state_base_fd,
+      kApplicationDirectory,
+      true);
+  if (application_fd < 0) {
+    close(state_base_fd);
+    return false;
+  }
+  const int mutex_fd = OpenVerifiedDirectoryAt(
+      application_fd,
+      kMutexDirectory,
+      true);
+  const int accountless_fd = OpenVerifiedDirectoryAt(
+      application_fd,
+      kAccountlessCredentialDirectory,
+      true);
+  const bool accountless_closed = accountless_fd >= 0 && close(accountless_fd) == 0;
+  const bool mutex_closed = mutex_fd >= 0 && close(mutex_fd) == 0;
+  const bool application_closed = close(application_fd) == 0;
+  const bool state_base_closed = close(state_base_fd) == 0;
+  return accountless_fd >= 0
+      && mutex_fd >= 0
+      && accountless_closed
+      && mutex_closed
+      && application_closed
+      && state_base_closed;
 }
 
 int OpenPersistentStateDirectory() {
@@ -986,6 +1274,46 @@ bool CapabilityArgument(napi_env env, napi_callback_info info, int* capability_i
   return IsCapabilityId(*capability_id);
 }
 
+bool NoArguments(napi_env env, napi_callback_info info) {
+  std::array<napi_value, 1> arguments {};
+  std::size_t argument_count = arguments.size();
+  return napi_get_cb_info(
+             env,
+             info,
+             &argument_count,
+             arguments.data(),
+             nullptr,
+             nullptr) == napi_ok
+      && argument_count == 0;
+}
+
+// This is deliberately a zero-argument main-process preparation authority.
+// It has no credential, journal, capability, or pathname input and does not
+// select a backend. It only creates the absent fixed directories needed before
+// a later, separately gated credential operation can reopen them.
+napi_value PrepareLinuxCredentialState(napi_env env, napi_callback_info info) {
+  if (!NoArguments(env, info)) return ThrowFixed(env, kCodeStateInvalid);
+
+  std::string state_base;
+  const int state_base_fd = OpenOrPrepareStateBaseDirectory(&state_base);
+  if (state_base_fd < 0) return ThrowFixed(env, kCodeStateUnavailable);
+  if (!PreflightExistingCredentialStateDirectories(state_base_fd)) {
+    close(state_base_fd);
+    return ThrowFixed(env, kCodeStateInvalid);
+  }
+  const bool prepared = PrepareFixedCredentialStateDirectories(state_base_fd);
+  const bool state_base_closed = close(state_base_fd) == 0;
+  if (!prepared || !state_base_closed
+      || !ReopenAndValidateCredentialStateDirectories(state_base)) {
+    return ThrowFixed(env, kCodeStateUnavailable);
+  }
+  napi_value undefined = nullptr;
+  if (napi_get_undefined(env, &undefined) != napi_ok) {
+    return ThrowFixed(env, kCodeStateUnavailable);
+  }
+  return undefined;
+}
+
 napi_value AcquireCredentialMutex(napi_env env, napi_callback_info info) {
   int capability_id = -1;
   if (!CapabilityArgument(env, info, &capability_id)) {
@@ -1606,7 +1934,8 @@ bool DefineBoolean(napi_env env, napi_value exports, const char* name, bool valu
 }
 
 napi_value Initialize(napi_env env, napi_value exports) {
-  if (!DefineMethod(env, exports, "acquireCredentialMutex", AcquireCredentialMutex)
+  if (!DefineMethod(env, exports, "prepareLinuxCredentialState", PrepareLinuxCredentialState)
+      || !DefineMethod(env, exports, "acquireCredentialMutex", AcquireCredentialMutex)
       || !DefineMethod(env, exports, "releaseCredentialMutex", ReleaseCredentialMutex)
       || !DefineMethod(env, exports, "abandonCredentialMutex", AbandonCredentialMutex)
       || !DefineMethod(
