@@ -434,15 +434,20 @@ test("outer session retains only bounded inner failure categories after owned cl
   });
   assert.equal(String(fixedMarkerError?.message).includes("private-runtime-preamble"), false);
 
+  let bootstrapError;
   await assert.rejects(runLinuxPackagedSecretServiceSession(identity(), {
     ...common,
     spawnSession() {
       return new SessionChild(null, {
         code: 1,
-        stderr: "Error [ERR_MODULE_NOT_FOUND]: private-module-path\n",
+        stderr: "Error [ERR_MODULE_NOT_FOUND]: private-module-path\ncode: 'ERR_MODULE_NOT_FOUND'\n",
       });
     },
-  }), smokeError("MODULE_LOAD_FAILED"));
+  }), (error) => {
+    bootstrapError = error;
+    return smokeError("MODULE_LOAD_FAILED")(error);
+  });
+  assert.equal(String(bootstrapError?.message).includes("private-module-path"), false);
 
   await assert.rejects(runLinuxPackagedSecretServiceSession(identity(), {
     ...common,

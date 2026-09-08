@@ -164,10 +164,10 @@ function classifyBootstrapFailure(stderrBytes) {
       "gu",
     );
     const count = [...stderr.matchAll(pattern)].length;
-    if (count > 0) matches.push({ code, count });
+    if (count > 0) matches.push(code);
   }
-  if (matches.length !== 1 || matches[0].count !== 1) return null;
-  return NODE_NATIVE_LOAD_ERROR_CODES.has(matches[0].code)
+  if (matches.length !== 1) return null;
+  return NODE_NATIVE_LOAD_ERROR_CODES.has(matches[0])
     ? "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_NATIVE_ROUND_TRIP_FAILED"
     : "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_MODULE_LOAD_FAILED";
 }
