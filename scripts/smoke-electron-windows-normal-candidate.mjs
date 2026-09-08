@@ -200,6 +200,10 @@ const FAILURE_CODES = new Set([
   "LOCAL_REFRESH_UNAVAILABLE",
   "LOCAL_STARTUP_REFRESH_UNAVAILABLE",
   "LOCAL_STARTUP_REFRESH_COMPLETION_UNAVAILABLE",
+  "LOCAL_EXPLICIT_REFRESH_BUTTON_UNAVAILABLE",
+  "LOCAL_EXPLICIT_REFRESH_REQUEST_UNOBSERVED",
+  "LOCAL_EXPLICIT_REFRESH_ACCEPTANCE_UNAVAILABLE",
+  "LOCAL_EXPLICIT_REFRESH_COMPLETION_UNAVAILABLE",
   "SETTINGS_UNAVAILABLE",
   "SETTINGS_PERSISTENCE_INVALID",
   "CLEAN_QUIT_INVALID",
@@ -1537,11 +1541,48 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
       return decision.status === "completed" ? decision : null;
     }, STARTUP_TIMEOUT_MS);
     if (terminal === null) fail("LOCAL_STARTUP_REFRESH_COMPLETION_UNAVAILABLE");
+    // The startup pass is terminal now, so ordinary user interaction must be
+    // restored. Reset the observer only after preserving that proof: the next
+    // one local POST is the user-requested detailed refresh, not a duplicate
+    // startup operation.
+    observer.resetRefreshes();
+    const clicked = await waitFor(() => cdp.evaluate(`(() => {
+      const button = document.querySelector("#refresh-button");
+      if (!button || button.disabled) return false;
+      button.click();
+      return true;
+    })()`), OPERATION_TIMEOUT_MS);
+    if (clicked !== true) fail("LOCAL_EXPLICIT_REFRESH_BUTTON_UNAVAILABLE");
+    if (await waitFor(() => observer.refreshObserved(), OPERATION_TIMEOUT_MS) !== true) {
+      fail("LOCAL_EXPLICIT_REFRESH_REQUEST_UNOBSERVED");
+    }
+    const explicitAccepted = await waitFor(async () => {
+      if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
+      const decision = classifyAutomaticStartupRefreshReceipt({
+        phase: "acceptance",
+        requestCount: observer.refreshCount(),
+        refresh: (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
+        previousRefreshId: accepted.refreshId,
+      });
+      return decision.status === "accepted" ? decision : null;
+    }, STARTUP_TIMEOUT_MS);
+    if (explicitAccepted === null) fail("LOCAL_EXPLICIT_REFRESH_ACCEPTANCE_UNAVAILABLE");
+    const explicitTerminal = await waitFor(async () => {
+      if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
+      const decision = classifyAutomaticStartupRefreshReceipt({
+        phase: "completion",
+        requestCount: observer.refreshCount(),
+        refresh: (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
+        expectedRefreshId: explicitAccepted.refreshId,
+      });
+      return decision.status === "completed" ? decision : null;
+    }, STARTUP_TIMEOUT_MS);
+    if (explicitTerminal === null) fail("LOCAL_EXPLICIT_REFRESH_COMPLETION_UNAVAILABLE");
     if (!observer.valid()) fail("DASHBOARD_INVALID");
     return Object.freeze({
       dashboardOrigin: dashboard.origin,
       observer,
-      refreshTerminalStatus: terminal.terminalStatus,
+      refreshTerminalStatus: explicitTerminal.terminalStatus,
     });
   } catch (error) {
     observer.dispose();
