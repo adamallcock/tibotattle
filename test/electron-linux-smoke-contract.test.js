@@ -21,6 +21,7 @@ import {
   isLinuxInspectablePageTarget,
   observeLocalRefreshRequests,
   reserveLinuxInspectablePageTargets,
+  runSmoke,
   selectLinuxDashboardTarget,
   waitFor,
 } from "../scripts/smoke-electron-linux.mjs";
@@ -578,6 +579,26 @@ test("Linux smoke exposes only closed failure-stage boundaries to callers", () =
     "quit_cleanup",
   ]);
   assert.equal(Object.isFrozen(ELECTRON_LINUX_SMOKE_FAILURE_STAGES), true);
+});
+
+test("Linux smoke refuses an invalid container before resolving its default Electron binary", async () => {
+  let resolverCalls = 0;
+  let fixtureCalls = 0;
+  await assert.rejects(runSmoke({
+    binaryResolver() {
+      resolverCalls += 1;
+      return "/private/tmp/unused-electron";
+    },
+    readContainerContract() {
+      throw new Error("invalid test container");
+    },
+    async fixtureFactory() {
+      fixtureCalls += 1;
+      throw new Error("fixture must not be created");
+    },
+  }), /invalid test container/u);
+  assert.equal(resolverCalls, 0);
+  assert.equal(fixtureCalls, 0);
 });
 
 test("Linux Electron smoke refuses an unbounded host checkout", () => {

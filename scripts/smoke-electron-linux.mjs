@@ -1103,7 +1103,9 @@ async function defaultSmokeResultWriter(value) {
  */
 export async function runSmoke({
   afterRefresh = null,
-  binary = electronBinary(),
+  binary = null,
+  binaryResolver = electronBinary,
+  readContainerContract = assertContainerContract,
   environmentFactory = defaultSmokeEnvironment,
   fixtureFactory = createSyntheticHome,
   launchArguments = defaultSmokeLaunchArguments,
@@ -1113,7 +1115,8 @@ export async function runSmoke({
   writeResult = defaultSmokeResultWriter,
 } = {}) {
   if (afterRefresh !== null && typeof afterRefresh !== "function"
-      || typeof binary !== "string" || binary.length === 0
+      || binary !== null && (typeof binary !== "string" || binary.length === 0)
+      || typeof binaryResolver !== "function" || typeof readContainerContract !== "function"
       || typeof environmentFactory !== "function" || typeof fixtureFactory !== "function"
       || typeof launchArguments !== "function"
       || onFailureStage !== null && typeof onFailureStage !== "function"
@@ -1122,9 +1125,13 @@ export async function runSmoke({
       || (sourceRevision !== null && !/^[0-9a-f]{40}$/u.test(sourceRevision))) {
     fail("Electron Linux smoke runner options are invalid");
   }
-  const containerContract = assertContainerContract();
+  const containerContract = readContainerContract();
   if (sourceRevision !== null && sourceRevision !== containerContract.sourceRevision) {
     fail("Electron Linux source revision does not match the container");
+  }
+  const selectedBinary = binary ?? binaryResolver();
+  if (typeof selectedBinary !== "string" || selectedBinary.length === 0) {
+    fail("Electron binary path is unavailable");
   }
   const selectedSourceRevision = sourceRevision ?? containerContract.sourceRevision;
   const fixture = await fixtureFactory();
@@ -1144,7 +1151,7 @@ export async function runSmoke({
     await rm(fixture.root, { recursive: true, force: true }).catch(() => {});
     fail("Electron Linux smoke launch configuration is invalid");
   }
-  const child = spawn(binary, [
+  const child = spawn(selectedBinary, [
     ...argumentsForLaunch,
   ], {
     cwd: REPOSITORY_ROOT,
