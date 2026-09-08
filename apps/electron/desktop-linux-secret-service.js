@@ -2,6 +2,7 @@ import {
   createLinuxCredentialMutationLeaseContext,
   createLinuxCredentialMutationMutexContext,
 } from "../../src/platform/linux-credential-mutation-lease.js";
+import { prepareLinuxCredentialState } from "../../src/platform/linux-credential-state.js";
 import {
   createLinuxSecretServiceBackend,
   isLinuxSecretServiceError,
@@ -26,6 +27,7 @@ const TEST_OPTION_KEYS = Object.freeze([
   "qualificationContext",
   "platform",
   "architecture",
+  "prepareState",
   "createMutexContext",
   "createLeaseContext",
   "createSecretServiceBackend",
@@ -117,6 +119,7 @@ function createHandover({
   qualificationContext,
   platform,
   architecture,
+  prepareState,
   createMutexContext,
   createLeaseContext,
   createSecretServiceBackend,
@@ -124,6 +127,7 @@ function createHandover({
 }) {
   const qualification = qualifiedLinuxContext(qualificationContext);
   if (platform !== qualification.platform || architecture !== qualification.architecture
+      || typeof prepareState !== "function"
       || typeof createMutexContext !== "function"
       || typeof createLeaseContext !== "function"
       || typeof createSecretServiceBackend !== "function"
@@ -135,6 +139,7 @@ function createHandover({
     let leaseContext = null;
     let backend = null;
     try {
+      prepareState({ platform, architecture });
       const mutexContext = createMutexContext({ platform, architecture });
       leaseContext = createLeaseContext({ mutexContext });
       backend = createSecretServiceBackend({
@@ -173,6 +178,7 @@ export function createLinuxQualificationSecretServiceHandover(options = {}) {
     qualificationContext: source.qualificationContext,
     platform: process.platform,
     architecture: process.arch,
+    prepareState: prepareLinuxCredentialState,
     createMutexContext: createLinuxCredentialMutationMutexContext,
     createLeaseContext: createLinuxCredentialMutationLeaseContext,
     createSecretServiceBackend: createLinuxSecretServiceBackend,

@@ -1,6 +1,8 @@
 *
 !scripts/
 !scripts/**
+!test/
+!test/linux-credential-mutex-native.test.js
 !.release-build/
 !.release-build/electron-dev/
 !.release-build/electron-dev/linux-x64/

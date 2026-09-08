@@ -40,9 +40,19 @@ secure native setup when the selected XDG state base does not yet exist;
 durable reconciliation of interrupted generic and separate FD3 credential
 mutations before clearing abandoned markers; and a production composition that
 supplies both reviewed parent-side credential factories. The current container
-receipt proves none of those gates. A bounded first-run native setup repair is
-in progress, using the binding's existing XDG/passwd resolution and refusing
-unsafe existing paths. Production flags remain closed. Real installed desktop
+receipt proves none of those gates. The native first-run setup is now implemented at `58f1aafb`, with an isolated
+umask-refusal regression at `0a0560a0`. It uses the binding's existing XDG/passwd
+resolution, creates only fixed missing components, refuses unsafe existing
+paths without chmod repair, and changes no credential or recovery state. The
+main-only facade now runs before qualified backend construction. The next CI
+lane uses separate disposable homes for the absent passwd-home native test
+and packaged credential journey; its v2 receipt requires absent default state
+before the app and a verified protected tree afterward. All 32 focused
+composition/smoke tests and 52 packaging/native contracts pass locally (six
+expected native/optional skips), plus 78 release-trust tests. Native build and
+first-run execution remain pending. An owner-bit-masking umask deliberately
+fails closed and can leave a refused partial directory; the native child test
+verifies that edge without changing the parent umask. Production flags remain closed. Real installed desktop
 session, locked collection, lifecycle and updater evidence remains separate.
 
 The later dormant Windows account-observation foundation is integrated at
@@ -79,8 +89,14 @@ the audit guard trying to validate the launcher's ordinary inherited-ACL state
 container as an owner-only final directory. The next candidate uses a fixed
 new protected child root for the observation audit, preserving all ACL checks.
 Fourteen focused tests pass, including a regression through the real audit
-guard facade that rejects the old inherited-ACL parent. Native rerun is pending;
-the current failure alone does not establish every underlying cause.
+guard facade that rejects the old inherited-ACL parent. The native rerun at
+`0ca67d425a5e21fa5b504e0975a5d423cadf581f`,
+[run 34182650103](https://github.com/adamallcock/tibotattle/actions/runs/34182650103),
+passes both Macs and Linux. Windows still passes FD3 and now reaches the
+observation child, failing at `child_initial_read`; the protected-root repair
+clears startup but does not yet qualify the full observation journey. The
+content-free failed receipt is preserved, and the fixed Credential Manager
+read/refusal path is under investigation.
 
 The accountless production companion profile is now integrated at `b3643991`.
 It requires the exact production mode/origin and a connected private IPC

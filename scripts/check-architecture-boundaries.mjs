@@ -94,6 +94,7 @@ const REVIEWED_SOURCE_OWNER_PUBLIC_ENTRYPOINTS = new Set([
   "src/platform/index.js",
   "src/platform/linux-accountless-installation-credential.js",
   "src/platform/linux-credential-mutation-lease.js",
+  "src/platform/linux-credential-state.js",
   "src/platform/linux-secret-service.js",
   "src/platform/linux-secret-service-broker.js",
   "src/platform/windows-accountless-installation-credential.js",

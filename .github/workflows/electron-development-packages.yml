@@ -227,7 +227,7 @@ jobs:
           node scripts/build-linux-credential-mutex-manifest.mjs
           node scripts/qualify-linux-credential-mutex.mjs
       - name: Validate private Linux credential channel and identity selection
-        run: node --test apps/electron/test/desktop-linux-secret-service-broker.test.mjs test/export-identity-production.test.js test/account-observation-secret.test.js
+        run: node --test apps/electron/test/desktop-linux-secret-service-broker.test.mjs apps/electron/test/desktop-linux-secret-service-composition.test.mjs test/linux-credential-state.test.js test/export-identity-production.test.js test/account-observation-secret.test.js
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
       - name: Build and verify development distributions
@@ -242,6 +242,8 @@ jobs:
             --tag tibotattle-electron-linux-packaged:test .
           package_root="/workspace/.release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution"
           host_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/secret-service-storage-smoke.json"
+          # Prove the absent .local/state fallback in its own fresh home before
+          # the separate packaged credential journey. Neither run sees host state.
           docker run --rm --init --platform=linux/amd64 --network none \
             --tmpfs /home/node:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=0700 \
             --tmpfs /run/user/1000:rw,noexec,nosuid,size=16m,uid=1000,gid=1000,mode=0700 \
@@ -250,7 +252,29 @@ jobs:
             --env XDG_CONFIG_HOME=/home/node/.config \
             --env XDG_CACHE_HOME=/home/node/.cache \
             --env XDG_DATA_HOME=/home/node/.local/share \
-            --env XDG_STATE_HOME=/home/node \
+            --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            --env USAGE_MONITOR_LINUX_CREDENTIAL_MUTEX_NATIVE_TEST=1 \
+            --env USAGE_MONITOR_LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_TEST=1 \
+            --entrypoint node tibotattle-electron-linux-packaged:test \
+            --input-type=module --eval '
+              import { spawnSync } from "node:child_process";
+              import { proveLinuxSecretServiceContainerIsolation } from "./scripts/qualify-linux-secret-service.mjs";
+              if (proveLinuxSecretServiceContainerIsolation().status !== "isolated") process.exit(1);
+              if (process.env.XDG_STATE_HOME !== undefined) process.exit(1);
+              const result = spawnSync(process.execPath, [
+                "--test", "--test-name-pattern=^native Linux credential state bootstrap creates the absent passwd-home default only in the isolated lane$",
+                "./test/linux-credential-mutex-native.test.js",
+              ], { stdio: "inherit", timeout: 15000, shell: false });
+              if (result.error || result.signal || result.status !== 0) process.exit(1);
+            '
+          docker run --rm --init --platform=linux/amd64 --network none \
+            --tmpfs /home/node:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=16m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 \
+            --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config \
+            --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share \
             --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
             tibotattle-electron-linux-packaged:test \
             --app "$package_root/linux-unpacked/tibotattle-dev" \

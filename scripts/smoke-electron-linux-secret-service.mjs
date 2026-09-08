@@ -44,7 +44,7 @@ const MAX_RECEIPT_BYTES = 16 * 1024;
 const MAX_PACKAGE_RECEIPT_BYTES = 256 * 1024;
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024;
 const SESSION_DEADLINE_MS = 45_000;
-const RECEIPT_SCHEMA = "tibotattle-electron-linux-secret-service-smoke-v1";
+const RECEIPT_SCHEMA = "tibotattle-electron-linux-secret-service-smoke-v2";
 const SHA256 = /^[0-9a-f]{64}$/u;
 const REVISION = /^[0-9a-f]{40}$/u;
 const INNER_KEYS = Object.freeze([
@@ -56,6 +56,7 @@ const INNER_KEYS = Object.freeze([
   "sourceRevision",
   "artifactSha256",
   "credentialStoreMode",
+  "statePreparation",
   "capabilities",
   "lifecycle",
   "cleanup",
@@ -71,6 +72,7 @@ const OUTER_KEYS = Object.freeze([
   "packageArtifactVerified",
   "packagedElectronExecutionVerified",
   "credentialLifecycleVerified",
+  "defaultStateBootstrapVerified",
   "sessionCleanupConfirmed",
   "errorCode",
   "productionReady",
@@ -106,6 +108,7 @@ const INNER_STAGE_FAILURE_CODES = new Set([
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_RUNTIME_IDENTITY_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_ARTIFACT_IDENTITY_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_ISOLATION_FAILED",
+  "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_STATE_BOOTSTRAP_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_MODULE_LOAD_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_MUTEX_LOAD_FAILED",
   "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_KEYTAR_LOAD_FAILED",
@@ -564,6 +567,7 @@ function expectedInnerReceipt(value, identity) {
       || receipt.sourceRevision !== identity.sourceRevision
       || receipt.artifactSha256 !== identity.artifactSha256
       || receipt.credentialStoreMode !== "isolated-secret-service"
+      || receipt.statePreparation !== "absent_default_state_created"
       || receipt.capabilities !== 2
       || receipt.lifecycle !== "two_capability_round_trip_absence_confirmed"
       || receipt.cleanup !== "owned_companion_stopped"
@@ -616,7 +620,8 @@ export async function runLinuxPackagedSecretServiceSession(identity, {
     fail("ARGUMENT_INVALID");
   }
   try {
-    if (proveContainerIsolation({ environment })?.status !== "isolated") {
+    if (environment.XDG_STATE_HOME !== undefined
+        || proveContainerIsolation({ environment })?.status !== "isolated") {
       fail("ISOLATION_REQUIRED");
     }
   } catch (error) {
@@ -739,6 +744,7 @@ function outerReceipt({
     packageArtifactVerified: identity !== null,
     packagedElectronExecutionVerified: executionVerified,
     credentialLifecycleVerified: lifecycleVerified,
+    defaultStateBootstrapVerified: lifecycleVerified,
     sessionCleanupConfirmed: cleanupConfirmed,
     errorCode,
     productionReady: false,
@@ -829,6 +835,43 @@ async function assertPackagedElectronNodeRuntime(appPath, {
   }
 }
 
+// The disposable container proof is required before this read-only check.
+// No setup in the harness may manufacture the state tree being qualified.
+export async function assertLinuxPackagedCredentialState({
+  prepared,
+  readMetadata = lstat,
+} = {}) {
+  const stateBase = "/home/node/.local/state";
+  if (prepared === false) {
+    try {
+      await readMetadata(stateBase);
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      fail("STATE_BOOTSTRAP_FAILED");
+    }
+    fail("STATE_BOOTSTRAP_FAILED");
+  }
+  if (prepared !== true) fail("ARGUMENT_INVALID");
+  for (const path of [
+    "/home/node/.local", stateBase,
+    `${stateBase}/app-usagemonitor`,
+    `${stateBase}/app-usagemonitor/linux-credential-mutex-v1`,
+    `${stateBase}/app-usagemonitor/linux-accountless-installation-credential-v1`,
+  ]) {
+    let metadata;
+    try { metadata = await readMetadata(path); } catch { fail("STATE_BOOTSTRAP_FAILED"); }
+    const mode = metadata?.mode & 0o777;
+    // Secret Service may create .local/share before credentials are opened.
+    // The shared .local parent may be readable, but must not be writable by
+    // others; this matches the native parent policy. Our new state is private.
+    const permissionsValid = path === "/home/node/.local"
+      ? (mode & 0o700) === 0o700 && (mode & 0o022) === 0
+      : mode === 0o700;
+    if (!metadata?.isDirectory() || metadata.uid !== 1_000
+        || !permissionsValid) fail("STATE_BOOTSTRAP_FAILED");
+  }
+}
+
 export async function runLinuxPackagedSecretServiceSmokeInside(options, {
   platform = process.platform,
   architecture = process.arch,
@@ -841,12 +884,14 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
   startDaemon = startLinuxSecretServiceDaemon,
   importModule = (url) => import(url),
   verifyNativeBindings = verifyLinuxPackagedNativeBindings,
+  assertCredentialState = assertLinuxPackagedCredentialState,
 } = {}) {
   if (!options || typeof options !== "object"
       || !absolutePath(options.appPath)
       || !REVISION.test(options.sourceRevision ?? "")
       || !SHA256.test(options.artifactSha256 ?? "")
       || typeof digest !== "function"
+      || typeof assertCredentialState !== "function"
       || typeof startDaemon !== "function"
       || typeof importModule !== "function" || typeof verifyNativeBindings !== "function") {
     fail("ARGUMENT_INVALID");
@@ -869,11 +914,12 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
   // This is the authoritative isolation proof: it verifies the reviewed
   // container marker and disposable home/runtime tmpfs mounts, then starts a
   // private D-Bus Secret Service before a branded context can exist.
-  // The native mutex opens an existing XDG state base. This test uses the
-  // already verified private home tmpfs, not an absent .local/state fallback.
-  if (environment.XDG_STATE_HOME !== "/home/node") fail("ISOLATION_FAILED");
+  // Omit XDG_STATE_HOME so the packaged main composition must prepare its
+  // missing passwd-home state base. The harness never creates that base.
+  if (environment.XDG_STATE_HOME !== undefined) fail("ISOLATION_FAILED");
   const daemon = await innerStage("ISOLATION_FAILED", () => startDaemon());
   if (daemon?.status !== "started") fail("ISOLATION_FAILED");
+  await innerStage("STATE_BOOTSTRAP_FAILED", () => assertCredentialState({ prepared: false }));
 
   const [qualification, smoke] = await innerStage("MODULE_LOAD_FAILED", () => Promise.all([
     importModule(asarModuleUrl(options.appPath, [
@@ -914,6 +960,7 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
     fail(suffix ?? "NATIVE_ROUND_TRIP_FAILED");
   }
   if (outcome?.status !== "passed") fail("NATIVE_ROUND_TRIP_FAILED");
+  await innerStage("STATE_BOOTSTRAP_FAILED", () => assertCredentialState({ prepared: true }));
   return Object.freeze({
     schemaVersion: RECEIPT_SCHEMA,
     status: "passed",
@@ -923,6 +970,7 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
     sourceRevision: options.sourceRevision,
     artifactSha256: options.artifactSha256,
     credentialStoreMode: "isolated-secret-service",
+    statePreparation: "absent_default_state_created",
     capabilities: 2,
     lifecycle: "two_capability_round_trip_absence_confirmed",
     cleanup: "owned_companion_stopped",

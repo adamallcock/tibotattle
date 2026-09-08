@@ -130,6 +130,7 @@ function handover(qualificationContext, native) {
     qualificationContext,
     platform: "linux",
     architecture: "x64",
+    prepareState() {},
     createMutexContext: (options) => createLinuxCredentialMutationMutexContext({
       ...options,
       binding: native.mutexBinding,
@@ -184,6 +185,7 @@ test("Linux main composition authenticates an L0 context before any native const
     qualificationContext: invalid,
     platform: "linux",
     architecture: "x64",
+    prepareState() { factoryCalls += 1; },
     createMutexContext() { factoryCalls += 1; return {}; },
     createLeaseContext() { factoryCalls += 1; return { close() {} }; },
     createSecretServiceBackend() { factoryCalls += 1; return {}; },
@@ -230,12 +232,14 @@ test("Linux qualification smoke refuses a non-isolated context before native loa
 test("Linux handover closes its injected lease context when the owned FD4 stream ends", () => {
   let backendCloses = 0;
   let leaseCloses = 0;
+  const setup = [];
   const h = createLinuxQualificationSecretServiceHandoverForTest({
     qualificationContext: context(),
     platform: "linux",
     architecture: "x64",
-    createMutexContext: () => Object.freeze({}),
-    createLeaseContext: () => Object.freeze({ close() { leaseCloses += 1; } }),
+    prepareState(options) { assert.deepEqual(options, { platform: "linux", architecture: "x64" }); setup.push("state"); },
+    createMutexContext: () => { setup.push("mutex"); return Object.freeze({}); },
+    createLeaseContext: () => { setup.push("lease"); return Object.freeze({ close() { leaseCloses += 1; } }); },
     createSecretServiceBackend: () => Object.freeze({
       async read() { return null; },
       async createIfMissing() { return "created"; },
@@ -252,10 +256,29 @@ test("Linux handover closes its injected lease context when the owned FD4 stream
     isSecretServiceError: () => false,
   });
   const stream = new Duplex({ read() {}, write(_chunk, _encoding, done) { done(); } });
+  assert.deepEqual(setup, [], "native preparation is deferred until the owned channel attaches");
   const broker = h.attachLinuxSecretServiceBroker(stream);
+  assert.deepEqual(setup, ["state", "mutex", "lease"]);
   broker.dispose();
   assert.equal(backendCloses, 1);
   assert.equal(leaseCloses, 1);
+});
+
+test("Linux state preparation refusal precedes mutex and credential construction", () => {
+  let prepared = 0;
+  const h = createLinuxQualificationSecretServiceHandoverForTest({
+    qualificationContext: context(), platform: "linux", architecture: "x64",
+    prepareState() { prepared += 1; throw new Error("private-state-path-canary"); },
+    createMutexContext() { assert.fail("unsafe state must precede the mutex"); },
+    createLeaseContext() { assert.fail("unsafe state must precede the lease"); },
+    createSecretServiceBackend() { assert.fail("unsafe state must precede credentials"); },
+    isSecretServiceError: () => false,
+  });
+  const stream = new Duplex({ read() {}, write(_chunk, _encoding, done) { done(); } });
+  try {
+    assert.throws(() => h.attachLinuxSecretServiceBroker(stream));
+    assert.equal(prepared, 1);
+  } finally { stream.destroy(); }
 });
 
 test("Linux main composition carries the real qualified lease backend over inherited FD4", {

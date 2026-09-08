@@ -5,6 +5,7 @@ import test from "node:test";
 
 import {
   assertLinuxPackagedSmokeReceiptIdentity,
+  assertLinuxPackagedCredentialState,
   parseLinuxPackagedSecretServiceSmokeArguments,
   runLinuxPackagedSecretServiceSession,
   runLinuxPackagedSecretServiceSmoke,
@@ -80,7 +81,7 @@ function identity() {
 
 function innerReceipt(overrides = {}) {
   return {
-    schemaVersion: "tibotattle-electron-linux-secret-service-smoke-v1",
+    schemaVersion: "tibotattle-electron-linux-secret-service-smoke-v2",
     status: "passed",
     scope: "development_only",
     target: "linux-x64",
@@ -88,6 +89,7 @@ function innerReceipt(overrides = {}) {
     sourceRevision: REVISION,
     artifactSha256: ARTIFACT,
     credentialStoreMode: "isolated-secret-service",
+    statePreparation: "absent_default_state_created",
     capabilities: 2,
     lifecycle: "two_capability_round_trip_absence_confirmed",
     cleanup: "owned_companion_stopped",
@@ -100,13 +102,43 @@ function smokeError(code) {
   return (error) => error?.code === `ELECTRON_LINUX_SECRET_SERVICE_SMOKE_${code}`;
 }
 
+test("packaged bootstrap evidence requires an absent default state and every protected directory", async () => {
+  const missing = Object.assign(new Error("private-path-canary"), { code: "ENOENT" });
+  await assertLinuxPackagedCredentialState({ prepared: false, readMetadata: async () => { throw missing; } });
+  await assert.rejects(assertLinuxPackagedCredentialState({ prepared: false, readMetadata: async () => ({}) }), smokeError("STATE_BOOTSTRAP_FAILED"));
+  await assert.rejects(assertLinuxPackagedCredentialState({ prepared: false, readMetadata: async () => { throw { code: "EACCES" }; } }), smokeError("STATE_BOOTSTRAP_FAILED"));
+  const visited = [];
+  const valid = { isDirectory: () => true, uid: 1_000, mode: 0o40700 };
+  await assertLinuxPackagedCredentialState({ prepared: true, readMetadata: async (path) => { visited.push(path); return valid; } });
+  assert.deepEqual(visited, [
+    "/home/node/.local", "/home/node/.local/state",
+    "/home/node/.local/state/app-usagemonitor",
+    "/home/node/.local/state/app-usagemonitor/linux-credential-mutex-v1",
+    "/home/node/.local/state/app-usagemonitor/linux-accountless-installation-credential-v1",
+  ]);
+  for (const invalid of [
+    { ...valid, isDirectory: () => false }, { ...valid, uid: 0 }, { ...valid, mode: 0o40770 },
+  ]) {
+    for (const target of visited) {
+      await assert.rejects(assertLinuxPackagedCredentialState({
+        prepared: true, readMetadata: async (path) => path === target ? invalid : valid,
+      }), smokeError("STATE_BOOTSTRAP_FAILED"));
+    }
+  }
+  await assertLinuxPackagedCredentialState({ prepared: true, readMetadata: async (path) =>
+    path === "/home/node/.local" ? { ...valid, mode: 0o40755 } : valid });
+  await assert.rejects(assertLinuxPackagedCredentialState({ prepared: true, readMetadata: async (path) =>
+    path.endsWith("/state") ? { ...valid, mode: 0o40755 } : valid }), smokeError("STATE_BOOTSTRAP_FAILED"));
+});
+
 function successfulInsideRuntime({ electronProcess, digest }) {
   return {
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
+    environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    async assertCredentialState() {},
     async verifyNativeBindings() {},
     electronProcess,
     async canonicalize(path) { return path; },
@@ -260,8 +292,9 @@ test("packaged Electron creates the isolated context only after the default-proo
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
+    environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    async assertCredentialState({ prepared }) { calls.push([prepared ? "prepared-state" : "absent-state"]); },
     async verifyNativeBindings(appPath) {
       assert.equal(appPath, APP);
       calls.push(["native-loaders"]);
@@ -301,7 +334,7 @@ test("packaged Electron creates the isolated context only after the default-proo
   });
   assert.deepEqual(result, innerReceipt());
   assert.deepEqual(calls.map(([name]) => name), [
-    "digest", "daemon", "qualification", "smoke", "native-loaders", "context", "run",
+    "digest", "daemon", "absent-state", "qualification", "smoke", "native-loaders", "context", "run", "prepared-state",
   ]);
   const context = calls.find(([name]) => name === "context")[1];
   assert.equal(context.credentialStoreMode, "isolated-secret-service");
@@ -336,16 +369,16 @@ test("packaged credential failures retain only closed stage categories", async (
   }
 });
 
-test("packaged session carries the isolated state root and refuses another root before native access", async () => {
+test("packaged session preserves XDG absence and refuses an explicit state root before native access", async () => {
   const selected = selectedSessionEnvironment({
     TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED: "1",
-    HOME: "/home/node", XDG_STATE_HOME: "/home/node",
+    HOME: "/home/node",
     NODE_OPTIONS: "private-canary", UNRELATED_SECRET: "private-canary",
   });
-  assert.equal(selected.XDG_STATE_HOME, "/home/node");
+  assert.equal(Object.hasOwn(selected, "XDG_STATE_HOME"), false);
   assert.equal(Object.hasOwn(selected, "NODE_OPTIONS"), false);
   assert.equal(Object.hasOwn(selected, "UNRELATED_SECRET"), false);
-  for (const state of [undefined, "/outside-disposable-root"]) {
+  for (const state of ["/home/node", "", "/outside-disposable-root"]) {
     const runtime = successfulInsideRuntime({ electronProcess: {}, digest: async () => ASAR });
     runtime.environment.XDG_STATE_HOME = state;
     runtime.startDaemon = () => assert.fail("invalid state root must precede daemon and native access");
@@ -366,7 +399,7 @@ test("packaged Electron emits bounded runtime and isolation stage failures befor
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
+    environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "",
     async canonicalize(path) { return path; },
     async digest() { return ASAR; },
@@ -384,8 +417,9 @@ test("packaged Electron emits bounded runtime and isolation stage failures befor
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
+    environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    async assertCredentialState() {},
     async verifyNativeBindings() {},
     async canonicalize(path) { return path; },
     async digest() { return ASAR; },
@@ -406,8 +440,9 @@ test("packaged Electron emits bounded module and native round-trip stage failure
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
+    environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    async assertCredentialState() {},
     async verifyNativeBindings() {},
     async canonicalize(path) { return path; },
     async digest() { return ASAR; },
@@ -458,8 +493,9 @@ test("packaged Electron restores ASAR mode after a physical archive digest failu
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
+    environment: { ELECTRON_RUN_AS_NODE: "1" },
     electronVersion: "43.2.0",
+    async assertCredentialState() {},
     async verifyNativeBindings() {},
     electronProcess,
     async canonicalize(path) { return path; },
@@ -547,11 +583,11 @@ test("session runner accepts only the bounded child receipt and cleans its exact
   const cleanupCalls = [];
   const result = await runLinuxPackagedSecretServiceSession(identity(), {
     appPath: APP,
-    environment: { TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED: "1", XDG_STATE_HOME: "/home/node" },
+    environment: { TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED: "1" },
     proveContainerIsolation() { return { status: "isolated" }; },
     async listProcesses() { return []; },
     spawnSession(_appPath, _identity, environment) {
-      assert.equal(environment.XDG_STATE_HOME, "/home/node");
+      assert.equal(environment.XDG_STATE_HOME, undefined);
       return new SessionChild(innerReceipt());
     },
     async readSessionIdentity(pid) {
@@ -763,7 +799,7 @@ test("outer smoke persists only a content-free failure receipt when package veri
   assert.equal(JSON.stringify(written).includes("private-canary"), false);
   assert.deepEqual(Object.keys(written).sort(), [
     "schemaVersion", "status", "scope", "target", "sourceRevision", "artifactSha256",
-    "packageArtifactVerified", "packagedElectronExecutionVerified", "credentialLifecycleVerified",
+    "packageArtifactVerified", "packagedElectronExecutionVerified", "credentialLifecycleVerified", "defaultStateBootstrapVerified",
     "sessionCleanupConfirmed", "errorCode", "productionReady",
   ].sort());
 });

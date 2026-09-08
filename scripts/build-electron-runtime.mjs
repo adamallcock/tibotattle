@@ -237,6 +237,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "src/desktop-shell-status.js",
   "src/platform/linux-credential-mutex.js",
   "src/platform/linux-credential-mutation-lease.js",
+  "src/platform/linux-credential-state.js",
   "src/platform/linux-secret-service-broker.js",
   "src/platform/linux-secret-service-binding.js",
   "src/platform/linux-secret-service.js",
