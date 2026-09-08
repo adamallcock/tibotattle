@@ -61,7 +61,20 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest combined result: `921e9ea8` in
+Latest combined result: `7ee7b9b9` in
+[run 34238600250](https://github.com/adamallcock/tibotattle/actions/runs/34238600250)
+passes both Mac package jobs and the Windows producer. The fresh Windows NSIS
+journey fails again; its bounded receipt is retained and the next missing
+boundary is being classified. Linux's development distribution builds successfully, but normal
+candidate preparation rejects the 11-digit GitHub run ID against the bounded
+build-number contract. The workflow now uses its shorter workflow run number
+for both preparation and builder metadata. The regression expands the actual
+workflow command and passes its arguments through the real production parser;
+34 parser/distribution/workflow tests and 78 release-trust tests pass. The
+Windows journey has terminated, so this Linux correction can proceed without
+canceling an active installed test.
+
+Previous combined result: `921e9ea8` in
 [run 34238242221](https://github.com/adamallcock/tibotattle/actions/runs/34238242221)
 stops at the package/verifier closure equality check before any app journey.
 The independent verifier and its synthetic fixture also need the same two

@@ -434,10 +434,10 @@ jobs:
       - name: Prepare the approved Linux normal-startup candidate without publication
         run: |
           node scripts/package-electron-production.mjs --target linux-x64 \
-            --source-revision "$GITHUB_SHA" --build-number "$GITHUB_RUN_ID" --replace-staging
+            --source-revision "$GITHUB_SHA" --build-number "$GITHUB_RUN_NUMBER" --replace-staging
           export TIBOTATTLE_ELECTRON_TARGET=linux-x64
           export TIBOTATTLE_ELECTRON_SOURCE_REVISION="$GITHUB_SHA"
-          export TIBOTATTLE_ELECTRON_BUILD_NUMBER="$GITHUB_RUN_ID"
+          export TIBOTATTLE_ELECTRON_BUILD_NUMBER="$GITHUB_RUN_NUMBER"
           export TIBOTATTLE_ELECTRON_VERSION="$(node -p 'require("./package.json").version')"
           pnpm exec electron-builder --config apps/electron/electron-builder.production.config.cjs \
             --linux dir --x64 --publish never

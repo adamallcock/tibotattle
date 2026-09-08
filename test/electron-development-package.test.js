@@ -7,6 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { developmentBuildEnvironment, developmentPackagePlan, executableArchitecture, parseDevelopmentPackageArguments, writeDevelopmentHandoff } from "../scripts/package-electron-development.mjs";
 
+import { parseProductionCandidateArguments } from "../scripts/package-electron-production.mjs";
+
 const sourceRevision = "a".repeat(40);
 
 test("one development packaging contract covers the four actual target architectures", () => {
@@ -185,7 +187,20 @@ test("the Linux normal candidate stays on the runner and executes only in the is
   const workflow = await readFile(new URL("../.github/workflows/electron-development-packages.yml", import.meta.url), "utf8");
   const linux = workflow.slice(workflow.indexOf("\n  linux-x64:\n"));
   assert.match(linux, /package-electron-production\.mjs --target linux-x64/u);
-  assert.match(linux, /--source-revision "\$GITHUB_SHA" --build-number "\$GITHUB_RUN_ID"/u);
+  const preparation = linux.match(/node scripts\/package-electron-production\.mjs ([\s\S]*?)\n {10}export/u);
+  assert.ok(preparation, "normal candidate preparation command exists");
+  const environment = { GITHUB_SHA: sourceRevision, GITHUB_RUN_ID: "34238600250", GITHUB_RUN_NUMBER: "1234" };
+  const argumentsForPreparation = preparation[1].replace(/\\\r?\n/gu, " ").trim().split(/\s+/u).map((argument) => {
+    const variable = argument.match(/^"\$([A-Z_]+)"$/u);
+    if (!variable) return argument;
+    assert.ok(Object.hasOwn(environment, variable[1]), "only known workflow values are expanded");
+    return environment[variable[1]];
+  });
+  const parsed = parseProductionCandidateArguments(argumentsForPreparation);
+  assert.equal(parsed.target, "linux-x64");
+  assert.equal(parsed.sourceRevision, sourceRevision);
+  assert.equal(parsed.buildNumber, environment.GITHUB_RUN_NUMBER);
+  assert.match(linux, /export TIBOTATTLE_ELECTRON_BUILD_NUMBER="\$GITHUB_RUN_NUMBER"/u);
   assert.match(linux, /--linux dir --x64 --publish never/u);
   const execution = linux.slice(linux.indexOf("- name: Exercise normal packaged Linux startup"),
     linux.indexOf("- name: Retain verified development packages and receipts"));
