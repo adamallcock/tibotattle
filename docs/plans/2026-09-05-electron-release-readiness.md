@@ -32,8 +32,9 @@ one. The Mac daily-use tester is available; that is not full cutover readiness.
 2. Finish the integrated disposable Windows installer journey, then complete
    required production credential/trust composition and installed updates.
    Linux's packaged native credential journey now passes, including its read
-   deadline. Windows process inspection now passes; its next observed failure
-   occurs during the first installed launch after installation and byte checks.
+   deadline and fixed observation IPC. Its normal packaged production launch
+   is next. Windows needs the guarded artifact transfer repaired so the
+   installed journey can run under a fresh account.
 3. Complete one authorized hosted contribution rehearsal and explicit
    accountless public-sample/overlapping-history decisions. Preserve accepted
    automatic-sharing and persistent opt-out behavior throughout.
@@ -48,7 +49,24 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest four-target results: `3136144f` in
+Latest native results: `f09e504e` in
+[run 34229064795](https://github.com/adamallcock/tibotattle/actions/runs/34229064795)
+pass both Mac jobs and Linux. Linux now proves the new fixed observation
+parent/child IPC route against the native store inside the packaged artifact,
+after the separate legacy credential lifecycle. No earlier native test shares
+that container's disposable credential store. Windows passes all native,
+package and packaged-credential tests; its new artifact-transfer guard rejects
+an unexpected hidden entry (`WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_INVALID`).
+No artifact is uploaded and the fresh installed job is skipped. Diagnose the
+closed entry category without weakening the exact-content transfer guard.
+
+The unsigned hosted rehearsal at `3136144f` now also has a private raw-session
+fixture that classifies as fresh and produces two usage plus two quota records
+in two v1.1 chunks. No indexed databases or real session data are pre-seeded,
+and no app launch or hosted request has occurred. Actual hosted scheduling
+still awaits the already-requested staging provisioning/deployment approval.
+
+The preceding four-target results: `3136144f` in
 [run 34225779614](https://github.com/adamallcock/tibotattle/actions/runs/34225779614)
 pass both Mac jobs and Linux. Windows reaches its first installed launch and
 fails specifically during the account-observation credential check over the
@@ -77,8 +95,19 @@ mechanics. The explicit Linux qualification entrypoint, companion selector and
 packaging inventories are connected; normal production selection stays closed.
 Local validation passes 333 companion tests, 108 focused contracts, 24 inventory
 checks (two artifact-only exclusions), and a real Linux child/accountless IPC
-coexistence check. The packaged native observation journey is the next evidence
-gate; these source results do not establish installed Linux readiness.
+coexistence check. The packaged native observation journey now passes at
+`f09e504e`; normal production composition and an ordinary packaged Electron
+launch remain the next gates. No source or native-only result establishes
+installed Linux readiness.
+
+The Linux production startup block remains intact. Automatic approval review
+refused replacing it before installed-artifact evidence existed. The next
+reviewable slice prepares the fixed FD3 and observation composition and an
+ordinary packaged launch harness behind that block. Enabling the narrowly
+validated stable Linux/x64 candidate for an isolated, network-disabled CI run
+needs explicit approval; it must continue to refuse malformed metadata,
+other targets, rehearsal selections and mixed test/qualification lanes.
+This candidate test would not publish a release or enable a public update feed.
 
 The preceding four-target results: `a648cf2b` in
 [run 34222727976](https://github.com/adamallcock/tibotattle/actions/runs/34222727976)
