@@ -697,18 +697,23 @@ export async function prepareWindowsNormalCandidateProfile({
       () => sharingCoordinator(shareBackend, { createCoordinator }),
     );
     try {
-      const { selection, authorization } = await protectedOptOutStage(
+      const { selection, authorization, inspection } = await protectedOptOutStage(
         "PROTECTED_OPT_OUT_SHARING_UNAVAILABLE",
         async () => {
           await coordinator.initialize();
           return {
             selection: await coordinator.setEnabled(false),
             authorization: await coordinator.readAuthorization(),
+            inspection: await coordinator.inspect(),
           };
         },
       );
-      if (selection?.enabled !== false || authorization?.enabled !== false
-          || authorization?.transportStatus !== "off") {
+      // readAuthorization intentionally returns the raw policy projection. Its
+      // `current` result binds the durable record to this fixed destination;
+      // inspect exposes Electron's transport-state projection separately.
+      if (selection?.enabled !== false || authorization?.available !== true
+          || authorization?.current !== true || authorization?.enabled !== false
+          || inspection?.enabled !== false || inspection?.transportStatus !== "off") {
         fail("PROTECTED_OPT_OUT_UNAVAILABLE");
       }
     } finally {
@@ -737,7 +742,10 @@ export async function verifyWindowsNormalCandidateOptOut(seed, {
   try {
     await coordinator.initialize();
     const authorization = await coordinator.readAuthorization();
-    if (authorization?.enabled !== false || authorization?.transportStatus !== "off") {
+    const inspection = await coordinator.inspect();
+    if (authorization?.available !== true || authorization?.current !== true
+        || authorization?.enabled !== false || inspection?.enabled !== false
+        || inspection?.transportStatus !== "off") {
       fail("PROTECTED_OPT_OUT_UNAVAILABLE");
     }
     return true;

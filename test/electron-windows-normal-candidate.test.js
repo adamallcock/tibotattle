@@ -8,6 +8,7 @@ import test from "node:test";
 
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import { DesktopSettingsBackendError } from "../apps/electron/desktop-settings-backends.js";
+import { createDesktopSharingCoordinator } from "../apps/electron/desktop-sharing.js";
 import { WindowsProtectedStateStoreError } from "../src/platform/windows-protected-state-store.js";
 import {
   buildWindowsNormalCandidateEnvironment,
@@ -25,6 +26,7 @@ import {
   selectWindowsNormalCandidateDashboardTarget,
   selectWindowsNormalCandidateSettingsTarget,
   validateWindowsNormalCandidateSmokeMetadata,
+  verifyWindowsNormalCandidateOptOut,
   verifyWindowsNormalCandidateSmokePackage,
 } from "../scripts/smoke-electron-windows-normal-candidate.mjs";
 
@@ -412,6 +414,39 @@ test("normal candidate protected opt-out seeding retains closed source causes by
       return true;
     });
   }
+});
+
+test("normal candidate opt-out distinguishes raw authorization from projected transport state", async () => {
+  let sharingText = null;
+  const sharingBackend = Object.freeze({
+    async load() { return sharingText; },
+    async save(value) { sharingText = value; },
+  });
+  const seed = await prepareWindowsNormalCandidateProfile({
+    profile: NORMAL_CANDIDATE_PROFILE,
+    stagedAppPath: STAGED_APP_PATH,
+  }, normalCandidateSeedDependencies({
+    createSharingBackend: () => sharingBackend,
+    createCoordinator: createDesktopSharingCoordinator,
+  }));
+  assert.equal(await verifyWindowsNormalCandidateOptOut(seed, {
+    createCoordinator: createDesktopSharingCoordinator,
+  }), true);
+
+  const coordinator = createDesktopSharingCoordinator({
+    backend: sharingBackend,
+    installationState: "fresh",
+    destinationOrigin: "https://tibotattle.com",
+  });
+  const authorization = await coordinator.readAuthorization();
+  const inspection = await coordinator.inspect();
+  assert.equal(authorization.available, true);
+  assert.equal(authorization.current, true);
+  assert.equal(authorization.enabled, false);
+  assert.equal(Object.hasOwn(authorization, "transportStatus"), false);
+  assert.equal(inspection.enabled, false);
+  assert.equal(inspection.transportStatus, "off");
+  coordinator.dispose();
 });
 
 test("normal candidate runner preserves a package stage in its content-free receipt", async () => {
