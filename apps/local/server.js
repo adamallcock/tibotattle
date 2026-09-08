@@ -146,6 +146,9 @@ import {
   createLinuxSecretServiceBrokerBackendFromEnvironment,
 } from "../../src/platform/linux-secret-service-broker.js";
 import {
+  createWindowsAccountObservationBrokerBackendFromEnvironment,
+} from "../../src/platform/index.js";
+import {
   PREVIEW_PRODUCT_BRAND,
   PRODUCT_BRAND,
   SEMANTIC_OPEN_TARGET_PLACEHOLDER,
@@ -2994,6 +2997,8 @@ function createPreparedLocalCompanionServer({
           createAppAwareKeychainBackend(environment),
         createLinuxBackend: () =>
           createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
+        createWindowsBrokerBackend: () =>
+          createWindowsAccountObservationBrokerBackendFromEnvironment(environment),
       }),
     refreshAccounting: refreshReplaySafeAccountingCache,
     refreshClaudeUsageShadow: claudeShadowEnabled
@@ -3119,6 +3124,8 @@ function createPreparedLocalCompanionServer({
     operationLockFile: statePaths.accountObservationLockFile,
     createKeychainBackend: () => createAppAwareKeychainBackend(environment),
     createLinuxBackend: () => createLinuxSecretServiceBrokerBackendFromEnvironment(environment),
+    createWindowsBrokerBackend: () =>
+      createWindowsAccountObservationBrokerBackendFromEnvironment(environment),
     createIfMissing: false,
   }).loadAccountObservationSecret(),
   readContributionAccountMarkers = async () => {

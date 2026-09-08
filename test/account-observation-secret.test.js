@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +11,15 @@ import {
 } from "../src/account-observation-secret.js";
 import { selectProductionAccountObservationSecret } from "../src/account-observation-production.js";
 import { EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES } from "../src/export-identity-keychain.js";
+import {
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+  WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
+  createWindowsAccountObservationBrokerBackendFromEnvironment,
+  createWindowsProductionReadinessAttestation,
+} from "../src/platform/index.js";
 import { run } from "../src/cli.js";
 import { sanitizeCodexAccountSnapshotWithSecretLoader } from "../src/providers/codex/account.js";
 
@@ -39,6 +49,51 @@ function memoryBackend(initial = null) {
       return "created";
     },
     stored() { return stored === null ? null : Buffer.from(stored); },
+  };
+}
+
+function windowsObservationBrokerChannel(initial = null) {
+  let stored = initial === null ? null : Buffer.from(initial);
+  const operations = [];
+  const channel = new EventEmitter();
+  channel.connected = true;
+  channel.send = (request, callback = undefined) => {
+    operations.push(request.op);
+    queueMicrotask(() => {
+      const existed = stored !== null;
+      if (request.op === "create_if_missing" && !existed) {
+        stored = Buffer.from(request.secret, "base64url");
+      }
+      const response = request.op === "read"
+        ? {
+          schemaVersion: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+          kind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
+          v: WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+          id: request.id,
+          ok: true,
+          secret: stored === null ? null : stored.toString("base64url"),
+        }
+        : {
+          schemaVersion: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_SCHEMA,
+          kind: WINDOWS_ACCOUNT_OBSERVATION_BROKER_RESPONSE_KIND,
+          v: WINDOWS_ACCOUNT_OBSERVATION_BROKER_PROTOCOL_VERSION,
+          id: request.id,
+          ok: true,
+          status: existed ? "existing" : "created",
+        };
+      channel.emit("message", response);
+      callback?.(null);
+    });
+    return true;
+  };
+  return {
+    channel,
+    operations,
+    dispose() {
+      channel.connected = false;
+      channel.emit("disconnect");
+      stored?.fill(0);
+    },
   };
 }
 
@@ -514,6 +569,176 @@ test("Windows x64 account-observation production selection remains fail closed",
     (error) => error.code === "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE",
   );
   assert.equal(constructions, 0);
+});
+
+test("Windows native account selection remains available when the parent IPC factory is omitted", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "windows-native-account-observation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const readiness = createWindowsProductionReadinessAttestation({
+    qualifiedAt: "2026-09-08T00:00:00.000Z",
+    qualificationReceipt: "windows-qualified-test-receipt",
+    credentialMutexSafe: true,
+    durableAuditSafe: true,
+    protectedStatePathsSafe: true,
+    authenticatedBindingSafe: true,
+    bindingProvenance: {
+      contractVersion: "windows-binding-provenance-v1",
+      status: "qualified",
+      source: "audited-signed-native-binding",
+    },
+  });
+  let constructions = 0;
+  const nativeBackend = {
+    productionSafe: true,
+    crossProcessSafe: true,
+    auditDurable: true,
+    auditFilesystemProtected: true,
+    startupRecoveryComplete: true,
+    bindingProvenanceAuthenticated: true,
+    async read(capability) {
+      assert.equal(capability, ACCOUNT_CAPABILITY);
+      return Buffer.alloc(32, 77);
+    },
+    async createIfMissing() { return "existing"; },
+    async replaceExact() { return "replaced"; },
+    async deleteExact() { return "deleted"; },
+    async withOperationLease(_capability, _operation, callback) { return callback({}); },
+  };
+  const selection = selectProductionAccountObservationSecret({
+    platform: "win32",
+    architecture: "x64",
+    operationLockFile: join(root, "operation.lock"),
+    createIfMissing: false,
+    windowsReadiness: readiness,
+    createWindowsBackend() {
+      constructions += 1;
+      return nativeBackend;
+    },
+  });
+  assert.equal(selection.mode, "windows_credential_manager_account_observation");
+  assert.deepEqual(await selection.loadAccountObservationSecret(), Buffer.alloc(32, 77));
+  assert.equal(constructions, 1);
+});
+
+test("Windows parent IPC account selection reads an existing upload root without a child lock", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "windows-parent-ipc-account-observation-"));
+  const lock = join(root, "child-operation.lock");
+  const broker = windowsObservationBrokerChannel(Buffer.alloc(32, 83));
+  t.after(() => {
+    broker.dispose();
+    return rm(root, { recursive: true, force: true });
+  });
+  let nativeConstructions = 0;
+  let keychainConstructions = 0;
+  const selection = selectProductionAccountObservationSecret({
+    platform: "win32",
+    architecture: "x64",
+    operationLockFile: lock,
+    createIfMissing: false,
+    createWindowsBrokerBackend: () => createWindowsAccountObservationBrokerBackendFromEnvironment({
+      [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+    }, broker.channel),
+    createWindowsBackend() { nativeConstructions += 1; throw new Error("native fallback"); },
+    createKeychainBackend() { keychainConstructions += 1; throw new Error("Keychain fallback"); },
+  });
+  assert.equal(selection.mode, "windows_parent_ipc_account_observation");
+  const observed = await selection.loadAccountObservationSecret();
+  assert.deepEqual(observed, Buffer.alloc(32, 83));
+  observed.fill(0);
+  assert.deepEqual(broker.operations, ["read"]);
+  assert.equal(nativeConstructions, 0);
+  assert.equal(keychainConstructions, 0);
+  await assert.rejects(readFile(lock), { code: "ENOENT" });
+});
+
+test("Windows parent IPC account selection preserves unknown absence and uses only parent-owned creation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "windows-parent-ipc-account-unknown-"));
+  const lock = join(root, "child-operation.lock");
+  const broker = windowsObservationBrokerChannel();
+  t.after(() => {
+    broker.dispose();
+    return rm(root, { recursive: true, force: true });
+  });
+  const createWindowsBrokerBackend = () => createWindowsAccountObservationBrokerBackendFromEnvironment({
+    [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+  }, broker.channel);
+  let nativeConstructions = 0;
+  let keychainConstructions = 0;
+  const nativeFallback = () => {
+    nativeConstructions += 1;
+    throw new Error("native fallback");
+  };
+  const unknown = selectProductionAccountObservationSecret({
+    platform: "win32",
+    architecture: "x64",
+    operationLockFile: lock,
+    createIfMissing: false,
+    createWindowsBrokerBackend,
+    createWindowsBackend: nativeFallback,
+    createKeychainBackend() {
+      keychainConstructions += 1;
+      throw new Error("Keychain fallback");
+    },
+  });
+  assert.equal(await unknown.loadAccountObservationSecret(), null);
+
+  const creating = selectProductionAccountObservationSecret({
+    platform: "win32",
+    architecture: "x64",
+    operationLockFile: lock,
+    createWindowsBrokerBackend,
+    createWindowsBackend: nativeFallback,
+    createKeychainBackend() {
+      keychainConstructions += 1;
+      throw new Error("Keychain fallback");
+    },
+  });
+  const created = await creating.loadAccountObservationSecret();
+  assert.equal(Buffer.isBuffer(created), true);
+  assert.equal(created.byteLength, 32);
+  created.fill(0);
+  assert.deepEqual(broker.operations, ["read", "read", "create_if_missing", "read"]);
+  assert.equal(nativeConstructions, 0);
+  assert.equal(keychainConstructions, 0);
+  await assert.rejects(readFile(lock), { code: "ENOENT" });
+});
+
+test("Windows parent IPC account selection refuses absent, malformed, and untrusted brokers without fallback", async () => {
+  const configurations = [
+    () => null,
+    () => createWindowsAccountObservationBrokerBackendFromEnvironment({
+      [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: "other",
+    }),
+    () => createWindowsAccountObservationBrokerBackendFromEnvironment({
+      [WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV]: WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_MARKER,
+      USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_BROKER_FD: "4",
+    }),
+    () => ({ async read() { return null; }, async createIfMissing() { return "created"; } }),
+    () => { throw new Error("private parent IPC failure"); },
+  ];
+  for (const createWindowsBrokerBackend of configurations) {
+    let nativeConstructions = 0;
+    let keychainConstructions = 0;
+    let selection = null;
+    try {
+      selection = selectProductionAccountObservationSecret({
+        platform: "win32",
+        architecture: "x64",
+        createWindowsBrokerBackend,
+        createWindowsBackend() { nativeConstructions += 1; throw new Error("native fallback"); },
+        createKeychainBackend() { keychainConstructions += 1; throw new Error("Keychain fallback"); },
+      });
+    } catch (error) {
+      assert.equal(error.code, "ACCOUNT_OBSERVATION_PRODUCTION_BACKEND_UNAVAILABLE");
+      assert.equal(`${error.stack}\n${JSON.stringify(error)}`.includes("private parent IPC failure"), false);
+    }
+    if (selection !== null) {
+      await assert.rejects(selection.loadAccountObservationSecret(), (error) =>
+        error.code === "account_observation_credential_unavailable");
+    }
+    assert.equal(nativeConstructions, 0);
+    assert.equal(keychainConstructions, 0);
+  }
 });
 
 test("Linux account selection preserves generic broker compatibility and read-only absence", async () => {
