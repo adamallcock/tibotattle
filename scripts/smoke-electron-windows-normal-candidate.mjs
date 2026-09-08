@@ -180,6 +180,7 @@ const FAILURE_CODES = new Set([
   "PACKAGE_STAGED_MANIFEST_INVALID",
   "PACKAGE_ARCHIVE_MANIFEST_INVALID",
   "PACKAGE_METADATA_INVALID",
+  "PACKAGE_RUNTIME_CLOSURE_INVALID",
   "PACKAGE_NATIVE_MEMBERS_INVALID",
   "NATIVE_PAIR_INVALID",
   "ASAR_UNAVAILABLE",
@@ -535,6 +536,42 @@ async function validateNativePair({
   });
 }
 
+const WINDOWS_NORMAL_RUNTIME_MANIFEST = "electron-runtime-manifest.json";
+const WINDOWS_NORMAL_PRELOAD_MEMBER = "apps/electron/preload.cjs";
+
+/**
+ * The runtime manifest names the preload that Electron executes. Bind both
+ * staged bytes to their ASAR members before launch, then bind the preload
+ * bytes to the reviewed manifest row. Hashes stay inside package validation.
+ */
+async function validateWindowsNormalCandidateRuntimeClosure({
+  stagedAppPath,
+  asarPath,
+  readJsonFile = readSafeJson,
+  digest = digestRegularFile,
+  asar = loadAsar(),
+  failureCode = "PACKAGE_RUNTIME_CLOSURE_INVALID",
+  platform = process.platform,
+} = {}) {
+  const stagedManifestPath = join(stagedAppPath, WINDOWS_NORMAL_RUNTIME_MANIFEST);
+  const stagedPreloadPath = join(stagedAppPath, ...WINDOWS_NORMAL_PRELOAD_MEMBER.split("/"));
+  const [manifest, stagedManifest, archivedManifest, stagedPreload, archivedPreload] = await Promise.all([
+    readJsonFile(stagedManifestPath, failureCode),
+    digest(stagedManifestPath, failureCode),
+    digestArchiveMember(asarPath, WINDOWS_NORMAL_RUNTIME_MANIFEST, { asar, code: failureCode, platform }),
+    digest(stagedPreloadPath, failureCode),
+    digestArchiveMember(asarPath, WINDOWS_NORMAL_PRELOAD_MEMBER, { asar, code: failureCode, platform }),
+  ]);
+  const row = Array.isArray(manifest?.files)
+    ? manifest.files.find((entry) => entry?.path === WINDOWS_NORMAL_PRELOAD_MEMBER) : null;
+  if (!sameDigest(stagedManifest, archivedManifest)
+      || !sameDigest(stagedPreload, archivedPreload)
+      || !Number.isSafeInteger(row?.bytes) || row.bytes !== stagedPreload.bytes
+      || typeof row?.sha256 !== "string" || row.sha256 !== stagedPreload.sha256) {
+    fail(failureCode);
+  }
+}
+
 async function verifyWindowsNormalCandidateSmokePackagePaths({
   appPath,
   stagedAppPath,
@@ -551,7 +588,7 @@ async function verifyWindowsNormalCandidateSmokePackagePaths({
   ]);
 }
 
-/** Verify the exact staged app, unpacked executable, stable metadata, and native pair. */
+/** Verify the exact staged app, ASAR runtime closure, stable metadata, and native pair. */
 export async function verifyWindowsNormalCandidateSmokePackage(options = {}, {
   platform = process.platform,
   architecture = process.arch,
@@ -559,6 +596,7 @@ export async function verifyWindowsNormalCandidateSmokePackage(options = {}, {
   digest = digestRegularFile,
   asar = loadAsar(),
   validateNative = validateNativePair,
+  validateRuntimeClosure = validateWindowsNormalCandidateRuntimeClosure,
   verifyPaths = verifyWindowsNormalCandidateSmokePackagePaths,
 } = {}) {
   if (platform !== "win32" || architecture !== "x64"
@@ -600,15 +638,26 @@ export async function verifyWindowsNormalCandidateSmokePackage(options = {}, {
   const metadata = validateWindowsNormalCandidateSmokeMetadata({
     sourceCandidate, stagedManifest, archiveManifest, sourceRevision: options.sourceRevision,
   });
-  const native = await validateNative({
-    stagedAppPath: options.stagedAppPath,
-    asarPath,
-    unpackedPath,
-    asar,
-    digest,
-    failureCode: "PACKAGE_NATIVE_MEMBERS_INVALID",
-    platform,
-  });
+  const [native] = await Promise.all([
+    validateNative({
+      stagedAppPath: options.stagedAppPath,
+      asarPath,
+      unpackedPath,
+      asar,
+      digest,
+      failureCode: "PACKAGE_NATIVE_MEMBERS_INVALID",
+      platform,
+    }),
+    validateRuntimeClosure({
+      stagedAppPath: options.stagedAppPath,
+      asarPath,
+      readJsonFile,
+      asar,
+      digest,
+      failureCode: "PACKAGE_RUNTIME_CLOSURE_INVALID",
+      platform,
+    }),
+  ]);
   return Object.freeze({
     sourceRevision: metadata.sourceRevision,
     target: metadata.target,

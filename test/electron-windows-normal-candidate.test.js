@@ -213,13 +213,17 @@ function packageVerificationDependencies({
   digest = async () => ({ bytes: 1, sha256: "a".repeat(64) }),
   asar,
   validateNative,
+  validateRuntimeClosure,
   useNativePair = false,
+  useRuntimeClosure = false,
 } = {}) {
   const manifest = { version: "0.1.0", tibotattleDistribution: candidateMetadata() };
   const selectedValidateNative = validateNative ?? (useNativePair ? undefined : async () => ({
     windowsFilesystemSha256: "b".repeat(64),
     keytarSha256: "c".repeat(64),
   }));
+  const selectedValidateRuntimeClosure = validateRuntimeClosure
+    ?? (useRuntimeClosure ? undefined : async () => {});
   return {
     platform: "win32",
     architecture: "x64",
@@ -234,6 +238,8 @@ function packageVerificationDependencies({
       extractFile: () => Buffer.from(JSON.stringify(manifest)),
     },
     ...(selectedValidateNative === undefined ? {} : { validateNative: selectedValidateNative }),
+    ...(selectedValidateRuntimeClosure === undefined
+      ? {} : { validateRuntimeClosure: selectedValidateRuntimeClosure }),
   };
 }
 
@@ -560,6 +566,15 @@ test("normal candidate package verification keeps its closed failure stages dist
     },
   }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_NATIVE_MEMBERS_INVALID" });
   assert.equal(nativeFailureCode, "PACKAGE_NATIVE_MEMBERS_INVALID");
+
+  let runtimeFailureCode = null;
+  await assert.rejects(verify({
+    validateRuntimeClosure: async ({ failureCode }) => {
+      runtimeFailureCode = failureCode;
+      throw packageStageFailure("PACKAGE_RUNTIME_CLOSURE_INVALID");
+    },
+  }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PACKAGE_RUNTIME_CLOSURE_INVALID" });
+  assert.equal(runtimeFailureCode, "PACKAGE_RUNTIME_CLOSURE_INVALID");
 });
 
 test("normal candidate package verification uses Windows ASAR separators for the virtual native sidecar", async () => {
@@ -592,6 +607,66 @@ test("normal candidate package verification uses Windows ASAR separators for the
   );
   assert.equal(result.target, "win32-x64");
   assert.deepEqual(members, ["package.json", virtualManifest]);
+});
+
+test("normal candidate package verification binds the staged preload and runtime manifest to ASAR", async () => {
+  const preload = Buffer.from("fixed-preload", "utf8");
+  const runtimeManifest = {
+    files: [{
+      path: "apps/electron/preload.cjs",
+      bytes: preload.byteLength,
+      sha256: createHash("sha256").update(preload).digest("hex"),
+    }],
+  };
+  const runtimeBytes = Buffer.from(JSON.stringify(runtimeManifest), "utf8");
+  const nativeManifest = Buffer.from("fixed-native-sidecar", "utf8");
+  const nativeDigest = Object.freeze({
+    bytes: nativeManifest.byteLength,
+    sha256: createHash("sha256").update(nativeManifest).digest("hex"),
+  });
+  const digestFor = (bytes) => Object.freeze({
+    bytes: bytes.byteLength,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  });
+  const seenMembers = [];
+  const result = await verifyWindowsNormalCandidateSmokePackage(
+    smokeOptions(),
+    packageVerificationDependencies({
+      useNativePair: true,
+      useRuntimeClosure: true,
+      readJsonFile: async (path, code) => {
+        if (code === "SOURCE_CANDIDATE_INVALID") return sourceCandidate();
+        if (path.endsWith("package.json")) return { version: "0.1.0", tibotattleDistribution: candidateMetadata() };
+        if (path.endsWith("electron-runtime-manifest.json")) return runtimeManifest;
+        throw new Error("unexpected staged member");
+      },
+      digest: async (path) => path.endsWith("electron-runtime-manifest.json")
+        ? digestFor(runtimeBytes)
+        : /apps[\\/]electron[\\/]preload\.cjs$/u.test(path)
+          ? digestFor(preload) : nativeDigest,
+      asar: {
+        extractFile: (_archive, member) => {
+          seenMembers.push(member);
+          if (member === "package.json") return Buffer.from(JSON.stringify({
+            version: "0.1.0", tibotattleDistribution: candidateMetadata(),
+          }));
+          if (member === "electron-runtime-manifest.json") return runtimeBytes;
+          if (member === String.raw`apps\electron\preload.cjs`) return preload;
+          if (member === String.raw`native\windows-filesystem\build\Release\windows_filesystem.node.manifest.json`) {
+            return nativeManifest;
+          }
+          throw new Error("unexpected archive member");
+        },
+      },
+    }),
+  );
+  assert.equal(result.target, "win32-x64");
+  assert.deepEqual([...seenMembers].sort(), [
+    "package.json",
+    String.raw`apps\electron\preload.cjs`,
+    "electron-runtime-manifest.json",
+    String.raw`native\windows-filesystem\build\Release\windows_filesystem.node.manifest.json`,
+  ].sort());
 });
 
 test("normal candidate protected opt-out seeding retains closed source causes by stage", async () => {
