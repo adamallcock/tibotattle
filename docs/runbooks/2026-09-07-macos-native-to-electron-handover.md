@@ -41,8 +41,11 @@ profile, sign code, or invoke the handover bridge.
 # Runtime decision contract
 
 Production startup first validates the signed enclosing app and loads its
-fixed credential adapter. It reads and discards the four permitted credentials
-before invoking any handover operation. Missing modern credentials are accepted
+fixed credential adapter. Before invoking any handover operation, it reads and
+discards the active account-observation and contribution-device credentials.
+Optional legacy export and reserved Claude credentials retain migration guards
+when first used; they do not block an unrelated handover. Accountless installation
+credentials remain main-process-only and are accessed on demand. Missing modern credentials are accepted
 only after a fixed, attribute-only legacy lookup also proves absence. Locked,
 denied, indeterminate or legacy-only credentials stop startup without modifying
 the predecessor, credentials or data. This preflight also runs after a completed
