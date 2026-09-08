@@ -48,6 +48,7 @@ test("packaged Linux native smoke has no network or user profile mount", async (
   assert.match(step, /--source-revision "\$GITHUB_SHA"/u);
   assert.match(step, /--receipt \/run\/user\/1000\/packaged-credential-receipt\.json/u);
   assert.match(step, /TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1/u);
+  assert.match(step, /--env XDG_STATE_HOME=\/home\/node \\/u);
   assert.match(step, /--staged-app \/workspace\/\.release-build\/electron-dev\/linux-x64\/app/u);
   assert.match(step, /> "\$host_receipt"/u);
   assert.match(workflow.slice(end), /if: \$\{\{ !cancelled\(\) \}\}/u);

@@ -248,6 +248,7 @@ jobs:
             --env XDG_CONFIG_HOME=/home/node/.config \
             --env XDG_CACHE_HOME=/home/node/.cache \
             --env XDG_DATA_HOME=/home/node/.local/share \
+            --env XDG_STATE_HOME=/home/node \
             --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
             tibotattle-electron-linux-packaged:test \
             --app "$package_root/linux-unpacked/tibotattle-dev" \

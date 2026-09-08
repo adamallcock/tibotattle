@@ -87,6 +87,7 @@ const SAFE_SESSION_ENVIRONMENT_KEYS = Object.freeze([
   "XDG_CONFIG_HOME",
   "XDG_DATA_HOME",
   "XDG_RUNTIME_DIR",
+  "XDG_STATE_HOME",
 ]);
 const QUALIFICATION_EXECUTABLES = new Set([
   "/usr/bin/dbus-daemon",
@@ -457,7 +458,7 @@ export async function verifyLinuxPackagedSecretServiceSmokePackage(options, {
   });
 }
 
-function selectedSessionEnvironment(environment) {
+export function selectedSessionEnvironment(environment) {
   if (environment?.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED !== "1") {
     fail("ISOLATION_REQUIRED");
   }
@@ -868,6 +869,9 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
   // This is the authoritative isolation proof: it verifies the reviewed
   // container marker and disposable home/runtime tmpfs mounts, then starts a
   // private D-Bus Secret Service before a branded context can exist.
+  // The native mutex opens an existing XDG state base. This test uses the
+  // already verified private home tmpfs, not an absent .local/state fallback.
+  if (environment.XDG_STATE_HOME !== "/home/node") fail("ISOLATION_FAILED");
   const daemon = await innerStage("ISOLATION_FAILED", () => startDaemon());
   if (daemon?.status !== "started") fail("ISOLATION_FAILED");
 

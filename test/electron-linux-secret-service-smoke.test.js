@@ -11,6 +11,7 @@ import {
   runLinuxPackagedSecretServiceSmokeInside,
   verifyLinuxPackagedSecretServiceSmokePackage,
   verifyLinuxPackagedNativeBindings,
+  selectedSessionEnvironment,
 } from "../scripts/smoke-electron-linux-secret-service.mjs";
 
 const REVISION = "a".repeat(40);
@@ -104,7 +105,7 @@ function successfulInsideRuntime({ electronProcess, digest }) {
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1" },
+    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
     electronVersion: "43.2.0",
     async verifyNativeBindings() {},
     electronProcess,
@@ -259,7 +260,7 @@ test("packaged Electron creates the isolated context only after the default-proo
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1" },
+    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
     electronVersion: "43.2.0",
     async verifyNativeBindings(appPath) {
       assert.equal(appPath, APP);
@@ -335,6 +336,25 @@ test("packaged credential failures retain only closed stage categories", async (
   }
 });
 
+test("packaged session carries the isolated state root and refuses another root before native access", async () => {
+  const selected = selectedSessionEnvironment({
+    TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED: "1",
+    HOME: "/home/node", XDG_STATE_HOME: "/home/node",
+    NODE_OPTIONS: "private-canary", UNRELATED_SECRET: "private-canary",
+  });
+  assert.equal(selected.XDG_STATE_HOME, "/home/node");
+  assert.equal(Object.hasOwn(selected, "NODE_OPTIONS"), false);
+  assert.equal(Object.hasOwn(selected, "UNRELATED_SECRET"), false);
+  for (const state of [undefined, "/outside-disposable-root"]) {
+    const runtime = successfulInsideRuntime({ electronProcess: {}, digest: async () => ASAR });
+    runtime.environment.XDG_STATE_HOME = state;
+    runtime.startDaemon = () => assert.fail("invalid state root must precede daemon and native access");
+    await assert.rejects(runLinuxPackagedSecretServiceSmokeInside({
+      appPath: APP, sourceRevision: REVISION, artifactSha256: ARTIFACT,
+    }, runtime), smokeError("ISOLATION_FAILED"));
+  }
+});
+
 test("packaged Electron emits bounded runtime and isolation stage failures before context construction", async () => {
   let daemonCalls = 0;
   let imports = 0;
@@ -346,7 +366,7 @@ test("packaged Electron emits bounded runtime and isolation stage failures befor
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1" },
+    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
     electronVersion: "",
     async canonicalize(path) { return path; },
     async digest() { return ASAR; },
@@ -364,7 +384,7 @@ test("packaged Electron emits bounded runtime and isolation stage failures befor
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1" },
+    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
     electronVersion: "43.2.0",
     async verifyNativeBindings() {},
     async canonicalize(path) { return path; },
@@ -386,7 +406,7 @@ test("packaged Electron emits bounded module and native round-trip stage failure
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1" },
+    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
     electronVersion: "43.2.0",
     async verifyNativeBindings() {},
     async canonicalize(path) { return path; },
@@ -438,7 +458,7 @@ test("packaged Electron restores ASAR mode after a physical archive digest failu
     platform: "linux",
     architecture: "x64",
     executable: APP,
-    environment: { ELECTRON_RUN_AS_NODE: "1" },
+    environment: { ELECTRON_RUN_AS_NODE: "1", XDG_STATE_HOME: "/home/node" },
     electronVersion: "43.2.0",
     async verifyNativeBindings() {},
     electronProcess,
@@ -527,10 +547,13 @@ test("session runner accepts only the bounded child receipt and cleans its exact
   const cleanupCalls = [];
   const result = await runLinuxPackagedSecretServiceSession(identity(), {
     appPath: APP,
-    environment: { TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED: "1" },
+    environment: { TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED: "1", XDG_STATE_HOME: "/home/node" },
     proveContainerIsolation() { return { status: "isolated" }; },
     async listProcesses() { return []; },
-    spawnSession() { return new SessionChild(innerReceipt()); },
+    spawnSession(_appPath, _identity, environment) {
+      assert.equal(environment.XDG_STATE_HOME, "/home/node");
+      return new SessionChild(innerReceipt());
+    },
     async readSessionIdentity(pid) {
       assert.equal(pid, 42);
       return { pid, executable: "/usr/bin/dbus-run-session", startTime: "10" };
