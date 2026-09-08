@@ -333,6 +333,13 @@ export function createCompanionSupervisor({
         fail(shellError("companion_spawn_failed"));
         return;
       }
+      if (currentChild.connected === false) {
+        fail(shellError("companion_exit_before_ready"), {
+          childAlreadyExited: Number.isSafeInteger(currentChild.exitCode)
+            || typeof currentChild.signalCode === "string",
+        });
+        return;
+      }
       try {
         if (selectedCredentialBroker) {
           currentCredentialBroker = selectedCredentialBroker(currentChild.stdio?.[4]);

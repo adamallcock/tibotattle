@@ -992,6 +992,25 @@ test("companion supervisor announces only its composed Windows observation IPC a
   }
 });
 
+test("companion supervisor refuses a pre-disconnected Windows observation child before broker construction", async () => {
+  const child = new FakeChild();
+  child.connected = false;
+  child.exitCode = 0;
+  child.signalCode = null;
+  let brokerConstructed = false;
+  const supervisor = createCompanionSupervisor({
+    spawnChild() { return child; },
+    attachWindowsAccountObservationBroker() {
+      brokerConstructed = true;
+      return { dispose() {} };
+    },
+  });
+  await assert.rejects(supervisor.start(), errorCode("companion_exit_before_ready"));
+  assert.equal(brokerConstructed, false);
+  assert.deepEqual(child.kills, []);
+  assert.equal(supervisor.state.state, "stopped");
+});
+
 test("companion supervisor rejects competing credential factories and ambient Windows channel authority", async () => {
   const factory = () => ({ dispose() {} });
   for (const other of ["attachCredentialBroker", "attachLinuxSecretServiceBroker"]) {

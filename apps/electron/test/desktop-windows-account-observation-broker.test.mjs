@@ -258,6 +258,20 @@ test("Windows account-observation IPC is dormant, exact, and unavailable without
   assert.throws(() => createWindowsAccountObservationBrokerTransport({ channel: null }),
     assertBrokerError("invalid_configuration"));
 
+  const disconnected = channelPair();
+  disconnected.parent.connected = false;
+  let constructed = false;
+  assert.throws(() => attachDesktopWindowsAccountObservationBroker({
+    channel: disconnected.parent,
+    createBackend() {
+      constructed = true;
+      throw new Error("must not construct for a disconnected child");
+    },
+  }), assertBrokerError("invalid_configuration"));
+  assert.equal(constructed, false);
+  assert.equal(disconnected.parent.listenerCount("message"), 0);
+  assert.equal(disconnected.parent.listenerCount("disconnect"), 0);
+
   const source = await readFile(
     new URL("../../../src/platform/windows-account-observation-broker.js", import.meta.url),
     "utf8",

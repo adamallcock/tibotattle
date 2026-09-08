@@ -119,6 +119,7 @@ function validChannel(channel) {
   try {
     return channel !== null
       && typeof channel === "object"
+      && channel.connected !== false
       && typeof channel.on === "function"
       && typeof channel.off === "function"
       && typeof channel.send === "function";

@@ -89,6 +89,7 @@ function validId(value) {
 function validIpcChannel(channel) {
   try {
     return record(channel)
+      && channel.connected !== false
       && typeof channel.on === "function"
       && typeof channel.off === "function"
       && typeof channel.send === "function";

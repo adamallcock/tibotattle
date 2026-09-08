@@ -257,7 +257,12 @@ async function runChildWithMalformedBrokerResponse() {
   }
 }
 
-function controlFixture({ failPhase = null, childExitCode = null, failStopPhase = null } = {}) {
+function controlFixture({
+  failPhase = null,
+  childExitCode = null,
+  failStopPhase = null,
+  preDisconnected = false,
+} = {}) {
   const calls = [];
   const context = Object.freeze({ kind: "synthetic-packaged-context" });
   const environment = Object.freeze({
@@ -305,7 +310,9 @@ function controlFixture({ failPhase = null, childExitCode = null, failStopPhase 
     spawnChild(command, args, options) {
       calls.push(["spawn", { args, command, options }]);
       const child = new EventEmitter();
-      child.connected = true;
+      child.connected = !preDisconnected;
+      child.exitCode = preDisconnected ? 0 : null;
+      child.signalCode = null;
       child.sent = [];
       child.send = (message, callback) => {
         child.sent.push(message);
@@ -376,6 +383,17 @@ test("Windows observation smoke fails closed before handover and exposes only fi
     });
   }
   assert.equal(classifyWindowsAccountObservationSmokeFailure(new Error("foreign")), null);
+
+  const disconnected = controlFixture({ preDisconnected: true });
+  await assert.rejects(runWindowsAccountObservationQualificationSmokeForTest({
+    environment: disconnected.environment,
+    qualificationContext: disconnected.context,
+  }, disconnected.dependencies), (error) => {
+    assert.equal(smokeError(error), true);
+    assert.equal(classifyWindowsAccountObservationSmokeFailure(error), "startup");
+    return true;
+  });
+  assert.equal(disconnected.calls.some(([name]) => name === "handover-attach"), false);
 
   const shutdown = controlFixture({ failStopPhase: "restart-read-v1" });
   await assert.rejects(runWindowsAccountObservationQualificationSmokeForTest({
