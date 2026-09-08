@@ -736,6 +736,24 @@ timeout. All 34 owning profile/QA tests pass. A separate fresh retry profile and
 provenance record bind the unchanged app to the reviewed `feac3e67` harness;
 the original failed profile and receipt remain intact.
 
+That retry passes the full real-history gate: all Usage/Community parity checks,
+5/5 timer advancement, clean quit and 20/20 active responses for each endpoint.
+Both health and refresh-status p95 are 1 ms against the unchanged 250 ms budget.
+One active 524 ms outlier is retained; the separate 3,000 ms request ceiling is
+also unchanged. Two warm-up samples per endpoint have maxima of 1 and 2 ms.
+The identity-bound receipt has SHA-256
+`2593b1bdaf0df74e94d6907ed98e00bcabce050677ef77354d322794abac0f9f`.
+This qualifies the copied-profile ARM tester journey, not a production install
+or the other operating systems.
+
+The Windows storage failure in `0f03c121` was independently traced to the same
+sibling-profile mismatch inside the actual accountless qualification factory.
+It now verifies every fixed launcher profile path before deriving a private
+context rooted at that profile. The launched app environment is unchanged, and
+malformed or unrelated paths are refused. Seventy focused checks pass with one
+explicit non-Windows host exclusion; that actual-launcher producer test runs in
+the existing Windows CI smoke suite. The next native run must verify the repair.
+
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
 retain the detailed design history. This document coordinates the remaining
