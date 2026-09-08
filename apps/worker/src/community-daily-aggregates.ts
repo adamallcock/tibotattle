@@ -1,4 +1,6 @@
 import { canonicalJson } from "./canonical-json";
+import { readCommunityRefreshLane, recordCommunityRefreshLane,
+  type CommunityRefreshLanePin } from "./community-refresh-lanes";
 import {
   COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
@@ -561,6 +563,7 @@ export async function rebuildPendingCommunityDailyAggregates(
   }
   const deferred = { processed: 0, remaining: true, aggregateIds: [], deferred: true } as const;
   const activityOnly = recovery?.mode === "activity-only";
+  let lane: CommunityRefreshLanePin | undefined;
   let initialFits: { epoch: number; fits: CommunityAllowanceFit[] } | undefined;
   if (recovery) {
     const budget = recovery.budget;
@@ -569,6 +572,12 @@ export async function rebuildPendingCommunityDailyAggregates(
     if (!["cache-only", "activity-only"].includes(recovery.mode) || !Number.isSafeInteger(budget.remainingQueries)
         || !Number.isSafeInteger(reserve) || reserve < 0 || !Number.isFinite(now)
         || !Number.isFinite(budget.deadlineMs) || now >= budget.deadlineMs) return { ...deferred, aggregateIds: [] };
+    if (!activityOnly) {
+      if (budget.remainingQueries - reserve < 2) return { ...deferred, aggregateIds: [] };
+      budget.remainingQueries -= 2; // Metadata lookup and final fenced receipt.
+      lane = await readCommunityRefreshLane(db, "daily", scheduledTime);
+      if (lane.current) return { processed: 0, remaining: false, aggregateIds: [] };
+    }
     const fixedQueries = activityOnly ? 2 : 77;
     if (!activityOnly) {
       // Read the COMPLETE cohort before allocating optional days/chunks. A
@@ -662,6 +671,8 @@ export async function rebuildPendingCommunityDailyAggregates(
   const pending = await db.prepare(
     "SELECT 1 AS pending FROM community_daily_aggregate_rebuilds LIMIT 1",
   ).first<{ pending: number }>();
+  if (lane) await recordCommunityRefreshLane(db, lane,
+    !pending && priceBackfills.size === 0 && !deferredWork, scheduledTime);
   return { processed, remaining: Boolean(pending) || priceBackfills.size > 0, aggregateIds,
     ...(recovery && deferredWork ? { deferred: true as const } : {}) };
 }
@@ -719,6 +730,7 @@ export interface PublishedCommunityDailyRead {
   rows: PublishedCommunityDailyAggregateRow[];
   allowancePublicationState: CommunityAllowancePublicationStateRow | null;
   allowanceBreakdownsCache: PublicAllowanceBreakdownsCacheRow | null;
+  allowanceReadState: "confirmed" | "temporarily_unavailable";
 }
 
 interface PublishedCommunityDailyQueryRow {
@@ -775,6 +787,7 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
   ).bind(fromDay, toDay);
   let queryRows: PublishedCommunityDailyQueryRow[];
   let allowanceBreakdownsCache: PublicAllowanceBreakdownsCacheRow | null = null;
+  let allowanceReadState: PublishedCommunityDailyRead["allowanceReadState"] = "confirmed";
   try {
     const previewStatement = db.prepare(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL)
       .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION);
@@ -798,6 +811,7 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
     // An unavailable optional cache/schema cannot hide existing activity. This
     // fallback has no preview, so it cannot combine rows from different epochs.
     // An unavailable daily store still fails normally; no source work is tried.
+    allowanceReadState = "temporarily_unavailable";
     queryRows = (await dailyStatement.all<PublishedCommunityDailyQueryRow>()).results;
   }
   const first = queryRows[0];
@@ -827,7 +841,7 @@ export async function readPublishedCommunityDailyAggregatesWithAllowanceState(
         }]
       : []
   ));
-  return { rows, allowancePublicationState, allowanceBreakdownsCache };
+  return { rows, allowancePublicationState, allowanceBreakdownsCache, allowanceReadState };
 }
 
 /**

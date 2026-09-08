@@ -43,7 +43,7 @@ Those remain separate verification gates in the relevant runbooks.
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 35 API paths, 36 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 36 API paths, 37 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
@@ -336,6 +336,7 @@ Authority vocabulary:
 | `GET` | `/api/v1/admin/overview` | Admin | Read owner operations state, bounded optional distribution integrations, and failure-isolated reconstruction progress; no calculation on refresh |
 | `GET` | `/api/v1/admin/metrics/history` | Admin | Read cached owner metrics history |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin | Preview the cached owner-only allowance merge without publishing it |
+| `GET` | `/api/v1/admin/reconstruction-progress` | Admin | Read bounded, content-free refresh and publication progress without advancing calculations |
 | `POST` | `/api/v1/admin/action` | Admin | Run an allowlisted operations action; explicit owner participant erasure is a task of `run_maintenance`, not a new action or route |
 | `POST` | `/api/v1/me/security-reset` | Session | Rotate participant recovery and session authority |
 | `POST` | `/api/v1/me/device-pairings` | Session | Mint a one-use pairing code for a local collector |

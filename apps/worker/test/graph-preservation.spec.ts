@@ -219,19 +219,27 @@ describe("preserved graph publication on local D1", () => {
     await expectUnavailable();
   });
 
-  it("a repository revision-2 replacement remains hard even though its replacement insert is atomic", async () => {
+  it("preserves every published view through both phases of an authorized revision-2 replacement", async () => {
     const { fixture } = await seedInput(); await seedPublication();
+    const before = await control(), oldCache = await cache(), graph = (await publicGraph()).graph, oldRevision = await revision();
     const supersedes = await currentTelemetryV1Chunk(db(), PARTICIPANT, fixture.deviceId, "usage", DAY, 0);
     await insertTelemetryV1Chunk(db(), await prepareChunk(fixture, { revision: 2, supersedes }));
     expect(await db().prepare("SELECT revision FROM telemetry_v1_chunks WHERE superseded_at IS NULL").first())
       .toEqual({ revision: 2 });
-    await expectUnavailable();
+    expect(await cache()).toEqual(oldCache);
+    expect((await publicGraph()).graph).toEqual(graph);
+    expect(await control()).toEqual({ mutation_epoch: before.mutation_epoch + 2,
+      graph_append_epoch: before.mutation_epoch + 2, graph_invalidation_epoch: before.graph_invalidation_epoch });
+    expect(await revision()).toBe(oldRevision! + 2);
+    expect(await db().prepare("SELECT COUNT(*) AS n FROM community_graph_update_scope").first()).toEqual({ n: 0 });
   });
 
-  it("a first-seen higher revision is not misclassified as an append", async () => {
+  it("preserves the publication when the authorized first sync of a new identity starts at a higher revision", async () => {
     const { fixture } = await seedInput(); await seedPublication();
+    const oldCache = await cache(), before = await control();
     await insertTelemetryV1Chunk(db(), await prepareChunk(fixture, { sequence: 1, revision: 2 }));
-    await expectUnavailable();
+    expect(await cache()).toEqual(oldCache);
+    expect((await control()).graph_invalidation_epoch).toBe(before.graph_invalidation_epoch);
   });
 
   it("a revision-1 insert cannot reuse a superseded higher-revision identity as a soft append", async () => {
@@ -253,11 +261,14 @@ describe("preserved graph publication on local D1", () => {
     expect(await cache()).toEqual(oldCache); expect((await publicGraph()).graph).toEqual(oldGraph.graph);
   });
 
-  it("a competing device on an already represented day invalidates the old elected-day result", async () => {
+  it("an authorized competing device marks calculations dirty without revoking the published generation", async () => {
     await seedInput(); const second = await createV11DeviceFixture(db(), { participantId: PARTICIPANT });
     await seedPublication();
+    const oldCache = await cache(), before = await control(), oldRevision = await revision();
     await insertTelemetryV1Chunk(db(), await prepareChunk(second));
-    await expectUnavailable();
+    expect(await cache()).toEqual(oldCache);
+    expect((await control()).graph_invalidation_epoch).toBe(before.graph_invalidation_epoch);
+    expect(await revision()).toBe(oldRevision! + 1);
   });
 
   it("a new device on a disjoint day can append without replacing an existing elected day", async () => {
@@ -347,6 +358,7 @@ describe("preserved graph publication on local D1", () => {
       .toEqual({ accepted_count: 1 });
     expect(await db().prepare("SELECT state FROM device_upload_authorizations WHERE id=?")
       .bind(insert.deviceUploadAuthorizationId).first()).toEqual({ state: "consuming" });
+    expect(await db().prepare("SELECT COUNT(*) AS n FROM community_graph_update_scope").first()).toEqual({ n: 0 });
   });
 
   it.each(["before hard fence", "after current epoch"])("readers reject a snapshot epoch %s even if a faulty writer stores it", async kind => {
@@ -365,13 +377,42 @@ describe("preserved graph publication on local D1", () => {
   });
 
   it("fails both optional snapshot readers closed before migration 0049 without hiding published activity", async () => {
-    await reset(); await applyD1Migrations(db(), migrations().filter(migration => !migration.name.startsWith("0049_")));
-    await seedInput(); await seedPublication();
+    await reset(); await applyD1Migrations(db(), migrations().filter(migration => migration.name < "0049_"));
+    await seedPublication();
     await expect(readCachedAdminCommunityAllowancePreview(db(), NOW))
-      .rejects.toMatchObject({ code: "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE" });
+      .rejects.toMatchObject({ code: "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE" });
     const read = await publicGraph();
     expect(read.read.rows).toEqual([{ day: DAY, revision: 1, payload_json: "{}", released_at: new Date(NOW).toISOString() }]);
     expect(read.read.allowanceBreakdownsCache).toBeNull(); expect(read.graph).toBeNull();
+    expect(read.read.allowanceReadState).toBe("temporarily_unavailable");
+  });
+
+  it("does not revoke or dirty analytical publication for R2 reconciliation and no-op journal updates", async () => {
+    await seedInput(); await seedPublication();
+    const before = await control(), priorRevision = await revision(), priorCache = await cache();
+    await db().prepare("UPDATE telemetry_v1_chunks SET r2_key='synthetic/reconciled',chunk_digest=chunk_digest").run();
+    expect(await control()).toEqual(before);
+    expect(await revision()).toBe(priorRevision);
+    expect(await cache()).toEqual(priorCache);
+  });
+
+  it("cannot preserve a correction across an unexpected hard mutation after its transaction marker", async () => {
+    const { fixture } = await seedInput(); await seedPublication();
+    const supersedes = await currentTelemetryV1Chunk(db(), PARTICIPANT, fixture.deviceId, "usage", DAY, 0);
+    const database = new Proxy(db(), { get(target, property) {
+      if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+        const results = await target.batch([statements[0]!,
+          target.prepare("UPDATE community_snapshot_mutation_control SET mutation_epoch=mutation_epoch+1 WHERE singleton_id=1"),
+          ...statements.slice(1)]);
+        return [results[0]!, ...results.slice(2)];
+      };
+      const value = Reflect.get(target, property, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    await insertTelemetryV1Chunk(database, await prepareChunk(fixture, { revision: 2, supersedes }));
+    await expectUnavailable();
+    expect((await control()).graph_invalidation_epoch).toBe((await control()).mutation_epoch);
+    expect(await db().prepare("SELECT COUNT(*) AS n FROM community_graph_update_scope").first()).toEqual({ n: 0 });
   });
 });
 

@@ -1072,6 +1072,12 @@ test("pending-migration discovery reads only the remote ledger and reports the e
 
 test("reconciled production ledger preserves the historical prefix and refuses alternate applied histories", async () => {
   const expected = EXPECTED_STAGING_MIGRATIONS;
+  const incrementalPending = [
+    "USAGE_MONITOR_DB:0050_preserve_authorized_graph_updates.sql",
+    "USAGE_MONITOR_DB:0051_historical_window_dependencies.sql",
+    "USAGE_MONITOR_DB:0052_prepared_source_days.sql",
+    "USAGE_MONITOR_DB:0053_refresh_lane_watermarks.sql",
+  ];
   const ledgerRows = (names) => names.map((name, index) => ({ id: index + 1, name }));
   const historicalPrefix = expected.USAGE_MONITOR_DB.slice(0, 41);
   assert.equal(historicalPrefix.at(-1), "0041_community_model_composition_cache.sql");
@@ -1096,6 +1102,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       "USAGE_MONITOR_DB:0047_community_analysis_work.sql",
       "USAGE_MONITOR_DB:0048_community_model_history.sql",
       "USAGE_MONITOR_DB:0049_preserve_published_graph.sql",
+      ...incrementalPending,
     ],
   });
   const through45 = expected.USAGE_MONITOR_DB.slice(0, 45);
@@ -1108,6 +1115,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       "USAGE_MONITOR_DB:0047_community_analysis_work.sql",
       "USAGE_MONITOR_DB:0048_community_model_history.sql",
       "USAGE_MONITOR_DB:0049_preserve_published_graph.sql",
+      ...incrementalPending,
     ],
   });
   assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB.slice(0, 46)), {
@@ -1117,6 +1125,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       "USAGE_MONITOR_DB:0047_community_analysis_work.sql",
       "USAGE_MONITOR_DB:0048_community_model_history.sql",
       "USAGE_MONITOR_DB:0049_preserve_published_graph.sql",
+      ...incrementalPending,
     ],
   });
   assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB.slice(0, 47)), {
@@ -1125,13 +1134,19 @@ test("reconciled production ledger preserves the historical prefix and refuses a
     pending: [
       "USAGE_MONITOR_DB:0048_community_model_history.sql",
       "USAGE_MONITOR_DB:0049_preserve_published_graph.sql",
+      ...incrementalPending,
     ],
   });
   assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB.slice(0, 48)), {
     ok: true,
     code: null,
-    pending: ["USAGE_MONITOR_DB:0049_preserve_published_graph.sql"],
+    pending: ["USAGE_MONITOR_DB:0049_preserve_published_graph.sql", ...incrementalPending],
   });
+  for (const count of [49, 50, 51, 52]) {
+    assert.deepEqual(await inspect(expected.USAGE_MONITOR_DB.slice(0, count)), {
+      ok: true, code: null, pending: incrementalPending.slice(count - 49),
+    });
+  }
   for (const applied of [
     [...through45, "0046_unreviewed_quota_index.sql"],
     [...through45, "0046_v1_quota_fit_cursor.sql"],
@@ -1139,6 +1154,8 @@ test("reconciled production ledger preserves the historical prefix and refuses a
     [...through45, "0046_v1_quota_fit_projection.sql", "0047_unreviewed_work.sql"],
     [...expected.USAGE_MONITOR_DB.slice(0, 47), "0048_unreviewed_model_history.sql"],
     [...expected.USAGE_MONITOR_DB.slice(0, 48), "0049_unreviewed_graph_preservation.sql"],
+    ...[50, 51, 52, 53].map(number => [...expected.USAGE_MONITOR_DB.slice(0, number - 1),
+      `${String(number).padStart(4, "0")}_unreviewed.sql`]),
   ]) {
     const index = applied.findIndex((name, item) => name !== expected.USAGE_MONITOR_DB[item]);
     assert.deepEqual(await inspect(applied), {
@@ -1147,7 +1164,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 49,
+        localCount: 53,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });
@@ -1168,7 +1185,7 @@ test("reconciled production ledger preserves the historical prefix and refuses a
       detail: {
         binding: "USAGE_MONITOR_DB",
         appliedCount: applied.length,
-        localCount: 49,
+        localCount: 53,
         firstMismatch: { index, applied: applied[index], local: expected.USAGE_MONITOR_DB[index] },
       },
     });
@@ -1344,13 +1361,17 @@ test("production public-surface recheck requires a public root and real 404s for
   assert.equal(calls[2].url, PUBLIC_SITEMAP_URL);
   assert.equal(calls[3].url, PUBLIC_WWW_ROOT_URL);
   assert.equal(calls[3].request.redirect, "manual");
-  assert.equal(calls.length, 14);
+  assert.equal(calls.length, 15);
   assert.equal(calls.some(({ url }) => url === new URL(
     "/telemetry-shared.generated.js",
     PUBLIC_ROOT_URL,
   ).href), true);
   assert.equal(calls.some(({ url }) => url === new URL(
     "/api/v1/admin/community/allowance-preview",
+    PUBLIC_ROOT_URL,
+  ).href), true);
+  assert.equal(calls.some(({ url }) => url === new URL(
+    "/api/v1/admin/reconstruction-progress",
     PUBLIC_ROOT_URL,
   ).href), true);
 });

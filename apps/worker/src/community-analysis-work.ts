@@ -42,6 +42,14 @@ export interface CommunityAnalysisWorkBudget {
   /** Queries held back for caller source-pin/final publication checks. */
   reserveQueries?: number;
 }
+export interface CommunityAnalysisHistoryRebaseProof {
+  day: string;
+  fromDay: string;
+  dependencyRevision: number;
+  /** Exact old vector digest, recomputed from the newly pinned source only. */
+  previousFingerprint: string;
+  maintenanceLease: string;
+}
 export interface CommunityAnalysisPartReference {
   component: V1QuotaWorkComponent;
   partKey: number;
@@ -50,6 +58,8 @@ export interface CommunityAnalysisPartReference {
 }
 export interface CommunityAnalysisWorkHead {
   identity: CommunityAnalysisWorkIdentity;
+  /** Absent on pre-upgrade/raw heads so their persisted hashes remain exact. */
+  readerPolicy?: "prepared-source-days-1";
   runId: string;
   progressRevision: number;
   phase: "plan" | "fitability" | "endpoints" | "complete";
@@ -207,7 +217,9 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
     return phase === control.phase || (phase === "complete" && control.phase === "endpoints");
   }
   function validateHead(head: CommunityAnalysisWorkHead): void {
-    if (!record(head) || !exactKeys(head, ["identity", "runId", "progressRevision", "phase", "control", "manifest"])) invalid();
+    const keys = ["identity", "runId", "progressRevision", "phase", "control", "manifest"];
+    if (!record(head) || !(exactKeys(head, keys) || (head.readerPolicy === "prepared-source-days-1"
+      && exactKeys(head, [...keys, "readerPolicy"])))) invalid();
     validateIdentity(head.identity);
     encodeControl(head.control); encodeManifest(head.manifest);
     if (typeof head.runId !== "string" || !RUN_ID.test(head.runId) || !integer(head.progressRevision) || !phaseValid(head.phase, head.control)) invalid();
@@ -224,14 +236,14 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
       AND h.input_revision = ? AND h.input_fingerprint = ?
       AND h.source_kind = ? AND h.source_method_version = ? AND h.fixed_now = ?
       AND h.observed_at_cutoff = ? AND h.resets_at_cutoff = ? AND h.window_minutes = ? AND h.max_quota_rows = ?
-      AND h.state_sha256 = ?
+      AND h.state_sha256 = ? AND h.reader_policy = ?
       AND p.state = 'active' AND v.revision = h.input_revision
       AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads d WHERE d.participant_id=p.id))`;
   async function guardValues(head: CommunityAnalysisWorkHead): Promise<unknown[]> {
     const i = head.identity;
     return [i.participantId, head.runId, head.progressRevision, i.inputRevision, i.inputFingerprint,
       i.sourceKind, i.sourceMethodVersion, i.fixedNow, i.observedAtCutoff, i.resetsAtCutoff, i.windowMinutes, i.maxQuotaRows,
-      await sha256Hex(canonicalJson(head))];
+      await sha256Hex(canonicalJson(head)), head.readerPolicy ?? "raw-source-pages-1"];
   }
 
   /** Start an empty run. Replacing old work requires its exact run/progress token.
@@ -239,15 +251,17 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
    * an erased participant or steal newer work. The caller has verified its source pin. */
   async function beginCommunityAnalysisWork(db: D1Database, identity: CommunityAnalysisWorkIdentity,
     control: V1QuotaWorkControl, budget: CommunityAnalysisWorkBudget,
-    replace?: { runId: string; progressRevision: number }): Promise<CommunityAnalysisWorkRead> {
+    replace?: { runId: string; progressRevision: number },
+    readerPolicy?: "prepared-source-days-1"): Promise<CommunityAnalysisWorkRead> {
     validateIdentity(identity);
+    if (readerPolicy !== undefined && readerPolicy !== "prepared-source-days-1") invalid();
     const controlJson = encodeControl(control);
     if (control.phase !== "plan" || control.planTime !== null || control.reset !== null || control.cursor.id !== 0
       || control.cursor.observedAt !== identity.observedAtCutoff || control.cursor.resetsAt !== identity.resetsAtCutoff
       || (replace && (!RUN_ID.test(replace.runId) || !integer(replace.progressRevision)))) invalid();
     const runId = crypto.randomUUID();
     const head: CommunityAnalysisWorkHead = { identity: { ...identity }, runId, progressRevision: 0,
-      phase: "plan", control, manifest: [] };
+      phase: "plan", control, manifest: [], ...(readerPolicy ? { readerPolicy } : {}) };
     const stateHash = await sha256Hex(canonicalJson(head));
     const statements: D1PreparedStatement[] = [];
     if (replace) statements.push(db.prepare(`DELETE FROM ${tables.head}
@@ -257,12 +271,13 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
       .bind(identity.participantId, replace.runId, replace.progressRevision, identity.participantId, identity.inputRevision));
     statements.push(db.prepare(`INSERT INTO ${tables.head}
       (participant_id,run_id,input_revision,input_fingerprint,source_kind,source_method_version,fixed_now,
-       observed_at_cutoff,resets_at_cutoff,window_minutes,max_quota_rows,phase,progress_revision,control_json,manifest_json,state_sha256)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,'plan',0,?,'[]',?
+       observed_at_cutoff,resets_at_cutoff,window_minutes,max_quota_rows,phase,progress_revision,control_json,manifest_json,state_sha256,reader_policy)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,'plan',0,?,'[]',?,?
       WHERE ${SOURCE_GUARD} AND NOT EXISTS (SELECT 1 FROM ${tables.head} WHERE participant_id = ?)`)
       .bind(identity.participantId, runId, identity.inputRevision, identity.inputFingerprint, identity.sourceKind,
         identity.sourceMethodVersion, identity.fixedNow, identity.observedAtCutoff, identity.resetsAtCutoff,
-        identity.windowMinutes, identity.maxQuotaRows, controlJson, stateHash, identity.participantId, identity.inputRevision, identity.participantId));
+        identity.windowMinutes, identity.maxQuotaRows, controlJson, stateHash, readerPolicy ?? "raw-source-pages-1",
+        identity.participantId, identity.inputRevision, identity.participantId));
     if (!spend(budget, statements.length)) return { status: "deferred" };
     const results = await db.batch(statements);
     if (results.at(-1)?.meta.changes !== 1) return { status: "stale" };
@@ -293,9 +308,11 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
       if (!validateV1QuotaWorkControl(control) || !validateManifest(manifest)
         || typeof row.run_id !== "string" || !RUN_ID.test(row.run_id) || !integer(row.progress_revision)
         || !["plan", "fitability", "endpoints", "complete"].includes(String(row.phase))) return { status: "corrupt" };
+      if (row.reader_policy !== "raw-source-pages-1" && row.reader_policy !== "prepared-source-days-1") return { status: "corrupt" };
       const head: CommunityAnalysisWorkHead = { identity: storedIdentity,
         runId: row.run_id, progressRevision: row.progress_revision,
-        phase: row.phase as CommunityAnalysisWorkHead["phase"], control, manifest };
+        phase: row.phase as CommunityAnalysisWorkHead["phase"], control, manifest,
+        ...(row.reader_policy === "prepared-source-days-1" ? { readerPolicy: "prepared-source-days-1" as const } : {}) };
       if (!phaseValid(head.phase, control) || typeof row.state_sha256 !== "string"
         || !HASH.test(row.state_sha256) || await sha256Hex(canonicalJson(head)) !== row.state_sha256) return { status: "corrupt" };
       return { status: "ready", head };
@@ -443,9 +460,14 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
     return { ...head, progressRevision: stage.baseProgressRevision + 1,
       phase: stage.target.phase, control: stage.target.control, manifest: stage.target.manifest };
   }
+  function replayPolicyMatches(head: CommunityAnalysisWorkHead, replay: V1QuotaPageReplay): boolean {
+    return head.readerPolicy === "prepared-source-days-1"
+      ? replay.version === "v1-quota-page-replay-2" && replay.readerPolicy === head.readerPolicy && replay.pageSize === 128
+      : replay.version === "v1-quota-page-replay-1";
+  }
   function replayMatches(head: CommunityAnalysisWorkHead, target: Pick<CommunityAnalysisStageTarget, "phase" | "control">,
     replay: unknown): replay is V1QuotaPageReplay {
-    if (!validateV1QuotaPageReplay(replay)
+    if (!validateV1QuotaPageReplay(replay) || !replayPolicyMatches(head, replay)
       || canonicalJson(replay.from) !== canonicalJson({ phase: head.phase, cursor: head.control.cursor })
       || canonicalJson(replay.through) !== canonicalJson({ phase: target.phase, cursor: target.control.cursor })) return false;
     const phases = ["plan", "fitability", "endpoints", "complete"];
@@ -494,7 +516,7 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
         || (stage.discardInputRevision > head.identity.inputRevision ? stage.replay !== null
           : stage.discardInputRevision !== head.identity.inputRevision || !supersessionValid(head, stage.replay))) invalid();
     } else {
-      if (stage.discardInputRevision !== null || !validateV1QuotaPageReplay(stage.replay)
+      if (stage.discardInputRevision !== null || !validateV1QuotaPageReplay(stage.replay) || !replayPolicyMatches(head, stage.replay)
         || canonicalJson(stage.replay.through) !== canonicalJson({ phase: stage.target.phase, cursor: stage.target.control.cursor })) invalid();
       if (stage.mode === "garbage_collecting") {
         if (head.progressRevision !== stage.baseProgressRevision + 1 || !headEqual(head, targetHead(head, stage))) invalid();
@@ -786,6 +808,84 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
     return { status: "ready", head: read.head, stage: staged.stage };
   }
 
+  /** Rebind unchanged CLOSED-WINDOW evidence to a newer transaction fence.
+   * Never available to current work, never weakens ordinary source guards, and
+   * never revives a discard. Immutable parts and replay cursors remain intact.
+   * The caller proved the old digest against the exact new window source; the
+   * dependency watch and current account/lease fence are checked in this batch. */
+  async function rebaseCommunityAnalysisWork(db: D1Database, identity: CommunityAnalysisWorkIdentity,
+    proof: CommunityAnalysisHistoryRebaseProof, budget: CommunityAnalysisWorkBudget): Promise<CommunityAnalysisWorkRead> {
+    validateIdentity(identity);
+    if (namespace !== "model-history" || !integer(proof.dependencyRevision)
+      || !HASH.test(proof.previousFingerprint) || !proof.maintenanceLease
+      || !/^\d{4}-\d{2}-\d{2}$/u.test(proof.day)
+      || identity.fixedNow !== `${proof.day}T23:59:59.999Z`
+      || identity.observedAtCutoff !== `${proof.fromDay}T00:00:00.000Z`) invalid();
+    if (!spend(budget, 1)) return { status: "deferred" };
+    const read = await readHead(db, identity, true);
+    if (read.status !== "ready") return read;
+    const head = read.head;
+    if (head.identity.inputRevision > identity.inputRevision
+      || head.identity.inputFingerprint !== proof.previousFingerprint
+      || !identityEqual({ ...head.identity, inputRevision: identity.inputRevision, inputFingerprint: identity.inputFingerprint }, identity)) {
+      return { status: "stale" };
+    }
+    if (identityEqual(head.identity, identity)) return read;
+    if (!spend(budget, 1)) return { status: "deferred" };
+    const staged = await readStageUncharged(db, head, identity.inputRevision);
+    if (staged.status !== "absent" && staged.status !== "ready") return { status: staged.status === "corrupt" ? "corrupt" : "stale" };
+    const stage = staged.status === "ready" ? staged.stage : null;
+    if (stage?.mode === "discarding" || stage && stage.revision >= Number.MAX_SAFE_INTEGER - 1) return { status: "stale" };
+    const nextHead = { ...head, identity: { ...identity } };
+    const nextStage = stage ? { ...stage, revision: stage.revision + 1,
+      target: { ...stage.target, stateSha256: await sha256Hex(canonicalJson(targetHead(nextHead, stage))) } } : null;
+    if (nextStage) await validateStage(nextHead, nextStage);
+    const oldHash = await sha256Hex(canonicalJson(head)), newHash = await sha256Hex(canonicalJson(nextHead));
+    const oldStageHash = stage ? await stageHash(head, stage) : null;
+    const newStageHash = nextStage ? await stageHash(nextHead, nextStage) : null;
+    const guard = `EXISTS (SELECT 1 FROM participants p
+      JOIN community_analytical_input_versions v ON v.participant_id=p.id
+      JOIN community_model_history_dependencies d ON d.participant_id=p.id
+      WHERE p.id=? AND p.state='active' AND v.revision=? AND d.day=? AND d.from_day=?
+        AND d.dependency_revision=? AND d.input_fingerprint=? AND d.verified_input_revision=?
+        AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id=p.id)
+        AND NOT EXISTS (SELECT 1 FROM telemetry_contributions c WHERE c.participant_id=p.id
+          AND c.status='accepted' AND c.transport_schema_version='telemetry-contribution-v0.2'))
+      AND EXISTS (SELECT 1 FROM retention_state WHERE singleton=1 AND maintenance_lease_token=?
+        AND maintenance_lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))`;
+    const values = [identity.participantId, identity.inputRevision, proof.day, proof.fromDay,
+      proof.dependencyRevision, identity.inputFingerprint, identity.inputRevision, proof.maintenanceLease];
+    const stageGuardSql = stage
+      ? `EXISTS (SELECT 1 FROM ${tables.stage} s WHERE s.participant_id=? AND s.run_id=? AND s.stage_id=? AND s.stage_revision=? AND s.state_sha256=?)`
+      : `NOT EXISTS (SELECT 1 FROM ${tables.stage} s WHERE s.participant_id=?)`;
+    const stageValues = stage ? [identity.participantId, head.runId, stage.stageId, stage.revision, oldStageHash] : [identity.participantId];
+    const statements = [db.prepare(`UPDATE ${tables.head} SET input_revision=?,input_fingerprint=?,state_sha256=?
+      WHERE participant_id=? AND run_id=? AND progress_revision=? AND state_sha256=? AND ${guard} AND ${stageGuardSql}`)
+      .bind(identity.inputRevision, identity.inputFingerprint, newHash, identity.participantId,
+        head.runId, head.progressRevision, oldHash, ...values, ...stageValues)];
+    if (stage && nextStage) statements.push(db.prepare(`UPDATE ${tables.stage}
+      SET stage_revision=?,target_state_sha256=?,state_sha256=?
+      WHERE participant_id=? AND run_id=? AND stage_id=? AND stage_revision=? AND state_sha256=? AND changes()=1`)
+      .bind(nextStage.revision, nextStage.target.stateSha256, newStageHash, identity.participantId,
+        head.runId, stage.stageId, stage.revision, oldStageHash));
+    const finalStageValues = nextStage
+      ? [identity.participantId, head.runId, nextStage.stageId, nextStage.revision, newStageHash] : [identity.participantId];
+    // A failed stage/final guard must ROLLBACK the earlier head update, not
+    // strand a half-rebound head. The NOT NULL constraint is the assertion.
+    statements.push(db.prepare(`UPDATE ${tables.head} SET state_sha256=CASE
+      WHEN state_sha256=? AND ${guard} AND ${stageGuardSql} THEN state_sha256 ELSE NULL END
+      WHERE participant_id=? AND run_id=?`)
+      .bind(newHash, ...values, ...finalStageValues, identity.participantId, head.runId));
+    if (!spend(budget, statements.length)) return { status: "deferred" };
+    try {
+      const results = await db.batch(statements);
+      return results.every(result => result.meta.changes === 1) ? { status: "ready", head: nextHead } : { status: "stale" };
+    } catch (error) {
+      if (error instanceof Error && error.message.includes(`NOT NULL constraint failed: ${tables.head}.state_sha256`)) return { status: "stale" };
+      throw error;
+    }
+  }
+
   async function collectCommunityAnalysisWorkGarbage(db: D1Database, head: CommunityAnalysisWorkHead,
     stage: CommunityAnalysisWorkStage, budget: CommunityAnalysisWorkBudget): Promise<
       | { status: "ready"; stage: CommunityAnalysisWorkStage; done: false }
@@ -853,6 +953,7 @@ export function createCommunityAnalysisWorkStore(namespace: "current" | "model-h
     beginCommunityAnalysisSupersession,
     readCommunityAnalysisWorkForSupersession,
     readCommunityAnalysisWorkForDiscard,
+    rebaseCommunityAnalysisWork,
     collectCommunityAnalysisWorkGarbage,
   });
 }

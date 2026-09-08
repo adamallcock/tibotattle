@@ -100,19 +100,25 @@ inputs retry `after_analysis`. Odd minutes preserve reconstruction's full budget
 and only attempt `after_analysis` publication. Both run before daily
 reconciliation. Refreshed rows and
 deferrals log `queriesUsed`, `phaseQueries`, `elapsedMs` and
-`deadlineRemainingMs`. An unchanged same-day preview is quiet and retains the
-55-minute refresh interval. Changed input epochs bypass the throttle. Migration
-0049 preserves published snapshots during append-only uploads; it never changes
-their generation timestamps or invents newer evidence. Corrections, withdrawals
-and other hard invalidations still clear the snapshot immediately.
+`deadlineRemainingMs`. An unchanged same-day preview is quiet; it no longer
+rebuilds after an age threshold. Changed inputs or newly completed model dates
+trigger publication. Migration 0050 preserves published snapshots during
+validated appends and corrections, without changing their timestamps. Withdrawal,
+erasure, policy changes and unrecognized direct mutations still invalidate them.
 
-The separate admin growth-history cache retains its two-hour read limit.
+The separate admin growth-history cache has no age-only read limit.
 Inspect `admin_metrics_history_cache.generated_at` and the latest
 `admin_metric_snapshots.captured_at` independently of allowance availability.
 Even-minute passes give these self-throttled caches an early opportunity after
 allowance publication. `admin_metrics_snapshot` and `admin_metrics_history_cache`
 log refresh/failure timing or `OWNER_METRICS_BUDGET_DEFERRED`; a current cache is
 quiet. Their failure must not be reported as an allowance or database outage.
+
+The independent owner-only `/api/v1/admin/reconstruction-progress` request
+shows exact requested/prepared/published generations and historical progress.
+A temporary storage failure preserves the last validated graph while this lane
+can continue reporting. Confirmed invalidation or revoked owner access clears
+the affected private data. Refresh requests never perform calculations.
 
 ### Only one day in the admin "By model" chart
 
@@ -142,6 +148,12 @@ not proof that the migration or Worker has been deployed.
   input window includes the corrected date; source transitions and withdrawal
   invalidate affected reconstructed cohorts. Private derived work follows
   participant erasure. Bounded cleanup removes only obsolete derived results.
+- Migration 0051 separates window dependencies from participant write revisions.
+  Unrelated out-of-window uploads retain results and checkpoint parts after exact
+  source revalidation. Migration 0052 prepares elected source days once for
+  overlapping windows; raw and prepared in-flight pages retain separate replay
+  policies. Migration 0053 skips completed unchanged current/daily lanes before
+  raw reads. Preserve all generation, method and lease checks during diagnosis.
 - The healthy preview stays available; new reconstructed points enter its
   normal atomic refresh, not necessarily the next browser refresh. No forced
   live replay or production cache clearing is part of local qualification.
@@ -174,8 +186,8 @@ The v1.1 public graph projection includes the combined summary so all three
 views advance atomically without substituting values into immutable daily
 revisions. Visible pages refresh once a minute and preserve the display on
 transient errors, but clear it for authoritative invalidation. New inputs should
-not produce the global updating placeholder unless the input is a correction or
-another hard-invalidating source transition.
+not produce the global updating placeholder for validated corrections either;
+only a confirmed hard-invalidating transition can revoke an authorized snapshot.
 
 Sample counts may be one account and must remain visibly disclosed. No
 account identifiers, private coverage diagnostics or plan-by-model cross-tabs

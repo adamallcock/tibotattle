@@ -98,7 +98,9 @@ describe("date-specific historical model acquisition", () => {
     await insertRecords(fixture, "future", future);
     const next = await historyInput();
     expect(next.sourcePin.inputRevision).toBeGreaterThan(input.sourcePin.inputRevision!);
-    expect(next.sourcePin.fingerprint).not.toBe(input.sourcePin.fingerprint);
+    // Upload fencing advances, but later-day data is not a dependency of this
+    // closed historical fit. Its exact vector identity must remain reusable.
+    expect(next.sourcePin.fingerprint).toBe(input.sourcePin.fingerprint);
     expect(next.sourcePin.winners).toEqual(input.sourcePin.winners);
     const after = await fit(DAY, next, (await acquire(next)).evidence);
     expect(withoutFingerprint(after)).toEqual(withoutFingerprint(before));

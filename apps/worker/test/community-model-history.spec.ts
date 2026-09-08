@@ -238,7 +238,9 @@ describe("historical model warmer and retrospective publication", () => {
     const fixture = await seedModelHistoryFixture({ participantId: "history-resumable" });
     await seedCurrentCaches(fixture.participantId);
     const before = await currentCaches();
-    const first = await warm(100);
+    // Prepared evidence reduces finishing cost, so use a smaller allocation to
+    // retain this test's intentional acquisition-only first invocation.
+    const first = await warm(85);
     expect(first.progress).toMatchObject({ day: DAY, requiredAccounts: 1, resolvedAccounts: 0, publishedDays: 0 });
     const saved = await db().prepare("SELECT run_id,phase,progress_revision FROM community_model_history_work").first<{
       run_id: string; phase: string; progress_revision: number;

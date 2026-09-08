@@ -26,6 +26,7 @@ import {
   resolveInitialPublicPlatform,
   renderPublicInstallerJourney,
   wirePublicPlatformSelector,
+  selectCommunityAllowancePayload,
 } from "../public/community.js";
 import {
   compactMacOSVersion,
@@ -1444,6 +1445,28 @@ function publishedDailySeries(overrides = {}) {
     ...overrides,
   };
 }
+
+test("an activity-only storage fallback preserves only the confirmed allowance observation", () => {
+  const previous = publishedDailySeries();
+  const temporary = publishedDailySeries({
+    allowanceState: "updating", allowanceReadState: "temporarily_unavailable",
+    days: [publishedDailyDay("2026-08-07", 3)],
+  });
+  assert.equal(selectCommunityAllowancePayload(previous, temporary), previous);
+  assert.equal(normalizeCommunityDailySeries(temporary).days[0].revision, 3,
+    "the new daily activity remains independently renderable");
+  assert.equal(selectCommunityAllowancePayload(null, temporary), null,
+    "a temporary response cannot invent a first graph");
+  const withdrawn = publishedDailySeries({ allowanceState: "updating", allowanceReadState: "confirmed", days: [] });
+  assert.equal(selectCommunityAllowancePayload(previous, withdrawn), withdrawn);
+  assert.equal(selectCommunityAllowancePayload(withdrawn, temporary), withdrawn,
+    "later read failures cannot resurrect a withdrawn graph");
+  assert.equal(selectCommunityAllowancePayload(previous, null), null);
+  const malformed = { ...temporary, days: "malformed" };
+  assert.equal(selectCommunityAllowancePayload(previous, malformed), malformed,
+    "an invalid payload cannot use a fallback marker as authority");
+  assert.equal(normalizeCommunityDailySeries({ ...temporary, allowanceReadState: "unreviewed" }).state, "unsupported_schema");
+});
 
 test("the public daily client requests exactly the inclusive year window", async () => {
   const calls = [];

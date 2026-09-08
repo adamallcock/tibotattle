@@ -196,13 +196,44 @@ interface PlanEvidenceRow {
   plan_variant: string | null;
 }
 
-interface WindowedUsageRow {
+export interface WindowedUsageRow {
   id: number;
   occurrence_id: string;
   observed_at: string;
   provider: string;
   session_uuid: string | null;
   record_json: string;
+  /** Only a source-pinned server preparation reader may supply this value.
+   * Explicit null preserves DROP; absence selects the original raw pricer. */
+  preparedPrice?: ReturnType<typeof priceChunkUsageRecord>;
+}
+
+export interface V1PreparedUsageFragment {
+  id: number;
+  observed_at: string;
+  provider: string;
+  binStartMs: number;
+  usageEventCount: number;
+  unpricedUsageEventCount: number;
+  cells: { model: string; costNanousd: number; overflowed: boolean;
+    firstObservedAt: string; firstOccurrenceId: string }[];
+}
+
+export interface V1PreparedUsageReader {
+  readPage(observedAt: string, id: number, limit: number, observedAtBefore?: string): Promise<WindowedUsageRow[]>;
+}
+
+export interface V1PreparedUsageBinsReader {
+  /** Includes every selected usage record, including DROP and other providers. */
+  readonly totalRowCount: number;
+  readonly fragmentCount: number;
+  readPage(observedAt: string, id: number, limit: number): Promise<V1PreparedUsageFragment[]>;
+}
+
+export interface V1PreparedFinishEvidence {
+  readonly sourceFingerprint: string;
+  readonly usageReader: V1PreparedUsageReader;
+  readonly usageBins: V1PreparedUsageBinsReader;
 }
 
 // Row shape for the test-only full reference path (both streams in one read).
@@ -274,6 +305,7 @@ export interface V1AnalysisOptions {
   maxWindowedUsageRows?: number;
   /** Reuse the collector's exact day/device vector; never re-elect mid-read. */
   sourcePin?: V1SourcePin;
+  preparedEvidence?: V1PreparedFinishEvidence;
 }
 
 export interface V1AcquiredQuotaEvidence {
@@ -296,14 +328,33 @@ export function v1QuotaFinishQueryReserve(maxUsageRows = MAX_WINDOWED_USAGE_ROWS
   return 5 + 2 * (Math.floor(maxUsageRows / USAGE_PAGE_SIZE) + 1);
 }
 
-function reserveV1QuotaFinish(budget: V1QuotaInvocationBudget, options: V1AnalysisOptions): boolean {
+/** Exact bounded read allowance for the selected prepared finishing path.
+ * Factories/readiness are caller-owned; unchanged source validation keeps its
+ * five-query allowance. Sparse bins fall back to prepared event pages. */
+export function v1PreparedFinishQueryReserve(prepared: V1PreparedFinishEvidence,
+  maxUsageRows = MAX_WINDOWED_USAGE_ROWS, scalarRequested = true): number {
+  v1QuotaFinishQueryReserve(maxUsageRows);
+  const { totalRowCount, fragmentCount } = prepared.usageBins;
+  if (!Number.isSafeInteger(totalRowCount) || totalRowCount < 0
+    || !Number.isSafeInteger(fragmentCount) || fragmentCount < 0 || fragmentCount > totalRowCount) {
+    throw new TypeError("v1 prepared finish counts invalid");
+  }
+  if (!scalarRequested && totalRowCount > maxUsageRows) return 5;
+  const eventQueries = Math.floor(Math.min(totalRowCount, maxUsageRows) / USAGE_PAGE_SIZE) + 1;
+  const binQueries = Math.floor(fragmentCount / 256) + 1;
+  return 5 + (scalarRequested ? eventQueries : Math.min(eventQueries, binQueries));
+}
+
+function reserveV1QuotaFinish(budget: V1QuotaInvocationBudget, options: V1AnalysisOptions, scalarRequested = true): boolean {
   if (!Number.isSafeInteger(budget.remainingQueries) || budget.remainingQueries < 0
       || !Number.isFinite(budget.deadlineMs)) throw new TypeError("v1 finish budget invalid");
   const maxQuotaRows = options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS;
   if (!Number.isSafeInteger(maxQuotaRows) || maxQuotaRows < 1 || maxQuotaRows > MAX_DOWNSAMPLED_QUOTA_ROWS) {
     throw new TypeError("v1 finish quota bound invalid");
   }
-  const required = v1QuotaFinishQueryReserve(options.maxWindowedUsageRows);
+  const required = options.preparedEvidence
+    ? v1PreparedFinishQueryReserve(options.preparedEvidence, options.maxWindowedUsageRows, scalarRequested)
+    : v1QuotaFinishQueryReserve(options.maxWindowedUsageRows);
   const now = (budget.now ?? Date.now)();
   if (!Number.isFinite(now)) throw new TypeError("v1 finish budget clock invalid");
   if (budget.remainingQueries < required || now >= budget.deadlineMs) return false;
@@ -373,7 +424,7 @@ export async function finishAccountScopedModelCompositionV1(
 ): Promise<{ status: "deferred" } | { status: "complete"; analysis: V1ModelCompositionResult }> {
   requireAcquiredQuotaEvidence(evidence);
   if (!options.sourcePin) throw new Error("v1 acquired finish requires source pin");
-  if (!reserveV1QuotaFinish(budget, options)) return { status: "deferred" };
+  if (!reserveV1QuotaFinish(budget, options, false)) return { status: "deferred" };
   const result = await finishAcquiredAnalyses(db, participantId, evidence, options, false, true);
   return { status: "complete", analysis: result.modelComposition };
 }
@@ -387,7 +438,7 @@ export async function finishHistoricalModelCompositionV1(
   const history = modelHistoryWindow(day);
   requireAcquiredQuotaEvidence(evidence);
   if (!options.sourcePin) throw new Error("v1 historical finish requires source pin");
-  if (!reserveV1QuotaFinish(budget, options)) return { status: "deferred" };
+  if (!reserveV1QuotaFinish(budget, options, false)) return { status: "deferred" };
   const result = await finishAcquiredAnalyses(db, participantId, evidence,
     { ...options, nowMs: Date.parse(history.fixedNow) }, false, true, history);
   return { status: "complete", analysis: result.modelComposition };
@@ -1049,6 +1100,7 @@ async function readAndBucketUsage(
   composition?: ReturnType<typeof createCompositionUsageAccumulator>,
   scalarEnabled = true,
   observedAtBefore?: string,
+  preparedUsage?: V1PreparedUsageReader,
 ): Promise<AttributedUsageEventPartial[] | "limit_exceeded" | "session_scope_limit_exceeded" | "cost_limit_exceeded"> {
   // Per provider: strictly-interior events keyed by their ceiling grid instant,
   // and grid-exact events kept as their own singleton at that instant (the
@@ -1121,7 +1173,9 @@ async function readAndBucketUsage(
   let cursorObs = observedAtCutoff;
   let cursorId = 0;
   for (;;) {
-    const rows = await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore);
+    const rows = preparedUsage
+      ? await preparedUsage.readPage(cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore)
+      : await readV1UsagePage(db, winnersJsonArg, participantId, cursorObs, cursorId, USAGE_PAGE_SIZE, observedAtBefore);
     if (rows.length === 0) break;
     total += rows.length;
     if (total > maxWindowedUsageRows) {
@@ -1136,7 +1190,7 @@ async function readAndBucketUsage(
       const scalarPriceNeeded = scalarEnabled && !scalarFailure && grid && grid.sortedMs.length > 0
         && eMs <= grid.sortedMs[grid.sortedMs.length - 1]!;
       const priced = scalarPriceNeeded || composition?.accepts(row.provider)
-        ? priceChunkUsageRecord(row.record_json, row.observed_at) : null;
+        ? Object.hasOwn(row, "preparedPrice") ? row.preparedPrice! : priceChunkUsageRecord(row.record_json, row.observed_at) : null;
       composition?.add(row, eMs, priced);
       if (!scalarEnabled || scalarFailure) continue;
       if (pendingObservedAt !== row.observed_at) {
@@ -1743,6 +1797,23 @@ function createCompositionUsageAccumulator(providers: ReadonlySet<string>, relev
   return {
     accepts(provider: string) { return providers.has(provider); },
     limitExceeded() { limited = true; },
+    addPreparedFragment(fragment: V1PreparedUsageFragment) {
+      if (!providers.has(fragment.provider)) return;
+      if (currentBin !== fragment.binStartMs) { flush(); currentBin = fragment.binStartMs; }
+      usageEventCount += fragment.usageEventCount;
+      unpricedUsageEventCount += fragment.unpricedUsageEventCount;
+      if (fragment.unpricedUsageEventCount > 0) poisoned = true;
+      for (const cell of fragment.cells) {
+        const previous = costs.get(cell.model);
+        if (!previous) { costs.set(cell.model, { ...cell }); continue; }
+        if (cell.overflowed || cell.costNanousd > Number.MAX_SAFE_INTEGER - previous.costNanousd) previous.overflowed = true;
+        else if (!previous.overflowed) previous.costNanousd += cell.costNanousd;
+        if (cell.firstObservedAt < previous.firstObservedAt
+          || cell.firstObservedAt === previous.firstObservedAt && cell.firstOccurrenceId < previous.firstOccurrenceId) {
+          previous.firstObservedAt = cell.firstObservedAt; previous.firstOccurrenceId = cell.firstOccurrenceId;
+        }
+      }
+    },
     add(row: WindowedUsageRow, observedAtMs: number, priced: ReturnType<typeof priceChunkUsageRecord>) {
       if (!providers.has(row.provider) || priced === null) return;
       const bin = Math.floor(observedAtMs / MODEL_COMPOSITION_POLICY.grainMs) * MODEL_COMPOSITION_POLICY.grainMs;
@@ -1819,6 +1890,9 @@ async function collectAcquiredAnalyses(db: D1Database, participantId: string, ev
   sourcePin: V1SourcePin, observedAtCutoff: string, resetsAtCutoff: string,
   history?: ModelHistoryWindow,
 ) {
+  if (options.preparedEvidence && options.preparedEvidence.sourceFingerprint !== sourcePin.fingerprint) {
+    throw new Error("v1 prepared evidence source mismatch");
+  }
   const prepared = await validateAcquiredQuotaEvidence(db, participantId, evidence, sourcePin,
     observedAtCutoff, resetsAtCutoff, options.maxDownsampledQuotaRows ?? MAX_DOWNSAMPLED_QUOTA_ROWS, history);
   const { attributionIndex: index, results: rows } = prepared;
@@ -1861,9 +1935,31 @@ async function collectAcquiredAnalyses(db: D1Database, participantId: string, ev
   const datasetId = await v1DatasetId(participantId);
   const composition = compositionReason === null ? createCompositionUsageAccumulator(compositionProviders,
     compositionQuotaBins(rows.filter(validCompositionQuotaRow).map(row => Date.parse(row.observed_at)))) : undefined;
-  const usage = scalarReason === null || composition ? await readAndBucketUsage(db, participantId, datasetId,
-    observedAtCutoff, accountTracks, gridByProvider, options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS,
-    sourcePin.winnersJson, index, composition, scalarReason === null, history?.observedAtBefore) : [];
+  const maxUsage = options.maxWindowedUsageRows ?? MAX_WINDOWED_USAGE_ROWS;
+  const preparedBins = options.preparedEvidence?.usageBins;
+  // Sparse data can have one fragment per event; use already-priced events in
+  // that case so preparation never expands the existing finish query reserve.
+  const useBins = scalarReason !== null && composition && preparedBins
+    && (preparedBins.totalRowCount > maxUsage || Math.floor(preparedBins.fragmentCount / 256) + 1
+      <= Math.floor(Math.min(preparedBins.totalRowCount, maxUsage) / USAGE_PAGE_SIZE) + 1);
+  let usage: Awaited<ReturnType<typeof readAndBucketUsage>> = [];
+  if (useBins) {
+    if (preparedBins.totalRowCount > maxUsage) composition.limitExceeded();
+    else {
+      let cursorTime = observedAtCutoff, cursorId = 0;
+      for (;;) {
+        const page = await preparedBins.readPage(cursorTime, cursorId, 256);
+        for (const fragment of page) composition.addPreparedFragment(fragment);
+        if (page.length < 256) break;
+        cursorTime = page[page.length - 1]!.observed_at; cursorId = page[page.length - 1]!.id;
+      }
+    }
+  } else if (scalarReason === null || composition) {
+    usage = await readAndBucketUsage(db, participantId, datasetId,
+      observedAtCutoff, accountTracks, gridByProvider, maxUsage,
+      sourcePin.winnersJson, index, composition, scalarReason === null, history?.observedAtBefore,
+      options.preparedEvidence?.usageReader);
+  }
   gridByProvider.clear();
   if (scalarReason === null && typeof usage === "string") scalarReason = usage === "limit_exceeded"
     ? "windowed_usage_limit_exceeded" : usage === "session_scope_limit_exceeded"

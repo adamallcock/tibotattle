@@ -22,7 +22,7 @@ the [macOS stable release runbook](./macos-stable-release-runbook.md).
 |---|---|
 | Public and `www` hosts | One production Worker and manifest-verified static release-site assets |
 | Admin host | Same Worker, but admin routes exist only on `admin.tibotattle.com`, behind Cloudflare Access and a Worker-side owner check |
-| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0049_preserve_published_graph.sql`; this is a source inventory, not proof of remote application |
+| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0053_refresh_lane_watermarks.sql`; this is a source inventory, not proof of remote application |
 | Deletion ledger | Separate `DELETION_LEDGER` D1 binding and migration ledger |
 | Encrypted/quarantined objects | Production `QUARANTINE` R2 binding with explicit deletion/reconciliation and deletion-safe restore rules; automatic age-based deletion is disabled in this source snapshot |
 | Upload admission | `UPLOAD_INGRESS_BUDGET` Durable Object plus explicit rate-limit bindings |
@@ -64,8 +64,8 @@ Up to sixteen account attempts may use available resources in one run. Rotate
 the first account by three-minute priority round so large accounts cannot alias
 with the schedule. When the last account finishes, re-read the same complete
 cohort once for source-fenced publication within the same budget. Keep a healthy
-preview; a bounded date-index check lets newly completed model dates bypass the
-normal refresh throttle without clearing the cache. See the
+preview; a bounded date-index check lets newly completed model dates trigger
+publication without clearing the cache. See the
 [allowance diagnosis runbook](2026-08-13-community-allowance-band-diagnosis.md)
 for historical interpretation and gap semantics.
 
@@ -95,13 +95,13 @@ preview first, current-account reconstruction first, then historical models firs
 This gives ready graphs an early refresh opportunity without letting a large
 incomplete cohort repeatedly crowd out the calculations needed to repair it.
 An unavailable early preview retries after reconstruction and before daily
-reconciliation. With migration 0049, a published preview survives genuine
-append-only v1 uploads without age-only expiration or altered timestamps. The
-hard-invalidation epoch still excludes withdrawals, corrections, device-source
-changes, policy changes and unknown mutations. New publications require the
-exact current input epoch. Same-epoch previews keep their normal refresh
-interval unless a newly completed model date is absent from the preview;
-changed epochs and UTC windows also bypass that throttle. A replacement
+reconciliation. Migration 0050 extends preserved publication to validated v1
+corrections and newly elected devices, using a one-use marker inside the same
+atomic upload transaction. The hard-invalidation epoch still excludes
+withdrawals, erasure, source-format transitions, policy changes and unrecognized
+direct mutations. New publications require the exact current input epoch.
+Elapsed time alone does not rebuild or expire an allowance preview. Changed
+inputs, UTC days and newly completed model dates trigger a successor. A replacement
 cannot drop model dates still awaiting reconstruction. Public aggregate/plan/
 model charts use one snapshot, separate from immutable activity/spend revisions.
 
@@ -112,6 +112,23 @@ source-vector acquisition and calculation. Legacy/mixed/successor and unfinished
 work retain the exact-source path. Final medians still recombine compact cohort
 fits; this is not additive billing math or permission to parallelize unbounded
 database work. Migration and deployment are separate owner-authorized gates.
+
+Migration 0051 tracks exact historical-window dependencies separately from
+participant write revisions. An out-of-window upload may rebind unchanged
+work/results under the current revision and live maintenance lease; it does
+not restart acquisition. Old revision-dependent fingerprints are adopted only
+after recomputing their exact prior digest from the current bounded source
+vector. A changed dependency, authority, method or raced lease refuses reuse.
+
+Migration 0052 stores restartable, elected-day quota summaries and already-priced
+usage. Overlapping windows reuse these inputs and the unchanged estimator.
+Raw and prepared physical readers have separate persisted policies and replay
+versions; never reinterpret an old in-flight page as a new one. Migration 0053
+stores exact epoch/day/method completion receipts for current and daily lanes.
+An unchanged completed lane needs one metadata lookup, not a fresh account or
+raw-evidence scan. Queued corrections prevent a daily receipt from being reused.
+Preparation, reconstruction and publication still share the existing budget.
+
 Preview-first passes also admit owner gauge capture and growth-history cache
 refresh after the allowance preview but before reconstruction. Each retains its
 55-minute self-throttle and runs at most once per invocation; other priority slots
@@ -132,8 +149,17 @@ scheduled progress, cache source identity, public/admin responses and the
 rendered graph independently. See the
 [recovery decision](../decisions/2026-09-06-hosted-calculator-recovery.md).
 
-The admin allowance section includes reconstruction progress from the existing
-owner-only overview. Its optional `reconstruction` block reads bounded derived
+The admin allowance section reads independent owner-only progress from
+`GET /api/v1/admin/reconstruction-progress`. Its closed response separates
+requested, prepared and published generations, exact historical date/account
+completion, recorded trigger/restart reason and observation time. Unknown
+counts stay null; it never estimates an unmeasured completion time. This GET
+does not start work. Overview, allowance, growth and progress use independent
+15-second, single-flight browser request lanes. Temporary storage/network
+failure preserves the prior validated graph; confirmed invalidation or lost
+owner access clears it. Growth snapshots have no age-only read expiry.
+
+The existing overview's optional compatibility `reconstruction` block reads bounded derived
 metadata: lookup position, acquisition phases, invalidated sources, maintenance
 lease state, last cached-result time, and the daily publication/price backlog.
 The display survives an unavailable allowance preview; a failed overview refresh
@@ -468,8 +494,9 @@ and read-back; never treat “contain” as permission to “restore.”
   so concurrent maintenance cannot finish an owner's in-flight erasure.
 - A Worker rollback must still understand the live schemas and current durable
   state. If it cannot, contain the affected path and deploy a forward repair.
-  After migration 0049, preserve its ledger entry, columns, triggers and schema
-  inventory when preparing a rollback repair; an untouched older checkout's
+  After migrations 0049–0053, preserve their ledger entries, columns, triggers,
+  prepared/raw reader policies and schema inventory when preparing a rollback
+  repair; an untouched older checkout's
   migration gate rejects the newer ledger. Do not reverse the schema to make
   that old checkout deployable.
 - Do not roll back appcast bytes by ordinary R2 overwrite. The signed feed,

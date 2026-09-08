@@ -2,10 +2,13 @@ import {
   AdminResponseError,
   adminActionErrorMessage,
   adminResponseError,
+  createAdminReadLane,
+  isTransientAdminReadError,
   projectAdminAllowancePreview,
   projectAdminAction,
   projectAdminMetricsHistory,
   projectAdminOverview,
+  projectAdminReconstructionProgress,
 } from "./admin-client.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
 import { planWeeklyApiEquivalentUsd } from "./community-data.js";
@@ -29,6 +32,9 @@ const state = {
   allowanceChartWidth: null,
   notificationPreferences: null,
   metricsHistory: undefined,
+  reconstructionProgress: null,
+  reconstructionProgressFailed: false,
+  overviewReadSucceeded: false,
   auditRows: [],
   auditPage: 0,
   auditSignature: null,
@@ -646,6 +652,7 @@ async function request(path, init = {}) {
   if (!response.ok) {
     throw adminResponseError(response.status, body);
   }
+  if (body === null) throw new AdminResponseError("ADMIN_RESPONSE_INVALID");
   return body;
 }
 
@@ -1024,7 +1031,7 @@ function renderGrowth(history) {
   if (cohortCard) cards.push(cohortCard);
   container.replaceChildren(...cards);
   badge.className = "admin-source-badge admin-source-available";
-  badge.textContent = "History available";
+  badge.textContent = `History through ${formatTime(history.generatedAt)}`;
 }
 
 function growthBandCard(snapshots) {
@@ -1129,19 +1136,9 @@ function growthPlanCohortCard(snapshots) {
   return card;
 }
 
-async function loadGrowthHistory(loadGeneration) {
+async function loadGrowthHistory() {
   if (!isAdminPage) return;
-  try {
-    const history = projectAdminMetricsHistory(await request("/api/v1/admin/metrics/history"));
-    if (history.schemaVersion !== GROWTH_SCHEMA_VERSION) throw new Error("unexpected metrics-history schema");
-    if (!isCurrentLoadGeneration(loadGeneration, state.loadGeneration)) return;
-    state.metricsHistory = history;
-    renderHistoryBackedSections();
-  } catch {
-    if (!isCurrentLoadGeneration(loadGeneration, state.loadGeneration)) return;
-    state.metricsHistory = null;
-    renderHistoryBackedSections();
-  }
+  return adminReadLanes.history.run();
 }
 
 function renderHistoryBackedSections() {
@@ -1180,7 +1177,7 @@ function renderCounts(overview) {
       label: "Accounts with accepted data",
       value: count(contributorEvidence.total, contributorEvidence.totalBounded),
       detail: contributorEvidence.exact
-        ? "Exact scheduled aggregate · refreshed hourly"
+        ? `Exact scheduled aggregate · ${formatTime(state.metricsHistory.generatedAt)}`
         : `${count(contributors.acceptedLast30Days, contributors.bounded)} sent data in the last 30 days`,
       points: contributorHistory.points,
       historyUnavailable: contributorHistory.unavailable,
@@ -2974,30 +2971,9 @@ function renderAdminCommunityAllowance(preview) {
   renderAdminAllowanceControls();
 }
 
-function isTransientAdminReadError(error) {
-  if (!(error instanceof AdminResponseError)) return false;
-  if (error.httpStatus === null) return error.code === "ADMIN_NETWORK_ERROR";
-  // Missing caches, policy refusals and unknown service codes are authoritative
-  // even when returned as 503; only transport/storage failures preserve a graph.
-  return error.httpStatus >= 500 && error.httpStatus <= 599 && [
-    "INTERNAL_ERROR", "BACKEND_STORAGE_UNAVAILABLE", `HTTP_${error.httpStatus}`,
-  ].includes(error.code);
-}
-
-async function loadAdminCommunityAllowance(loadGeneration) {
+async function loadAdminCommunityAllowance() {
   if (!isAdminPage) return;
-  let preview;
-  try {
-    preview = projectAdminAllowancePreview(await request(
-      "/api/v1/admin/community/allowance-preview",
-    ));
-  } catch (error) {
-    if (isTransientAdminReadError(error) && state.allowancePreview !== null) return;
-    preview = null;
-  }
-  if (!isCurrentLoadGeneration(loadGeneration, state.loadGeneration)) return;
-  state.allowancePreview = preview;
-  renderAdminCommunityAllowance(state.allowancePreview);
+  return adminReadLanes.allowance.run();
 }
 
 function renderReconstructionProgress(progress, { stale = false } = {}) {
@@ -3082,6 +3058,86 @@ function renderReconstructionProgress(progress, { stale = false } = {}) {
     "admin-reconstruction-freshness");
 }
 
+function renderCurrentReconstructionProgress() {
+  const progress = state.reconstructionProgress;
+  if (progress === null) {
+    renderReconstructionProgress(state.overview?.reconstruction);
+    return;
+  }
+  const panel = $("#admin-reconstruction-progress");
+  const badge = $("#admin-reconstruction-status");
+  const details = $("#admin-reconstruction-details");
+  if (!panel || !badge || !details) return;
+  const { publication, work, history } = progress;
+  panel.className = "admin-reconstruction";
+  badge.className = `admin-source-badge admin-source-${work.state === "unavailable" || work.state === "paused" ? "partial" : "available"}`;
+  const workLabel = {
+    idle: "Up to date", queued: "Update queued", building: "Updating",
+    paused: "Updates paused", unavailable: "Work state unavailable",
+  }[work.state];
+  badge.textContent = publication.state === "ready"
+    ? `Graph available · ${workLabel.toLowerCase()}` : workLabel;
+  const paragraph = text => {
+    const node = document.createElement("p");
+    node.textContent = text;
+    return node;
+  };
+  const grid = document.createElement("dl");
+  grid.className = "admin-reconstruction-grid";
+  const metric = (label, text) => {
+    const group = document.createElement("div");
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = text;
+    group.append(term, description);
+    grid.append(group);
+    return group;
+  };
+  const historyText = `${formatNumber(history.resolvedDays)} of ${formatNumber(history.requiredDays)} days resolved`;
+  const historyGroup = metric("Historical model days", historyText);
+  if (history.requiredDays > 0) {
+    const meter = document.createElement("progress");
+    meter.setAttribute("max", history.requiredDays);
+    meter.setAttribute("value", history.resolvedDays);
+    meter.setAttribute("aria-label", "Historical model days resolved");
+    meter.setAttribute("aria-valuetext", historyText);
+    meter.textContent = historyText;
+    historyGroup.append(meter);
+  }
+  historyGroup.append(paragraph("Resolved days include completed calculations with insufficient evidence; a missing estimate is never zero."));
+  const phaseLabel = {
+    current: "Current account calculations", history: "Historical day calculations",
+    daily: "Daily activity and spend", publication: "Preparing graph publication",
+  }[work.phase] ?? "Not recorded";
+  const phaseGroup = metric("Calculation phase", phaseLabel);
+  if (history.activeDay !== null) phaseGroup.append(paragraph(`Active history day: ${history.activeDay}`));
+  const accountText = history.completeAccounts === null || history.requiredAccounts === null
+    ? "Account progress not recorded"
+    : `${formatNumber(history.completeAccounts)} of ${formatNumber(history.requiredAccounts)} account calculations complete`;
+  phaseGroup.append(paragraph(accountText));
+  const generation = value => value === null ? "not recorded" : formatNumber(value);
+  const publicationGroup = metric("Graph publication", {
+    ready: "Available", empty: "Awaiting publication", invalidated: "Invalidated",
+  }[publication.state]);
+  publicationGroup.append(paragraph(`Requested generation: ${generation(publication.requestedGeneration)} · prepared: ${generation(publication.preparedGeneration)} · published: ${generation(publication.publishedGeneration)}`));
+  publicationGroup.append(paragraph(`Published: ${publication.publishedAt === null ? "not recorded" : formatTime(publication.publishedAt)}`));
+  const trigger = {
+    contribution: "New contribution", correction: "Contribution correction",
+    day_boundary: "New calendar day", method_change: "Calculation method changed",
+    reconciliation: "Scheduled reconciliation", privacy: "Privacy or publication change",
+  }[work.trigger] ?? "Not recorded";
+  const restart = {
+    input_changed: "Inputs changed", lease_expired: "Work lease expired",
+    method_changed: "Calculation method changed", retry: "Retry",
+  }[work.restartReason] ?? "Not recorded";
+  const triggerGroup = metric("Update trigger", trigger);
+  triggerGroup.append(paragraph(`Restart reason: ${restart}`));
+  const freshness = paragraph(`${state.reconstructionProgressFailed ? "Progress refresh unavailable. " : ""}Observed ${formatTime(progress.generatedAt)}${work.updatedAt === null ? "" : ` · work updated ${formatTime(work.updatedAt)}`}. No time estimate is available.`);
+  freshness.className = "admin-reconstruction-freshness";
+  details.replaceChildren(grid, freshness);
+}
+
 function render(overview) {
   state.overview = overview;
   const attention = renderAttention(overview);
@@ -3093,7 +3149,7 @@ function render(overview) {
   renderIngress(overview.ingress);
   renderErrors(overview.errors);
   renderAudit(overview.audit);
-  renderReconstructionProgress(overview.reconstruction);
+  renderCurrentReconstructionProgress();
   $("#last-refresh").textContent = formatTime(overview.generatedAt);
   $("#service-state").textContent = `${overview.service.environment} · ${overview.collection.state}`;
   notifyAttention(attention);
@@ -3101,7 +3157,9 @@ function render(overview) {
 
 function renderOverviewUnavailable() {
   const hasPreviousData = state.overview !== null;
-  renderReconstructionProgress(state.overview?.reconstruction, { stale: hasPreviousData });
+  if (state.reconstructionProgress === null) {
+    renderReconstructionProgress(state.overview?.reconstruction, { stale: hasPreviousData });
+  }
   const serviceState = $("#service-state");
   if (serviceState) {
     serviceState.textContent = hasPreviousData
@@ -3118,42 +3176,129 @@ function renderOverviewUnavailable() {
   if (isAdminPage) document.title = `• ${ADMIN_TITLE}`;
 }
 
+function refuseAdminAccess(error) {
+  if (![401, 403, 410].includes(error?.httpStatus)) return false;
+  // A refusal on any owner route invalidates every independent lane. A late
+  // successful response from before the refusal cannot restore private data.
+  for (const lane of Object.values(adminReadLanes)) lane.invalidate();
+  state.overview = null;
+  state.overviewReadSucceeded = false;
+  state.metricsHistory = null;
+  state.allowancePreview = null;
+  state.reconstructionProgress = null;
+  state.diagnosticLookup = null;
+  state.diagnosticLookupGeneration += 1;
+  state.auditRows = [];
+  for (const id of [
+    "counts", "quarantine-counts", "quarantine-status", "distribution-counts",
+    "distribution-version-rows", "distribution-source-status", "github-release-rows",
+    "ingress-status", "lifecycle-status", "snapshot-rows", "error-groups",
+    "recent-diagnostic-rows", "diagnostic-lookup", "audit-rows", "operator-attention",
+  ]) $(`#${id}`)?.replaceChildren();
+  if (isAdminPage) {
+    renderGrowth(null);
+    renderAdminCommunityAllowance(null);
+    renderReconstructionProgress(null);
+  }
+  $("#last-refresh").textContent = "Not loaded";
+  renderOverviewUnavailable();
+  showNotice("Owner access is unavailable. Sign in again, then refresh.");
+  return true;
+}
+
+const adminReadLanes = {
+  overview: createAdminReadLane({
+    read: async ({ signal }) => projectAdminOverview(await request("/api/v1/admin/overview", { signal })),
+    publish: overview => {
+      render(overview);
+      $("#notice").hidden = true;
+      state.lastSuccessfulLoadAt = Date.now();
+      state.retryDelayMilliseconds = 30_000;
+      state.overviewReadSucceeded = true;
+    },
+    failed: error => {
+      if (refuseAdminAccess(error)) return;
+      renderOverviewUnavailable();
+      showNotice(`Operations view unavailable: ${error.message}.`);
+      state.retryDelayMilliseconds = Math.min(state.retryDelayMilliseconds * 2, 5 * 60 * 1_000);
+    },
+  }),
+  history: createAdminReadLane({
+    read: async ({ signal }) => projectAdminMetricsHistory(await request("/api/v1/admin/metrics/history", { signal })),
+    publish: history => {
+      if (JSON.stringify(history) === JSON.stringify(state.metricsHistory)) return;
+      state.metricsHistory = history;
+      renderHistoryBackedSections();
+    },
+    failed: error => {
+      if (refuseAdminAccess(error)) return;
+      if (isTransientAdminReadError(error) && state.metricsHistory) return;
+      state.metricsHistory = null;
+      renderHistoryBackedSections();
+    },
+  }),
+  allowance: createAdminReadLane({
+    read: async ({ signal }) => projectAdminAllowancePreview(await request("/api/v1/admin/community/allowance-preview", { signal })),
+    publish: preview => {
+      if (JSON.stringify(preview) === JSON.stringify(state.allowancePreview)) return;
+      state.allowancePreview = preview;
+      renderAdminCommunityAllowance(preview);
+    },
+    failed: error => {
+      if (refuseAdminAccess(error)) return;
+      if (isTransientAdminReadError(error) && state.allowancePreview !== null) return;
+      state.allowancePreview = null;
+      renderAdminCommunityAllowance(null);
+    },
+  }),
+  progress: createAdminReadLane({
+    read: async ({ signal }) => projectAdminReconstructionProgress(await request("/api/v1/admin/reconstruction-progress", { signal })),
+    publish: progress => {
+      state.reconstructionProgress = progress;
+      state.reconstructionProgressFailed = false;
+      if (progress.publication.state === "invalidated") {
+        // A confirmed hard-invalidation floor failure, not ordinary queued
+        // work. Fence an older in-flight preview before removing it.
+        adminReadLanes.allowance.invalidate();
+        state.allowancePreview = null;
+        renderAdminCommunityAllowance(null);
+      }
+      renderCurrentReconstructionProgress();
+    },
+    failed: error => {
+      if (refuseAdminAccess(error)) return;
+      state.reconstructionProgressFailed = true;
+      // A failed progress read is not authority to remove a graph. Retain its
+      // recorded timestamp; old Workers can still supply overview progress.
+      if (state.reconstructionProgress !== null) renderCurrentReconstructionProgress();
+    },
+  }),
+};
+
 async function load() {
   if (state.loading) return;
-  const loadGeneration = ++state.loadGeneration;
+  state.loadGeneration += 1;
   state.loading = true;
-  let succeeded = false;
+  state.overviewReadSucceeded = false;
   $("#refresh").disabled = true;
   refreshStatusText();
+  // Each resource is owner-authenticated independently. A slow or unavailable
+  // overview cannot block graph/progress refresh, and repeated refreshes join
+  // each resource's existing bounded request rather than overlapping it.
+  const overviewRead = adminReadLanes.overview.run();
+  void loadAdminCommunityAllowance();
+  void loadGrowthHistory();
+  if (isAdminPage) void adminReadLanes.progress.run();
   try {
     // No app session on the admin host: authentication is Cloudflare Access and
     // the owner-email pin, and CSRF is the always-sent x-usage-monitor-admin
     // header. The old /api/v1/session pre-fetch 401'd here and was the dead
     // console symptom.
-    const overview = projectAdminOverview(await request("/api/v1/admin/overview"));
-    state.metricsHistory = undefined;
-    render(overview);
-    $("#notice").hidden = true;
-    state.lastSuccessfulLoadAt = Date.now();
-    state.retryDelayMilliseconds = 30_000;
-    succeeded = true;
-    void loadAdminCommunityAllowance(loadGeneration);
-    void loadGrowthHistory(loadGeneration);
-  } catch (error) {
-    if (!isTransientAdminReadError(error)) {
-      state.allowancePreview = null;
-      renderAdminCommunityAllowance(null);
-    }
-    renderOverviewUnavailable();
-    showNotice(`Operations view unavailable: ${error.message}.`);
-    state.retryDelayMilliseconds = Math.min(
-      state.retryDelayMilliseconds * 2,
-      5 * 60 * 1_000,
-    );
+    await overviewRead;
   } finally {
     state.loading = false;
     $("#refresh").disabled = false;
-    if (isAdminPage) scheduleRefresh({ retry: !succeeded });
+    if (isAdminPage) scheduleRefresh({ retry: !state.overviewReadSucceeded });
   }
 }
 
@@ -3396,6 +3541,11 @@ if (isAdminPage) {
     clearRefreshSchedule();
     refreshStatusText();
   });
+  window.addEventListener("pagehide", () => {
+    clearRefreshSchedule();
+    for (const lane of Object.values(adminReadLanes)) lane.invalidate();
+  });
+  window.addEventListener("pageshow", () => { void load(); });
 }
 
 void load();

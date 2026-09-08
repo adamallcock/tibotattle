@@ -158,8 +158,13 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
    * admission-only: incomplete acquisition still uses all its phase allocation,
    * and no queries are charged here for work the caller has not executed. */
   completedEvidenceReserveQueries?: number;
+  /** Only selects NEW heads. Persisted raw replay journals retain their reader. */
+  preparedReader?: { sourceFingerprint: string; quotaReader: V1QuotaPageReader;
+    replayPolicy: "prepared-source-days-1" };
 }): Promise<CommunityAnalysisRunResult> {
   const { identity, sourcePin, budget } = options;
+  if (options.preparedReader && (options.preparedReader.sourceFingerprint !== sourcePin.fingerprint
+    || options.preparedReader.replayPolicy !== "prepared-source-days-1")) throw new TypeError("prepared reader source mismatch");
   if (options.storage !== undefined && options.storage !== "current" && options.storage !== "model-history") {
     throw new TypeError("community analysis storage invalid");
   }
@@ -189,10 +194,12 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
   }
   if (read.status === "absent") {
     read = await work.beginCommunityAnalysisWork(db, identity,
-      encodeV1QuotaWorkCheckpoint(createV1QuotaAcquisitionCheckpoint(acquisitionIdentity)).control, budget);
+      encodeV1QuotaWorkCheckpoint(createV1QuotaAcquisitionCheckpoint(acquisitionIdentity)).control, budget,
+      undefined, options.preparedReader?.replayPolicy);
   }
   if (read.status !== "ready") return { status: read.status === "absent" ? "stale" : read.status };
   let head = read.head;
+  if (head.readerPolicy && !options.preparedReader) return { status: "deferred" };
   const staged = await work.readCommunityAnalysisStage(db, head, budget);
   if (staged.status !== "ready" && staged.status !== "absent") return { status: staged.status === "deferred" ? "deferred" : staged.status === "corrupt" ? "corrupt" : "stale" };
   let stage: CommunityAnalysisWorkStage | null = staged.status === "ready" ? staged.stage : null;
@@ -241,9 +248,12 @@ export async function advanceCommunityAnalysisRun(db: D1Database, options: {
     if (!pending) {
       if (!available(budget, reader ? 2 : 3)) return { status: "deferred" };
       if (!reader) {
-        if (!spend(budget, 1)) return { status: "deferred" };
-        try { reader = await createV1QuotaPageReader(db, identity.participantId, history?.observedAtBefore); }
-        catch (error) { if (error instanceof V1QuotaFitProjectionUnavailableError) return { status: "projection_unavailable" }; throw error; }
+        if (head.readerPolicy) reader = options.preparedReader!.quotaReader;
+        else {
+          if (!spend(budget, 1)) return { status: "deferred" };
+          try { reader = await createV1QuotaPageReader(db, identity.participantId, history?.observedAtBefore); }
+          catch (error) { if (error instanceof V1QuotaFitProjectionUnavailableError) return { status: "projection_unavailable" }; throw error; }
+        }
       }
       const page = await acquirePage(reader, head, state, winners, budget);
       if (page.status === "not_testable") {

@@ -51,6 +51,7 @@ const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
   "/admin",
   ...ADMIN_UI_SOURCES.map(({ route }) => route),
   "/api/v1/admin/community/allowance-preview",
+  "/api/v1/admin/reconstruction-progress",
 ]);
 const PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS = Object.freeze([
   'src="./app.js"',

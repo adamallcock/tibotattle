@@ -8,10 +8,13 @@ import {
   AdminResponseError,
   adminActionErrorMessage,
   adminResponseError,
+  createAdminReadLane,
+  isTransientAdminReadError,
   projectAdminAllowancePreview,
   projectAdminAction,
   projectAdminMetricsHistory,
   projectAdminOverview,
+  projectAdminReconstructionProgress,
 } from "../public/admin-client.js";
 
 const fixture = async (name) => JSON.parse(await readFile(
@@ -20,6 +23,111 @@ const fixture = async (name) => JSON.parse(await readFile(
 ));
 
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
+
+test("admin read lanes are independent, single-flight, and reuse a pending request", async () => {
+  let completeSlow;
+  let slowReads = 0;
+  const published = [];
+  const failed = error => assert.fail(error.code);
+  const slow = createAdminReadLane({
+    read: () => { slowReads += 1; return new Promise(resolve => { completeSlow = resolve; }); },
+    publish: value => published.push(value), failed,
+  });
+  const fast = createAdminReadLane({ read: async () => "fast", publish: value => published.push(value), failed });
+  const pending = slow.run();
+  assert.equal(slow.run(), pending);
+  await fast.run();
+  assert.equal(slowReads, 1);
+  assert.deepEqual(published, ["fast"]);
+  completeSlow("slow");
+  await pending;
+  assert.deepEqual(published, ["fast", "slow"]);
+});
+
+test("an admin read deadline aborts stalled work, frees its lane, and fences late completion", async () => {
+  let finish, signal, onDeadline;
+  const published = [], failures = [];
+  let calls = 0;
+  const lane = createAdminReadLane({
+    read: options => {
+      signal = options.signal;
+      return ++calls === 1 ? new Promise(resolve => { finish = resolve; }) : "recovered";
+    },
+    publish: value => published.push(value), failed: error => failures.push(error.code),
+    schedule: (callback, milliseconds) => { assert.equal(milliseconds, 15_000); onDeadline = callback; return 1; },
+    cancel: () => {},
+  });
+  const stalled = lane.run();
+  await Promise.resolve();
+  onDeadline();
+  await stalled;
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(failures, ["ADMIN_READ_TIMEOUT"]);
+  await lane.run();
+  finish("obsolete");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(published, ["recovered"]);
+});
+
+test("authoritative invalidation cancels an admin lane without publishing or reviving the old generation", async () => {
+  let complete;
+  let requests = 0;
+  const values = [], failures = [];
+  const lane = createAdminReadLane({
+    read: () => ++requests === 1 ? new Promise(resolve => { complete = resolve; }) : "new",
+    publish: value => values.push(value), failed: error => failures.push(error.code),
+  });
+  const older = lane.run();
+  await Promise.resolve();
+  lane.invalidate();
+  await lane.run();
+  complete("old");
+  await older;
+  assert.deepEqual(values, ["new"]);
+  assert.deepEqual(failures, []);
+});
+
+test("admin storage failures are transient, while an authoritative missing cache or refusal is not", () => {
+  for (const code of ["ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE", "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE"]) {
+    assert.equal(isTransientAdminReadError(new AdminResponseError(code, null, 503)), true);
+    assert.equal(isTransientAdminReadError(new AdminResponseError(code, null, 403)), false);
+  }
+  for (const code of ["ADMIN_ALLOWANCE_CACHE_UNAVAILABLE", "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE", "PUBLICATION_DISABLED"]) {
+    assert.equal(isTransientAdminReadError(new AdminResponseError(code, null, 503)), false);
+  }
+});
+
+test("generation progress projects a closed, dated aggregate contract with explicit unknowns", async () => {
+  const payload = await fixture("admin-reconstruction-progress-valid.json");
+  const projected = projectAdminReconstructionProgress(payload);
+  assert.deepEqual(projected, payload);
+  assert.equal(Object.isFrozen(projected.history), true);
+  assert.equal(projected.publication.preparedGeneration, null);
+  for (const mutate of [
+    value => { value.participantId = "synthetic-unexpected"; },
+    value => { value.work.rawError = "synthetic-unexpected"; },
+    value => { value.history.resolvedDays = 70; },
+    value => { value.history.requiredDays = 71; },
+    value => { value.history.completeAccounts = 16; },
+    value => { value.history.activeDay = "2026-02-30"; },
+    value => { value.publication.publishedGeneration = 43; },
+    value => { value.work.restartReason = "raw_private_reason"; },
+    value => { value.work.updatedAt = "yesterday"; },
+    value => { value.history.requiredDays = Number.MAX_SAFE_INTEGER + 1; },
+  ]) {
+    const invalid = structuredClone(payload);
+    mutate(invalid);
+    assert.throws(() => projectAdminReconstructionProgress(invalid), error => error.code === "ADMIN_RECONSTRUCTION_PROGRESS_INVALID");
+  }
+  payload.work.phase = null;
+  payload.work.updatedAt = null;
+  payload.work.trigger = null;
+  payload.work.restartReason = null;
+  payload.history.activeDay = null;
+  payload.history.completeAccounts = null;
+  payload.history.requiredAccounts = null;
+  assert.deepEqual(projectAdminReconstructionProgress(payload), payload);
+});
 
 function reconstructionPayload() {
   return {
@@ -222,6 +330,26 @@ test("admin allowance preview projects the fixed merge trial contract", () => {
   assert.equal(Object.isFrozen(preview), true);
   assert.equal(Object.isFrozen(preview.days), true);
   assert.equal(Object.isFrozen(preview.days.at(-1).byPlanType), true);
+});
+
+test("admin model display-label changes preserve results but analytical changes still fail closed", () => {
+  const payload = structuredClone(allowancePreviewPayload());
+  payload.models.modelConfig[0].label = "Previous reviewed display name";
+  const projected = projectAdminAllowancePreview(payload);
+  assert.deepEqual(projected.models.modelConfig, ADMIN_MODEL_CONFIG);
+  assert.deepEqual(projected.models.days, projectAdminAllowancePreview(allowancePreviewPayload()).models.days);
+  for (const label of ["", "x".repeat(81), null, 1]) {
+    const invalid = structuredClone(payload);
+    invalid.models.modelConfig[0].label = label;
+    assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" });
+  }
+  for (const field of ["modelId", "allowanceTrack", "pricingStatus"]) {
+    const invalid = structuredClone(payload);
+    invalid.models.modelConfig[0][field] = "unreviewed";
+    assert.throws(() => projectAdminAllowancePreview(invalid), { code: "ADMIN_ALLOWANCE_PREVIEW_INVALID" }, field);
+  }
+  payload.models.modelConfig[0].label = "x".repeat(80);
+  assert.deepEqual(projectAdminAllowancePreview(payload).models.modelConfig, ADMIN_MODEL_CONFIG);
 });
 
 test("admin allowance preview validates additive upload-to-merge coverage", () => {

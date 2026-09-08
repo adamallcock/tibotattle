@@ -129,13 +129,14 @@ function sourceCacheKey(pin: CommunitySourcePin, fromDay: string, suffix: string
   return `${source}:${pin.inputRevision}:${fromDay}:${suffix}`;
 }
 
-export async function loadCommunitySourcePin(db: D1Database, participantId: string, fromDay: string, source: LegacySource) {
+export async function loadCommunitySourcePin(db: D1Database, participantId: string, fromDay: string, source: LegacySource,
+  options?: { includeDayDependencies?: boolean }) {
   if (source === "v1.1") {
     const sourcePin = await loadV11SourcePin(db, participantId, {fromDay});
     if (!sourcePin) throw new Error("activated attribution source unavailable");
     return {sourcePin, fingerprint: sourcePin.fingerprint};
   }
-  const sourcePin = await loadV1SourcePin(db, { participantId, fromDay });
+  const sourcePin = await loadV1SourcePin(db, { participantId, fromDay }, options);
   const legacy = await db.prepare(`SELECT id, plaintext_digest, envelope_digest, dataset_id,
       range_start, range_end, created_at FROM telemetry_contributions
     WHERE participant_id = ? AND status = 'accepted'
@@ -148,6 +149,11 @@ export async function loadCommunitySourcePin(db: D1Database, participantId: stri
     v1: sourcePin.fingerprint, legacy: legacy.results,
   }));
   return { sourcePin, fingerprint };
+}
+
+/** All analytical versions used by either current cache, excluding display copy. */
+export function communityAnalysisCacheVersion(): string {
+  return `${V1_FIT_CACHE_KEY_SUFFIX}:${COMPOSITION_CACHE_KEY_SUFFIX}`;
 }
 
 function parsedCachedFits(json: string, participantId: string): CommunityAllowanceFit[] | null {
@@ -1140,14 +1146,16 @@ export async function publishCommunityAnalysisCaches(db: D1Database,
       (participant_id,cache_key,fits_json,computed_at,input_fingerprint,source_method_version)
     SELECT ?1,?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?4,?5 WHERE ${guard}
     ON CONFLICT(participant_id) DO UPDATE SET cache_key=excluded.cache_key,fits_json=excluded.fits_json,
-      computed_at=excluded.computed_at,input_fingerprint=excluded.input_fingerprint,source_method_version=excluded.source_method_version`)
+      computed_at=excluded.computed_at,input_fingerprint=excluded.input_fingerprint,source_method_version=excluded.source_method_version
+    RETURNING participant_id`)
     .bind(participantId, sourceCacheKey(sourcePin, fromDay, V1_FIT_CACHE_KEY_SUFFIX, source), fitsJson,
       fitFingerprint, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourcePin.inputRevision, isV11Pin(sourcePin) ? 1 : 0, maintenanceLease)];
   if (identity.compositionSupported) statements.push(db.prepare(`INSERT INTO community_model_composition_cache
       (participant_id,cache_key,composition_json,computed_at,input_fingerprint,source_method_version)
     SELECT ?1,?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?4,?5 WHERE ${guard}
     ON CONFLICT(participant_id) DO UPDATE SET cache_key=excluded.cache_key,composition_json=excluded.composition_json,
-      computed_at=excluded.computed_at,input_fingerprint=excluded.input_fingerprint,source_method_version=excluded.source_method_version`)
+      computed_at=excluded.computed_at,input_fingerprint=excluded.input_fingerprint,source_method_version=excluded.source_method_version
+    RETURNING participant_id`)
     .bind(participantId, sourceCacheKey(sourcePin, fromDay, COMPOSITION_CACHE_KEY_SUFFIX, isV11Pin(sourcePin) ? "v1.1" : "v1"),
       compositionJson, sourcePin.fingerprint, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourcePin.inputRevision,
       isV11Pin(sourcePin) ? 1 : 0, maintenanceLease));
@@ -1156,11 +1164,15 @@ export async function publishCommunityAnalysisCaches(db: D1Database,
   // not merely turn the second INSERT into a no-op. The existing NOT NULL
   // constraint is an assertion; no null value can become durable.
   statements.push(db.prepare(`UPDATE community_allowance_fit_cache
-    SET fits_json=CASE WHEN ${guard} THEN fits_json ELSE NULL END WHERE participant_id=?1`)
+    SET fits_json=CASE WHEN ${guard} THEN fits_json ELSE NULL END WHERE participant_id=?1 RETURNING participant_id`)
     .bind(participantId, null, null, null, null, sourcePin.inputRevision, isV11Pin(sourcePin) ? 1 : 0, maintenanceLease));
   try {
-    const results = await db.batch(statements);
-    return results.length === statements.length && results.every(result => result.meta.changes === 1);
+    const results = await db.batch<{ participant_id: string }>(statements);
+    // D1 change counts include receipt-trigger effects. RETURNING attests the
+    // exact authorized top-level row instead; every write and the final
+    // in-transaction authority assertion must identify this participant once.
+    return results.length === statements.length && results.every(result =>
+      result.results.length === 1 && result.results[0]?.participant_id === participantId);
   } catch (error) {
     if (error instanceof Error && error.message.includes("NOT NULL constraint failed: community_allowance_fit_cache.fits_json")) return false;
     throw error;

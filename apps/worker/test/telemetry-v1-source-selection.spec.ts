@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { selectV1WinningDevices } from "../src/telemetry-v1-source-selection";
+import { selectV1WinningDevices, selectV1SourceDayDependencies } from "../src/telemetry-v1-source-selection";
 import type { V1SourceChunk } from "../src/telemetry-v1-source-selection";
 
 const chunk = (device: string, stream: V1SourceChunk["stream"], hour: number,
@@ -40,5 +40,26 @@ describe("shared v1 source selection", () => {
     const rows = [chunk("device-Z", "usage", 1), chunk("device-a", "usage", 1)];
     expect(selectV1WinningDevices(rows)[0]?.device_id).toBe("device-a");
     expect(selectV1WinningDevices([...rows].reverse())).toEqual(selectV1WinningDevices(rows));
+  });
+
+  it("keys day preparation only to the elected analytical vector, independent of input order and losing/session chunks", async () => {
+    const rows = [chunk("device-a", "usage", 4), chunk("device-a", "quota", 4), chunk("device-b", "usage", 1)];
+    const before = await selectV1SourceDayDependencies(rows);
+    expect(before).toEqual(await selectV1SourceDayDependencies([...rows].reverse()));
+    expect(before[0]).toMatchObject({ participantId: "participant-a", day: "2026-08-01", deviceId: "device-a",
+      usageRecordCount: 1, quotaRecordCount: 1 });
+    expect(await selectV1SourceDayDependencies([...rows, chunk("device-b", "session", 23)] )).toEqual(before);
+    expect(await selectV1SourceDayDependencies([...rows, chunk("device-a", "session", 23)] )).toEqual(before);
+    expect((await selectV1SourceDayDependencies([...rows, chunk("device-b", "usage", 5)]))[0]?.fingerprint)
+      .not.toBe(before[0]?.fingerprint);
+    expect((await selectV1SourceDayDependencies([chunk("device-a", "usage", 4, { chunk_digest: "b".repeat(64) }), ...rows.slice(1)]))[0]?.fingerprint)
+      .not.toBe(before[0]?.fingerprint);
+  });
+
+  it("retains a stable empty analytical identity for a session-only elected day", async () => {
+    const value = await selectV1SourceDayDependencies([chunk("device-a", "session", 1)]);
+    expect(value[0]).toMatchObject({ day: "2026-08-01", deviceId: "device-a", usageRecordCount: 0, quotaRecordCount: 0 });
+    expect((await selectV1SourceDayDependencies([chunk("device-a", "session", 2)]))[0]?.fingerprint).toBe(value[0]?.fingerprint);
+    expect((await selectV1SourceDayDependencies([chunk("device-b", "session", 2)]))[0]?.fingerprint).not.toBe(value[0]?.fingerprint);
   });
 });

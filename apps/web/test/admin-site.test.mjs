@@ -9,6 +9,26 @@ const fixture = async (name) => JSON.parse(await readFile(
   new URL(`./fixtures/${name}`, import.meta.url),
   "utf8",
 ));
+const ADMIN_READ_PATHS = [
+  "/api/v1/admin/overview", "/api/v1/admin/community/allowance-preview",
+  "/api/v1/admin/metrics/history", "/api/v1/admin/reconstruction-progress",
+];
+
+function metricsHistoryPayload() {
+  return {
+    schemaVersion: "admin-metrics-history-v0.2",
+    generatedAt: "2026-09-07T12:00:00.000Z",
+    events: Object.fromEntries([
+      "participants", "webSessions", "devicePairings", "deviceCredentials", "deviceConsents",
+      "uploadedChunks", "uploadedRecords", "uploadingParticipants", "acceptedUploads",
+    ].map(name => [name, {
+      total: 6, last24Hours: 3, previous24Hours: 2, byDayStartsAt: "2026-08-09",
+      byDay: [{ day: "2026-09-05", count: 1 }, { day: "2026-09-06", count: 2 }, { day: "2026-09-07", count: 3 }],
+    }])),
+    downloads: { available: false, byDayStartsAt: "2026-08-09", byDay: [] },
+    gauges: { snapshots: [] },
+  };
+}
 
 class FakeNode {
   constructor(tag) {
@@ -301,10 +321,11 @@ async function withAdminPage(fetchResponse, check) {
   const storedPreferences = new Map([
     ["tibotattle-admin-auto-refresh-minutes-v1", "0"],
   ]);
+  const windowListeners = new Map();
   const replacements = {
     document: documentRef,
     fetch: fetchResponse,
-    window: { innerHeight: 844, innerWidth: 390, addEventListener() {} },
+    window: { innerHeight: 844, innerWidth: 390, addEventListener(name, listener) { windowListeners.set(name, listener); } },
     localStorage: {
       getItem: (key) => storedPreferences.get(key) ?? null,
       setItem: (key, value) => storedPreferences.set(key, value),
@@ -323,8 +344,11 @@ async function withAdminPage(fetchResponse, check) {
     const moduleUrl = new URL("../public/admin.js", import.meta.url);
     moduleUrl.search = `?admin-refresh-test=${process.hrtime.bigint()}`;
     await import(moduleUrl.href);
+    await new Promise(resolve => setImmediate(resolve));
     await check(documentRef, storedPreferences);
   } finally {
+    windowListeners.get("pagehide")?.();
+    await new Promise(resolve => setImmediate(resolve));
     for (const [key, descriptor] of descriptors) {
       if (descriptor) Object.defineProperty(globalThis, key, descriptor);
       else delete globalThis[key];
@@ -342,14 +366,153 @@ function unavailableResponse() {
   };
 }
 
+test("graphs and generation progress render independently while the overview is stalled", async () => {
+  const progress = await fixture("admin-reconstruction-progress-valid.json");
+  let finishOverview;
+  const requests = [];
+  await withAdminPage(async path => {
+    requests.push(path);
+    if (path === ADMIN_READ_PATHS[0]) return new Promise(resolve => { finishOverview = resolve; });
+    if (path === ADMIN_READ_PATHS[1]) return response(createAdminAllowancePreviewPayload());
+    if (path === ADMIN_READ_PATHS[2]) return response(metricsHistoryPayload());
+    assert.equal(path, ADMIN_READ_PATHS[3]);
+    return response(progress);
+  }, async documentRef => {
+    await waitFor(() => documentRef.byId.get("admin-community-status").textContent === "Admin preview available");
+    assert.equal(documentRef.byId.get("growth-cards").querySelectorAll("svg.admin-sparkline").length, 8);
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Graph available · updating");
+    const text = reconstructionText(documentRef);
+    assert.match(text, /51 of 69 days resolved/u);
+    assert.match(text, /8 of 15 account calculations complete/u);
+    assert.match(text, /Active history day: 2026-09-02/u);
+    assert.match(text, /Requested generation: 42 · prepared: not recorded · published: 40/u);
+    assert.match(text, /Update trigger Contribution correction/u);
+    assert.match(text, /Restart reason: Inputs changed/u);
+    assert.doesNotMatch(text, /last good|\d+%|ETA/u);
+    const meter = documentRef.byId.get("admin-reconstruction-details").querySelector("progress");
+    assert.equal(meter.getAttribute("max"), "69");
+    assert.equal(meter.getAttribute("value"), "51");
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.deepEqual(requests, ADMIN_READ_PATHS, "manual refresh joins the pending pass instead of overlapping it");
+    finishOverview(unavailableResponse());
+    await waitFor(() => !documentRef.byId.get("refresh").disabled);
+    assert.equal(documentRef.byId.get("admin-community-status").textContent, "Admin preview available");
+    assert.equal(documentRef.byId.get("admin-reconstruction-status").textContent, "Graph available · updating");
+  });
+});
+
+test("ordinary overview reload and temporary history failures preserve the exact dated growth graphs", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const history = metricsHistoryPayload();
+  let historyResponse = () => response(history);
+  await withAdminPage(async path => {
+    if (path === ADMIN_READ_PATHS[0]) return response(overview);
+    if (path === ADMIN_READ_PATHS[2]) return historyResponse();
+    return unavailableResponse();
+  }, async documentRef => {
+    const container = documentRef.byId.get("growth-cards");
+    const initial = [...container.children];
+    assert.equal(initial.length, 8);
+    assert.match(documentRef.byId.get("growth-status").textContent, /History through/u);
+    assert.ok(documentRef.byId.get("growth-status").textContent.includes(formatReportingTime(history.generatedAt)));
+    for (const next of [
+      () => response(history),
+      () => unavailableResponse(),
+      () => ({ ok: false, status: 503, json: async () => ({ error: { code: "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE" } }) }),
+      () => { throw new Error("synthetic network failure"); },
+    ]) {
+      historyResponse = next;
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      assert.deepEqual(container.children, initial);
+      assert.equal(container.querySelectorAll("svg.admin-sparkline").length, 8);
+    }
+    historyResponse = () => ({ ok: false, status: 503, json: async () => ({ error: { code: "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE" } }) });
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.equal(documentRef.byId.get("growth-status").textContent, "History unavailable");
+    assert.equal(container.querySelectorAll("svg.admin-sparkline").length, 0);
+  });
+});
+
+test("progress refreshes remain independent, retain observed work on errors, and never invent unknown counters", async () => {
+  const progress = await fixture("admin-reconstruction-progress-valid.json");
+  progress.history.completeAccounts = null;
+  progress.history.requiredAccounts = null;
+  progress.work.restartReason = null;
+  let progressReply = () => response(progress);
+  await withAdminPage(async path => path === ADMIN_READ_PATHS[3] ? progressReply() : unavailableResponse(), async documentRef => {
+    assert.match(reconstructionText(documentRef), /Account progress not recorded/u);
+    assert.match(reconstructionText(documentRef), /Restart reason: Not recorded/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /0 of 0 account/u);
+    progressReply = () => unavailableResponse();
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.match(reconstructionText(documentRef), /Progress refresh unavailable/u);
+    assert.match(reconstructionText(documentRef), /51 of 69 days resolved/u);
+    assert.ok(reconstructionText(documentRef).includes(formatReportingTime(progress.generatedAt)));
+    progress.history.resolvedDays = 52;
+    progress.publication.preparedGeneration = 42;
+    progressReply = () => response(progress);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    assert.match(reconstructionText(documentRef), /52 of 69 days resolved/u);
+    assert.match(reconstructionText(documentRef), /prepared: 42/u);
+    assert.doesNotMatch(reconstructionText(documentRef), /Progress refresh unavailable/u);
+  });
+});
+
+test("only confirmed progress invalidation clears the graph and fences an older preview response", async () => {
+  const overview = await fixture("admin-overview-valid.json");
+  const progress = await fixture("admin-reconstruction-progress-valid.json");
+  const preview = createAdminAllowancePreviewPayload();
+  let nextPreview = () => response(preview);
+  let resolveOlderPreview;
+  await withAdminPage(async path => {
+    if (path === ADMIN_READ_PATHS[0]) return response(overview);
+    if (path === ADMIN_READ_PATHS[1]) return nextPreview();
+    if (path === ADMIN_READ_PATHS[3]) return response(structuredClone(progress));
+    return unavailableResponse();
+  }, async documentRef => {
+    const container = documentRef.byId.get("admin-community-allowance-result");
+    const badge = documentRef.byId.get("admin-community-status");
+    const graph = container.querySelector('svg[role="img"]');
+    assert.ok(graph);
+    for (const publicationState of ["ready", "empty"]) {
+      progress.publication.state = publicationState;
+      progress.work.state = "queued";
+      nextPreview = () => ({ ok: false, status: 503, json: async () => ({ error: { code: "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE" } }) });
+      await documentRef.byId.get("refresh").listeners.get("click")();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(container.querySelector('svg[role="img"]'), graph, publicationState);
+    }
+    nextPreview = () => new Promise(resolve => { resolveOlderPreview = resolve; });
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => typeof resolveOlderPreview === "function");
+    progress.publication.state = "invalidated";
+    progress.publication.publishedGeneration = null;
+    progress.publication.publishedAt = null;
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(badge.textContent, "Preview unavailable");
+    assert.equal(container.querySelectorAll('svg[role="img"]').length, 0);
+    resolveOlderPreview(response(preview));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(container.querySelectorAll('svg[role="img"]').length, 0, "pre-invalidation read cannot restore withdrawn data");
+    progress.publication.state = "ready";
+    progress.publication.publishedGeneration = 42;
+    progress.publication.publishedAt = progress.generatedAt;
+    nextPreview = () => response(preview);
+    await documentRef.byId.get("refresh").listeners.get("click")();
+    await waitFor(() => badge.textContent === "Admin preview available");
+    assert.equal(container.querySelectorAll('svg[role="img"]').length, 1, "a new post-invalidation confirmed read can restore the graph");
+  });
+});
+
 test("an initial overview failure marks operations unavailable without inventing a successful snapshot", async () => {
   const requests = [];
   await withAdminPage(async (path) => {
     requests.push(path);
     return unavailableResponse();
   }, async (documentRef) => {
-    await waitFor(() => !documentRef.byId.get("notice").hidden);
-    assert.deepEqual(requests, ["/api/v1/admin/overview"]);
+    await waitFor(() => !documentRef.byId.get("notice").hidden && !documentRef.byId.get("refresh").disabled);
+    assert.deepEqual(requests, ADMIN_READ_PATHS);
     assert.equal(documentRef.byId.get("last-refresh").textContent, "Not loaded");
     assert.equal(documentRef.byId.get("service-state").textContent,
       "Refresh unavailable · no successful data loaded");
@@ -440,11 +603,7 @@ test("an independent allowance-preview failure does not mark a successful overvi
   }, async (documentRef) => {
     await waitFor(() => documentRef.byId.get("admin-community-status").textContent === "Preview unavailable"
       && documentRef.byId.get("growth-status").textContent === "History unavailable");
-    assert.deepEqual(requests, [
-      "/api/v1/admin/overview",
-      "/api/v1/admin/community/allowance-preview",
-      "/api/v1/admin/metrics/history",
-    ]);
+    assert.deepEqual(requests, ADMIN_READ_PATHS);
     assert.equal(documentRef.byId.get("service-state").textContent, "production · operational");
     assert.equal(documentRef.byId.get("operator-attention-badge").textContent, "No action indicated");
     assert.equal(documentRef.byId.get("operator-attention-badge").className,
@@ -491,9 +650,7 @@ test("reconstruction shows checkpoint acquisition separately from daily publicat
     assert.equal(meters[0].getAttribute("aria-label"), "Account checkpoint acquisition");
     assert.equal(meters[0].getAttribute("aria-valuetext"), "3 of 8 tracked accounts have acquired checkpoints");
     assert.equal(meters[0].getAttribute("aria-describedby"), "admin-reconstruction-explanation");
-    assert.deepEqual(requests, [
-      "/api/v1/admin/overview", "/api/v1/admin/community/allowance-preview", "/api/v1/admin/metrics/history",
-    ]);
+    assert.deepEqual(requests, ADMIN_READ_PATHS);
   });
 });
 
@@ -979,7 +1136,7 @@ test("the owner dashboard keeps the merge trial private and separate from the pu
   ]);
   assert.match(
     source,
-    /request\(\n      "\/api\/v1\/admin\/community\/allowance-preview",/u,
+    /request\("\/api\/v1\/admin\/community\/allowance-preview", \{ signal \}\)/u,
   );
   assert.match(source, /projectAdminAllowancePreview/u);
   assert.doesNotMatch(source, /PublicCommunityClient/u);
@@ -1001,17 +1158,13 @@ async function withAllowancePage(preview, check) {
     requests.push(path);
     if (path === "/api/v1/admin/overview") return response(overview);
     if (path === "/api/v1/admin/community/allowance-preview") return response(preview);
-    assert.equal(path, "/api/v1/admin/metrics/history", "never call a public or unapproved endpoint");
+    assert.ok(ADMIN_READ_PATHS.slice(2).includes(path), "never call a public or unapproved endpoint");
     return unavailableResponse();
   }, async (documentRef) => {
     await waitFor(() => documentRef.byId.get("admin-community-status").textContent === "Admin preview available"
       && documentRef.byId.get("growth-status").textContent === "History unavailable");
     await check(documentRef);
-    assert.deepEqual(requests, [
-      "/api/v1/admin/overview",
-      "/api/v1/admin/community/allowance-preview",
-      "/api/v1/admin/metrics/history",
-    ]);
+    assert.deepEqual(requests, ADMIN_READ_PATHS);
   });
 }
 
@@ -1039,7 +1192,7 @@ test("admin refresh preserves the exact allowance DOM on transport failures and 
       previewRequests += 1;
       return nextPreview();
     }
-    assert.equal(path, "/api/v1/admin/metrics/history");
+    assert.ok(ADMIN_READ_PATHS.slice(2).includes(path));
     return unavailableResponse();
   }, async documentRef => {
     const badge = documentRef.byId.get("admin-community-status");
@@ -1057,6 +1210,8 @@ test("admin refresh preserves the exact allowance DOM on transport failures and 
       async () => { throw new TypeError("fixture-private-transport-detail"); },
       async () => unavailableResponse(),
       async () => ({ ok: false, status: 503, json: async () => ({ error: { code: "BACKEND_STORAGE_UNAVAILABLE" } }) }),
+      async () => ({ ok: false, status: 503, json: async () => ({ error: { code: "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE" } }) }),
+      async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("fixture-malformed-payload"); } }),
       async () => ({ ok: false, status: 502, json: async () => { throw new SyntaxError("fixture-proxy-html"); } }),
       async () => ({ ok: false, status: 504, json: async () => null }),
     ]) {
@@ -1090,7 +1245,7 @@ test("admin refresh removes allowance graphs on authoritative refusals, unavaila
   await withAdminPage(async path => {
     if (path === "/api/v1/admin/overview") return response(overview);
     if (path === "/api/v1/admin/community/allowance-preview") return nextPreview();
-    assert.equal(path, "/api/v1/admin/metrics/history");
+    assert.ok(ADMIN_READ_PATHS.slice(2).includes(path));
     return unavailableResponse();
   }, async documentRef => {
     const badge = documentRef.byId.get("admin-community-status");
@@ -1114,7 +1269,6 @@ test("admin refresh removes allowance graphs on authoritative refusals, unavaila
       async () => response({ status: "updating" }),
       async () => response({ status: "unavailable" }),
       async () => response({ ...preview, days: "malformed" }),
-      async () => ({ ok: true, status: 200, json: async () => { throw new SyntaxError("fixture-malformed-payload"); } }),
     ]) {
       assert.equal(badge.textContent, "Admin preview available");
       assert.equal(container.querySelectorAll('svg[role="img"]').length, 1);
@@ -1140,7 +1294,7 @@ test("overview access refusal clears the allowance graph and a delayed older pre
   await withAdminPage(async path => {
     if (path === "/api/v1/admin/overview") return nextOverview();
     if (path === "/api/v1/admin/community/allowance-preview") return nextPreview();
-    assert.equal(path, "/api/v1/admin/metrics/history");
+    assert.ok(ADMIN_READ_PATHS.slice(2).includes(path));
     return unavailableResponse();
   }, async documentRef => {
     const badge = documentRef.byId.get("admin-community-status");

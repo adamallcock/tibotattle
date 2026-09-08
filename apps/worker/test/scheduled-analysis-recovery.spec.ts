@@ -89,7 +89,7 @@ function bindings(observation = observe(), mode = "resumable"): Env {
     return Reflect.get(target, key);
   } });
 }
-async function migrations(max = 49) {
+async function migrations(max = Number.POSITIVE_INFINITY) {
   await applyD1Migrations(db(), runtime.TEST_MIGRATIONS.filter(migration => Number(migration.name.slice(0, 4)) <= max));
   await applyD1Migrations(runtime.DELETION_LEDGER, runtime.TEST_DELETION_LEDGER_MIGRATIONS);
 }
@@ -248,6 +248,9 @@ describe("actual scheduled resumable analysis recovery", () => {
     await seedQuota(200);
     const setup = observe(); await runScheduledMaintenance(bindings(setup), NOW);
     assertMeter(setup); await released();
+    // Model a missing completion receipt. An intact current lane now skips
+    // account probes altogether, so only recovery needs this expensive probe.
+    await db().prepare("DELETE FROM community_refresh_lanes WHERE lane='current'").run();
     inspection.modelHistory.mockClear();
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     logSpy.mockClear();
@@ -268,8 +271,10 @@ describe("actual scheduled resumable analysis recovery", () => {
       expect.objectContaining({ phase: "before_analysis", code: "BOUNDED_MODEL_HISTORY_PROGRESS",
         elapsedMs: 0, deadlineRemainingMs: 40_000 }),
     ]);
+    // A completed account cache does not grant permission to write the lane
+    // completion receipt after the shared deadline has elapsed.
     expect(logs).toContainEqual(expect.objectContaining({ event: "scheduled_allowance_reconstruction",
-      outcome: "complete", elapsedMs: 40_001, deadlineRemainingMs: 0 }));
+      outcome: "deferred", elapsedMs: 40_001, deadlineRemainingMs: 0 }));
     assertMeter(observation); await released();
   });
 
@@ -312,17 +317,26 @@ describe("actual scheduled resumable analysis recovery", () => {
     assertMeter(observation); await released();
   });
 
-  it("preserves acquisition and queue on a shared small budget, then resumes and publishes both caches", async () => {
-    await seedQuota(2050); const queued = await queue(), first = observe();
+  it("preserves completed acquisition and queue at the shared optional deadline, then resumes and publishes both caches", async () => {
+    await seedQuota(2050); const queued = await queue();
+    const started = Date.now(); let currentTime = started, crossed = false;
+    vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+    const first = observe(async (entry, moment) => {
+      if (crossed || moment !== "after" || !entry.sql.includes("UPDATE community_analysis_work SET phase=")) return;
+      const head = await db().prepare("SELECT phase FROM community_analysis_work WHERE participant_id=?").bind(PARTICIPANT)
+        .first<{ phase: string }>();
+      if (head?.phase === "complete") { crossed = true; currentTime = started + 40_001; }
+    });
     inspection.limit = 350;
     const result = await runScheduledMaintenance(bindings(first), NOW);
     expect(result).toMatchObject({ outcome: "success", lifecycleComplete: true, aggregateRebuildComplete: false });
+    expect(crossed).toBe(true);
     assertMeter(first); await released();
     const before = await db().prepare("SELECT fixed_now,run_id,phase,progress_revision FROM community_analysis_work WHERE participant_id=?").bind(PARTICIPANT).first();
     expect(before?.phase).toBe("complete");
     expect((await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds ORDER BY day").all()).results).toEqual(queued);
     expect(await db().prepare("SELECT count(*) AS n FROM community_allowance_fit_cache").first()).toEqual({ n: 0 });
-    inspection.limit = 900; const second = observe();
+    inspection.limit = 900; currentTime = started + 60_000; const second = observe();
     expect(await runScheduledMaintenance(bindings(second), NOW + 60_000)).toMatchObject({ outcome: "success", lifecycleComplete: true });
     assertMeter(second); await released();
     const payloadRead = second.queries.findIndex(entry => entry.sql.includes("FROM wanted w JOIN community_analysis_work_parts p"));
@@ -333,13 +347,13 @@ describe("actual scheduled resumable analysis recovery", () => {
     const setupReceipt = { fixedSetupQueries,
       primary: second.queries.slice(0, fixedSetupQueries).filter(entry => entry.binding === "primary").length,
       ledger: second.queries.slice(0, fixedSetupQueries).filter(entry => entry.binding === "ledger").length };
-    // The current-first slot has no speculative preview/cohort scan. Keep
-    // the original setup budget even when the preview's inputs are incomplete.
+    // The current-first slot has no speculative preview/cohort scan. Pin the
+    // source/preparation/receipt setup cost even when preview inputs are incomplete.
     expect(second.queries.slice(0, payloadRead).some(entry => entry.sql.includes("FROM admin_community_allowance_preview_cache"))).toBe(false);
-    expect(setupReceipt).toEqual({ fixedSetupQueries: 50, primary: 47, ledger: 3 });
+    expect(setupReceipt).toEqual({ fixedSetupQueries: 55, primary: 52, ledger: 3 });
     // Worst legal 1024-part head:384 reads,3 final pin/head checks,407 finish
     // reserve,24 combined warmer/scheduler headroom. Heavy sustained required
-    // housekeeping can exceed the remaining33 queries and safely defer finish.
+    // housekeeping can exceed the remaining 27 queries and safely defer finish.
     expect(fixedSetupQueries + 384 + 3 + 407 + 24).toBeLessThanOrEqual(900);
     expect(await db().prepare("SELECT fixed_now,run_id,phase FROM community_analysis_work WHERE participant_id=?").bind(PARTICIPANT).first())
       .toMatchObject({ fixed_now: before!.fixed_now, run_id: before!.run_id, phase: "complete" });
@@ -372,7 +386,7 @@ describe("actual scheduled resumable analysis recovery", () => {
     expect(await db().prepare("SELECT count(*) AS n FROM telemetry_v1_quota_fit_rows").first()).toEqual({ n: 4097 });
   });
 
-  it("refreshes an aged preview before the current-account scan consumes the optional deadline", async () => {
+  it("keeps an aged preview readable and publishes newly available history before a slow current-account recovery probe", async () => {
     await seedQuota(200);
     const setup = observe();
     expect(await runScheduledMaintenance(bindings(setup), NOW)).toMatchObject({ outcome: "success", lifecycleComplete: true });
@@ -388,10 +402,11 @@ describe("actual scheduled resumable analysis recovery", () => {
     expect(prior?.generated_at).toBe(new Date(NOW).toISOString());
     expect(caches.map(rows => rows.length)).toEqual([1, 1]);
     expect(await db().prepare("SELECT count(*) AS n FROM community_daily_aggregate_rebuilds").first()).toEqual({ n: 0 });
-
-    // Keep the same UTC/source window but make the old singleton genuinely
-    // expired. Simulate slow D1 I/O, not a sleep or an invalid cached body.
+    await db().prepare("DELETE FROM community_refresh_lanes WHERE lane='current'").run();
+    // Keep the same UTC/source window. Age alone never hides the old singleton;
+    // the history published after the first preview is a real refresh input.
     const refreshedAt = NOW + 3 * 3_600_000, started = Date.now();
+    expect(validCachedAdminCommunityAllowancePreview(JSON.parse(prior!.payload_json), prior!.generated_at, refreshedAt)).toBe(true);
     let crossed = false;
     const deadlineObservation: { preview: Awaited<ReturnType<typeof readPreview>> } = { preview: null };
     vi.spyOn(Date, "now").mockImplementation(() => started + (crossed ? 40_001 : 0));
@@ -417,11 +432,11 @@ describe("actual scheduled resumable analysis recovery", () => {
     expect(await accountCaches()).toEqual(caches);
     expect(await db().prepare("SELECT count(*) AS n FROM community_daily_aggregate_rebuilds").first()).toEqual({ n: 0 });
     const logs = logSpy.mock.calls.map(([message]) => JSON.parse(String(message)) as { event: string });
-    expect(logs).toContainEqual(expect.objectContaining({ event: "scheduled_allowance_reconstruction", outcome: "complete",
+    expect(logs).toContainEqual(expect.objectContaining({ event: "scheduled_allowance_reconstruction", outcome: "deferred",
       visited: 1, published: 0, resumed: 0 }));
     expect(logs).toContainEqual(expect.objectContaining({ event: "admin_allowance_preview_cache", phase: "before_analysis",
       outcome: "success", code: "ALLOWANCE_PREVIEW_CACHE_REFRESHED", elapsedMs: 0, deadlineRemainingMs: 40_000,
-      queriesUsed: expect.any(Number), phaseQueries: 13 }));
+      queriesUsed: expect.any(Number), phaseQueries: 14 }));
     expect(observation.queries.filter(entry => entry.sql.includes("FROM admin_community_allowance_preview_cache"))).toHaveLength(1);
     expect(warnSpy.mock.calls.some(([message]) => String(message).includes("admin_allowance_preview_cache"))).toBe(false);
     expect(logs.filter(log => log.event === "scheduled_model_history")).toEqual([
@@ -434,7 +449,7 @@ describe("actual scheduled resumable analysis recovery", () => {
     assertMeter(observation); await released();
   });
 
-  it("refreshes expired owner metrics before slow account probes and never attempts a cache twice", async () => {
+  it("refreshes due owner metrics before slow account probes and never attempts a cache twice", async () => {
     await seedQuota(200);
     const started = Date.now();
     let currentTime = started;
@@ -447,7 +462,10 @@ describe("actual scheduled resumable analysis recovery", () => {
 
     const refreshedAt = started + 3 * 3_600_000;
     currentTime = refreshedAt;
-    await expect(readCachedAdminMetricsHistory(db(), currentTime)).rejects.toMatchObject({ code: "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE" });
+    // A refresh due time is not an availability expiry. Preserve the verified
+    // metrics until their atomic replacement is ready.
+    expect(await readCachedAdminMetricsHistory(db(), currentTime)).toEqual(prior);
+    await db().prepare("DELETE FROM community_refresh_lanes WHERE lane='current'").run();
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const metricsAtProbe: { generatedAt?: string; capturedAt?: string } = {};
     const observation = observe(async (entry, moment) => {

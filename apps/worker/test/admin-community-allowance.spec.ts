@@ -621,6 +621,25 @@ describe("admin community allowance preview", () => {
     expect(JSON.stringify(cached)).not.toContain("participant-1");
   });
 
+  it("uses reviewed current labels without invalidating analytically identical cached models", async () => {
+    const now=Date.parse("2026-09-07T12:00:00.000Z");
+    const preview=buildAdminCommunityAllowancePreview([fit()],now);
+    const renamed={...preview,models:{...preview.models,
+      modelConfig:preview.models.modelConfig.map(model=>({...model,label:"Previous display label"}))}};
+    const cached=previewCacheDatabase(previewRow(renamed));
+    expect(await readCachedAdminCommunityAllowancePreview(cached.database,now)).toEqual(preview);
+    expect(cached.statements).toHaveLength(1);
+    for(const mutation of [
+      {modelId:"unrecognized-model"}, {allowanceTrack:"unrecognized-track"},
+      {pricingStatus:"unrecognized-pricing"}, {label:""}, {label:"x".repeat(81)},
+    ]) {
+      const invalid=structuredClone(renamed);
+      Object.assign(invalid.models.modelConfig[0]!,mutation);
+      await expect(readCachedAdminCommunityAllowancePreview(previewCacheDatabase(previewRow(invalid)).database,now))
+        .rejects.toMatchObject({status:503,code:"ADMIN_ALLOWANCE_CACHE_UNAVAILABLE"});
+    }
+  });
+
   it("preserves old evidence dates but fails closed for missing, oversized, corrupt, or non-exact rows", async () => {
     const nowEpoch = Date.parse("2026-08-23T10:30:00.000Z");
     const preview = buildAdminCommunityAllowancePreview([], nowEpoch);
@@ -653,11 +672,11 @@ describe("admin community allowance preview", () => {
       nowEpoch,
     )).rejects.toMatchObject({
       status: 503,
-      code: "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE",
+      code: "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE",
     });
   });
 
-  it("scheduled refresh stores the actual bounded aggregate and self-throttles", async () => {
+  it("scheduled refresh stores the actual bounded aggregate and reuses an unchanged source", async () => {
     const nowEpoch = Date.parse("2026-08-23T10:30:00.000Z");
     const source = previewWarmDatabase([cacheRow()]);
     await expect(warmAdminCommunityAllowancePreviewCache(

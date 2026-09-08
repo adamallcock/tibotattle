@@ -529,6 +529,8 @@ export function normalizeCommunityDailySeries(payload, { nowMs = Date.now() } = 
       || from === null
       || to === null
       || !["ready", "updating"].includes(payload.allowanceState)
+      || (payload.allowanceReadState !== undefined
+        && !["confirmed", "temporarily_unavailable"].includes(payload.allowanceReadState))
       || !Array.isArray(payload.days)
       || payload.days.length > COMMUNITY_DAILY_WINDOW_DAYS) {
     return { state: "unsupported_schema", days: [] };

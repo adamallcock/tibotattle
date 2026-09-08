@@ -144,7 +144,10 @@ describe("owner-only reconstruction progress", () => {
         state,consent_version,consented_at,created_at)
       SELECT printf('bounded-%05d',i),printf('access-%05d',i),zeroblob(32),printf('recovery-%05d',i),zeroblob(32),
         'active','privacy-safe-telemetry-v0.1',?1,?1 FROM n`).bind(ISO).run();
-    await db().prepare(`INSERT INTO community_analysis_work SELECT p.id,p.id,v.revision,h.input_fingerprint,
+    await db().prepare(`INSERT INTO community_analysis_work
+      (participant_id,run_id,input_revision,input_fingerprint,source_kind,source_method_version,fixed_now,
+        observed_at_cutoff,resets_at_cutoff,window_minutes,max_quota_rows,phase,progress_revision,control_json,manifest_json,state_sha256)
+      SELECT p.id,p.id,v.revision,h.input_fingerprint,
       h.source_kind,h.source_method_version,h.fixed_now,h.observed_at_cutoff,h.resets_at_cutoff,h.window_minutes,
       h.max_quota_rows,h.phase,h.progress_revision,h.control_json,h.manifest_json,h.state_sha256
       FROM participants p JOIN community_analytical_input_versions v ON v.participant_id=p.id

@@ -318,7 +318,8 @@ describe("GET /api/v1/community/daily", () => {
   });
 
   it("keeps activity available when breakdown cache content is absent, stale, malformed, or oversized", async () => {
-    const nowMs = Date.now(), day = utcDay(nowMs, -1);
+    // Keep the requested day before even the two-hour-old generation at UTC midnight.
+    const nowMs = Date.now(), day = utcDay(nowMs, -2);
     await seedDailyRevision({ day, revision: 1 });
     await seedReadyAllowanceState(nowMs);
     const assertAbsent = async () => {

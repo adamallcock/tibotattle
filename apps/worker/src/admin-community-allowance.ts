@@ -27,10 +27,8 @@ const MINIMUM_FITS_FOR_BAND = 3;
 // 70 compact days across the reviewed catalog, including fully populated rows.
 // Enforced before writes and reads; tests cover the complete reviewed roster.
 export const PREVIEW_CACHE_JSON_LIMIT_BYTES = 256 * 1_024;
-// Unchanged epochs need no more than an hourly rebuild. Changed source epochs,
-// UTC days or newly completed historical model days bypass this throttle.
-// Published snapshots have no age-only expiry.
-const PREVIEW_CACHE_MIN_INTERVAL_MILLISECONDS = 55 * 60 * 1_000;
+// Changed source epochs, UTC days or completed historical model days refresh
+// publication. Elapsed time alone neither expires nor rebuilds a snapshot.
 const PREVIEW_CACHE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 
 export const ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
@@ -222,7 +220,7 @@ function validAdminCommunityAllowanceModels(
     if (model === null
         || !exactKeys(model, ["modelId", "label", "allowanceTrack", "pricingStatus"])
         || model.modelId !== expected.modelId
-        || model.label !== expected.label
+        || typeof model.label !== "string" || model.label.length < 1 || model.label.length > 80
         || model.allowanceTrack !== expected.allowanceTrack
         || model.pricingStatus !== expected.pricingStatus) {
       return false;
@@ -844,7 +842,7 @@ export async function readCachedAdminCommunityAllowancePreview(
       .bind(PREVIEW_CACHE_JSON_LIMIT_BYTES, COMMUNITY_ATTRIBUTION_METHOD_VERSION)
       .first<{ generated_at: string; payload_json: string }>();
   } catch {
-    return previewCacheUnavailable();
+    throw new ApiError(503, "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE");
   }
   if (row === null
       || typeof row.generated_at !== "string"
@@ -866,7 +864,9 @@ export async function readCachedAdminCommunityAllowancePreview(
   )) {
     return previewCacheUnavailable();
   }
-  return parsed;
+  // Display copy is not analytical identity. Never echo a stored label when a
+  // reviewed catalog rename can supply the current content-free presentation.
+  return { ...parsed, models: { ...parsed.models, modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG } };
 }
 
 export interface AdminCommunityAllowancePreviewCacheResult {
@@ -911,7 +911,6 @@ export async function warmAdminCommunityAllowancePreviewCache(
       if (previousPreview !== null && existing.source_mutation_epoch === existing.mutation_epoch
           && existing.generated_at.slice(0, 10) === new Date(nowEpoch).toISOString().slice(0, 10)
           && Number.isFinite(existingEpoch)
-          && nowEpoch - existingEpoch < PREVIEW_CACHE_MIN_INTERVAL_MILLISECONDS
           && validCachedAdminCommunityAllowancePreview(
             parsed,
             existing.generated_at,

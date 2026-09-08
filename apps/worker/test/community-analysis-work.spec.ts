@@ -83,6 +83,23 @@ beforeEach(async () => {
 });
 
 describe("participant-scoped resumable analysis work", () => {
+  it("preserves old raw head hashes and fences a prepared reader policy throughout replay", async () => {
+    const raw = await begin();
+    expect(Object.hasOwn(raw, "readerPolicy")).toBe(false);
+    expect(await readCommunityAnalysisWork(db(), IDENTITY, budget())).toEqual({ status: "ready", head: raw });
+    await db().prepare("DELETE FROM community_analysis_work WHERE participant_id=?").bind(IDENTITY.participantId).run();
+    const prepared = await beginCommunityAnalysisWork(db(), IDENTITY, control(), budget(), undefined, "prepared-source-days-1");
+    expect(prepared.status).toBe("ready");
+    if (prepared.status !== "ready") throw new Error("expected prepared run");
+    const next = await saved(prepared.head);
+    expect(next.readerPolicy).toBe("prepared-source-days-1");
+    expect(await readCommunityAnalysisWork(db(), IDENTITY, budget())).toEqual({ status: "ready", head: next });
+    await db().prepare("UPDATE community_analysis_work SET reader_policy='raw-source-pages-1'").run();
+    expect(await readCommunityAnalysisWork(db(), IDENTITY, budget())).toEqual({ status: "corrupt" });
+    expect(await commitCommunityAnalysisWorkPage(db(), next, { phase: "plan", control: control(), parts: [] }, budget()))
+      .toEqual({ status: "stale" });
+  });
+
   it("refuses an unmigrated store, then starts only for an active exact source revision", async () => {
     await db().prepare("DROP TABLE community_analysis_work_parts").run();
     await db().prepare("DROP TABLE community_analysis_work").run();
@@ -472,6 +489,61 @@ async function seedLarge(count: number) {
 }
 
 describe("staged immutable checkpoint promotion", () => {
+  it("resumes a prepared 128-row staged page without interchanging raw physical replay", async () => {
+    const raw = await begin();
+    const identity: V1QuotaAcquisitionIdentity = { participantId: IDENTITY.participantId,
+      inputFingerprint: IDENTITY.inputFingerprint, sourceMethodVersion: IDENTITY.sourceMethodVersion,
+      observedAtCutoff: IDENTITY.observedAtCutoff, resetsAtCutoff: IDENTITY.resetsAtCutoff,
+      windowMinutes: IDENTITY.windowMinutes, maxQuotaRows: IDENTITY.maxQuotaRows };
+    const rows: V1PlanSourceRow[] = Array.from({ length: 128 }, (_, offset) => ({ id: offset + 1,
+      observed_at: new Date(Date.parse(IDENTITY.observedAtCutoff) + offset * 1000).toISOString(),
+      observed_day: "2026-08-01", device_id: "synthetic-winner", provider: "openai_codex", limit_id: "codex",
+      plan_type: "pro", plan_variant: "unknown" }));
+    const replayPage = async () => advanceV1QuotaAcquisitionPage({ pageSize: 128,
+      async readPlanPage(_cursor, limit) { expect(limit).toBe(128); return rows; },
+      async readFitPage() { throw new Error("plan replay must read exactly one physical page"); },
+    }, identity, new Map([["2026-08-01", "synthetic-winner"]]), budget(1), createV1QuotaAcquisitionCheckpoint(identity));
+    const first = await replayPage();
+    if (!first.checkpoint || !first.replay || first.replay.version !== "v1-quota-page-replay-2") throw new Error("expected prepared replay");
+    expect(first.replay).toMatchObject({ version: "v1-quota-page-replay-2", readerPolicy: "prepared-source-days-1", pageSize: 128,
+      from: { phase: "plan", cursor: { id: 0 } }, through: { phase: "plan", cursor: { id: 128 } } });
+    const encoded = encodeV1QuotaWorkCheckpoint(first.checkpoint);
+    const target: CommunityAnalysisStageTarget = { phase: first.replay.through.phase, control: encoded.control, components: encoded.components };
+    expect(await beginCommunityAnalysisStage(db(), raw, target, first.replay, budget())).toEqual({ status: "replay_unresolved" });
+    await db().prepare("DELETE FROM community_analysis_work WHERE participant_id=?").bind(IDENTITY.participantId).run();
+    const prepared = await beginCommunityAnalysisWork(db(), IDENTITY, control(), budget(), undefined, "prepared-source-days-1");
+    if (prepared.status !== "ready") throw new Error("expected prepared head");
+    const rawReplay: V1QuotaPageReplay = { version: "v1-quota-page-replay-1", from: first.replay.from, through: first.replay.through,
+      sourceQueryCount: 1, resolution: "resolved" };
+    expect(await beginCommunityAnalysisStage(db(), prepared.head, target, rawReplay, budget())).toEqual({ status: "replay_unresolved" });
+    const begun = await beginCommunityAnalysisStage(db(), prepared.head, target, first.replay, budget());
+    if (begun.status !== "ready") throw new Error("expected prepared stage");
+    expect(begun.stage.mode).toBe("writing");
+    const restored = await readCommunityAnalysisStage(db(), prepared.head, budget());
+    expect(restored).toEqual(begun);
+    if (restored.status !== "ready") throw new Error("expected durable prepared stage");
+    expect(await writeCommunityAnalysisStagePage(db(), prepared.head, restored.stage, target, rawReplay, budget()))
+      .toEqual({ status: "replay_unresolved" });
+    const replayed = await replayPage();
+    expect(replayed).toEqual(first);
+    const written = await finishWrites(prepared.head, restored.stage, target, first.replay);
+    const verified = await finishVerification(prepared.head, written);
+    const promoted = await promoteCommunityAnalysisStage(db(), prepared.head, verified, budget());
+    if (promoted.status !== "ready") throw new Error("expected prepared promotion");
+    expect(promoted.head.readerPolicy).toBe("prepared-source-days-1");
+    await collectAll(promoted.head, promoted.stage);
+    expect(await readCommunityAnalysisWork(db(), IDENTITY, budget())).toEqual({ status: "ready", head: promoted.head });
+    const parts = await readCommunityAnalysisWorkParts(db(), promoted.head, 0, budget());
+    if (parts.status !== "ready") throw new Error("expected promoted prepared parts");
+    expect(parts.done).toBe(true);
+    const components: Record<V1QuotaWorkComponent, unknown[]> = emptyComponents();
+    for (const part of parts.parts) {
+      if (!Array.isArray(part.value)) throw new Error("expected component array");
+      components[part.component].push(...part.value);
+    }
+    expect(decodeV1QuotaWorkCheckpoint(identity, promoted.head.control, components)).toEqual(first.checkpoint);
+  });
+
   it.each([
     { sourceMethodVersion: "legacy-day-or-complete-domain-3:policy-2" },
     { observedAtCutoff: "2026-08-02T00:00:00.000Z", resetsAtCutoff: "2026-08-09T00:00:00.000Z" },

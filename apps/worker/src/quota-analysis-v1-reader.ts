@@ -61,6 +61,9 @@ export interface V1ResetCursor extends V1TimeCursor { resetsAt: string }
  * Adapters must not hide additional queries or unbounded filtered-prefix scans.
  */
 export interface V1QuotaPageReader {
+  /** A distinct, persisted prepared-reader policy uses smaller bounded fanout
+   * pages. Absence is the immutable legacy 1024-row physical protocol. */
+  readonly pageSize?: 128;
   readPlanPage(cursor: V1TimeCursor, limit: number): Promise<V1PlanSourceRow[]>;
   readFitPage(cursor: V1ResetCursor, limit: number): Promise<V1FitSourceRow[]>;
 }
@@ -153,13 +156,14 @@ export type V1QuotaAcquisitionStep =
   | ({ status: "complete"; attributionIndex: PlanAttributionIndex } & V1CompletedQuotaAcquisition)
   | { status: "not_testable"; reason: "plan_attribution_limit_exceeded" | "downsampled_quota_limit_exceeded" };
 
-export interface V1QuotaPageReplay {
-  version: "v1-quota-page-replay-1";
+export type V1QuotaPageReplay = {
   from: { phase: V1QuotaAcquisitionCheckpoint["phase"]; cursor: V1ResetCursor };
   through: { phase: V1QuotaAcquisitionCheckpoint["phase"] | "complete"; cursor: V1ResetCursor };
   sourceQueryCount: 1;
   resolution: "resolved";
-}
+} & ({ version: "v1-quota-page-replay-1" } | {
+  version: "v1-quota-page-replay-2"; readerPolicy: "prepared-source-days-1"; pageSize: 128;
+});
 
 function textOrder(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -291,8 +295,11 @@ export function validateV1QuotaPageReplay(value: unknown): value is V1QuotaPageR
     && closed(candidate.cursor, ["resetsAt", "observedAt", "id"]) && instant(candidate.cursor.resetsAt)
     && (candidate.cursor.observedAt === "" || instant(candidate.cursor.observedAt))
     && Number.isSafeInteger(candidate.cursor.id) && (candidate.cursor.id as number) >= 0;
-  return closed(value, ["version", "from", "through", "sourceQueryCount", "resolution"])
-    && value.version === "v1-quota-page-replay-1" && value.sourceQueryCount === 1 && value.resolution === "resolved"
+  return (closed(value, ["version", "from", "through", "sourceQueryCount", "resolution"])
+      && value.version === "v1-quota-page-replay-1"
+    || closed(value, ["version", "from", "through", "sourceQueryCount", "resolution", "readerPolicy", "pageSize"])
+      && value.version === "v1-quota-page-replay-2" && value.readerPolicy === "prepared-source-days-1" && value.pageSize === 128)
+    && value.sourceQueryCount === 1 && value.resolution === "resolved"
     && point(value.from, false) && point(value.through, true);
 }
 
@@ -461,6 +468,8 @@ export async function advanceV1QuotaAcquisition(
   state: V1QuotaAcquisitionCheckpoint = createV1QuotaAcquisitionCheckpoint(identity),
   options: { maxPages?: number } = {},
 ): Promise<V1QuotaAcquisitionStep> {
+  const pageSize = reader.pageSize ?? V1_QUOTA_ACQUISITION_PAGE_SIZE;
+  if (pageSize !== 128 && pageSize !== V1_QUOTA_ACQUISITION_PAGE_SIZE) throw new Error("v1 quota reader page policy invalid");
   validateCheckpoint(state, identity);
   if (!Number.isSafeInteger(budget.remainingQueries) || budget.remainingQueries < 0
       || !Number.isFinite(budget.deadlineMs)) throw new Error("v1 quota acquisition budget invalid");
@@ -558,8 +567,8 @@ export async function advanceV1QuotaAcquisition(
     budget.remainingQueries -= 1;
     pagesRead += 1;
     if (state.phase === "plan") {
-      const rows = await reader.readPlanPage(state.cursor, V1_QUOTA_ACQUISITION_PAGE_SIZE);
-      if (rows.length > V1_QUOTA_ACQUISITION_PAGE_SIZE) throw new Error("v1 quota acquisition page overflow");
+      const rows = await reader.readPlanPage(state.cursor, pageSize);
+      if (rows.length > pageSize) throw new Error("v1 quota acquisition page overflow");
       let previous: V1TimeCursor = state.cursor;
       for (const row of rows) {
         if (!Number.isSafeInteger(row.id) || row.id <= 0
@@ -585,7 +594,7 @@ export async function advanceV1QuotaAcquisition(
         if (state.plan.anchors.length + equalTime.size > V1_PLAN_ANCHOR_LIMIT) return fail("plan_attribution_limit_exceeded");
       }
       state.cursor = { ...state.cursor, ...previous };
-      if (rows.length === V1_QUOTA_ACQUISITION_PAGE_SIZE) continue;
+      if (rows.length === pageSize) continue;
       if (!flushPlanTime()) return fail("plan_attribution_limit_exceeded");
       for (const run of planRuns.values()) {
         if (!sameAnchor(run.first, run.last)) state.plan.anchors.push(run.last);
@@ -602,8 +611,8 @@ export async function advanceV1QuotaAcquisition(
       continue;
     }
 
-    const rows = await reader.readFitPage(state.cursor, V1_QUOTA_ACQUISITION_PAGE_SIZE);
-    if (rows.length > V1_QUOTA_ACQUISITION_PAGE_SIZE) throw new Error("v1 quota acquisition page overflow");
+    const rows = await reader.readFitPage(state.cursor, pageSize);
+    if (rows.length > pageSize) throw new Error("v1 quota acquisition page overflow");
     let previous: V1ResetCursor = state.cursor;
     for (const row of rows) {
       const order = textOrder(row.resets_at, previous.resetsAt) || textOrder(row.observed_at, previous.observedAt)
@@ -655,7 +664,7 @@ export async function advanceV1QuotaAcquisition(
       }
     }
     state.cursor = previous;
-    if (rows.length === V1_QUOTA_ACQUISITION_PAGE_SIZE) continue;
+    if (rows.length === pageSize) continue;
     if (state.phase === "fitability") {
       if (!finishStats()) return fail("downsampled_quota_limit_exceeded");
       state.phase = "endpoints";
@@ -691,7 +700,9 @@ export async function advanceV1QuotaAcquisitionPage(reader: V1QuotaPageReader, i
   // Explicitly expose the actual final endpoint IDs for staged persistence.
   // A completed marker has phase complete while this resumable control stays
   // endpoints; no opaque attribution index is part of the checkpoint.
-  return { result, checkpoint: state, replay: { version: "v1-quota-page-replay-1", from,
+  return { result, checkpoint: state, replay: { ...(reader.pageSize === 128
+    ? { version: "v1-quota-page-replay-2" as const, readerPolicy: "prepared-source-days-1" as const, pageSize: 128 as const }
+    : { version: "v1-quota-page-replay-1" as const }), from,
     through: { phase: result.status === "complete" ? "complete" : result.checkpoint.phase, cursor: { ...state.cursor } },
     sourceQueryCount: 1, resolution: "resolved" } };
 }

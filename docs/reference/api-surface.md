@@ -58,6 +58,7 @@ site.
 | `POST` | `/api/v1/logout` | Website or loopback relay | Session | Revokes/clears the current web session. | Participant account |
 | `GET` | `/api/v1/admin/overview` | Admin application | Admin | Reads bounded operational, distribution, lifecycle, sampled error evidence, and optional failure-isolated reconstruction progress. Refresh never advances calculation. | Operations |
 | `GET` | `/api/v1/admin/metrics/history` | Admin application | Admin | Reads bounded operational history. | Operations |
+| `GET` | `/api/v1/admin/reconstruction-progress` | Admin application | Admin | Reads bounded refresh-generation and historical-completion metadata; never advances calculation. | Operations |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin application | Admin | Reads unpublished allowance-fit previews; does not publish. | Operations |
 | `POST` | `/api/v1/admin/action` | Owner/admin application | Admin | Collection controls, maintenance, and distribution actions; explicit participant erasure uses the existing maintenance action with auditable D1/R2 effects. | Operations |
 | `POST` | `/api/v1/me/security-reset` | Participant browser | Session | Rotates session/recovery state and invalidates affected credentials. | Participant account |
@@ -105,10 +106,11 @@ transaction. The optional cache is limited to 256 KiB, must match the current
 method and fall between the last hard-invalidation epoch and current input
 epoch, and is projected into a new closed
 object. Only requested, actually published days before both the current and
-generation UTC dates are included. A genuine append-only v1 upload preserves
-the published graph while changed accounts and affected days are processed.
-Corrections, source-device changes, withdrawal, policy changes and unknown
-mutations hard-invalidate it. Missing/invalidated/invalid
+generation UTC dates are included. A validated v1 append or same-device chunk
+correction preserves the published graph while changed accounts and affected
+days are processed. Corrections require a one-use capability created and consumed
+inside the same accepted-upload transaction. Source-device changes, withdrawal,
+policy changes and unknown mutations hard-invalidate it. Missing/invalidated/invalid
 cache or an unavailable optional cache schema omits the breakdown, preserving
 the independent daily activity response. No public request invokes analysis,
 writes state, accepts cohort filters or exposes the private admin response.
@@ -126,6 +128,19 @@ selected legend and keyboard inspection position without retaining old values.
 The owner page likewise keeps its graph through classified network/storage
 failures, but clears it for access/policy refusals, invalid payloads or an
 authoritative unavailable-cache response.
+
+The additive `allowanceReadState` distinguishes `confirmed` from
+`temporarily_unavailable`. An optional storage-read failure keeps independent
+daily activity available, uses `no-store`, and does not clear an already displayed
+graph. It is not permission to retain a graph after a confirmed invalidation.
+
+The owner-only `GET /api/v1/admin/reconstruction-progress` returns the closed
+metadata contract (`schemaVersion: 1`): requested, prepared and
+published generations; current phase/trigger; and resolved/required historical
+days. Unknown counts stay null. It is read-only, disallows query parameters and
+returns no account IDs or raw evidence. The owner UI polls progress and each
+graph independently with non-overlapping requests every 15 seconds, so a slow
+graph read cannot conceal progress. Access loss clears private state.
 
 The owner explicitly approved dollar estimates and sample counts even when
 based on one account. This can reveal that contributor's estimated capacity;

@@ -143,9 +143,13 @@ describe("cache-only graph recovery publication", () => {
 
   it("insufficient phase admission does not start cache reads or mutate the queue", async () => {
     await queue(); const prior = await snapshot(); const options = recovery(50);
-    expect(await rebuildPendingCommunityDailyAggregates(db(),NOW,1,{chunks:8},options)).toMatchObject({deferred:true});
+    const observation = observed();
+    expect(await rebuildPendingCommunityDailyAggregates(observation.database,NOW,1,{chunks:8},options)).toMatchObject({deferred:true});
     expect(readers.fits).not.toHaveBeenCalled(); expect(await snapshot()).toEqual(prior);
-    expect(options.budget.remainingQueries).toBe(50);
+    expect(observation.prepared).toHaveLength(1);
+    expect(observation.prepared[0]).toContain("community_refresh_lanes");
+    expect(observation.mutations).toEqual([]);
+    expect(options.budget.remainingQueries).toBe(48); // Metadata read plus conservative final-receipt reserve.
   });
 
   it("missing model composition defers the admin graph without an empty model-day substitute", async () => {
@@ -158,10 +162,22 @@ describe("cache-only graph recovery publication", () => {
 
   it("admin recovery retains previous cache and model-day when a refresh cohort is incomplete", async () => {
     expect((await warmAdminCommunityAllowancePreviewCache(db(),NOW,recovery())).code).toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
+    // New source evidence, not age alone, is what requires a new cohort.
+    await db().prepare(`UPDATE community_snapshot_mutation_control
+      SET mutation_epoch=mutation_epoch+1,graph_append_epoch=mutation_epoch+1 WHERE singleton_id=1`).run();
     const prior = await snapshot(); readers.corpus.mockResolvedValue(null);
     expect(await warmAdminCommunityAllowancePreviewCache(db(),NOW+3_600_000,recovery()))
       .toEqual({code:"ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE"});
     expect(await snapshot()).toEqual(prior);expect(readers.rawModels).not.toHaveBeenCalled();
+  });
+
+  it("does not rebuild an unchanged admin cohort merely because an hour elapsed", async () => {
+    expect((await warmAdminCommunityAllowancePreviewCache(db(),NOW,recovery())).code).toBe("ALLOWANCE_PREVIEW_CACHE_REFRESHED");
+    const prior = await snapshot(); readers.corpus.mockClear(); readers.models.mockClear();
+    expect(await warmAdminCommunityAllowancePreviewCache(db(),NOW+3_600_000,recovery()))
+      .toEqual({code:"ALLOWANCE_PREVIEW_CACHE_CURRENT"});
+    expect(readers.corpus).not.toHaveBeenCalled();expect(readers.models).not.toHaveBeenCalled();
+    expect(await snapshot()).toEqual(prior);
   });
 
   it("valid admin cache payloads preserve scalar and model-day parity and publish together", async () => {

@@ -7,7 +7,9 @@ import {
   finishAccountScopedAnalysesV1, finishAccountScopedQuotaAnalysisV1, finishAccountScopedModelCompositionV1,
   V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION, V1_USAGE_PAGE_AT_TIME_SQL, V1_USAGE_PAGE_AFTER_TIME_SQL,
   QUOTA_DOWNSAMPLE_SQL, v1QuotaFinishQueryReserve, priceChunkUsageRecord, type V1AcquiredQuotaEvidence,
+  type V1PreparedFinishEvidence, type WindowedUsageRow, type V1PreparedUsageFragment,
 } from "../src/quota-analysis-v1";
+import { prepareUsagePage } from "../src/prepared-v1-day";
 import type { V1AcquiredQuotaRow, V1PlanAnchor } from "../src/quota-analysis-v1-reader";
 
 const BASE = Date.parse("2026-08-01T00:00:00.000Z"), HOUR = 3_600_000;
@@ -98,6 +100,23 @@ async function fixture(rows: Usage[], switchPlan = false) {
     mutate() { revision += 1; }, onRead(callback: () => void) { onUsageRead = callback; } };
 }
 const budget = (remainingQueries = 1000) => ({ remainingQueries, deadlineMs: Date.now() + 60_000 });
+function preparedUsage(rows: Usage[], sourceFingerprint: string): V1PreparedFinishEvidence {
+  const order = (a: {observed_at:string;id:number}, b: {observed_at:string;id:number}) =>
+    a.observed_at < b.observed_at ? -1 : a.observed_at > b.observed_at ? 1 : a.id-b.id;
+  const ordered=[...rows].sort(order), prices:WindowedUsageRow[]=[], fragments:V1PreparedUsageFragment[]=[];
+  for(let offset=0;offset<ordered.length;offset+=256) {
+    const prepared=prepareUsagePage(ordered.slice(offset,offset+256));
+    prices.push(...prepared.prices); fragments.push(...prepared.fragments);
+  }
+  fragments.sort(order);
+  const after=(time:string,id:number)=>(row:{observed_at:string;id:number})=>
+    row.observed_at>time || row.observed_at===time&&row.id>id;
+  return { sourceFingerprint,
+    usageReader:{async readPage(time,id,limit){return prices.filter(after(time,id)).slice(0,limit);}},
+    usageBins:{totalRowCount:rows.length,fragmentCount:fragments.length,
+      async readPage(time,id,limit){return fragments.filter(after(time,id)).slice(0,limit);}},
+  };
+}
 const newMethod = (analysis: object) => Object.hasOwn(analysis, "attributionMethod")
   ? { ...analysis, attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION } : analysis;
 function resetFits(analysis: object): object[] {
@@ -177,11 +196,17 @@ describe("shared acquired v1 finish", () => {
       : { status: "not_testable", reason: "usage_cost_limit_exceeded" });
     expect(await finishAccountScopedAnalysesV1(f.db, PARTICIPANT, f.evidence, budget(), f.options))
       .toMatchObject({ status: "complete", modelComposition: expected });
+    const preparedEvidence=preparedUsage(rows,f.pin.fingerprint);
+    expect(await finishAccountScopedModelCompositionV1(f.db,PARTICIPANT,f.evidence,budget(),{...f.options,preparedEvidence}))
+      .toMatchObject({status:"complete",analysis:expected});
     // Physical page overflow takes precedence even if the prior bin already
     // accumulated an unsafe integer total.
     expect(await finishAccountScopedAnalysesV1(f.db, PARTICIPANT, f.evidence, budget(),
       { ...f.options, maxWindowedUsageRows: rows.length - 1 }))
       .toMatchObject({ status: "complete", modelComposition: { status: "not_testable", reason: "windowed_usage_limit_exceeded" } });
+    expect(await finishAccountScopedModelCompositionV1(f.db,PARTICIPANT,f.evidence,budget(),
+      {...f.options,preparedEvidence,maxWindowedUsageRows:rows.length-1}))
+      .toEqual({status:"complete",analysis:{status:"not_testable",reason:"windowed_usage_limit_exceeded"}});
   }, 20_000);
 
   it.each([false, true])("matches both independent calculators including refusals and pricing (plan switch %s)", async switchPlan => {
@@ -210,6 +235,8 @@ describe("shared acquired v1 finish", () => {
       .toEqual({ status: "complete", analysis: combined.quotaAnalysis });
     expect((await finishAccountScopedModelCompositionV1(f.db, PARTICIPANT, f.evidence, budget(), f.options)))
       .toEqual({ status: "complete", analysis: combined.modelComposition });
+    expect(await finishAccountScopedAnalysesV1(f.db,PARTICIPANT,f.evidence,budget(),
+      {...f.options,preparedEvidence:preparedUsage(rows,f.pin.fingerprint)})).toEqual(combined);
   });
 
   it("keeps an occurrence-first interval election across a physical page seam", async () => {

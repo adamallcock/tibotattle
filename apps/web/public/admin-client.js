@@ -67,6 +67,67 @@ export class AdminResponseError extends Error {
   }
 }
 
+/** One bounded read per resource. Invalidating a lane fences even a fetch or
+ * body reader that ignores abort, so a revoked page cannot be repopulated by
+ * an older in-flight response. Mutating actions do not use this retry lane. */
+export function createAdminReadLane({
+  read, publish, failed, timeoutMs = 15_000,
+  schedule = globalThis.setTimeout, cancel = globalThis.clearTimeout,
+}) {
+  let active = null;
+  return {
+    run() {
+      if (active !== null) return active.promise;
+      const operation = { controller: new AbortController(), promise: null, timer: null };
+      active = operation;
+      const cancelled = new Promise((_, reject) => {
+        operation.controller.signal.addEventListener("abort", () => {
+          reject(new AdminResponseError("ADMIN_READ_CANCELLED"));
+        }, { once: true });
+      });
+      const timedOut = new Promise((_, reject) => {
+        operation.timer = schedule(() => {
+          reject(new AdminResponseError("ADMIN_READ_TIMEOUT"));
+          operation.controller.abort();
+        }, timeoutMs);
+      });
+      operation.promise = Promise.race([
+        Promise.resolve().then(() => read({ signal: operation.controller.signal })),
+        timedOut, cancelled,
+      ]).then(value => {
+        if (active === operation) publish(value);
+      }, error => {
+        if (active === operation) failed(error);
+      }).finally(() => {
+        cancel(operation.timer);
+        if (active === operation) active = null;
+      });
+      return operation.promise;
+    },
+    invalidate() {
+      const operation = active;
+      active = null;
+      if (operation !== null) {
+        cancel(operation.timer);
+        operation.controller.abort();
+      }
+    },
+  };
+}
+
+export function isTransientAdminReadError(error) {
+  if (!(error instanceof AdminResponseError)) return false;
+  if (error.httpStatus === null) return [
+    "ADMIN_NETWORK_ERROR", "ADMIN_READ_TIMEOUT", "ADMIN_RESPONSE_INVALID",
+  ].includes(error.code);
+  // An absent/invalid cache is authoritative, unlike an unsuccessful read.
+  return error.httpStatus >= 500 && error.httpStatus <= 599 && [
+    "INTERNAL_ERROR", "BACKEND_STORAGE_UNAVAILABLE",
+    "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE", "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE",
+    `HTTP_${error.httpStatus}`,
+  ].includes(error.code);
+}
+
 function invalid(code) {
   throw new AdminResponseError(code);
 }
@@ -134,6 +195,69 @@ function isoTimestamp(value, code) {
   const epoch = Date.parse(timestamp);
   if (!Number.isFinite(epoch)) invalid(code);
   return timestamp;
+}
+
+/** Closed, aggregate-only owner progress. It describes recorded work and
+ * publication generations, never estimates remaining time or missing counts. */
+export function projectAdminReconstructionProgress(value) {
+  const code = "ADMIN_RECONSTRUCTION_PROGRESS_INVALID";
+  const closed = (candidate, keys) => {
+    const result = record(candidate, code);
+    const actual = Object.keys(result);
+    if (actual.length !== keys.length || actual.some(key => !keys.includes(key))) invalid(code);
+    return result;
+  };
+  const timestamp = value => {
+    const result = isoTimestamp(value, code);
+    if (new Date(result).toISOString() !== result) invalid(code);
+    return result;
+  };
+  const nullableTime = value => value === null ? null : timestamp(value);
+  const nullableCount = value => value === null ? null : count(value, code);
+  const nullableEnum = (value, values) => value === null ? null : enumValue(value, new Set(values), code);
+  const progress = closed(value, ["schemaVersion", "generatedAt", "publication", "work", "history"]);
+  if (progress.schemaVersion !== 1) invalid(code);
+  const publication = closed(progress.publication, [
+    "state", "requestedGeneration", "preparedGeneration", "publishedGeneration", "publishedAt",
+  ]);
+  const work = closed(progress.work, ["state", "phase", "updatedAt", "trigger", "restartReason"]);
+  const history = closed(progress.history, [
+    "resolvedDays", "requiredDays", "activeDay", "completeAccounts", "requiredAccounts",
+  ]);
+  const projectedPublication = Object.freeze({
+    state: enumValue(publication.state, new Set(["ready", "empty", "invalidated"]), code),
+    requestedGeneration: nullableCount(publication.requestedGeneration),
+    preparedGeneration: nullableCount(publication.preparedGeneration),
+    publishedGeneration: nullableCount(publication.publishedGeneration),
+    publishedAt: nullableTime(publication.publishedAt),
+  });
+  if (projectedPublication.requestedGeneration !== null
+      && [projectedPublication.preparedGeneration, projectedPublication.publishedGeneration]
+        .some(value => value !== null && value > projectedPublication.requestedGeneration)) invalid(code);
+  const projectedHistory = Object.freeze({
+    resolvedDays: count(history.resolvedDays, code),
+    requiredDays: count(history.requiredDays, code),
+    activeDay: history.activeDay === null ? null : calendarDay(history.activeDay, code),
+    completeAccounts: nullableCount(history.completeAccounts),
+    requiredAccounts: nullableCount(history.requiredAccounts),
+  });
+  if (projectedHistory.requiredDays > 70
+      || projectedHistory.resolvedDays > projectedHistory.requiredDays
+      || (projectedHistory.completeAccounts !== null && projectedHistory.requiredAccounts !== null
+        && projectedHistory.completeAccounts > projectedHistory.requiredAccounts)) invalid(code);
+  return Object.freeze({
+    schemaVersion: 1,
+    generatedAt: timestamp(progress.generatedAt),
+    publication: projectedPublication,
+    work: Object.freeze({
+      state: enumValue(work.state, new Set(["idle", "queued", "building", "paused", "unavailable"]), code),
+      phase: nullableEnum(work.phase, ["current", "history", "daily", "publication"]),
+      updatedAt: nullableTime(work.updatedAt),
+      trigger: nullableEnum(work.trigger, ["contribution", "correction", "day_boundary", "method_change", "reconciliation", "privacy"]),
+      restartReason: nullableEnum(work.restartReason, ["input_changed", "lease_expired", "method_changed", "retry"]),
+    }),
+    history: projectedHistory,
+  });
 }
 
 function boundedArray(value, maximum, code) {
@@ -226,11 +350,13 @@ function projectAllowanceModels(value, latestAllowedDay) {
     const expected = ADMIN_ALLOWANCE_PREVIEW_MODELS[index];
     if (!expected
         || model.modelId !== expected.modelId
-        || model.label !== expected.label
+        || typeof model.label !== "string" || model.label.length === 0 || model.label.length > 80
         || model.allowanceTrack !== expected.allowanceTrack
         || model.pricingStatus !== expected.pricingStatus) {
       invalid(code);
     }
+    // Display copy is not an analytical version. Render the current reviewed
+    // catalog label without discarding otherwise compatible results.
     return expected;
   });
   if (modelConfig.length !== ADMIN_ALLOWANCE_PREVIEW_MODELS.length) invalid(code);

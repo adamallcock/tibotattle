@@ -57,6 +57,8 @@ import {
 } from "./admin-operations";
 import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
 import { readAdminReconstructionProgress } from "./admin-reconstruction-progress";
+import { readAdminGraphRefreshProgress } from "./admin-graph-refresh-progress";
+import { retireV1PreparedEvidence } from "./prepared-v1-evidence";
 import { readDistributionAnalytics } from "./distribution-analytics";
 import {
   githubUnavailable,
@@ -2876,6 +2878,21 @@ async function handleAdminCommunityAllowancePreview(
   });
 }
 
+async function handleAdminReconstructionProgress(
+  request: Request, env: Env, access?: { readonly identityKey: string },
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  if (access === undefined) {
+    if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
+      throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+    }
+    await adminSession(request, env);
+  }
+  if ([...new URL(request.url).searchParams].length !== 0) throw new ApiError(400, "BODY_INVALID");
+  const progress = await readAdminGraphRefreshProgress(env.USAGE_MONITOR_DB, Date.now(), allowanceReconstructionMode(env));
+  return jsonResponse(progress, 200, { "cache-control": "no-store", vary: "Cookie" });
+}
+
 async function handleAdminOverview(
   request: Request,
   env: Env,
@@ -3245,6 +3262,7 @@ async function handleCommunityDaily(
       from,
       to,
       allowanceState,
+      allowanceReadState: read.allowanceReadState,
       ...(allowanceBreakdowns === null ? {} : { allowanceBreakdowns }),
       days,
     },
@@ -3252,7 +3270,8 @@ async function handleCommunityDaily(
     // Every returned revision is immutable, but the latest-revision selection
     // is not: withdrawal and late-data recomputation both move it. A modest
     // shared lifetime keeps the read cheap without pinning a stale revision.
-    { "cache-control": "public, max-age=300" },
+    { "cache-control": read.allowanceReadState === "temporarily_unavailable"
+      ? "no-store" : "public, max-age=300" },
   );
 }
 
@@ -3404,6 +3423,8 @@ async function routeApi(
       return handleAdminMetricsHistory(request, env);
     case "admin_community_allowance_preview":
       return handleAdminCommunityAllowancePreview(request, env);
+    case "admin_reconstruction_progress":
+      return handleAdminReconstructionProgress(request, env);
     case "admin_action":
       return handleAdminAction(request, env);
     case "security_reset":
@@ -3504,11 +3525,16 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           assertWorkerRouteMethod(request, route);
           return noStore(await handleAdminAction(request, env, { identityKey }));
         }
+        if (route.kind === "exact" && route.id === "admin_reconstruction_progress") {
+          assertWorkerRouteMethod(request, route);
+          return noStore(await handleAdminReconstructionProgress(request, env, { identityKey }));
+        }
       } else if (isAdminSurfacePath(url.pathname)
         || (route.kind === "exact"
           && (route.id === "admin_overview"
             || route.id === "admin_metrics_history"
             || route.id === "admin_community_allowance_preview"
+            || route.id === "admin_reconstruction_progress"
             || route.id === "admin_action"))) {
         throw new ApiError(404, "NOT_FOUND");
       }
@@ -3658,6 +3684,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if ([
       "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE",
       "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE",
+      "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE",
+      "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE",
+      "ADMIN_RECONSTRUCTION_PROGRESS_UNAVAILABLE",
     ].includes(apiError.code)) {
       // Expected fail-closed state for read-only admin aggregates. Scheduled
       // maintenance warms each cache; an interactive request never writes a
@@ -3964,6 +3993,18 @@ export async function runScheduledMaintenance(
     restoreReplayComplete = lifecycle.restoreReplayComplete;
     lifecycleComplete = quarantineRetentionComplete
       && restoreReplayComplete;
+
+    // Raw retention revokes derived days immediately via triggers. Drain their
+    // private projections independently of publication/reconstruction switches,
+    // with the same actual-statement meter and lease-release headroom.
+    if (queryMeter.remainingQueries >= 14 && await env.USAGE_MONITOR_DB.prepare(
+      "SELECT 1 AS present FROM sqlite_schema WHERE type='table' AND name='community_prepared_source_days'",
+    ).first<{ present: number }>()) {
+      const retirement = await retireV1PreparedEvidence(env.USAGE_MONITOR_DB,
+        { maxPages: 2, deadlineMs: Date.now() + 5_000 });
+      if (retirement.pagesRun > 0) console.log(JSON.stringify({ level: "info", event: "prepared_evidence_retirement",
+        outcome: retirement.status, pages: retirement.pagesRun, queries: retirement.queriesUsed }));
+    }
 
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     const reconciliation = await reconcilePendingQuarantineObjects(

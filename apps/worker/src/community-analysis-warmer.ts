@@ -9,10 +9,12 @@ import {
 import { accountScopedQuotaAnalysis } from "./quota-analysis";
 import {
   V1_ANALYSIS_WINDOW_DAYS, MAX_DOWNSAMPLED_QUOTA_ROWS, V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
-  finishAccountScopedAnalysesV1, v1QuotaFinishQueryReserve, type V1ModelCompositionResult,
+  finishAccountScopedAnalysesV1, v1PreparedFinishQueryReserve, v1QuotaFinishQueryReserve, type V1ModelCompositionResult,
 } from "./quota-analysis-v1";
 import { accountScopedModelCompositionV11, accountScopedQuotaAnalysisV11 } from "./quota-analysis-v11";
 import type { D1InvocationBudget } from "./d1-invocation-budget";
+import { readCommunityRefreshLane, recordCommunityRefreshLane } from "./community-refresh-lanes";
+import { ensurePreparedV1Window, createPreparedV1EvidenceReader, canPrepareV1Window } from "./prepared-v1-evidence";
 
 const DAY_MS = 86_400_000;
 const PAGE_SIZE = 64;
@@ -69,6 +71,9 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
 }): Promise<CommunityAnalysisWarmResult> {
   const result: CommunityAnalysisWarmResult = {status:"deferred",visited:0,published:0,resumed:0};
   if (!Number.isFinite(nowMs) || !Number.isFinite(options.deadlineMs) || !options.maintenanceLease) return result;
+  if (options.meter.remainingQueries < FINAL_RESERVE + 2 || Date.now() >= options.deadlineMs) return result;
+  const lane = await readCommunityRefreshLane(db, "current", nowMs);
+  if (lane.current) return {...result, status:"complete"};
   const fromDay=new Date(nowMs-V1_ANALYSIS_WINDOW_DAYS*DAY_MS).toISOString().slice(0,10);
   const observedAtCutoff=`${fromDay}T00:00:00.000Z`;
   const resetsAtCutoff=new Date(Date.parse(observedAtCutoff)+SEVEN_DAY_WINDOW_MINUTES*60_000).toISOString();
@@ -91,7 +96,10 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
     if(rows.length<=PAGE_SIZE) {complete=true;break;}
   }
   if(!complete) return result;
-  if(candidates.length===0) return {...result,status:"complete"};
+  if(candidates.length===0) {
+    const completed = await recordCommunityRefreshLane(db, lane, true, nowMs, options.maintenanceLease);
+    return {...result,status:completed ? "complete" : "deferred"};
+  }
   // Rotate over a stable participant-ID census: a large or continuously changing
   // first account cannot monopolize every pass. No participant ID enters logs.
   const start=Math.floor(nowMs/60_000)%candidates.length;
@@ -107,7 +115,8 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
     result.visited++;
     if (source === "v1" && candidate.input_revision !== null
         && await completedCommunityAnalysisCachesCurrent(db, candidate.participant_id, candidate.input_revision, fromDay)) continue;
-    const {sourcePin,fingerprint}=await loadCommunitySourcePin(db,candidate.participant_id,fromDay,source);
+    const {sourcePin,fingerprint}=await loadCommunitySourcePin(db,candidate.participant_id,fromDay,source,
+      { includeDayDependencies: true });
     const identity: CommunityAnalysisCacheIdentity = {participantId:candidate.participant_id,source,sourcePin,
       fitFingerprint:fingerprint,fromDay,compositionSupported:source!=="v0.2"&&!candidate.legacy_overlap};
     if(await communityAnalysisCachesCurrent(db,identity)) continue;
@@ -134,10 +143,20 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
         inputFingerprint:sourcePin.fingerprint,sourceKind:"v1",sourceMethodVersion:V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
         fixedNow:reuse?previous.fixed_now:new Date(nowMs).toISOString(),observedAtCutoff,resetsAtCutoff,
         windowMinutes:SEVEN_DAY_WINDOW_MINUTES,maxQuotaRows:MAX_DOWNSAMPLED_QUOTA_ROWS};
+      let preparedEvidence: Awaited<ReturnType<typeof createPreparedV1EvidenceReader>> | undefined;
+      if (canPrepareV1Window(sourcePin)) {
+        const preparation = await ensurePreparedV1Window(db, sourcePin,
+          { maxPages: 64, deadlineMs: options.deadlineMs, budget: allocation });
+        if (preparation.status !== "complete" || !validBudget(allocation, 1)) { deferred=true; continue; }
+        allocation.remainingQueries -= 1;
+        preparedEvidence = await createPreparedV1EvidenceReader(db, sourcePin);
+      }
+      const finishReserve = preparedEvidence ? v1PreparedFinishQueryReserve(preparedEvidence) : v1QuotaFinishQueryReserve();
       // Acquisition makes durable progress even when this pass cannot finish.
       // A completed checkpoint can be finished in the next independent pass.
       const acquired=await advanceCommunityAnalysisRun(db,{identity:workIdentity,sourcePin,budget:allocation,
-        completedEvidenceReserveQueries:v1QuotaFinishQueryReserve()});
+        preparedReader: preparedEvidence,
+        completedEvidenceReserveQueries:finishReserve});
       result.resumed++;
       if(acquired.status==="not_testable") {
         analyses.push({source:"v1",analysis:{status:"not_testable",reason:acquired.reason}});
@@ -146,9 +165,9 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
         // Refresh from actual usage: acquisition's conservative reservations
         // must not be confused with statements actually sent to the database.
         allocation.remainingQueries=Math.max(0,options.meter.remainingQueries-FINAL_RESERVE);
-        if(!validBudget(allocation,v1QuotaFinishQueryReserve())) {deferred=true;continue;}
+        if(!validBudget(allocation,finishReserve)) {deferred=true;continue;}
         const finished=await finishAccountScopedAnalysesV1(db,candidate.participant_id,acquired.evidence,allocation,
-          {nowMs:Date.parse(workIdentity.fixedNow),sourcePin});
+          {nowMs:Date.parse(workIdentity.fixedNow),sourcePin,preparedEvidence});
         if(finished.status!=="complete") {deferred=true;continue;}
         analyses.push({source:"v1",analysis:finished.quotaAnalysis});
         if(identity.compositionSupported) composition=finished.modelComposition;
@@ -162,5 +181,8 @@ export async function warmCommunityAnalysisCaches(db: D1Database, nowMs: number,
     if(await publishCommunityAnalysisCaches(db,identity,analyses,composition,options.maintenanceLease)) result.published++;
     else deferred=true;
   }
-  return {...result,status:!deferred&&result.visited===candidates.length?"complete":"deferred"};
+  const completeResult = !deferred && result.visited === candidates.length;
+  const recorded = options.meter.remainingQueries > FINAL_RESERVE && Date.now() < options.deadlineMs
+    && await recordCommunityRefreshLane(db, lane, completeResult, nowMs, options.maintenanceLease);
+  return {...result,status:completeResult && recorded ? "complete":"deferred"};
 }

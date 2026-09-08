@@ -10,10 +10,13 @@ import {
 import { modelHistoryWindow } from "./model-history-window";
 import {
   MODEL_HISTORY_METHOD_VERSION, MAX_DOWNSAMPLED_QUOTA_ROWS,
-  finishHistoricalModelCompositionV1, v1QuotaFinishQueryReserve, type V1ModelCompositionResult,
+  finishHistoricalModelCompositionV1, v1PreparedFinishQueryReserve, type V1ModelCompositionResult,
 } from "./quota-analysis-v1";
-import { assertV1SourcePinCurrent, loadV1SourcePin, type V1SourcePin } from "./telemetry-v1-source-selection";
+import { assertV1SourcePinCurrent, type V1SourcePin } from "./telemetry-v1-source-selection";
+import { ensureCommunityHistoryDependency, historicalResultDependencyMatches, loadCommunityHistorySource,
+  rebindCommunityHistoryWork, type CommunityHistoryDependency } from "./community-model-history-dependencies";
 import type { D1InvocationBudget } from "./d1-invocation-budget";
+import { ensurePreparedV1Window, createPreparedV1EvidenceReader } from "./prepared-v1-evidence";
 
 export const COMMUNITY_MODEL_HISTORY_METHOD = `${COMPOSITION_CACHE_KEY_SUFFIX}:${MODEL_HISTORY_METHOD_VERSION}`;
 export const COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES = 3;
@@ -27,6 +30,13 @@ export interface CommunityModelHistoryProgress {
   resolvedAccounts: number;
   requiredAccounts: number;
   publishedDays: number;
+}
+export interface CommunityModelHistoryReadProgress {
+  resolvedDays: number;
+  requiredDays: number;
+  activeDay: string | null;
+  completeAccounts: number | null;
+  requiredAccounts: number | null;
 }
 interface Candidate {
   participant_id: string;
@@ -57,8 +67,12 @@ SELECT s.id AS participant_id, s.state, s.has_v1, s.has_v11, s.has_legacy,
   CASE WHEN length(CAST(result.result_json AS BLOB))<=?7 THEN result.result_json ELSE NULL END AS result_json
 FROM sources s
 LEFT JOIN community_analytical_input_versions v ON v.participant_id=s.id
+LEFT JOIN community_model_history_dependencies dependency ON dependency.participant_id=s.id
+  AND dependency.day=?5 AND dependency.from_day=substr(?3,1,10)
 LEFT JOIN community_model_history_results result ON result.participant_id=s.id
-  AND result.day=?5 AND result.input_revision=v.revision AND result.method_version=?6
+  AND result.day=?5 AND result.method_version=?6 AND (
+    (result.dependency_revision IS NULL AND result.input_revision=v.revision)
+    OR (result.dependency_revision=dependency.dependency_revision AND result.input_fingerprint=dependency.input_fingerprint))
 ORDER BY s.id`;
 
 function admitted(options: { meter: D1InvocationBudget; deadlineMs: number }, queries: number): boolean {
@@ -74,28 +88,100 @@ function parsedResult(row: Candidate): V1ModelCompositionResult | null {
   } catch { return null; }
 }
 
+/** Owner-only progress from bounded metadata. This must never acquire raw
+ * quota/usage evidence or decide mixed legacy overlap on a request path. */
+export async function readCommunityModelHistoryProgress(db: D1Database,
+  nowMs: number): Promise<CommunityModelHistoryReadProgress | null> {
+  if (!Number.isFinite(nowMs)) return null;
+  const today = new Date(nowMs).toISOString().slice(0, 10);
+  const initial = await db.prepare(`SELECT mutation_epoch,
+    (SELECT COUNT(*) FROM sqlite_master WHERE type='table'
+      AND name IN ('community_model_history_dependencies','community_model_history_results')) AS tables_present
+    FROM community_snapshot_mutation_control WHERE singleton_id=1`)
+    .first<{ mutation_epoch: number; tables_present: number }>();
+  if (initial?.tables_present !== 2 || !Number.isSafeInteger(initial.mutation_epoch) || initial.mutation_epoch < 0) return null;
+  const requiredDays = ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS - 1;
+  const days = await db.prepare(`WITH RECURSIVE dates(day,n) AS (
+    SELECT date(?1,'-1 day'),1 UNION ALL SELECT date(day,'-1 day'),n+1 FROM dates WHERE n<?2
+  ) SELECT COUNT(d.day) AS resolved_days,MAX(CASE WHEN d.day IS NULL THEN dates.day END) AS active_day
+    FROM dates LEFT JOIN community_model_composition_days d ON d.day=dates.day
+      AND d.attribution_method_version=?3 AND (d.history_method_version IS NULL OR d.history_method_version=?4)`)
+    .bind(today, requiredDays, COMMUNITY_ATTRIBUTION_METHOD_VERSION, COMMUNITY_MODEL_HISTORY_METHOD)
+    .first<{ resolved_days: number; active_day: string | null }>();
+  if (!days || !Number.isSafeInteger(days.resolved_days) || days.resolved_days < 0 || days.resolved_days > requiredDays
+    || (days.active_day !== null && !/^\d{4}-\d{2}-\d{2}$/u.test(days.active_day))) return null;
+  const progress: CommunityModelHistoryReadProgress = { resolvedDays: days.resolved_days, requiredDays,
+    activeDay: days.active_day, completeAccounts: 0, requiredAccounts: 0 };
+  if (days.active_day !== null) {
+    const window = modelHistoryWindow(days.active_day);
+    let cursor = "", complete = false, unknown = false;
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const rows = (await db.prepare(`${COMMUNITY_PARTICIPANT_PAGE_CTE}
+        SELECT s.id AS participant_id,s.state,s.has_v1,s.has_v11,s.has_legacy,0 AS legacy_overlap,
+          v.revision AS input_revision,result.input_fingerprint,
+          CASE WHEN length(CAST(result.result_json AS BLOB))<=?7 THEN result.result_json END AS result_json
+        FROM sources s LEFT JOIN community_analytical_input_versions v ON v.participant_id=s.id
+        LEFT JOIN community_model_history_dependencies dependency ON dependency.participant_id=s.id
+          AND dependency.day=?5 AND dependency.from_day=substr(?3,1,10)
+        LEFT JOIN community_model_history_results result ON result.participant_id=s.id
+          AND result.day=?5 AND result.method_version=?6 AND (
+            (result.dependency_revision IS NULL AND result.input_revision=v.revision)
+            OR (result.dependency_revision=dependency.dependency_revision AND result.input_fingerprint=dependency.input_fingerprint))
+        ORDER BY s.id`).bind(cursor, PAGE_SIZE + 1, window.observedAtCutoff, window.observedAtBefore,
+        window.day, COMMUNITY_MODEL_HISTORY_METHOD, MAX_RESULT_BYTES).all<Candidate>()).results;
+      if (rows.length > PAGE_SIZE + 1) return null;
+      let previous = cursor;
+      for (const row of rows) {
+        if (typeof row.participant_id !== "string" || row.participant_id <= previous || row.participant_id.length > 128
+          || ![row.has_v1, row.has_v11, row.has_legacy].every(value => value === 0 || value === 1)) return null;
+        previous = row.participant_id;
+      }
+      for (const row of rows.slice(0, PAGE_SIZE)) {
+        cursor = row.participant_id;
+        if (row.state !== "active" || !row.has_v1 || row.has_v11) continue;
+        // The warmer can determine whether legacy rows overlap this window.
+        // An interactive progress read deliberately cannot, so never guess.
+        if (row.has_legacy) { unknown = true; continue; }
+        if (!Number.isSafeInteger(row.input_revision) || row.input_revision === null || row.input_revision < 0) return null;
+        progress.requiredAccounts!++;
+        const result = parsedResult(row);
+        if (result && (result.status !== "ready" || result.latestQuotaObservedAt < window.observedAtBefore)) progress.completeAccounts!++;
+      }
+      if (rows.length <= PAGE_SIZE) { complete = true; break; }
+    }
+    if (!complete || unknown) { progress.completeAccounts = null; progress.requiredAccounts = null; }
+  }
+  const final = await db.prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id=1")
+    .first<{ mutation_epoch: number }>();
+  return final?.mutation_epoch === initial.mutation_epoch ? progress : null;
+}
+
 async function publishResult(db: D1Database, day: string, sourcePin: V1SourcePin,
-  result: V1ModelCompositionResult, lease: string): Promise<boolean> {
+  result: V1ModelCompositionResult, lease: string, dependency: CommunityHistoryDependency): Promise<boolean> {
   if (!("participantId" in sourcePin.scope) || sourcePin.scope.throughDay !== day
-    || sourcePin.inputRevision === null || !validCompleteCachedComposition(result, sourcePin.fingerprint, MODEL_HISTORY_METHOD_VERSION)) {
+    || sourcePin.inputRevision === null || dependency.day !== day || dependency.fromDay !== sourcePin.scope.fromDay
+    || dependency.fingerprint !== sourcePin.fingerprint
+    || !validCompleteCachedComposition(result, sourcePin.fingerprint, MODEL_HISTORY_METHOD_VERSION)) {
     throw new TypeError("model history result identity invalid");
   }
   const json = JSON.stringify(result);
   if (encoder.encode(json).byteLength > MAX_RESULT_BYTES) return false;
   await assertV1SourcePinCurrent(db, sourcePin);
   return (await db.prepare(`INSERT INTO community_model_history_results
-      (participant_id,day,input_revision,input_fingerprint,method_version,result_json,computed_at)
-    SELECT ?1,?2,?3,?4,?5,?6,strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      (participant_id,day,input_revision,input_fingerprint,method_version,result_json,computed_at,dependency_revision)
+    SELECT ?1,?2,?3,?4,?5,?6,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?8
     WHERE EXISTS (SELECT 1 FROM participants p JOIN community_analytical_input_versions v ON v.participant_id=p.id
       WHERE p.id=?1 AND p.state='active' AND v.revision=?3
         AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id=p.id))
       AND EXISTS (SELECT 1 FROM retention_state WHERE singleton=1 AND maintenance_lease_token=?7
         AND maintenance_lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+      AND EXISTS (SELECT 1 FROM community_model_history_dependencies d WHERE d.participant_id=?1 AND d.day=?2
+        AND d.dependency_revision=?8 AND d.input_fingerprint=?4 AND d.verified_input_revision=?3)
     ON CONFLICT(participant_id,day) DO UPDATE SET input_revision=excluded.input_revision,
       input_fingerprint=excluded.input_fingerprint,method_version=excluded.method_version,
-      result_json=excluded.result_json,computed_at=excluded.computed_at`)
+      result_json=excluded.result_json,computed_at=excluded.computed_at,dependency_revision=excluded.dependency_revision`)
     .bind(sourcePin.scope.participantId, day, sourcePin.inputRevision, sourcePin.fingerprint,
-      COMMUNITY_MODEL_HISTORY_METHOD, json, lease).run()).meta.changes === 1;
+      COMMUNITY_MODEL_HISTORY_METHOD, json, lease, dependency.revision).run()).meta.changes === 1;
 }
 
 /** Restartable backfill of missing closed UTC days. One date per
@@ -129,17 +215,25 @@ async function advanceModelHistoryDay(db: D1Database, nowMs: number, options: {
     resolvedAccounts: 0, requiredAccounts: 0, publishedDays: 0 };
   if (!Number.isFinite(nowMs) || !Number.isFinite(options.deadlineMs) || !options.maintenanceLease || !admitted(options, 4)) return progress;
   const today = new Date(nowMs).toISOString().slice(0, 10);
-  // Schema gate is independent: a missing 0048 defers only history, not the
+  // Schema gate is independent: a missing history dependency migration defers only history, not the
   // deployed current calculator or cached graph. No exception means "empty".
   const schema = await db.prepare(`SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'
     AND name IN ('community_model_history_work','community_model_history_work_parts',
-      'community_model_history_work_stage','community_model_history_results')`).first<{ count: number }>();
-  if (schema?.count !== 4) return { ...progress, status: "unavailable" };
+      'community_model_history_work_stage','community_model_history_results','community_model_history_dependencies')`).first<{ count: number }>();
+  if (schema?.count !== 5) return { ...progress, status: "unavailable" };
   // Bound derived result retention to the displayed history horizon. This is
   // a small indexed page, never a source-record deletion or an unbounded purge.
   if (publicationOnlyDay === null && admitted(options, 1)) await db.prepare(`DELETE FROM community_model_history_results
     WHERE (day,participant_id) IN (SELECT day,participant_id FROM community_model_history_results
       WHERE day<date(?1,?2) ORDER BY day,participant_id LIMIT 64)
+      AND EXISTS (SELECT 1 FROM retention_state WHERE singleton=1 AND maintenance_lease_token=?3
+        AND maintenance_lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))`)
+    .bind(today, `-${ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS - 1} days`, options.maintenanceLease).run();
+  if (publicationOnlyDay === null && admitted(options, 1)) await db.prepare(`DELETE FROM community_model_history_dependencies
+    WHERE (day,participant_id) IN (SELECT d.day,d.participant_id FROM community_model_history_dependencies d
+      WHERE d.day<date(?1,?2) AND NOT EXISTS (SELECT 1 FROM community_model_history_work w
+        WHERE w.participant_id=d.participant_id AND substr(w.fixed_now,1,10)=d.day)
+      ORDER BY d.day,d.participant_id LIMIT 64)
       AND EXISTS (SELECT 1 FROM retention_state WHERE singleton=1 AND maintenance_lease_token=?3
         AND maintenance_lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now'))`)
     .bind(today, `-${ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS - 1} days`, options.maintenanceLease).run();
@@ -228,28 +322,53 @@ async function advanceModelHistoryDay(db: D1Database, nowMs: number, options: {
   for (let attempt = 0; attempt < Math.min(MAX_ATTEMPTS, pending.length); attempt++) {
     if (!admitted(options, 40)) break;
     const row = pending[(start + attempt) % pending.length]!;
-    const pin = await loadV1SourcePin(db, { participantId: row.participant_id, fromDay: window.fromDay, throughDay: window.day });
+    const allocation = { remainingQueries: Math.max(0, options.meter.remainingQueries - FINAL_RESERVE), deadlineMs: options.deadlineMs };
+    const sourceInput = await loadCommunityHistorySource(db, row.participant_id, window.day, allocation);
+    if (!sourceInput) continue;
+    const { pin } = sourceInput;
     if (pin.inputRevision === null || pin.inputRevision !== row.input_revision) continue;
+    const dependency = await ensureCommunityHistoryDependency(db, pin, options.maintenanceLease, allocation);
+    if (!dependency) continue;
+    const previous = sourceInput.previousResult;
+    if (previous && previous.method_version === COMMUNITY_MODEL_HISTORY_METHOD
+      && historicalResultDependencyMatches(previous, pin, dependency)) {
+      let cached: unknown;
+      try { cached = JSON.parse(previous.result_json); } catch { /* malformed caches are recomputed */ }
+      if (validCompleteCachedComposition(cached, previous.input_fingerprint, MODEL_HISTORY_METHOD_VERSION)) {
+        const rebound = cached.status === "ready" ? { ...cached, inputFingerprint: pin.fingerprint } : cached;
+        if (admitted(options, 3) && await publishResult(db, window.day, pin, rebound, options.maintenanceLease, dependency)) progress.resolvedAccounts++;
+        continue;
+      }
+    }
     const identity: CommunityAnalysisWorkIdentity = { participantId: row.participant_id,
       inputRevision: pin.inputRevision, inputFingerprint: pin.fingerprint, sourceKind: "v1",
       sourceMethodVersion: MODEL_HISTORY_METHOD_VERSION, fixedNow: window.fixedNow,
       observedAtCutoff: window.observedAtCutoff,
       resetsAtCutoff: new Date(Date.parse(window.observedAtCutoff) + SEVEN_DAY_WINDOW_MINUTES * 60_000).toISOString(),
       windowMinutes: SEVEN_DAY_WINDOW_MINUTES, maxQuotaRows: MAX_DOWNSAMPLED_QUOTA_ROWS };
-    const allocation = { remainingQueries: Math.max(0, options.meter.remainingQueries - FINAL_RESERVE), deadlineMs: options.deadlineMs };
+    const rebound = await rebindCommunityHistoryWork(db, identity, pin, sourceInput.previousWorkFingerprint,
+      dependency, options.maintenanceLease, allocation);
+    if (rebound === "deferred" || rebound === "corrupt") continue;
+    allocation.remainingQueries = Math.max(0, options.meter.remainingQueries - FINAL_RESERVE);
+    const preparation = await ensurePreparedV1Window(db, pin,
+      { maxPages: 64, deadlineMs: options.deadlineMs, budget: allocation });
+    if (preparation.status !== "complete" || allocation.remainingQueries < 1 || !admitted(options, 1)) continue;
+    allocation.remainingQueries -= 1;
+    const preparedEvidence = await createPreparedV1EvidenceReader(db, pin);
+    const finishReserve = v1PreparedFinishQueryReserve(preparedEvidence, undefined, false);
     const acquired = await advanceCommunityAnalysisRun(db, { identity, sourcePin: pin, budget: allocation,
-      storage: "model-history", completedEvidenceReserveQueries: v1QuotaFinishQueryReserve() + 3 });
+      preparedReader: preparedEvidence, storage: "model-history", completedEvidenceReserveQueries: finishReserve + 3 });
     let result: V1ModelCompositionResult;
     if (acquired.status === "not_testable") result = { status: "not_testable", reason: acquired.reason };
     else if (acquired.status === "ready") {
-      if (!admitted(options, v1QuotaFinishQueryReserve() + 3)) break;
+      if (!admitted(options, finishReserve + 3)) break;
       allocation.remainingQueries = options.meter.remainingQueries - FINAL_RESERVE - 3;
       const finished = await finishHistoricalModelCompositionV1(db, row.participant_id, window.day,
-        acquired.evidence, allocation, { sourcePin: pin });
+        acquired.evidence, allocation, { sourcePin: pin, preparedEvidence });
       if (finished.status !== "complete") continue;
       result = finished.analysis;
     } else continue;
-    if (admitted(options, 3) && await publishResult(db, window.day, pin, result, options.maintenanceLease)) progress.resolvedAccounts++;
+    if (admitted(options, 3) && await publishResult(db, window.day, pin, result, options.maintenanceLease, dependency)) progress.resolvedAccounts++;
   }
   if (progress.resolvedAccounts === progress.requiredAccounts) onFinishedCohort?.();
   return progress;
