@@ -1,10 +1,13 @@
-import { generateKeyPairSync, randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
 import { pathToFileURL } from "node:url";
 
-export function generateEnvelopeKeys(destination) {
+export function generateEnvelopeKeys(destination, { environment = "local" } = {}) {
+  if (!["local", "staging", "production"].includes(environment)) {
+    throw new TypeError("Invalid key generation environment");
+  }
   const { publicKey, privateKey } = generateKeyPairSync("rsa", {
     modulusLength: 2048,
     publicExponent: 0x10001,
@@ -21,6 +24,9 @@ export function generateEnvelopeKeys(destination) {
   const contents = [
     `ENVELOPE_PRIVATE_JWK='${JSON.stringify(privateJwk)}'`,
     `ENVELOPE_PUBLIC_JWK='${JSON.stringify(publicJwk)}'`,
+    ...(environment === "staging"
+      ? [`IDENTITY_LINK_SECRET='${randomBytes(32).toString("base64url")}'`]
+      : []),
     "",
   ].join("\n");
 
@@ -55,7 +61,7 @@ function main() {
   const filename = environment === "local"
     ? ".dev.vars"
     : `.dev.vars.${environment}`;
-  const result = generateEnvelopeKeys(resolve(filename));
+  const result = generateEnvelopeKeys(resolve(filename), { environment });
   if (!result.ok) {
     process.stderr.write(
       `${filename} already exists; refusing to overwrite it.\n`,

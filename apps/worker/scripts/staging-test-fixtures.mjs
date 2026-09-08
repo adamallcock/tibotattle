@@ -81,6 +81,7 @@ export function successSpawn(
         stdout: JSON.stringify([
           { name: "ENVELOPE_PRIVATE_JWK", type: "secret_text" },
           { name: "ENVELOPE_PUBLIC_JWK", type: "secret_text" },
+          { name: "IDENTITY_LINK_SECRET", type: "secret_text" },
         ]),
         stderr: "",
       };

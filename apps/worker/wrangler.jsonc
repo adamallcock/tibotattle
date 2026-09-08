@@ -171,7 +171,8 @@
       "secrets": {
         "required": [
           "ENVELOPE_PRIVATE_JWK",
-          "ENVELOPE_PUBLIC_JWK"
+          "ENVELOPE_PUBLIC_JWK",
+          "IDENTITY_LINK_SECRET"
         ]
       },
       "ratelimits": [

@@ -146,6 +146,7 @@ function rehearsalActions(sourceCommit) {
       installsIfAbsent: Object.freeze([
         "ENVELOPE_PRIVATE_JWK",
         "ENVELOPE_PUBLIC_JWK",
+        "IDENTITY_LINK_SECRET",
       ]),
       installMechanism: "existing staging:deploy validates the owner-only generated file and passes --secrets-file only when required staging secrets are absent",
       command: command(

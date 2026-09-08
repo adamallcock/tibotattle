@@ -66,10 +66,11 @@ async function validStagingSecretsFile(filename) {
     return false;
   }
   const lines = contents.trim().split("\n");
-  if (lines.length !== 2) return false;
+  if (lines.length !== 3) return false;
   const privateMatch = /^ENVELOPE_PRIVATE_JWK='([^'\r\n]+)'$/u.exec(lines[0]);
   const publicMatch = /^ENVELOPE_PUBLIC_JWK='([^'\r\n]+)'$/u.exec(lines[1]);
-  if (!privateMatch?.[1] || !publicMatch?.[1]) return false;
+  const identityMatch = /^IDENTITY_LINK_SECRET='([A-Za-z0-9_-]{43})'$/u.exec(lines[2]);
+  if (!privateMatch?.[1] || !publicMatch?.[1] || !identityMatch) return false;
   let privateJwk;
   let publicJwk;
   try {

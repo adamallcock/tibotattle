@@ -63,6 +63,7 @@ test("accountless hosted rehearsal plan fixes one origin and stays blocked befor
   assert.deepEqual(disabledDeployment.installsIfAbsent, [
     "ENVELOPE_PRIVATE_JWK",
     "ENVELOPE_PUBLIC_JWK",
+    "IDENTITY_LINK_SECRET",
   ]);
   assert.match(disabledDeployment.installMechanism, /--secrets-file/u);
   const hostedClient = plan.requiredRemoteActions.find(

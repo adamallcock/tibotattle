@@ -15,6 +15,7 @@ export const STAGING_PROOF_TYPES = Object.freeze({
 export const REQUIRED_STAGING_SECRETS = Object.freeze([
   "ENVELOPE_PRIVATE_JWK",
   "ENVELOPE_PUBLIC_JWK",
+  "IDENTITY_LINK_SECRET",
 ]);
 export const REQUIRED_D1_BINDINGS = Object.freeze([
   Object.freeze({

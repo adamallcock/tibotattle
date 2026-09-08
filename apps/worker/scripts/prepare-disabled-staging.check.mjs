@@ -334,6 +334,7 @@ test("preparation contains and rechecks an initialized pending target before bot
         stdout: JSON.stringify([
           { name: "ENVELOPE_PRIVATE_JWK" },
           { name: "ENVELOPE_PUBLIC_JWK" },
+          { name: "IDENTITY_LINK_SECRET" },
         ]),
         stderr: "",
       };
