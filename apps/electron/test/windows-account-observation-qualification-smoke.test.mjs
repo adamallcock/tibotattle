@@ -12,6 +12,9 @@ import {
   classifyWindowsAccountObservationSmokeFailure,
   runWindowsAccountObservationQualificationSmoke,
   runWindowsAccountObservationQualificationSmokeForTest,
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_FIRST_PHASE,
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE_ENVIRONMENT_KEY,
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_RESTART_PHASE,
 } from "../windows-account-observation-qualification-smoke.js";
 import {
   createWindowsAccountObservationCredentialBackend,
@@ -88,7 +91,7 @@ function syntheticManager(read) {
   });
 }
 
-function workingManager() {
+function workingManager({ onCreate = () => {} } = {}) {
   let stored = null;
   const leases = new WeakSet();
   return Object.freeze({
@@ -104,6 +107,7 @@ function workingManager() {
       return callback(lease);
     },
     async createIfMissing(_capability, secret, lease) {
+      onCreate();
       assert.equal(leases.has(lease), true);
       if (stored !== null) return "existing";
       stored = Buffer.from(secret);
@@ -261,12 +265,16 @@ function controlFixture({
   failPhase = null,
   childExitCode = null,
   failStopPhase = null,
+  lifecyclePhase = undefined,
   preDisconnected = false,
 } = {}) {
   const calls = [];
   const context = Object.freeze({ kind: "synthetic-packaged-context" });
   const environment = Object.freeze({
     USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: RUN_ID,
+    ...(lifecyclePhase === undefined
+      ? {}
+      : { [WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE_ENVIRONMENT_KEY]: lifecyclePhase }),
   });
   const handover = Object.freeze({
     attachWindowsAccountObservationBroker(channel) {
@@ -346,6 +354,65 @@ test("Windows observation smoke attaches the parent before one explicit IPC star
     assert.equal(options.environment, value.environment);
     assert.equal(typeof options.attachWindowsAccountObservationBroker, "function");
   }
+});
+
+test("Windows observation lifecycle phase keeps the first must-empty sequence and uses only matching restart-read on the second launch", async () => {
+  const first = controlFixture({
+    lifecyclePhase: WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_FIRST_PHASE,
+  });
+  await runWindowsAccountObservationQualificationSmokeForTest({
+    environment: first.environment,
+    qualificationContext: first.context,
+  }, first.dependencies);
+  assert.deepEqual(first.calls.filter(([name]) => name === "supervisor").map(([, options]) => options.args[1]), [
+    "create-v1",
+    "restart-read-v1",
+  ]);
+
+  const second = controlFixture({
+    lifecyclePhase: WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_RESTART_PHASE,
+  });
+  await runWindowsAccountObservationQualificationSmokeForTest({
+    environment: second.environment,
+    qualificationContext: second.context,
+  }, second.dependencies);
+  const secondSupervisors = second.calls.filter(([name]) => name === "supervisor").map(([, options]) => options);
+  assert.equal(secondSupervisors.length, 1);
+  assert.equal(secondSupervisors[0].args[1], "restart-read-v1");
+  assert.equal(secondSupervisors[0].args[2], RUN_ID);
+
+  const invalid = controlFixture({ lifecyclePhase: "untrusted-phase" });
+  await assert.rejects(runWindowsAccountObservationQualificationSmokeForTest({
+    environment: invalid.environment,
+    qualificationContext: invalid.context,
+  }, invalid.dependencies), smokeError);
+  assert.deepEqual(invalid.calls, [["run-id", RUN_ID]]);
+});
+
+test("Windows observation restart child reads the matching first-launch record without another create", async () => {
+  let createCalls = 0;
+  const manager = workingManager({ onCreate() { createCalls += 1; } });
+  const attachBroker = (channel) => attachDesktopWindowsAccountObservationBroker({
+    channel,
+    createBackend: () => createWindowsAccountObservationCredentialBackend({
+      platform: "win32",
+      architecture: "x64",
+      createCredentialManagerBackend: () => manager,
+    }),
+  });
+  const created = launchChild({ phase: "create-v1", attachBroker });
+  try {
+    await childReady(created.child);
+  } finally {
+    await created.dispose();
+  }
+  const restarted = launchChild({ phase: "restart-read-v1", attachBroker });
+  try {
+    await childReady(restarted.child);
+  } finally {
+    await restarted.dispose();
+  }
+  assert.equal(createCalls, 1);
 });
 
 test("Windows observation smoke fails closed before handover and exposes only fixed child stages", async () => {

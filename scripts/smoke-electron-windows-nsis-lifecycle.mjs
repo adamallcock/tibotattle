@@ -26,7 +26,13 @@ import {
 } from "./launch-electron-windows-development.mjs";
 import {
   WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_SMOKE_FAILURE_STAGES,
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_FIRST_PHASE,
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE_ENVIRONMENT_KEY,
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_RESTART_PHASE,
 } from "../apps/electron/windows-account-observation-qualification-smoke.js";
+import {
+  validateWindowsElectronQualificationRunId,
+} from "../apps/electron/windows-qualification.js";
 
 const PREFIX = "ELECTRON_WINDOWS_NSIS_LIFECYCLE_";
 const require = createRequire(import.meta.url);
@@ -1334,6 +1340,7 @@ export async function defaultLaunchAndExercise({
   appPath,
   profile,
   launchOrdinal,
+  qualificationRunId,
   environment,
   spawnApplication = spawn,
   exercise = exerciseWindowsNsisLifecycleSmoke,
@@ -1344,6 +1351,18 @@ export async function defaultLaunchAndExercise({
   runProgram = defaultRunProgram,
   firstLaunchDiagnostic = null,
 }) {
+  let selectedQualificationRunId;
+  try {
+    selectedQualificationRunId = validateWindowsElectronQualificationRunId(qualificationRunId);
+  } catch {
+    fail("APPLICATION_LAUNCH_UNAVAILABLE");
+  }
+  const observationLifecyclePhase = launchOrdinal === 1
+    ? WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_FIRST_PHASE
+    : launchOrdinal === 2
+      ? WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_RESTART_PHASE
+      : null;
+  if (observationLifecyclePhase === null) fail("APPLICATION_LAUNCH_UNAVAILABLE");
   const spec = buildWindowsDevelopmentLaunchSpec({ appPath, profile, environment });
   let child = null;
   let tracker = null;
@@ -1377,7 +1396,8 @@ export async function defaultLaunchAndExercise({
           GITHUB_ACTIONS: "true",
           USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
           USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION: "windows-account-observation-fd4-v1",
-          USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: randomUUID(),
+          USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: selectedQualificationRunId,
+          [WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE_ENVIRONMENT_KEY]: observationLifecyclePhase,
         },
         stdio: ["ignore", "ignore", "pipe", "ipc"],
       });
@@ -1762,6 +1782,7 @@ export async function runWindowsNsisLifecycle(options, {
   let secondInstalledBytesVerified = false;
   let sameInstalledApplicationBytesBound = false;
   let firstRunAcknowledgementPrepared = false;
+  const qualificationRunId = randomUUID();
   const firstLaunchDiagnostic = createFirstLaunchDiagnostic();
   const launches = [];
   let uninstallationAttempted = false;
@@ -1832,6 +1853,7 @@ export async function runWindowsNsisLifecycle(options, {
       appPath,
       profile,
       launchOrdinal: 1,
+      qualificationRunId,
       environment,
       runProgram,
       firstLaunchDiagnostic,
@@ -1854,6 +1876,7 @@ export async function runWindowsNsisLifecycle(options, {
       appPath,
       profile,
       launchOrdinal: 2,
+      qualificationRunId,
       environment,
       runProgram,
     }));

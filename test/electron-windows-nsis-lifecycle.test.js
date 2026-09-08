@@ -7,6 +7,12 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 
 import {
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_FIRST_PHASE,
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE_ENVIRONMENT_KEY,
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_RESTART_PHASE,
+} from "../apps/electron/windows-account-observation-qualification-smoke.js";
+
+import {
   assertPinnedNsisSilentInstallDoesNotAutoRun,
   assertWindowsNsisInstallerIdentity,
   assertWindowsProcessTreeExited,
@@ -28,6 +34,7 @@ import {
 } from "../scripts/smoke-electron-windows-nsis-lifecycle.mjs";
 
 const revision = "a".repeat(40);
+const qualificationRunId = "550e8400-e29b-41d4-a716-446655440000";
 const installerDigest = Object.freeze({ bytes: 123, sha256: "b".repeat(64) });
 const installedIdentity = Object.freeze({
   sourceRevision: revision,
@@ -761,14 +768,19 @@ test("launch proof fences ready snapshot and rejects a lingering exact installed
   const child = new FixedSmokeChild(505);
   const processCalls = [];
   const processRequestDetails = [];
+  let spawnedEnvironment = null;
   let snapshots = 0;
   try {
     const result = await defaultLaunchAndExercise({
       appPath,
       profile: profile(join(root, "profile")),
       launchOrdinal: 1,
+      qualificationRunId,
       environment: { SystemRoot: "C:\\Windows" },
-      spawnApplication: () => child,
+      spawnApplication: (_command, _argumentsList, options) => {
+        spawnedEnvironment = options.env;
+        return child;
+      },
       exercise: async (_child, { observations, readyBarrier }) => {
         child.emit("message", {
           type: "windows-electron-smoke-v1",
@@ -807,6 +819,61 @@ test("launch proof fences ready snapshot and rejects a lingering exact installed
       { rootProcessId: child.pid, retainedProcessIds: null },
       { rootProcessId: null, retainedProcessIds: [child.pid] },
     ]);
+    assert.equal(spawnedEnvironment.USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID, qualificationRunId);
+    assert.equal(
+      spawnedEnvironment[WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE_ENVIRONMENT_KEY],
+      WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_FIRST_PHASE,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("second top-level launch binds the existing lifecycle run ID to restart-read only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-second-launch-phase-test-"));
+  const appPath = join(root, "TiboTattle Dev.exe");
+  const child = new FixedSmokeChild(506);
+  let snapshots = 0;
+  let spawnedEnvironment = null;
+  try {
+    await defaultLaunchAndExercise({
+      appPath,
+      profile: profile(join(root, "profile")),
+      launchOrdinal: 2,
+      qualificationRunId,
+      environment: { SystemRoot: "C:\\Windows" },
+      spawnApplication: (_command, _argumentsList, options) => {
+        spawnedEnvironment = options.env;
+        return child;
+      },
+      exercise: async (_child, { observations, readyBarrier }) => {
+        child.emit("message", {
+          type: "windows-electron-smoke-v1",
+          message: "state-v1",
+          started: true,
+          primary: true,
+          window: true,
+          visible: true,
+          tray: true,
+        });
+        const tracked = await readyBarrier();
+        observations.storagePassed = true;
+        observations.accountObservationStoragePassed = true;
+        child.exitCode = 0;
+        return tracked;
+      },
+      readProcessSnapshot: async () => {
+        snapshots += 1;
+        return snapshots === 1 ? [{ pid: child.pid, parentPid: 1, creation: "started" }] : [];
+      },
+      readInstalledExecutableProcesses: async () => [],
+      stopChild: async () => true,
+    });
+    assert.equal(spawnedEnvironment.USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID, qualificationRunId);
+    assert.equal(
+      spawnedEnvironment[WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE_ENVIRONMENT_KEY],
+      WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_RESTART_PHASE,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -822,6 +889,7 @@ test("launch proof refuses a later exact installed-executable process before the
       appPath,
       profile: profile(join(root, "profile")),
       launchOrdinal: 1,
+      qualificationRunId,
       environment: { SystemRoot: "C:\\Windows" },
       spawnApplication: () => child,
       exercise: async (_child, { observations, readyBarrier }) => {
@@ -868,6 +936,7 @@ test("launch refuses an exact installed executable at its immediate pre-spawn sn
       appPath,
       profile: profile(join(root, "profile")),
       launchOrdinal: 2,
+      qualificationRunId,
       environment: { SystemRoot: "C:\\Windows" },
       spawnApplication: () => {
         launches += 1;
@@ -939,8 +1008,8 @@ test("lifecycle binds installed bytes, uses two distinct top-level processes in 
       prepareFirstRun: async ({ profile: selected, stagedAppPath }) => {
         calls.push(["first-run", selected.root, stagedAppPath]);
       },
-      launchAndExercise: async ({ appPath, profile: selected, launchOrdinal }) => {
-        calls.push(["launch", launchOrdinal, appPath, selected.root]);
+      launchAndExercise: async ({ appPath, profile: selected, launchOrdinal, qualificationRunId: selectedRunId }) => {
+        calls.push(["launch", launchOrdinal, appPath, selected.root, selectedRunId]);
         return {
           pid: launchOrdinal === 1 ? 101 : 202,
           observedProcessTreeExited: true,
@@ -977,7 +1046,10 @@ test("lifecycle binds installed bytes, uses two distinct top-level processes in 
       "cleanup-poll",
       "remove-root",
     ]);
-    assert.deepEqual(calls.filter(([name]) => name === "launch").map((entry) => entry[1]), [1, 2]);
+    const launchCalls = calls.filter(([name]) => name === "launch");
+    assert.deepEqual(launchCalls.map((entry) => entry[1]), [1, 2]);
+    assert.equal(launchCalls[0][4], launchCalls[1][4]);
+    assert.match(launchCalls[0][4], /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu);
     assert.equal(calls.find(([name]) => name === "verify-installed")[1], join(installationRoot, "TiboTattle Dev.exe"));
     const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
     assert.equal(receipt.status, "passed");

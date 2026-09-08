@@ -14,7 +14,19 @@ const CHILD_PATH = fileURLToPath(new URL(
   import.meta.url,
 ));
 const PHASES = Object.freeze(["create-v1", "restart-read-v1"]);
+const RESTART_READ_PHASES = Object.freeze(["restart-read-v1"]);
 const CONTROL_SCHEMA = "windows-account-observation-qualification-smoke-ipc-v1";
+
+// The outer NSIS lifecycle reuses one deterministic synthetic record across
+// two top-level Electron processes. This selector remains inside the already
+// qualified smoke route; absent configuration preserves the standalone
+// create-and-restart proof.
+export const WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE_ENVIRONMENT_KEY =
+  "USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE";
+export const WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_FIRST_PHASE =
+  "create-and-restart-v1";
+export const WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_RESTART_PHASE =
+  "restart-read-v1";
 const CHILD_FAILURE_STAGES = new Map([
   [41, "child_configuration"],
   [42, "child_initial_read"],
@@ -128,6 +140,19 @@ function validChannel(channel) {
   }
 }
 
+function lifecyclePhases(environment) {
+  const phase = Object.hasOwn(environment, WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE_ENVIRONMENT_KEY)
+    ? environment[WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_PHASE_ENVIRONMENT_KEY]
+    : undefined;
+  if (phase === undefined || phase === WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_FIRST_PHASE) {
+    return PHASES;
+  }
+  if (phase === WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_LIFECYCLE_RESTART_PHASE) {
+    return RESTART_READ_PHASES;
+  }
+  throw new Error("invalid lifecycle phase");
+}
+
 /**
  * Attach the observation broker first, then begin the child phase only after
  * its independently installed control listener has acknowledged readiness.
@@ -217,10 +242,12 @@ async function runWithDependencies({
       || typeof validateRunId !== "function") {
     throw smokeFailure("preparation");
   }
+  let phases;
   let runId;
   let handover;
   try {
     runId = validateRunId(environment?.USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID);
+    phases = lifecyclePhases(environment);
     handover = createHandover({ qualificationContext, environment });
     if (handover === null || typeof handover !== "object"
         || typeof handover.attachWindowsAccountObservationBroker !== "function") {
@@ -230,7 +257,7 @@ async function runWithDependencies({
     throw smokeFailure("preparation");
   }
 
-  for (const phase of PHASES) {
+  for (const phase of phases) {
     let supervisor = null;
     let childExitCode = null;
     try {
