@@ -1283,6 +1283,8 @@ function renderHistory(documentRef, projection, t, numberFormatter, formattingLo
     setElementText(documentRef, "history-unavailable-body", t("electron.trayPopover.accountingUnavailableBody"));
     const bars = documentRef.getElementById("history-bars");
     if (bars) bars.replaceChildren();
+    setElementText(documentRef, "history-bar-detail", "");
+    setHidden(documentRef, "history-bar-detail", true);
     return;
   }
 
@@ -1325,6 +1327,8 @@ function renderHistory(documentRef, projection, t, numberFormatter, formattingLo
   if (!bars) return;
   bars.dataset.range = history.range;
   bars.replaceChildren();
+  setElementText(documentRef, "history-bar-detail", "");
+  setHidden(documentRef, "history-bar-detail", true);
   const measured = history.days
     .map((day) => day.totalTokens)
     .filter((value) => value !== null);
@@ -1340,6 +1344,14 @@ function renderHistory(documentRef, projection, t, numberFormatter, formattingLo
       : `${t("electron.trayPopover.tokenCount", { count: compact(day.totalTokens) })} · ${historyPriceCopy(day, t, numberFormatter)}`;
     bar.setAttribute("aria-label", `${label}: ${detail}`);
     bar.setAttribute("title", `${label}: ${detail}`);
+    const showDetail = () => {
+      setElementText(documentRef, "history-bar-detail", `${label}: ${detail}`);
+      setHidden(documentRef, "history-bar-detail", false);
+    };
+    // Electron popovers do not consistently surface an element title. Keep the
+    // per-day value visible after hover or keyboard focus instead.
+    bar.addEventListener("mouseenter", showDetail);
+    bar.addEventListener("focus", showDetail);
     const fill = documentRef.createElement("span");
     fill.className = "electron-tray-popup-history-fill";
     if (day.totalTokens !== null) {

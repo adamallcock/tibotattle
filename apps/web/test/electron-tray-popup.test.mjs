@@ -252,7 +252,7 @@ class FakeDocument {
       "history-unavailable", "history-unavailable-title", "history-unavailable-body",
       "history-period", "history-tokens", "history-events", "history-price",
       "history-start", "history-end", "history-coverage", "history-retained",
-      "history-bars", "pace-section", "pace-state", "pace-outlook", "pace-metrics",
+      "history-bars", "history-bar-detail", "pace-section", "pace-state", "pace-outlook", "pace-metrics",
       "pace-used", "pace-remaining", "pace-rate", "pace-reset", "pace-track",
       "pace-fill", "pace-active-marker", "tray-popup-freshness", "tray-popup-live",
     ]) this.elements.set(id, new FakeElement());
@@ -708,6 +708,13 @@ test("compact history keeps tokens primary and makes partial coverage explicit",
   assert.ok(bar);
   assert.match(bar.attributes.get("title"), /tokens.*\$0\.01/u);
   assert.equal(bar.attributes.get("tabindex"), "0");
+  assert.equal(documentRef.getElementById("history-bar-detail").hidden, true);
+  bar.dispatch("mouseenter");
+  assert.equal(documentRef.getElementById("history-bar-detail").hidden, false);
+  assert.match(documentRef.getElementById("history-bar-detail").textContent, /tokens.*\$0\.01/u);
+  documentRef.getElementById("history-bar-detail").hidden = true;
+  bar.dispatch("focus");
+  assert.equal(documentRef.getElementById("history-bar-detail").hidden, false);
 });
 
 test("unavailable accounting never turns absent history into zero", () => {
