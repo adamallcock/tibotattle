@@ -2057,6 +2057,14 @@ struct AccountObservationRecord {
   std::array<unsigned char, kAccountObservationCredentialBytes> bytes {};
 };
 
+// SecretCollection deliberately keeps a weak reference to the service proxy.
+// Keep the explicitly acquired proxy alive through the no-replace call rather
+// than relying on an implementation detail of the collection wrapper.
+struct AccountObservationCollectionBinding {
+  SecretService* service = nullptr;
+  SecretCollection* collection = nullptr;
+};
+
 struct AccountObservationOperationJournal {
   std::array<unsigned char, kAccountObservationCredentialBytes> digest {};
 };
@@ -2078,6 +2086,19 @@ enum class AccountObservationOperationJournalRemoveOutcome {
 void ClearAccountObservationRecord(AccountObservationRecord* record) {
   if (record == nullptr) return;
   record->bytes.fill(0);
+}
+
+void ClearAccountObservationCollectionBinding(
+    AccountObservationCollectionBinding* binding) {
+  if (binding == nullptr) return;
+  if (binding->collection != nullptr) {
+    g_object_unref(binding->collection);
+    binding->collection = nullptr;
+  }
+  if (binding->service != nullptr) {
+    g_object_unref(binding->service);
+    binding->service = nullptr;
+  }
 }
 
 void ClearAccountObservationOperationJournal(
@@ -2451,15 +2472,33 @@ AccountObservationCollectionOpenOutcome ClassifyAccountObservationCollectionErro
 
 AccountObservationCollectionOpenOutcome OpenAccountObservationDefaultCollection(
     GCancellable* cancellable,
-    SecretCollection** result) {
+    AccountObservationCollectionBinding* result) {
   if (result == nullptr) return AccountObservationCollectionOpenOutcome::kErrorOther;
-  *result = nullptr;
+  ClearAccountObservationCollectionBinding(result);
   if (AccountObservationDeadlineCancelled(cancellable)) {
     return AccountObservationCollectionOpenOutcome::kPreCancelled;
   }
   GError* error = nullptr;
+  // The public libsecret wrapper documents a nullable service, but the
+  // reviewed alias implementation delegates to an instance helper that
+  // rejects a null proxy and returns no collection without a GError. Acquire
+  // the same default proxy explicitly, within this worker's one cancellable
+  // deadline, before resolving the fixed alias.
+  SecretService* service = secret_service_get_sync(
+      SECRET_SERVICE_NONE,
+      cancellable,
+      &error);
+  if (error != nullptr || service == nullptr) {
+    const AccountObservationCollectionOpenOutcome outcome = error == nullptr
+        ? AccountObservationCollectionOpenOutcome::kNull
+        : ClassifyAccountObservationCollectionError(error);
+    if (error != nullptr) g_error_free(error);
+    if (service != nullptr) g_object_unref(service);
+    return outcome;
+  }
+  error = nullptr;
   SecretCollection* collection = secret_collection_for_alias_sync(
-      nullptr,
+      service,
       SECRET_COLLECTION_DEFAULT,
       SECRET_COLLECTION_NONE,
       cancellable,
@@ -2469,6 +2508,7 @@ AccountObservationCollectionOpenOutcome OpenAccountObservationDefaultCollection(
         ClassifyAccountObservationCollectionError(error);
     g_error_free(error);
     if (collection != nullptr) g_object_unref(collection);
+    g_object_unref(service);
     return outcome;
   }
   // Do not create a digest intent or ask libsecret to create an item when the
@@ -2476,17 +2516,21 @@ AccountObservationCollectionOpenOutcome OpenAccountObservationDefaultCollection(
   // calls an unlock API; a lock that races this checked snapshot remains an
   // uncertain postcondition and is handled through the retained intent.
   if (collection == nullptr) {
+    g_object_unref(service);
     return AccountObservationCollectionOpenOutcome::kNull;
   }
   if (secret_collection_get_locked(collection)) {
     g_object_unref(collection);
+    g_object_unref(service);
     return AccountObservationCollectionOpenOutcome::kLocked;
   }
   if (AccountObservationDeadlineCancelled(cancellable)) {
-    if (collection != nullptr) g_object_unref(collection);
+    g_object_unref(collection);
+    g_object_unref(service);
     return AccountObservationCollectionOpenOutcome::kPostCancelled;
   }
-  *result = collection;
+  result->service = service;
+  result->collection = collection;
   return AccountObservationCollectionOpenOutcome::kReady;
 }
 
@@ -3527,9 +3571,9 @@ AccountObservationWorkResult RunAccountObservationCreate(
   // Obtain the default collection before persisting the digest intent. A
   // missing or locked collection is a known non-mutation failure, whereas a
   // later create result is intentionally reconciled through the digest.
-  SecretCollection* collection = nullptr;
+  AccountObservationCollectionBinding collection_binding {};
   const AccountObservationCollectionOpenOutcome collection_outcome =
-      OpenAccountObservationDefaultCollection(cancellable, &collection);
+      OpenAccountObservationDefaultCollection(cancellable, &collection_binding);
   if (collection_outcome != AccountObservationCollectionOpenOutcome::kReady) {
     work->qualification_phase =
         AccountObservationCollectionQualificationPhase(collection_outcome);
@@ -3541,20 +3585,23 @@ AccountObservationWorkResult RunAccountObservationCreate(
         : FinishAccountObservationUnavailable(lease);
   }
   if (AccountObservationDeadlineCancelled(cancellable)) {
-    g_object_unref(collection);
+    ClearAccountObservationCollectionBinding(&collection_binding);
     work->qualification_phase = AccountObservationQualificationPhase::kDeadline;
     return FinishAccountObservationCancellation(lease);
   }
   if (!BeginAccountObservationMutation(lease, work->candidate)) {
-    g_object_unref(collection);
+    ClearAccountObservationCollectionBinding(&collection_binding);
     return FinishAccountObservationRecovery(lease);
   }
   if (AccountObservationDeadlineCancelled(cancellable)) {
-    g_object_unref(collection);
+    ClearAccountObservationCollectionBinding(&collection_binding);
     return FinishAccountObservationRecovery(lease);
   }
-  CreateAccountObservationCredentialNoReplace(collection, work->candidate, cancellable);
-  g_object_unref(collection);
+  CreateAccountObservationCredentialNoReplace(
+      collection_binding.collection,
+      work->candidate,
+      cancellable);
+  ClearAccountObservationCollectionBinding(&collection_binding);
   if (AccountObservationDeadlineCancelled(cancellable)) {
     return FinishAccountObservationRecovery(lease);
   }

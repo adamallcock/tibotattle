@@ -172,9 +172,11 @@ outside, non-cooperating same-user writer add a duplicate; the postcondition
 read rejects that result and the binding makes no cross-writer uniqueness
 claim.
 
-Before it creates an intent, the binding resolves the default collection with
-`SECRET_COLLECTION_NONE` and refuses a missing or already-locked collection.
-It does not call a Secret Service unlock operation. A lock that races this
+Before it creates an intent, the binding acquires the default Secret Service
+proxy with `SECRET_SERVICE_NONE`, retains it through the fixed collection
+lookup and no-replace call, and resolves the default collection with
+`SECRET_COLLECTION_NONE`. It refuses a missing or already-locked collection
+and does not call a Secret Service unlock operation. A lock that races this
 checked collection snapshot can still make the subsequent no-replace call
 uncertain; the retained intent and active refusal handle that state rather
 than retrying or issuing an explicit unlock request from this route. The

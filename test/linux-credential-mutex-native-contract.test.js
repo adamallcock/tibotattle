@@ -121,6 +121,23 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   );
   assert.match(source, /SECRET_SEARCH_ALL \| SECRET_SEARCH_LOAD_SECRETS/u);
   assert.match(source, /secret_collection_get_locked\(collection\)/u);
+  assert.match(source, /AccountObservationCollectionBinding/u);
+  assert.match(
+    source,
+    /SecretService\* service = secret_service_get_sync\(\s*SECRET_SERVICE_NONE,\s*cancellable,\s*&error\);/u,
+  );
+  assert.match(
+    source,
+    /secret_collection_for_alias_sync\(\s*service,\s*SECRET_COLLECTION_DEFAULT,\s*SECRET_COLLECTION_NONE,\s*cancellable,\s*&error\)/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /secret_collection_for_alias_sync\(\s*nullptr,\s*SECRET_COLLECTION_DEFAULT/u,
+  );
+  assert.match(
+    source,
+    /OpenAccountObservationDefaultCollection\(cancellable, &collection_binding\)[\s\S]*?CreateAccountObservationCredentialNoReplace\(\s*collection_binding\.collection,[\s\S]*?ClearAccountObservationCollectionBinding\(&collection_binding\)/u,
+  );
   assert.match(source, /AccountObservationCollectionOpenOutcome/u);
   assert.match(source, /G_IO_ERROR_CANCELLED/u);
   assert.match(source, /error->domain == G_DBUS_ERROR/u);
@@ -177,7 +194,7 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /deadline->StopDeadline\(\)/u);
   assert.match(
     source,
-    /OpenAccountObservationDefaultCollection\(cancellable, &collection\)[\s\S]*?AccountObservationDeadlineCancelled\(cancellable\)[\s\S]*?BeginAccountObservationMutation/u,
+    /OpenAccountObservationDefaultCollection\(cancellable, &collection_binding\)[\s\S]*?AccountObservationDeadlineCancelled\(cancellable\)[\s\S]*?BeginAccountObservationMutation/u,
   );
   assert.match(
     source,
