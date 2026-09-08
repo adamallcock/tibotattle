@@ -1231,16 +1231,17 @@ test("production policy reads only the final packaged app manifest and validates
   const metadata = createProductionDistributionMetadata({
     target: "darwin-arm64", sourceRevision: "a".repeat(40), buildNumber: "20260906",
   });
+  const packagedAppPath = join(tmpdir(), "tibotattle-policy-fixture", "app.asar");
   const paths = [];
   const app = { isPackaged: true, getName: () => "TiboTattle",
-    getAppPath: () => "/Applications/TiboTattle.app/Contents/Resources/app.asar" };
+    getAppPath: () => packagedAppPath };
   const readManifest = async (path) => {
     paths.push(path);
     return Buffer.from(JSON.stringify({ tibotattleDistribution: metadata }));
   };
   assert.deepEqual(await readProductionDistribution({ app, platform: "darwin",
     architecture: "arm64", readManifest }), metadata);
-  assert.deepEqual(paths, ["/Applications/TiboTattle.app/Contents/Resources/app.asar/package.json"]);
+  assert.deepEqual(paths, [join(packagedAppPath, "package.json")]);
   await assert.rejects(readProductionDistribution({ app, platform: "darwin",
     architecture: "x64", readManifest }), errorCode("electron_configuration_invalid"));
   for (const value of [{}, { tibotattleDistribution: { ...metadata, updateFeed: "https://example.test" } }]) {
