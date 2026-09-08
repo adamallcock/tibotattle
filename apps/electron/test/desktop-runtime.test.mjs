@@ -673,6 +673,9 @@ test("macOS production composes the main-only credential backend without touchin
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_PREPARED_DIRECTORY, undefined);
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_MODE, "production-v1");
   assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, "https://tibotattle.com");
+  await assert.rejects(fixture.desktop.controller.handlers.openHostedSignIn({
+    authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+  }), { code: "accountless_signin_unavailable" });
   await fixture.desktop.lifecycle.requestQuit();
 });
 
