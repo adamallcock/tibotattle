@@ -14,12 +14,15 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Current gate: the latest completed run (`eeb74786`) passes both Mac packages and
-Linux's native and packaged first-install credential checks, but stops Windows
-in the observation-channel contract test. The IPC replacement is integrated
-locally at `cc15807d`, with startup refusal at `b28d0cda`; its native rerun is pending. Production selection and
-release remain gated. The daily Mac tester remains the verified `1f74bbb6`
-artifact described below.
+Current gate: the `2abe5448` run passes both Mac packages and the formerly
+failing native Windows channel tests, but catches a Linux startup regression
+before packaging. The corrected supervisor is integrated at `394996f5` and
+passes all 123 affected Windows/Linux/Mac broker, shell and runner tests with
+one native-only exclusion. Windows's packaged journey also stops before storage
+because its ordinary companion has the same no-IPC shape. The corrected full
+rerun is pending. Linux's first-install credential proof remains the earlier
+`eeb74786` artifact. Production selection and release remain gated. The daily
+Mac tester remains the verified `1f74bbb6` artifact described below.
 
 The earlier all-four development packaging baseline passes at
 `f26146aaf7fe34845ed7192ae0100e88b9d9b660` in
@@ -151,6 +154,25 @@ the wire has a distinct IPC announcement/schema. Linux foundation now passes
 120 tests with five expected native/optional exclusions, and all 20 preflight
 checks pass. Native Windows validation is pending. No native credential safety
 check, deadline or production selector has been relaxed.
+
+The native `2abe5448` run
+[34186569809](https://github.com/adamallcock/tibotattle/actions/runs/34186569809)
+passes the Windows channel tests but catches an integration regression in the
+new supervisor guard: a live Linux FD4-only child reports `connected: false`
+because it has no Node IPC channel. The correction at `394996f5` applies that
+connection requirement only when Node IPC is selected, while refusing an
+actually exited child on every transport. All 123 integrated cross-platform
+broker/shell/runner tests pass with one native-only exclusion, including real
+POSIX child journeys. The failed Linux job is retained; it produced no package.
+Windows builds its package but the ordinary development companion is also
+rejected before readiness by that same unconditional check. Its main process
+continues answering status, so the outer rehearsal times out without requesting
+either storage operation. The downloaded failed receipt is independently bound
+to ASAR `ced4962677a95fd7b56ff12f709cd4ab87d5d89493d5998a9b073f343f77004b`.
+The further regression at `3bddf9a8` spawns a real plain child without IPC,
+observes `connected: false`, reaches readiness and stops it cleanly. Windows CI
+now runs the full shell-core suite before packaging, so ordinary companion
+startup is tested alongside the credential channels. Native rerun is pending.
 
 The accountless production companion profile is now integrated at `b3643991`.
 It requires the exact production mode/origin and a connected private IPC
