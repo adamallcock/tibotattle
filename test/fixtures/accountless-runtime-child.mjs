@@ -1,7 +1,6 @@
 // Synthetic owned companion for desktop/private-channel integration tests.
 // It uses the real local scheduler composition with a credential-only runner;
 // it never enrolls, reads provider history or uploads to a hosted service.
-import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { createLocalAccountlessContribution } from "../../apps/local/accountless-contribution.js";
@@ -32,23 +31,17 @@ const contribution = createLocalAccountlessContribution({
     return { status: "complete", chunksUploaded: 0 };
   },
 });
-const server = createServer((_request, response) => {
-  response.writeHead(404, { "content-type": "application/json" });
-  response.end('{"error":"synthetic_route_unavailable"}');
-});
-await new Promise((resolve, reject) => {
-  server.once("error", reject);
-  server.listen(0, "127.0.0.1", resolve);
-});
 process.on("message", (message) => {
   if (message?.schemaVersion === "synthetic-accountless-runtime-control-v1"
       && message.action === "run") void contribution.runNow();
 });
-process.stdout.write(`USAGE_MONITOR_READY http://127.0.0.1:${server.address().port}/\n`);
+// The owned runtime integration contract only needs a valid ready origin. Its
+// credential-only runner never sends an HTTP request, so opening a loopback
+// listener makes this fixture depend on the host sandbox without exercising a
+// product path.
+process.stdout.write("USAGE_MONITOR_READY http://127.0.0.1:4811/\n");
 contribution.start();
 process.once("SIGTERM", async () => {
   await contribution.stop();
-  server.closeAllConnections();
-  await new Promise((resolve) => server.close(resolve));
   process.exit(0);
 });
