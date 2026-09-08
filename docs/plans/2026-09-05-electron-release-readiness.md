@@ -14,17 +14,31 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-The current integrated test source is
-`0f03c121ba1102314ae674be23f4b2c009bd3ed5` in
-[run 34171149724](https://github.com/adamallcock/tibotattle/actions/runs/34171149724).
-It includes the collector-worker responsiveness repair, Windows first-run/native
-claim integration and the complete packaged Linux credential module/binary set.
-Both Mac jobs and Linux packaging pass. Windows native and package checks pass,
-but its packaged IPC storage journey reports `ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_STORAGE_FAILED`.
-A fresh
-Mac app from this same source is being qualified separately against a copied
-profile. The new Linux container smoke is prepared but has not executed. No current
-source is yet declared a production replacement.
+The latest completed native packaging run is
+[`34172410440`](https://github.com/adamallcock/tibotattle/actions/runs/34172410440)
+at `a17d235ffd11179668e9189f0960d4cf70985b1d`. Both Mac jobs and Windows pass.
+Windows now passes the actual packaged accountless credential journey, including
+read/create, a retained record in a separate child, deletion, status and clean
+quit. This qualifies the fixed synthetic credential path, not a full installed
+application restart or production activation.
+
+Linux passes native component checks, packaging, artifact verification and
+container construction, but the actual packaged session fails with
+`ELECTRON_LINUX_SECRET_SERVICE_SMOKE_SESSION_EXECUTION_FAILED`. Its cause was not
+visible in the old receipt. Commits `39dc4b48` and `4dbf7f21` add closed stage and
+Node bootstrap classifications without emitting raw errors or making stderr a
+success; all 37 focused qualification/container tests pass. A native rerun is
+required. No ABI or module-loader cause is asserted before that evidence.
+
+The current daily Mac tester is frozen `0f03c121ba1102314ae674be23f4b2c009bd3ed5`,
+with ASAR `2216a54ddf6315fcc52c4982542e12ffa5406ce4520c3842b92774054245a3db`.
+Its synthetic rendered journeys and copied-history Usage/Community, timer,
+active-refresh responsiveness and clean-quit qualification pass. Both endpoints
+have p95 1 ms over 20 active samples each against the unchanged 250 ms limit;
+one 524 ms response is retained. The default durable launcher now selects this
+package with hosted contributions disabled and a separate copied profile. Its
+previous d5 launcher is preserved as a versioned backup. No installed native app
+has been replaced. No current source is yet a production replacement.
 
 The latest completed four-target successful development build is
 `ae8f5bb60f011d3d14300beb026560d417eb2370`. Its unsigned packages passed
@@ -71,8 +85,9 @@ upgrade evidence remain incomplete.
 The exact `d5dc8025` Mac package subsequently passed settings/About and shared
 sharing-destination inspection, both cache-table pages, refresh cancellation
 with completed results retained, native-menu Quit and restart through the
-durable launcher. Sharing remained off after restart. The launcher now selects
-this package; the previous `aead5d00` package/profile/launcher are preserved.
+durable launcher. Sharing remained off after restart. At that stage the launcher selected
+this package; it now selects the qualified `0f03c121` package described above.
+The earlier packages, profiles and versioned launchers remain preserved.
 All 180 active-refresh samples in 45 seconds passed: health and status p95 were
 1 ms, maxima 28 ms, with no failures and the unchanged 250 ms p95 budget.
 Settings remained interactive during the same refresh. Parent task URLs are
@@ -758,3 +773,30 @@ The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
 retain the detailed design history. This document coordinates the remaining
 work and exit criteria for the current candidate.
+
+## 2026-09-07 current native evidence and launcher handoff
+
+- Windows `a17d235f`: the retained package manifest, storage smoke and independent
+  hash proof are under `.release-build/electron-readiness-20260907/windows-a17d235f-evidence/`
+  in the original project. The synthetic smoke passes, confirms its owned process
+  stopped, and explicitly records `fullAppRestart: false`. The executable and
+  ASAR hashes match the native CI package; no production credential was used.
+- Mac `0f03c121`: the default and versioned launcher are byte-identical, private
+  executable files; the previous d5 launcher has a separate verified backup.
+  The transition receipt confirms the copied profile, no hosted origin and
+  disabled contributions. The original failed Usage-readiness receipt remains
+  alongside the fresh retry receipt; polling now waits for the same full
+  readiness predicate within the original 30-second budget.
+- Linux `a17d235f`: the packaged session failure is retained. New diagnostics
+  distinguish runtime identity, artifact identity, isolation, module load and
+  native round-trip failures. Only a fixed vocabulary can leave the child. A
+  genuine post-cleanup failure retains authenticated cleanup proof; fabricated
+  error properties cannot assert cleanup. The receipt now calls the success
+  fact `packagedElectronExecutionVerified`, avoiding an implication that a
+  failed child was never launched.
+- Source readiness remains separate: Windows/Linux stable composition gates
+  are still closed. A read-only review found the Windows global gate also
+  requires legacy sign-in storage not used by the fixed accountless credential.
+  Any simplification must close those reachable legacy routes and preserve
+  observed-account linkage, protected settings, authenticated native bindings
+  and recovery; changing readiness booleans is not sufficient.
