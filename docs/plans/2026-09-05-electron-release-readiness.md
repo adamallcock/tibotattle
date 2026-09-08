@@ -37,9 +37,9 @@ fixture repair; normal Linux first-launch/state setup is still a separate gate.
 
 The follow-up Linux production review identifies three remaining source gates:
 secure native setup when the selected XDG state base does not yet exist;
-durable reconciliation of interrupted generic and separate FD3 credential
-mutations before clearing abandoned markers; and a production composition that
-supplies both reviewed parent-side credential factories. The current container
+durable reconciliation of interrupted required credential mutations before
+clearing abandoned markers; and a production composition that supplies the
+reviewed parent-side credential factories. The current container
 receipt proves none of those gates. The native first-run setup is now implemented at `58f1aafb`, with an isolated
 umask-refusal regression at `0a0560a0`. It uses the binding's existing XDG/passwd
 resolution, creates only fixed missing components, refuses unsafe existing
@@ -52,10 +52,33 @@ composition/smoke tests and 52 packaging/native contracts pass locally (six
 expected native/optional skips), plus 78 release-trust tests. The first native run at `993a711b`,
 [run 34183824959](https://github.com/adamallcock/tibotattle/actions/runs/34183824959),
 catches one C++ call passing a string where a character pointer is required.
-That call is corrected; native build and first-run execution await the rerun. An owner-bit-masking umask deliberately
+That call is corrected. The next native run at `eeb74786762ae2127f5d1a49efbaaf751802f6cc`,
+[run 34184192713](https://github.com/adamallcock/tibotattle/actions/runs/34184192713),
+passes native compilation, explicit-XDG and umask tests, the separate absent
+passwd-home test, and the packaged first-run Secret Service journey. The downloaded ASAR matches both package and smoke receipts at
+`5dc652fef50c4713655e15c0c0c44b14655f2b98b3455bf4fd74fce5f6f7f506`. The actual
+default native test log records one pass and zero skips. Its standalone
+workflow acceptance is being tightened so a future skipped test cannot be
+accepted merely because Node exits zero. The repaired source-level Linux guard
+now checks the exact qualification dependency closure and proves that ordinary
+launch options expose no broker while production Linux selection stays closed;
+all 119 portable foundation tests pass (five expected native/optional skips). An owner-bit-masking umask deliberately
 fails closed and can leave a refused partial directory; the native child test
 verifies that edge without changing the parent umask. Production flags remain closed. Real installed desktop
 session, locked collection, lifecycle and updater evidence remains separate.
+
+The accountless profile permits a smaller Linux production scope: the fixed
+installation credential for enrollment/upload and one read/create-only account
+observation credential for stable forward account/quota linkage. The uploader
+uses an existing observation root only; unavailable roots retain explicit
+account-unknown evidence. Legacy export-identity, Claude callback and paired
+device credentials are not required by this profile and must stay unselected.
+A dedicated observation facade and create/readback recovery can therefore be
+qualified without activating or claiming recovery for the generic four-capability
+backend. The Linux observation selector currently asks for unused replace/delete
+methods and needs a narrow contract update alongside that facade. The separate
+installation record still needs its own interruption/recovery proof. This scope
+reduction is a source-backed implementation plan, not production activation.
 
 The later dormant Windows account-observation foundation is integrated at
 `f94161f4`, with packaging/source-export separation at `209a545e`. Its fixed
@@ -97,8 +120,16 @@ guard facade that rejects the old inherited-ACL parent. The native rerun at
 passes both Macs and Linux. Windows still passes FD3 and now reaches the
 observation child, failing at `child_initial_read`; the protected-root repair
 clears startup but does not yet qualify the full observation journey. The
-content-free failed receipt is preserved, and the fixed Credential Manager
-read/refusal path is under investigation.
+content-free failed receipt is preserved. The later Windows diagnostic patch
+at `eeb74786` distinguishes existing records from fixed trusted broker failure
+categories. Its native run stops in the new composition tests before packaging;
+the failing child/broker test exposes a duplex-transport mismatch. The extra
+Windows pipe supports child-to-parent traffic, while this protocol requires
+replies. The repair replaces that Windows-only channel with a fixed observation
+protocol on the already-owned Node IPC channel, preserving independent upload
+messages and parent-owned credentials. That repair and native validation are
+in progress. No native credential safety check, deadline or production
+selector has been relaxed.
 
 The accountless production companion profile is now integrated at `b3643991`.
 It requires the exact production mode/origin and a connected private IPC
