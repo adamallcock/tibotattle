@@ -30,8 +30,8 @@ one. The Mac daily-use tester is available; that is not full cutover readiness.
    credential continuity checks.
 2. Finish the Linux native deadline fixture and the integrated disposable
    Windows installer journey. Observation creation/recovery now passes; the
-   remaining failures are a nested-test environment and a process query.
-   Fix and rerun these observed failures, then complete
+   latest failures remain in the Linux deadline child and Windows process
+   inspection. Diagnose and rerun these observed failures, then complete
    required production credential/trust composition and installed updates.
 3. Complete one authorized hosted contribution rehearsal and explicit
    accountless public-sample/overlapping-history decisions. Preserve accepted
@@ -47,15 +47,58 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest four-target results: `45fde21e` in
+Latest four-target results: `611200c7` in
+[run 34215345667](https://github.com/adamallcock/tibotattle/actions/runs/34215345667)
+passes both Mac builds. Windows's new native empty-result process regression
+hangs inside WMI and fails after its settlement deadline, before the installer
+journey. The name filter did not resolve that dependency; both process-inspection
+paths need one bounded native replacement. Linux again fails the service-deadline
+fixture in about one second. The nested-runner environment defect was real but
+was not the only cause. Preserve the failure while obtaining the actual nested
+child boundary on the native runner; emulation is diagnostic only. The local
+emulator cannot acquire the abstract Unix credential lease, so it cannot
+establish the cause of this native failure.
+No installed Windows lifecycle or complete Linux credential journey is qualified.
+
+The integrated Windows repair at `146ece1a` removes WMI from both process
+proofs. A fixed Toolhelp query supplies real parent PIDs and process creation
+identities; the post-exit proof rechecks only retained PIDs. The early Windows
+regression now exercises this actual helper in the lifecycle's closed child
+environment, including a real child and its exit. Native verification is
+pending; the prior hanging process regression remains a failure.
+
+Hosted preparation at `086ae315` fixes the rehearsal target to the isolated
+staging Worker and leaves checked-in accountless admission disabled. The
+source-only plan names the two staging databases, quarantine bucket, fresh
+migrations, isolated envelope keys, temporary accountless admission and final
+containment restoration. The hosted client uses only synthetic records and
+retains private recovery state if disconnect is uncertain. Integrated client,
+endpoint and Windows tests pass 92 cases with five native/hosted exclusions;
+the staging plan/readiness checks pass 27 cases. Remote provisioning,
+deployment, migrations and the synthetic hosted run await explicit approval.
+This is client preparation, not installed background-scheduler proof, and
+accountless records remain excluded from public aggregates.
+
+The Mac verifier correction is frozen at `19c63f7b`. Its native regression
+uses a canonical-path disposable bundle and bounded real `codesign` calls;
+twelve credential tests and four focused handover/runtime tests pass. Both Mac
+CI lanes now include that native regression. Replacement source candidates
+`0.1.19-native-to-electron-handover.3` and `.4`, build numbers `2026090803` and
+`2026090804`, are staged for Apple Silicon and Intel. All four staged manifests,
+changed app files, helper contracts and compiled adapter targets are verified.
+They are unsigned; explicit approval for the corrected signing/notarization
+submission is pending. Contributions remain disabled in this private pair.
+The previous signed fixtures and the failed installed attempt remain retained.
+
+The preceding four-target results: `45fde21e` in
 [run 34206887816](https://github.com/adamallcock/tibotattle/actions/runs/34206887816)
 passes both Mac builds. Linux now passes observation creation, readback,
 no-replace and recovery/refusal phases; its terminal service-deadline fixture
 fails before reaching the expected five-second wait. Windows passes installation,
 paired registry inspection, uninstaller availability and the first installed-byte
 identity check, then its exact-process pre-launch probe fails. No installed app
-launch or restart is qualified. Each platform owner is repairing the reproduced
-fixture/probe failure while root executes the Mac installed rehearsal. Hosted
+launch or restart is qualified. These findings led to the subsequent
+fixture/probe repair and native rerun above. Hosted
 work is confined to preparing a fixed nonproduction synthetic rehearsal;
 no remote deployment or public aggregate-policy change is authorized by this
 source preparation.
@@ -73,7 +116,7 @@ preserved stopped backup, and its actual dashboard has reopened. The failed
 Electron bundle and private receipts are retained. The source repair and a
 replacement signed pair are the next Mac gate; no update feed changed.
 
-The Windows process probe now uses a fixed executable-name filter before its
+The preceding Windows process repair used a fixed executable-name filter before its
 exact installed-path comparison. Nineteen focused tests pass locally, with
 three native-only exclusions. Linux's nested `node --test` child inherited
 `NODE_TEST_CONTEXT` and exited successfully before executing the required
