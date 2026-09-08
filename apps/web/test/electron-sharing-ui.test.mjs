@@ -616,6 +616,12 @@ test("Settings asks Electron for notification permission before opening system s
   mounted.teardown();
 });
 
+test("Settings only shows its page focus ring for keyboard-visible focus", async () => {
+  const css = await readFile(new URL("../public/electron-settings.css", import.meta.url), "utf8");
+  assert.match(css, /#settings-content:focus-visible\s*\{[\s\S]*?outline: 3px solid var\(--blue\)/u);
+  assert.doesNotMatch(css, /#settings-content:focus\s*\{/u);
+});
+
 test("a successful visible notice receipt keeps its current banner actionable", async () => {
   const source = await readFile(APP_SOURCE_URL, "utf8");
   const functions = [

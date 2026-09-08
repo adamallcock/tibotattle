@@ -23,7 +23,7 @@
   z-index: 50;
 }
 
-.electron-settings-page #settings-content:focus {
+.electron-settings-page #settings-content:focus-visible {
   outline: 3px solid var(--blue);
   outline-offset: 4px;
 }
@@ -783,7 +783,7 @@
   .settings-project-links a:focus-visible,
   .settings-root-primary:focus-visible,
   .settings-root-actions .button:focus-visible,
-  .electron-settings-page #settings-content:focus {
+  .electron-settings-page #settings-content:focus-visible {
     outline: 3px solid Highlight;
     outline-offset: 3px;
   }
