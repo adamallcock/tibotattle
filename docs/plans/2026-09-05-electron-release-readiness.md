@@ -40,6 +40,17 @@ one. The Mac daily-use tester is available; that is not full cutover readiness.
    accountless public-sample/overlapping-history decisions. Preserve accepted
    automatic-sharing and persistent opt-out behavior throughout.
 
+Windows next composition boundary (read-only verification at `8b84e971`):
+normal startup does not yet connect the fixed FD3 installation credential,
+FD4 account-observation broker, and existing protected settings store. These
+native backends can execute with their current false production-safety flags;
+the missing normal selection is distinct from release qualification. The
+reported final-rename race also affects protected settings/credential journal
+replacement, and the current sidecar does not establish authenticated signed
+native provenance. Preserve those limits and legacy ciphertext recovery; do
+not manufacture a full-readiness attestation or select legacy identity/device
+routes to make the candidate run.
+
 Across these three streams, freeze release candidates, verify four-target
 installation/update evidence, then request the concrete staged
 publication/activation decision.
@@ -50,7 +61,18 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest native results: `e65aacac` in
+Latest combined result: `8b84e971` in
+[run 34236634828](https://github.com/adamallcock/tibotattle/actions/runs/34236634828)
+fails all four distribution builds at `ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE`.
+The new Linux candidate contract checks pass, but normal Linux startup and
+Windows installed relaunch are not reached. A local staged import reproduces
+the cause: the Linux handover imports the fixed accountless backend, but the
+shared shell staging inventory omits that module and its backing implementation.
+The two-file inventory repair is integrated at `c9d5ddde`; actual staged linkage
+and the 13 owning package tests pass. This result does not invalidate or extend
+the earlier installed evidence; native packaging and app journeys need a new run.
+
+Previous native results: `e65aacac` in
 [run 34232097779](https://github.com/adamallcock/tibotattle/actions/runs/34232097779)
 pass all four package jobs, including the repaired Windows artifact transfer.
 The fresh Windows installed job completes installation, exact-byte checks and
@@ -70,7 +92,7 @@ fresh and unavailable Secret Service journeys using raw synthetic input. The
 combined harness and workflow checks pass 63 local tests. The normal candidate
 stays on the disposable runner with external networking disabled; only its
 bounded receipt joins the existing development artifact. Actual normal Linux
-execution remains pending the combined CI run.
+execution remains pending a new combined CI run after the staging repair.
 
 Preceding native results: `f09e504e` in
 [run 34229064795](https://github.com/adamallcock/tibotattle/actions/runs/34229064795)
