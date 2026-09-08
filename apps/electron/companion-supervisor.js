@@ -333,9 +333,9 @@ export function createCompanionSupervisor({
         currentChild = spawnChild(command, [...args], {
           cwd,
           env: companionEnvironment(environment, parentPid, credentialBrokerKind),
-          // Windows observation and FD3 accountless share the one inherited
-          // Node IPC channel, with distinct closed schemas. macOS/Linux keep
-          // their existing FD4 pipe contracts unchanged.
+          // Fixed Windows/Linux observation and accountless messages share
+          // one inherited Node IPC channel with distinct closed schemas.
+          // macOS and legacy Linux qualification retain their FD4 pipes.
           stdio: selectedCredentialBroker
             ? ["ignore", "pipe", "pipe", attachPrivateChannel ? "ipc" : "ignore", "pipe"]
             : (attachPrivateChannel || selectedAccountObservationBroker)

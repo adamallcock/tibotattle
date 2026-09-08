@@ -20,8 +20,9 @@ Change only a reproduced cutover blocker or the smallest test needed to resolve
 one. The Mac daily-use tester is available; that is not full cutover readiness.
 
 1. Close the real native Mac -> signed Electron -> next signed Electron
-   installed rehearsal. Four signed private fixtures are prepared. The user
-   approved proceeding with the backed-up installed Mac rehearsal on 2026-09-08;
+   installed rehearsal. The original signed private fixtures exposed the
+   startup verifier defect; corrected unsigned replacements are prepared.
+   The user approved the backed-up installed Mac rehearsal on 2026-09-08;
    the signed current fixture reached the installed startup gate but stopped
    before migration because the credential verifier supplied a signing rule as
    a filename. Native 0.1.18 has been restored and reopened; its stopped-state
@@ -54,8 +55,12 @@ fails specifically during the account-observation credential check over the
 private parent/child channel. Installation, file verification, startup and the
 separate accountless credential check precede that failure. The closed phase
 is `ACCOUNT_OBSERVATION_STORAGE_PRIVATE_IPC`; uninstall runs but both recorded
-postconditions remain false. Repair the installed-versus-packaged discrepancy,
-then repeat the same complete installer journey without weakening its gates.
+postconditions remain false. The retained receipt identifies an existing
+record at the initial observation read: the earlier packaged smoke intentionally
+leaves its synthetic record until the disposable runner account is destroyed.
+Both tests ran under that same account. Run the installed journey on a separate
+fresh hosted runner using the exact retained artifact; preserve both tests and
+their refusal to accept an unknown existing credential.
 
 The unsigned installed-scheduler rehearsal is frozen at `3136144f` and built
 for Mac arm64 using the existing TiboTattle Dev identity. Its compiled profile
@@ -66,6 +71,14 @@ pass, as do all 333 owning companion tests. The staging Worker is separately
 frozen at `086ae315`, with a source-only plan and no remote provisioning.
 This keeps hosted approval concrete while leaving normal development packages
 and the separately prepared signed Mac migration pair unchanged.
+
+Linux observation composition now reuses the fixed Windows read/create IPC
+mechanics. The explicit Linux qualification entrypoint, companion selector and
+packaging inventories are connected; normal production selection stays closed.
+Local validation passes 333 companion tests, 108 focused contracts, 24 inventory
+checks (two artifact-only exclusions), and a real Linux child/accountless IPC
+coexistence check. The packaged native observation journey is the next evidence
+gate; these source results do not establish installed Linux readiness.
 
 The preceding four-target results: `a648cf2b` in
 [run 34222727976](https://github.com/adamallcock/tibotattle/actions/runs/34222727976)
