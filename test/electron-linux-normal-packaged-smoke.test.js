@@ -168,6 +168,37 @@ test("Linux session and outer receipt preserve closed process observations and r
   }
 });
 
+test("Linux session retains only fixed automatic refresh failure classifiers", async () => {
+  const identity = { sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256 };
+  const fixed = "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED";
+  for (const value of [fixed, "private refresh detail"]) {
+    const child = sessionChild();
+    const receipt = await runLinuxNormalPackagedSmoke({ sourceRevision: SOURCE_REVISION }, {
+      verifyPackage: async () => identity,
+      runSession: () => runLinuxNormalPackagedSmokeSession(identity, {
+        appPath: APP_PATH, spawnSession: () => {
+          queueMicrotask(() => {
+            child.stdout.end();
+            child.stderr.write("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RELOAD_REFRESH_FAILED\n");
+            child.stderr.end(`${JSON.stringify({
+              schemaVersion: "tibotattle-electron-linux-normal-packaged-automatic-refresh-failure-v1",
+              automaticRefreshFailure: value,
+            })}\n`);
+            child.exitCode = 1;
+            child.emit("exit", 1, null);
+          });
+          return child;
+        },
+      }),
+      reserve: async () => ({}), write: async () => {},
+    });
+    assert.equal(receipt.errorCode,
+      "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RELOAD_REFRESH_FAILED");
+    assert.equal(receipt.automaticRefreshFailure, value === fixed ? fixed : undefined);
+    assert.equal(JSON.stringify(receipt).includes("private refresh detail"), false);
+  }
+});
+
 function productionMetadata(sourceRevision = SOURCE_REVISION) {
   return createProductionDistributionMetadata({
     buildNumber: "12345",

@@ -22,6 +22,7 @@ import {
 } from "../apps/electron/desktop-first-run.js";
 import { validateProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import {
+  ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES,
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES,
   assertContainerContract,
   runSmoke,
@@ -52,7 +53,12 @@ const SNAPSHOT_DIAGNOSTIC_SCHEMA =
   "tibotattle-electron-linux-normal-packaged-snapshot-diagnostic-v1";
 const STARTUP_FAILURE_DIAGNOSTIC_SCHEMA =
   "tibotattle-electron-linux-normal-packaged-startup-failure-v1";
+const AUTOMATIC_REFRESH_DIAGNOSTIC_SCHEMA =
+  "tibotattle-electron-linux-normal-packaged-automatic-refresh-failure-v1";
 const STARTUP_JOURNAL_STATUSES = new Set(["absent", "unreadable", "invalid", "no_failure", "failure"]);
+const AUTOMATIC_REFRESH_FAILURE_CODES = new Set(
+  Object.values(ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES),
+);
 const CLI_FAILURE = "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_FAILED";
 const MAX_JSON_BYTES = 1_048_576;
 // Two source-smoke journeys each retain their existing 30s startup, two 45s
@@ -173,6 +179,20 @@ function startupDiagnosticEnvelope(failureValue, statusValue) {
     schemaVersion: STARTUP_FAILURE_DIAGNOSTIC_SCHEMA,
     companionStartupJournalStatus: statusValue,
     companionStartupFailure: selected,
+  });
+}
+
+/** Keep only the shared smoke runner's fixed refresh classifiers in a receipt. */
+function validateAutomaticRefreshFailure(value) {
+  return typeof value === "string" && AUTOMATIC_REFRESH_FAILURE_CODES.has(value)
+    ? value : null;
+}
+
+function automaticRefreshDiagnosticEnvelope(value) {
+  const code = validateAutomaticRefreshFailure(value);
+  return code === null ? null : Object.freeze({
+    schemaVersion: AUTOMATIC_REFRESH_DIAGNOSTIC_SCHEMA,
+    automaticRefreshFailure: code,
   });
 }
 const SOURCE_SMOKE_STAGE_CODES = Object.freeze({
@@ -614,6 +634,7 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
   let rendererReadinessDiagnostics = null;
   let companionProcessDiagnostics = null;
   let dashboardLoadFailure = null;
+  let automaticRefreshFailure = null;
   let result;
   let ownedFixture = null;
   try {
@@ -655,6 +676,9 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
     });
   } catch (error) {
     if (observationFailure !== null) fail(observationFailure);
+    if (smokeFailureStage === "initial_refresh" || smokeFailureStage === "reload_refresh") {
+      automaticRefreshFailure = validateAutomaticRefreshFailure(error?.code);
+    }
     const stageCode = normalPackagedSmokeFailureStageCode(smokeFailureStage);
     if (stageCode !== null) {
       const classified = validateRendererReadinessDiagnostics(rendererReadinessDiagnostics);
@@ -662,6 +686,7 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
       if (classified !== null) fixed.rendererReadinessDiagnostics = classified;
       if (companionProcessDiagnostics !== null) fixed.companionProcessDiagnostics = companionProcessDiagnostics;
       if (dashboardLoadFailure !== null) fixed.dashboardLoadFailure = dashboardLoadFailure;
+      if (automaticRefreshFailure !== null) fixed.automaticRefreshFailure = automaticRefreshFailure;
       const startupFailure = await readLinuxNormalStartupFailure(ownedFixture?.userData, {
         onStatus: (status) => { fixed.companionStartupJournalStatus = status; },
       });
@@ -977,6 +1002,11 @@ function classifiedInnerFailure(stderr) {
   }).map((value) => value?.schemaVersion === LINUX_DASHBOARD_FAILURE_DIAGNOSTIC_SCHEMA
     ? validateLinuxDashboardFailureDiagnostic(value.dashboardLoadFailure) : null)
     .filter((value) => value !== null);
+  const automaticRefreshFailures = lines.map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).map((value) => value?.schemaVersion === AUTOMATIC_REFRESH_DIAGNOSTIC_SCHEMA
+    ? validateAutomaticRefreshFailure(value.automaticRefreshFailure) : null)
+    .filter((value) => value !== null);
   return Object.freeze({
     code: matches[0],
     rendererReadinessDiagnostics: diagnostics.length === 1 ? diagnostics[0] : null,
@@ -984,6 +1014,7 @@ function classifiedInnerFailure(stderr) {
     companionStartupJournalStatus: startupFailures.length === 1 ? startupFailures[0].companionStartupJournalStatus : null,
     companionProcessDiagnostics: processDiagnostics.length === 1 ? processDiagnostics[0] : null,
     dashboardLoadFailure: dashboardFailures.length === 1 ? dashboardFailures[0] : null,
+    automaticRefreshFailure: automaticRefreshFailures.length === 1 ? automaticRefreshFailures[0] : null,
   });
 }
 
@@ -1032,6 +1063,9 @@ export async function runLinuxNormalPackagedSmokeSession(identity, {
       if (innerFailure.dashboardLoadFailure !== null) {
         error.dashboardLoadFailure = innerFailure.dashboardLoadFailure;
       }
+      if (innerFailure.automaticRefreshFailure !== null) {
+        error.automaticRefreshFailure = innerFailure.automaticRefreshFailure;
+      }
       throw error;
     }
     fail("SESSION_EXECUTION_FAILED");
@@ -1071,6 +1105,7 @@ function outerReceipt({
   companionStartupJournalStatus = null,
   companionProcessDiagnostics = null,
   dashboardLoadFailure = null,
+  automaticRefreshFailure = null,
 }) {
   const diagnostic = validateRendererReadinessDiagnostics(rendererReadinessDiagnostics);
   const receipt = {
@@ -1092,6 +1127,8 @@ function outerReceipt({
   if (processDiagnostic !== null) receipt.companionProcessDiagnostics = processDiagnostic;
   const dashboardFailure = validateLinuxDashboardFailureDiagnostic(dashboardLoadFailure);
   if (dashboardFailure !== null) receipt.dashboardLoadFailure = dashboardFailure;
+  const automaticRefresh = automaticRefreshDiagnosticEnvelope(automaticRefreshFailure);
+  if (automaticRefresh !== null) receipt.automaticRefreshFailure = automaticRefresh.automaticRefreshFailure;
   return Object.freeze(receipt);
 }
 
@@ -1113,6 +1150,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
   let companionStartupJournalStatus = null;
   let companionProcessDiagnostics = null;
   let dashboardLoadFailure = null;
+  let automaticRefreshFailure = null;
   try {
     identity = await verifyPackage(options);
     inner = await runSession(identity, { appPath: options.appPath, environment });
@@ -1126,6 +1164,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
       ? error.companionStartupJournalStatus : null;
     companionProcessDiagnostics = validateLinuxCompanionProcessDiagnostics(error?.companionProcessDiagnostics);
     dashboardLoadFailure = validateLinuxDashboardFailureDiagnostic(error?.dashboardLoadFailure);
+    automaticRefreshFailure = validateAutomaticRefreshFailure(error?.automaticRefreshFailure);
   }
   const receipt = outerReceipt({
     sourceRevision: options.sourceRevision,
@@ -1137,6 +1176,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
     companionStartupJournalStatus,
     companionProcessDiagnostics,
     dashboardLoadFailure,
+    automaticRefreshFailure,
   });
   await write(handle, receipt);
   return receipt;
@@ -1179,6 +1219,8 @@ if (resolve(process.argv[1] ?? "") === SCRIPT_FILE) {
       schemaVersion: LINUX_DASHBOARD_FAILURE_DIAGNOSTIC_SCHEMA,
       dashboardLoadFailure: dashboardFailure,
     })}\n`);
+    const automaticRefresh = automaticRefreshDiagnosticEnvelope(error?.automaticRefreshFailure);
+    if (automaticRefresh !== null) process.stderr.write(`${JSON.stringify(automaticRefresh)}\n`);
     process.exitCode = 1;
   });
 }
