@@ -38,7 +38,7 @@ const CANDIDATE = {
   },
 };
 
-function responseSpawn(reply, calls) {
+function responseSpawn(reply, calls, { exitCode = 0 } = {}) {
   return (command, args, options) => {
     calls.push({ command, args, options });
     const child = new EventEmitter();
@@ -48,7 +48,7 @@ function responseSpawn(reply, calls) {
     queueMicrotask(() => {
       child.stdout.end(`${JSON.stringify(reply)}\n`);
       child.stderr.end();
-      child.emit("close", 0, null);
+      child.emit("close", exitCode, null);
     });
     return child;
   };
@@ -111,6 +111,71 @@ test("macOS bridge calls only the fixed helper operation and validates its reply
   assert.equal(await adapter.claimElectronLoginItem({ startAtLogin: false, candidate: CANDIDATE }), "owned");
 });
 
+test("macOS bridge preparation preflight is a fixed no-side-effect helper operation", async () => {
+  const calls = [];
+  let loginWrites = 0;
+  const adapter = createMacNativeHandoverAdapter({
+    platform: "darwin",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    electronApp: {
+      setLoginItemSettings() { loginWrites += 1; },
+      getLoginItemSettings() { return { openAtLogin: false, status: "not-registered" }; },
+    },
+    spawnProcess: responseSpawn({
+      schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+      status: "preflight_ready",
+    }, calls),
+  });
+  assert.deepEqual(await adapter.preflightNativeHandover({
+    nativeAppPath: "/Applications/TiboTattle-old.app",
+    candidate: CANDIDATE,
+  }), { status: "preflight_ready" });
+  assert.equal(loginWrites, 0);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].args, ["--prepare-preflight", "--native-app", "/Applications/TiboTattle-old.app"]);
+  assert.deepEqual(calls[0].options, {
+    cwd: "/",
+    env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+
+  const refusingAdapter = createMacNativeHandoverAdapter({
+    platform: "darwin",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    electronApp: {
+      setLoginItemSettings() { loginWrites += 1; },
+      getLoginItemSettings() { return { openAtLogin: false, status: "not-registered" }; },
+    },
+    spawnProcess: responseSpawn({
+      schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+      status: "failed",
+    }, [], { exitCode: 1 }),
+  });
+  await assert.rejects(refusingAdapter.preflightNativeHandover({
+    nativeAppPath: "/Applications/TiboTattle-old.app", candidate: CANDIDATE,
+  }), (error) => error?.code === "native_electron_mac_bridge_preflight_invalid_reply");
+  assert.equal(loginWrites, 0, "a refusing preflight cannot alter Electron login ownership");
+
+  const stagedRefusal = createMacNativeHandoverAdapter({
+    platform: "darwin",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    electronApp: {
+      setLoginItemSettings() { loginWrites += 1; },
+      getLoginItemSettings() { return { openAtLogin: false, status: "not-registered" }; },
+    },
+    spawnProcess: responseSpawn({
+      schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+      status: "failed",
+      failureStage: "native_writer",
+    }, [], { exitCode: 1 }),
+  });
+  await assert.rejects(stagedRefusal.preflightNativeHandover({
+    nativeAppPath: "/Applications/TiboTattle-old.app", candidate: CANDIDATE,
+  }), (error) => error?.code === "native_electron_mac_bridge_preflight_native_writer");
+  assert.equal(loginWrites, 0, "a staged preflight refusal cannot alter Electron login ownership");
+});
+
 test("macOS bridge fails closed on an incomplete reply or unverified candidate", async () => {
   const app = {
     setLoginItemSettings() {},
@@ -139,6 +204,53 @@ test("macOS bridge fails closed on an incomplete reply or unverified candidate",
     assert.equal(error.code, "native_electron_handover_signature_evidence_invalid");
     return true;
   });
+});
+
+test("macOS bridge accepts only closed preparation failure stages and retains legacy failed replies", async () => {
+  const app = {
+    setLoginItemSettings() {},
+    getLoginItemSettings() { return { openAtLogin: false, status: "not-registered" }; },
+  };
+  const stagedFailure = createMacNativeHandoverAdapter({
+    platform: "darwin",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    electronApp: app,
+    spawnProcess: responseSpawn({
+      schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+      status: "failed",
+      failureStage: "login_item_unregister",
+    }, [], { exitCode: 1 }),
+  });
+  await assert.rejects(stagedFailure.prepareNativeHandover({
+    nativeAppPath: "/Applications/TiboTattle-old.app", candidate: CANDIDATE,
+  }), (error) => error?.code === "native_electron_mac_bridge_prepare_login_item_unregister");
+
+  const legacyFailure = createMacNativeHandoverAdapter({
+    platform: "darwin",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    electronApp: app,
+    spawnProcess: responseSpawn({
+      schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+      status: "failed",
+    }, [], { exitCode: 1 }),
+  });
+  await assert.rejects(legacyFailure.prepareNativeHandover({
+    nativeAppPath: "/Applications/TiboTattle-old.app", candidate: CANDIDATE,
+  }), (error) => error?.code === "native_electron_mac_bridge_failed");
+
+  const malformedFailure = createMacNativeHandoverAdapter({
+    platform: "darwin",
+    helperPath: "/Applications/TiboTattle.app/Contents/MacOS/TiboTattleNativeHandover",
+    electronApp: app,
+    spawnProcess: responseSpawn({
+      schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+      status: "failed",
+      failureStage: "raw_os_error",
+    }, [], { exitCode: 1 }),
+  });
+  await assert.rejects(malformedFailure.prepareNativeHandover({
+    nativeAppPath: "/Applications/TiboTattle-old.app", candidate: CANDIDATE,
+  }), (error) => error?.code === "native_electron_mac_bridge_invalid_reply");
 });
 
 test("bridge availability is an explicit packaged-resource probe", async () => {

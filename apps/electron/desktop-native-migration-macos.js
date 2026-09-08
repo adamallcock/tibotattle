@@ -18,6 +18,16 @@ export const NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION =
   "tibotattle-native-electron-handover-bridge-v1";
 export const NATIVE_ELECTRON_MAC_BRIDGE_MAX_OUTPUT_BYTES = 16 * 1024;
 export const NATIVE_ELECTRON_MAC_BRIDGE_TIMEOUT_MS = 15_000;
+const PREPARE_FAILURE_STAGES = new Set([
+  "identity",
+  "native_application",
+  "native_writer",
+  "login_item_unregister",
+  "login_item_status",
+  "preferences",
+  "invalid_request",
+  "unknown",
+]);
 export const NATIVE_ELECTRON_MAC_BRIDGE_CONTENTS_RELATIVE_PATH = Object.freeze([
   "MacOS",
   "TiboTattleNativeHandover",
@@ -120,6 +130,20 @@ function validatePreferences(value) {
 }
 
 function validatePrepareReply(value) {
+  if (exactKeys(value, ["schemaVersion", "status", "failureStage"])
+      && value.schemaVersion === NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
+      && value.status === "failed"
+      && PREPARE_FAILURE_STAGES.has(value.failureStage)) {
+    throw bridgeFailure(`prepare_${value.failureStage}`);
+  }
+  // The first shipped helper only supplied this two-key failure reply. Keep
+  // that response fail-closed and recognizable while newer helpers provide a
+  // fixed internal stage without exposing native error text.
+  if (exactKeys(value, ["schemaVersion", "status"])
+      && value.schemaVersion === NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
+      && value.status === "failed") {
+    throw bridgeFailure("failed");
+  }
   if (!exactKeys(value, [
     "schemaVersion",
     "status",
@@ -142,6 +166,21 @@ function validatePrepareReply(value) {
     preferences: validatePreferences(value.preferences),
     credentialState: value.credentialState,
   });
+}
+
+function validatePreparationPreflightReply(value) {
+  if (exactKeys(value, ["schemaVersion", "status", "failureStage"])
+      && value.schemaVersion === NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
+      && value.status === "failed"
+      && PREPARE_FAILURE_STAGES.has(value.failureStage)) {
+    throw bridgeFailure(`preflight_${value.failureStage}`);
+  }
+  if (!exactKeys(value, ["schemaVersion", "status"])
+      || value.schemaVersion !== NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
+      || value.status !== "preflight_ready") {
+    throw bridgeFailure("preflight_invalid_reply");
+  }
+  return Object.freeze({ status: "preflight_ready" });
 }
 
 function assertion(value, message) {
@@ -242,7 +281,6 @@ async function invokeBridge(configuration, argumentsList) {
     child.once("error", () => fail("unavailable"));
     child.once("close", (code, signal) => {
       if (overflow) return fail("output_invalid");
-      if (code !== 0 || signal !== null) return fail("failed");
       let parsed;
       try {
         const text = output();
@@ -250,6 +288,13 @@ async function invokeBridge(configuration, argumentsList) {
         parsed = JSON.parse(text);
       } catch {
         return fail("invalid_reply");
+      }
+      // A helper's deliberate fixed failed reply is its only non-zero result
+      // that may cross this boundary. Signals and every other exit remain
+      // transport failures, even when they happened to write JSON first.
+      if (code !== 0 || signal !== null) {
+        if (code === 1 && signal === null) return settle(resolve, parsed);
+        return fail("failed");
       }
       settle(resolve, parsed);
     });
@@ -278,6 +323,25 @@ function claimedLoginItem(status, startAtLogin) {
 export function createMacNativeHandoverAdapter(options = {}) {
   const configuration = normalizeOptions(options);
   return Object.freeze({
+    async preflightNativeHandover({ nativeAppPath, candidate } = {}) {
+      if (!validPath(nativeAppPath)) throw bridgeFailure("invalid_native_app");
+      const qualified = validateNativeElectronHandoverCandidate(candidate);
+      if (qualified.native.appId !== NATIVE_ELECTRON_APP_ID
+          || qualified.electron.appId !== NATIVE_ELECTRON_APP_ID) {
+        throw bridgeFailure("identity_mismatch");
+      }
+      let reply;
+      try {
+        reply = await invokeBridge(configuration, ["--prepare-preflight", "--native-app", nativeAppPath]);
+      } catch (error) {
+        if (typeof error?.code === "string" && error.code.startsWith("native_electron_mac_bridge_")) {
+          throw error;
+        }
+        throw bridgeFailure("unavailable");
+      }
+      return validatePreparationPreflightReply(reply);
+    },
+
     async prepareNativeHandover({ nativeAppPath, candidate } = {}) {
       if (!validPath(nativeAppPath)) throw bridgeFailure("invalid_native_app");
       const qualified = validateNativeElectronHandoverCandidate(candidate);

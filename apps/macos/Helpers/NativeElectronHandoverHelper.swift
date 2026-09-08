@@ -25,8 +25,10 @@ enum NativeElectronHandoverHelper {
         case identity
         case nativeApplication
         case nativeVersion
-        case loginItem
+        case loginItemUnregister
+        case loginItemStatus
         case nativeWriter
+        case preferences
     }
 
     static func main() {
@@ -37,7 +39,7 @@ enum NativeElectronHandoverHelper {
             // No underlying OS error, path, bundle value, process ID, or
             // credential status is emitted. Electron maps this fixed result to
             // a user-safe recovery state.
-            result = (1, failureResponse())
+            result = (1, failureResponse(for: error, command: CommandLine.arguments.dropFirst().first))
         }
         write(result.1)
         exit(result.0)
@@ -73,6 +75,11 @@ enum NativeElectronHandoverHelper {
                 throw BridgeFailure.invalidRequest
             }
             return try prepare(nativeApplicationPath: arguments[3])
+        case "--prepare-preflight":
+            guard arguments.count == 4, arguments[2] == "--native-app" else {
+                throw BridgeFailure.invalidRequest
+            }
+            return try preparePreflight(nativeApplicationPath: arguments[3])
         default:
             throw BridgeFailure.invalidRequest
         }
@@ -90,6 +97,11 @@ enum NativeElectronHandoverHelper {
 
         let service = SMAppService.mainApp
         let startAtLogin = service.status == .enabled
+        try validatePreparationLoginItemStatus(service)
+        // Preferences are read and validated before the helper terminates the
+        // old writer or withdraws its login item. A malformed legacy value
+        // therefore cannot leave the predecessor partially transitioned.
+        let preferences = try readPreferences(startAtLogin: startAtLogin)
         try stopNativeApplications(nativeApplicationPath)
         // Withdraw the same-identity native main-app request after the old UI
         // has exited, so it cannot relaunch after the copied state is staged. A pending
@@ -100,14 +112,13 @@ enum NativeElectronHandoverHelper {
             do {
                 try service.unregister()
             } catch {
-                throw BridgeFailure.loginItem
+                throw BridgeFailure.loginItemUnregister
             }
         }
         guard service.status == .notRegistered else {
-            throw BridgeFailure.loginItem
+            throw BridgeFailure.loginItemStatus
         }
 
-        let preferences = try readPreferences(startAtLogin: startAtLogin)
         return [
             "schemaVersion": schemaVersion,
             "status": "prepared",
@@ -119,6 +130,37 @@ enum NativeElectronHandoverHelper {
             // qualified using signed installed artifacts.
             "credentialState": "unchanged",
         ]
+    }
+
+    private static func preparePreflight(nativeApplicationPath: String) throws -> [String: Any] {
+        // This mirrors every non-mutating prerequisite of --prepare. It does
+        // not terminate an app, alter ServiceManagement, write defaults, or
+        // access Keychain material.
+        guard Bundle.main.bundleIdentifier == productIdentifier,
+              enclosingApplicationBundleIdentifier() == productIdentifier else {
+            throw BridgeFailure.identity
+        }
+        try validateNativeApplication(nativeApplicationPath)
+        let service = SMAppService.mainApp
+        let startAtLogin = service.status == .enabled
+        try validatePreparationLoginItemStatus(service)
+        _ = try readPreferences(startAtLogin: startAtLogin)
+        try assertNativeApplicationsStopped(nativeApplicationPath)
+        return [
+            "schemaVersion": schemaVersion,
+            "status": "preflight_ready",
+        ]
+    }
+
+    private static func validatePreparationLoginItemStatus(_ service: SMAppService) throws {
+        switch service.status {
+        case .enabled, .notRegistered:
+            return
+        case .requiresApproval, .notFound:
+            throw BridgeFailure.loginItemStatus
+        @unknown default:
+            throw BridgeFailure.loginItemStatus
+        }
     }
 
     private static func enclosingApplicationBundleIdentifier() -> String? {
@@ -168,12 +210,12 @@ enum NativeElectronHandoverHelper {
         }
     }
 
-    private static func stopNativeApplications(_ nativeApplicationPath: String) throws {
+    private static func nativeApplications(_ nativeApplicationPath: String) -> [NSRunningApplication] {
         let targetPath = URL(fileURLWithPath: nativeApplicationPath)
             .standardizedFileURL.path
         let ownPID = ProcessInfo.processInfo.processIdentifier
         let parentPID = getppid()
-        let nativeProcesses = NSWorkspace.shared.runningApplications.filter { application in
+        return NSWorkspace.shared.runningApplications.filter { application in
             guard application.bundleIdentifier == productIdentifier,
                   application.processIdentifier != ownPID,
                   application.processIdentifier != parentPID,
@@ -181,19 +223,23 @@ enum NativeElectronHandoverHelper {
             else { return false }
             return bundleURL.standardizedFileURL.path == targetPath
         }
+    }
+
+    private static func assertNativeApplicationsStopped(_ nativeApplicationPath: String) throws {
+        guard nativeApplications(nativeApplicationPath).isEmpty else {
+            throw BridgeFailure.nativeWriter
+        }
+    }
+
+    private static func stopNativeApplications(_ nativeApplicationPath: String) throws {
+        let nativeProcesses = nativeApplications(nativeApplicationPath)
         for application in nativeProcesses {
             guard application.terminate() else { throw BridgeFailure.nativeWriter }
         }
 
         let deadline = Date().addingTimeInterval(nativeStopTimeout)
         while Date() < deadline {
-            let remaining = NSWorkspace.shared.runningApplications.contains { application in
-                application.bundleIdentifier == productIdentifier
-                    && application.processIdentifier != ownPID
-                    && application.processIdentifier != parentPID
-                    && application.bundleURL?.standardizedFileURL.path == targetPath
-            }
-            if !remaining { return }
+            if nativeApplications(nativeApplicationPath).isEmpty { return }
             RunLoop.current.run(until: Date().addingTimeInterval(0.05))
         }
         throw BridgeFailure.nativeWriter
@@ -201,7 +247,7 @@ enum NativeElectronHandoverHelper {
 
     private static func readPreferences(startAtLogin: Bool) throws -> [String: Any] {
         guard let defaults = UserDefaults(suiteName: productIdentifier) else {
-            throw BridgeFailure.identity
+            throw BridgeFailure.preferences
         }
         let rawLanguage = defaults.string(forKey: nativeLanguageKey) ?? "system"
         let language: String
@@ -210,11 +256,11 @@ enum NativeElectronHandoverHelper {
         case "en", "en-US": language = "en"
         case "zh-Hans": language = "zh-Hans"
         case "es": language = "es"
-        default: throw BridgeFailure.identity
+        default: throw BridgeFailure.preferences
         }
         let appearance = defaults.string(forKey: nativeAppearanceKey) ?? "system"
         guard ["system", "light", "dark"].contains(appearance) else {
-            throw BridgeFailure.identity
+            throw BridgeFailure.preferences
         }
         let storedInterval = defaults.integer(forKey: nativeRefreshKey)
         let refreshInterval = [60, 300, 900, 1800].contains(storedInterval)
@@ -228,10 +274,40 @@ enum NativeElectronHandoverHelper {
         ]
     }
 
-    private static func failureResponse() -> [String: Any] {
-        [
+    private static func failureResponse(for error: Error, command: String?) -> [String: Any] {
+        // Existing callers that only understand the legacy two-key failed
+        // response retain it. Preparation alone gets a fixed private stage
+        // code; no OS error, path, preference value, PID, or credential data
+        // crosses this boundary.
+        guard command == "--prepare" || command == "--prepare-preflight" else {
+            return [
+                "schemaVersion": schemaVersion,
+                "status": "failed",
+            ]
+        }
+        let failureStage: String
+        switch error {
+        case BridgeFailure.identity:
+            failureStage = "identity"
+        case BridgeFailure.nativeApplication, BridgeFailure.nativeVersion:
+            failureStage = "native_application"
+        case BridgeFailure.loginItemUnregister:
+            failureStage = "login_item_unregister"
+        case BridgeFailure.loginItemStatus:
+            failureStage = "login_item_status"
+        case BridgeFailure.nativeWriter:
+            failureStage = "native_writer"
+        case BridgeFailure.preferences:
+            failureStage = "preferences"
+        case BridgeFailure.invalidRequest:
+            failureStage = "invalid_request"
+        default:
+            failureStage = "unknown"
+        }
+        return [
             "schemaVersion": schemaVersion,
             "status": "failed",
+            "failureStage": failureStage,
         ]
     }
 
