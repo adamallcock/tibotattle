@@ -26,8 +26,30 @@ COM firewall setup/removal but its empty synthetic Codex root keeps Refresh
 disabled. The integrated fixture repair adds one content-free session metadata
 record before launch. Combined owning Windows/Linux checks pass 45/45.
 These followups preserve the newer parallel tray commits through `a60b5fa1`.
-Mac `.3`/`.4` signing authorization remains pending for frozen source `82122044`;
-those migration candidates do not include the subsequent tray-only refinements.
+The user has now authorized signing/notarizing Mac `.3`/`.4` from frozen source
+`82122044` for both architectures. Signing is underway; the first Apple Silicon
+candidate is Apple-accepted and stapled, with final metadata verification still
+in progress. These migration candidates do not include subsequent tray-only
+refinements. Installed migration and update proof remain open.
+
+Followup native run `34279624092` still failed Windows refresh and Linux reload.
+The causes are now covered by concrete local regressions: Linux switches to the
+quick-refresh endpoint after creating its trusted projection, but the observer
+watched only the detailed endpoint. Windows needs a canonical discoverable
+rollout, not merely a readable JSONL file. The corrected Windows fixture passes
+actual discovery, normalized onboarding, authorized companion refresh, terminal
+completion and restart; its old fixture is proved undiscoverable. The Linux
+observer accepts only the two legitimate refresh routes with unchanged origin
+and document binding. Linux checks pass 57/57 and Windows checks pass 22/22.
+Both fixes are batched for the next native run, preserving safety assertions.
+
+The Worker development-only Vitest security patch is integrated at `216502c6`:
+Vitest and its sibling packages are pinned to 4.1.11. All 581 Worker tests and
+193 script checks pass, as do type/configuration checks. An initial dry-run
+failure identified stale generated public assets; after rebuilding those local
+assets, both remaining dry-deployment and staging checks pass. No hosted service
+was deployed. Read-only inspection confirms the two planned staging databases
+do not yet exist.
 
 Cutover focus as of 2026-09-08: freeze the tested feature set at `98a5256d`.
 Do not add cosmetic work, optional platform abstractions, or broader audits.
