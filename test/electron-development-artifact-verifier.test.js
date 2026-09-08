@@ -114,6 +114,11 @@ const SHELL_FILES = [
   "src/platform/windows-credential-manager-probe.js",
   "src/platform/windows-account-observation-broker.js",
   "src/platform/windows-account-observation-credential.js",
+  "src/platform/windows-credential-manager.js",
+  "src/platform/windows-credential-operation-lease.js",
+  "src/platform/windows-credential-mutex.js",
+  "src/platform/windows-credential-operation-audit.js",
+  "src/platform/windows-credential-audit-file-guard.js",
 ];
 const KEYTAR = Object.freeze({
   "darwin-arm64": "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",

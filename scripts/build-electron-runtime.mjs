@@ -241,6 +241,11 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "src/platform/windows-credential-manager-probe.js",
   "src/platform/windows-account-observation-broker.js",
   "src/platform/windows-account-observation-credential.js",
+  "src/platform/windows-credential-manager.js",
+  "src/platform/windows-credential-operation-lease.js",
+  "src/platform/windows-credential-mutex.js",
+  "src/platform/windows-credential-operation-audit.js",
+  "src/platform/windows-credential-audit-file-guard.js",
 ]);
 // Existing outputs are authenticated against their own complete manifest and
 // payload before replacement. Keep this stable identity subset separate from
@@ -724,8 +729,9 @@ function stagedBarePackageManifest(stagingRoot, specifier) {
 }
 
 /**
- * Prove the staged Electron entrypoint's static ESM graph stays inside the
- * staged runtime. This runs before the atomic publish, so a newly imported
+ * Prove every declared shell module's static ESM graph stays inside the
+ * staged runtime, including dormant platform/qualification entrypoints.
+ * This runs before the atomic publish, so a newly imported
  * source file or direct package cannot be masked by a checkout ancestor.
  * Electron itself remains an explicit runtime-only dynamic import.
  */
@@ -745,10 +751,9 @@ export async function assertStagedElectronShellModuleLinkage(
   if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
     failStagedElectronModuleLinkage();
   }
-  const pending = [await stagedElectronModuleFile(
-    root,
-    outputPath(root, "apps/electron/main.js"),
-  )];
+  const pending = await Promise.all(ELECTRON_SHELL_RUNTIME_FILES
+    .filter((path) => /\.(?:mjs|js)$/u.test(path))
+    .map((path) => stagedElectronModuleFile(root, outputPath(root, path))));
   const visited = new Set();
   while (pending.length > 0) {
     const importer = pending.pop();

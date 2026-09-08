@@ -266,8 +266,14 @@ test("staged Electron main links in isolated plain Node for every target", async
       const shellClosure = await assertStagedElectronShellModuleLinkage(result.output);
       assert.ok(shellClosure.includes("apps/electron/desktop-contribution-credential.js"), target);
       assert.ok(shellClosure.includes("apps/electron/desktop-tray-preferences.js"), target);
+      assert.ok(shellClosure.includes("src/platform/windows-credential-manager.js"), target);
+      assert.ok(shellClosure.includes("src/platform/windows-credential-operation-audit.js"), target);
       // buildElectronRuntime runs the same isolated plain-Node linkage check
       // before publishing the staged tree for every target.
+      await rm(join(result.output, "src/platform/windows-credential-mutex.js"));
+      await assert.rejects(assertStagedElectronShellModuleLinkage(result.output), {
+        code: "ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE",
+      }, "a dormant platform entrypoint must not hide a missing dependency");
     }
   });
 });
