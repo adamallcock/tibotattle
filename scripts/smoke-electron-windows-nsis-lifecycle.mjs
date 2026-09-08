@@ -53,6 +53,8 @@ const PROGRAM_OUTPUT_LIMIT_BYTES = 64 * 1024;
 const REGISTRY_ABSENT = "absent-v1";
 const REGISTRY_EXPECTED = "expected-v1";
 const REGISTRY_OTHER = "other-v1";
+const WINDOWS_PROCESS_ID_MAX = 0xffff_ffff;
+const PROCESS_SNAPSHOT_MAX_TARGETS = 4096;
 // This value is injected only into the two fixed read-only PowerShell probes.
 // It is deliberately not inherited from the parent environment by any child.
 export const WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY =
@@ -96,6 +98,10 @@ function validAbsolutePath(value) {
     && value.length <= 4096
     && !value.includes("\0")
     && isAbsolute(value);
+}
+
+function validWindowsProcessId(value) {
+  return Number.isSafeInteger(value) && value > 0 && value <= WINDOWS_PROCESS_ID_MAX;
 }
 
 function validDigest(value) {
@@ -642,23 +648,325 @@ async function defaultExecuteUninstaller({ uninstallerPath, environment, runProg
   return programExecutionOutcome(result);
 }
 
-async function defaultReadWindowsProcessSnapshot({ environment, runProgram }) {
+const WINDOWS_TOOLHELP_PROCESS_SNAPSHOT_SOURCE = String.raw`using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.Runtime.InteropServices;
+
+public static class TiboTattleWindowsProcessSnapshot
+{
+    private const uint TH32CS_SNAPPROCESS = 0x00000002;
+    private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x00001000;
+    private const int ERROR_NO_MORE_FILES = 18;
+    private const int ERROR_INVALID_PARAMETER = 87;
+    private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct PROCESSENTRY32
+    {
+        public uint dwSize;
+        public uint cntUsage;
+        public uint th32ProcessID;
+        public IntPtr th32DefaultHeapID;
+        public uint th32ModuleID;
+        public uint cntThreads;
+        public uint th32ParentProcessID;
+        public int pcPriClassBase;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExeFile;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME
+    {
+        public uint dwLowDateTime;
+        public uint dwHighDateTime;
+    }
+
+    private sealed class SnapshotEntry
+    {
+        public uint ProcessId;
+        public uint ParentProcessId;
+    }
+
+    public sealed class Evidence
+    {
+        public uint ProcessId { get; private set; }
+        public uint ParentProcessId { get; private set; }
+        public string CreationDate { get; private set; }
+
+        public Evidence(uint processId, uint parentProcessId, ulong creationDate)
+        {
+            ProcessId = processId;
+            ParentProcessId = parentProcessId;
+            CreationDate = creationDate.ToString(CultureInfo.InvariantCulture);
+        }
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32First(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Process32Next(IntPtr hSnapshot, ref PROCESSENTRY32 lppe);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetProcessTimes(IntPtr hProcess, out FILETIME lpCreationTime,
+        out FILETIME lpExitTime, out FILETIME lpKernelTime, out FILETIME lpUserTime);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    private static Dictionary<uint, SnapshotEntry> CaptureProcessTable()
+    {
+        IntPtr snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snapshot == IntPtr.Zero || snapshot == INVALID_HANDLE_VALUE)
+        {
+            throw new InvalidOperationException();
+        }
+        try
+        {
+            var entries = new Dictionary<uint, SnapshotEntry>();
+            var current = new PROCESSENTRY32();
+            current.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+            if (!Process32First(snapshot, ref current))
+            {
+                throw new InvalidOperationException();
+            }
+            while (true)
+            {
+                if (entries.ContainsKey(current.th32ProcessID) || entries.Count >= 65536)
+                {
+                    throw new InvalidOperationException();
+                }
+                entries.Add(current.th32ProcessID, new SnapshotEntry {
+                    ProcessId = current.th32ProcessID,
+                    ParentProcessId = current.th32ParentProcessID,
+                });
+                current.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+                if (Process32Next(snapshot, ref current))
+                {
+                    continue;
+                }
+                if (Marshal.GetLastWin32Error() != ERROR_NO_MORE_FILES)
+                {
+                    throw new InvalidOperationException();
+                }
+                return entries;
+            }
+        }
+        finally
+        {
+            if (!CloseHandle(snapshot))
+            {
+                throw new InvalidOperationException();
+            }
+        }
+    }
+
+    private static bool TryReadEvidence(SnapshotEntry entry, out Evidence evidence, out bool absent)
+    {
+        evidence = null;
+        absent = false;
+        IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, entry.ProcessId);
+        if (process == IntPtr.Zero || process == INVALID_HANDLE_VALUE)
+        {
+            if (Marshal.GetLastWin32Error() == ERROR_INVALID_PARAMETER)
+            {
+                absent = true;
+            }
+            return false;
+        }
+        try
+        {
+            FILETIME creation;
+            FILETIME exit;
+            FILETIME kernel;
+            FILETIME user;
+            if (!GetProcessTimes(process, out creation, out exit, out kernel, out user))
+            {
+                return false;
+            }
+            ulong creationDate = ((ulong)creation.dwHighDateTime << 32) | creation.dwLowDateTime;
+            if (creationDate == 0)
+            {
+                return false;
+            }
+            evidence = new Evidence(entry.ProcessId, entry.ParentProcessId, creationDate);
+            return true;
+        }
+        finally
+        {
+            if (!CloseHandle(process))
+            {
+                throw new InvalidOperationException();
+            }
+        }
+    }
+
+    public static Evidence[] Read(uint rootProcessId, uint[] retainedProcessIds)
+    {
+        bool rootMode = rootProcessId != 0;
+        if ((rootMode && retainedProcessIds != null && retainedProcessIds.Length != 0)
+            || (!rootMode && (retainedProcessIds == null || retainedProcessIds.Length == 0)))
+        {
+            throw new InvalidOperationException();
+        }
+        var entries = CaptureProcessTable();
+        var selected = new HashSet<uint>();
+        if (rootMode)
+        {
+            if (!entries.ContainsKey(rootProcessId))
+            {
+                throw new InvalidOperationException();
+            }
+            var children = new Dictionary<uint, List<uint>>();
+            foreach (SnapshotEntry entry in entries.Values)
+            {
+                List<uint> childIds;
+                if (!children.TryGetValue(entry.ParentProcessId, out childIds))
+                {
+                    childIds = new List<uint>();
+                    children.Add(entry.ParentProcessId, childIds);
+                }
+                childIds.Add(entry.ProcessId);
+            }
+            var pending = new Queue<uint>();
+            pending.Enqueue(rootProcessId);
+            while (pending.Count != 0)
+            {
+                uint processId = pending.Dequeue();
+                if (!selected.Add(processId))
+                {
+                    continue;
+                }
+                List<uint> childIds;
+                if (children.TryGetValue(processId, out childIds))
+                {
+                    foreach (uint childId in childIds)
+                    {
+                        pending.Enqueue(childId);
+                    }
+                }
+            }
+        }
+        else
+        {
+            var seen = new HashSet<uint>();
+            foreach (uint processId in retainedProcessIds)
+            {
+                if (processId == 0 || !seen.Add(processId))
+                {
+                    throw new InvalidOperationException();
+                }
+                if (entries.ContainsKey(processId))
+                {
+                    selected.Add(processId);
+                }
+            }
+        }
+
+        var results = new List<Evidence>();
+        bool rootObserved = false;
+        foreach (uint processId in selected)
+        {
+            Evidence evidence;
+            bool absent;
+            if (!TryReadEvidence(entries[processId], out evidence, out absent))
+            {
+                if (absent && (!rootMode || processId != rootProcessId))
+                {
+                    continue;
+                }
+                throw new InvalidOperationException();
+            }
+            if (processId == rootProcessId)
+            {
+                rootObserved = true;
+            }
+            results.Add(evidence);
+        }
+        if (rootMode && !rootObserved)
+        {
+            throw new InvalidOperationException();
+        }
+        results.Sort(delegate(Evidence left, Evidence right) {
+            return left.ProcessId.CompareTo(right.ProcessId);
+        });
+        return results.ToArray();
+    }
+}`;
+
+function validTrackedWindowsProcessIds(value) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > PROCESS_SNAPSHOT_MAX_TARGETS) {
+    return false;
+  }
+  const seen = new Set();
+  for (const processId of value) {
+    if (!validWindowsProcessId(processId) || seen.has(processId)) return false;
+    seen.add(processId);
+  }
+  return true;
+}
+
+function toolhelpPowerShellTypeDefinition() {
+  return `$source=@'
+${WINDOWS_TOOLHELP_PROCESS_SNAPSHOT_SOURCE}
+'@
+Add-Type -TypeDefinition $source -ErrorAction Stop;
+`;
+}
+
+/**
+ * A fixed Toolhelp/Win32 query for either a ready app's live descendant tree
+ * or the retained PIDs to recheck after it exits. It emits only PID, parent
+ * PID, and exact creation metadata; each selected live process must permit
+ * `GetProcessTimes`, otherwise the proof fails closed.
+ */
+export function buildWindowsOwnedProcessSnapshotQueryArguments({ rootProcessId = null, retainedProcessIds = null } = {}) {
+  const rootMode = rootProcessId !== null;
+  if ((rootMode && (!validWindowsProcessId(rootProcessId) || retainedProcessIds !== null))
+      || (!rootMode && !validTrackedWindowsProcessIds(retainedProcessIds))) {
+    fail("PROCESS_PROOF_UNAVAILABLE");
+  }
+  const root = rootMode ? rootProcessId : 0;
+  const retained = rootMode ? "@()" : `@(${retainedProcessIds.join(",")})`;
+  const query = `$ErrorActionPreference='Stop';${toolhelpPowerShellTypeDefinition()}$rows=[TiboTattleWindowsProcessSnapshot]::Read([uint32]${root},[uint32[]]${retained});[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
+  return Object.freeze([
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    query,
+  ]);
+}
+
+async function defaultReadWindowsProcessSnapshot({
+  environment,
+  runProgram,
+  rootProcessId = null,
+  retainedProcessIds = null,
+}) {
   const command = systemExecutable(environment, [
     "System32",
     "WindowsPowerShell",
     "v1.0",
     "powershell.exe",
   ]);
-  // This fixed read-only query returns only PID, parent PID, and creation time.
-  // It receives no caller data and emits no executable path or environment.
-  const query = "$ErrorActionPreference='Stop';$rows=@(Get-CimInstance Win32_Process|Where-Object {$null -ne $_.CreationDate}|Select-Object ProcessId,ParentProcessId,CreationDate);[Console]::Out.Write(($rows|ConvertTo-Json -Compress -Depth 2))";
-  const result = await runProgram(command, [
-    "-NoLogo",
-    "-NoProfile",
-    "-NonInteractive",
-    "-Command",
-    query,
-  ], {
+  const result = await runProgram(command, buildWindowsOwnedProcessSnapshotQueryArguments({
+    rootProcessId,
+    retainedProcessIds,
+  }), {
     timeoutMs: PROCESS_SNAPSHOT_TIMEOUT_MS,
     captureOutput: true,
     environment,
@@ -670,19 +978,23 @@ async function defaultReadWindowsProcessSnapshot({ environment, runProgram }) {
 }
 
 /**
- * Ask WMI only whether the exact installed Electron executable remains. The
- * app path is a fixed, validated child-only environment value, never
- * interpolated into the command or copied from the parent environment.
- * Output deliberately keeps paths out of receipts and logs.
+ * Ask the .NET process API only whether the exact installed Electron
+ * executable remains. The app path is a fixed, validated child-only
+ * environment value, never interpolated into the command or copied from the
+ * parent environment. Output deliberately keeps paths out of receipts and
+ * logs.
  */
 export function buildWindowsExactExecutableProcessQueryArguments(appPath) {
   if (!validAbsolutePath(appPath) || basename(appPath) !== APP_EXECUTABLE) {
     fail("PROCESS_PROOF_UNAVAILABLE");
   }
-  // The fixed image name lets CIM perform the narrow selection before reading
-  // ExecutablePath. The exact expected path remains a validated child-only
-  // value, so this query never interpolates a caller-controlled path.
-  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$rows=@(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'TiboTattle Dev.exe'"|Where-Object {$null -ne $_.CreationDate -and $null -ne $_.ExecutablePath -and [string]::Equals($_.ExecutablePath,$expected,[System.StringComparison]::OrdinalIgnoreCase)}|Select-Object ProcessId,ParentProcessId,CreationDate);[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
+  // The image name is fixed. Every matching process must disclose both its
+  // module path and start time: an access failure therefore rejects the proof
+  // rather than silently treating an uninspectable process as absent. For an
+  // exact match, Toolhelp supplies its real parent PID and independently
+  // rechecks the same creation identity. The expected path remains a validated
+  // child-only value, so this query never interpolates a caller-controlled path.
+  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$matches=@();foreach($process in [System.Diagnostics.Process]::GetProcessesByName('TiboTattle Dev')){try{$processPath=$process.MainModule.FileName;$creationDate=$process.StartTime.ToFileTimeUtc().ToString([System.Globalization.CultureInfo]::InvariantCulture);if($processPath -isnot [string] -or [string]::IsNullOrWhiteSpace($processPath) -or [string]::IsNullOrWhiteSpace($creationDate)){throw 'process-proof'};if([string]::Equals($processPath,$expected,[System.StringComparison]::OrdinalIgnoreCase)){$matches+=[pscustomobject]@{ProcessId=[uint32]$process.Id;CreationDate=$creationDate}}}finally{$process.Dispose()}};if($matches.Count -eq 0){$rows=@()}else{${toolhelpPowerShellTypeDefinition()}$processIds=[uint32[]]@($matches|ForEach-Object {[uint32]$_.ProcessId});$proof=@([TiboTattleWindowsProcessSnapshot]::Read([uint32]0,$processIds));$rows=@();foreach($match in $matches){$evidence=@($proof|Where-Object {$_.ProcessId -eq $match.ProcessId -and [string]::Equals($_.CreationDate,$match.CreationDate,[System.StringComparison]::Ordinal)});if($evidence.Count -gt 1){throw 'process-proof'};if($evidence.Count -eq 1){$rows+=$evidence[0]}}};[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
   return Object.freeze([
     "-NoLogo",
     "-NoProfile",
@@ -881,7 +1193,12 @@ export async function defaultLaunchAndExercise({
     observeStderr(child.stderr, observations);
     tracker = observeOwnedProcessTreeAtReady(
       child,
-      () => readProcessSnapshot({ environment, runProgram }),
+      () => readProcessSnapshot({
+        environment,
+        runProgram,
+        rootProcessId: child.pid,
+        retainedProcessIds: null,
+      }),
     );
     const tracked = await exercise(child, {
       observations,
@@ -889,7 +1206,12 @@ export async function defaultLaunchAndExercise({
     });
     assertWindowsProcessTreeExited(
       tracked,
-      await readProcessSnapshot({ environment, runProgram }),
+      await readProcessSnapshot({
+        environment,
+        runProgram,
+        rootProcessId: null,
+        retainedProcessIds: tracked.map(({ pid }) => pid),
+      }),
     );
     if ((await readInstalledExecutableProcesses({ appPath, environment, runProgram })).length !== 0) {
       fail("INSTALLED_EXECUTABLE_REMAINS");

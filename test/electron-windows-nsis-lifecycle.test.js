@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +13,7 @@ import {
   buildWindowsExactExecutableProcessQueryArguments,
   buildWindowsNsisInstallArguments,
   buildWindowsNsisRegistryInspectionArguments,
+  buildWindowsOwnedProcessSnapshotQueryArguments,
   defaultLaunchAndExercise,
   exerciseWindowsNsisLifecycleSmoke,
   ownedWindowsProcessTree,
@@ -166,7 +167,7 @@ test("pinned NSIS source proves a silent install cannot start the app without fo
   }), /NSIS_TEMPLATE_UNVERIFIED/u);
 });
 
-test("registry and exact-executable probes use fixed read-only PowerShell contracts", () => {
+test("registry and Windows process probes use fixed read-only PowerShell contracts", () => {
   const installationRoot = resolve("tibotattle-nsis-app");
   const registryArguments = buildWindowsNsisRegistryInspectionArguments(installationRoot);
   assert.equal(registryArguments.includes(installationRoot), false);
@@ -189,13 +190,40 @@ test("registry and exact-executable probes use fixed read-only PowerShell contra
   const appPath = join(installationRoot, "TiboTattle Dev.exe");
   const processArguments = buildWindowsExactExecutableProcessQueryArguments(appPath);
   assert.equal(processArguments.includes(appPath), false);
-  assert.match(processArguments[4], /Get-CimInstance -ClassName Win32_Process -Filter "Name = 'TiboTattle Dev\.exe'"/u);
-  assert.doesNotMatch(processArguments[4], /Get-CimInstance Win32_Process\|Where-Object/u);
+  assert.match(processArguments[4], /\[System\.Diagnostics\.Process\]::GetProcessesByName\('TiboTattle Dev'\)/u);
+  assert.match(processArguments[4], /\$process\.MainModule\.FileName/u);
+  assert.match(processArguments[4], /\$process\.StartTime\.ToFileTimeUtc\(\)/u);
+  assert.match(processArguments[4], /TiboTattleWindowsProcessSnapshot\]::Read/u);
+  assert.match(processArguments[4], /\$process\.Dispose\(\)/u);
+  assert.doesNotMatch(processArguments[4], /ParentProcessId=0/u);
+  assert.doesNotMatch(processArguments[4], /Get-CimInstance|Win32_Process|WMI/u);
   assert.match(processArguments[4], new RegExp(WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY, "u"));
   assert.doesNotMatch(processArguments[4], /\$args\[0\]/u);
   assert.doesNotMatch(processArguments[4], /Remove-|Stop-Process|Start-Process/u);
   assert.throws(
     () => buildWindowsExactExecutableProcessQueryArguments(join(installationRoot, "other.exe")),
+    /PROCESS_PROOF_UNAVAILABLE/u,
+  );
+
+  const readySnapshotArguments = buildWindowsOwnedProcessSnapshotQueryArguments({ rootProcessId: 42 });
+  assert.match(readySnapshotArguments[4], /CreateToolhelp32Snapshot/u);
+  assert.match(readySnapshotArguments[4], /Process32First/u);
+  assert.match(readySnapshotArguments[4], /Process32Next/u);
+  assert.match(readySnapshotArguments[4], /OpenProcess/u);
+  assert.match(readySnapshotArguments[4], /GetProcessTimes/u);
+  assert.doesNotMatch(readySnapshotArguments[4], /Get-CimInstance|Win32_Process|WMI/u);
+  assert.doesNotMatch(readySnapshotArguments[4], /Remove-|Stop-Process|Start-Process|taskkill/u);
+  assert.match(readySnapshotArguments[4], /\[uint32\]42/u);
+  const retainedSnapshotArguments = buildWindowsOwnedProcessSnapshotQueryArguments({
+    retainedProcessIds: [42, 43],
+  });
+  assert.match(retainedSnapshotArguments[4], /\[uint32\[\]\]@\(42,43\)/u);
+  assert.throws(
+    () => buildWindowsOwnedProcessSnapshotQueryArguments({ rootProcessId: 0 }),
+    /PROCESS_PROOF_UNAVAILABLE/u,
+  );
+  assert.throws(
+    () => buildWindowsOwnedProcessSnapshotQueryArguments({ retainedProcessIds: [42, 42] }),
     /PROCESS_PROOF_UNAVAILABLE/u,
   );
 });
@@ -287,6 +315,93 @@ test("Windows hosted CI runs the narrow exact-executable proof in its closed chi
   assert.equal(result.timedOut, false);
   assert.equal(result.exitCode, 0);
   assert.deepEqual(parseWindowsProcessSnapshot(result.stdout), []);
+});
+
+function waitForNativeFixtureExit(child, timeoutMs = 5_000) {
+  return new Promise((resolveExit, rejectExit) => {
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* Test failure below preserves no residue. */ }
+      rejectExit(new Error("native fixture did not exit"));
+    }, timeoutMs);
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      rejectExit(error);
+    });
+    child.once("close", () => {
+      clearTimeout(timer);
+      resolveExit();
+    });
+  });
+}
+
+test("Windows hosted CI runs Toolhelp ready and retained-process proofs with real identity metadata", {
+  skip: process.platform !== "win32" || process.arch !== "x64" || process.env.GITHUB_ACTIONS !== "true",
+}, async () => {
+  const systemRoot = process.env.SystemRoot;
+  assert.equal(typeof systemRoot, "string");
+  const executable = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const invokeSnapshot = async (argumentsList) => runWindowsNsisLifecycleProgram(
+    executable,
+    argumentsList,
+    {
+      timeoutMs: 20_000,
+      captureOutput: true,
+      environment: process.env,
+    },
+  );
+  const readyResult = await invokeSnapshot(
+    buildWindowsOwnedProcessSnapshotQueryArguments({ rootProcessId: process.pid }),
+  );
+  assert.equal(readyResult.settled, true);
+  assert.equal(readyResult.timedOut, false);
+  assert.equal(readyResult.exitCode, 0);
+  const readySnapshot = parseWindowsProcessSnapshot(readyResult.stdout);
+  const testRunner = readySnapshot.find((entry) => entry.pid === process.pid);
+  assert.ok(testRunner);
+  assert.match(testRunner.creation, /^[0-9]+$/u);
+  assert.ok(readySnapshot.some((entry) => entry.parentPid === process.pid));
+
+  const fixture = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+    shell: false,
+    windowsHide: true,
+    stdio: "ignore",
+  });
+  let fixtureExited = false;
+  const fixtureExit = waitForNativeFixtureExit(fixture, 20_000).then(() => {
+    fixtureExited = true;
+  });
+  fixtureExit.catch(() => {});
+  try {
+    assert.ok(Number.isSafeInteger(fixture.pid) && fixture.pid > 0);
+    const fixtureReady = await invokeSnapshot(
+      buildWindowsOwnedProcessSnapshotQueryArguments({ rootProcessId: fixture.pid }),
+    );
+    assert.equal(fixtureReady.settled, true);
+    assert.equal(fixtureReady.timedOut, false);
+    assert.equal(fixtureReady.exitCode, 0);
+    const fixtureSnapshot = parseWindowsProcessSnapshot(fixtureReady.stdout);
+    const fixtureIdentity = fixtureSnapshot.find((entry) => entry.pid === fixture.pid);
+    assert.ok(fixtureIdentity);
+    assert.equal(fixtureIdentity.parentPid, process.pid);
+    assert.match(fixtureIdentity.creation, /^[0-9]+$/u);
+
+    fixture.kill();
+    await fixtureExit;
+    const retainedResult = await invokeSnapshot(
+      buildWindowsOwnedProcessSnapshotQueryArguments({ retainedProcessIds: [fixtureIdentity.pid] }),
+    );
+    assert.equal(retainedResult.settled, true);
+    assert.equal(retainedResult.timedOut, false);
+    assert.equal(retainedResult.exitCode, 0);
+    const retainedSnapshot = parseWindowsProcessSnapshot(retainedResult.stdout);
+    assert.equal(retainedSnapshot.some((entry) => entry.pid === fixtureIdentity.pid
+      && entry.creation === fixtureIdentity.creation), false);
+  } finally {
+    if (!fixtureExited) {
+      try { fixture.kill(); } catch { /* Fixture cleanup is best effort after failure. */ }
+      await fixtureExit.catch(() => {});
+    }
+  }
 });
 
 test("Windows hosted CI refuses an orphaned uninstall key before classifying a disposable installation", {
@@ -556,6 +671,7 @@ test("launch proof fences ready snapshot and rejects a lingering exact installed
   const appPath = join(root, "TiboTattle Dev.exe");
   const child = new FixedSmokeChild(505);
   const processCalls = [];
+  const processRequestDetails = [];
   let snapshots = 0;
   try {
     const result = await defaultLaunchAndExercise({
@@ -580,8 +696,9 @@ test("launch proof fences ready snapshot and rejects a lingering exact installed
         child.exitCode = 0;
         return tracked;
       },
-      readProcessSnapshot: async () => {
+      readProcessSnapshot: async ({ rootProcessId, retainedProcessIds }) => {
         processCalls.push("snapshot");
+        processRequestDetails.push({ rootProcessId, retainedProcessIds });
         snapshots += 1;
         return snapshots === 1
           ? [{ pid: child.pid, parentPid: 1, creation: "started" }]
@@ -597,6 +714,10 @@ test("launch proof fences ready snapshot and rejects a lingering exact installed
     assert.equal(result.installedExecutableAbsentAtPreLaunchSnapshot, true);
     assert.equal(result.installedExecutableAbsentAtPostExitSnapshot, true);
     assert.deepEqual(processCalls, ["exact-executable", "snapshot", "snapshot", "exact-executable"]);
+    assert.deepEqual(processRequestDetails, [
+      { rootProcessId: child.pid, retainedProcessIds: null },
+      { rootProcessId: null, retainedProcessIds: [child.pid] },
+    ]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
