@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -26,10 +26,11 @@ const MACOS_CODESIGN_SKIP = process.platform === "darwin"
   : "requires macOS codesign";
 
 async function createAdHocApplicationFixture() {
-  const root = await mkdtemp(join(tmpdir(), "desktop-macos-keychain-codesign-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "desktop-macos-keychain-codesign-")));
   const appBundle = join(root, "TiboTattle.app");
   const resourcesPath = join(appBundle, "Contents", "Resources");
   const executable = join(appBundle, "Contents", "MacOS", "TiboTattle");
+  const binary = join(resourcesPath, "native", "macos-keychain.node");
   await Promise.all([
     mkdir(join(resourcesPath, "native"), { recursive: true }),
     mkdir(join(appBundle, "Contents", "MacOS"), { recursive: true }),
@@ -45,12 +46,14 @@ async function createAdHocApplicationFixture() {
     ].join("\n")),
     writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 }),
     writeFile(join(resourcesPath, "app.asar"), "synthetic", { mode: 0o600 }),
-    writeFile(join(resourcesPath, "native", "macos-keychain.node"), "synthetic", { mode: 0o700 }),
+    writeFile(binary, "synthetic", { mode: 0o700 }),
   ]);
   await chmod(executable, 0o700);
+  assert.equal(await realpath(binary), binary);
   const signing = spawnSync("/usr/bin/codesign", [
     "--force", "--sign", "-", "--identifier", PRODUCTION_ELECTRON_APP_ID, appBundle,
-  ], { encoding: "utf8" });
+  ], { encoding: "utf8", timeout: 15_000 });
+  assert.equal(signing.error, undefined);
   assert.equal(signing.status, 0);
   return { appBundle, resourcesPath, root };
 }
@@ -215,7 +218,9 @@ test("the default application verifier uses native codesign requirement syntax",
   const nativeVerification = spawnSync("/usr/bin/codesign",
     macOSCredentialApplicationVerificationArguments(fixture.appBundle), {
       encoding: "utf8",
+      timeout: 15_000,
     });
+  assert.equal(nativeVerification.error, undefined);
   assert.notEqual(nativeVerification.status, 0);
   assert.equal(
     /No such file or directory|invalid requirement specification/iu.test(
