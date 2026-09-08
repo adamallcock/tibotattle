@@ -25,16 +25,31 @@ Current checkpoint, 2026-09-08 (supersedes the historical entries below):
   state preparation in the normal profile; it now invokes the existing safe
   preparation routine before constructing either credential backend. Combined
   Windows, Linux and staging bootstrap checks pass 80/80 at `06c4a126`.
-  These changes still require the next native workflow result.
+  These changes are running with the latest tray integration at `3485a504` in
+  [34283753736](https://github.com/adamallcock/tibotattle/actions/runs/34283753736).
+  Linux's packaged credentials and ordinary startup journey now pass in that
+  run, including its isolated no-network normal-app check. Windows development
+  packaging passes; its normal-app result exposed the observer race below.
+  That run then identified an observer timing race: the Windows renderer can
+  POST before CDP attaches. The next repair uses the existing one-shot preload
+  barrier under the normal candidate's exact smoke control, releases it only
+  after network observation is enabled, and retains both automatic and manual
+  completion requirements. Its 24 owning checks pass. Optional manual
+  Windows/Linux runtime selections reuse the same jobs in an independent
+  concurrency group; every push and default manual run still executes the full
+  matrix. Workflow lint and 21 package/Linux workflow checks pass. The Linux
+  container test now explicitly lists the already-approved production closure
+  and synthetic executable instead of its stale seven-copy expectation.
 - All four private Mac `.3`/`.4` installers from frozen `82122044` have Apple
   acceptance, stapling and finalization receipts. Final DMG/ZIP bytes and
   metadata are preserved under the project's ignored `signed-handover-82122044`
-  directory. Installed handover is not qualified: a fresh strict verification
-  rejects the predecessor and candidate on this host, despite the predecessor
-  matching all 539 members of the official 0.1.18 bundle. Apple Terminal and
-  unrelated signed apps also fail verification. Host trust and execution
-  context are being diagnosed; no app, writer, credentials or state were
-  changed by this attempt. Historical signing receipts do not close this gate.
+  directory. Strict verification failures were caused by the restricted
+  execution context: controls, predecessor and candidate pass outside it.
+  The next guarded installed rehearsal then stopped at `BACKUP_CHANGED`, before
+  replacement, because native state changed while the stopped-state copy was
+  verified. The native app remains 0.1.18 build1026 and was relaunched unchanged;
+  the partial backup is preserved. Writer quiescence is being diagnosed.
+  Installed handover and the subsequent signed update remain unqualified.
 - The isolated staging Worker is deployed from `9951627d` at
   `https://app-usagemonitor-staging.adamallcock.workers.dev`, with the explicitly
   approved staging-only encryption keys and all collection capabilities off.
