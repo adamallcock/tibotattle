@@ -14,7 +14,15 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Current gate: all four development packages pass at `de8965d5` in
+Latest native run: `5d57f4e3` in
+[run 34193035717](https://github.com/adamallcock/tibotattle/actions/runs/34193035717)
+passes both Macs and Windows, including the repaired packager's real runtime
+configuration tests. Linux compiles and packages successfully, then fails the new
+fixed account-observation test after the default-state marker passes. Its empty
+raw qualification file and fixed failure are preserved with exact package hashes.
+The following source adds reviewed, closed phase diagnostics; it does not print
+raw native errors or weaken the success marker. The previous all-four baseline
+remains `de8965d5` in
 [run 34189342330](https://github.com/adamallcock/tibotattle/actions/runs/34189342330).
 The downloaded Windows and Linux apps, distributions and launchers match their
 receipts. Linux's fixed-record v2 recovery compiles and passes native tests;
@@ -29,7 +37,19 @@ synchronous post-write SQLite `PRAGMA quick_check`: a cold scan blocks the event
 loop for 8,545 ms, while open, mutation commit, ordinary reads, projection and
 publication do not reproduce that stall. The in-progress repair moves only the
 read-only integrity scan into a worker and retains the collector lock and success
-gate. The daily launcher still selects verified `1f74bbb6`.
+gate. The repair is integrated at `dd7058e9`, with export closure at `ad0e1333`.
+It passes 195 focused collector tests and 149 integrated worker, refresh, export
+and packaging tests (two artifact exclusions), plus architecture and preflight.
+A real read-only scan over the disposable copied-state database takes 8,794 ms
+with a 12 ms maximum main-loop gap. The frozen unsigned Mac `ad0e1333` package
+matches ASAR `dd21fc6ed3824a13113b161478e2f5e51c1f2bbf1013d58c0aa4c6677cdabff0`;
+its new copied-profile GUI qualification is in progress. The daily launcher still
+selects verified `1f74bbb6`.
+
+The actual accountless client-to-disposable-Worker journey is reverified at
+`5d57f4e3`: enrollment, encrypted upload, renewal, retained identity, no duplicate
+uploads after restart, disconnect and persistent opt-out all pass. This uses
+synthetic data and loopback only; it is not a hosted or installed-app receipt.
 
 The next native candidate adds the fixed Linux account-observation credential
 facade and its libsecret implementation at `547d4467`. Its read/create-only
@@ -38,7 +58,7 @@ harness runs its exact native test in a separate disposable Secret Service
 container and requires the success marker after assertions; a skipped test
 cannot qualify it. Portable integration passes 46 tests with one native-only
 exclusion, 32 packaging tests with two artifact exclusions, and architecture
-checks. Native compilation and execution remain pending.
+checks. Native compilation now passes in `34193035717`; its fixed observation execution fails and is being localized with closed phase diagnostics.
 
 Windows signing configuration is repaired at `48da8404` and `261bfa83`. The
 pinned packager previously rejected the configured Azure boolean switches and
