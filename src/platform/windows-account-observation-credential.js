@@ -1,3 +1,5 @@
+import { win32 } from "node:path";
+
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
 } from "./export-identity-keychain.js";
@@ -459,7 +461,10 @@ function createQualifiedBackend({
     auditStore = createAuditStore({
       filePath: defaultAuditFile({
         platform,
-        stateRoot: qualifiedContext.stateRoot,
+        // The launcher-created state container has ordinary inherited ACLs.
+        // The audit guard must create its own fixed, owner-only root rather
+        // than treating that existing container as a protected directory.
+        stateRoot: win32.join(qualifiedContext.stateRoot, "account-observation-fd4-v1"),
       }),
       fileGuardContext,
     });

@@ -71,7 +71,16 @@ confined to a disposable CI account; the fixed observation wire has no delete
 operation, so that synthetic record's cleanup boundary is the runner account's
 lifetime. All 90 integrated shell/credential/runner tests pass (one native-only
 skip), plus 73 resource-authority/shell tests and 36 packaging/export tests
-(two optional skips). Native execution of this new composition is still pending.
+(two optional skips). Its first native run at `c5fe88f5`,
+[run 34181867605](https://github.com/adamallcock/tibotattle/actions/runs/34181867605),
+passes the FD3 journey but fails observation startup before child readiness.
+The failed v2 receipt and exact ASAR digest are preserved. Source review finds
+the audit guard trying to validate the launcher's ordinary inherited-ACL state
+container as an owner-only final directory. The next candidate uses a fixed
+new protected child root for the observation audit, preserving all ACL checks.
+Fourteen focused tests pass, including a regression through the real audit
+guard facade that rejects the old inherited-ACL parent. Native rerun is pending;
+the current failure alone does not establish every underlying cause.
 
 The accountless production companion profile is now integrated at `b3643991`.
 It requires the exact production mode/origin and a connected private IPC

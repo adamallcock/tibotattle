@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { win32 } from "node:path";
 
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
@@ -7,6 +8,8 @@ import {
 import {
   WindowsCredentialManagerError,
 } from "../src/platform/windows-credential-manager.js";
+import { defaultWindowsCredentialOperationAuditFile } from "../src/platform/windows-credential-operation-audit.js";
+import { createWindowsCredentialAuditFileGuardContext } from "../src/platform/windows-credential-audit-file-guard.js";
 import {
   WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_INTEGRATION_STATUS,
   WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_PRODUCTION_SAFE,
@@ -133,7 +136,7 @@ function qualifiedBackendFixture({
     },
     defaultAuditFile(options) {
       calls.push(["file", options]);
-      return "C:\\qualification\\state\\private\\windows-credential-operation-audit-v1.sqlite";
+      return defaultWindowsCredentialOperationAuditFile(options);
     },
     createAuditStore(options) {
       calls.push(["store", options]);
@@ -341,7 +344,7 @@ test("qualified Windows account-observation construction keeps the generic manag
   assert.deepEqual(fixture.calls[2][1], { platform: "win32", architecture: "x64" });
   assert.deepEqual(fixture.calls[3][1], {
     platform: "win32",
-    stateRoot: "C:\\qualification\\state",
+    stateRoot: "C:\\qualification\\state\\account-observation-fd4-v1",
   });
   assert.deepEqual(fixture.calls[6], ["recover"]);
   assert.deepEqual(Object.keys(fixture.calls[7][1]).sort(), [
@@ -356,6 +359,43 @@ test("qualified Windows account-observation construction keeps the generic manag
   // the lease instead, so a close cannot accidentally call the generic path.
   assert.equal(fixture.manager.closeCalls, 0);
   assert.equal(fixture.manager.calls.every(([, capability]) => capability === ACCOUNT_CAPABILITY), true);
+});
+
+test("qualified observation audit creates a protected child instead of reclassifying the launcher's inherited-ACL state container", () => {
+  const fixture = qualifiedBackendFixture();
+  const stateRoot = fixture.context.stateRoot;
+  const ensured = [];
+  const createdFiles = [];
+  const identity = Object.freeze({ volumeSerialNumber: "0".repeat(16), fileId: "0".repeat(32), linkCount: 1 });
+  const guard = createWindowsCredentialAuditFileGuardContext({
+    platform: "win32", architecture: "x64",
+    binding: {
+      credentialAuditFileGuardContractVersion: "windows-credential-audit-file-guard-v1",
+      credentialAuditFileGuardSafe: true,
+      ensureDirectory(path) {
+        // A real launcher directory inherits its parent's ACL; native
+        // EnsureDirectory rejects it as the final protected directory.
+        if (path === stateRoot) throw Object.assign(new Error("ordinary inherited ACL"), { code: "WINDOWS_FILESYSTEM_SECURITY_POLICY" });
+        ensured.push(path);
+      },
+      createFile(path) { createdFiles.push(path); },
+      acquireCredentialAuditFileGuard() { return { guard: {}, identity }; },
+      releaseCredentialAuditFileGuard() {},
+    },
+  });
+  const backend = createQualifiedWindowsAccountObservationCredentialBackendForTest(fixture.options, {
+    ...fixture.factories,
+    createAuditFileGuardContext: () => guard,
+    createAuditStore({ filePath, fileGuardContext }) {
+      const lease = fileGuardContext.acquire(filePath);
+      return { close() { fileGuardContext.release(lease); } };
+    },
+  });
+  backend.close();
+  const privateRoot = win32.join(stateRoot, "account-observation-fd4-v1");
+  assert.deepEqual(ensured, [privateRoot, win32.join(privateRoot, "private")]);
+  const auditPath = win32.join(privateRoot, "private", "windows-credential-operation-audit-v1.sqlite");
+  assert.deepEqual(createdFiles, [auditPath, `${auditPath}-journal`]);
 });
 
 test("qualified Windows account-observation construction authenticates context and recovery before native factories", () => {
