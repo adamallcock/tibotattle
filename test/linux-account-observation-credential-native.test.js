@@ -63,6 +63,14 @@ async function writeOwnerOnlyFile(path, bytes) {
   await chmod(path, 0o600);
 }
 
+async function prepareOwnerPrivateState(stateBase) {
+  const paths = fixturePaths(stateBase);
+  await ownerOnlyDirectory(stateBase);
+  await ownerOnlyDirectory(paths.applicationDirectory);
+  await ownerOnlyDirectory(paths.mutexDirectory);
+  return paths;
+}
+
 function equalSecret(actual, expected) {
   assert.equal(Buffer.isBuffer(actual), true);
   assert.equal(actual.byteLength, 32);
@@ -88,16 +96,18 @@ async function assertMissing(path) {
   assert.fail("expected fixed native journal to be absent");
 }
 
-test("native Linux account-observation credential creates once, preserves an existing root, and reconciles only a matching digest intent", {
+test("native Linux account-observation credential refuses an absent retained intent before creation, creates once, and reconciles only a matching digest intent", {
   skip: !NATIVE_TEST_ENABLED,
 }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-linux-account-observation-"));
-  const stateBase = join(root, "state");
+  const absentStateBase = join(root, "absent-state");
+  const successStateBase = join(root, "success-state");
   const previousState = process.env.XDG_STATE_HOME;
+  const absentCandidate = Buffer.alloc(32, 70);
   const first = Buffer.alloc(32, 71);
   const different = Buffer.alloc(32, 72);
-  const paths = fixturePaths(stateBase);
   t.after(async () => {
+    absentCandidate.fill(0);
     first.fill(0);
     different.fill(0);
     if (previousState === undefined) delete process.env.XDG_STATE_HOME;
@@ -105,14 +115,35 @@ test("native Linux account-observation credential creates once, preserves an exi
     await rm(root, { recursive: true, force: true });
   });
 
-  await Promise.all([
-    ownerOnlyDirectory(stateBase),
-    ownerOnlyDirectory(paths.applicationDirectory),
-    ownerOnlyDirectory(paths.mutexDirectory),
-  ]);
-  process.env.XDG_STATE_HOME = stateBase;
-  const backend = createLinuxAccountObservationCredentialBackend();
   const capability = EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation;
+  const absentPaths = await prepareOwnerPrivateState(absentStateBase);
+  process.env.XDG_STATE_HOME = absentStateBase;
+  const absentBackend = createLinuxAccountObservationCredentialBackend();
+
+  // This root must observe absence before it receives a valid digest-only
+  // intent. The read below cannot recreate the candidate, because that value
+  // was deliberately not persisted with the digest.
+  assert.equal(await absentBackend.read(capability), null);
+  let absentIntent = operationJournal(absentCandidate);
+  try {
+    await writeOwnerOnlyFile(absentPaths.operationJournal, absentIntent);
+  } finally {
+    absentIntent.fill(0);
+  }
+  await assert.rejects(absentBackend.read(capability), nativeError("recovery_required"));
+  assert.equal(
+    await readFile(absentPaths.legacyJournal, "utf8"),
+    "linux-credential-mutex-journal-v1:active\n",
+  );
+  const retainedAbsentIntent = await lstat(absentPaths.operationJournal);
+  assert.equal(retainedAbsentIntent.isFile(), true);
+  assert.equal(retainedAbsentIntent.mode & 0o777, 0o600);
+
+  // The successful lifecycle uses a distinct owner-private state root. That
+  // prevents the retained absent-record intent from being adopted or cleared.
+  const paths = await prepareOwnerPrivateState(successStateBase);
+  process.env.XDG_STATE_HOME = successStateBase;
+  const backend = createLinuxAccountObservationCredentialBackend();
 
   assert.equal(await backend.read(capability), null);
   assert.equal(await backend.createIfMissing(capability, first), "created");

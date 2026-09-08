@@ -2226,6 +2226,14 @@ SecretCollection* OpenAccountObservationDefaultCollection() {
     if (collection != nullptr) g_object_unref(collection);
     return nullptr;
   }
+  // Do not create a digest intent or ask libsecret to create an item when the
+  // resolved default collection is already locked. The fixed route never
+  // calls an unlock API; a lock that races this checked snapshot remains an
+  // uncertain postcondition and is handled through the retained intent.
+  if (collection == nullptr || secret_collection_get_locked(collection)) {
+    if (collection != nullptr) g_object_unref(collection);
+    return nullptr;
+  }
   return collection;
 }
 

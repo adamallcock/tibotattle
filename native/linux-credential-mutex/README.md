@@ -172,6 +172,17 @@ outside, non-cooperating same-user writer add a duplicate; the postcondition
 read rejects that result and the binding makes no cross-writer uniqueness
 claim.
 
+Before it creates an intent, the binding resolves the default collection with
+`SECRET_COLLECTION_NONE` and refuses a missing or already-locked collection.
+It does not call a Secret Service unlock operation. A lock that races this
+checked collection snapshot can still make the subsequent no-replace call
+uncertain; the retained intent and active refusal handle that state rather
+than retrying or issuing an explicit unlock request from this route. The
+focused native qualification does not yet drive an isolated collection
+lock/unlock transition or prove prompt behavior after a lock race, so those
+runtime details remain required native follow-up work rather than a passing
+claim.
+
 The fixed v1 intent is 64 bytes:
 
 - `0..15`: exact `TIBOTATTLE-FD4\0\0` byte array
@@ -196,6 +207,13 @@ digest settlement, and unresolvable-digest refusal assertions. It performs no
 delete, cleanup wire, or real-account credential access; session cleanup is a
 disposable-runner lifetime boundary. It does not model an actual process kill,
 desktop lock transition, service crash, storage loss, or power failure.
+
+The native calls run outside the JavaScript event loop, but this source slice
+does not yet give libsecret's synchronous service calls a per-operation
+cancellation deadline. The isolated runner deadline limits a qualification
+process, not a blocked service call or worker. Prompt and unresponsive-service
+behavior therefore remain native qualification gates; this module makes no
+bounded-operation readiness claim.
 
 Building this fixed path also requires the Linux `libsecret-1` development
 headers and linker metadata (for example, `libsecret-1-dev`). Those packages
