@@ -55,6 +55,7 @@ const REGISTRY_EXPECTED = "expected-v1";
 const REGISTRY_OTHER = "other-v1";
 const WINDOWS_PROCESS_ID_MAX = 0xffff_ffff;
 const PROCESS_SNAPSHOT_MAX_TARGETS = 4096;
+const WINDOWS_POWER_SHELL_UTILITY_MODULE = "Microsoft.PowerShell.Utility";
 // This value is injected only into the two fixed read-only PowerShell probes.
 // It is deliberately not inherited from the parent environment by any child.
 export const WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY =
@@ -440,7 +441,11 @@ async function defaultCreateOwnedRoot(runnerTemp) {
   return root;
 }
 
-function selectedInstallerEnvironment(environment, fixedProbePath = null) {
+function selectedInstallerEnvironment(
+  environment,
+  fixedProbePath = null,
+  fixedPowerShellUtilityModules = false,
+) {
   const selected = {};
   for (const key of INSTALLER_ENVIRONMENT_KEYS) {
     const value = environment?.[key];
@@ -453,6 +458,11 @@ function selectedInstallerEnvironment(environment, fixedProbePath = null) {
   if (fixedProbePath !== null) {
     if (!validAbsolutePath(fixedProbePath)) fail("PROGRAM_INVALID");
     selected[WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY] = fixedProbePath;
+  }
+  // Process-proof queries use only the Windows PowerShell system module
+  // directory. Do not forward a user, runner, or ambient module search path.
+  if (fixedPowerShellUtilityModules) {
+    selected.PSModulePath = systemPowerShellUtilityModuleDirectory(environment);
   }
   return selected;
 }
@@ -489,6 +499,7 @@ export async function runWindowsNsisLifecycleProgram(command, args, {
   captureOutput = false,
   environment = process.env,
   fixedProbePath = null,
+  fixedPowerShellUtilityModules = false,
 } = {}, {
   spawnProcess = spawn,
   terminationGraceMs = PROGRAM_TERMINATION_GRACE_MS,
@@ -497,6 +508,9 @@ export async function runWindowsNsisLifecycleProgram(command, args, {
       || args.some((value) => typeof value !== "string" || value.includes("\0"))
       || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0
       || (fixedProbePath !== null && !validAbsolutePath(fixedProbePath))
+      || typeof fixedPowerShellUtilityModules !== "boolean"
+      || (fixedPowerShellUtilityModules && (!captureOutput
+        || command !== systemPowerShellExecutable(environment)))
       || typeof spawnProcess !== "function"
       || !Number.isSafeInteger(terminationGraceMs) || terminationGraceMs <= 0) {
     fail("PROGRAM_INVALID");
@@ -507,7 +521,11 @@ export async function runWindowsNsisLifecycleProgram(command, args, {
       child = spawnProcess(command, args, {
         shell: false,
         windowsHide: true,
-        env: selectedInstallerEnvironment(environment, fixedProbePath),
+        env: selectedInstallerEnvironment(
+          environment,
+          fixedProbePath,
+          fixedPowerShellUtilityModules,
+        ),
         stdio: captureOutput ? ["ignore", "pipe", "ignore"] : "ignore",
       });
     } catch {
@@ -574,6 +592,24 @@ function systemExecutable(environment, relativePath) {
   return join(root, ...relativePath);
 }
 
+function systemPowerShellExecutable(environment) {
+  return systemExecutable(environment, [
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "powershell.exe",
+  ]);
+}
+
+function systemPowerShellUtilityModuleDirectory(environment) {
+  return systemExecutable(environment, [
+    "System32",
+    "WindowsPowerShell",
+    "v1.0",
+    "Modules",
+  ]);
+}
+
 export function parseWindowsNsisRegistryInspectionResult(output) {
   if (typeof output !== "string" || output.length === 0
       || output.length > PROGRAM_OUTPUT_LIMIT_BYTES) {
@@ -587,6 +623,10 @@ export function parseWindowsNsisRegistryInspectionResult(output) {
 
 function fixedPowerShellExpectedPathPrelude() {
   return `function ConvertTo-CanonicalLifecyclePath([string]$path){$full=[System.IO.Path]::GetFullPath($path);$root=[System.IO.Path]::GetPathRoot($full);if([string]::IsNullOrWhiteSpace($root) -or -not [System.IO.Path]::IsPathRooted($full)){throw 'expected-path'};if($full.Length -gt $root.Length){return $full.TrimEnd([System.IO.Path]::DirectorySeparatorChar,[System.IO.Path]::AltDirectorySeparatorChar)};return $full};$expectedPathRaw=[Environment]::GetEnvironmentVariable('${WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY}','Process');if($expectedPathRaw -isnot [string] -or [string]::IsNullOrWhiteSpace($expectedPathRaw) -or -not [System.IO.Path]::IsPathRooted($expectedPathRaw)){throw 'expected-path'};$expected=ConvertTo-CanonicalLifecyclePath($expectedPathRaw);`;
+}
+
+function fixedPowerShellUtilityModulePrelude() {
+  return `Import-Module -Name ${WINDOWS_POWER_SHELL_UTILITY_MODULE} -ErrorAction Stop;`;
 }
 
 /** A fixed, read-only Registry API probe with no raw registry value in stdout. */
@@ -941,7 +981,7 @@ export function buildWindowsOwnedProcessSnapshotQueryArguments({ rootProcessId =
   }
   const root = rootMode ? rootProcessId : 0;
   const retained = rootMode ? "@()" : `@(${retainedProcessIds.join(",")})`;
-  const query = `$ErrorActionPreference='Stop';${toolhelpPowerShellTypeDefinition()}$rows=[TiboTattleWindowsProcessSnapshot]::Read([uint32]${root},[uint32[]]${retained});[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
+  const query = `$ErrorActionPreference='Stop';${fixedPowerShellUtilityModulePrelude()}${toolhelpPowerShellTypeDefinition()}$rows=[TiboTattleWindowsProcessSnapshot]::Read([uint32]${root},[uint32[]]${retained});[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
   return Object.freeze([
     "-NoLogo",
     "-NoProfile",
@@ -957,12 +997,7 @@ async function defaultReadWindowsProcessSnapshot({
   rootProcessId = null,
   retainedProcessIds = null,
 }) {
-  const command = systemExecutable(environment, [
-    "System32",
-    "WindowsPowerShell",
-    "v1.0",
-    "powershell.exe",
-  ]);
+  const command = systemPowerShellExecutable(environment);
   const result = await runProgram(command, buildWindowsOwnedProcessSnapshotQueryArguments({
     rootProcessId,
     retainedProcessIds,
@@ -970,6 +1005,7 @@ async function defaultReadWindowsProcessSnapshot({
     timeoutMs: PROCESS_SNAPSHOT_TIMEOUT_MS,
     captureOutput: true,
     environment,
+    fixedPowerShellUtilityModules: true,
   });
   if (!validProgramResult(result, true) || !result.settled || result.timedOut || result.exitCode !== 0) {
     fail("PROCESS_PROOF_UNAVAILABLE");
@@ -994,7 +1030,7 @@ export function buildWindowsExactExecutableProcessQueryArguments(appPath) {
   // exact match, Toolhelp supplies its real parent PID and independently
   // rechecks the same creation identity. The expected path remains a validated
   // child-only value, so this query never interpolates a caller-controlled path.
-  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$matches=@();foreach($process in [System.Diagnostics.Process]::GetProcessesByName('TiboTattle Dev')){try{$processPath=$process.MainModule.FileName;$creationDate=$process.StartTime.ToFileTimeUtc().ToString([System.Globalization.CultureInfo]::InvariantCulture);if($processPath -isnot [string] -or [string]::IsNullOrWhiteSpace($processPath) -or [string]::IsNullOrWhiteSpace($creationDate)){throw 'process-proof'};if([string]::Equals($processPath,$expected,[System.StringComparison]::OrdinalIgnoreCase)){$matches+=[pscustomobject]@{ProcessId=[uint32]$process.Id;CreationDate=$creationDate}}}finally{$process.Dispose()}};if($matches.Count -eq 0){$rows=@()}else{${toolhelpPowerShellTypeDefinition()}$processIds=[uint32[]]@($matches|ForEach-Object {[uint32]$_.ProcessId});$proof=@([TiboTattleWindowsProcessSnapshot]::Read([uint32]0,$processIds));$rows=@();foreach($match in $matches){$evidence=@($proof|Where-Object {$_.ProcessId -eq $match.ProcessId -and [string]::Equals($_.CreationDate,$match.CreationDate,[System.StringComparison]::Ordinal)});if($evidence.Count -gt 1){throw 'process-proof'};if($evidence.Count -eq 1){$rows+=$evidence[0]}}};[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
+  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}${fixedPowerShellUtilityModulePrelude()}$matches=@();foreach($process in [System.Diagnostics.Process]::GetProcessesByName('TiboTattle Dev')){try{$processPath=$process.MainModule.FileName;$creationDate=$process.StartTime.ToFileTimeUtc().ToString([System.Globalization.CultureInfo]::InvariantCulture);if($processPath -isnot [string] -or [string]::IsNullOrWhiteSpace($processPath) -or [string]::IsNullOrWhiteSpace($creationDate)){throw 'process-proof'};if([string]::Equals($processPath,$expected,[System.StringComparison]::OrdinalIgnoreCase)){$matches+=[pscustomobject]@{ProcessId=[uint32]$process.Id;CreationDate=$creationDate}}}finally{$process.Dispose()}};if($matches.Count -eq 0){$rows=@()}else{${toolhelpPowerShellTypeDefinition()}$processIds=[uint32[]]@($matches|ForEach-Object {[uint32]$_.ProcessId});$proof=@([TiboTattleWindowsProcessSnapshot]::Read([uint32]0,$processIds));$rows=@();foreach($match in $matches){$evidence=@($proof|Where-Object {$_.ProcessId -eq $match.ProcessId -and [string]::Equals($_.CreationDate,$match.CreationDate,[System.StringComparison]::Ordinal)});if($evidence.Count -gt 1){throw 'process-proof'};if($evidence.Count -eq 1){$rows+=$evidence[0]}}};[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
   return Object.freeze([
     "-NoLogo",
     "-NoProfile",
@@ -1005,17 +1041,13 @@ export function buildWindowsExactExecutableProcessQueryArguments(appPath) {
 }
 
 async function defaultReadInstalledExecutableProcesses({ appPath, environment, runProgram }) {
-  const command = systemExecutable(environment, [
-    "System32",
-    "WindowsPowerShell",
-    "v1.0",
-    "powershell.exe",
-  ]);
+  const command = systemPowerShellExecutable(environment);
   const result = await runProgram(command, buildWindowsExactExecutableProcessQueryArguments(appPath), {
     timeoutMs: PROCESS_SNAPSHOT_TIMEOUT_MS,
     captureOutput: true,
     environment,
     fixedProbePath: appPath,
+    fixedPowerShellUtilityModules: true,
   });
   if (!validProgramResult(result, true) || !result.settled || result.timedOut || result.exitCode !== 0) {
     fail("PROCESS_PROOF_UNAVAILABLE");

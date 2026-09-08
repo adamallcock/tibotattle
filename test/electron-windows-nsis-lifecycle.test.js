@@ -191,6 +191,7 @@ test("registry and Windows process probes use fixed read-only PowerShell contrac
   const processArguments = buildWindowsExactExecutableProcessQueryArguments(appPath);
   assert.equal(processArguments.includes(appPath), false);
   assert.match(processArguments[4], /\[System\.Diagnostics\.Process\]::GetProcessesByName\('TiboTattle Dev'\)/u);
+  assert.match(processArguments[4], /Import-Module -Name Microsoft\.PowerShell\.Utility -ErrorAction Stop/u);
   assert.match(processArguments[4], /\$process\.MainModule\.FileName/u);
   assert.match(processArguments[4], /\$process\.StartTime\.ToFileTimeUtc\(\)/u);
   assert.match(processArguments[4], /TiboTattleWindowsProcessSnapshot\]::Read/u);
@@ -206,6 +207,7 @@ test("registry and Windows process probes use fixed read-only PowerShell contrac
   );
 
   const readySnapshotArguments = buildWindowsOwnedProcessSnapshotQueryArguments({ rootProcessId: 42 });
+  assert.match(readySnapshotArguments[4], /Import-Module -Name Microsoft\.PowerShell\.Utility -ErrorAction Stop/u);
   assert.match(readySnapshotArguments[4], /CreateToolhelp32Snapshot/u);
   assert.match(readySnapshotArguments[4], /Process32First/u);
   assert.match(readySnapshotArguments[4], /Process32Next/u);
@@ -228,8 +230,11 @@ test("registry and Windows process probes use fixed read-only PowerShell contrac
   );
 });
 
-test("read-only PowerShell probes receive only an explicit fixed child path", async () => {
+test("read-only PowerShell probes receive only fixed child state", async () => {
   const expectedPath = resolve("tibotattle-nsis-probe-path");
+  const systemRoot = resolve("synthetic-windows");
+  const powerShell = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const moduleDirectory = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules");
   const captured = [];
   const spawnProcess = (_command, _argumentsList, options) => {
     captured.push(options.env);
@@ -240,17 +245,44 @@ test("read-only PowerShell probes receive only an explicit fixed child path", as
   await runWindowsNsisLifecycleProgram(resolve("powershell.exe"), ["-Command", "exit 0"], {
     timeoutMs: 100,
     environment: {
-      SystemRoot: "/synthetic/windows",
+      SystemRoot: systemRoot,
       [WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY]: "/ambient/must-not-pass",
+      PSModulePath: "/ambient/must-not-pass",
     },
   }, { spawnProcess });
   await runWindowsNsisLifecycleProgram(resolve("powershell.exe"), ["-Command", "exit 0"], {
     timeoutMs: 100,
-    environment: { SystemRoot: "/synthetic/windows" },
+    environment: { SystemRoot: systemRoot, PSModulePath: "/ambient/must-not-pass" },
     fixedProbePath: expectedPath,
+  }, { spawnProcess });
+  await runWindowsNsisLifecycleProgram(powerShell, ["-Command", "exit 0"], {
+    timeoutMs: 100,
+    captureOutput: true,
+    environment: { SystemRoot: systemRoot, PSModulePath: "/ambient/must-not-pass" },
+    fixedPowerShellUtilityModules: true,
   }, { spawnProcess });
   assert.equal(Object.hasOwn(captured[0], WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY), false);
   assert.equal(captured[1][WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY], expectedPath);
+  assert.equal(Object.hasOwn(captured[0], "PSModulePath"), false);
+  assert.equal(Object.hasOwn(captured[1], "PSModulePath"), false);
+  assert.equal(captured[2].PSModulePath, moduleDirectory);
+  await assert.rejects(
+    runWindowsNsisLifecycleProgram(resolve("not-powershell.exe"), ["-Command", "exit 0"], {
+      timeoutMs: 100,
+      captureOutput: true,
+      environment: { SystemRoot: systemRoot },
+      fixedPowerShellUtilityModules: true,
+    }, { spawnProcess }),
+    /PROGRAM_INVALID/u,
+  );
+  await assert.rejects(
+    runWindowsNsisLifecycleProgram(powerShell, ["-Command", "exit 0"], {
+      timeoutMs: 100,
+      environment: { SystemRoot: systemRoot },
+      fixedPowerShellUtilityModules: true,
+    }, { spawnProcess }),
+    /PROGRAM_INVALID/u,
+  );
 });
 
 test("Windows PowerShell fixed path probe rejects missing and malformed child values", {
@@ -286,6 +318,40 @@ test("Windows PowerShell fixed path probe rejects missing and malformed child va
   }
 });
 
+test("Windows hosted CI runs a closed .NET baseline and fixed Utility module probe", {
+  skip: process.platform !== "win32" || process.arch !== "x64" || process.env.GITHUB_ACTIONS !== "true",
+}, async () => {
+  const systemRoot = process.env.SystemRoot;
+  assert.equal(typeof systemRoot, "string");
+  const executable = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const invoke = (query, fixedPowerShellUtilityModules) => runWindowsNsisLifecycleProgram(
+    executable,
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", query],
+    {
+      timeoutMs: 20_000,
+      captureOutput: true,
+      environment: process.env,
+      fixedPowerShellUtilityModules,
+    },
+  );
+  const dotNetResult = await invoke(
+    "$ErrorActionPreference='Stop';[Console]::Out.Write('dotnet-v1')",
+    false,
+  );
+  assert.equal(dotNetResult.settled, true);
+  assert.equal(dotNetResult.timedOut, false);
+  assert.equal(dotNetResult.exitCode, 0);
+  assert.equal(dotNetResult.stdout, "dotnet-v1");
+  const utilityResult = await invoke(
+    "$ErrorActionPreference='Stop';Import-Module -Name Microsoft.PowerShell.Utility -ErrorAction Stop;$value=[pscustomobject]@{proof='utility-v1'};[Console]::Out.Write((ConvertTo-Json -InputObject $value -Compress))",
+    true,
+  );
+  assert.equal(utilityResult.settled, true);
+  assert.equal(utilityResult.timedOut, false);
+  assert.equal(utilityResult.exitCode, 0);
+  assert.equal(utilityResult.stdout, '{"proof":"utility-v1"}');
+});
+
 test("Windows hosted CI runs the narrow exact-executable proof in its closed child environment", {
   skip: process.platform !== "win32" || process.arch !== "x64" || process.env.GITHUB_ACTIONS !== "true",
 }, async () => {
@@ -309,6 +375,7 @@ test("Windows hosted CI runs the narrow exact-executable proof in its closed chi
       captureOutput: true,
       environment: process.env,
       fixedProbePath: expectedPath,
+      fixedPowerShellUtilityModules: true,
     },
   );
   assert.equal(result.settled, true);
@@ -347,6 +414,7 @@ test("Windows hosted CI runs Toolhelp ready and retained-process proofs with rea
       timeoutMs: 20_000,
       captureOutput: true,
       environment: process.env,
+      fixedPowerShellUtilityModules: true,
     },
   );
   const readyResult = await invokeSnapshot(
