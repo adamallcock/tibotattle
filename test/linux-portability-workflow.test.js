@@ -415,7 +415,7 @@ exit 92
   });
 });
 
-test("Production composition admits only the reviewed Linux qualification closure", async () => {
+test("Production composition admits only the reviewed Linux handover and qualification closures", async () => {
   const productionCompositionRoots = [
     "apps/electron/main.js",
     "apps/electron/desktop-runtime.js",
@@ -433,9 +433,14 @@ test("Production composition admits only the reviewed Linux qualification closur
     "apps/electron/electron-builder.config.cjs",
   ];
   const reviewedLinuxFoundationPaths = new Set([
+    "apps/electron/desktop-linux-account-observation-broker.js",
+    "apps/electron/desktop-linux-accountless-credential.js",
     "apps/electron/desktop-linux-secret-service-broker.js",
     "apps/electron/desktop-linux-secret-service.js",
     "apps/electron/linux-qualification.js",
+    "src/platform/linux-account-observation-broker.js",
+    "src/platform/linux-account-observation-credential.js",
+    "src/platform/linux-accountless-installation-credential.js",
     "src/platform/linux-credential-mutation-lease.js",
     "src/platform/linux-credential-mutex.js",
     "src/platform/linux-credential-state.js",
@@ -443,21 +448,35 @@ test("Production composition admits only the reviewed Linux qualification closur
     "src/platform/linux-secret-service-broker.js",
     "src/platform/linux-secret-service.js",
   ]);
-  // Each direct local import touching this closure is reviewed.  The two
-  // non-Electron callers are deliberately narrow: the companion owns only an
-  // inherited-descriptor transport, and the packager validates the fixed
-  // binding manifest. Neither path may select or load native credentials.
+  // Each direct local import touching this closure is reviewed. The normal
+  // handover uses only the fixed FD3 installation record and fixed read/create
+  // observation IPC; the generic Secret Service broker remains qualification-
+  // only. The two non-Electron callers are deliberately narrow: the companion
+  // owns only an inherited-descriptor transport, and the packager validates
+  // the fixed binding manifest. Neither path may select or load credentials.
   const reviewedLinuxFoundationEdges = new Set([
+    "apps/electron/desktop-linux-account-observation-broker.js -> src/platform/index.js",
+    "apps/electron/desktop-linux-account-observation-broker.js -> src/platform/linux-account-observation-credential.js",
+    "apps/electron/desktop-linux-accountless-credential.js -> src/platform/linux-accountless-installation-credential.js",
     "apps/electron/desktop-linux-secret-service-broker.js -> src/platform/linux-secret-service-broker.js",
+    "apps/electron/desktop-linux-secret-service.js -> apps/electron/desktop-linux-account-observation-broker.js",
+    "apps/electron/desktop-linux-secret-service.js -> apps/electron/desktop-linux-accountless-credential.js",
     "apps/electron/desktop-linux-secret-service.js -> apps/electron/desktop-linux-secret-service-broker.js",
     "apps/electron/desktop-linux-secret-service.js -> apps/electron/errors.js",
     "apps/electron/desktop-linux-secret-service.js -> apps/electron/linux-qualification.js",
+    "apps/electron/desktop-linux-secret-service.js -> src/platform/linux-account-observation-credential.js",
     "apps/electron/desktop-linux-secret-service.js -> src/platform/linux-credential-mutation-lease.js",
     "apps/electron/desktop-linux-secret-service.js -> src/platform/linux-credential-state.js",
     "apps/electron/desktop-linux-secret-service.js -> src/platform/linux-secret-service.js",
     "apps/electron/main.js -> apps/electron/desktop-linux-secret-service.js",
     "apps/local/server.js -> src/platform/linux-secret-service-broker.js",
     "scripts/build-electron-runtime.mjs -> src/platform/linux-credential-mutex.js",
+    "src/platform/index.js -> src/platform/linux-account-observation-broker.js",
+    "src/platform/linux-account-observation-broker.js -> src/platform/account-observation-broker-ipc.js",
+    "src/platform/linux-account-observation-broker.js -> src/platform/keychain-capabilities.js",
+    "src/platform/linux-account-observation-credential.js -> src/platform/keychain-capabilities.js",
+    "src/platform/linux-account-observation-credential.js -> src/platform/linux-credential-mutex.js",
+    "src/platform/linux-accountless-installation-credential.js -> src/platform/linux-credential-mutex.js",
     "src/platform/linux-credential-mutation-lease.js -> src/platform/export-identity-keychain.js",
     "src/platform/linux-credential-mutation-lease.js -> src/platform/linux-credential-mutex.js",
     "src/platform/linux-credential-state.js -> src/platform/linux-credential-mutex.js",
@@ -549,13 +568,15 @@ test("Linux native construction is dormant by default and branded qualification 
     assert.deepEqual(Object.keys(ordinary), []);
     assert.equal(Object.isFrozen(ordinary), true);
     assert.equal(Object.hasOwn(ordinary, "attachLinuxSecretServiceBroker"), false);
+    assert.equal(Object.hasOwn(ordinary, "attachLinuxAccountObservationBroker"), false);
 
     const qualified = main.createLinuxQualificationSupervisorOptions({
       linuxQualificationContext: context,
     });
-    assert.deepEqual(Object.keys(qualified), ["attachLinuxSecretServiceBroker"]);
+    assert.deepEqual(Object.keys(qualified), ["attachLinuxAccountObservationBroker"]);
     assert.equal(Object.isFrozen(qualified), true);
-    assert.equal(typeof qualified.attachLinuxSecretServiceBroker, "function");
+    assert.equal(typeof qualified.attachLinuxAccountObservationBroker, "function");
+    assert.equal(Object.hasOwn(qualified, "attachLinuxSecretServiceBroker"), false);
 
     let untrustedContextCode = null;
     try {
@@ -599,7 +620,7 @@ test("Linux native construction is dormant by default and branded qualification 
   assert.equal(result.stderr, "");
   assert.deepEqual(JSON.parse(result.stdout), {
     ordinaryKeys: [],
-    qualifiedKeys: ["attachLinuxSecretServiceBroker"],
+    qualifiedKeys: ["attachLinuxAccountObservationBroker"],
     untrustedContextCode: "electron_shell_electron_configuration_invalid",
     productionGateCode: "electron_shell_linux_readiness_unavailable",
   });
