@@ -168,6 +168,16 @@ function validatePrepareReply(value) {
   });
 }
 
+function closedFailureReply(value) {
+  return (exactKeys(value, ["schemaVersion", "status", "failureStage"])
+      && value.schemaVersion === NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
+      && value.status === "failed"
+      && PREPARE_FAILURE_STAGES.has(value.failureStage))
+    || (exactKeys(value, ["schemaVersion", "status"])
+      && value.schemaVersion === NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
+      && value.status === "failed");
+}
+
 function validatePreparationPreflightReply(value) {
   if (exactKeys(value, ["schemaVersion", "status", "failureStage"])
       && value.schemaVersion === NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
@@ -289,11 +299,13 @@ async function invokeBridge(configuration, argumentsList) {
       } catch {
         return fail("invalid_reply");
       }
-      // A helper's deliberate fixed failed reply is its only non-zero result
-      // that may cross this boundary. Signals and every other exit remain
-      // transport failures, even when they happened to write JSON first.
+      // A helper's exact closed failed reply is its only non-zero result that
+      // may cross this boundary. Signals and every other exit remain transport
+      // failures, even when they happened to write JSON first.
       if (code !== 0 || signal !== null) {
-        if (code === 1 && signal === null) return settle(resolve, parsed);
+        if (code === 1 && signal === null && closedFailureReply(parsed)) {
+          return settle(resolve, parsed);
+        }
         return fail("failed");
       }
       settle(resolve, parsed);
