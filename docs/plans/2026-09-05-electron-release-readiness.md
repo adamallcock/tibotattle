@@ -61,7 +61,15 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest combined result: `8b84e971` in
+Latest combined result: `921e9ea8` in
+[run 34238242221](https://github.com/adamallcock/tibotattle/actions/runs/34238242221)
+stops at the package/verifier closure equality check before any app journey.
+The independent verifier and its synthetic fixture also need the same two
+module entries. Those exact entries are now updated; the complete CI packaging
+contract command passes locally (41 tests, two optional native-artifact skips).
+The preceding repair also completes a local unsigned Mac distribution build.
+
+Preceding combined result: `8b84e971` in
 [run 34236634828](https://github.com/adamallcock/tibotattle/actions/runs/34236634828)
 fails all four distribution builds at `ELECTRON_RUNTIME_STAGED_MODULE_LINKAGE`.
 The new Linux candidate contract checks pass, but normal Linux startup and
