@@ -10,6 +10,7 @@ import { validateDesktopFirstRunReceipt } from "../apps/electron/desktop-first-r
 import {
   assertContainerContract,
   classifyAutomaticStartupRefreshReceipt,
+  createLinuxCompanionProcessDiagnostics,
   createRendererReadinessCompanionSnapshotObserver,
   combineStartupRefreshEvidence,
   createRendererReadinessDiagnostics,
@@ -27,8 +28,50 @@ import {
   runSmoke,
   selectLinuxDashboardTarget,
   validateRendererReadinessDiagnostics,
+  validateLinuxCompanionProcessDiagnostics,
   waitFor,
 } from "../scripts/smoke-electron-linux.mjs";
+
+test("Linux companion process diagnostics preserve the first unexpected exit across restarts", () => {
+  const collector = createLinuxCompanionProcessDiagnostics();
+  const started = { event: "started", phase: "starting", outcome: null };
+  const crashed = { event: "exited", phase: "ready", outcome: "signal_abrt" };
+  const stopped = { event: "exited", phase: "stopping", outcome: "signal_term" };
+  const marker = (event) => `TIBOTATTLE_ELECTRON_COMPANION_PROCESS ${JSON.stringify(event)}\n`;
+  assert.deepEqual(collector.snapshot(), { lastEvent: null, firstUnexpectedExit: null });
+  const input = marker(started) + marker(crashed) + marker(started) + marker(stopped);
+  for (let offset = 0; offset < input.length; offset += 7) collector.feed(Buffer.from(input.slice(offset, offset + 7)));
+  assert.deepEqual(collector.snapshot(), { lastEvent: stopped, firstUnexpectedExit: crashed });
+});
+
+test("Linux companion process diagnostics discard private, malformed and oversized lines", () => {
+  const collector = createLinuxCompanionProcessDiagnostics();
+  const marker = (event) => `TIBOTATTLE_ELECTRON_COMPANION_PROCESS ${JSON.stringify(event)}\n`;
+  collector.feed("private/path with private-token\nTIBOTATTLE_ELECTRON_COMPANION_PROCESS {bad}\n");
+  collector.feed(marker({ event: "exited", phase: "ready", outcome: "private-native-text" }));
+  collector.feed(marker({ event: "started", phase: "ready", outcome: null }));
+  collector.feed(marker({ event: "exited", phase: "ready", outcome: "exit_nonzero", path: "/private/path" }));
+  collector.feed("TIBOTATTLE_ELECTRON_COMPANION_PROCESS " + " ".repeat(600));
+  collector.feed(marker({ event: "exited", phase: "ready", outcome: "signal_segv" }));
+  assert.deepEqual(collector.snapshot(), { lastEvent: null, firstUnexpectedExit: null });
+  const cleanExit = { event: "exited", phase: "starting", outcome: "exit_zero" };
+  collector.feed(marker(cleanExit));
+  assert.deepEqual(collector.snapshot(), { lastEvent: cleanExit, firstUnexpectedExit: cleanExit });
+  assert.equal(JSON.stringify(collector.snapshot()).includes("private"), false);
+});
+
+test("Linux companion receipt validation rejects inconsistent and open-ended records", () => {
+  const exited = { event: "exited", phase: "starting", outcome: "exit_nonzero" };
+  const valid = { lastEvent: exited, firstUnexpectedExit: exited };
+  assert.deepEqual(validateLinuxCompanionProcessDiagnostics(valid), valid);
+  for (const invalid of [
+    null, [], {}, { ...valid, path: "/private/path" },
+    { lastEvent: null, firstUnexpectedExit: exited },
+    { lastEvent: exited, firstUnexpectedExit: { ...exited, phase: "stopping" } },
+    { lastEvent: exited, firstUnexpectedExit: { event: "started", phase: "starting", outcome: null } },
+    { lastEvent: { ...exited, private: "value" }, firstUnexpectedExit: null },
+  ]) assert.equal(validateLinuxCompanionProcessDiagnostics(invalid), null);
+});
 
 class FakeCdp {
   constructor() {

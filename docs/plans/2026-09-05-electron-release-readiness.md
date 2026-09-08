@@ -19,7 +19,7 @@ Do not add cosmetic work, optional platform abstractions, or broader audits.
 Change only a reproduced cutover blocker or the smallest test needed to resolve
 one. The Mac daily-use tester is available; that is not full cutover readiness.
 
-Latest completed native candidate: `d523068d`,
+Earlier native candidate: `d523068d`,
 [run 34258700354](https://github.com/adamallcock/tibotattle/actions/runs/34258700354).
 Both Mac package/artifact jobs pass. Windows development packaging and a fourth
 fresh NSIS lifecycle pass. The normal Windows candidate builds, but package
@@ -47,6 +47,25 @@ reports whether the journal was absent, unreadable, invalid, empty of startup
 failures, or contained a failure. The next workflow also retains the same
 closed Linux receipt separately, avoiding a large development-package download
 for every diagnosis. No normal candidate binaries are added to artifact upload.
+
+Latest completed native candidate: `610bc97c`,
+[run 34266665792](https://github.com/adamallcock/tibotattle/actions/runs/34266665792).
+Both Mac package/artifact jobs, Windows development packaging and a sixth
+fresh Windows NSIS lifecycle pass. The normal Windows package now verifies,
+confirming the ASAR path repair, but preparation of its synthetic durable
+opt-out fails before firewall setup or app launch. The next runner classifies
+that setup boundary and only known fixed adapter/store/settings error codes.
+Its failed receipt SHA-256 is
+`e480b9cd79c4446e346cfc07a38baea455ac5195c2687888cef1160f0a6fff48`.
+Linux repeats the renderer-readiness failure; the corrected reader reports
+the startup journal is absent. There is no recorded handled snapshot exception
+to fix. Its receipt SHA-256 is
+`41d0e28a7ab5b3279462420c78206122152d0370dce73287a33e98dc6fbec4ff`.
+The next isolated Linux run observes closed companion start/exit categories,
+preserving the first unexpected exit across automatic retries. Observation is
+scoped to the existing Linux/x64 quit-only smoke control and captures no raw
+process output, paths or credentials. It does not change startup or success
+criteria. Neither normal application journey is qualified yet.
 
 1. Close the real native Mac -> signed Electron -> next signed Electron
    installed rehearsal. The original signed private fixtures exposed the

@@ -27,6 +27,8 @@ import {
   runSmoke,
   terminateLinuxSmokeChild,
   validateRendererReadinessDiagnostics,
+  LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA,
+  validateLinuxCompanionProcessDiagnostics,
 } from "./smoke-electron-linux.mjs";
 import {
   boundedCapture,
@@ -608,6 +610,7 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
   let observationFailure = null;
   let smokeFailureStage = null;
   let rendererReadinessDiagnostics = null;
+  let companionProcessDiagnostics = null;
   let result;
   let ownedFixture = null;
   try {
@@ -627,6 +630,9 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
       onFailureStage: (stage) => { smokeFailureStage = stage; },
       onRendererReadinessDiagnostics: (diagnostic) => {
         rendererReadinessDiagnostics = validateRendererReadinessDiagnostics(diagnostic);
+      },
+      onCompanionProcessDiagnostics: (diagnostic) => {
+        companionProcessDiagnostics = validateLinuxCompanionProcessDiagnostics(diagnostic);
       },
       sourceRevision: identity.sourceRevision,
       qualification: "candidate-only",
@@ -648,6 +654,7 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
       const classified = validateRendererReadinessDiagnostics(rendererReadinessDiagnostics);
       const fixed = failure(stageCode);
       if (classified !== null) fixed.rendererReadinessDiagnostics = classified;
+      if (companionProcessDiagnostics !== null) fixed.companionProcessDiagnostics = companionProcessDiagnostics;
       const startupFailure = await readLinuxNormalStartupFailure(ownedFixture?.userData, {
         onStatus: (status) => { fixed.companionStartupJournalStatus = status; },
       });
@@ -953,11 +960,17 @@ function classifiedInnerFailure(stderr) {
   }).map((value) => value?.schemaVersion === STARTUP_FAILURE_DIAGNOSTIC_SCHEMA
     ? startupDiagnosticEnvelope(value.companionStartupFailure, value.companionStartupJournalStatus) : null)
     .filter((value) => value !== null);
+  const processDiagnostics = lines.map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).map((value) => value?.schemaVersion === LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA
+    ? validateLinuxCompanionProcessDiagnostics(value.companionProcessDiagnostics) : null)
+    .filter((value) => value !== null);
   return Object.freeze({
     code: matches[0],
     rendererReadinessDiagnostics: diagnostics.length === 1 ? diagnostics[0] : null,
     companionStartupFailure: startupFailures.length === 1 ? startupFailures[0].companionStartupFailure : null,
     companionStartupJournalStatus: startupFailures.length === 1 ? startupFailures[0].companionStartupJournalStatus : null,
+    companionProcessDiagnostics: processDiagnostics.length === 1 ? processDiagnostics[0] : null,
   });
 }
 
@@ -1000,6 +1013,9 @@ export async function runLinuxNormalPackagedSmokeSession(identity, {
       if (innerFailure.companionStartupJournalStatus !== null) {
         error.companionStartupJournalStatus = innerFailure.companionStartupJournalStatus;
       }
+      if (innerFailure.companionProcessDiagnostics !== null) {
+        error.companionProcessDiagnostics = innerFailure.companionProcessDiagnostics;
+      }
       throw error;
     }
     fail("SESSION_EXECUTION_FAILED");
@@ -1037,6 +1053,7 @@ function outerReceipt({
   rendererReadinessDiagnostics = null,
   companionStartupFailure = null,
   companionStartupJournalStatus = null,
+  companionProcessDiagnostics = null,
 }) {
   const diagnostic = validateRendererReadinessDiagnostics(rendererReadinessDiagnostics);
   const receipt = {
@@ -1054,6 +1071,8 @@ function outerReceipt({
     receipt.companionStartupJournalStatus = startup.companionStartupJournalStatus;
     if (startup.companionStartupFailure !== null) receipt.companionStartupFailure = startup.companionStartupFailure;
   }
+  const processDiagnostic = validateLinuxCompanionProcessDiagnostics(companionProcessDiagnostics);
+  if (processDiagnostic !== null) receipt.companionProcessDiagnostics = processDiagnostic;
   return Object.freeze(receipt);
 }
 
@@ -1073,6 +1092,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
   let rendererReadinessDiagnostics = null;
   let companionStartupFailure = null;
   let companionStartupJournalStatus = null;
+  let companionProcessDiagnostics = null;
   try {
     identity = await verifyPackage(options);
     inner = await runSession(identity, { appPath: options.appPath, environment });
@@ -1084,6 +1104,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
     companionStartupFailure = validateStartupFailure(error?.companionStartupFailure);
     companionStartupJournalStatus = STARTUP_JOURNAL_STATUSES.has(error?.companionStartupJournalStatus)
       ? error.companionStartupJournalStatus : null;
+    companionProcessDiagnostics = validateLinuxCompanionProcessDiagnostics(error?.companionProcessDiagnostics);
   }
   const receipt = outerReceipt({
     sourceRevision: options.sourceRevision,
@@ -1093,6 +1114,7 @@ export async function runLinuxNormalPackagedSmoke(options, {
     rendererReadinessDiagnostics,
     companionStartupFailure,
     companionStartupJournalStatus,
+    companionProcessDiagnostics,
   });
   await write(handle, receipt);
   return receipt;
@@ -1125,6 +1147,11 @@ if (resolve(process.argv[1] ?? "") === SCRIPT_FILE) {
     if (diagnostic !== null) process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
     const startup = startupDiagnosticEnvelope(error?.companionStartupFailure, error?.companionStartupJournalStatus);
     if (startup !== null) process.stderr.write(`${JSON.stringify(startup)}\n`);
+    const processDiagnostic = validateLinuxCompanionProcessDiagnostics(error?.companionProcessDiagnostics);
+    if (processDiagnostic !== null) process.stderr.write(`${JSON.stringify({
+      schemaVersion: LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA,
+      companionProcessDiagnostics: processDiagnostic,
+    })}\n`);
     process.exitCode = 1;
   });
 }

@@ -26,6 +26,7 @@ import {
   verifyLinuxNormalPackagedSmokePackage,
 } from "../scripts/smoke-electron-linux-packaged.mjs";
 import {
+  LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA,
   validateRendererReadinessDiagnostics,
 } from "../scripts/smoke-electron-linux.mjs";
 import {
@@ -123,6 +124,40 @@ test("Linux session and outer receipt preserve a fixed startup failure without w
   assert.equal(missingJournal.companionStartupJournalStatus, "absent");
   assert.equal(missingJournal.companionStartupFailure, undefined);
   assert.equal(JSON.stringify(missingJournal).includes("private content"), false);
+});
+
+test("Linux session and outer receipt preserve closed process observations and reject forged fields", async () => {
+  const diagnostic = {
+    lastEvent: { event: "started", phase: "starting", outcome: null },
+    firstUnexpectedExit: { event: "exited", phase: "ready", outcome: "signal_abrt" },
+  };
+  const identity = { sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256 };
+  for (const value of [diagnostic, { ...diagnostic, stderr: "private payload" }]) {
+    const child = sessionChild();
+    const receipt = await runLinuxNormalPackagedSmoke({ sourceRevision: SOURCE_REVISION }, {
+      verifyPackage: async () => identity,
+      runSession: () => runLinuxNormalPackagedSmokeSession(identity, {
+        appPath: APP_PATH, spawnSession: () => {
+          queueMicrotask(() => {
+            child.stdout.end();
+            child.stderr.write("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_TRUE_FAILED\n");
+            child.stderr.end(`${JSON.stringify({
+              schemaVersion: LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA,
+              companionProcessDiagnostics: value,
+            })}\n`);
+            child.exitCode = 1;
+            child.emit("exit", 1, null);
+          });
+          return child;
+        },
+      }),
+      reserve: async () => ({}), write: async () => {},
+    });
+    assert.equal(receipt.status, "failed");
+    assert.equal(receipt.packagedElectronExecutionVerified, false);
+    assert.deepEqual(receipt.companionProcessDiagnostics, value === diagnostic ? diagnostic : undefined);
+    assert.equal(JSON.stringify(receipt).includes("private payload"), false);
+  }
 });
 
 function productionMetadata(sourceRevision = SOURCE_REVISION) {
