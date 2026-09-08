@@ -5127,6 +5127,28 @@ test("native dashboard readiness does not wait on secondary companion reads", as
   );
 });
 
+test("the primary dashboard owner resumes one deferred Electron startup pass after releasing its lock", async () => {
+  const primary = dashboardStartupDeferred();
+  const harness = await createDashboardStartupHarness({
+    client: { load: () => primary.promise },
+  });
+  harness.context.electronStartupRefreshDeferred = true;
+
+  const loading = harness.context.loadLocalDashboard();
+  await settleDashboardStartupTasks();
+  assert.equal(harness.context.localActionBusy, true);
+  assert.equal(harness.context.electronStartupRefreshDeferred, true);
+  assert.equal(harness.state.startupRefreshChecks, 0,
+    "the launch pass remains deferred while the primary owner is busy");
+
+  primary.resolve({ marker: "primary", mode: "real_local_evidence" });
+  await loading;
+  assert.equal(harness.context.localActionBusy, false);
+  assert.equal(harness.context.electronStartupRefreshDeferred, false);
+  assert.equal(harness.state.startupRefreshChecks, 1,
+    "the real loader retries exactly once after restoring its previous busy state");
+});
+
 function dashboardStartupDeferred() {
   let resolve;
   let reject;
@@ -5163,6 +5185,7 @@ async function createDashboardStartupHarness({
   const state = {
     events: [], previews: [], primaryReads: 0, statusReads: 0, polls: 0,
     preparations: 0, reviewUnavailableReports: 0, returnRefreshChecks: 0,
+    startupRefreshChecks: 0,
   };
   const elements = new Map();
   const element = (selector) => {
@@ -5181,6 +5204,7 @@ async function createDashboardStartupHarness({
     cacheDropThreadLinks: { loadToken: 0 },
     activeLocalDashboardLoad: null,
     localActionBusy: initialBusy,
+    electronStartupRefreshDeferred: false,
     localCompanionHealth: initialHealth,
     localOnboarding: null,
     dashboard: null,
@@ -5224,7 +5248,10 @@ async function createDashboardStartupHarness({
     // Electron's launch coordinator. Keep that path explicitly inert so the
     // optional onboarding callback remains faithful to the browser/native
     // readiness tests.
-    startElectronStartupRefresh: () => false,
+    startElectronStartupRefresh: () => {
+      state.startupRefreshChecks += 1;
+      return true;
+    },
     setJourneyState(value) { state.journey = value; },
     scheduleIncrementalSyncStatusPoll() { state.polls += 1; },
     scheduleReturningUserRefresh() { state.returnRefreshChecks += 1; },
