@@ -220,6 +220,7 @@ test("synthetic hosted accountless client proof uses the one reviewed staging or
   let disconnected = false;
   let disconnectAttempted = false;
   let enrollmentRequested = false;
+  let lostUploadResponse = false;
   const requests = [];
   t.after(async () => {
     await cleanupHostedSyntheticClient({
@@ -247,6 +248,11 @@ test("synthetic hosted accountless client proof uses the one reviewed staging or
       }
       const response = await fetch(url, request);
       requests.push(Object.freeze({ path: parsed.pathname, status: response.status }));
+      if (!lostUploadResponse && parsed.pathname === "/api/v1/contributions" && response.status === 202) {
+        lostUploadResponse = true;
+        await response.body?.cancel();
+        throw new TypeError("Synthetic acknowledged upload response lost");
+      }
       return response;
     },
     ensureCapability: (options) => ensureContributionDeviceCapability({
@@ -263,17 +269,29 @@ test("synthetic hosted accountless client proof uses the one reviewed staging or
     requestTimeoutMilliseconds: 10_000,
     stateFile,
   };
-  let result = await runAccountlessContributionSyncOnce(options);
   let retries = 0;
-  while (result.status === "failed" && result.failure?.retryable === true
+  let recoveredLostResponse = false;
+  async function synchronize() {
+    let result = await runAccountlessContributionSyncOnce(options);
+    if (lostUploadResponse && !recoveredLostResponse && result.status === "failed"
+        && result.failure?.retryable === true) {
+      recoveredLostResponse = true;
+      retries += 1;
+      await delay(1_000);
+      result = await runAccountlessContributionSyncOnce(options);
+    }
+    while (result.status === "failed" && result.failure?.retryable === true
       && Number.isSafeInteger(result.failure.retryAfterMilliseconds)
       && result.failure.retryAfterMilliseconds > 0
       && result.failure.retryAfterMilliseconds <= 60_000 && retries < 4) {
-    t.diagnostic(`Hosted service requested retry after ${result.failure.retryAfterMilliseconds} ms`);
-    await delay(result.failure.retryAfterMilliseconds + 1_000);
-    retries += 1;
-    result = await runAccountlessContributionSyncOnce(options);
+      t.diagnostic(`Hosted service requested retry after ${result.failure.retryAfterMilliseconds} ms`);
+      await delay(result.failure.retryAfterMilliseconds + 1_000);
+      retries += 1;
+      result = await runAccountlessContributionSyncOnce(options);
+    }
+    return result;
   }
+  const result = await synchronize();
   assert.equal(result.status, "complete", JSON.stringify({
     status: result.status,
     failure: result.failure,
@@ -287,12 +305,23 @@ test("synthetic hosted accountless client proof uses the one reviewed staging or
     daysSynced: result.daysSynced, chunksUploaded: result.chunksUploaded,
     recordsUploaded: result.recordsUploaded, requests }));
 
+  const uploadsBeforeReplay = requests.filter(({ path }) => path === "/api/v1/contributions").length;
+  assert.equal(lostUploadResponse, true);
+  assert.equal(recoveredLostResponse, true);
+  const replay = await synchronize();
+  assert.equal(replay.status, "complete", JSON.stringify({ status: replay.status, failure: replay.failure }));
+  assert.equal(replay.chunksUploaded, 0);
+  assert.equal(replay.recordsUploaded, 0);
+  assert.equal(requests.filter(({ path }) => path === "/api/v1/contributions").length, uploadsBeforeReplay);
+  t.diagnostic("Repeated synchronization completed without duplicate uploads");
+
   disconnectAttempted = true;
   await disconnectSyntheticDevice({ backend, origin, stateFile });
   disconnected = true;
   preferenceEnabled = false;
   const optOut = await runAccountlessContributionSyncOnce({
     backend,
+    fetchImpl: async () => assert.fail("Opt-out must not issue network requests"),
     indexFile,
     origin,
     readPreference: async () => syntheticPreference(origin, preferenceEnabled),
