@@ -6,6 +6,7 @@ import {
   createMacOSKeychainAdapterFacade,
   MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY,
   MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES,
+  MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES,
 } from "../../native/macos-keychain/contract.js";
 import { CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER } from "../../src/platform/index.js";
 import { PRODUCTION_ELECTRON_APP_ID } from "./desktop-updater.js";
@@ -96,10 +97,10 @@ function createDesktopMacOSCredentialBackendFromAdapter(adapter) {
       if (status !== "deleted" && status !== "absent") assertStatus(status);
     },
     async preflight() {
-      // Read, then discard, only the four credentials that the inherited
-      // companion broker may serve. Accountless installation credentials stay
-      // main-process-only and are checked only when sharing needs one.
-      for (const capability of MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES) {
+      // Read, then discard, only the active Electron startup credentials.
+      // Optional/export capabilities retain their per-operation protection;
+      // accountless installation remains main-process-only and on-demand.
+      for (const capability of MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES) {
         await backend.get(capability);
       }
     },

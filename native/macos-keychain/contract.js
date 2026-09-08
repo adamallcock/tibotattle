@@ -19,6 +19,19 @@ export const MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES = Object.freeze([
   "contribution_device",
 ]);
 
+// Startup validates only the credential paths which the current Electron
+// composition activates: account observation and the contribution-device
+// bridge. Export identity is a legacy, on-demand path and the Claude
+// pseudonym is reserved for the optional Claude provider. Their read, store,
+// and migration-required guards stay active when either path is requested;
+// an export migration still requires the released native approval route.
+// Accountless installation enrollment remains main-process-only and is
+// deliberately checked only when sharing needs it.
+export const MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES = Object.freeze([
+  "account_observation",
+  "contribution_device",
+]);
+
 export const MACOS_KEYCHAIN_ADAPTER_ACCOUNTLESS_INSTALLATION_CAPABILITY =
   "accountless_installation";
 

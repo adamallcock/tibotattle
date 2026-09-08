@@ -15,6 +15,7 @@ import {
   MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES,
   MACOS_KEYCHAIN_ADAPTER_CAPABILITIES,
   MACOS_KEYCHAIN_ADAPTER_CONTRACT_VERSION,
+  MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES,
 } from "../../../native/macos-keychain/contract.js";
 import { createProductionMacCredentialHandover } from "../main.js";
 import { Duplex } from "node:stream";
@@ -104,7 +105,8 @@ test("native bytes retain the existing identity through the fixed broker port", 
   f.items.set("export_identity", Buffer.from(SECRET, "base64url"));
   const backend = createDesktopMacOSCredentialBackend({ binding: f.binding });
   await backend.preflight();
-  assert.deepEqual(f.calls, MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES.map((cap) => ["read", cap]));
+  assert.deepEqual(f.calls, MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES
+    .map((cap) => ["read", cap]));
   assert.equal(await backend.get("export_identity"), SECRET);
   await backend.set("account_observation", SECRET);
   assert.equal(await backend.get("account_observation"), SECRET);
@@ -179,15 +181,53 @@ test("locked accountless credentials are retryable while denial and recovery rem
   assert.equal(f.items.size, 0, "a locked conditional write must not mint a replacement identity");
 });
 
-test("preflight remains read-only and blocks unavailable or migration-required credentials", async () => {
+test("startup preflight remains read-only and blocks unavailable active credentials", async () => {
   for (const [status, code] of [["locked", "KEYCHAIN_LOCKED"], ["denied", "KEYCHAIN_DENIED"], ["unknown", "broker_unavailable"], ["migration_required", "KEYCHAIN_MIGRATION_REQUIRED"]]) {
-    const f = bindingFixture();
-    f.binding.read = async () => ({ status, value: null });
-    const backend = createDesktopMacOSCredentialBackend({ binding: f.binding });
-    await assert.rejects(backend.preflight(), { code });
-    assert.equal(f.items.size, 0);
-    assert.equal(f.calls.some(([operation]) => operation === "store"), false);
+    for (const blockedCapability of MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES) {
+      const f = bindingFixture();
+      f.binding.read = async (capability) => {
+        f.calls.push(["read", capability]);
+        return {
+          status: capability === blockedCapability ? status : "absent",
+          value: null,
+        };
+      };
+      const backend = createDesktopMacOSCredentialBackend({ binding: f.binding });
+      await assert.rejects(backend.preflight(), { code });
+      assert.equal(f.items.size, 0);
+      assert.equal(f.calls.some(([operation]) => operation === "store"), false);
+      assert.equal(f.calls.some(([, capability]) => !MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES
+        .includes(capability)), false);
+    }
   }
+});
+
+test("optional broker migrations do not block startup and remain visible at first use", async () => {
+  const f = bindingFixture();
+  const optionalCapabilities = MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES.filter(
+    (capability) => !MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES.includes(capability),
+  );
+  f.binding.read = async (capability) => {
+    f.calls.push(["read", capability]);
+    return {
+      status: optionalCapabilities.includes(capability) ? "migration_required" : "absent",
+      value: null,
+    };
+  };
+  f.binding.store = async (capability) => {
+    f.calls.push(["store", capability]);
+    return optionalCapabilities.includes(capability) ? "migration_required" : "stored";
+  };
+
+  const backend = createDesktopMacOSCredentialBackend({ binding: f.binding });
+  await backend.preflight();
+  assert.deepEqual(f.calls, MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES
+    .map((capability) => ["read", capability]));
+  for (const capability of optionalCapabilities) {
+    await assert.rejects(backend.get(capability), { code: "KEYCHAIN_MIGRATION_REQUIRED" });
+    await assert.rejects(backend.set(capability, SECRET), { code: "KEYCHAIN_MIGRATION_REQUIRED" });
+  }
+  assert.equal(f.items.size, 0, "optional migration must not mint replacement credentials");
 });
 
 const APP_BUNDLE = "/Applications/TiboTattle.app";
@@ -257,7 +297,7 @@ test("both Mac targets verify the enclosing application before loading and prefl
       requireBinding(path) { assert.equal(path, `${RESOURCES}/native/macos-keychain.node`); order.push("load"); return f.binding; },
     });
     assert.deepEqual(order, ["verify", "load"]);
-    assert.equal(f.calls.length, 4);
+    assert.equal(f.calls.length, MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES.length);
     assert.equal(await backend.get("export_identity"), null);
   }
 });
@@ -272,12 +312,13 @@ test("verified adapter loading exposes a separate accountless factory without pr
     verifyApplication: async () => true,
     requireBinding: () => f.binding,
   });
-  assert.equal(f.calls.length, 4);
+  assert.equal(f.calls.length, MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES.length);
   const accountless = backends.createAccountlessCredentialBackend({
     legacyCredentialProbe: async () => "absent",
   });
   assert.equal(await accountless.createIfMissing(Buffer.alloc(32, 3)), "created");
-  assert.equal(f.calls.filter((call) => call[0] === "read").length, 4);
+  assert.equal(f.calls.filter((call) => call[0] === "read").length,
+    MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES.length);
 });
 
 test("unsigned, replaced, linked, development and wrong-target candidates cannot load native code", async () => {
@@ -350,6 +391,72 @@ test("production composition establishes credentials before touching the predece
   assert.equal(bridge.createAccountlessCredentialBackend({
     legacyCredentialProbe: async () => "absent",
   }), accountless);
+});
+
+test("production composition permits unused optional migrations but preserves their visible guard", async () => {
+  const f = bindingFixture();
+  const optionalCapability = MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES.find(
+    (capability) => !MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES.includes(capability),
+  );
+  let broker;
+  let handovers = 0;
+  f.binding.read = async (capability) => {
+    f.calls.push(["read", capability]);
+    return {
+      status: capability === optionalCapability ? "migration_required" : "absent",
+      value: null,
+    };
+  };
+  const bridge = createProductionMacCredentialHandover({
+    async loadBackend() {
+      broker = createDesktopMacOSCredentialBackend({ binding: f.binding });
+      await broker.preflight();
+      return { broker };
+    },
+    async runHandover() {
+      handovers += 1;
+      return { status: "no_legacy_state" };
+    },
+  });
+
+  assert.deepEqual(await bridge.prepareNativeHandover({ homeDirectory: "/synthetic/home" }), {
+    status: "no_legacy_state",
+  });
+  assert.equal(handovers, 1);
+  await assert.rejects(broker.get(optionalCapability), { code: "KEYCHAIN_MIGRATION_REQUIRED" });
+  assert.equal(f.items.size, 0);
+  assert.equal(f.calls.some(([operation]) => operation === "store"), false);
+});
+
+test("production composition blocks a required credential before handover or writes", async () => {
+  const f = bindingFixture();
+  let handovers = 0;
+  f.binding.read = async (capability) => {
+    f.calls.push(["read", capability]);
+    return {
+      status: capability === "account_observation" ? "migration_required" : "absent",
+      value: null,
+    };
+  };
+  const bridge = createProductionMacCredentialHandover({
+    async loadBackend() {
+      const broker = createDesktopMacOSCredentialBackend({ binding: f.binding });
+      await broker.preflight();
+      return { broker };
+    },
+    async runHandover() {
+      handovers += 1;
+      return { status: "migrated" };
+    },
+  });
+
+  assert.deepEqual(await bridge.prepareNativeHandover({ homeDirectory: "/synthetic/home" }), {
+    status: "credential_preflight_blocked",
+  });
+  assert.equal(handovers, 0);
+  assert.equal(f.items.size, 0);
+  assert.equal(f.calls.some(([operation]) => operation === "store"), false);
+  assert.deepEqual(f.calls, [["read", "account_observation"]]);
 });
 
 test("fixed credential preflight failures never start handover or open a child credential channel", async () => {

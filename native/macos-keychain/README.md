@@ -43,6 +43,14 @@ updated only through `kSecValueData`, retaining its original ACL. A duplicate
 add after an absence preflight fails closed and preserves the item; this adapter
 never deletes a credential as part of `store`.
 
+Electron startup preflights `account_observation` and `contribution_device`,
+the currently active desktop paths. `export_identity` remains an on-demand
+legacy path and `claude_session_pseudonym` remains reserved for the optional
+Claude provider. They retain the same read, store, and migration-required
+guards at first use: a required export migration must be approved through the
+released native application's local approval flow. The main-only
+`accountless_installation` path is checked only when sharing requires it.
+
 Each operation captures the user's Keychain search list and binds its modern
 and legacy queries to that exact list. A not-found result is trusted only when
 every member is unlocked and readable. A successful modern read remains usable
