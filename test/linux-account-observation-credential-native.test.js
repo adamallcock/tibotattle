@@ -668,10 +668,14 @@ test("native Linux account-observation child maps an unresponsive D-Bus service 
   assert.notEqual(blackholeTool, null);
   try {
     const backend = createLinuxAccountObservationCredentialBackend();
+    const startedAt = Date.now();
     await assert.rejects(
       backend.read(EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation),
       nativeError("unavailable"),
     );
+    const elapsedMs = Date.now() - startedAt;
+    assert.ok(elapsedMs >= BLACKHOLE_MINIMUM_DELAY_MS);
+    assert.ok(elapsedMs < BLACKHOLE_CHILD_DEADLINE_MS);
   } finally {
     assert.equal(await stopPrivateBlackholeTool(blackholeTool), true);
   }
