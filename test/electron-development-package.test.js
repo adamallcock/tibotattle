@@ -142,6 +142,14 @@ test("the development workflow builds each target on a static native runner with
   assert.match(windowsPackageJob, /\.release-build\/electron-dev\/win32-x64\/app\//u);
   assert.match(windowsPackageJob, /id: validate-win32-retained-inputs/u);
   assert.match(windowsPackageJob, /WINDOWS_RETAINED_ARTIFACT_REPARSE_POINT/u);
+  assert.match(windowsPackageJob, /WINDOWS_RETAINED_ARTIFACT_HIDDEN_TOPOLOGY/u);
+  assert.match(windowsPackageJob, /ValidateSet\('distribution', 'staged'\)/u);
+  assert.match(windowsPackageJob, /ValidateSet\('dot_directory', 'dot_file', 'missing'\)/u);
+  assert.match(windowsPackageJob, /ValidateSet\('approved_json_schema', 'approved_fast_uri', 'unapproved'\)/u);
+  assert.match(windowsPackageJob, /excludedHiddenDirectory = '\.icon-ico'/u);
+  assert.match(windowsPackageJob, /\$isFixedExcludedCache = \$rootSpec\.inventoryRoot -ceq 'distribution'/u);
+  assert.match(windowsPackageJob, /if \(\$isFixedExcludedCache\) \{ continue \}/u);
+  assert.match(windowsPackageJob, /!\.release-build\/electron-candidates\/\$\{\{ github\.sha \}\}\/win32-x64\/distribution\/\.icon-ico\/\*\*/u);
   assert.match(windowsPackageJob, /node_modules\/json-schema-traverse\/\.eslintrc\.yml/u);
   assert.match(windowsPackageJob, /b1ea981e2461f053646b08a616efcaba0d3b278b223957e9eb931bcbc3971ccc/u);
   assert.match(windowsPackageJob, /node_modules\/fast-uri\/\.gitattributes/u);

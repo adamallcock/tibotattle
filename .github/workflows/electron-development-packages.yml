@@ -187,26 +187,40 @@ jobs:
           $expectedStagedHiddenFiles = @(
             [pscustomobject]@{
               relativePath = 'node_modules/json-schema-traverse/.eslintrc.yml'
+              inventoryName = 'approved_json_schema'
               sha256 = 'b1ea981e2461f053646b08a616efcaba0d3b278b223957e9eb931bcbc3971ccc'
             },
             [pscustomobject]@{
               relativePath = 'node_modules/fast-uri/.gitattributes'
+              inventoryName = 'approved_fast_uri'
               sha256 = 'e173bffc6cde613d3e6d06e49f2b1d05385cb02aa68c4931656b5b051ab649dd'
             }
           )
           $roots = @(
             [pscustomobject]@{
+              inventoryRoot = 'distribution'
               path = $distributionRoot
               expectedHiddenFiles = @()
+              excludedHiddenDirectory = '.icon-ico'
             },
             [pscustomobject]@{
+              inventoryRoot = 'staged'
               path = $stagedAppRoot
               expectedHiddenFiles = $expectedStagedHiddenFiles
+              excludedHiddenDirectory = $null
             }
           )
           function Fail-WindowsRetainedArtifactGuard {
             param([string]$Code)
             throw [System.InvalidOperationException]::new($Code)
+          }
+          function Write-WindowsRetainedArtifactHiddenTopology {
+            param(
+              [ValidateSet('distribution', 'staged')][string]$RootKind,
+              [ValidateSet('dot_directory', 'dot_file', 'missing')][string]$EntryKind,
+              [ValidateSet('approved_json_schema', 'approved_fast_uri', 'unapproved')][string]$NameKind
+            )
+            Write-Host "WINDOWS_RETAINED_ARTIFACT_HIDDEN_TOPOLOGY root=$RootKind entry=$EntryKind name=$NameKind"
           }
           $knownFailures = @(
             'WINDOWS_RETAINED_ARTIFACT_ROOT_MISSING',
@@ -235,25 +249,39 @@ jobs:
                   $isDotPath = @($relativePath.Split('/') | Where-Object { $_.StartsWith('.') }).Count -gt 0
                   if ($isDotPath) {
                     $expected = @($rootSpec.expectedHiddenFiles | Where-Object { $_.relativePath -ceq $relativePath })
+                    $entryKind = if (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) { 'dot_directory' } else { 'dot_file' }
+                    $nameKind = if ($expected.Count -eq 1) { $expected[0].inventoryName } else { 'unapproved' }
+                    # This exact non-reparse distribution-root directory is an
+                    # app-builder-lib icon-conversion cache, never a retained
+                    # artifact input. Do not traverse or transfer it.
+                    $isFixedExcludedCache = $rootSpec.inventoryRoot -ceq 'distribution' `
+                      -and $relativePath -ceq $rootSpec.excludedHiddenDirectory `
+                      -and $entry -is [System.IO.DirectoryInfo]
+                    if ($isFixedExcludedCache) { continue }
                     if ($entry -isnot [System.IO.FileInfo] -or $expected.Count -ne 1) {
+                      Write-WindowsRetainedArtifactHiddenTopology $rootSpec.inventoryRoot $entryKind $nameKind
                       Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_INVALID'
                     }
                     $sha256 = (Get-FileHash -LiteralPath $entry.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
                     if ($sha256 -cne $expected[0].sha256) {
+                      Write-WindowsRetainedArtifactHiddenTopology $rootSpec.inventoryRoot $entryKind $nameKind
                       Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_HASH_INVALID'
                     }
                     [void]$observedHiddenFiles.Add($relativePath)
                   }
-                  if ($entry -is [System.IO.DirectoryInfo]) { $pending.Push($entry) }
+                  if (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+                    $pending.Push([System.IO.DirectoryInfo]::new($entry.FullName))
+                  }
+                }
+              }
+              foreach ($expected in $rootSpec.expectedHiddenFiles) {
+                if (@($observedHiddenFiles | Where-Object { $_ -ceq $expected.relativePath }).Count -ne 1) {
+                  Write-WindowsRetainedArtifactHiddenTopology $rootSpec.inventoryRoot 'missing' $expected.inventoryName
+                  Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_SET_INVALID'
                 }
               }
               if ($observedHiddenFiles.Count -ne $rootSpec.expectedHiddenFiles.Count) {
                 Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_SET_INVALID'
-              }
-              foreach ($expected in $rootSpec.expectedHiddenFiles) {
-                if (@($observedHiddenFiles | Where-Object { $_ -ceq $expected.relativePath }).Count -ne 1) {
-                  Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_SET_INVALID'
-                }
               }
             }
           } catch {
@@ -271,6 +299,7 @@ jobs:
           # lifecycle job revalidates both against the installed application.
           path: |
             .release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/
+            !.release-build/electron-candidates/${{ github.sha }}/win32-x64/distribution/.icon-ico/**
             .release-build/electron-dev/win32-x64/app/
           if-no-files-found: error
           include-hidden-files: true
