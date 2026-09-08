@@ -214,6 +214,12 @@ delete, cleanup wire, or real-account credential access; session cleanup is a
 disposable-runner lifetime boundary. It does not model an actual process kill,
 desktop lock transition, service crash, storage loss, or power failure.
 
+Before the test's first create, a qualification-only fixed D-Bus probe reads
+the `default` alias and its `Locked` property. It never creates, unlocks,
+replaces, or deletes a collection or item. The fixture retains only a closed
+ready/missing/locked/unavailable/invalid result for the CI failure stage and
+does not print the D-Bus reply or collection path.
+
 Each fixed slot-five worker creates one `GCancellable` with a five-second
 aggregate deadline shared by its search, collection lookup, no-replace create,
 and reconciliation calls. Its watchdog uses GLib's fallible thread constructor

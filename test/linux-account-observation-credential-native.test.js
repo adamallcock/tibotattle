@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmod,
@@ -36,8 +36,19 @@ const BLACKHOLE_CHILD_ENABLED = NATIVE_TEST_PREREQUISITES && BLACKHOLE_CHILD;
 const OPERATION_JOURNAL = "account-observation-operation-5-v1";
 const BLACKHOLE_CHILD_DEADLINE_MS = 9_000;
 const BLACKHOLE_MINIMUM_DELAY_MS = 4_000;
+const DBUS_SEND = "/usr/bin/dbus-send";
+const DBUS_REPLY_TIMEOUT_MS = 1_000;
+const DBUS_MAX_OUTPUT_BYTES = 4_096;
+const DEFAULT_COLLECTION_ALIAS = "default";
+const SECRET_SERVICE_DESTINATION = "org.freedesktop.secrets";
+const SECRET_SERVICE_PATH = "/org/freedesktop/secrets";
+const SECRET_SERVICE_READ_ALIAS = "org.freedesktop.Secret.Service.ReadAlias";
+const DBUS_PROPERTIES_GET = "org.freedesktop.DBus.Properties.Get";
+const SECRET_COLLECTION_INTERFACE = "org.freedesktop.Secret.Collection";
+const COLLECTION_PATH = /^\/org\/freedesktop\/secrets\/collection\/[A-Za-z_][A-Za-z0-9_]*$/u;
 const CREATE_DIAGNOSTIC_PHASES = new Set([
   "CREATE_PRECHECK",
+  "CREATE_NATIVE_READ",
   "CREATE_MUTATION",
 ]);
 const OPERATION_MAGIC = Buffer.from([
@@ -128,6 +139,78 @@ async function runClosedObservationDiagnosticPhase(testContext, phase, operation
   }
 }
 
+function fixedDbusReply(argumentsList, spawnCommand = spawnSync) {
+  let result;
+  try {
+    result = spawnCommand(DBUS_SEND, argumentsList, {
+      encoding: "utf8",
+      maxBuffer: DBUS_MAX_OUTPUT_BYTES,
+      timeout: DBUS_REPLY_TIMEOUT_MS,
+      shell: false,
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    });
+  } catch {
+    return null;
+  }
+  try {
+    return result?.error === undefined
+      && result.signal === null
+      && result.status === 0
+      && typeof result.stdout === "string"
+      ? result.stdout
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function exactlyOneOutputMatch(output, expression) {
+  if (typeof output !== "string") return null;
+  const matches = [...output.matchAll(expression)];
+  return matches.length === 1 ? matches[0] : null;
+}
+
+// Qualification-only probe: it calls the fixed Secret Service alias/property
+// reads without asking the daemon to unlock, create, replace, or delete
+// anything. Its closed state tells the native test whether a later pre-intent
+// refusal is caused by the default collection rather than by record mutation.
+function defaultCollectionState({ spawnCommand = spawnSync } = {}) {
+  const alias = fixedDbusReply([
+    "--session",
+    "--print-reply",
+    `--reply-timeout=${DBUS_REPLY_TIMEOUT_MS}`,
+    `--dest=${SECRET_SERVICE_DESTINATION}`,
+    SECRET_SERVICE_PATH,
+    SECRET_SERVICE_READ_ALIAS,
+    `string:${DEFAULT_COLLECTION_ALIAS}`,
+  ], spawnCommand);
+  if (alias === null) return "UNAVAILABLE";
+  const pathMatch = exactlyOneOutputMatch(alias, /^\s*object path "([^"]+)"\s*$/gmu);
+  if (pathMatch === null) return "INVALID";
+  const collectionPath = pathMatch[1];
+  if (collectionPath === "/") return "MISSING";
+  if (!COLLECTION_PATH.test(collectionPath)) return "INVALID";
+
+  const locked = fixedDbusReply([
+    "--session",
+    "--print-reply",
+    `--reply-timeout=${DBUS_REPLY_TIMEOUT_MS}`,
+    `--dest=${SECRET_SERVICE_DESTINATION}`,
+    collectionPath,
+    DBUS_PROPERTIES_GET,
+    `string:${SECRET_COLLECTION_INTERFACE}`,
+    "string:Locked",
+  ], spawnCommand);
+  if (locked === null) return "UNAVAILABLE";
+  const lockedMatch = exactlyOneOutputMatch(
+    locked,
+    /^\s*variant\s+boolean\s+(true|false)\s*$/gmu,
+  );
+  if (lockedMatch === null) return "INVALID";
+  return lockedMatch[1] === "true" ? "LOCKED" : "READY";
+}
+
 test("native account-observation CREATE diagnostics retain only closed facade outcomes", async () => {
   const diagnostics = [];
   const testContext = {
@@ -165,6 +248,65 @@ test("native account-observation CREATE diagnostics retain only closed facade ou
     "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION_OTHER",
   ]);
   assert.equal(diagnostics.join("\n").includes("synthetic private native detail"), false);
+});
+
+test("native account-observation default collection probe has only closed non-mutating states", () => {
+  const replies = [
+    {
+      error: undefined,
+      signal: null,
+      status: 0,
+      stdout: "method return\n   object path \"/org/freedesktop/secrets/collection/login\"\n",
+    },
+    {
+      error: undefined,
+      signal: null,
+      status: 0,
+      stdout: "method return\n   variant       boolean false\n",
+    },
+  ];
+  const calls = [];
+  const ready = defaultCollectionState({
+    spawnCommand(command, argumentsList, options) {
+      calls.push({ command, argumentsList, options });
+      return replies.shift();
+    },
+  });
+  assert.equal(ready, "READY");
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].command, DBUS_SEND);
+  assert.deepEqual(calls[0].argumentsList, [
+    "--session",
+    "--print-reply",
+    "--reply-timeout=1000",
+    "--dest=org.freedesktop.secrets",
+    "/org/freedesktop/secrets",
+    "org.freedesktop.Secret.Service.ReadAlias",
+    "string:default",
+  ]);
+  assert.equal(calls[0].options.shell, false);
+  assert.equal(calls[0].options.timeout, DBUS_REPLY_TIMEOUT_MS);
+  assert.deepEqual(calls[0].options.stdio, ["ignore", "pipe", "ignore"]);
+  assert.deepEqual(calls[1].argumentsList, [
+    "--session",
+    "--print-reply",
+    "--reply-timeout=1000",
+    "--dest=org.freedesktop.secrets",
+    "/org/freedesktop/secrets/collection/login",
+    "org.freedesktop.DBus.Properties.Get",
+    "string:org.freedesktop.Secret.Collection",
+    "string:Locked",
+  ]);
+
+  const probe = (reply) => defaultCollectionState({ spawnCommand: () => reply });
+  assert.equal(probe({ error: undefined, signal: null, status: 0, stdout: "object path \"/\"\n" }), "MISSING");
+  assert.equal(probe({ error: undefined, signal: null, status: 0, stdout: "object path \"/unsafe\"\n" }), "INVALID");
+  assert.equal(probe({ error: new Error("fixed synthetic failure"), signal: null, status: null, stdout: "" }), "UNAVAILABLE");
+  const lockedReplies = [
+    { error: undefined, signal: null, status: 0, stdout: "object path \"/org/freedesktop/secrets/collection/login\"\n" },
+    { error: undefined, signal: null, status: 0, stdout: "variant boolean true\n" },
+  ];
+  assert.equal(defaultCollectionState({ spawnCommand: () => lockedReplies.shift() }), "LOCKED");
 });
 
 async function assertMissing(path) {
@@ -318,6 +460,13 @@ test("native Linux account-observation credential refuses an absent retained int
   await runClosedObservationDiagnosticPhase(t, "CREATE_PRECHECK", async () => {
     assert.equal(await backend.read(capability), null);
   });
+  await runClosedObservationDiagnosticPhase(t, "CREATE_NATIVE_READ", async () => {
+    assert.equal(await backend.read(capability), null);
+  });
+  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_COLLECTION");
+  const collection = defaultCollectionState();
+  t.diagnostic(`LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_COLLECTION_${collection}`);
+  assert.equal(collection, "READY");
   await runClosedObservationDiagnosticPhase(t, "CREATE_MUTATION", async () => {
     assert.equal(await backend.createIfMissing(capability, first), "created");
   });
