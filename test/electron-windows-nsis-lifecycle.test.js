@@ -299,6 +299,18 @@ test("registry and Windows process probes use fixed read-only PowerShell contrac
     () => buildWindowsExactExecutableProcessQueryArguments(join(installationRoot, "other.exe")),
     /PROCESS_PROOF_UNAVAILABLE/u,
   );
+  const normalCandidateArguments = buildWindowsExactExecutableProcessQueryArguments(
+    join(installationRoot, "TiboTattle.exe"),
+    { executableName: "TiboTattle.exe" },
+  );
+  assert.match(normalCandidateArguments[4], /GetProcessesByName\('TiboTattle'\)/u);
+  assert.throws(
+    () => buildWindowsExactExecutableProcessQueryArguments(
+      join(installationRoot, "other.exe"),
+      { executableName: "other.exe" },
+    ),
+    /PROCESS_PROOF_UNAVAILABLE/u,
+  );
 
   const readySnapshotArguments = buildWindowsOwnedProcessSnapshotQueryArguments({ rootProcessId: 42 });
   assert.match(readySnapshotArguments[4], /Import-Module -Name Microsoft\.PowerShell\.Utility -ErrorAction Stop/u);

@@ -39,6 +39,7 @@ const require = createRequire(import.meta.url);
 const REVISION = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const APP_EXECUTABLE = "TiboTattle Dev.exe";
+const NORMAL_CANDIDATE_APP_EXECUTABLE = "TiboTattle.exe";
 const UNINSTALLER = "Uninstall TiboTattle Dev.exe";
 const APP_BUILDER_LIB_VERSION = "26.15.7";
 // UUID v5(appId, electron-builder's pinned NSIS namespace) for the fixed
@@ -1300,17 +1301,22 @@ async function defaultReadWindowsProcessSnapshot({
  * parent environment. Output deliberately keeps paths out of receipts and
  * logs.
  */
-export function buildWindowsExactExecutableProcessQueryArguments(appPath) {
-  if (!validAbsolutePath(appPath) || basename(appPath) !== APP_EXECUTABLE) {
+export function buildWindowsExactExecutableProcessQueryArguments(appPath, {
+  executableName = APP_EXECUTABLE,
+} = {}) {
+  if (!validAbsolutePath(appPath)
+      || ![APP_EXECUTABLE, NORMAL_CANDIDATE_APP_EXECUTABLE].includes(executableName)
+      || basename(appPath) !== executableName) {
     fail("PROCESS_PROOF_UNAVAILABLE");
   }
+  const imageName = executableName.slice(0, -".exe".length);
   // The image name is fixed. Every matching process must disclose both its
   // module path and start time: an access failure therefore rejects the proof
   // rather than silently treating an uninspectable process as absent. For an
   // exact match, Toolhelp supplies its real parent PID and independently
   // rechecks the same creation identity. The expected path remains a validated
   // child-only value, so this query never interpolates a caller-controlled path.
-  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}${fixedPowerShellUtilityModulePrelude()}$matches=@();foreach($process in [System.Diagnostics.Process]::GetProcessesByName('TiboTattle Dev')){try{$processPath=$process.MainModule.FileName;$creationDate=$process.StartTime.ToFileTimeUtc().ToString([System.Globalization.CultureInfo]::InvariantCulture);if($processPath -isnot [string] -or [string]::IsNullOrWhiteSpace($processPath) -or [string]::IsNullOrWhiteSpace($creationDate)){throw 'process-proof'};if([string]::Equals($processPath,$expected,[System.StringComparison]::OrdinalIgnoreCase)){$matches+=[pscustomobject]@{ProcessId=[uint32]$process.Id;CreationDate=$creationDate}}}finally{$process.Dispose()}};if($matches.Count -eq 0){$rows=@()}else{${toolhelpPowerShellTypeDefinition()}$processIds=[uint32[]]@($matches|ForEach-Object {[uint32]$_.ProcessId});$proof=@([TiboTattleWindowsProcessSnapshot]::Read([uint32]0,$processIds));$rows=@();foreach($match in $matches){$evidence=@($proof|Where-Object {$_.ProcessId -eq $match.ProcessId -and [string]::Equals($_.CreationDate,$match.CreationDate,[System.StringComparison]::Ordinal)});if($evidence.Count -gt 1){throw 'process-proof'};if($evidence.Count -eq 1){$rows+=$evidence[0]}}};[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
+  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}${fixedPowerShellUtilityModulePrelude()}$matches=@();foreach($process in [System.Diagnostics.Process]::GetProcessesByName('${imageName}')){try{$processPath=$process.MainModule.FileName;$creationDate=$process.StartTime.ToFileTimeUtc().ToString([System.Globalization.CultureInfo]::InvariantCulture);if($processPath -isnot [string] -or [string]::IsNullOrWhiteSpace($processPath) -or [string]::IsNullOrWhiteSpace($creationDate)){throw 'process-proof'};if([string]::Equals($processPath,$expected,[System.StringComparison]::OrdinalIgnoreCase)){$matches+=[pscustomobject]@{ProcessId=[uint32]$process.Id;CreationDate=$creationDate}}}finally{$process.Dispose()}};if($matches.Count -eq 0){$rows=@()}else{${toolhelpPowerShellTypeDefinition()}$processIds=[uint32[]]@($matches|ForEach-Object {[uint32]$_.ProcessId});$proof=@([TiboTattleWindowsProcessSnapshot]::Read([uint32]0,$processIds));$rows=@();foreach($match in $matches){$evidence=@($proof|Where-Object {$_.ProcessId -eq $match.ProcessId -and [string]::Equals($_.CreationDate,$match.CreationDate,[System.StringComparison]::Ordinal)});if($evidence.Count -gt 1){throw 'process-proof'};if($evidence.Count -eq 1){$rows+=$evidence[0]}}};[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
   return Object.freeze([
     "-NoLogo",
     "-NoProfile",

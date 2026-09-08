@@ -53,6 +53,10 @@ const DEFAULT_PROFILE_PATH = join(
 );
 const WINDOWS_TARGET = "win32-x64";
 const WINDOWS_APP_NAME = "TiboTattle Dev.exe";
+// This fixed name is used only by the disposable normal-candidate runner.
+// It deliberately does not share the development launcher's qualification
+// environment or manual smoke IPC.
+export const WINDOWS_NORMAL_CANDIDATE_APP_NAME = "TiboTattle.exe";
 const USER_DATA_DIRECTORY = "user-data";
 const PROFILE_DIRECTORY_NAMES = Object.freeze([
   "home",
@@ -380,6 +384,85 @@ export function buildWindowsDevelopmentEnvironment({
     WINDOWS_ELECTRON_QUALIFICATION_MARKER;
   selected.USAGE_MONITOR_TEST_LANE = WINDOWS_ELECTRON_TEST_LANE;
   return Object.freeze(selected);
+}
+
+/**
+ * Construct the private environment for a normal stable-metadata candidate.
+ *
+ * This shares only the owned profile layout with the development launcher.
+ * The allowlist intentionally drops all inherited test, qualification,
+ * contribution, endpoint, and Node-option selectors. The sole retained smoke
+ * control is the existing quit-only lifecycle request; it does not expose
+ * renderer or private-storage capabilities. The packaged main process must
+ * make its ordinary manifest-based selection itself.
+ */
+export function buildWindowsNormalCandidateEnvironment({
+  environment = process.env,
+  profile,
+} = {}) {
+  const paths = assertProfileObject(profile);
+  const selected = copySafeEnvironment(environment);
+  selected.USERPROFILE = paths.home;
+  selected.HOME = paths.home;
+  selected.APPDATA = paths.appdata;
+  selected.LOCALAPPDATA = paths.localappdata;
+  selected.TEMP = paths.tmp;
+  selected.TMP = paths.tmp;
+  selected.TMPDIR = paths.tmp;
+  selected.CODEX_HOME = paths.codex;
+  selected.CLAUDE_CONFIG_DIR = paths.claude;
+  selected.XDG_CONFIG_HOME = paths.config;
+  selected.XDG_DATA_HOME = paths.data;
+  selected.XDG_CACHE_HOME = paths.cache;
+  selected.XDG_RUNTIME_DIR = paths.runtime;
+  selected.USAGE_MONITOR_STATE_ROOT = paths.state;
+  selected.USAGE_MONITOR_ACCOUNTING_SOURCE_MODE = "unified";
+  selected.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL = "quit-v1";
+  return Object.freeze(selected);
+}
+
+function normalCandidateDebugPort(value) {
+  return Number.isSafeInteger(value) && value >= 1 && value <= 65_535
+    ? value
+    : null;
+}
+
+/**
+ * Launch only the exact unpacked stable-candidate executable with a private
+ * profile and loopback-only DevTools endpoint. This does not select a test
+ * lane, a Windows qualification context, or legacy private-storage controls.
+ */
+export function buildWindowsNormalCandidateLaunchSpec({
+  appPath,
+  profile,
+  remoteDebuggingPort,
+  environment = process.env,
+} = {}) {
+  const selectedAppPath = normalizedPath(appPath, FIXED_STATUS.appInvalid);
+  if (basename(selectedAppPath).toLowerCase()
+      !== WINDOWS_NORMAL_CANDIDATE_APP_NAME.toLowerCase()) {
+    fail(FIXED_STATUS.appInvalid);
+  }
+  const paths = assertProfileObject(profile);
+  const port = normalCandidateDebugPort(remoteDebuggingPort);
+  if (port === null) fail(FIXED_STATUS.argumentInvalid);
+  assertDistinctAppAndProfile(selectedAppPath, paths.root);
+  return Object.freeze({
+    command: selectedAppPath,
+    args: Object.freeze([
+      `--user-data-dir=${paths.userData}`,
+      `--remote-debugging-port=${port}`,
+      "--remote-debugging-address=127.0.0.1",
+      "--disable-gpu",
+    ]),
+    options: Object.freeze({
+      cwd: dirname(selectedAppPath),
+      env: buildWindowsNormalCandidateEnvironment({ environment, profile: paths }),
+      shell: false,
+      windowsHide: true,
+      stdio: "ignore",
+    }),
+  });
 }
 
 export function buildWindowsDevelopmentLaunchSpec({
