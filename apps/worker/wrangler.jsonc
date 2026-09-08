@@ -166,7 +166,8 @@
         "UPLOAD_INGRESS_BODY_TOTAL_SECONDS": "60",
         "UPLOAD_INGRESS_BODY_IDLE_SECONDS": "15",
         "SIGN_IN_START_MAX_PER_MINUTE": "5",
-        "IDENTITY_LINK_SECRET_VERSION": "staging-v1"
+        "IDENTITY_LINK_SECRET_VERSION": "staging-v1",
+        "PUBLIC_ORIGIN": "https://app-usagemonitor-staging.adamallcock.workers.dev"
       },
       "secrets": {
         "required": [

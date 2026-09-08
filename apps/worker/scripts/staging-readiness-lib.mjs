@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
 
 export const STAGING_READINESS_SCHEMA_VERSION =
   "usage-monitor-staging-readiness-v0.1";
@@ -306,6 +307,7 @@ export const REQUIRED_STAGING_VARIABLES = Object.freeze({
   UPLOAD_INGRESS_BODY_IDLE_SECONDS: "15",
   SIGN_IN_START_MAX_PER_MINUTE: "5",
   IDENTITY_LINK_SECRET_VERSION: "staging-v1",
+  PUBLIC_ORIGIN: DEPLOYMENT_ENDPOINTS.staging.origin,
 });
 export const REQUIRED_INGRESS_DURABLE_OBJECT_BINDING = Object.freeze({
   name: "UPLOAD_INGRESS_BUDGET",
@@ -909,7 +911,7 @@ export function assessStagingConfiguration(
     workersDevHttpsEnabled: environment?.workers_dev === true,
     originBoundaryClosed: environment?.workers_dev === true
       && !Object.hasOwn(environment ?? {}, "routes")
-      && !Object.hasOwn(environment?.vars ?? {}, "PUBLIC_ORIGIN"),
+      && environment?.vars?.PUBLIC_ORIGIN === DEPLOYMENT_ENDPOINTS.staging.origin,
     previewUrlsDisabled: environment?.preview_urls === false,
     observabilityEnabled: environment?.observability?.enabled === true
       && environment?.observability?.head_sampling_rate === 1,

@@ -263,7 +263,7 @@ export function validateWorkerDeploymentEndpoints(
       || staging.workers_dev !== endpoints.staging.workersDev
       || staging.preview_urls !== endpoints.staging.previewUrls
       || Object.hasOwn(staging, "routes")
-      || Object.hasOwn(staging.vars ?? {}, "PUBLIC_ORIGIN")) {
+      || staging.vars?.PUBLIC_ORIGIN !== endpoints.staging.origin) {
     fail("Worker staging configuration must match the reviewed nonproduction endpoint");
   }
   const production = configuration?.env?.production;

@@ -61,7 +61,7 @@ test("Worker endpoint projection rejects an independent public origin", () => {
         name: DEPLOYMENT_ENDPOINTS.staging.workerName,
         workers_dev: DEPLOYMENT_ENDPOINTS.staging.workersDev,
         preview_urls: DEPLOYMENT_ENDPOINTS.staging.previewUrls,
-        vars: {},
+        vars: { PUBLIC_ORIGIN: DEPLOYMENT_ENDPOINTS.staging.origin },
       },
     },
   };
@@ -112,6 +112,12 @@ test("Worker endpoint projection rejects an independent public origin", () => {
     DEPLOYMENT_ENDPOINTS.public.origin;
   assert.throws(
     () => validateWorkerDeploymentEndpoints(stagingPublicOrigin),
+    { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
+  );
+  const missingStagingOrigin = structuredClone(configuration);
+  delete missingStagingOrigin.env.staging.vars.PUBLIC_ORIGIN;
+  assert.throws(
+    () => validateWorkerDeploymentEndpoints(missingStagingOrigin),
     { code: "DEPLOYMENT_ENDPOINTS_MISMATCH" },
   );
 });

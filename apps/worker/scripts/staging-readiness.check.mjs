@@ -678,6 +678,17 @@ test("unsafe target configuration stops before any live command", () => {
   assert.equal(called, false);
 });
 
+test("hosted staging capabilities require the exact fixed staging public origin", () => {
+  assert.equal(assessStagingConfiguration(checkedInConfig).checks.originBoundaryClosed, true);
+  for (const origin of [undefined, "http://app-usagemonitor-staging.adamallcock.workers.dev",
+    "https://app-usagemonitor-staging.adamallcock.workers.dev/", "https://unrelated.workers.dev"]) {
+    const config = structuredClone(checkedInConfig);
+    if (origin === undefined) delete config.env.staging.vars.PUBLIC_ORIGIN;
+    else config.env.staging.vars.PUBLIC_ORIGIN = origin;
+    assert.equal(assessStagingConfiguration(config).checks.originBoundaryClosed, false);
+  }
+});
+
 test("operation receipts keep evidence fixed and non-secret", () => {
   const receipt = stagingOperationReceipt("disabled_staging_prepared", {
     resourcesVerified: true,
