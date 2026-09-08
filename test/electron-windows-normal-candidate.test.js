@@ -32,6 +32,7 @@ import {
   parseWindowsNormalCandidateSmokeArguments,
   prepareWindowsNormalCandidateProfile,
   runWindowsNormalCandidateSmoke,
+  releaseWindowsNormalCandidateStartupRefreshGate,
   seedWindowsNormalCandidateCodexFixture,
   selectWindowsNormalCandidateDashboardTarget,
   selectWindowsNormalCandidateSettingsTarget,
@@ -62,6 +63,23 @@ test("normal candidate loopback requests refuse redirects and bound response wai
     timeoutMs: 10,
     fetchImpl: async () => ({ ok: true, json: () => new Promise(() => {}) }),
   }), /loopback response unavailable/u);
+});
+
+test("normal candidate releases its startup gate only through the fixed Windows preload bridge", async () => {
+  const expressions = [];
+  assert.equal(await releaseWindowsNormalCandidateStartupRefreshGate({
+    async evaluate(expression) {
+      expressions.push(expression);
+      return true;
+    },
+  }), true);
+  assert.equal(expressions.length, 1);
+  assert.match(expressions[0], /__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__/u);
+  assert.match(expressions[0], /releaseStartupRefresh/u);
+  assert.equal(await releaseWindowsNormalCandidateStartupRefreshGate({
+    async evaluate() { return false; },
+  }), false);
+  assert.equal(await releaseWindowsNormalCandidateStartupRefreshGate(null), false);
 });
 
 function smokeOptions() {

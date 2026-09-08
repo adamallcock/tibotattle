@@ -198,6 +198,7 @@ const FAILURE_CODES = new Set([
   "DASHBOARD_UNAVAILABLE",
   "DASHBOARD_INVALID",
   "LOCAL_REFRESH_UNAVAILABLE",
+  "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE",
   "LOCAL_STARTUP_REFRESH_UNAVAILABLE",
   "LOCAL_STARTUP_REFRESH_COMPLETION_UNAVAILABLE",
   "LOCAL_EXPLICIT_REFRESH_BUTTON_UNAVAILABLE",
@@ -1371,6 +1372,28 @@ function localNetworkObserver(cdp, dashboardOrigin) {
 }
 
 /**
+ * Release only the preload's one-shot startup-refresh barrier after CDP has
+ * enabled its exact dashboard-origin network observer. The ordinary Windows
+ * candidate receives this bridge only under its existing quit-only smoke
+ * control; production and Windows qualification use disjoint environment
+ * gates. This does not start, complete, or otherwise fabricate a refresh.
+ */
+export async function releaseWindowsNormalCandidateStartupRefreshGate(cdp) {
+  if (cdp === null || typeof cdp !== "object" || typeof cdp.evaluate !== "function") return false;
+  try {
+    return await cdp.evaluate(`(() => {
+      const bridge = globalThis.__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__;
+      if (!bridge || bridge.version !== "v1" || typeof bridge.releaseStartupRefresh !== "function") {
+        return false;
+      }
+      return bridge.releaseStartupRefresh() === true;
+    })()`) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * The normal candidate has one inherited-IPC capability: request the same
  * desktop-lifecycle.quit path as the tray. It accepts no credential, status,
  * storage, or renderer messages and is never exposed to a preload bridge.
@@ -1501,6 +1524,12 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
   try {
     await cdp.request("Page.enable");
     await cdp.request("Network.enable");
+    // The exact normal-candidate preload is now holding automatic refresh at
+    // its existing smoke gate. Releasing only after Network.enable closes the
+    // fast-renderer race without accepting an unobserved startup POST.
+    if (!await releaseWindowsNormalCandidateStartupRefreshGate(cdp)) {
+      fail("LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE");
+    }
     const ready = await waitFor(async () => {
       const value = await cdp.evaluate(`(() => ({
         ready: document.documentElement?.dataset?.localDashboardReady === "true",

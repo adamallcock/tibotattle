@@ -21,6 +21,7 @@ const MACOS_SMOKE_CONTROL = "quit-v1";
 const MACOS_SMOKE_BRIDGE_NAME = "__TIBOTATTLE_ELECTRON_MACOS_SMOKE__";
 const MACOS_SMOKE_BRIDGE_VERSION = "v1";
 const WINDOWS_SMOKE_CONTROL = "windows-v1";
+const WINDOWS_NORMAL_SMOKE_CONTROL = "quit-v1";
 const WINDOWS_SMOKE_BRIDGE_NAME = "__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__";
 const WINDOWS_SMOKE_BRIDGE_VERSION = "v1";
 const WINDOWS_QUALIFICATION_ENV = "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION";
@@ -441,6 +442,16 @@ function installQualifiedSmokeBridge() {
       && control === WINDOWS_SMOKE_CONTROL
       && processRef?.env?.[WINDOWS_QUALIFICATION_ENV] === WINDOWS_QUALIFICATION_MARKER
       && processRef?.env?.[WINDOWS_TEST_LANE_ENV] === WINDOWS_TEST_LANE) {
+    bridgeName = WINDOWS_SMOKE_BRIDGE_NAME;
+    bridgeVersion = WINDOWS_SMOKE_BRIDGE_VERSION;
+  } else if (processRef?.platform === "win32"
+      && control === WINDOWS_NORMAL_SMOKE_CONTROL
+      && processRef?.env?.[WINDOWS_QUALIFICATION_ENV] === undefined
+      && processRef?.env?.[WINDOWS_TEST_LANE_ENV] === undefined) {
+    // The ordinary packaged Windows candidate has only the inherited
+    // quit-only smoke control. Reuse this intentionally narrow preload gate
+    // so its CDP observer is armed before the app issues its automatic local
+    // refresh. No status, storage, credential, or command surface is exposed.
     bridgeName = WINDOWS_SMOKE_BRIDGE_NAME;
     bridgeVersion = WINDOWS_SMOKE_BRIDGE_VERSION;
   } else {
