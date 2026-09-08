@@ -523,6 +523,10 @@ export async function launchDesktopRuntime({
   delete childEnvironment.USAGE_MONITOR_ACCOUNTLESS_MODE;
   if (accountlessLaboratory) childEnvironment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN = accountlessLaboratory.origin;
   if (accountlessProduction) {
+    // The accountless companion owns its fixed binding and progress paths.
+    // Retired manual-upload inputs must not select a second queue or spool.
+    delete childEnvironment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE;
+    delete childEnvironment.USAGE_MONITOR_PREPARED_DIRECTORY;
     childEnvironment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN = accountlessProduction.origin;
     childEnvironment.USAGE_MONITOR_ACCOUNTLESS_MODE = "production-v1";
   }

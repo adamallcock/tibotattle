@@ -649,7 +649,11 @@ test("macOS production composes the main-only credential backend without touchin
         decryptStringAsync: async () => { safeStorageCalls += 1; throw new Error("must not run"); },
       },
     },
-    environment: { HOME: "/synthetic" },
+    environment: {
+      HOME: "/synthetic",
+      USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE: "/synthetic/legacy-queue.json",
+      USAGE_MONITOR_PREPARED_DIRECTORY: "/synthetic/legacy-prepared",
+    },
     sharingBackend: { load: async () => null, save: async () => {} },
     sharingInstallationState: "fresh",
     accountlessProduction: {
@@ -665,6 +669,10 @@ test("macOS production composes the main-only credential backend without touchin
   });
   assert.equal(factoryCalls, 1);
   assert.equal(safeStorageCalls, 0);
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE, undefined);
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_PREPARED_DIRECTORY, undefined);
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_MODE, "production-v1");
+  assert.equal(fixture.spawnCalls[0].options.env.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, "https://tibotattle.com");
   await fixture.desktop.lifecycle.requestQuit();
 });
 
