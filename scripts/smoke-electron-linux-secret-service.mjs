@@ -93,6 +93,7 @@ const SAFE_SESSION_ENVIRONMENT_KEYS = Object.freeze([
 ]);
 const QUALIFICATION_EXECUTABLES = new Set([
   "/usr/bin/dbus-daemon",
+  "/usr/bin/dbus-test-tool",
   "/usr/bin/gnome-keyring-daemon",
 ]);
 const CREDENTIAL_STAGE_FAILURES = new Map([

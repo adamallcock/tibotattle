@@ -63,6 +63,15 @@ create diagnostic cannot satisfy it. Both original failures and logs remain
 retained. Neither installed Windows lifecycle nor the full Linux credential
 journey is qualified.
 
+The next native rerun includes the fixed system PowerShell module path and
+explicit Utility import used by both Windows process probes. Linux now runs
+its original read against the standard no-response test service on a new
+private D-Bus session, verifies the spawned service owner's PID, and measures
+the native read separately from fixture setup and cleanup. The read must still
+fail as unavailable after at least four seconds and before nine seconds.
+The combined local contracts pass 61 tests, with eight native-only exclusions;
+these repairs await native CI and do not qualify either installed journey.
+
 The preceding four-target results: `611200c7` in
 [run 34215345667](https://github.com/adamallcock/tibotattle/actions/runs/34215345667)
 passes both Mac builds. Windows's new native empty-result process regression

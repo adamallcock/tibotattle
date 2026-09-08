@@ -28,6 +28,7 @@ const CLEANUP_DEADLINE_MS = 5_000;
 const KILL_CLEANUP_DEADLINE_MS = 1_000;
 const KNOWN_QUALIFICATION_EXECUTABLES = new Set([
   "/usr/bin/dbus-daemon",
+  "/usr/bin/dbus-test-tool",
   "/usr/bin/gnome-keyring-daemon",
 ]);
 const SAFE_ENVIRONMENT_KEYS = Object.freeze([

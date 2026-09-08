@@ -162,6 +162,7 @@ test("Linux AMD64 image pins the reviewed native Node child, GUI, and Secret Ser
   assert.match(dockerfile, /xvfb-run/u);
   assert.match(dockerfile, /-nolisten tcp/u);
   assert.match(dockerfile, /dbus-daemon/u);
+  assert.match(dockerfile, /dbus-tests/u);
   assert.match(dockerfile, /gnome-keyring/u);
   assert.match(dockerfile, /libsecret-1-0/u);
   assert.match(dockerfile, /scripts\/qualify-linux-secret-service\.mjs/u);

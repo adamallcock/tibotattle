@@ -30,6 +30,7 @@ RUN apt-get update \
     ca-certificates \
     curl \
     dbus-daemon \
+    dbus-tests \
     fonts-liberation \
     gnome-keyring \
     libasound2 \
