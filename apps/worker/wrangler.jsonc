@@ -153,7 +153,7 @@
         "ENVIRONMENT": "staging",
         "ENROLLMENT_MODE": "disabled",
         // Accountless admission stays explicitly closed in the checked-in
-        // unprovisioned target. A reviewed rehearsal deploy supplies its own
+        // staging target. A reviewed rehearsal deploy supplies its own
         // one-time overrides without changing public enrollment.
         "ACCOUNTLESS_ENROLLMENT_MODE": "disabled",
         "ACCOUNTLESS_OWNERSHIP_MODE": "disabled",
