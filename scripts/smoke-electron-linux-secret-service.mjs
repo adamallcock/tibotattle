@@ -69,7 +69,7 @@ const OUTER_KEYS = Object.freeze([
   "sourceRevision",
   "artifactSha256",
   "packageArtifactVerified",
-  "packagedElectronExecuted",
+  "packagedElectronExecutionVerified",
   "credentialLifecycleVerified",
   "sessionCleanupConfirmed",
   "errorCode",
@@ -92,6 +92,25 @@ const QUALIFICATION_EXECUTABLES = new Set([
   "/usr/bin/dbus-daemon",
   "/usr/bin/gnome-keyring-daemon",
 ]);
+const INNER_STAGE_FAILURE_CODES = new Set([
+  "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_RUNTIME_IDENTITY_FAILED",
+  "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_ARTIFACT_IDENTITY_FAILED",
+  "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_ISOLATION_FAILED",
+  "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_MODULE_LOAD_FAILED",
+  "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_NATIVE_ROUND_TRIP_FAILED",
+]);
+const NODE_MODULE_LOAD_ERROR_CODES = new Set([
+  "ERR_INVALID_MODULE_SPECIFIER",
+  "ERR_MODULE_NOT_FOUND",
+  "ERR_PACKAGE_PATH_NOT_EXPORTED",
+  "ERR_REQUIRE_ESM",
+  "ERR_UNKNOWN_FILE_EXTENSION",
+  "ERR_UNSUPPORTED_ESM_URL_SCHEME",
+]);
+const NODE_NATIVE_LOAD_ERROR_CODES = new Set([
+  "ERR_DLOPEN_FAILED",
+]);
+const PROVEN_SESSION_CLEANUP_ERRORS = new WeakSet();
 
 function failure(code) {
   const error = new Error(`ELECTRON_LINUX_SECRET_SERVICE_SMOKE_${code}`);
@@ -107,6 +126,58 @@ function fixedCode(error) {
   return /^ELECTRON_LINUX_SECRET_SERVICE_SMOKE_[A-Z_]+$/u.test(error?.code ?? "")
     ? error.code
     : "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_FAILED";
+}
+
+function throwFixedCode(code, { sessionCleanupConfirmed = false } = {}) {
+  const error = new Error(code);
+  error.code = code;
+  if (sessionCleanupConfirmed) PROVEN_SESSION_CLEANUP_ERRORS.add(error);
+  throw error;
+}
+
+function failAfterConfirmedSessionCleanup(code) {
+  const error = failure(code);
+  PROVEN_SESSION_CLEANUP_ERRORS.add(error);
+  throw error;
+}
+
+function hasProvenSessionCleanup(error) {
+  return Boolean(error && typeof error === "object" && PROVEN_SESSION_CLEANUP_ERRORS.has(error));
+}
+
+async function innerStage(suffix, action) {
+  try {
+    return await action();
+  } catch {
+    fail(suffix);
+  }
+}
+
+function classifyBootstrapFailure(stderrBytes) {
+  if (!Buffer.isBuffer(stderrBytes) || stderrBytes.length === 0) return null;
+  const stderr = stderrBytes.toString("utf8");
+  if (stderr.includes("\0")) return null;
+  const matches = [];
+  for (const code of [...NODE_MODULE_LOAD_ERROR_CODES, ...NODE_NATIVE_LOAD_ERROR_CODES]) {
+    const pattern = new RegExp(
+      `(?:Error \\[${code}\\]:|code: ["']${code}["'])`,
+      "gu",
+    );
+    const count = [...stderr.matchAll(pattern)].length;
+    if (count > 0) matches.push({ code, count });
+  }
+  if (matches.length !== 1 || matches[0].count !== 1) return null;
+  return NODE_NATIVE_LOAD_ERROR_CODES.has(matches[0].code)
+    ? "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_NATIVE_ROUND_TRIP_FAILED"
+    : "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_MODULE_LOAD_FAILED";
+}
+
+function classifyInnerFailure(stderrBytes) {
+  if (!Buffer.isBuffer(stderrBytes) || stderrBytes.length === 0) return null;
+  const stderr = stderrBytes.toString("utf8");
+  const stageMarkers = stderr.split("\n").filter((line) => INNER_STAGE_FAILURE_CODES.has(line));
+  if (stageMarkers.length === 1) return stageMarkers[0];
+  return classifyBootstrapFailure(stderrBytes);
 }
 
 function exactObject(value, keys) {
@@ -541,22 +612,26 @@ export async function runLinuxPackagedSecretServiceSession(identity, {
     cleanupConfirmed = false;
   }
   if (!cleanupConfirmed) fail("SESSION_CLEANUP_UNCONFIRMED");
-  if (timedOut) fail("SESSION_DEADLINE_EXCEEDED");
+  if (timedOut) failAfterConfirmedSessionCleanup("SESSION_DEADLINE_EXCEEDED");
   const [exitCode, signal] = outcome;
   const stdoutBytes = stdout.bytes();
   const stderrBytes = stderr.bytes();
-  if (exitCode !== 0 || signal !== null || stdoutBytes === null || stderrBytes === null
-      || stderrBytes.byteLength !== 0) {
-    fail("SESSION_EXECUTION_FAILED");
+  if (exitCode !== 0 || signal !== null || stdoutBytes === null || stderrBytes === null) {
+    if (exitCode !== 0 && signal === null && stdoutBytes !== null && stderrBytes !== null) {
+      const innerFailure = classifyInnerFailure(stderrBytes);
+      if (innerFailure !== null) throwFixedCode(innerFailure, { sessionCleanupConfirmed: true });
+    }
+    failAfterConfirmedSessionCleanup("SESSION_EXECUTION_FAILED");
   }
   let parsed;
   try {
     parsed = JSON.parse(stdoutBytes.toString("utf8"));
   } catch {
-    fail("SESSION_RECEIPT_INVALID");
+    failAfterConfirmedSessionCleanup("SESSION_RECEIPT_INVALID");
   }
   const receipt = expectedInnerReceipt(parsed, identity);
-  if (receipt === null) fail("SESSION_RECEIPT_INVALID");
+  if (receipt === null) failAfterConfirmedSessionCleanup("SESSION_RECEIPT_INVALID");
+  if (stderrBytes.byteLength !== 0) failAfterConfirmedSessionCleanup("PASS_RECEIPT_STDERR_REJECTED");
   return receipt;
 }
 
@@ -590,7 +665,14 @@ async function writeReceipt(handle, receipt) {
   }
 }
 
-function outerReceipt({ identity, executed, lifecycleVerified, cleanupConfirmed, errorCode, sourceRevision }) {
+function outerReceipt({
+  identity,
+  executionVerified,
+  lifecycleVerified,
+  cleanupConfirmed,
+  errorCode,
+  sourceRevision,
+}) {
   return Object.freeze({
     schemaVersion: RECEIPT_SCHEMA,
     status: errorCode === null ? "passed" : "failed",
@@ -599,7 +681,7 @@ function outerReceipt({ identity, executed, lifecycleVerified, cleanupConfirmed,
     sourceRevision,
     artifactSha256: identity?.artifactSha256 ?? null,
     packageArtifactVerified: identity !== null,
-    packagedElectronExecuted: executed,
+    packagedElectronExecutionVerified: executionVerified,
     credentialLifecycleVerified: lifecycleVerified,
     sessionCleanupConfirmed: cleanupConfirmed,
     errorCode,
@@ -620,22 +702,23 @@ export async function runLinuxPackagedSecretServiceSmoke(options, {
   }
   const handle = await reserve(options.receiptPath);
   let identity = null;
-  let executed = false;
+  let executionVerified = false;
   let lifecycleVerified = false;
   let cleanupConfirmed = false;
   let errorCode = null;
   try {
     identity = await verifyPackage(options);
     await runSession(identity, { appPath: options.appPath, environment });
-    executed = true;
+    executionVerified = true;
     lifecycleVerified = true;
     cleanupConfirmed = true;
   } catch (error) {
     errorCode = fixedCode(error);
+    cleanupConfirmed = hasProvenSessionCleanup(error);
   }
   const receipt = outerReceipt({
     identity,
-    executed,
+    executionVerified,
     lifecycleVerified,
     cleanupConfirmed,
     errorCode,
@@ -694,49 +777,55 @@ export async function runLinuxPackagedSecretServiceSmokeInside(options, {
       || typeof importModule !== "function") {
     fail("ARGUMENT_INVALID");
   }
-  await assertPackagedElectronNodeRuntime(options.appPath, {
+  await innerStage("RUNTIME_IDENTITY_FAILED", () => assertPackagedElectronNodeRuntime(options.appPath, {
     platform,
     architecture,
     executable,
     environment,
     electronVersion,
     canonicalize,
-  });
+  }));
   const asarPath = join(dirname(options.appPath), "resources", "app.asar");
-  const artifact = await digest(asarPath);
-  if (artifact.sha256 !== options.artifactSha256) fail("PACKAGE_IDENTITY_INVALID");
+  const artifact = await innerStage("ARTIFACT_IDENTITY_FAILED", () => digest(asarPath));
+  if (artifact?.sha256 !== options.artifactSha256) fail("ARTIFACT_IDENTITY_FAILED");
 
   // This is the authoritative isolation proof: it verifies the reviewed
   // container marker and disposable home/runtime tmpfs mounts, then starts a
   // private D-Bus Secret Service before a branded context can exist.
-  const daemon = startDaemon();
-  if (daemon?.status !== "started") fail("ISOLATION_REQUIRED");
+  const daemon = await innerStage("ISOLATION_FAILED", () => startDaemon());
+  if (daemon?.status !== "started") fail("ISOLATION_FAILED");
 
-  const qualification = await importModule(asarModuleUrl(options.appPath, [
-    "apps", "electron", "linux-qualification.js",
-  ]));
-  const smoke = await importModule(asarModuleUrl(options.appPath, [
-    "apps", "electron", "linux-secret-service-qualification-smoke.js",
+  const [qualification, smoke] = await innerStage("MODULE_LOAD_FAILED", () => Promise.all([
+    importModule(asarModuleUrl(options.appPath, [
+      "apps", "electron", "linux-qualification.js",
+    ])),
+    importModule(asarModuleUrl(options.appPath, [
+      "apps", "electron", "linux-secret-service-qualification-smoke.js",
+    ])),
   ]));
   if (typeof qualification?.createLinuxQualificationContext !== "function"
       || typeof smoke?.runLinuxSecretServiceQualificationSmoke !== "function") {
-    fail("PACKAGE_IDENTITY_INVALID");
+    fail("MODULE_LOAD_FAILED");
   }
-  const context = qualification.createLinuxQualificationContext({
-    platform: "linux",
-    architecture: "x64",
-    sourceRevision: options.sourceRevision,
-    distribution: "debian-bookworm",
-    desktopProtocol: "none",
-    credentialStoreMode: "isolated-secret-service",
-    subjectKind: "unpacked",
-    artifactDigest: options.artifactSha256,
-    developmentOnly: true,
+  const outcome = await innerStage("NATIVE_ROUND_TRIP_FAILED", async () => {
+    const context = qualification.createLinuxQualificationContext({
+      platform: "linux",
+      architecture: "x64",
+      sourceRevision: options.sourceRevision,
+      distribution: "debian-bookworm",
+      desktopProtocol: "none",
+      credentialStoreMode: "isolated-secret-service",
+      subjectKind: "unpacked",
+      artifactDigest: options.artifactSha256,
+      developmentOnly: true,
+    });
+    const result = await smoke.runLinuxSecretServiceQualificationSmoke({
+      qualificationContext: context,
+    });
+    if (result?.status !== "passed") fail("NATIVE_ROUND_TRIP_FAILED");
+    return result;
   });
-  const outcome = await smoke.runLinuxSecretServiceQualificationSmoke({
-    qualificationContext: context,
-  });
-  if (outcome?.status !== "passed") fail("SESSION_EXECUTION_FAILED");
+  if (outcome?.status !== "passed") fail("NATIVE_ROUND_TRIP_FAILED");
   return Object.freeze({
     schemaVersion: RECEIPT_SCHEMA,
     status: "passed",

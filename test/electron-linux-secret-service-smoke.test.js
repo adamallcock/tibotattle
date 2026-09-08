@@ -234,7 +234,7 @@ test("packaged Electron creates the isolated context only after the default-proo
   assert.equal(context.developmentOnly, true);
 });
 
-test("packaged Electron refuses non-Electron execution and daemon failure before context construction", async () => {
+test("packaged Electron emits bounded runtime and isolation stage failures before context construction", async () => {
   let daemonCalls = 0;
   let imports = 0;
   await assert.rejects(runLinuxPackagedSecretServiceSmokeInside({
@@ -251,7 +251,7 @@ test("packaged Electron refuses non-Electron execution and daemon failure before
     async digest() { return ASAR; },
     startDaemon() { daemonCalls += 1; return { status: "started" }; },
     async importModule() { imports += 1; return {}; },
-  }), smokeError("PACKAGED_ELECTRON_REQUIRED"));
+  }), smokeError("RUNTIME_IDENTITY_FAILED"));
   assert.equal(daemonCalls, 0);
   assert.equal(imports, 0);
 
@@ -269,9 +269,51 @@ test("packaged Electron refuses non-Electron execution and daemon failure before
     async digest() { return ASAR; },
     startDaemon() { daemonCalls += 1; throw new Error("canary"); },
     async importModule() { imports += 1; return {}; },
-  }), /canary/u);
+  }), smokeError("ISOLATION_FAILED"));
   assert.equal(daemonCalls, 1);
   assert.equal(imports, 0);
+});
+
+test("packaged Electron emits bounded module and native round-trip stage failures", async () => {
+  const options = {
+    appPath: APP,
+    sourceRevision: REVISION,
+    artifactSha256: ARTIFACT,
+  };
+  const runtime = {
+    platform: "linux",
+    architecture: "x64",
+    executable: APP,
+    environment: { ELECTRON_RUN_AS_NODE: "1" },
+    electronVersion: "43.2.0",
+    async canonicalize(path) { return path; },
+    async digest() { return ASAR; },
+    startDaemon() { return { status: "started" }; },
+  };
+  await assert.rejects(runLinuxPackagedSecretServiceSmokeInside(options, {
+    ...runtime,
+    async digest() { return { ...ASAR, sha256: "d".repeat(64) }; },
+    async importModule() { assert.fail("artifact mismatch must precede module loading"); },
+  }), smokeError("ARTIFACT_IDENTITY_FAILED"));
+
+  await assert.rejects(runLinuxPackagedSecretServiceSmokeInside(options, {
+    ...runtime,
+    async importModule() { throw new Error("private-module-path"); },
+  }), smokeError("MODULE_LOAD_FAILED"));
+
+  await assert.rejects(runLinuxPackagedSecretServiceSmokeInside(options, {
+    ...runtime,
+    async importModule(url) {
+      if (url.endsWith("linux-qualification.js")) {
+        return { createLinuxQualificationContext() { return Object.freeze({}); } };
+      }
+      return {
+        async runLinuxSecretServiceQualificationSmoke() {
+          throw new Error("private-native-detail");
+        },
+      };
+    },
+  }), smokeError("NATIVE_ROUND_TRIP_FAILED"));
 });
 
 class SessionChild extends EventEmitter {
@@ -367,6 +409,123 @@ test("outer session observes an immediate child error before async identity look
   }), smokeError("SESSION_EXECUTION_FAILED"));
 });
 
+test("outer session retains only bounded inner failure categories after owned cleanup", async () => {
+  const common = {
+    appPath: APP,
+    proveContainerIsolation() { return { status: "isolated" }; },
+    async listProcesses() { return []; },
+    async readSessionIdentity(pid) {
+      return { pid, executable: "/usr/bin/dbus-run-session", startTime: "12" };
+    },
+    async cleanup() { return true; },
+  };
+  let fixedMarkerError;
+  await assert.rejects(runLinuxPackagedSecretServiceSession(identity(), {
+    ...common,
+    spawnSession() {
+      return new SessionChild(null, {
+        code: 1,
+        stderr: "private-runtime-preamble\nELECTRON_LINUX_SECRET_SERVICE_SMOKE_NATIVE_ROUND_TRIP_FAILED\n",
+      });
+    },
+  }), (error) => {
+    fixedMarkerError = error;
+    return smokeError("NATIVE_ROUND_TRIP_FAILED")(error);
+  });
+  assert.equal(String(fixedMarkerError?.message).includes("private-runtime-preamble"), false);
+
+  await assert.rejects(runLinuxPackagedSecretServiceSession(identity(), {
+    ...common,
+    spawnSession() {
+      return new SessionChild(null, {
+        code: 1,
+        stderr: "Error [ERR_MODULE_NOT_FOUND]: private-module-path\n",
+      });
+    },
+  }), smokeError("MODULE_LOAD_FAILED"));
+
+  await assert.rejects(runLinuxPackagedSecretServiceSession(identity(), {
+    ...common,
+    spawnSession() {
+      return new SessionChild(null, {
+        code: 1,
+        stderr: "Error [ERR_DLOPEN_FAILED]: native loader detail\n",
+      });
+    },
+  }), smokeError("NATIVE_ROUND_TRIP_FAILED"));
+
+  let observed;
+  await assert.rejects(runLinuxPackagedSecretServiceSession(identity(), {
+    ...common,
+    spawnSession() {
+      return new SessionChild(null, {
+        code: 1,
+        stderr: "untrusted-private-secret ERR_NOT_ALLOWLISTED\n",
+      });
+    },
+  }), (error) => {
+    observed = error;
+    return error?.code === "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_SESSION_EXECUTION_FAILED";
+  });
+  assert.equal(String(observed?.message).includes("untrusted-private-secret"), false);
+});
+
+test("outer session rejects a passing child receipt that emits any stderr", async () => {
+  await assert.rejects(runLinuxPackagedSecretServiceSession(identity(), {
+    appPath: APP,
+    proveContainerIsolation() { return { status: "isolated" }; },
+    async listProcesses() { return []; },
+    spawnSession() { return new SessionChild(innerReceipt(), { stderr: "benign-looking warning\n" }); },
+    async readSessionIdentity(pid) {
+      return { pid, executable: "/usr/bin/dbus-run-session", startTime: "13" };
+    },
+    async cleanup() { return true; },
+  }), smokeError("PASS_RECEIPT_STDERR_REJECTED"));
+});
+
+test("outer failure receipt preserves only proved post-session cleanup evidence", async () => {
+  const handle = Object.freeze({ kind: "receipt" });
+  let written = null;
+  const result = await runLinuxPackagedSecretServiceSmoke({
+    appPath: APP,
+    stagedAppPath: STAGED,
+    packageReceiptPath: PACKAGE_RECEIPT,
+    sourceRevision: REVISION,
+    receiptPath: OUTPUT_RECEIPT,
+  }, {
+    async reserve() { return handle; },
+    async verifyPackage() { return identity(); },
+    async runSession(currentIdentity, { appPath }) {
+      return runLinuxPackagedSecretServiceSession(currentIdentity, {
+        appPath,
+        proveContainerIsolation() { return { status: "isolated" }; },
+        async listProcesses() { return []; },
+        spawnSession() {
+          return new SessionChild(null, {
+            code: 1,
+            stderr: "private-preamble\nELECTRON_LINUX_SECRET_SERVICE_SMOKE_NATIVE_ROUND_TRIP_FAILED\n",
+          });
+        },
+        async readSessionIdentity(pid) {
+          return { pid, executable: "/usr/bin/dbus-run-session", startTime: "14" };
+        },
+        async cleanup() { return true; },
+      });
+    },
+    async write(receiptHandle, receipt) {
+      assert.equal(receiptHandle, handle);
+      written = receipt;
+    },
+  });
+  assert.equal(result.status, "failed");
+  assert.equal(result.errorCode, "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_NATIVE_ROUND_TRIP_FAILED");
+  assert.equal(result.packageArtifactVerified, true);
+  assert.equal(result.packagedElectronExecutionVerified, false);
+  assert.equal(result.credentialLifecycleVerified, false);
+  assert.equal(result.sessionCleanupConfirmed, true);
+  assert.equal(JSON.stringify(written).includes("private-preamble"), false);
+});
+
 test("outer smoke persists only a content-free failure receipt when package verification fails", async () => {
   let sessionCalls = 0;
   let written = null;
@@ -393,12 +552,12 @@ test("outer smoke persists only a content-free failure receipt when package veri
   assert.equal(result.status, "failed");
   assert.equal(result.errorCode, "ELECTRON_LINUX_SECRET_SERVICE_SMOKE_FAILED");
   assert.equal(result.packageArtifactVerified, false);
-  assert.equal(result.packagedElectronExecuted, false);
+  assert.equal(result.packagedElectronExecutionVerified, false);
   assert.equal(result.productionReady, false);
   assert.equal(JSON.stringify(written).includes("private-canary"), false);
   assert.deepEqual(Object.keys(written).sort(), [
     "schemaVersion", "status", "scope", "target", "sourceRevision", "artifactSha256",
-    "packageArtifactVerified", "packagedElectronExecuted", "credentialLifecycleVerified",
+    "packageArtifactVerified", "packagedElectronExecutionVerified", "credentialLifecycleVerified",
     "sessionCleanupConfirmed", "errorCode", "productionReady",
   ].sort());
 });
