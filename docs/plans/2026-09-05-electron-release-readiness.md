@@ -67,7 +67,7 @@ scoped to the existing Linux/x64 quit-only smoke control and captures no raw
 process output, paths or credentials. It does not change startup or success
 criteria. Neither normal application journey is qualified yet.
 
-Latest completed native candidate: `5d0774fb`,
+Earlier native candidate: `5d0774fb`,
 [run 34269016362](https://github.com/adamallcock/tibotattle/actions/runs/34269016362).
 Both Mac package/artifact jobs, Windows development packaging and a seventh
 fresh Windows NSIS lifecycle pass. Normal Windows again passes package
@@ -86,6 +86,46 @@ The next isolated diagnostic distinguishes dashboard load rejection,
 main-frame load failure and renderer-process loss using fixed categories;
 these currently converge on the same startup recovery handler. The renderer
 crash/shared-memory explanation remains a hypothesis until that test runs.
+
+Latest completed native candidate: `90991288`,
+[run 34271211699](https://github.com/adamallcock/tibotattle/actions/runs/34271211699).
+Both Mac package/artifact jobs, Windows development packaging and an eighth
+fresh Windows NSIS lifecycle pass. The Windows sharing-test repair is confirmed:
+normal setup now reaches outbound firewall preparation, which exceeds its
+20-second command bound. The runner gives only firewall create/readback and
+remove/readback a separate 60-second bound; exact rule verification remains
+mandatory before launch. That adjustment still requires native verification.
+The Windows receipt SHA-256 is
+`ec6adc43fb2d6a995f8ba6177a9fb65d32d1535a051d418e87422a1082ca5979`.
+Linux again stops its companion cleanly and records no dashboard load failure;
+receipt SHA-256
+`583d8148d7f47dad1d9f5c5e550b66083a0a93cabec6e502937eded6622d1d0f`.
+Source inspection identifies a separate post-window startup defect: the runtime
+selects Electron's built-in `autoUpdater` ahead of `electron-updater`, then
+requires `downloadUpdate`, which the built-in adapter does not provide. The
+resulting exception reaches the main entry's quit handler. The shared repair
+must select the bundled updater library explicitly on every production target;
+the Windows/Linux native journeys must then be rerun. Corrected unsigned Mac
+handover fixtures must also include this repair before signing. The older
+`19c63f7b` unsigned candidates are superseded for readiness purposes; they must
+not be signed on the basis of their pending request.
+
+The updater selection repair is integrated and frozen at `d8845172`. Its new
+runtime regression fails against the preceding source at the real updater
+contract check and passes with the fix. An earlier owning runtime run passed all
+44 tests; a separate worktree rerun now reports four accountless child-readiness
+failures. Their cause is under investigation and that rerun is not presented as
+passing. Corrected unsigned Mac source candidates for `.3`/`.4` on both Mac
+architectures are prepared from `d8845172`. All 49 focused Mac tests pass;
+root independently verifies all four receipt hashes, staged updater/verifier
+source, candidate versions and thin native helper/adapter architectures.
+Signing/notarization of this corrected source remains a separate pending step.
+Windows firewall preparation now uses the direct COM API at `17807be8`, retaining
+strict rule ownership, outbound blocking and readback requirements. Its 20
+focused checks pass; native proof is pending. Mac preparation proceeds
+independently while native Windows/Linux tests qualify the shared application.
+A harness failure is recorded separately from an app defect; neither is
+silently relabelled as a successful release gate.
 
 1. Close the real native Mac -> signed Electron -> next signed Electron
    installed rehearsal. The original signed private fixtures exposed the
