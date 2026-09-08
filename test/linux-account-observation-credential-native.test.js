@@ -124,7 +124,9 @@ test("native Linux account-observation credential refuses an absent retained int
   // This root must observe absence before it receives a valid digest-only
   // intent. The read below cannot recreate the candidate, because that value
   // was deliberately not persisted with the digest.
+  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_INITIAL_READ");
   assert.equal(await absentBackend.read(capability), null);
+  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_ABSENT_INTENT");
   let absentIntent = operationJournal(absentCandidate);
   try {
     await writeOwnerOnlyFile(absentPaths.operationJournal, absentIntent);
@@ -146,16 +148,20 @@ test("native Linux account-observation credential refuses an absent retained int
   process.env.XDG_STATE_HOME = successStateBase;
   const backend = createLinuxAccountObservationCredentialBackend();
 
+  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE");
   assert.equal(await backend.read(capability), null);
   assert.equal(await backend.createIfMissing(capability, first), "created");
+  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_READBACK");
   const stored = await backend.read(capability);
   equalSecret(stored, first);
   stored.fill(0);
+  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_NO_REPLACE");
   assert.equal(await backend.createIfMissing(capability, different), "existing");
   const retained = await backend.read(capability);
   equalSecret(retained, first);
   retained.fill(0);
 
+  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_MATCHING_INTENT");
   let settled = operationJournal(first);
   try {
     await writeOwnerOnlyFile(paths.operationJournal, settled);
@@ -174,6 +180,7 @@ test("native Linux account-observation credential refuses an absent retained int
   // Model a crash after recovery removed a matching digest intent and before
   // its final active-to-normal settlement. The durable active fence must keep
   // the exact existing Secret Service record from being silently adopted.
+  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_INTERRUPTED_REMOVAL");
   const interruptedPaths = await prepareOwnerPrivateState(interruptedStateBase);
   process.env.XDG_STATE_HOME = interruptedStateBase;
   const interruptedBackend = createLinuxAccountObservationCredentialBackend();
@@ -210,6 +217,7 @@ test("native Linux account-observation credential refuses an absent retained int
   );
 
   process.env.XDG_STATE_HOME = successStateBase;
+  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_MISMATCHED_INTENT");
   let unresolved = operationJournal(different);
   try {
     await writeOwnerOnlyFile(paths.operationJournal, unresolved);
