@@ -4,6 +4,7 @@ import { once } from "node:events";
 import {
   chmod,
   chown,
+  link,
   lstat,
   mkdir,
   mkdtemp,
@@ -55,6 +56,67 @@ const DEFAULT_STATE_TEST_ENABLED = NATIVE_TEST_ENABLED
   && process.env.HOME === "/home/node"
   && typeof process.getuid === "function"
   && process.getuid() === 1_000;
+const ACCOUNTLESS_OPERATION_JOURNAL = "accountless-operation-4-v2";
+const ACCOUNTLESS_CREATE_TEMPORARY = ".accountless-create-4-v2";
+const ACCOUNTLESS_DELETE_TEMPORARY = ".accountless-delete-4-v2";
+const ACCOUNTLESS_OPERATION_MAGIC = Buffer.from([
+  0x54, 0x49, 0x42, 0x4f, 0x54, 0x41, 0x54, 0x54,
+  0x4c, 0x45, 0x2d, 0x46, 0x44, 0x33, 0x00, 0x00,
+]);
+const ACCOUNTLESS_OPERATION_CREATE = 1;
+const ACCOUNTLESS_OPERATION_DELETE = 2;
+
+function fixedAccountlessOperationJournal(operation, value) {
+  assert.equal(Buffer.isBuffer(value), true);
+  assert.equal(value.length, 32);
+  const journal = Buffer.alloc(64);
+  ACCOUNTLESS_OPERATION_MAGIC.copy(journal, 0);
+  journal[16] = 2;
+  journal[17] = operation;
+  value.copy(journal, 32);
+  return journal;
+}
+
+function accountlessFixturePaths(stateBase) {
+  const applicationDirectory = join(stateBase, "app-usagemonitor");
+  const mutexDirectory = join(applicationDirectory, "linux-credential-mutex-v1");
+  const credentialDirectory = join(
+    applicationDirectory,
+    "linux-accountless-installation-credential-v1",
+  );
+  return {
+    applicationDirectory,
+    mutexDirectory,
+    credentialDirectory,
+    legacyJournal: join(mutexDirectory, "journal-4-v1"),
+    operationJournal: join(mutexDirectory, ACCOUNTLESS_OPERATION_JOURNAL),
+    record: join(credentialDirectory, "accountless-installation-credential-v1"),
+    createTemporary: join(credentialDirectory, ACCOUNTLESS_CREATE_TEMPORARY),
+    deleteTemporary: join(credentialDirectory, ACCOUNTLESS_DELETE_TEMPORARY),
+  };
+}
+
+async function prepareFixedAccountlessFixture(binding, stateBase) {
+  const paths = accountlessFixturePaths(stateBase);
+  await Promise.all([
+    ownerOnlyDirectory(stateBase),
+    ownerOnlyDirectory(paths.applicationDirectory),
+    ownerOnlyDirectory(paths.mutexDirectory),
+    ownerOnlyDirectory(paths.credentialDirectory),
+  ]);
+  process.env.XDG_STATE_HOME = stateBase;
+  assert.equal(binding.readAccountlessInstallationCredential(), null);
+  assert.equal(
+    await readFile(paths.legacyJournal, "utf8"),
+    "linux-credential-mutex-journal-v1:normal\n",
+  );
+  return paths;
+}
+
+async function writeOwnerOnlyFile(path, bytes) {
+  await writeFile(path, bytes, { mode: 0o600 });
+  await chmod(path, 0o600);
+}
 
 function runChild(mode, capabilityId, environment) {
   return spawnSync(process.execPath, [CHILD, mode, String(capabilityId)], {
@@ -417,6 +479,294 @@ test("native Linux mutex uses a socket primary lease, preserves crash state, and
     () => binding.acquireCredentialMutex(3),
     (error) => error?.code === "LINUX_CREDENTIAL_MUTEX_STATE_INVALID",
   );
+});
+
+test("native Linux accountless v2 journal replays only modeled fixed-record states", {
+  skip: !NATIVE_TEST_ENABLED,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-linux-accountless-v2-"));
+  const previousState = process.env.XDG_STATE_HOME;
+  t.after(async () => {
+    if (previousState === undefined) delete process.env.XDG_STATE_HOME;
+    else process.env.XDG_STATE_HOME = previousState;
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const binding = loadLinuxCredentialMutexBinding();
+
+  async function fixture(name) {
+    return prepareFixedAccountlessFixture(binding, join(root, name, "state"));
+  }
+
+  async function assertFixedRecoveryRefusal(paths) {
+    assert.throws(
+      () => binding.readAccountlessInstallationCredential(),
+      (error) => error?.code === "LINUX_ACCOUNTLESS_CREDENTIAL_RECOVERY_REQUIRED",
+    );
+    assert.equal(
+      await readFile(paths.legacyJournal, "utf8"),
+      "linux-credential-mutex-journal-v1:active\n",
+    );
+  }
+
+  async function assertCreateReplay(name, stage) {
+    const paths = await fixture(name);
+    const candidate = Buffer.alloc(32, 0x41 + stage.length);
+    const journal = fixedAccountlessOperationJournal(
+      ACCOUNTLESS_OPERATION_CREATE,
+      candidate,
+    );
+    await writeOwnerOnlyFile(paths.operationJournal, journal);
+    journal.fill(0);
+    if (stage === "temporary") {
+      await writeOwnerOnlyFile(paths.createTemporary, candidate);
+    } else if (stage === "published") {
+      await writeOwnerOnlyFile(paths.record, candidate);
+    } else {
+      assert.equal(stage, "prepared");
+    }
+    const recovered = binding.readAccountlessInstallationCredential();
+    assert.deepEqual(recovered, candidate);
+    recovered.fill(0);
+    assert.deepEqual(await readFile(paths.record), candidate);
+    await Promise.all([
+      assertMissing(paths.operationJournal),
+      assertMissing(paths.createTemporary),
+      assertMissing(paths.deleteTemporary),
+    ]);
+    candidate.fill(0);
+  }
+
+  async function assertDeleteReplay(name, stage) {
+    const paths = await fixture(name);
+    const expected = Buffer.alloc(32, 0x61 + stage.length);
+    const journal = fixedAccountlessOperationJournal(
+      ACCOUNTLESS_OPERATION_DELETE,
+      expected,
+    );
+    await writeOwnerOnlyFile(paths.operationJournal, journal);
+    journal.fill(0);
+    if (stage === "before-rename") {
+      await writeOwnerOnlyFile(paths.record, expected);
+    } else if (stage === "after-rename") {
+      await writeOwnerOnlyFile(paths.deleteTemporary, expected);
+    } else {
+      assert.equal(stage, "after-unlink");
+    }
+    assert.equal(binding.readAccountlessInstallationCredential(), null);
+    await Promise.all([
+      assertMissing(paths.operationJournal),
+      assertMissing(paths.record),
+      assertMissing(paths.createTemporary),
+      assertMissing(paths.deleteTemporary),
+    ]);
+    expected.fill(0);
+  }
+
+  await t.test("replays create before temporary creation", async () => {
+    await assertCreateReplay("create-prepared", "prepared");
+  });
+  await t.test("replays create after temporary creation", async () => {
+    await assertCreateReplay("create-temporary", "temporary");
+  });
+  await t.test("settles create after publication", async () => {
+    await assertCreateReplay("create-published", "published");
+  });
+  await t.test("replays delete before rename", async () => {
+    await assertDeleteReplay("delete-before-rename", "before-rename");
+  });
+  await t.test("replays delete after rename", async () => {
+    await assertDeleteReplay("delete-after-rename", "after-rename");
+  });
+  await t.test("settles delete after unlink", async () => {
+    await assertDeleteReplay("delete-after-unlink", "after-unlink");
+  });
+
+  await t.test("refuses either orphaned fixed residue without a v2 intent", async () => {
+    for (const [name, property] of [
+      ["orphan-create", "createTemporary"],
+      ["orphan-delete", "deleteTemporary"],
+    ]) {
+      const paths = await fixture(name);
+      const residue = Buffer.alloc(32, name.length);
+      await writeOwnerOnlyFile(paths[property], residue);
+      assert.throws(
+        () => binding.readAccountlessInstallationCredential(),
+        (error) => error?.code === "LINUX_ACCOUNTLESS_CREDENTIAL_RECOVERY_REQUIRED",
+      );
+      assert.equal(
+        await readFile(paths.legacyJournal, "utf8"),
+        "linux-credential-mutex-journal-v1:active\n",
+      );
+      assert.deepEqual(await readFile(paths[property]), residue);
+      residue.fill(0);
+    }
+  });
+
+  await t.test("retains mismatched or cross-operation v2 state for refusal", async () => {
+    const mismatch = await fixture("mismatched-v2");
+    const intended = Buffer.alloc(32, 0x7a);
+    const foreign = Buffer.alloc(32, 0x7b);
+    const mismatchJournal = fixedAccountlessOperationJournal(
+      ACCOUNTLESS_OPERATION_CREATE,
+      intended,
+    );
+    await writeOwnerOnlyFile(mismatch.operationJournal, mismatchJournal);
+    await writeOwnerOnlyFile(mismatch.record, foreign);
+    assert.throws(
+      () => binding.readAccountlessInstallationCredential(),
+      (error) => error?.code === "LINUX_ACCOUNTLESS_CREDENTIAL_RECOVERY_REQUIRED",
+    );
+    assert.deepEqual(await readFile(mismatch.operationJournal), mismatchJournal);
+    assert.equal(
+      await readFile(mismatch.legacyJournal, "utf8"),
+      "linux-credential-mutex-journal-v1:active\n",
+    );
+    mismatchJournal.fill(0);
+    intended.fill(0);
+    foreign.fill(0);
+
+    const crossOperation = await fixture("cross-operation-v2");
+    const candidate = Buffer.alloc(32, 0x7c);
+    const crossJournal = fixedAccountlessOperationJournal(
+      ACCOUNTLESS_OPERATION_CREATE,
+      candidate,
+    );
+    await writeOwnerOnlyFile(crossOperation.operationJournal, crossJournal);
+    await writeOwnerOnlyFile(crossOperation.deleteTemporary, candidate);
+    assert.throws(
+      () => binding.readAccountlessInstallationCredential(),
+      (error) => error?.code === "LINUX_ACCOUNTLESS_CREDENTIAL_RECOVERY_REQUIRED",
+    );
+    assert.deepEqual(await readFile(crossOperation.operationJournal), crossJournal);
+    assert.equal(
+      await readFile(crossOperation.legacyJournal, "utf8"),
+      "linux-credential-mutex-journal-v1:active\n",
+    );
+    crossJournal.fill(0);
+    candidate.fill(0);
+  });
+
+  await t.test("refuses malformed v2 intent without clearing it", async () => {
+    const paths = await fixture("malformed-v2");
+    const malformed = Buffer.alloc(64);
+    ACCOUNTLESS_OPERATION_MAGIC.copy(malformed, 0);
+    malformed[16] = 2;
+    malformed[17] = ACCOUNTLESS_OPERATION_CREATE;
+    malformed[18] = 1;
+    await writeOwnerOnlyFile(paths.operationJournal, malformed);
+    assert.throws(
+      () => binding.readAccountlessInstallationCredential(),
+      (error) => error?.code === "LINUX_ACCOUNTLESS_CREDENTIAL_RECOVERY_REQUIRED",
+    );
+    assert.deepEqual(await readFile(paths.operationJournal), malformed);
+    assert.equal(
+      await readFile(paths.legacyJournal, "utf8"),
+      "linux-credential-mutex-journal-v1:active\n",
+    );
+    malformed.fill(0);
+  });
+
+  await t.test("refuses torn or noncanonical v2 journal bytes without clearing them", async () => {
+    const seed = Buffer.alloc(32, 0x65);
+    const canonical = fixedAccountlessOperationJournal(
+      ACCOUNTLESS_OPERATION_CREATE,
+      seed,
+    );
+    const cases = [
+      ["truncated", Buffer.from(canonical.subarray(0, 63))],
+      ["extra-byte", Buffer.concat([canonical, Buffer.from([0])])],
+      ["bad-version", Buffer.from(canonical)],
+      ["reserved", Buffer.from(canonical)],
+    ];
+    cases[2][1][16] = 3;
+    cases[3][1][31] = 1;
+    for (const [name, bytes] of cases) {
+      const paths = await fixture(`journal-${name}`);
+      await writeOwnerOnlyFile(paths.operationJournal, bytes);
+      await assertFixedRecoveryRefusal(paths);
+      assert.deepEqual(await readFile(paths.operationJournal), bytes);
+      bytes.fill(0);
+    }
+    canonical.fill(0);
+    seed.fill(0);
+  });
+
+  await t.test("refuses unsafe v2 journal inode and mode states without clearing evidence", async () => {
+    const seed = Buffer.alloc(32, 0x66);
+    const canonical = fixedAccountlessOperationJournal(
+      ACCOUNTLESS_OPERATION_CREATE,
+      seed,
+    );
+
+    const modePaths = await fixture("journal-mode");
+    await writeOwnerOnlyFile(modePaths.operationJournal, canonical);
+    await chmod(modePaths.operationJournal, 0o640);
+    await assertFixedRecoveryRefusal(modePaths);
+    assert.equal((await stat(modePaths.operationJournal)).mode & 0o777, 0o640);
+
+    const hardLinkPaths = await fixture("journal-hard-link");
+    await writeOwnerOnlyFile(hardLinkPaths.operationJournal, canonical);
+    const hardLinkPath = join(hardLinkPaths.mutexDirectory, "operation-journal-linked");
+    await link(hardLinkPaths.operationJournal, hardLinkPath);
+    await assertFixedRecoveryRefusal(hardLinkPaths);
+    assert.equal((await stat(hardLinkPaths.operationJournal)).nlink, 2);
+    assert.deepEqual(await readFile(hardLinkPaths.operationJournal), canonical);
+
+    const symlinkPaths = await fixture("journal-symlink");
+    const target = join(symlinkPaths.mutexDirectory, "operation-journal-target");
+    await writeOwnerOnlyFile(target, canonical);
+    await symlink(target, symlinkPaths.operationJournal);
+    await assertFixedRecoveryRefusal(symlinkPaths);
+    assert.equal((await lstat(symlinkPaths.operationJournal)).isSymbolicLink(), true);
+    assert.deepEqual(await readFile(target), canonical);
+
+    canonical.fill(0);
+    seed.fill(0);
+  });
+
+  await t.test("refuses malformed or unsafe fixed residue without an intent", async () => {
+    const malformedPaths = await fixture("residue-malformed");
+    const malformed = Buffer.alloc(31, 0x67);
+    await writeOwnerOnlyFile(malformedPaths.createTemporary, malformed);
+    await assertFixedRecoveryRefusal(malformedPaths);
+    assert.deepEqual(await readFile(malformedPaths.createTemporary), malformed);
+    malformed.fill(0);
+
+    const modePaths = await fixture("residue-mode");
+    const unsafeMode = Buffer.alloc(32, 0x68);
+    await writeOwnerOnlyFile(modePaths.deleteTemporary, unsafeMode);
+    await chmod(modePaths.deleteTemporary, 0o640);
+    await assertFixedRecoveryRefusal(modePaths);
+    assert.equal((await stat(modePaths.deleteTemporary)).mode & 0o777, 0o640);
+    assert.deepEqual(await readFile(modePaths.deleteTemporary), unsafeMode);
+    unsafeMode.fill(0);
+  });
+
+  await t.test("refuses later access after modeled settlement uncertainty", async () => {
+    const paths = await fixture("settlement-uncertain");
+    const finalValue = Buffer.alloc(32, 0x7d);
+    // Model the only safe observable postcondition after v2 unlink succeeded
+    // but its directory fsync or descriptor close was uncertain: no v2 name,
+    // an exact final record, and the retained legacy refusal marker. This does
+    // not claim a process-kill or power-loss simulation.
+    await writeOwnerOnlyFile(paths.record, finalValue);
+    await writeOwnerOnlyFile(
+      paths.legacyJournal,
+      "linux-credential-mutex-journal-v1:active\n",
+    );
+    await assertMissing(paths.operationJournal);
+    assert.throws(
+      () => binding.readAccountlessInstallationCredential(),
+      (error) => error?.code === "LINUX_ACCOUNTLESS_CREDENTIAL_RECOVERY_REQUIRED",
+    );
+    assert.deepEqual(await readFile(paths.record), finalValue);
+    assert.equal(
+      await readFile(paths.legacyJournal, "utf8"),
+      "linux-credential-mutex-journal-v1:active\n",
+    );
+    finalValue.fill(0);
+  });
 });
 
 test("native Linux credential state bootstrap creates only fixed absent paths and refuses unsafe state", {

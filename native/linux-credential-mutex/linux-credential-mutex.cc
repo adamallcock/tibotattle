@@ -9,7 +9,6 @@
 #include <linux/fs.h>
 #include <linux/openat2.h>
 #include <pwd.h>
-#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -45,12 +44,35 @@ constexpr char kAccountlessCredentialDirectory[] =
     "linux-accountless-installation-credential-v1";
 constexpr char kAccountlessCredentialFile[] =
     "accountless-installation-credential-v1";
+// This is a fixed, private intent record for slot four only. It deliberately
+// lives beside the legacy mutex journal rather than widening that generic
+// 0..3 format or API.
+constexpr char kAccountlessOperationJournalFile[] =
+    "accountless-operation-4-v2";
+constexpr char kAccountlessCreateTemporaryFile[] =
+    ".accountless-create-4-v2";
+constexpr char kAccountlessDeleteTemporaryFile[] =
+    ".accountless-delete-4-v2";
 constexpr char kSocketNamespace[] = "app-usagemonitor/linux-credential-mutex-v1";
 constexpr char kJournalActiveText[] = "linux-credential-mutex-journal-v1:active\n";
 constexpr char kJournalNormalText[] = "linux-credential-mutex-journal-v1:normal\n";
 constexpr std::size_t kMaximumPathBytes = 4096;
 constexpr std::size_t kMaximumPasswordRecordBytes = 1024 * 1024;
 constexpr std::size_t kAccountlessCredentialBytes = 32;
+constexpr std::size_t kAccountlessOperationJournalBytes = 64;
+constexpr std::size_t kAccountlessOperationJournalMagicBytes = 16;
+constexpr std::size_t kAccountlessOperationJournalVersionOffset = 16;
+constexpr std::size_t kAccountlessOperationJournalOperationOffset = 17;
+constexpr std::size_t kAccountlessOperationJournalReservedStart = 18;
+constexpr std::size_t kAccountlessOperationJournalValueOffset = 32;
+constexpr unsigned char kAccountlessOperationJournalVersion = 2;
+// Exact binary bytes: the printable namespace is deliberately terminated and
+// padded instead of relying on a C string's implicit trailing byte.
+constexpr std::array<unsigned char, kAccountlessOperationJournalMagicBytes>
+    kAccountlessOperationJournalMagic {{
+        'T', 'I', 'B', 'O', 'T', 'A', 'T', 'T',
+        'L', 'E', '-', 'F', 'D', '3', '\0', '\0',
+    }};
 
 static_assert(
     sizeof(kJournalActiveText) == sizeof(kJournalNormalText),
@@ -84,6 +106,8 @@ struct NativeLease {
   int persistent_state_fd = -1;
   int journal_fd = -1;
   FileIdentity journal_identity {};
+  int accountless_operation_journal_fd = -1;
+  FileIdentity accountless_operation_journal_identity {};
   int capability_id = -1;
   bool abandoned = false;
   bool active = true;
@@ -92,6 +116,10 @@ struct NativeLease {
   // mutation or when an unsafe record must be latched for recovery. Generic
   // FD4 leases retain their existing eager-marker behavior.
   bool accountless_active_marker_written = false;
+  // A complete v2 fixed intent is recoverable under the same private socket.
+  // It is never rewritten or replaced after creation; failure leaves it for a
+  // later exact replay rather than falling back to the generic v1 marker.
+  bool accountless_operation_journal_written = false;
 };
 
 enum class JournalState {
@@ -200,6 +228,15 @@ bool IsOwnerRegularFile(const struct stat& metadata) {
     return false;
   }
   return (metadata.st_mode & 0777) == 0600;
+}
+
+// Directory descriptors are retained across the fixed replay flow, but each
+// mutation rechecks the opened directory's owner-only mode before it acts.
+bool VerifyOwnerPrivateDirectory(int fd) {
+  struct stat metadata {};
+  return fd >= 0
+      && fstat(fd, &metadata) == 0
+      && IsOwnerDirectory(metadata, true);
 }
 
 bool CaptureRegularFileIdentity(int fd, FileIdentity* identity) {
@@ -825,7 +862,9 @@ AccountlessRecordState ReadAccountlessRecordNamed(
     int credential_directory_fd,
     const char* name,
     AccountlessRecord* result) {
-  if (credential_directory_fd < 0 || name == nullptr || result == nullptr) {
+  if (!VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || name == nullptr
+      || result == nullptr) {
     return AccountlessRecordState::kUnavailable;
   }
   result->bytes.fill(0);
@@ -893,7 +932,8 @@ bool NamedRecordMatches(
     const char* name,
     const FileIdentity& identity) {
   struct stat named {};
-  return fstatat(
+  return VerifyOwnerPrivateDirectory(credential_directory_fd)
+      && fstatat(
              credential_directory_fd,
              name,
              &named,
@@ -902,47 +942,13 @@ bool NamedRecordMatches(
       && MatchesIdentity(named, identity);
 }
 
-bool FillRandomBytes(unsigned char* bytes, std::size_t length) {
-  if (bytes == nullptr || length == 0) return false;
-  std::size_t offset = 0;
-  while (offset < length) {
-    const ssize_t count = getrandom(
-        bytes + offset,
-        length - offset,
-        GRND_NONBLOCK);
-    if (count < 0 && errno == EINTR) continue;
-    if (count <= 0) return false;
-    offset += static_cast<std::size_t>(count);
-  }
-  return true;
-}
-
-bool TransientRecordName(
-    const char* operation,
-    char* output,
-    std::size_t length) {
-  if (operation == nullptr || output == nullptr || length < 64) return false;
-  std::array<unsigned char, 12> random {};
-  if (!FillRandomBytes(random.data(), random.size())) return false;
-  const int written = snprintf(
-      output,
-      length,
-      ".accountless-%s-%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x-v1",
-      operation,
-      random[0], random[1], random[2], random[3], random[4], random[5],
-      random[6], random[7], random[8], random[9], random[10], random[11]);
-  random.fill(0);
-  return written > 0 && static_cast<std::size_t>(written) < length;
-}
-
-// Return a pinned, newly-created temporary record, `-1` if the O_EXCL call
-// did not create anything, and `-2` after the inode exists but could not be
-// normalized. The caller generates the opaque name before it marks its
-// journal active, so entropy and name-generation failures remain retryable.
+// Return a pinned, newly-created fixed operation residue. The slot-four
+// abstract socket serialises normal callers; O_EXCL means a stale or foreign
+// residue can never be overwritten or silently adopted.
 int CreateTransientRecord(
     int credential_directory_fd,
     const char* name) {
-  if (credential_directory_fd < 0 || name == nullptr) return -1;
+  if (!VerifyOwnerPrivateDirectory(credential_directory_fd) || name == nullptr) return -1;
   const int fd = openat(
       credential_directory_fd,
       name,
@@ -962,7 +968,8 @@ bool WriteTransientAccountlessRecord(
     int record_fd,
     const std::array<unsigned char, kAccountlessCredentialBytes>& value) {
   FileIdentity identity {};
-  return CaptureRegularFileIdentity(record_fd, &identity)
+  return VerifyOwnerPrivateDirectory(credential_directory_fd)
+      && CaptureRegularFileIdentity(record_fd, &identity)
       && VerifyNamedRegularFileContinuity(
           credential_directory_fd,
           name,
@@ -984,6 +991,11 @@ bool RenameNoReplace(
     int directory_fd,
     const char* source,
     const char* destination) {
+  if (!VerifyOwnerPrivateDirectory(directory_fd)
+      || source == nullptr
+      || destination == nullptr) {
+    return false;
+  }
 #if defined(SYS_renameat2)
   return syscall(
              SYS_renameat2,
@@ -998,11 +1010,645 @@ bool RenameNoReplace(
 #endif
 }
 
+enum class AccountlessOperation {
+  kCreate = 1,
+  kDelete = 2,
+  kInvalid,
+};
+
+struct AccountlessOperationJournal {
+  AccountlessOperation operation = AccountlessOperation::kInvalid;
+  std::array<unsigned char, kAccountlessCredentialBytes> value {};
+};
+
+enum class AccountlessOperationJournalOpenOutcome {
+  kMissing,
+  kOpened,
+  kInvalid,
+};
+
+enum class AccountlessOperationJournalRemoveOutcome {
+  kRemoved,
+  // unlinkat may have committed even though the following directory fsync
+  // failed. The caller must report uncertainty and inspect observed state on a
+  // later invocation; it must never recreate an intent record.
+  kUncertain,
+  kInvalid,
+};
+
+enum class AccountlessOperationRecoveryOutcome {
+  kRecovered,
+  kUnavailable,
+  kAmbiguous,
+  kUncertain,
+};
+
+void ClearAccountlessRecord(AccountlessRecord* record) {
+  if (record == nullptr) return;
+  record->bytes.fill(0);
+  record->identity = FileIdentity {};
+}
+
+void ClearAccountlessOperationJournal(AccountlessOperationJournal* journal) {
+  if (journal == nullptr) return;
+  journal->value.fill(0);
+  journal->operation = AccountlessOperation::kInvalid;
+}
+
+bool VerifyAccountlessOperationJournalContinuity(
+    int state_fd,
+    int journal_fd,
+    const FileIdentity& identity) {
+  struct stat opened {};
+  struct stat named {};
+  return VerifyOwnerPrivateDirectory(state_fd)
+      && fstat(journal_fd, &opened) == 0
+      && IsOwnerRegularFile(opened)
+      && MatchesIdentity(opened, identity)
+      && fstatat(
+             state_fd,
+             kAccountlessOperationJournalFile,
+             &named,
+             AT_SYMLINK_NOFOLLOW) == 0
+      && IsOwnerRegularFile(named)
+      && MatchesIdentity(named, identity);
+}
+
+AccountlessOperationJournalOpenOutcome OpenAccountlessOperationJournal(
+    int state_fd,
+    int* journal_fd,
+    FileIdentity* identity) {
+  if (journal_fd == nullptr || identity == nullptr || !VerifyOwnerPrivateDirectory(state_fd)) {
+    return AccountlessOperationJournalOpenOutcome::kInvalid;
+  }
+  *journal_fd = -1;
+  *identity = FileIdentity {};
+  const int fd = openat(
+      state_fd,
+      kAccountlessOperationJournalFile,
+      O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) {
+    return errno == ENOENT
+        ? AccountlessOperationJournalOpenOutcome::kMissing
+        : AccountlessOperationJournalOpenOutcome::kInvalid;
+  }
+  if (!CaptureRegularFileIdentity(fd, identity)
+      || !VerifyAccountlessOperationJournalContinuity(state_fd, fd, *identity)) {
+    close(fd);
+    *identity = FileIdentity {};
+    return AccountlessOperationJournalOpenOutcome::kInvalid;
+  }
+  *journal_fd = fd;
+  return AccountlessOperationJournalOpenOutcome::kOpened;
+}
+
+bool ReadAccountlessOperationJournal(
+    int state_fd,
+    int journal_fd,
+    const FileIdentity& identity,
+    AccountlessOperationJournal* result) {
+  if (result == nullptr) return false;
+  ClearAccountlessOperationJournal(result);
+  std::array<unsigned char, kAccountlessOperationJournalBytes> bytes {};
+  unsigned char trailing = 0;
+  bool valid = false;
+  do {
+    if (!VerifyAccountlessOperationJournalContinuity(state_fd, journal_fd, identity)
+        || lseek(journal_fd, 0, SEEK_SET) < 0
+        || !ReadAll(
+            journal_fd,
+            reinterpret_cast<char*>(bytes.data()),
+            bytes.size())) {
+      break;
+    }
+    ssize_t trailing_count = 0;
+    do {
+      trailing_count = read(journal_fd, &trailing, 1);
+    } while (trailing_count < 0 && errno == EINTR);
+    if (trailing_count != 0
+        || std::memcmp(
+               bytes.data(),
+               kAccountlessOperationJournalMagic.data(),
+               kAccountlessOperationJournalMagic.size()) != 0
+        || bytes[kAccountlessOperationJournalVersionOffset]
+            != kAccountlessOperationJournalVersion
+        || (bytes[kAccountlessOperationJournalOperationOffset]
+                != static_cast<unsigned char>(AccountlessOperation::kCreate)
+            && bytes[kAccountlessOperationJournalOperationOffset]
+                != static_cast<unsigned char>(AccountlessOperation::kDelete))) {
+      break;
+    }
+    bool reserved_zero = true;
+    for (std::size_t index = kAccountlessOperationJournalReservedStart;
+         index < kAccountlessOperationJournalValueOffset;
+         ++index) {
+      reserved_zero = reserved_zero && bytes[index] == 0;
+    }
+    if (!reserved_zero
+        || !VerifyAccountlessOperationJournalContinuity(state_fd, journal_fd, identity)) {
+      break;
+    }
+    result->operation = static_cast<AccountlessOperation>(
+        bytes[kAccountlessOperationJournalOperationOffset]);
+    std::memcpy(
+        result->value.data(),
+        bytes.data() + kAccountlessOperationJournalValueOffset,
+        result->value.size());
+    valid = true;
+  } while (false);
+  bytes.fill(0);
+  trailing = 0;
+  if (!valid) ClearAccountlessOperationJournal(result);
+  return valid;
+}
+
+bool CreateAccountlessOperationJournal(
+    int state_fd,
+    AccountlessOperation operation,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& value,
+    int* journal_fd,
+    FileIdentity* identity) {
+  if (journal_fd == nullptr
+      || identity == nullptr
+      || (operation != AccountlessOperation::kCreate
+          && operation != AccountlessOperation::kDelete)
+      || !VerifyOwnerPrivateDirectory(state_fd)) {
+    return false;
+  }
+  *journal_fd = -1;
+  *identity = FileIdentity {};
+  const int fd = openat(
+      state_fd,
+      kAccountlessOperationJournalFile,
+      O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+      0600);
+  if (fd < 0) return false;
+  std::array<unsigned char, kAccountlessOperationJournalBytes> bytes {};
+  std::memcpy(
+      bytes.data(),
+      kAccountlessOperationJournalMagic.data(),
+      kAccountlessOperationJournalMagic.size());
+  bytes[kAccountlessOperationJournalVersionOffset] =
+      kAccountlessOperationJournalVersion;
+  bytes[kAccountlessOperationJournalOperationOffset] =
+      static_cast<unsigned char>(operation);
+  std::memcpy(
+      bytes.data() + kAccountlessOperationJournalValueOffset,
+      value.data(),
+      value.size());
+  const bool written = CaptureRegularFileIdentity(fd, identity)
+      && VerifyAccountlessOperationJournalContinuity(state_fd, fd, *identity)
+      && WriteAll(
+          fd,
+          reinterpret_cast<const char*>(bytes.data()),
+          bytes.size())
+      && fsync(fd) == 0
+      && VerifyAccountlessOperationJournalContinuity(state_fd, fd, *identity)
+      && fsync(state_fd) == 0
+      && VerifyAccountlessOperationJournalContinuity(state_fd, fd, *identity);
+  bytes.fill(0);
+  if (!written) {
+    close(fd);
+    *identity = FileIdentity {};
+    return false;
+  }
+  *journal_fd = fd;
+  return true;
+}
+
+AccountlessOperationJournalRemoveOutcome RemoveAccountlessOperationJournal(
+    int state_fd,
+    int journal_fd,
+    const FileIdentity& identity) {
+  if (!VerifyAccountlessOperationJournalContinuity(state_fd, journal_fd, identity)
+      || unlinkat(state_fd, kAccountlessOperationJournalFile, 0) != 0) {
+    return AccountlessOperationJournalRemoveOutcome::kInvalid;
+  }
+  return fsync(state_fd) == 0
+      ? AccountlessOperationJournalRemoveOutcome::kRemoved
+      : AccountlessOperationJournalRemoveOutcome::kUncertain;
+}
+
+bool IsFixedAccountlessResidueAbsent(int credential_directory_fd, const char* name) {
+  if (!VerifyOwnerPrivateDirectory(credential_directory_fd) || name == nullptr) return false;
+  struct stat metadata {};
+  return fstatat(
+             credential_directory_fd,
+             name,
+             &metadata,
+             AT_SYMLINK_NOFOLLOW) != 0
+      && errno == ENOENT;
+}
+
+bool NoFixedAccountlessOperationResidue(int credential_directory_fd) {
+  return IsFixedAccountlessResidueAbsent(
+             credential_directory_fd,
+             kAccountlessCreateTemporaryFile)
+      && IsFixedAccountlessResidueAbsent(
+             credential_directory_fd,
+             kAccountlessDeleteTemporaryFile);
+}
+
+const char* AccountlessOperationTemporaryFile(AccountlessOperation operation) {
+  return operation == AccountlessOperation::kCreate
+      ? kAccountlessCreateTemporaryFile
+      : operation == AccountlessOperation::kDelete
+          ? kAccountlessDeleteTemporaryFile
+          : nullptr;
+}
+
+bool IsOtherFixedAccountlessResidueAbsent(
+    int credential_directory_fd,
+    const char* temporary_name) {
+  const char* other = temporary_name == kAccountlessCreateTemporaryFile
+      ? kAccountlessDeleteTemporaryFile
+      : temporary_name == kAccountlessDeleteTemporaryFile
+          ? kAccountlessCreateTemporaryFile
+          : nullptr;
+  return other != nullptr
+      && IsFixedAccountlessResidueAbsent(credential_directory_fd, other);
+}
+
+bool PublishNewAccountlessRecord(
+    int credential_directory_fd,
+    const char* temporary_name,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& value) {
+  if (!VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || !IsFixedAccountlessResidueAbsent(credential_directory_fd, temporary_name)
+      || !IsOtherFixedAccountlessResidueAbsent(
+          credential_directory_fd,
+          temporary_name)) {
+    return false;
+  }
+  AccountlessRecord final_before {};
+  const AccountlessRecordState final_before_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &final_before);
+  ClearAccountlessRecord(&final_before);
+  if (final_before_state != AccountlessRecordState::kAbsent) return false;
+
+  int temporary_fd = CreateTransientRecord(credential_directory_fd, temporary_name);
+  if (temporary_fd < 0) return false;
+  const bool written = WriteTransientAccountlessRecord(
+      credential_directory_fd,
+      temporary_name,
+      temporary_fd,
+      value);
+  const bool temporary_closed = CloseDescriptor(&temporary_fd);
+  if (!written || !temporary_closed) return false;
+
+  AccountlessRecord temporary {};
+  const AccountlessRecordState temporary_state = ReadAccountlessRecordNamed(
+      credential_directory_fd,
+      temporary_name,
+      &temporary);
+  const FileIdentity temporary_identity = temporary.identity;
+  const bool temporary_exact = temporary_state == AccountlessRecordState::kPresent
+      && EqualAccountlessCredential(temporary.bytes, value)
+      && NamedRecordMatches(
+          credential_directory_fd,
+          temporary_name,
+          temporary_identity);
+  ClearAccountlessRecord(&temporary);
+  if (!temporary_exact
+      || !VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || !IsOtherFixedAccountlessResidueAbsent(
+          credential_directory_fd,
+          temporary_name)
+      || !RenameNoReplace(
+          credential_directory_fd,
+          temporary_name,
+          kAccountlessCredentialFile)
+      || fsync(credential_directory_fd) != 0) {
+    return false;
+  }
+
+  AccountlessRecord final_after {};
+  const AccountlessRecordState final_after_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &final_after);
+  const bool exact = final_after_state == AccountlessRecordState::kPresent
+      && SameFileIdentity(final_after.identity, temporary_identity)
+      && EqualAccountlessCredential(final_after.bytes, value)
+      && IsFixedAccountlessResidueAbsent(credential_directory_fd, temporary_name);
+  ClearAccountlessRecord(&final_after);
+  return exact;
+}
+
+bool PublishExistingAccountlessRecord(
+    int credential_directory_fd,
+    const char* temporary_name,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& value) {
+  if (!VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || !IsOtherFixedAccountlessResidueAbsent(
+          credential_directory_fd,
+          temporary_name)) {
+    return false;
+  }
+  AccountlessRecord final_before {};
+  const AccountlessRecordState final_before_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &final_before);
+  ClearAccountlessRecord(&final_before);
+  if (final_before_state != AccountlessRecordState::kAbsent) return false;
+
+  AccountlessRecord temporary {};
+  const AccountlessRecordState temporary_state = ReadAccountlessRecordNamed(
+      credential_directory_fd,
+      temporary_name,
+      &temporary);
+  const FileIdentity temporary_identity = temporary.identity;
+  const bool temporary_exact = temporary_state == AccountlessRecordState::kPresent
+      && EqualAccountlessCredential(temporary.bytes, value)
+      && NamedRecordMatches(
+          credential_directory_fd,
+          temporary_name,
+          temporary_identity);
+  ClearAccountlessRecord(&temporary);
+  if (!temporary_exact
+      || !VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || !IsOtherFixedAccountlessResidueAbsent(
+          credential_directory_fd,
+          temporary_name)
+      || !RenameNoReplace(
+          credential_directory_fd,
+          temporary_name,
+          kAccountlessCredentialFile)
+      || fsync(credential_directory_fd) != 0) {
+    return false;
+  }
+
+  AccountlessRecord final_after {};
+  const AccountlessRecordState final_after_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &final_after);
+  const bool exact = final_after_state == AccountlessRecordState::kPresent
+      && SameFileIdentity(final_after.identity, temporary_identity)
+      && EqualAccountlessCredential(final_after.bytes, value)
+      && IsFixedAccountlessResidueAbsent(credential_directory_fd, temporary_name);
+  ClearAccountlessRecord(&final_after);
+  return exact;
+}
+
+bool DeleteCurrentAccountlessRecord(
+    int credential_directory_fd,
+    const char* temporary_name,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& expected) {
+  if (!VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || !IsFixedAccountlessResidueAbsent(credential_directory_fd, temporary_name)
+      || !IsOtherFixedAccountlessResidueAbsent(
+          credential_directory_fd,
+          temporary_name)) {
+    return false;
+  }
+  AccountlessRecord current {};
+  const AccountlessRecordState current_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &current);
+  const FileIdentity current_identity = current.identity;
+  const bool exact_current = current_state == AccountlessRecordState::kPresent
+      && EqualAccountlessCredential(current.bytes, expected)
+      && NamedRecordMatches(
+          credential_directory_fd,
+          kAccountlessCredentialFile,
+          current_identity);
+  ClearAccountlessRecord(&current);
+  if (!exact_current
+      || !VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || !IsOtherFixedAccountlessResidueAbsent(
+          credential_directory_fd,
+          temporary_name)
+      || !RenameNoReplace(
+          credential_directory_fd,
+          kAccountlessCredentialFile,
+          temporary_name)
+      || fsync(credential_directory_fd) != 0) {
+    return false;
+  }
+
+  AccountlessRecord temporary {};
+  const AccountlessRecordState temporary_state = ReadAccountlessRecordNamed(
+      credential_directory_fd,
+      temporary_name,
+      &temporary);
+  const bool exact_temporary = temporary_state == AccountlessRecordState::kPresent
+      && SameFileIdentity(temporary.identity, current_identity)
+      && EqualAccountlessCredential(temporary.bytes, expected)
+      && NamedRecordMatches(
+          credential_directory_fd,
+          temporary_name,
+          temporary.identity);
+  ClearAccountlessRecord(&temporary);
+  if (!exact_temporary
+      || !VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || unlinkat(credential_directory_fd, temporary_name, 0) != 0
+      || fsync(credential_directory_fd) != 0) {
+    return false;
+  }
+  AccountlessRecord final_after {};
+  const AccountlessRecordState final_after_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &final_after);
+  ClearAccountlessRecord(&final_after);
+  return final_after_state == AccountlessRecordState::kAbsent
+      && IsFixedAccountlessResidueAbsent(credential_directory_fd, temporary_name);
+}
+
+bool DeleteExistingAccountlessRecord(
+    int credential_directory_fd,
+    const char* temporary_name,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& expected) {
+  if (!VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || !IsOtherFixedAccountlessResidueAbsent(
+          credential_directory_fd,
+          temporary_name)) {
+    return false;
+  }
+  AccountlessRecord final_before {};
+  const AccountlessRecordState final_before_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &final_before);
+  ClearAccountlessRecord(&final_before);
+  if (final_before_state != AccountlessRecordState::kAbsent) return false;
+
+  AccountlessRecord temporary {};
+  const AccountlessRecordState temporary_state = ReadAccountlessRecordNamed(
+      credential_directory_fd,
+      temporary_name,
+      &temporary);
+  const bool exact_temporary = temporary_state == AccountlessRecordState::kPresent
+      && EqualAccountlessCredential(temporary.bytes, expected)
+      && NamedRecordMatches(
+          credential_directory_fd,
+          temporary_name,
+          temporary.identity);
+  ClearAccountlessRecord(&temporary);
+  if (!exact_temporary
+      || !VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || !IsOtherFixedAccountlessResidueAbsent(
+          credential_directory_fd,
+          temporary_name)
+      || unlinkat(credential_directory_fd, temporary_name, 0) != 0
+      || fsync(credential_directory_fd) != 0) {
+    return false;
+  }
+  AccountlessRecord final_after {};
+  const AccountlessRecordState final_after_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &final_after);
+  ClearAccountlessRecord(&final_after);
+  return final_after_state == AccountlessRecordState::kAbsent
+      && IsFixedAccountlessResidueAbsent(credential_directory_fd, temporary_name);
+}
+
+bool AccountlessOperationPostconditionHolds(
+    int credential_directory_fd,
+    AccountlessOperation operation,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& value) {
+  if (!VerifyOwnerPrivateDirectory(credential_directory_fd)
+      || (operation != AccountlessOperation::kCreate
+          && operation != AccountlessOperation::kDelete)) {
+    return false;
+  }
+  AccountlessRecord final_record {};
+  const AccountlessRecordState final_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &final_record);
+  const bool exact_create = final_state == AccountlessRecordState::kPresent
+      && EqualAccountlessCredential(final_record.bytes, value);
+  ClearAccountlessRecord(&final_record);
+  return (operation == AccountlessOperation::kCreate
+          ? exact_create
+          : final_state == AccountlessRecordState::kAbsent)
+      && NoFixedAccountlessOperationResidue(credential_directory_fd);
+}
+
+// A prior operation can leave an exact-looking postcondition after its record
+// directory fsync failed. It is not safe to clear its intent based only on a
+// later observation: bind settlement to a successful fsync and two independent
+// descriptor/path revalidations of the exact final state.
+bool VerifyDurableAccountlessOperationPostcondition(
+    int credential_directory_fd,
+    AccountlessOperation operation,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& value) {
+  return AccountlessOperationPostconditionHolds(
+             credential_directory_fd,
+             operation,
+             value)
+      && fsync(credential_directory_fd) == 0
+      && AccountlessOperationPostconditionHolds(
+          credential_directory_fd,
+          operation,
+          value);
+}
+
+AccountlessOperationRecoveryOutcome RecoverAccountlessOperationJournal(
+    int state_fd,
+    int journal_fd,
+    const FileIdentity& journal_identity,
+    int credential_directory_fd) {
+  if (!VerifyOwnerPrivateDirectory(state_fd)
+      || !VerifyOwnerPrivateDirectory(credential_directory_fd)) {
+    return AccountlessOperationRecoveryOutcome::kUnavailable;
+  }
+  AccountlessOperationJournal journal {};
+  if (!ReadAccountlessOperationJournal(
+          state_fd,
+          journal_fd,
+          journal_identity,
+          &journal)) {
+    return AccountlessOperationRecoveryOutcome::kAmbiguous;
+  }
+  const char* temporary_name = AccountlessOperationTemporaryFile(journal.operation);
+  if (temporary_name == nullptr
+      || !IsOtherFixedAccountlessResidueAbsent(
+          credential_directory_fd,
+          temporary_name)) {
+    ClearAccountlessOperationJournal(&journal);
+    return AccountlessOperationRecoveryOutcome::kAmbiguous;
+  }
+  AccountlessRecord final_record {};
+  AccountlessRecord temporary_record {};
+  const AccountlessRecordState final_state = ReadAccountlessRecord(
+      credential_directory_fd,
+      &final_record);
+  const AccountlessRecordState temporary_state = ReadAccountlessRecordNamed(
+      credential_directory_fd,
+      temporary_name,
+      &temporary_record);
+  const bool final_exact = final_state == AccountlessRecordState::kPresent
+      && EqualAccountlessCredential(final_record.bytes, journal.value);
+  const bool temporary_exact = temporary_state == AccountlessRecordState::kPresent
+      && EqualAccountlessCredential(temporary_record.bytes, journal.value);
+  bool reconciled = false;
+  if (journal.operation == AccountlessOperation::kCreate) {
+    if (final_exact && temporary_state == AccountlessRecordState::kAbsent) {
+      reconciled = true;
+    } else if (final_state == AccountlessRecordState::kAbsent && temporary_exact) {
+      reconciled = PublishExistingAccountlessRecord(
+          credential_directory_fd,
+          temporary_name,
+          journal.value);
+    } else if (final_state == AccountlessRecordState::kAbsent
+        && temporary_state == AccountlessRecordState::kAbsent) {
+      reconciled = PublishNewAccountlessRecord(
+          credential_directory_fd,
+          temporary_name,
+          journal.value);
+    }
+  } else if (journal.operation == AccountlessOperation::kDelete) {
+    if (final_state == AccountlessRecordState::kAbsent
+        && temporary_state == AccountlessRecordState::kAbsent) {
+      reconciled = true;
+    } else if (final_exact && temporary_state == AccountlessRecordState::kAbsent) {
+      reconciled = DeleteCurrentAccountlessRecord(
+          credential_directory_fd,
+          temporary_name,
+          journal.value);
+    } else if (final_state == AccountlessRecordState::kAbsent && temporary_exact) {
+      reconciled = DeleteExistingAccountlessRecord(
+          credential_directory_fd,
+          temporary_name,
+          journal.value);
+    }
+  }
+  ClearAccountlessRecord(&final_record);
+  ClearAccountlessRecord(&temporary_record);
+  if (!reconciled
+      || !VerifyDurableAccountlessOperationPostcondition(
+          credential_directory_fd,
+          journal.operation,
+          journal.value)) {
+    ClearAccountlessOperationJournal(&journal);
+    return AccountlessOperationRecoveryOutcome::kAmbiguous;
+  }
+  ClearAccountlessOperationJournal(&journal);
+  const AccountlessOperationJournalRemoveOutcome removal =
+      RemoveAccountlessOperationJournal(state_fd, journal_fd, journal_identity);
+  return removal == AccountlessOperationJournalRemoveOutcome::kRemoved
+      ? AccountlessOperationRecoveryOutcome::kRecovered
+      : removal == AccountlessOperationJournalRemoveOutcome::kUncertain
+          ? AccountlessOperationRecoveryOutcome::kUncertain
+          : AccountlessOperationRecoveryOutcome::kAmbiguous;
+}
+
 enum class AccountlessLeaseOutcome {
   kAcquired,
   kUnavailable,
   kRecoveryRequired,
 };
+
+bool LatchUnissuedAccountlessRecovery(
+    int state_fd,
+    int journal_fd,
+    const FileIdentity& journal_identity) {
+  return WriteJournalState(
+      state_fd,
+      journal_fd,
+      kAccountlessInstallationCredentialSlot,
+      journal_identity,
+      JournalState::kActive);
+}
 
 AccountlessLeaseOutcome AcquireAccountlessLease(NativeLease** result) {
   if (result == nullptr) return AccountlessLeaseOutcome::kUnavailable;
@@ -1058,40 +1704,160 @@ AccountlessLeaseOutcome AcquireAccountlessLease(NativeLease** result) {
     CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
     return AccountlessLeaseOutcome::kRecoveryRequired;
   }
-  auto* lease = new (std::nothrow) NativeLease {
-    socket_fd,
-    persistent_state_fd,
-    journal_fd,
-    journal_identity,
-    kAccountlessInstallationCredentialSlot,
-    false,
-    true,
-  };
+
+  int operation_journal_fd = -1;
+  FileIdentity operation_journal_identity {};
+  const AccountlessOperationJournalOpenOutcome operation_journal =
+      OpenAccountlessOperationJournal(
+          persistent_state_fd,
+          &operation_journal_fd,
+          &operation_journal_identity);
+  if (operation_journal == AccountlessOperationJournalOpenOutcome::kInvalid) {
+    LatchUnissuedAccountlessRecovery(
+        persistent_state_fd,
+        journal_fd,
+        journal_identity);
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return AccountlessLeaseOutcome::kRecoveryRequired;
+  }
+
+  int credential_directory_fd = OpenAccountlessCredentialDirectory();
+  if (credential_directory_fd < 0) {
+    CloseDescriptor(&operation_journal_fd);
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return operation_journal == AccountlessOperationJournalOpenOutcome::kMissing
+        ? AccountlessLeaseOutcome::kUnavailable
+        : AccountlessLeaseOutcome::kRecoveryRequired;
+  }
+
+  if (operation_journal == AccountlessOperationJournalOpenOutcome::kMissing) {
+    const bool clean = NoFixedAccountlessOperationResidue(credential_directory_fd);
+    const bool credential_directory_closed = CloseDescriptor(&credential_directory_fd);
+    if (!clean || !credential_directory_closed) {
+      LatchUnissuedAccountlessRecovery(
+          persistent_state_fd,
+          journal_fd,
+          journal_identity);
+      CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+      return AccountlessLeaseOutcome::kRecoveryRequired;
+    }
+  } else {
+    // A v2 intent can only have been written after this v1 marker was durably
+    // normal. A newly-created v1 marker beside one is therefore an unbound
+    // replacement state, never an intent we may adopt.
+    const AccountlessOperationRecoveryOutcome recovery = journal
+            == JournalOpenOutcome::kCreated
+        ? AccountlessOperationRecoveryOutcome::kAmbiguous
+        : RecoverAccountlessOperationJournal(
+            persistent_state_fd,
+            operation_journal_fd,
+            operation_journal_identity,
+            credential_directory_fd);
+    const bool credential_directory_closed = CloseDescriptor(&credential_directory_fd);
+    const bool operation_journal_closed = CloseDescriptor(&operation_journal_fd);
+    if (recovery != AccountlessOperationRecoveryOutcome::kRecovered
+        || !credential_directory_closed
+        || !operation_journal_closed) {
+      // If unlink or close becomes uncertain, the v2 name may no longer be a
+      // durable fence. Preserve the existing v1 active refusal before the
+      // socket is released; never recreate a journal from observed state.
+      LatchUnissuedAccountlessRecovery(
+          persistent_state_fd,
+          journal_fd,
+          journal_identity);
+      CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+      return AccountlessLeaseOutcome::kRecoveryRequired;
+    }
+  }
+
+  const bool journal_still_normal = VerifyJournalContinuity(
+          persistent_state_fd,
+          journal_fd,
+          kAccountlessInstallationCredentialSlot,
+          journal_identity)
+      && ReadJournalState(journal_fd) == JournalState::kNormal
+      && VerifyJournalContinuity(
+          persistent_state_fd,
+          journal_fd,
+          kAccountlessInstallationCredentialSlot,
+          journal_identity);
+  if (!journal_still_normal) {
+    LatchUnissuedAccountlessRecovery(
+        persistent_state_fd,
+        journal_fd,
+        journal_identity);
+    CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
+    return AccountlessLeaseOutcome::kRecoveryRequired;
+  }
+
+  auto* lease = new (std::nothrow) NativeLease {};
   if (lease == nullptr) {
     CloseUnissuedLeaseDescriptors(&socket_fd, &persistent_state_fd, &journal_fd);
     return AccountlessLeaseOutcome::kUnavailable;
   }
+  lease->socket_fd = socket_fd;
+  lease->persistent_state_fd = persistent_state_fd;
+  lease->journal_fd = journal_fd;
+  lease->journal_identity = journal_identity;
+  lease->capability_id = kAccountlessInstallationCredentialSlot;
+  socket_fd = -1;
+  persistent_state_fd = -1;
+  journal_fd = -1;
   *result = lease;
   return AccountlessLeaseOutcome::kAcquired;
 }
 
-bool BeginAccountlessMutation(NativeLease* lease) {
+bool BeginAccountlessMutation(
+    NativeLease* lease,
+    AccountlessOperation operation,
+    const std::array<unsigned char, kAccountlessCredentialBytes>& value) {
   if (lease == nullptr
       || lease->capability_id != kAccountlessInstallationCredentialSlot
       || !lease->active
-      || lease->accountless_active_marker_written) {
+      || lease->accountless_active_marker_written
+      || lease->accountless_operation_journal_written
+      || lease->accountless_operation_journal_fd >= 0) {
     return false;
   }
-  if (!WriteJournalState(
+  int operation_journal_fd = -1;
+  FileIdentity operation_journal_identity {};
+  if (!CreateAccountlessOperationJournal(
           lease->persistent_state_fd,
-          lease->journal_fd,
-          lease->capability_id,
-          lease->journal_identity,
-          JournalState::kActive)) {
+          operation,
+          value,
+          &operation_journal_fd,
+          &operation_journal_identity)) {
     return false;
   }
-  lease->accountless_active_marker_written = true;
+  lease->accountless_operation_journal_fd = operation_journal_fd;
+  lease->accountless_operation_journal_identity = operation_journal_identity;
+  lease->accountless_operation_journal_written = true;
   return true;
+}
+
+AccountlessOperationJournalRemoveOutcome SettleAccountlessMutation(
+    NativeLease* lease) {
+  if (lease == nullptr
+      || lease->capability_id != kAccountlessInstallationCredentialSlot
+      || !lease->active
+      || !lease->accountless_operation_journal_written
+      || lease->accountless_operation_journal_fd < 0) {
+    return AccountlessOperationJournalRemoveOutcome::kInvalid;
+  }
+  const AccountlessOperationJournalRemoveOutcome removal =
+      RemoveAccountlessOperationJournal(
+          lease->persistent_state_fd,
+          lease->accountless_operation_journal_fd,
+          lease->accountless_operation_journal_identity);
+  const bool closed = CloseDescriptor(&lease->accountless_operation_journal_fd);
+  if (removal == AccountlessOperationJournalRemoveOutcome::kRemoved && closed) {
+    lease->accountless_operation_journal_identity = FileIdentity {};
+    lease->accountless_operation_journal_written = false;
+    return AccountlessOperationJournalRemoveOutcome::kRemoved;
+  }
+  return removal == AccountlessOperationJournalRemoveOutcome::kRemoved
+      ? AccountlessOperationJournalRemoveOutcome::kUncertain
+      : removal;
 }
 
 // A malformed or unsafe fixed record is not a retryable pre-mutation error:
@@ -1131,6 +1897,14 @@ bool FinishAccountlessLease(NativeLease* lease, bool preserve_active) {
   // record would add an unnecessary ftruncate/fsync crash window. Verify the
   // pinned normal state and close it instead. A marker written for a mutation
   // or recovery latch still uses the ordinary active->normal/preserve path.
+  const bool operation_journal_retained = !lease->accountless_operation_journal_written
+      || (lease->accountless_operation_journal_fd >= 0
+          && VerifyAccountlessOperationJournalContinuity(
+              lease->persistent_state_fd,
+              lease->accountless_operation_journal_fd,
+              lease->accountless_operation_journal_identity));
+  const bool operation_journal_closed = CloseDescriptor(
+      &lease->accountless_operation_journal_fd);
   bool finished = false;
   if (!preserve_active && !lease->accountless_active_marker_written) {
     const bool journal_normal = VerifyJournalContinuity(
@@ -1153,7 +1927,7 @@ bool FinishAccountlessLease(NativeLease* lease, bool preserve_active) {
   }
   lease->active = false;
   delete lease;
-  return finished;
+  return operation_journal_retained && operation_journal_closed && finished;
 }
 
 bool CloseDescriptor(int* fd) {
@@ -1361,15 +2135,7 @@ napi_value AcquireCredentialMutex(napi_env env, napi_callback_info info) {
     return ThrowFixed(env, kCodeStateInvalid);
   }
 
-  auto* lease = new (std::nothrow) NativeLease {
-    socket_fd,
-    persistent_state_fd,
-    journal_fd,
-    journal_identity,
-    capability_id,
-    prior == JournalState::kActive,
-    true,
-  };
+  auto* lease = new (std::nothrow) NativeLease {};
   if (lease == nullptr) {
     CloseUnissuedLeaseDescriptors(
         &socket_fd,
@@ -1377,6 +2143,12 @@ napi_value AcquireCredentialMutex(napi_env env, napi_callback_info info) {
         &journal_fd);
     return ThrowFixed(env, kCodeStateUnavailable);
   }
+  lease->socket_fd = socket_fd;
+  lease->persistent_state_fd = persistent_state_fd;
+  lease->journal_fd = journal_fd;
+  lease->journal_identity = journal_identity;
+  lease->capability_id = capability_id;
+  lease->abandoned = prior == JournalState::kActive;
   // Ownership transferred to the lease object. Do not close these aliases in
   // an error path after this point.
   socket_fd = -1;
@@ -1535,6 +2307,7 @@ napi_value AccountlessValue(
 
 napi_value FailAccountlessRecovery(napi_env env, NativeLease* lease);
 napi_value FailAccountlessKnownNonMutation(napi_env env, NativeLease* lease);
+napi_value FailAccountlessPendingOperation(napi_env env, NativeLease* lease);
 
 napi_value ReadAccountlessInstallationCredential(
     napi_env env,
@@ -1601,11 +2374,34 @@ napi_value FailAccountlessKnownNonMutation(napi_env env, NativeLease* lease) {
   if (lease == nullptr || lease->accountless_active_marker_written) {
     return FailAccountlessRecovery(env, lease);
   }
+  if (lease->accountless_operation_journal_written) {
+    return FailAccountlessPendingOperation(env, lease);
+  }
   return ThrowFixed(
       env,
       FinishAccountlessLease(lease, false)
           ? kCodeAccountlessUnavailable
           : kCodeAccountlessRecoveryRequired);
+}
+
+napi_value FailAccountlessPendingOperation(napi_env env, NativeLease* lease) {
+  // A complete v2 intent remains the only authority for replay. Do not turn
+  // it into a generic v1 active marker: the next private-socket holder must be
+  // able to inspect the exact journal and observed record state.
+  if (lease == nullptr || !lease->accountless_operation_journal_written) {
+    return FailAccountlessRecovery(env, lease);
+  }
+  if (lease->accountless_operation_journal_fd < 0) {
+    // Settle may already have unlinked the fixed v2 name before its directory
+    // fsync or descriptor close failed. That name cannot honestly fence a
+    // later process, so retain the legacy v1 active refusal rather than
+    // recreating an intent from a final record that merely appears correct.
+    LatchAccountlessRecovery(lease);
+    FinishAccountlessLease(lease, true);
+    return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+  }
+  FinishAccountlessLease(lease, false);
+  return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
 }
 
 napi_value FailAccountlessRecovery(napi_env env, NativeLease* lease) {
@@ -1626,15 +2422,9 @@ napi_value CreateAccountlessInstallationCredentialIfMissing(
     value.fill(0);
     return ThrowFixed(env, kCodeAccountlessInvalidValue);
   }
-  int credential_directory_fd = OpenAccountlessCredentialDirectory();
-  if (credential_directory_fd < 0) {
-    value.fill(0);
-    return ThrowFixed(env, kCodeAccountlessUnavailable);
-  }
   NativeLease* lease = nullptr;
   const AccountlessLeaseOutcome acquired = AcquireAccountlessLease(&lease);
   if (acquired != AccountlessLeaseOutcome::kAcquired) {
-    close(credential_directory_fd);
     value.fill(0);
     return ThrowFixed(
         env,
@@ -1642,14 +2432,19 @@ napi_value CreateAccountlessInstallationCredentialIfMissing(
             ? kCodeAccountlessRecoveryRequired
             : kCodeAccountlessUnavailable);
   }
+  int credential_directory_fd = OpenAccountlessCredentialDirectory();
+  if (credential_directory_fd < 0) {
+    value.fill(0);
+    return FailAccountlessKnownNonMutation(env, lease);
+  }
 
   AccountlessRecord existing {};
   const AccountlessRecordState before = ReadAccountlessRecord(
       credential_directory_fd,
       &existing);
   if (before == AccountlessRecordState::kPresent) {
-    existing.bytes.fill(0);
-    const bool directory_closed = close(credential_directory_fd) == 0;
+    ClearAccountlessRecord(&existing);
+    const bool directory_closed = CloseDescriptor(&credential_directory_fd);
     value.fill(0);
     if (!directory_closed) return FailAccountlessRecovery(env, lease);
     if (!FinishAccountlessLease(lease, false)) {
@@ -1657,105 +2452,45 @@ napi_value CreateAccountlessInstallationCredentialIfMissing(
     }
     return AccountlessStatus(env, "existing");
   }
-  existing.bytes.fill(0);
+  ClearAccountlessRecord(&existing);
   if (before == AccountlessRecordState::kInvalid) {
-    close(credential_directory_fd);
+    CloseDescriptor(&credential_directory_fd);
     value.fill(0);
     return FailAccountlessRecovery(env, lease);
   }
   if (before != AccountlessRecordState::kAbsent) {
-    close(credential_directory_fd);
+    CloseDescriptor(&credential_directory_fd);
     value.fill(0);
     return FailAccountlessKnownNonMutation(env, lease);
   }
 
-  char temporary_name[96] {};
-  if (!TransientRecordName("create", temporary_name, sizeof(temporary_name))) {
-    close(credential_directory_fd);
-    value.fill(0);
-    return FailAccountlessKnownNonMutation(env, lease);
-  }
-  // The active journal precedes only the O_EXCL call that can create durable
-  // record residue. Discovery, validation, and entropy acquisition above can
-  // fail or crash without poisoning a known unchanged installation identity.
-  if (!BeginAccountlessMutation(lease)) {
-    close(credential_directory_fd);
+  // The exact v2 intent is durable before the first O_EXCL temporary inode can
+  // appear. It authorizes only this candidate's later replay under slot four.
+  if (!BeginAccountlessMutation(lease, AccountlessOperation::kCreate, value)) {
+    CloseDescriptor(&credential_directory_fd);
     value.fill(0);
     return FailAccountlessRecovery(env, lease);
   }
-  int temporary_fd = CreateTransientRecord(
+  const bool published = PublishNewAccountlessRecord(
       credential_directory_fd,
-      temporary_name);
-  if (temporary_fd < 0) {
-    // An O_EXCL failure can be settled only after rechecking both the fixed
-    // record and the generated temporary name. A collision or any residue is
-    // a recovery boundary; an absent temp plus absent record proves this
-    // particular create did not publish or leave an inode behind.
-    AccountlessRecord rechecked {};
-    const AccountlessRecordState rechecked_state = ReadAccountlessRecord(
-        credential_directory_fd,
-        &rechecked);
-    rechecked.bytes.fill(0);
-    struct stat temporary_metadata {};
-    const bool temporary_absent = fstatat(
-            credential_directory_fd,
-            temporary_name,
-            &temporary_metadata,
-            AT_SYMLINK_NOFOLLOW) != 0
-        && errno == ENOENT;
-    const bool no_record_mutation = temporary_fd == -1
-        && temporary_absent
-        && rechecked_state == AccountlessRecordState::kAbsent;
-    close(credential_directory_fd);
-    value.fill(0);
-    if (no_record_mutation) {
-      const bool settled = FinishAccountlessLease(lease, false);
-      return ThrowFixed(
-          env,
-          settled ? kCodeAccountlessUnavailable : kCodeAccountlessRecoveryRequired);
-    }
-    return FailAccountlessRecovery(env, lease);
-  }
-  const bool written = WriteTransientAccountlessRecord(
-      credential_directory_fd,
-      temporary_name,
-      temporary_fd,
+      kAccountlessCreateTemporaryFile,
       value);
-  const bool temporary_closed = CloseDescriptor(&temporary_fd);
-  if (!written || !temporary_closed) {
-    close(credential_directory_fd);
-    value.fill(0);
-    return FailAccountlessRecovery(env, lease);
-  }
-  if (!RenameNoReplace(
-          credential_directory_fd,
-          temporary_name,
-          kAccountlessCredentialFile)
-      || fsync(credential_directory_fd) != 0) {
-    close(credential_directory_fd);
-    value.fill(0);
-    return FailAccountlessRecovery(env, lease);
-  }
-
-  AccountlessRecord readback {};
-  const AccountlessRecordState after = ReadAccountlessRecord(
-      credential_directory_fd,
-      &readback);
-  const bool exact = after == AccountlessRecordState::kPresent
-      && EqualAccountlessCredential(readback.bytes, value);
-  readback.bytes.fill(0);
-  const bool directory_closed = close(credential_directory_fd) == 0;
+  const bool directory_closed = CloseDescriptor(&credential_directory_fd);
   value.fill(0);
-  if (!exact || !directory_closed) return FailAccountlessRecovery(env, lease);
-  // Allocate the JavaScript result before settling the durable mutation. If
-  // N-API cannot allocate it, retain active rather than reporting a retryable
-  // pre-mutation failure after a record was already published.
+  if (!published || !directory_closed) {
+    return FailAccountlessPendingOperation(env, lease);
+  }
+  // Allocate the JavaScript result before clearing the intent. A failed
+  // allocation leaves that exact v2 record available for restart replay.
   napi_value result = AccountlessStatus(env, "created");
   if (result == nullptr) {
     napi_value ignored = nullptr;
     napi_get_and_clear_last_exception(env, &ignored);
-    FinishAccountlessLease(lease, true);
-    return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+    return FailAccountlessPendingOperation(env, lease);
+  }
+  if (SettleAccountlessMutation(lease)
+      != AccountlessOperationJournalRemoveOutcome::kRemoved) {
+    return FailAccountlessPendingOperation(env, lease);
   }
   if (!FinishAccountlessLease(lease, false)) {
     return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
@@ -1771,15 +2506,9 @@ napi_value DeleteAccountlessInstallationCredentialExact(
     expected.fill(0);
     return ThrowFixed(env, kCodeAccountlessInvalidValue);
   }
-  int credential_directory_fd = OpenAccountlessCredentialDirectory();
-  if (credential_directory_fd < 0) {
-    expected.fill(0);
-    return ThrowFixed(env, kCodeAccountlessUnavailable);
-  }
   NativeLease* lease = nullptr;
   const AccountlessLeaseOutcome acquired = AcquireAccountlessLease(&lease);
   if (acquired != AccountlessLeaseOutcome::kAcquired) {
-    close(credential_directory_fd);
     expected.fill(0);
     return ThrowFixed(
         env,
@@ -1787,13 +2516,19 @@ napi_value DeleteAccountlessInstallationCredentialExact(
             ? kCodeAccountlessRecoveryRequired
             : kCodeAccountlessUnavailable);
   }
+  int credential_directory_fd = OpenAccountlessCredentialDirectory();
+  if (credential_directory_fd < 0) {
+    expected.fill(0);
+    return FailAccountlessKnownNonMutation(env, lease);
+  }
 
   AccountlessRecord current {};
   const AccountlessRecordState before = ReadAccountlessRecord(
       credential_directory_fd,
       &current);
   if (before == AccountlessRecordState::kAbsent) {
-    const bool directory_closed = close(credential_directory_fd) == 0;
+    ClearAccountlessRecord(&current);
+    const bool directory_closed = CloseDescriptor(&credential_directory_fd);
     expected.fill(0);
     if (!directory_closed) return FailAccountlessRecovery(env, lease);
     if (!FinishAccountlessLease(lease, false)) {
@@ -1802,16 +2537,16 @@ napi_value DeleteAccountlessInstallationCredentialExact(
     return AccountlessStatus(env, "missing");
   }
   if (before != AccountlessRecordState::kPresent) {
-    current.bytes.fill(0);
-    close(credential_directory_fd);
+    ClearAccountlessRecord(&current);
+    CloseDescriptor(&credential_directory_fd);
     expected.fill(0);
     return before == AccountlessRecordState::kInvalid
         ? FailAccountlessRecovery(env, lease)
         : FailAccountlessKnownNonMutation(env, lease);
   }
   if (!EqualAccountlessCredential(current.bytes, expected)) {
-    current.bytes.fill(0);
-    const bool directory_closed = close(credential_directory_fd) == 0;
+    ClearAccountlessRecord(&current);
+    const bool directory_closed = CloseDescriptor(&credential_directory_fd);
     expected.fill(0);
     if (!directory_closed) return FailAccountlessRecovery(env, lease);
     if (!FinishAccountlessLease(lease, false)) {
@@ -1819,87 +2554,32 @@ napi_value DeleteAccountlessInstallationCredentialExact(
     }
     return AccountlessStatus(env, "mismatch");
   }
-
-  char quarantine_name[96] {};
-  if (!TransientRecordName("delete", quarantine_name, sizeof(quarantine_name))) {
-    current.bytes.fill(0);
-    close(credential_directory_fd);
-    expected.fill(0);
-    return FailAccountlessKnownNonMutation(env, lease);
-  }
-  if (!NamedRecordMatches(
-          credential_directory_fd,
-          kAccountlessCredentialFile,
-          current.identity)) {
-    current.bytes.fill(0);
-    close(credential_directory_fd);
+  ClearAccountlessRecord(&current);
+  if (!BeginAccountlessMutation(lease, AccountlessOperation::kDelete, expected)) {
+    CloseDescriptor(&credential_directory_fd);
     expected.fill(0);
     return FailAccountlessRecovery(env, lease);
   }
-  // All non-mutating work, including entropy acquisition and exact source
-  // validation, completes before the durable active marker. The marker
-  // immediately precedes the only syscall that can move the record.
-  if (!BeginAccountlessMutation(lease)) {
-    current.bytes.fill(0);
-    close(credential_directory_fd);
-    expected.fill(0);
-    return FailAccountlessRecovery(env, lease);
-  }
-  if (!RenameNoReplace(
-          credential_directory_fd,
-          kAccountlessCredentialFile,
-          quarantine_name)) {
-    current.bytes.fill(0);
-    close(credential_directory_fd);
-    expected.fill(0);
-    return FailAccountlessRecovery(env, lease);
-  }
-  if (fsync(credential_directory_fd) != 0) {
-    current.bytes.fill(0);
-    close(credential_directory_fd);
-    expected.fill(0);
-    return FailAccountlessRecovery(env, lease);
-  }
-  AccountlessRecord quarantined {};
-  const AccountlessRecordState quarantine_state = ReadAccountlessRecordNamed(
+  const bool deleted = DeleteCurrentAccountlessRecord(
       credential_directory_fd,
-      quarantine_name,
-      &quarantined);
-  const bool exact = quarantine_state == AccountlessRecordState::kPresent
-      && SameFileIdentity(quarantined.identity, current.identity)
-      && EqualAccountlessCredential(quarantined.bytes, expected)
-      && NamedRecordMatches(
-          credential_directory_fd,
-          quarantine_name,
-          current.identity);
-  quarantined.bytes.fill(0);
-  if (!exact
-      || unlinkat(credential_directory_fd, quarantine_name, 0) != 0
-      || fsync(credential_directory_fd) != 0) {
-    current.bytes.fill(0);
-    close(credential_directory_fd);
-    expected.fill(0);
-    return FailAccountlessRecovery(env, lease);
-  }
-  AccountlessRecord final_record {};
-  const AccountlessRecordState final_state = ReadAccountlessRecord(
-      credential_directory_fd,
-      &final_record);
-  final_record.bytes.fill(0);
-  current.bytes.fill(0);
-  const bool directory_closed = close(credential_directory_fd) == 0;
+      kAccountlessDeleteTemporaryFile,
+      expected);
+  const bool directory_closed = CloseDescriptor(&credential_directory_fd);
   expected.fill(0);
-  if (final_state != AccountlessRecordState::kAbsent || !directory_closed) {
-    return FailAccountlessRecovery(env, lease);
+  if (!deleted || !directory_closed) {
+    return FailAccountlessPendingOperation(env, lease);
   }
-  // As with create, do not settle a successful deletion before its fixed
-  // result object exists in JavaScript.
+  // As with create, retain the exact delete intent until its result object
+  // exists and the postcondition is durable.
   napi_value result = AccountlessStatus(env, "deleted");
   if (result == nullptr) {
     napi_value ignored = nullptr;
     napi_get_and_clear_last_exception(env, &ignored);
-    FinishAccountlessLease(lease, true);
-    return ThrowFixed(env, kCodeAccountlessRecoveryRequired);
+    return FailAccountlessPendingOperation(env, lease);
+  }
+  if (SettleAccountlessMutation(lease)
+      != AccountlessOperationJournalRemoveOutcome::kRemoved) {
+    return FailAccountlessPendingOperation(env, lease);
   }
   if (!FinishAccountlessLease(lease, false)) {
     return ThrowFixed(env, kCodeAccountlessRecoveryRequired);

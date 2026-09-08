@@ -11,6 +11,8 @@ tree:
 
 - socket namespace: `app-usagemonitor/linux-credential-mutex-v1/<effective-uid>/<capability>`
 - persistent journal: `XDG_STATE_HOME/app-usagemonitor/linux-credential-mutex-v1`
+- fixed accountless operation journal:
+  `XDG_STATE_HOME/app-usagemonitor/linux-credential-mutex-v1/accountless-operation-4-v2`
 - accountless record:
   `XDG_STATE_HOME/app-usagemonitor/linux-accountless-installation-credential-v1/accountless-installation-credential-v1`
 
@@ -50,13 +52,19 @@ settled release writes and fsyncs `normal` through that same descriptor. A
 callback failure, process exit, or hard kill preserves `active`. The next
 acquirer receives an opaque lease with `abandoned: true`; the JavaScript lease
 layer releases only the socket and reports `recovery_required`. It never clears
-the active state. The fixed accountless operations hold the same private socket
-while they preflight, but do not mark `active` until their mutation boundary
-described below. Before every journal transition, the binding compares the
+the active state. Before every journal transition, the binding compares the
 pinned descriptor with the fixed directory entry; a replacement fails closed
-without writing or unlinking the replacement. A future explicit recovery
-workflow must bind any clearing action to a durable credential-operation
-journal.
+without writing or unlinking the replacement.
+
+Slot four retains `journal-4-v1` only as its legacy compatibility fence. It
+must be absent or exactly `normal` before a fixed operation starts; legacy
+`active`, malformed, replaced, or otherwise invalid v1 state is a permanent
+`recovery_required` refusal. A fully settled v2 transaction never changes v1 to
+`active`, so the next holder can replay its exact v2 intent. The binding writes
+v1 `active` only for an unsafe record, malformed/unbound v2 state, an orphaned
+fixed residue, or an uncertain v2 settlement. It never clears that legacy
+fence. A future explicit recovery workflow must bind any clearing action to a
+durable credential-operation journal.
 
 The abstract socket claim covers ordinary desktop application and companion
 processes in the **same Linux network namespace**. It does not claim
@@ -82,17 +90,54 @@ credential. It is never a provider, social, participant, or FD4 credential.
 The Electron main process can pass it only through its existing private FD3
 companion channel; this module has no renderer surface.
 
-Create validates an absent record under the private socket, marks the journal
-`active` immediately before an `O_EXCL` temporary file can appear, fsyncs the
-fixed-size value, publishes with `renameat2(RENAME_NOREPLACE)`, fsyncs the
-directory, and performs exact pinned readback. Delete compares the exact
-32-byte record, moves it only to a random no-clobber quarantine name, verifies
-the pinned identity and bytes, unlinks that verified quarantine, fsyncs, and
-checks that the fixed name is absent. A failure before a temporary inode or
-rename can occur settles `normal` after rechecking that no record changed.
-After any possible record mutation, interruption, malformed or unsafe fixed
-record, or failed readback, the durable journal remains `active` and later calls
-return `recovery_required`; it is never silently cleared.
+Before a slot-four create or delete can mutate the record, the binding creates
+the owner-only `accountless-operation-4-v2` file with `O_EXCL`, pins and
+rechecks that descriptor and directory entry, writes and fsyncs its entire
+fixed 64-byte value, then fsyncs the pinned mutex directory. Its bytes are:
+
+- `0..15`: exact `TIBOTATTLE-FD3\0\0` byte array
+- `16`: version `2`
+- `17`: operation `1` (create) or `2` (delete)
+- `18..31`: zero reserved bytes
+- `32..63`: the exact 32-byte create candidate or delete expectation
+
+The candidate is therefore retained in an owner-only `0600` journal under the
+same unencrypted-at-rest permission boundary as the fixed record. It is never
+logged or exported. Its deterministic, no-clobber residues are
+`.accountless-create-4-v2` and `.accountless-delete-4-v2`. With no valid v2
+intent, either residue is an orphan: the binding writes the legacy v1 refusal
+fence and never adopts or deletes it.
+
+Under the slot-four abstract socket, a valid create intent may replay only its
+stored candidate: an absent final and absent create residue creates that exact
+residue, an exact residue is published with `renameat2(RENAME_NOREPLACE)`, and
+an exact final settles the intent. A valid delete intent may remove only its
+stored expected bytes: it moves an exact final to the fixed delete residue,
+then validates and unlinks that exact residue; an absent final and absent
+residue settles it. Every replay mutation rechecks the pinned owner-only
+directory, journal identity, source identity, mode, and fixed pathname. Any
+different, malformed, replaced, cross-operation, or both-present state fails
+closed without journal cleanup.
+
+An observed create final or delete absence does not by itself settle a prior
+transaction: recovery first fsyncs the pinned credential directory and
+revalidates the exact final/residue postcondition both before and after that
+fsync. A failed prior record-directory fsync therefore cannot be followed by a
+state-directory-only journal removal.
+
+Only after the intended final postcondition has been directory-fsynced and
+exactly read back does the binding unlink the pinned v2 journal and fsync its
+directory. If that unlink, its directory fsync, or the journal descriptor close
+is uncertain, the binding returns `recovery_required` and writes legacy v1
+`active` before releasing the socket. It does not claim that the v2 name was
+retained and does not recreate an intent from observed record state. A later
+call therefore remains refused even if it observes an exact final record and no
+v2 name.
+
+Focused native tests use controlled valid on-disk modeled interruption states
+(before/after temporary creation or rename, after publication or unlink). They
+do not simulate an actual process kill, kernel crash, storage loss, or power
+failure; native Linux x86_64 CI remains the required runtime qualification.
 
 This owner-private file is an operating-system file-permission boundary, not a
 claim of encryption at rest or protection from a hostile process under the

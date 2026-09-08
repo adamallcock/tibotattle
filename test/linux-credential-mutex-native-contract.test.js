@@ -59,6 +59,20 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /deleteAccountlessInstallationCredentialExact/u);
   assert.match(source, /kAccountlessCredentialBytes = 32/u);
   assert.match(source, /OpenAccountlessCredentialDirectory/u);
+  assert.match(source, /kAccountlessOperationJournalFile/u);
+  assert.match(source, /accountless-operation-4-v2/u);
+  assert.match(source, /kAccountlessOperationJournalBytes = 64/u);
+  assert.match(source, /kAccountlessOperationJournalMagic/u);
+  assert.match(source, /kAccountlessOperationJournalVersion = 2/u);
+  assert.match(source, /kAccountlessCreateTemporaryFile/u);
+  assert.match(source, /kAccountlessDeleteTemporaryFile/u);
+  assert.match(source, /CreateAccountlessOperationJournal/u);
+  assert.match(source, /RecoverAccountlessOperationJournal/u);
+  assert.match(source, /VerifyDurableAccountlessOperationPostcondition/u);
+  assert.match(source, /AccountlessOperationPostconditionHolds/u);
+  assert.match(source, /SettleAccountlessMutation/u);
+  assert.match(source, /NoFixedAccountlessOperationResidue/u);
+  assert.match(source, /accountless_operation_journal_written/u);
   assert.match(source, /O_CREAT \| O_EXCL/u);
   assert.match(source, /O_RDONLY \| O_CLOEXEC \| O_NOFOLLOW \| O_NONBLOCK/u);
   assert.match(source, /RENAME_NOREPLACE/u);
@@ -71,12 +85,10 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   );
   assert.match(source, /ReadJournalState\(lease->journal_fd\) == JournalState::kNormal/u);
   assert.match(source, /FailAccountlessRecovery/u);
-  assert.match(
-    source,
-    /if \(no_record_mutation\) \{\s+const bool settled = FinishAccountlessLease\(lease, false\);\s+return ThrowFixed\(/u,
-  );
-  assert.doesNotMatch(source, /no_record_mutation && FinishAccountlessLease/u);
-  assert.match(source, /unlinkat\(credential_directory_fd, quarantine_name, 0\)/u);
+  assert.match(source, /FailAccountlessPendingOperation/u);
+  assert.match(source, /AccountlessOperationJournalRemoveOutcome::kUncertain/u);
+  assert.match(source, /LatchUnissuedAccountlessRecovery\(/u);
+  assert.match(source, /unlinkat\(credential_directory_fd, temporary_name, 0\)/u);
   assert.match(source, /WriteJournalState/u);
   assert.match(source, /VerifyJournalContinuity/u);
   assert.match(source, /fstatat\(state_fd/u);
@@ -92,6 +104,8 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /"credentialMutexDurableMarker", true/u);
   assert.match(source, /"productionSafe", false/u);
   assert.doesNotMatch(source, /flock\(/u);
+  assert.doesNotMatch(source, /TransientRecordName/u);
+  assert.doesNotMatch(source, /getrandom\(/u);
   assert.doesNotMatch(source, /XDG_RUNTIME_DIR/u);
   assert.doesNotMatch(source, /safeStorage/u);
   assert.doesNotMatch(source, /productionSafe", true/u);
@@ -100,5 +114,7 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(readme, /rather than chmod-repairing it/u);
   assert.match(readme, /same Linux network namespace/u);
   assert.match(readme, /recovery_required/u);
+  assert.match(readme, /accountless-operation-4-v2/u);
+  assert.match(readme, /modeled interruption states/u);
   assert.match(readme, /not a\s+selected credential\s+backend/u);
 });
