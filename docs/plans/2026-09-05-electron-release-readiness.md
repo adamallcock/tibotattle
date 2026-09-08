@@ -129,7 +129,13 @@ failure. Local offline emulation builds a fresh snapshot under plain Node, but
 the emulated Electron invocation exits 137 without a result; neither qualifies
 native Linux. The existing Mac tester's exact Electron/ASAR snapshot build
 succeeds with an isolated empty synthetic profile. Native packaged Linux needs
-its own fixed snapshot-build error before application behavior is changed.
+its own fixed snapshot-build error before application behavior is changed. The next
+native candidate therefore runs a 15-second exact-Electron/ASAR startup-store
+probe against a separate empty tmpfs fixture before the unchanged normal UI
+journey. It includes snapshot persistence, exports only a closed failure code,
+and retains its private fixture if child shutdown cannot be proved. It has no
+credential or hosted service access; passing it will not replace the normal
+render/refresh/observation requirements. Owning Linux contracts pass 35 tests.
 
 The next Windows test uses a separate disposable runner account and an unpacked
 unsigned candidate with the exact normal distribution metadata. It must prove

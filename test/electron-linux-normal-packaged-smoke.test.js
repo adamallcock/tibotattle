@@ -15,6 +15,8 @@ import {
   normalPackagedSmokeEnvironment,
   normalPackagedSmokeFailureStageCode,
   runLinuxNormalPackagedSmoke,
+  runExactAsarSnapshot,
+  runExactAsarSnapshotInside,
   parseLinuxNormalPackagedSmokeArguments,
   runLinuxNormalPackagedSmokeSession,
   validateLinuxNormalPackagedSmokeMetadata,
@@ -575,4 +577,118 @@ test("normal packaged Linux session separates execution, receipt, and passing-re
   }, { appPath: APP_PATH, spawnSession: () => stderrChild }), {
     code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_PASS_RECEIPT_STDERR_REJECTED",
   });
+});
+
+
+test("exact ASAR snapshot uses the production startup store and fixed failure codes", async () => {
+  const runtime = await mkdtemp(join(tmpdir(), "linux-exact-snapshot-"));
+  try {
+    for (const errorCode of [null, "local_collector_projection_worker_failed", "private-detail"]) {
+      const snapshotRoot = await mkdtemp(join(runtime, "fixture-"));
+      const modules = [];
+      let initialized = false;
+      const receipt = await runExactAsarSnapshotInside({
+        appPath: APP_PATH, sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256,
+        snapshotRoot: await (await import("node:fs/promises")).realpath(snapshotRoot),
+      }, {
+        assertRuntime: async () => {},
+        loadModule: async (url) => {
+          modules.push(url);
+          if (url.endsWith("local-installation-diagnostics.js")) {
+            return import("../src/local-installation-diagnostics.js");
+          }
+          return {
+            buildLocalCompanionSnapshot: async (options) => {
+              assert.equal(options.accountingSourceMode, "unified");
+              assert.equal(options.unifiedProjectionMode, "deferred");
+              assert.equal(options.archiveIndexFile, null);
+              assert.ok(options.codexHome.endsWith("/home/.codex"));
+            },
+            LocalCompanionDataStore: class {
+              constructor(options) {
+                assert.ok(options.snapshotFile.endsWith(".json"));
+                this.options = options;
+              }
+              async initialize(options) {
+                assert.equal(options.purpose, "startup");
+                initialized = true;
+                await this.options.builder();
+                if (errorCode !== null) throw Object.assign(new Error("private detail"), { code: errorCode });
+              }
+            },
+          };
+        },
+      });
+      assert.equal(initialized, true);
+      assert.equal(modules.length, 2);
+      assert.ok(modules.every((url) => url.includes("/resources/app.asar/src/")));
+      assert.equal(receipt.errorCode, errorCode === null ? null
+        : errorCode === "local_collector_projection_worker_failed"
+          ? "SNAPSHOT_COLLECTOR_PROJECTION_WORKER_FAILED" : "SNAPSHOT_UNKNOWN_FAILED");
+      assert.equal(JSON.stringify(receipt).includes("private"), false);
+    }
+  } finally { await rm(runtime, { recursive: true, force: true }); }
+});
+
+test("exact ASAR diagnostic accepts only one bound child receipt and removes stopped fixtures", async () => {
+  const runtime = await mkdtemp(join(tmpdir(), "linux-snapshot-child-"));
+  try {
+    for (const mode of ["passed", "failed", "extra"]) {
+      let fixture;
+      const operation = runExactAsarSnapshot({ sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256 }, {
+        appPath: APP_PATH, environment: { XDG_RUNTIME_DIR: runtime, HOME: runtime },
+        spawnChild: (app, args, spec) => {
+          assert.equal(app, APP_PATH);
+          assert.equal(spec.env.ELECTRON_RUN_AS_NODE, "1");
+          assert.equal(args[1], "--inside-exact-asar-snapshot");
+          fixture = args.at(-1);
+          const child = new EventEmitter();
+          child.stdout = new PassThrough(); child.stderr = new PassThrough();
+          child.exitCode = null; child.signalCode = null;
+          queueMicrotask(() => {
+            const receipt = {
+              schemaVersion: "tibotattle-electron-linux-normal-packaged-snapshot-diagnostic-v1",
+              status: mode === "failed" ? "failed" : "passed", scope: "candidate_only", target: "linux-x64",
+              execution: "packaged_electron_run_as_node", sourceRevision: SOURCE_REVISION,
+              artifactSha256: ARTIFACT_SHA256,
+              errorCode: mode === "failed" ? "SNAPSHOT_COLLECTOR_PROJECTION_WORKER_FAILED" : null,
+              ...(mode === "extra" ? { private: "discard" } : {}),
+            };
+            child.exitCode = mode === "failed" ? 1 : 0;
+            child.emit("exit", child.exitCode, null);
+            // The receipt can drain after exit; wait for the stdio close event.
+            child.stdout.end(JSON.stringify(receipt));
+            child.stderr.end();
+            child.emit("close", child.exitCode, null);
+          });
+          return child;
+        },
+      });
+      if (mode === "passed") assert.equal((await operation).status, "passed");
+      else await assert.rejects(operation, { code: mode === "failed"
+        ? "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SNAPSHOT_COLLECTOR_PROJECTION_WORKER_FAILED"
+        : "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SNAPSHOT_RECEIPT_INVALID" });
+      await assert.rejects(stat(fixture), { code: "ENOENT" });
+    }
+  } finally { await rm(runtime, { recursive: true, force: true }); }
+});
+
+test("exact ASAR diagnostic retains its private fixture when timeout cleanup cannot be proved", async () => {
+  const runtime = await mkdtemp(join(tmpdir(), "linux-snapshot-timeout-"));
+  let fixture;
+  try {
+    await assert.rejects(runExactAsarSnapshot({ sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256 }, {
+      appPath: APP_PATH, environment: { XDG_RUNTIME_DIR: runtime },
+      spawnChild: (_app, args) => {
+        fixture = args.at(-1);
+        const child = new EventEmitter();
+        child.stdout = new PassThrough(); child.stderr = new PassThrough();
+        child.exitCode = null; child.signalCode = null;
+        return child;
+      },
+      waitForExit: async () => null,
+      stopChild: async () => false,
+    }), { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SNAPSHOT_CLEANUP_UNCONFIRMED" });
+    assert.equal((await stat(fixture)).mode & 0o777, 0o700);
+  } finally { await rm(runtime, { recursive: true, force: true }); }
 });

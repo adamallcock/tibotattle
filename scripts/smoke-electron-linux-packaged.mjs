@@ -9,10 +9,10 @@
  */
 
 import { spawn } from "node:child_process";
-import { chmod, lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   DESKTOP_FIRST_RUN_RECEIPT_FILE_NAME,
@@ -24,6 +24,7 @@ import {
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES,
   assertContainerContract,
   runSmoke,
+  terminateLinuxSmokeChild,
   validateRendererReadinessDiagnostics,
 } from "./smoke-electron-linux.mjs";
 import {
@@ -42,6 +43,8 @@ const TARGET = "linux-x64";
 const RECEIPT_SCHEMA = "tibotattle-electron-linux-normal-packaged-smoke-v1";
 const RENDERER_READINESS_DIAGNOSTIC_SCHEMA =
   "tibotattle-electron-linux-normal-packaged-renderer-readiness-diagnostic-v2";
+const SNAPSHOT_DIAGNOSTIC_SCHEMA =
+  "tibotattle-electron-linux-normal-packaged-snapshot-diagnostic-v1";
 const CLI_FAILURE = "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_FAILED";
 const MAX_JSON_BYTES = 1_048_576;
 // Two source-smoke journeys each retain their existing 30s startup, two 45s
@@ -50,7 +53,45 @@ const MAX_JSON_BYTES = 1_048_576;
 const SESSION_DEADLINE_MS = 300_000;
 const SESSION_TERMINATION_MS = 5_000;
 const SESSION_KILL_MS = 1_000;
+// This is a new diagnostic-only hard bound inside the unchanged total session
+// budget. It cannot relax the normal Electron startup or refresh deadlines.
+const SNAPSHOT_DIAGNOSTIC_DEADLINE_MS = 15_000;
 const DBUS_RUN_SESSION = "/usr/bin/dbus-run-session";
+const SNAPSHOT_FAILURE_CODES = Object.freeze({
+  cleanup: "SNAPSHOT_CLEANUP_UNCONFIRMED",
+  execution: "SNAPSHOT_EXECUTION_FAILED",
+  aborted: "SNAPSHOT_PROCESS_ABORTED",
+  segmentation: "SNAPSHOT_PROCESS_SEGMENTATION_FAULT",
+  killed: "SNAPSHOT_PROCESS_KILLED",
+  fixture: "SNAPSHOT_FIXTURE_INVALID",
+  module: "SNAPSHOT_MODULE_LOAD_FAILED",
+  receipt: "SNAPSHOT_RECEIPT_INVALID",
+  result: "SNAPSHOT_RESULT_INVALID",
+  runtime: "SNAPSHOT_RUNTIME_IDENTITY_FAILED",
+  start: "SNAPSHOT_START_FAILED",
+  timeout: "SNAPSHOT_DEADLINE_EXCEEDED",
+  type: "SNAPSHOT_TYPE_ERROR",
+  unknown: "SNAPSHOT_UNKNOWN_FAILED",
+});
+// These are the only domain failures propagated by the exact startup snapshot
+// path. Preserve each source category while keeping the outer receipt closed.
+const SNAPSHOT_DOMAIN_ERROR_CODES = new Map([
+  ["collector_invalid_size", "SNAPSHOT_COLLECTOR_INVALID_SIZE"],
+  ["collector_unavailable", "SNAPSHOT_COLLECTOR_UNAVAILABLE"],
+  ["local_collector_projection_aborted", "SNAPSHOT_COLLECTOR_PROJECTION_ABORTED"],
+  ["local_collector_projection_worker_failed", "SNAPSHOT_COLLECTOR_PROJECTION_WORKER_FAILED"],
+  ["local_collector_state_corrupt", "SNAPSHOT_COLLECTOR_STATE_CORRUPT"],
+  ["local_collector_state_migration_busy", "SNAPSHOT_COLLECTOR_STATE_MIGRATION_BUSY"],
+  ["local_collector_state_schema_invalid", "SNAPSHOT_COLLECTOR_STATE_SCHEMA_INVALID"],
+  ["local_collector_state_unavailable", "SNAPSHOT_COLLECTOR_STATE_UNAVAILABLE"],
+  ["local_companion_snapshot_reload_aborted", "SNAPSHOT_RELOAD_ABORTED"],
+  ["snapshot_invalid", "SNAPSHOT_DOMAIN_RESULT_INVALID"],
+  ["snapshot_unavailable", "SNAPSHOT_DOMAIN_RESULT_UNAVAILABLE"],
+]);
+const SNAPSHOT_DIAGNOSTIC_CODES = new Set([
+  ...Object.values(SNAPSHOT_FAILURE_CODES),
+  ...SNAPSHOT_DOMAIN_ERROR_CODES.values(),
+]);
 const SOURCE_SMOKE_STAGE_CODES = Object.freeze({
   startup: "SOURCE_SMOKE_STARTUP_FAILED",
   target: "SOURCE_SMOKE_TARGET_FAILED",
@@ -93,6 +134,7 @@ const CODES = new Set([
   "FIXTURE_INVALID", "OBSERVATION_UNAVAILABLE", "UNAVAILABLE_RESPONSE_INVALID",
   "SESSION_START_FAILED", "SESSION_EXECUTION_FAILED", "SESSION_RECEIPT_INVALID",
   "PASS_RECEIPT_STDERR_REJECTED", "SESSION_DEADLINE_EXCEEDED", "SESSION_CLEANUP_UNCONFIRMED",
+  ...SNAPSHOT_DIAGNOSTIC_CODES,
   ...SOURCE_SMOKE_STAGE_CODE_VALUES,
   "RECEIPT_PATH_INVALID", "UNEXPECTED",
 ]);
@@ -132,6 +174,55 @@ function absolutePath(value) {
   }
 }
 
+function snapshotDiagnosticCode(error) {
+  const domain = SNAPSHOT_DOMAIN_ERROR_CODES.get(error?.code);
+  if (domain !== undefined) return domain;
+  return error?.name === "TypeError"
+    ? SNAPSHOT_FAILURE_CODES.type
+    : SNAPSHOT_FAILURE_CODES.unknown;
+}
+
+function snapshotDiagnosticFailure(code) {
+  const error = new Error(code);
+  error.code = code;
+  return error;
+}
+
+function snapshotDiagnosticReceipt(identity, errorCode = null) {
+  return Object.freeze({
+    schemaVersion: SNAPSHOT_DIAGNOSTIC_SCHEMA,
+    status: errorCode === null ? "passed" : "failed",
+    scope: "candidate_only",
+    target: TARGET,
+    execution: "packaged_electron_run_as_node",
+    sourceRevision: identity.sourceRevision,
+    artifactSha256: identity.artifactSha256,
+    errorCode,
+  });
+}
+
+function validateSnapshotDiagnosticReceipt(value, identity) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Reflect.ownKeys(value).length !== 8
+      || value.schemaVersion !== SNAPSHOT_DIAGNOSTIC_SCHEMA
+      || !["passed", "failed"].includes(value.status)
+      || value.scope !== "candidate_only" || value.target !== TARGET
+      || value.execution !== "packaged_electron_run_as_node"
+      || value.sourceRevision !== identity.sourceRevision
+      || value.artifactSha256 !== identity.artifactSha256) {
+    return null;
+  }
+  if (value.status === "passed" && value.errorCode === null) return snapshotDiagnosticReceipt(identity);
+  if (value.status === "failed" && SNAPSHOT_DIAGNOSTIC_CODES.has(value.errorCode)) {
+    return snapshotDiagnosticReceipt(identity, value.errorCode);
+  }
+  return null;
+}
+
+function asarModuleUrl(appPath, modulePath) {
+  return pathToFileURL(join(dirname(appPath), "resources", "app.asar", ...modulePath)).href;
+}
+
 function valueAfter(argv, index) {
   const value = argv[index + 1];
   if (typeof value !== "string" || value.length === 0 || value.startsWith("--")) {
@@ -143,17 +234,23 @@ function valueAfter(argv, index) {
 /** Accept only the outer artifact proof or its private D-Bus-session child. */
 export function parseLinuxNormalPackagedSmokeArguments(argv) {
   if (!Array.isArray(argv)) fail("ARGUMENT_INVALID");
+  const snapshot = argv[0] === "--inside-exact-asar-snapshot";
   const inside = argv[0] === "--inside-isolated-session";
-  const fields = inside
+  const fields = snapshot
+    ? new Map([
+      ["--app", "appPath"], ["--source-revision", "sourceRevision"],
+      ["--artifact-digest", "artifactSha256"], ["--snapshot-root", "snapshotRoot"],
+    ])
+    : inside
     ? new Map([["--app", "appPath"], ["--source-revision", "sourceRevision"], ["--artifact-digest", "artifactSha256"]])
     : new Map([
       ["--app", "appPath"], ["--staged-app", "stagedAppPath"],
       ["--source-candidate", "sourceCandidatePath"], ["--source-revision", "sourceRevision"],
       ["--receipt", "receiptPath"],
     ]);
-  const result = { mode: inside ? "inside" : "outer" };
+  const result = { mode: snapshot ? "snapshot" : inside ? "inside" : "outer" };
   const seen = new Set();
-  for (let index = inside ? 1 : 0; index < argv.length; index += 1) {
+  for (let index = snapshot || inside ? 1 : 0; index < argv.length; index += 1) {
     const flag = argv[index];
     if (!fields.has(flag) || seen.has(flag)) fail("ARGUMENT_INVALID");
     seen.add(flag);
@@ -162,8 +259,9 @@ export function parseLinuxNormalPackagedSmokeArguments(argv) {
   }
   if (seen.size !== fields.size || !absolutePath(result.appPath)
       || !SHA.test(result.sourceRevision ?? "")
-      || (inside && !SHA256.test(result.artifactSha256 ?? ""))
-      || (!inside && (!absolutePath(result.stagedAppPath)
+      || ((inside || snapshot) && !SHA256.test(result.artifactSha256 ?? ""))
+      || (snapshot && !absolutePath(result.snapshotRoot))
+      || (!inside && !snapshot && (!absolutePath(result.stagedAppPath)
         || !absolutePath(result.sourceCandidatePath) || !absolutePath(result.receiptPath)))) {
     fail("ARGUMENT_INVALID");
   }
@@ -482,6 +580,125 @@ function sessionEnvironment(environment) {
   return selected;
 }
 
+/** Execute only the packaged startup projection against an empty private fixture. */
+export async function runExactAsarSnapshotInside(options, {
+  assertRuntime = async () => {
+    const contract = assertContainerContract();
+    if (!process.versions.electron || process.env.ELECTRON_RUN_AS_NODE !== "1"
+        || contract.sourceRevision !== options.sourceRevision
+        || await realpath(process.execPath) !== await realpath(options.appPath)) {
+      throw snapshotDiagnosticFailure(SNAPSHOT_FAILURE_CODES.runtime);
+    }
+  },
+  loadModule = (url) => import(url),
+} = {}) {
+  let phase = "runtime";
+  try {
+    await assertRuntime();
+    phase = "fixture";
+    const root = absolutePath(options.snapshotRoot);
+    if (root === null || await realpath(root) !== root) throw new Error();
+    const metadata = await lstat(root);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()
+        || (metadata.mode & 0o777) !== 0o700
+        || metadata.uid !== process.getuid() || (await readdir(root)).length !== 0) throw new Error();
+    const home = join(root, "home");
+    const state = join(root, "companion-state");
+    await mkdir(home, { mode: 0o700 });
+    await mkdir(join(home, ".codex"), { mode: 0o700 });
+    await mkdir(state, { mode: 0o700 });
+    phase = "module";
+    const { buildLocalCompanionSnapshot, LocalCompanionDataStore } = await loadModule(
+      asarModuleUrl(options.appPath, ["src", "local-companion-data.js"]),
+    );
+    const { localCompanionStatePaths } = await loadModule(
+      asarModuleUrl(options.appPath, ["src", "local-installation-diagnostics.js"]),
+    );
+    phase = "snapshot";
+    const paths = localCompanionStatePaths(state);
+    const store = new LocalCompanionDataStore({
+      snapshotFile: paths.authoritativeDashboardSnapshotFile,
+      builder: () => buildLocalCompanionSnapshot({
+        root: join(dirname(options.appPath), "resources", "app.asar"),
+        collectorStateFile: paths.collectorStateFile,
+        archiveIndexFile: null,
+        unifiedIndexFile: paths.unifiedIndexFile,
+        codexHome: join(home, ".codex"),
+        accountingSourceMode: "unified",
+        unifiedProjectionMode: "deferred",
+      }),
+    });
+    await store.initialize({ purpose: "startup" });
+    return snapshotDiagnosticReceipt(options);
+  } catch (error) {
+    return snapshotDiagnosticReceipt(options, phase === "snapshot"
+      ? snapshotDiagnosticCode(error) : SNAPSHOT_FAILURE_CODES[phase]);
+  }
+}
+
+/** A bounded child of the already isolated, identity-verified native session. */
+export async function runExactAsarSnapshot(identity, {
+  appPath, environment = process.env,
+  spawnChild = spawn,
+  waitForExit = (child, timeoutMs) => waitForChild(child, timeoutMs, { exitEvent: "close" }),
+  stopChild = terminateLinuxSmokeChild,
+} = {}) {
+  const base = absolutePath(environment.XDG_RUNTIME_DIR);
+  if (base === null) fail(SNAPSHOT_FAILURE_CODES.fixture);
+  const root = await mkdtemp(join(base, "tibotattle-snapshot-"));
+  await chmod(root, 0o700);
+  let child = null;
+  let stopped = true;
+  let output = Buffer.alloc(0);
+  let oversized = false;
+  try {
+    const selected = sessionEnvironment(environment);
+    selected.ELECTRON_RUN_AS_NODE = "1";
+    selected.HOME = root;
+    selected.CODEX_HOME = join(root, "home", ".codex");
+    try {
+      child = spawnChild(appPath, [SCRIPT_FILE, "--inside-exact-asar-snapshot",
+        "--app", appPath, "--source-revision", identity.sourceRevision,
+        "--artifact-digest", identity.artifactSha256, "--snapshot-root", root], {
+        env: selected, cwd: root, shell: false, stdio: ["ignore", "pipe", "pipe"],
+      });
+      stopped = false;
+      child.on("error", () => {});
+      child.stdout.on("data", (chunk) => {
+        if (oversized) return;
+        const bytes = Buffer.from(chunk);
+        if (output.length + bytes.length > 4096) { oversized = true; output = Buffer.alloc(0); return; }
+        output = Buffer.concat([output, bytes]);
+      });
+      child.stderr.on("data", () => {});
+    } catch { fail(SNAPSHOT_FAILURE_CODES.start); }
+    const outcome = await waitForExit(child, SNAPSHOT_DIAGNOSTIC_DEADLINE_MS);
+    if (outcome === null) fail(SNAPSHOT_FAILURE_CODES.timeout);
+    stopped = child.exitCode !== null && child.exitCode !== undefined
+      || child.signalCode !== null && child.signalCode !== undefined;
+    if (!stopped || outcome[1] !== null || ![0, 1].includes(outcome[0])) {
+      fail(outcome[1] === "SIGABRT" ? SNAPSHOT_FAILURE_CODES.aborted
+        : outcome[1] === "SIGSEGV" ? SNAPSHOT_FAILURE_CODES.segmentation
+          : outcome[1] === "SIGKILL" ? SNAPSHOT_FAILURE_CODES.killed
+            : SNAPSHOT_FAILURE_CODES.execution);
+    }
+    let value;
+    try { value = oversized ? null : JSON.parse(output.toString("utf8")); } catch { value = null; }
+    const receipt = validateSnapshotDiagnosticReceipt(value, identity);
+    if (receipt === null || (receipt.status === "passed") !== (outcome[0] === 0)) {
+      fail(SNAPSHOT_FAILURE_CODES.receipt);
+    }
+    if (receipt.status === "failed") fail(receipt.errorCode);
+    return receipt;
+  } finally {
+    if (!stopped) {
+      try { stopped = await stopChild(child); } catch { stopped = false; }
+    }
+    if (!stopped) fail(SNAPSHOT_FAILURE_CODES.cleanup);
+    await rm(root, { recursive: true, force: false });
+  }
+}
+
 export async function runLinuxNormalPackagedSmokeInside(options, {
   environment = process.env,
   startDaemon = async () => (await import("./qualify-linux-secret-service.mjs"))
@@ -490,6 +707,7 @@ export async function runLinuxNormalPackagedSmokeInside(options, {
     .proveLinuxSecretServiceContainerIsolation({ environment }),
   assertCodexFixture = assertSyntheticCodexFixture,
   runApp = runOneNormalApp,
+  runSnapshot = runExactAsarSnapshot,
 } = {}) {
   if (!options || !absolutePath(options.appPath) || !SHA.test(options.sourceRevision ?? "")
       || !SHA256.test(options.artifactSha256 ?? "") || typeof assertCodexFixture !== "function"
@@ -511,13 +729,14 @@ export async function runLinuxNormalPackagedSmokeInside(options, {
     if (String(error?.code ?? "").startsWith("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_")) throw error;
     fail("CONTAINER_INVALID");
   }
+  const identity = Object.freeze({ sourceRevision: options.sourceRevision, artifactSha256: options.artifactSha256 });
+  await runSnapshot(identity, { appPath: options.appPath, environment });
   try {
     if ((await startDaemon())?.status !== "started") fail("CONTAINER_INVALID");
   } catch (error) {
     if (String(error?.code ?? "").startsWith("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_")) throw error;
     fail("CONTAINER_INVALID");
   }
-  const identity = Object.freeze({ sourceRevision: options.sourceRevision, artifactSha256: options.artifactSha256 });
   if (await runApp(identity, { appPath: options.appPath, environment, service: "available" }) !== "available") {
     fail("OBSERVATION_UNAVAILABLE");
   }
@@ -533,10 +752,11 @@ export async function runLinuxNormalPackagedSmokeInside(options, {
   });
 }
 
-function waitForChild(child, timeoutMs) {
+function waitForChild(child, timeoutMs, { exitEvent = "exit" } = {}) {
   if (!child || typeof child !== "object") return Promise.resolve([null, "spawn_error"]);
-  const exited = () => child.exitCode !== null && child.exitCode !== undefined
-    || child.signalCode !== null && child.signalCode !== undefined;
+  const exited = () => (child.exitCode !== null && child.exitCode !== undefined
+    || child.signalCode !== null && child.signalCode !== undefined)
+    && (exitEvent === "exit" || child.stdout?.readableEnded === true && child.stderr?.readableEnded === true);
   if (exited()) return Promise.resolve([child.exitCode, child.signalCode]);
   return new Promise((resolveWait) => {
     let timer = null;
@@ -547,11 +767,11 @@ function waitForChild(child, timeoutMs) {
       if (settled) return;
       settled = true;
       if (timer !== null) clearTimeout(timer);
-      child.removeListener?.("exit", onExit);
+      child.removeListener?.(exitEvent, onExit);
       child.removeListener?.("error", onError);
       resolveWait(value);
     };
-    child.once?.("exit", onExit);
+    child.once?.(exitEvent, onExit);
     child.once?.("error", onError);
     if (exited()) {
       finish([child.exitCode, child.signalCode]);
@@ -760,6 +980,12 @@ export async function runLinuxNormalPackagedSmoke(options, {
 
 async function main() {
   const options = parseLinuxNormalPackagedSmokeArguments(process.argv.slice(2));
+  if (options.mode === "snapshot") {
+    const receipt = await runExactAsarSnapshotInside(options);
+    process.stdout.write(`${JSON.stringify(receipt)}\n`);
+    if (receipt.status !== "passed") process.exitCode = 1;
+    return;
+  }
   if (options.mode === "inside") {
     process.stdout.write(`${JSON.stringify(await runLinuxNormalPackagedSmokeInside(options))}\n`);
     return;
