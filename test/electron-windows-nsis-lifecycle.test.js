@@ -1363,6 +1363,68 @@ test("post-uninstall polling uses one monotonic budget across fixed probes", asy
   }
 });
 
+test("default post-uninstall budget leaves the full registry timeout before its termination grace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-postcondition-default-budget-test-"));
+  const receiptPath = join(root, "receipt.json");
+  const ownedRoot = join(root, "owned");
+  let registryCalls = 0;
+  let removedRoots = 0;
+  const postconditionTimeouts = [];
+  try {
+    await assert.rejects(runWindowsNsisLifecycle({
+      installerPath: join(root, "installer.exe"),
+      stagedAppPath: join(root, "staged"),
+      packageReceiptPath: join(root, "development-package.json"),
+      sourceRevision: revision,
+      receiptPath,
+    }, {
+      platform: "win32",
+      architecture: "x64",
+      environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: root, SystemRoot: "C:\\Windows" },
+      verifyInstaller: async () => ({ sourceRevision: revision, installerBytes: 123, installerSha256: "b".repeat(64) }),
+      verifySilentNsisTemplate: async () => true,
+      createOwnedRoot: async () => ownedRoot,
+      isMissing: async () => true,
+      inspectRegistry: async ({ timeoutMs } = {}) => {
+        registryCalls += 1;
+        if (timeoutMs === undefined) return registryCalls === 1 ? "absent-v1" : "expected-v1";
+        postconditionTimeouts.push(timeoutMs);
+        throw Object.assign(new Error("synthetic registry timeout"), {
+          postUninstallRegistryProbeFailureCode:
+            "ELECTRON_WINDOWS_NSIS_LIFECYCLE_POST_UNINSTALL_REGISTRY_PROBE_TIMED_OUT",
+        });
+      },
+      executeInstaller: async () => ({ settled: true, succeeded: true }),
+      assertUninstaller: async () => {},
+      verifyInstalledPackage: async () => installedIdentity,
+      prepareProfile: async ({ profilePath }) => profile(profilePath),
+      prepareFirstRun: async () => {},
+      launchAndExercise: async ({ launchOrdinal }) => ({
+        pid: launchOrdinal === 1 ? 901 : 902,
+        observedProcessTreeExited: true,
+        installedExecutableAbsentAtPreLaunchSnapshot: true,
+        installedExecutableAbsentAtPostExitSnapshot: true,
+        storageJourneyCompleted: true,
+      }),
+      executeUninstaller: async () => ({ settled: true, succeeded: true }),
+      monotonicNow: () => 0,
+      removeOwnedRoot: async () => { removedRoots += 1; },
+    }), /CLEANUP_UNCONFIRMED/u);
+    assert.deepEqual(postconditionTimeouts, [20_000]);
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.postUninstallPhase, "uninstall_registry_probe_unavailable");
+    assert.equal(
+      receipt.postUninstallFailureCode,
+      "ELECTRON_WINDOWS_NSIS_LIFECYCLE_POST_UNINSTALL_REGISTRY_PROBE_TIMED_OUT",
+    );
+    assert.equal(receipt.cleanupConfirmed, false);
+    assert.equal(receipt.ownedTemporaryRootRemoved, false);
+    assert.equal(removedRoots, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("post-uninstall receipts isolate fixed probe failures without releasing the owned root", async (t) => {
   const registryProbeScenario = (name, result, failureCode) => ({
     name,
