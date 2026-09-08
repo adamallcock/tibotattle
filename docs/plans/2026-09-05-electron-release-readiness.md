@@ -800,3 +800,38 @@ work and exit criteria for the current candidate.
   Any simplification must close those reachable legacy routes and preserve
   observed-account linkage, protected settings, authenticated native bindings
   and recovery; changing readiness booleans is not sufficient.
+
+## 2026-09-07 public-sample decision and verified identity limits
+
+The owner requested an explanation before deciding whether accountless
+measurements should join the public sample. Eligibility remains unchanged.
+Social sign-in proves control of that login; neither it nor an installation
+credential proves one unique person, a provider account, or measurement truth.
+The proposed label is **contribution sources**, with metric-specific source
+influence limits for allowance estimates and existing suppression/revocation.
+Those limits must not silently clip accepted token and API-equivalent totals.
+
+The current replay guarantee is narrower than global deduplication. An
+accountless installation retains its backend secret and
+`accountless-device-binding-v1.json`; the retained unified index/device salt
+also preserves event anchors. Retries and lease renewal keep that graph and
+accepted history. The legacy `contribution-device-binding-v1.json` is a different
+binding and is not a substitute. A clean reinstall without retained state or a
+second device creates another source. Event and quota anchors include local
+salt/source scope, and server uniqueness is scoped to participant/device.
+Two independent installations reading the same cloud-synced history therefore
+can both submit it. The shared session UUID alone is not an authenticated
+identity and currently does not merge those records across sources.
+
+Before public admission, choose and test an overlapping-history policy as well
+as the source label. A protected profile restore can preserve one installation's
+continuity; it does not solve separately-created sources. Comparing content-free
+session/occurrence evidence at aggregation time is a possible follow-up design,
+not an implemented guarantee, and must preserve conflicting/partial evidence
+and avoid merging separate provider accounts. Enrollment/upload budgets and
+revocation address abuse independently of this good-faith duplicate case.
+
+The accountless Electron companion will close legacy sign-in, pairing and
+manual-preparation entrypoints while keeping observed-account secrets and
+usage/quota linkage. No-social composition must not make historical markers
+unattributed merely to pass a platform readiness gate.
