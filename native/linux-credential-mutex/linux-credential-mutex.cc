@@ -19,7 +19,9 @@
 #include <libsecret/secret.h>
 
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -29,6 +31,8 @@
 #include <mutex>
 #include <new>
 #include <string>
+#include <system_error>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -87,6 +91,7 @@ constexpr std::size_t kAccountObservationOperationJournalReservedStart = 18;
 constexpr std::size_t kAccountObservationOperationJournalDigestOffset = 32;
 constexpr unsigned char kAccountObservationOperationJournalVersion = 1;
 constexpr unsigned char kAccountObservationOperationCreate = 1;
+constexpr std::chrono::milliseconds kAccountObservationOperationDeadline {5'000};
 // Exact binary bytes: the printable namespace is deliberately terminated and
 // padded instead of relying on a C string's implicit trailing byte.
 constexpr std::array<unsigned char, kAccountlessOperationJournalMagicBytes>
@@ -2054,6 +2059,100 @@ void ClearAccountObservationOperationJournal(
   journal->digest.fill(0);
 }
 
+// The fixed observation route has one aggregate cancellation budget per N-API
+// worker. A single guard covers lookup, collection resolution, create, and
+// reconciliation; nested calls must never extend that budget.
+class AccountObservationDeadlineGuard {
+ public:
+  AccountObservationDeadlineGuard() = default;
+  AccountObservationDeadlineGuard(const AccountObservationDeadlineGuard&) = delete;
+  AccountObservationDeadlineGuard& operator=(const AccountObservationDeadlineGuard&) = delete;
+
+  ~AccountObservationDeadlineGuard() {
+    Finish();
+  }
+
+  bool Start() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (finished_ || cancellable_ != nullptr || watchdog_.joinable()) return false;
+    cancellable_ = g_cancellable_new();
+    if (cancellable_ == nullptr) return false;
+    try {
+      watchdog_ = std::thread(&AccountObservationDeadlineGuard::Watch, this);
+    } catch (const std::system_error&) {
+      g_object_unref(cancellable_);
+      cancellable_ = nullptr;
+      return false;
+    }
+    return true;
+  }
+
+  GCancellable* cancellable() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cancellable_;
+  }
+
+  // Stop the aggregate deadline before a caller commits an otherwise-normal
+  // local settlement. Joining first means an already-expired watchdog is
+  // observed while the lease can still be latched as recovery-required.
+  bool StopDeadline() noexcept {
+    bool notify = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!finished_) {
+        finished_ = true;
+        notify = true;
+      }
+    }
+    if (notify) condition_.notify_all();
+    if (watchdog_.joinable()) watchdog_.join();
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cancellable_ == nullptr || g_cancellable_is_cancelled(cancellable_);
+  }
+
+  void Finish() noexcept {
+    StopDeadline();
+    GCancellable* current = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      current = cancellable_;
+      cancellable_ = nullptr;
+    }
+    if (current != nullptr) g_object_unref(current);
+  }
+
+ private:
+  void Watch() noexcept {
+    bool timed_out = false;
+    try {
+      std::unique_lock<std::mutex> lock(mutex_);
+      timed_out = !condition_.wait_for(
+          lock,
+          kAccountObservationOperationDeadline,
+          [this]() { return finished_; });
+    } catch (...) {
+      timed_out = true;
+    }
+    if (!timed_out) return;
+    GCancellable* current = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      current = cancellable_;
+    }
+    if (current != nullptr) g_cancellable_cancel(current);
+  }
+
+  mutable std::mutex mutex_;
+  std::condition_variable condition_;
+  GCancellable* cancellable_ = nullptr;
+  std::thread watchdog_;
+  bool finished_ = false;
+};
+
+bool AccountObservationDeadlineCancelled(GCancellable* cancellable) {
+  return cancellable == nullptr || g_cancellable_is_cancelled(cancellable);
+}
+
 bool EqualAccountObservationCredential(
     const std::array<unsigned char, kAccountObservationCredentialBytes>& first,
     const std::array<unsigned char, kAccountObservationCredentialBytes>& second) {
@@ -2165,8 +2264,11 @@ void FreeAccountObservationItems(GList* items) {
 }
 
 AccountObservationRecordState ReadAccountObservationCredential(
-    AccountObservationRecord* result) {
-  if (result == nullptr) return AccountObservationRecordState::kUnavailable;
+    AccountObservationRecord* result,
+    GCancellable* cancellable) {
+  if (result == nullptr || AccountObservationDeadlineCancelled(cancellable)) {
+    return AccountObservationRecordState::kUnavailable;
+  }
   ClearAccountObservationRecord(result);
   GHashTable* attributes = g_hash_table_new(g_str_hash, g_str_equal);
   if (attributes == nullptr) return AccountObservationRecordState::kUnavailable;
@@ -2185,7 +2287,7 @@ AccountObservationRecordState ReadAccountObservationCredential(
       attributes,
       static_cast<SecretSearchFlags>(
           SECRET_SEARCH_ALL | SECRET_SEARCH_LOAD_SECRETS),
-      nullptr,
+      cancellable,
       &error);
   g_hash_table_destroy(attributes);
   if (error != nullptr) {
@@ -2213,13 +2315,15 @@ AccountObservationRecordState ReadAccountObservationCredential(
       : AccountObservationRecordState::kInvalid;
 }
 
-SecretCollection* OpenAccountObservationDefaultCollection() {
+SecretCollection* OpenAccountObservationDefaultCollection(
+    GCancellable* cancellable) {
+  if (AccountObservationDeadlineCancelled(cancellable)) return nullptr;
   GError* error = nullptr;
   SecretCollection* collection = secret_collection_for_alias_sync(
       nullptr,
       SECRET_COLLECTION_DEFAULT,
       SECRET_COLLECTION_NONE,
-      nullptr,
+      cancellable,
       &error);
   if (error != nullptr) {
     g_error_free(error);
@@ -2239,8 +2343,11 @@ SecretCollection* OpenAccountObservationDefaultCollection() {
 
 bool CreateAccountObservationCredentialNoReplace(
     SecretCollection* collection,
-    const std::array<unsigned char, kAccountObservationCredentialBytes>& value) {
-  if (collection == nullptr) return false;
+    const std::array<unsigned char, kAccountObservationCredentialBytes>& value,
+    GCancellable* cancellable) {
+  if (collection == nullptr || AccountObservationDeadlineCancelled(cancellable)) {
+    return false;
+  }
   std::array<char, 44> encoded = EncodeAccountObservationCredential(value);
   if (encoded[0] == '\0') return false;
   GHashTable* attributes = g_hash_table_new(g_str_hash, g_str_equal);
@@ -2276,7 +2383,7 @@ bool CreateAccountObservationCredentialNoReplace(
       kAccountObservationLabel,
       secret,
       SECRET_ITEM_CREATE_NONE,
-      nullptr,
+      cancellable,
       &error);
   const bool created = item != nullptr && error == nullptr;
   if (error != nullptr) g_error_free(error);
@@ -2742,11 +2849,13 @@ AccountObservationOperationJournalRemoveOutcome SettleAccountObservationMutation
 }
 
 AccountObservationOperationRecoveryOutcome RecoverAccountObservationOperationJournal(
-    AccountObservationLease* lease) {
+    AccountObservationLease* lease,
+    GCancellable* cancellable) {
   if (lease == nullptr
       || !lease->active
       || !lease->operation_journal_written
-      || lease->operation_journal_fd < 0) {
+      || lease->operation_journal_fd < 0
+      || AccountObservationDeadlineCancelled(cancellable)) {
     return AccountObservationOperationRecoveryOutcome::kAmbiguous;
   }
   AccountObservationOperationJournal journal {};
@@ -2758,7 +2867,9 @@ AccountObservationOperationRecoveryOutcome RecoverAccountObservationOperationJou
     return AccountObservationOperationRecoveryOutcome::kAmbiguous;
   }
   AccountObservationRecord record {};
-  const AccountObservationRecordState state = ReadAccountObservationCredential(&record);
+  const AccountObservationRecordState state = ReadAccountObservationCredential(
+      &record,
+      cancellable);
   std::array<unsigned char, kAccountObservationCredentialBytes> digest {};
   const bool exact = state == AccountObservationRecordState::kPresent
       && DigestAccountObservationCredential(record.bytes, &digest)
@@ -2766,6 +2877,9 @@ AccountObservationOperationRecoveryOutcome RecoverAccountObservationOperationJou
   ClearAccountObservationRecord(&record);
   digest.fill(0);
   ClearAccountObservationOperationJournal(&journal);
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    return AccountObservationOperationRecoveryOutcome::kUnavailable;
+  }
   if (!exact) {
     return state == AccountObservationRecordState::kUnavailable
         ? AccountObservationOperationRecoveryOutcome::kUnavailable
@@ -2919,13 +3033,42 @@ AccountObservationWorkResult FinishAccountObservationRecovery(
   return AccountObservationWorkResult::kRecoveryRequired;
 }
 
-bool ReconcilePendingAccountObservationOperation(AccountObservationLease* lease) {
-  if (lease == nullptr || !lease->operation_journal_written) return lease != nullptr;
-  return RecoverAccountObservationOperationJournal(lease)
+AccountObservationWorkResult FinishAccountObservationCancellation(
+    AccountObservationLease* lease) {
+  if (lease == nullptr) return AccountObservationWorkResult::kUnavailable;
+  return lease->operation_journal_written || lease->active_marker_written
+      ? FinishAccountObservationRecovery(lease)
+      : FinishAccountObservationUnavailable(lease);
+}
+
+AccountObservationWorkResult FinishAccountObservationNormal(
+    AccountObservationLease* lease,
+    AccountObservationDeadlineGuard* deadline,
+    AccountObservationWorkResult normal_result) {
+  // Freeze the watchdog before changing active back to normal. If it expired
+  // between the last service postcondition check and this point, the v1/v5
+  // recovery fence remains durable rather than racing that final settlement.
+  if (deadline == nullptr || deadline->StopDeadline()) {
+    return FinishAccountObservationCancellation(lease);
+  }
+  return FinishAccountObservationLease(lease, false)
+      ? normal_result
+      : AccountObservationWorkResult::kRecoveryRequired;
+}
+
+bool ReconcilePendingAccountObservationOperation(
+    AccountObservationLease* lease,
+    GCancellable* cancellable) {
+  if (lease == nullptr) return false;
+  if (!lease->operation_journal_written) return true;
+  return RecoverAccountObservationOperationJournal(lease, cancellable)
       == AccountObservationOperationRecoveryOutcome::kRecovered;
 }
 
-AccountObservationWorkResult RunAccountObservationRead(AccountObservationWork* work) {
+AccountObservationWorkResult RunAccountObservationRead(
+    AccountObservationWork* work,
+    GCancellable* cancellable,
+    AccountObservationDeadlineGuard* deadline) {
   if (work == nullptr) return AccountObservationWorkResult::kUnavailable;
   AccountObservationLease* lease = nullptr;
   const AccountObservationLeaseOutcome acquired = AcquireAccountObservationLease(&lease);
@@ -2935,33 +3078,55 @@ AccountObservationWorkResult RunAccountObservationRead(AccountObservationWork* w
   if (acquired != AccountObservationLeaseOutcome::kAcquired) {
     return AccountObservationWorkResult::kUnavailable;
   }
-  if (!ReconcilePendingAccountObservationOperation(lease)) {
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    return FinishAccountObservationCancellation(lease);
+  }
+  if (!ReconcilePendingAccountObservationOperation(lease, cancellable)) {
     return FinishAccountObservationRecovery(lease);
   }
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    return FinishAccountObservationCancellation(lease);
+  }
   AccountObservationRecord record {};
-  const AccountObservationRecordState state = ReadAccountObservationCredential(&record);
+  const AccountObservationRecordState state = ReadAccountObservationCredential(
+      &record,
+      cancellable);
+  const bool cancelled = AccountObservationDeadlineCancelled(cancellable);
   if (state == AccountObservationRecordState::kAbsent) {
     ClearAccountObservationRecord(&record);
-    return FinishAccountObservationLease(lease, false)
-        ? AccountObservationWorkResult::kAbsent
-        : AccountObservationWorkResult::kRecoveryRequired;
+    if (cancelled) return FinishAccountObservationCancellation(lease);
+    return FinishAccountObservationNormal(
+        lease,
+        deadline,
+        AccountObservationWorkResult::kAbsent);
   }
   if (state == AccountObservationRecordState::kPresent) {
     work->value = record.bytes;
     ClearAccountObservationRecord(&record);
-    if (!FinishAccountObservationLease(lease, false)) {
+    if (cancelled) {
       work->value.fill(0);
-      return AccountObservationWorkResult::kRecoveryRequired;
+      return FinishAccountObservationCancellation(lease);
     }
-    return AccountObservationWorkResult::kValue;
+    const AccountObservationWorkResult result = FinishAccountObservationNormal(
+        lease,
+        deadline,
+        AccountObservationWorkResult::kValue);
+    if (result != AccountObservationWorkResult::kValue) {
+      work->value.fill(0);
+    }
+    return result;
   }
   ClearAccountObservationRecord(&record);
+  if (cancelled) return FinishAccountObservationCancellation(lease);
   return state == AccountObservationRecordState::kUnavailable
       ? FinishAccountObservationUnavailable(lease)
       : FinishAccountObservationRecovery(lease);
 }
 
-AccountObservationWorkResult RunAccountObservationCreate(AccountObservationWork* work) {
+AccountObservationWorkResult RunAccountObservationCreate(
+    AccountObservationWork* work,
+    GCancellable* cancellable,
+    AccountObservationDeadlineGuard* deadline) {
   if (work == nullptr) return AccountObservationWorkResult::kUnavailable;
   AccountObservationLease* lease = nullptr;
   const AccountObservationLeaseOutcome acquired = AcquireAccountObservationLease(&lease);
@@ -2971,19 +3136,31 @@ AccountObservationWorkResult RunAccountObservationCreate(AccountObservationWork*
   if (acquired != AccountObservationLeaseOutcome::kAcquired) {
     return AccountObservationWorkResult::kUnavailable;
   }
-  if (!ReconcilePendingAccountObservationOperation(lease)) {
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    return FinishAccountObservationCancellation(lease);
+  }
+  if (!ReconcilePendingAccountObservationOperation(lease, cancellable)) {
     return FinishAccountObservationRecovery(lease);
+  }
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    return FinishAccountObservationCancellation(lease);
   }
 
   AccountObservationRecord before {};
-  const AccountObservationRecordState before_state = ReadAccountObservationCredential(&before);
+  const AccountObservationRecordState before_state = ReadAccountObservationCredential(
+      &before,
+      cancellable);
+  const bool cancelled_before = AccountObservationDeadlineCancelled(cancellable);
   if (before_state == AccountObservationRecordState::kPresent) {
     ClearAccountObservationRecord(&before);
-    return FinishAccountObservationLease(lease, false)
-        ? AccountObservationWorkResult::kExisting
-        : AccountObservationWorkResult::kRecoveryRequired;
+    if (cancelled_before) return FinishAccountObservationCancellation(lease);
+    return FinishAccountObservationNormal(
+        lease,
+        deadline,
+        AccountObservationWorkResult::kExisting);
   }
   ClearAccountObservationRecord(&before);
+  if (cancelled_before) return FinishAccountObservationCancellation(lease);
   if (before_state == AccountObservationRecordState::kUnavailable) {
     return FinishAccountObservationUnavailable(lease);
   }
@@ -2994,41 +3171,75 @@ AccountObservationWorkResult RunAccountObservationCreate(AccountObservationWork*
   // Obtain the default collection before persisting the digest intent. A
   // missing or locked collection is a known non-mutation failure, whereas a
   // later create result is intentionally reconciled through the digest.
-  SecretCollection* collection = OpenAccountObservationDefaultCollection();
-  if (collection == nullptr) return FinishAccountObservationUnavailable(lease);
+  SecretCollection* collection = OpenAccountObservationDefaultCollection(cancellable);
+  if (collection == nullptr) {
+    return AccountObservationDeadlineCancelled(cancellable)
+        ? FinishAccountObservationCancellation(lease)
+        : FinishAccountObservationUnavailable(lease);
+  }
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    g_object_unref(collection);
+    return FinishAccountObservationCancellation(lease);
+  }
   if (!BeginAccountObservationMutation(lease, work->candidate)) {
     g_object_unref(collection);
     return FinishAccountObservationRecovery(lease);
   }
-  CreateAccountObservationCredentialNoReplace(collection, work->candidate);
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    g_object_unref(collection);
+    return FinishAccountObservationRecovery(lease);
+  }
+  CreateAccountObservationCredentialNoReplace(collection, work->candidate, cancellable);
   g_object_unref(collection);
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    return FinishAccountObservationRecovery(lease);
+  }
 
   AccountObservationRecord after {};
-  const AccountObservationRecordState after_state = ReadAccountObservationCredential(&after);
+  const AccountObservationRecordState after_state = ReadAccountObservationCredential(
+      &after,
+      cancellable);
   const bool exact = after_state == AccountObservationRecordState::kPresent
       && EqualAccountObservationCredential(after.bytes, work->candidate);
   ClearAccountObservationRecord(&after);
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    return FinishAccountObservationRecovery(lease);
+  }
   if (!exact) {
     // A no-replace create may still race a non-cooperating same-user writer and
     // leave a duplicate or foreign item. Retain the digest intent and refuse;
     // this route never cleans, replaces, or adopts that state.
     return FinishAccountObservationRecovery(lease);
   }
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    return FinishAccountObservationRecovery(lease);
+  }
   if (SettleAccountObservationMutation(lease)
       != AccountObservationOperationJournalRemoveOutcome::kRemoved) {
     return FinishAccountObservationRecovery(lease);
   }
-  return FinishAccountObservationLease(lease, false)
-      ? AccountObservationWorkResult::kCreated
-      : AccountObservationWorkResult::kRecoveryRequired;
+  if (AccountObservationDeadlineCancelled(cancellable)) {
+    return FinishAccountObservationRecovery(lease);
+  }
+  return FinishAccountObservationNormal(
+      lease,
+      deadline,
+      AccountObservationWorkResult::kCreated);
 }
 
 void ExecuteAccountObservationWork(napi_env /* env */, void* data) {
   auto* work = static_cast<AccountObservationWork*>(data);
   if (work == nullptr) return;
-  work->result = work->operation == AccountObservationWorkOperation::kRead
-      ? RunAccountObservationRead(work)
-      : RunAccountObservationCreate(work);
+  AccountObservationDeadlineGuard deadline;
+  if (!deadline.Start()) {
+    work->result = AccountObservationWorkResult::kUnavailable;
+  } else {
+    GCancellable* cancellable = deadline.cancellable();
+    work->result = work->operation == AccountObservationWorkOperation::kRead
+        ? RunAccountObservationRead(work, cancellable, &deadline)
+        : RunAccountObservationCreate(work, cancellable, &deadline);
+  }
+  deadline.Finish();
   work->candidate.fill(0);
 }
 

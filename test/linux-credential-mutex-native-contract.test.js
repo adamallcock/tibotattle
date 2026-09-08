@@ -122,6 +122,38 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /secret_collection_get_locked\(collection\)/u);
   assert.match(source, /secret_item_create_sync/u);
   assert.match(source, /SECRET_ITEM_CREATE_NONE/u);
+  assert.match(source, /kAccountObservationOperationDeadline \{5'000\}/u);
+  assert.match(source, /class AccountObservationDeadlineGuard/u);
+  assert.match(source, /g_cancellable_new\(\)/u);
+  assert.match(source, /g_cancellable_cancel\(current\)/u);
+  assert.match(source, /std::condition_variable/u);
+  assert.match(source, /FinishAccountObservationCancellation/u);
+  assert.match(source, /FinishAccountObservationNormal/u);
+  assert.match(source, /deadline->StopDeadline\(\)/u);
+  assert.match(
+    source,
+    /OpenAccountObservationDefaultCollection\(cancellable\)[\s\S]*?AccountObservationDeadlineCancelled\(cancellable\)[\s\S]*?BeginAccountObservationMutation/u,
+  );
+  assert.match(
+    source,
+    /BeginAccountObservationMutation\(lease, work->candidate\)[\s\S]*?AccountObservationDeadlineCancelled\(cancellable\)[\s\S]*?FinishAccountObservationRecovery\(lease\)/u,
+  );
+  assert.match(
+    source,
+    /RecoverAccountObservationOperationJournal[\s\S]*?AccountObservationDeadlineCancelled\(cancellable\)[\s\S]*?AccountObservationOperationRecoveryOutcome::kUnavailable/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /SECRET_SEARCH_ALL \| SECRET_SEARCH_LOAD_SECRETS\),\s*nullptr,\s*&error/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /SECRET_COLLECTION_NONE,\s*nullptr,\s*&error/u,
+  );
+  assert.doesNotMatch(
+    source,
+    /SECRET_ITEM_CREATE_NONE,\s*nullptr,\s*&error/u,
+  );
   assert.match(source, /napi_create_async_work/u);
   assert.match(source, /QueueAccountObservationWork/u);
   assert.doesNotMatch(source, /secret_password_store_sync/u);
@@ -148,5 +180,7 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(readme, /unresolvable-digest refusal/u);
   assert.match(readme, /libsecret-1/u);
   assert.match(readme, /modeled interruption states/u);
+  assert.match(readme, /five-second\s+aggregate deadline/u);
+  assert.match(readme, /never replies/u);
   assert.match(readme, /not a\s+selected credential\s+backend/u);
 });

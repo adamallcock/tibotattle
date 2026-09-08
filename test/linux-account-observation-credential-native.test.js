@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmod,
@@ -9,9 +10,11 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES,
@@ -21,11 +24,17 @@ import {
   LinuxAccountObservationCredentialError,
 } from "../src/platform/linux-account-observation-credential.js";
 
-const NATIVE_TEST_ENABLED = process.platform === "linux"
+const BLACKHOLE_CHILD = process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_CHILD
+  === "1";
+const NATIVE_TEST_PREREQUISITES = process.platform === "linux"
   && process.arch === "x64"
   && process.env.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED === "1"
   && process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NATIVE_TEST === "1";
+const NATIVE_TEST_ENABLED = NATIVE_TEST_PREREQUISITES && !BLACKHOLE_CHILD;
+const BLACKHOLE_CHILD_ENABLED = NATIVE_TEST_PREREQUISITES && BLACKHOLE_CHILD;
 const OPERATION_JOURNAL = "account-observation-operation-5-v1";
+const BLACKHOLE_CHILD_DEADLINE_MS = 9_000;
+const BLACKHOLE_MINIMUM_DELAY_MS = 4_000;
 const OPERATION_MAGIC = Buffer.from([
   0x54, 0x49, 0x42, 0x4f, 0x54, 0x41, 0x54, 0x54,
   0x4c, 0x45, 0x2d, 0x46, 0x44, 0x34, 0x00, 0x00,
@@ -96,6 +105,90 @@ async function assertMissing(path) {
   assert.fail("expected fixed native journal to be absent");
 }
 
+async function startBlackholeSessionBus(socketPath) {
+  const sockets = new Set();
+  const server = createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+    socket.on("error", () => {});
+    // A D-Bus client can connect and start authentication, but this fixed
+    // fixture intentionally never responds. The child must settle through the
+    // native aggregate cancellation deadline rather than an outer test kill.
+    socket.resume();
+  });
+  await new Promise((resolve, reject) => {
+    const fail = (error) => {
+      server.off("listening", ready);
+      reject(error);
+    };
+    const ready = () => {
+      server.off("error", fail);
+      resolve();
+    };
+    server.once("error", fail);
+    server.once("listening", ready);
+    server.listen(socketPath);
+  });
+  server.on("error", () => {});
+  return async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise((resolve) => server.close(() => resolve()));
+  };
+}
+
+async function runBlackholeChild({ stateBase, sessionBusAddress }) {
+  const child = spawn(
+    process.execPath,
+    ["--test", "--test-reporter=tap", fileURLToPath(import.meta.url)],
+    {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DBUS_SESSION_BUS_ADDRESS: sessionBusAddress,
+        USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_CHILD: "1",
+        XDG_STATE_HOME: stateBase,
+      },
+      shell: false,
+      stdio: "ignore",
+    },
+  );
+  const startedAt = Date.now();
+  const outcome = await new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // The close handler below reports the bounded child outcome.
+      }
+      finish({ code: null, signal: "deadline" });
+    }, BLACKHOLE_CHILD_DEADLINE_MS);
+    child.once("error", () => finish({ code: null, signal: "spawn_error" }));
+    child.once("close", (code, signal) => finish({ code, signal }));
+  });
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(outcome.signal, null);
+  assert.equal(outcome.code, 0);
+  assert.ok(elapsedMs >= BLACKHOLE_MINIMUM_DELAY_MS);
+  assert.ok(elapsedMs < BLACKHOLE_CHILD_DEADLINE_MS);
+}
+
+test("native Linux account-observation child maps an unresponsive D-Bus service to unavailable", {
+  skip: !BLACKHOLE_CHILD_ENABLED,
+}, async () => {
+  const backend = createLinuxAccountObservationCredentialBackend();
+  await assert.rejects(
+    backend.read(EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation),
+    nativeError("unavailable"),
+  );
+});
+
 test("native Linux account-observation credential refuses an absent retained intent before creation, creates once, and reconciles only a matching digest intent", {
   skip: !NATIVE_TEST_ENABLED,
 }, async (t) => {
@@ -103,6 +196,8 @@ test("native Linux account-observation credential refuses an absent retained int
   const absentStateBase = join(root, "absent-state");
   const successStateBase = join(root, "success-state");
   const interruptedStateBase = join(root, "interrupted-state");
+  const blackholeStateBase = join(root, "blackhole-state");
+  const blackholeSocket = join(root, "blackhole-session-bus.sock");
   const previousState = process.env.XDG_STATE_HOME;
   const absentCandidate = Buffer.alloc(32, 70);
   const first = Buffer.alloc(32, 71);
@@ -232,6 +327,25 @@ test("native Linux account-observation credential refuses an absent retained int
   const retainedIntent = await lstat(paths.operationJournal);
   assert.equal(retainedIntent.isFile(), true);
   assert.equal(retainedIntent.mode & 0o777, 0o600);
+
+  // The native deadline is exercised through a closed child invocation with a
+  // local D-Bus socket that accepts connections but never replies. This does
+  // not contact a real account service or expose secret material.
+  const blackholePaths = await prepareOwnerPrivateState(blackholeStateBase);
+  const closeBlackholeBus = await startBlackholeSessionBus(blackholeSocket);
+  try {
+    await runBlackholeChild({
+      stateBase: blackholeStateBase,
+      sessionBusAddress: `unix:path=${blackholeSocket}`,
+    });
+  } finally {
+    await closeBlackholeBus();
+  }
+  await assertMissing(blackholePaths.operationJournal);
+  assert.equal(
+    await readFile(blackholePaths.legacyJournal, "utf8"),
+    "linux-credential-mutex-journal-v1:normal\n",
+  );
 
   // The wrapper accepts this marker only with a zero exit and its exact TAP
   // comment form, so a skipped or partial test cannot become a passing receipt.

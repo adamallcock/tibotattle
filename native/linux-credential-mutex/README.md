@@ -214,12 +214,22 @@ delete, cleanup wire, or real-account credential access; session cleanup is a
 disposable-runner lifetime boundary. It does not model an actual process kill,
 desktop lock transition, service crash, storage loss, or power failure.
 
-The native calls run outside the JavaScript event loop, but this source slice
-does not yet give libsecret's synchronous service calls a per-operation
-cancellation deadline. The isolated runner deadline limits a qualification
-process, not a blocked service call or worker. Prompt and unresponsive-service
-behavior therefore remain native qualification gates; this module makes no
-bounded-operation readiness claim.
+Each fixed slot-five worker creates one `GCancellable` with a five-second
+aggregate deadline shared by its search, collection lookup, no-replace create,
+and reconciliation calls. The watchdog joins before that cancellable is
+released. A deadline before any persisted intent returns `unavailable`; after
+the digest intent or v1 `active` marker exists it latches and retains recovery,
+returning `recovery_required` instead of normalizing the local state. The
+focused native qualification includes a closed local D-Bus socket that accepts
+but never replies, and requires the child read to return its fixed unavailable
+outcome inside the broker's larger deadline.
+
+This bounds the reviewed libsecret calls, but does not prove universal
+no-prompt behavior: a default collection can lock after the checked snapshot
+and before `secret_item_create_sync`. The native route still does not call an
+unlock API, and an actual late-lock prompt, process kill, desktop lock
+transition, service crash, storage loss, or power failure remains outside the
+modeled qualification coverage and any production-readiness claim.
 
 Building this fixed path also requires the Linux `libsecret-1` development
 headers and linker metadata (for example, `libsecret-1-dev`). Those packages
