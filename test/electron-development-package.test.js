@@ -139,8 +139,22 @@ test("the development workflow builds each target on a static native runner with
   assert.match(windowsPackageJob, /outputs:\n\s+development-artifact-id: \$\{\{ steps\.retain-win32-development\.outputs\.artifact-id \}\}/u);
   assert.match(windowsPackageJob, /id: retain-win32-development/u);
   assert.match(windowsPackageJob, /\.release-build\/electron-dev\/win32-x64\/app\//u);
+  assert.match(windowsPackageJob, /id: validate-win32-retained-inputs/u);
+  assert.match(windowsPackageJob, /WINDOWS_RETAINED_ARTIFACT_REPARSE_POINT/u);
+  assert.match(windowsPackageJob, /node_modules\/json-schema-traverse\/\.eslintrc\.yml/u);
+  assert.match(windowsPackageJob, /b1ea981e2461f053646b08a616efcaba0d3b278b223957e9eb931bcbc3971ccc/u);
+  assert.match(windowsPackageJob, /node_modules\/fast-uri\/\.gitattributes/u);
+  assert.match(windowsPackageJob, /e173bffc6cde613d3e6d06e49f2b1d05385cb02aa68c4931656b5b051ab649dd/u);
+  assert.match(
+    windowsPackageJob,
+    /if: \$\{\{ !cancelled\(\) && steps\.validate-win32-retained-inputs\.outcome == 'success' \}\}/u,
+  );
   assert.ok(
     windowsPackageJob.indexOf("Exercise synthetic upload and account-observation storage")
+      < windowsPackageJob.indexOf("Validate exact retained Windows artifact inputs"),
+  );
+  assert.ok(
+    windowsPackageJob.indexOf("Validate exact retained Windows artifact inputs")
       < windowsPackageJob.indexOf("Retain verified Windows package, staging tree, and receipts"),
   );
   assert.doesNotMatch(windowsPackageJob, /Exercise unsigned NSIS install/u);

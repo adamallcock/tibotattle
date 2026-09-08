@@ -175,8 +175,95 @@ jobs:
           $smokeReceipt = Join-Path $packageRoot 'accountless-storage-smoke.json'
           node scripts/smoke-electron-windows-accountless.mjs --app $appPath --staged-app $stagedApp --package-receipt $packageReceipt --source-revision $env:GITHUB_SHA --receipt $smokeReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_ACCOUNTLESS_PACKAGED_SMOKE_FAILED' }
+      # upload-artifact excludes dotfiles by default. Before an explicit
+      # inclusion can be reviewed, prove the only such staged inputs are these
+      # two pinned dependency metadata files and that neither tree has a
+      # reparse point which could escape its fixed upload root.
+      - name: Validate exact retained Windows artifact inputs
+        id: validate-win32-retained-inputs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $distributionRoot = Join-Path $env:GITHUB_WORKSPACE ".release-build/electron-candidates/$env:GITHUB_SHA/win32-x64/distribution"
+          $stagedAppRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-dev/win32-x64/app'
+          $expectedStagedHiddenFiles = @(
+            [pscustomobject]@{
+              relativePath = 'node_modules/json-schema-traverse/.eslintrc.yml'
+              sha256 = 'b1ea981e2461f053646b08a616efcaba0d3b278b223957e9eb931bcbc3971ccc'
+            },
+            [pscustomobject]@{
+              relativePath = 'node_modules/fast-uri/.gitattributes'
+              sha256 = 'e173bffc6cde613d3e6d06e49f2b1d05385cb02aa68c4931656b5b051ab649dd'
+            }
+          )
+          $roots = @(
+            [pscustomobject]@{
+              path = $distributionRoot
+              expectedHiddenFiles = @()
+            },
+            [pscustomobject]@{
+              path = $stagedAppRoot
+              expectedHiddenFiles = $expectedStagedHiddenFiles
+            }
+          )
+          function Fail-WindowsRetainedArtifactGuard {
+            param([string]$Code)
+            throw [System.InvalidOperationException]::new($Code)
+          }
+          $knownFailures = @(
+            'WINDOWS_RETAINED_ARTIFACT_ROOT_MISSING',
+            'WINDOWS_RETAINED_ARTIFACT_REPARSE_POINT',
+            'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_INVALID',
+            'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_HASH_INVALID',
+            'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_SET_INVALID'
+          )
+          try {
+            foreach ($rootSpec in $roots) {
+              $root = [System.IO.DirectoryInfo]::new([System.IO.Path]::GetFullPath($rootSpec.path))
+              if (-not $root.Exists) { Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_ROOT_MISSING' }
+              if (($root.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_REPARSE_POINT'
+              }
+              $observedHiddenFiles = [System.Collections.Generic.List[string]]::new()
+              $pending = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
+              $pending.Push($root)
+              while ($pending.Count -gt 0) {
+                $current = $pending.Pop()
+                foreach ($entry in $current.EnumerateFileSystemInfos()) {
+                  if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_REPARSE_POINT'
+                  }
+                  $relativePath = [System.IO.Path]::GetRelativePath($root.FullName, $entry.FullName).Replace('\', '/')
+                  $isDotPath = @($relativePath.Split('/') | Where-Object { $_.StartsWith('.') }).Count -gt 0
+                  if ($isDotPath) {
+                    $expected = @($rootSpec.expectedHiddenFiles | Where-Object { $_.relativePath -ceq $relativePath })
+                    if ($entry -isnot [System.IO.FileInfo] -or $expected.Count -ne 1) {
+                      Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_INVALID'
+                    }
+                    $sha256 = (Get-FileHash -LiteralPath $entry.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                    if ($sha256 -cne $expected[0].sha256) {
+                      Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_HASH_INVALID'
+                    }
+                    [void]$observedHiddenFiles.Add($relativePath)
+                  }
+                  if ($entry -is [System.IO.DirectoryInfo]) { $pending.Push($entry) }
+                }
+              }
+              if ($observedHiddenFiles.Count -ne $rootSpec.expectedHiddenFiles.Count) {
+                Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_SET_INVALID'
+              }
+              foreach ($expected in $rootSpec.expectedHiddenFiles) {
+                if (@($observedHiddenFiles | Where-Object { $_ -ceq $expected.relativePath }).Count -ne 1) {
+                  Fail-WindowsRetainedArtifactGuard 'WINDOWS_RETAINED_ARTIFACT_HIDDEN_PATH_SET_INVALID'
+                }
+              }
+            }
+          } catch {
+            $failure = $_.Exception.Message
+            if ($knownFailures -ccontains $failure) { throw $failure }
+            throw 'WINDOWS_RETAINED_ARTIFACT_GUARD_FAILED'
+          }
       - name: Retain verified Windows package, staging tree, and receipts
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.validate-win32-retained-inputs.outcome == 'success' }}
         id: retain-win32-development
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
