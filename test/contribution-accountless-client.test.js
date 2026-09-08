@@ -19,9 +19,11 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_SCOPE,
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
 } from "../src/contribution/index.js";
+import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 
 const ORIGIN = "https://usage.example";
 const LABORATORY_ORIGIN = "http://127.0.0.1:8787";
+const REHEARSAL_ORIGIN = DEPLOYMENT_ENDPOINTS.staging.origin;
 const DEVICE_ID = "11111111-1111-4111-8111-111111111111";
 const DEVICE_SECRET_HASH = "a".repeat(64);
 const EXPIRES_AT = "2026-09-28T00:00:00.000Z";
@@ -760,12 +762,14 @@ test("the accountless runner carries only versioned policy authorization into v1
     claimOwnership: async (options) => {
       order.push("ownership");
       assert.equal(options.laboratory, true);
+      assert.equal(options.rehearsal, false);
       await options.fetchImpl(`${LABORATORY_ORIGIN}/api/v1/accountless/ownership`);
       return Object.freeze({ status: "created" });
     },
     runIncrementalSync: async (options) => {
       order.push("sync");
       assert.equal(options.laboratory, true);
+      assert.equal(options.rehearsal, false);
       assert.equal(Object.hasOwn(options, "consent"), false);
       assert.deepEqual(options.authorization, {
         schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
@@ -848,7 +852,7 @@ test("production accountless ownership requires the exact reviewed origin and ex
     },
   };
   for (const override of [
-    { production: false }, { laboratory: true }, { production: "true" },
+    { production: false }, { laboratory: true }, { rehearsal: true }, { production: "true" },
     { origin: "https://other.example" }, { origin: "http://127.0.0.1:8787" },
   ]) await assert.rejects(claimAccountlessContributionOwnership({ ...options, ...override }),
     isClientError("invalid_configuration"));
@@ -863,6 +867,40 @@ test("production accountless ownership requires the exact reviewed origin and ex
   assert.equal(calls, 1, "persistent opt-out prevents production network work");
 });
 
+test("rehearsal accountless ownership requires the fixed staging origin and explicit mode", async () => {
+  const origin = REHEARSAL_ORIGIN;
+  let reads = 0;
+  let calls = 0;
+  const options = {
+    origin, rehearsal: true, backend: {}, now: () => NOW,
+    readPreference: async () => { reads++; return preference({ destinationOrigin: origin }); },
+    withDeviceSecret: async ({ expectedOrigin, operation }) => {
+      assert.equal(expectedOrigin, origin);
+      const secret = Buffer.alloc(32, 7);
+      try { return await operation(secret, { origin, deviceId: DEVICE_ID }); }
+      finally { secret.fill(0); }
+    },
+    fetchImpl: async (url, request) => {
+      calls++;
+      assert.equal(String(url), `${origin}/api/v1/accountless/ownership`);
+      assert.equal(request.redirect, "error");
+      assert.equal(request.credentials, "omit");
+      return jsonResponse(ownershipReceipt());
+    },
+  };
+  for (const override of [
+    { rehearsal: false }, { laboratory: true }, { production: true },
+    { rehearsal: "true" }, { origin: "https://tibotattle.com" },
+    { origin: "http://127.0.0.1:8787" },
+  ]) await assert.rejects(claimAccountlessContributionOwnership({ ...options, ...override }),
+    isClientError("invalid_configuration"));
+  assert.equal(reads, 0);
+  assert.equal(calls, 0);
+  const receipt = await claimAccountlessContributionOwnership(options);
+  assert.equal(receipt.deviceId, DEVICE_ID);
+  assert.equal(calls, 1);
+});
+
 test("production selection survives the accountless runner into the existing v1.1 pipeline", async () => {
   const origin = "https://tibotattle.com";
   const order = [];
@@ -874,11 +912,39 @@ test("production selection survives the accountless runner into the existing v1.
       order.push("ownership");
       assert.equal(options.production, true);
       assert.equal(options.laboratory, false);
+      assert.equal(options.rehearsal, false);
     },
     runIncrementalSync: async (options) => {
       order.push("sync");
       assert.equal(options.production, true);
       assert.equal(options.laboratory, false);
+      assert.equal(options.rehearsal, false);
+      assert.equal(Object.hasOwn(options, "consent"), false);
+      return { status: "complete", chunksUploaded: 1 };
+    },
+  });
+  assert.equal(result.status, "complete");
+  assert.deepEqual(order, ["enroll", "ownership", "sync"]);
+});
+
+test("rehearsal selection reaches the existing v1.1 pipeline without opening another lane", async () => {
+  const origin = REHEARSAL_ORIGIN;
+  const order = [];
+  const result = await runAccountlessContributionSyncOnce({
+    origin, rehearsal: true, backend: {}, indexFile: "/synthetic/index.sqlite",
+    readPreference: async () => preference({ destinationOrigin: origin }),
+    enroll: async () => { order.push("enroll"); },
+    claimOwnership: async (options) => {
+      order.push("ownership");
+      assert.equal(options.rehearsal, true);
+      assert.equal(options.laboratory, false);
+      assert.equal(options.production, false);
+    },
+    runIncrementalSync: async (options) => {
+      order.push("sync");
+      assert.equal(options.rehearsal, true);
+      assert.equal(options.laboratory, false);
+      assert.equal(options.production, false);
       assert.equal(Object.hasOwn(options, "consent"), false);
       return { status: "complete", chunksUploaded: 1 };
     },

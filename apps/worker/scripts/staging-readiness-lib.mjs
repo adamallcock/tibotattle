@@ -293,6 +293,8 @@ export const REQUIRED_RATE_LIMITS = Object.freeze([
 export const REQUIRED_STAGING_VARIABLES = Object.freeze({
   ENVIRONMENT: "staging",
   ENROLLMENT_MODE: "disabled",
+  ACCOUNTLESS_ENROLLMENT_MODE: "disabled",
+  ACCOUNTLESS_OWNERSHIP_MODE: "disabled",
   ACCOUNT_SCOPED_INGEST_MODE: "disabled",
   UPLOAD_INGRESS_QUEUE_MODE: "disabled",
   UPLOAD_INGRESS_MAX_CONCURRENT: "8",
@@ -919,6 +921,9 @@ export function assessStagingConfiguration(
       && environment.triggers.crons[0] === "* * * * *",
     enrollmentDisabled: environment?.vars?.ENVIRONMENT === "staging"
       && environment?.vars?.ENROLLMENT_MODE === "disabled",
+    accountlessAdmissionDisabled:
+      environment?.vars?.ACCOUNTLESS_ENROLLMENT_MODE === "disabled"
+      && environment?.vars?.ACCOUNTLESS_OWNERSHIP_MODE === "disabled",
     accountScopedIngestDisabled:
       environment?.vars?.ACCOUNT_SCOPED_INGEST_MODE === "disabled",
     noUnexpectedVariables: exactStringMap(

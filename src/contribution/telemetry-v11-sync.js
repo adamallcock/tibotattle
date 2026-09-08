@@ -266,8 +266,8 @@ function requireTransportAdmission(capability, accountless) {
       || format.rank < capability.minimumWriteRank) stop("consent_rejected");
 }
 
-function accountlessAuthorization(value, laboratory, production, serverBaseUrl) {
-  if (accountlessTransportOrigin({ laboratory, production, origin: serverBaseUrl }) === null
+function accountlessAuthorization(value, laboratory, rehearsal, production, serverBaseUrl) {
+  if (accountlessTransportOrigin({ laboratory, rehearsal, production, origin: serverBaseUrl }) === null
       || !exact(value, ["authorizationBasis", "policyVersion", "schemaVersion", "telemetrySchemaVersion"])
       || value.schemaVersion !== ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION
       || value.policyVersion !== ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION
@@ -284,14 +284,14 @@ function accountlessAuthorization(value, laboratory, production, serverBaseUrl) 
 // accountless mode it describes the content contract only: authorization is
 // the separately versioned policy record checked by the service, never a
 // fabricated local consent event.
-function transportAuthorization({ consent, authorization, laboratory, production, serverBaseUrl }) {
+function transportAuthorization({ consent, authorization, laboratory, rehearsal, production, serverBaseUrl }) {
   if (authorization !== undefined) {
     if (consent !== undefined) {
       const error = new TypeError("Accountless contribution authorization is invalid");
       error.code = "contribution_incremental_sync_authorization_invalid";
       throw error;
     }
-    const accountless = accountlessAuthorization(authorization, laboratory, production, serverBaseUrl);
+    const accountless = accountlessAuthorization(authorization, laboratory, rehearsal, production, serverBaseUrl);
     return Object.freeze({ journalBinding: Object.freeze({ mode: "accountless_policy", accountless }) });
   }
   if (!isTelemetryV11ConsentCurrent(consent)) {
@@ -462,13 +462,13 @@ function progressSnapshot(value, expected, revalidateProgress) {
 
 /** A closed explicit consent or accountless policy authorization is required. */
 export async function runTelemetryV11Sync({
-  serverBaseUrl, deviceAuthorization, consent, authorization = undefined, laboratory = undefined, production = false, days, readDay, createEnvelope,
+  serverBaseUrl, deviceAuthorization, consent, authorization = undefined, laboratory = undefined, rehearsal = false, production = false, days, readDay, createEnvelope,
   fetchImpl = globalThis.fetch, signal, clock = Date.now,
   maxChunks = 500, maxDurationMs = 60_000, requestTimeoutMs = 30_000,
   maxDays = MAX_TELEMETRY_V11_DOMAIN_DAYS,
   progressStore = null, sourcePublication = null, revalidateProgress = false,
 } = {}) {
-  const selectedAuthorization = transportAuthorization({ consent, authorization, laboratory, production, serverBaseUrl });
+  const selectedAuthorization = transportAuthorization({ consent, authorization, laboratory, rehearsal, production, serverBaseUrl });
   if (!integer(maxChunks, 2_000) || maxChunks < 1 || !integer(maxDurationMs, 300_000) || maxDurationMs < 1
       || !integer(maxDays, MAX_TELEMETRY_V11_DOMAIN_DAYS) || maxDays < 1
       || !Array.isArray(days) || days.length > maxDays || typeof readDay !== "function" || typeof createEnvelope !== "function"

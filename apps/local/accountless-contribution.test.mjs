@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
 import { createLocalAccountlessContribution } from "./accountless-contribution.js";
 import { attachAccountlessParentChannel } from "../../src/platform/index.js";
 
@@ -37,6 +38,7 @@ for (const mode of ["laboratory", "production"]) test(`${mode} companion compose
       calls++;
       assert.equal(options.laboratory, mode === "laboratory");
       assert.equal(options.production, mode === "production");
+      assert.equal(Object.hasOwn(options, "rehearsal"), false);
       assert.equal(options.origin, origin);
       assert.equal(options.indexFile, "/synthetic/index.sqlite");
       assert.equal(options.stateFile, "/synthetic/accountless-device-binding-v1.json");
@@ -80,7 +82,10 @@ test("production companion refuses ambient modes without the private parent capa
   const base = { USAGE_MONITOR_ACCOUNTLESS_ORIGIN: "https://tibotattle.com",
     USAGE_MONITOR_ACCOUNTLESS_MODE: "production-v1" };
   for (const environment of [base, { ...base, USAGE_MONITOR_TEST_LANE: "macos-electron-local-qa-v1" },
-    { ...base, USAGE_MONITOR_ACCOUNTLESS_ORIGIN: "https://unreviewed.example" }]) {
+    { ...base, USAGE_MONITOR_ACCOUNTLESS_ORIGIN: "https://unreviewed.example" },
+    { ...base, USAGE_MONITOR_ACCOUNTLESS_ORIGIN: DEPLOYMENT_ENDPOINTS.staging.origin },
+    { USAGE_MONITOR_ACCOUNTLESS_MODE: "rehearsal-v1",
+      USAGE_MONITOR_ACCOUNTLESS_ORIGIN: DEPLOYMENT_ENDPOINTS.staging.origin }]) {
     assert.throws(() => createLocalAccountlessContribution({ environment, channel: {} }),
       /Invalid accountless contribution configuration/u);
   }

@@ -33,6 +33,7 @@ test("checked-in staging configuration is closed and intentionally unprovisioned
   assert.equal(result.evidenceType, STAGING_PROOF_TYPES.STATIC_CONFIGURATION);
   assert.equal(result.liveProof, false);
   assert.equal(result.checks.enrollmentDisabled, true);
+  assert.equal(result.checks.accountlessAdmissionDisabled, true);
   assert.equal(result.checks.accountScopedIngestDisabled, true);
   assert.equal(result.checks.assetsClosed, true);
   assert.equal(result.checks.migrationInventorySafe, true);
@@ -539,6 +540,15 @@ test("unsafe staging admission configuration fails closed", () => {
   assert.equal(result.state, "unsafe_configuration");
   assert.equal(result.checks.enrollmentDisabled, false);
   assert.equal(result.blockers.includes("CONFIG_ENROLLMENT_DISABLED"), true);
+
+  const accountless = structuredClone(checkedInConfig);
+  accountless.env.staging.vars.ACCOUNTLESS_OWNERSHIP_MODE = "enabled";
+  const accountlessResult = assessStagingConfiguration(accountless);
+  assert.equal(accountlessResult.state, "unsafe_configuration");
+  assert.equal(accountlessResult.checks.accountlessAdmissionDisabled, false);
+  assert.equal(accountlessResult.blockers.includes(
+    "CONFIG_ACCOUNTLESS_ADMISSION_DISABLED",
+  ), true);
 });
 
 test("staging readiness rejects a missing ingress budget binding or migration", () => {

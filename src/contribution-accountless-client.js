@@ -494,8 +494,8 @@ function exactKeys(value, keys) {
     && Object.keys(value).sort().join("\0") === keys;
 }
 
-function assertTransportDestination(laboratory, production, origin) {
-  const selected = accountlessTransportOrigin({ laboratory, production, origin });
+function assertTransportDestination(laboratory, rehearsal, production, origin) {
+  const selected = accountlessTransportOrigin({ laboratory, rehearsal, production, origin });
   if (selected === null) fail("invalid_configuration");
   return selected;
 }
@@ -676,11 +676,12 @@ export async function enrollAccountlessContribution({
 }
 
 /**
- * Ownership registration for an explicitly selected laboratory or production
+ * Ownership registration for an explicitly selected laboratory, rehearsal, or production
  * destination. Enrollment remains a separate, non-upload-capable operation.
  */
 async function requestAccountlessAuthority({
   laboratory = false,
+  rehearsal = false,
   production = false,
   origin,
   readPreference,
@@ -707,7 +708,7 @@ async function requestAccountlessAuthority({
     clearTimeoutImpl,
   });
   const selectedOrigin = canonicalOrigin(origin);
-  assertTransportDestination(laboratory, production, selectedOrigin);
+  assertTransportDestination(laboratory, rehearsal, production, selectedOrigin);
   assertSignalActive(signal);
   await readEligiblePreference(readPreference, selectedOrigin);
   assertSignalActive(signal);
@@ -802,6 +803,7 @@ function configuredAccountlessSync(options) {
   }
   const {
     laboratory = false,
+    rehearsal = false,
     production = false,
     origin,
     readPreference,
@@ -848,9 +850,10 @@ function configuredAccountlessSync(options) {
     fail("invalid_configuration");
   }
   const selectedOrigin = canonicalOrigin(origin);
-  assertTransportDestination(laboratory, production, selectedOrigin);
+  assertTransportDestination(laboratory, rehearsal, production, selectedOrigin);
   return Object.freeze({
     laboratory,
+    rehearsal,
     production,
     origin: selectedOrigin,
     readPreference,
@@ -927,6 +930,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
   const configured = configuredAccountlessSync(options);
   const {
     laboratory,
+    rehearsal,
     production,
     origin,
     readPreference,
@@ -968,7 +972,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
     await readEligiblePreference(readPreference, origin);
     assertSignalActive(signal);
     const authorityOptions = {
-      laboratory, production, origin, readPreference, backend,
+      laboratory, rehearsal, production, origin, readPreference, backend,
       ...(stateFile === undefined ? {} : { stateFile }),
       fetchImpl: guardedFetch, withDeviceSecret, signal,
       requestTimeoutMilliseconds, now, setTimeoutImpl, clearTimeoutImpl,
@@ -1023,6 +1027,7 @@ export async function runAccountlessContributionSyncOnce(options = {}) {
     assertSignalActive(signal);
     const result = await runIncrementalSync({
       laboratory,
+      rehearsal,
       production,
       origin,
       backend,

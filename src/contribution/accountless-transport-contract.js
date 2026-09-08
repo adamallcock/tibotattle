@@ -29,9 +29,9 @@ export function accountlessDeviceUnavailableCode(value) {
     && ACCOUNTLESS_DEVICE_UNAVAILABLE_CODES.has(value);
 }
 
-// The approved implementation surface is synthetic local qualification only.
-// A caller must inject `laboratory: true` and a canonical IPv4 loopback origin;
-// no production destination is accepted through the accountless transport.
+// A local caller must inject `laboratory: true` and a canonical IPv4 loopback
+// origin. The separately gated rehearsal lane has exactly one reviewed hosted
+// destination; it is never inferred from caller input.
 export function accountlessLocalLaboratoryOrigin(laboratory, origin) {
   if (laboratory !== true || typeof origin !== "string") return null;
   let parsed;
@@ -47,10 +47,18 @@ export function accountlessLocalLaboratoryOrigin(laboratory, origin) {
 
 /** Destination selection never grants upload authority. The caller still needs
  * a current protected preference, installation credential and server grant.
- * Production is explicit and restricted to the reviewed deployment origin. */
-export function accountlessTransportOrigin({ laboratory = false, production = false, origin } = {}) {
-  if (typeof laboratory !== "boolean" || typeof production !== "boolean"
-      || (laboratory && production)) return null;
+ * Production and rehearsal are explicit and restricted to reviewed origins. */
+export function accountlessTransportOrigin({
+  laboratory = false,
+  rehearsal = false,
+  production = false,
+  origin,
+} = {}) {
+  if ([laboratory, rehearsal, production].some((value) => typeof value !== "boolean")
+      || [laboratory, rehearsal, production].filter(Boolean).length !== 1) return null;
   if (laboratory) return accountlessLocalLaboratoryOrigin(true, origin);
+  if (rehearsal) {
+    return origin === DEPLOYMENT_ENDPOINTS.staging.origin ? origin : null;
+  }
   return production && origin === DEPLOYMENT_ENDPOINTS.public.origin ? origin : null;
 }

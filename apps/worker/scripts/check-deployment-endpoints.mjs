@@ -255,6 +255,17 @@ export function validateWorkerDeploymentEndpoints(
   endpoints = DEPLOYMENT_ENDPOINTS,
 ) {
   assertDeploymentEndpoints(endpoints);
+  const staging = configuration?.env?.staging;
+  if (!staging || typeof staging !== "object") {
+    fail("wrangler.jsonc must define an env.staging deployment");
+  }
+  if (staging.name !== endpoints.staging.workerName
+      || staging.workers_dev !== endpoints.staging.workersDev
+      || staging.preview_urls !== endpoints.staging.previewUrls
+      || Object.hasOwn(staging, "routes")
+      || Object.hasOwn(staging.vars ?? {}, "PUBLIC_ORIGIN")) {
+    fail("Worker staging configuration must match the reviewed nonproduction endpoint");
+  }
   const production = configuration?.env?.production;
   if (!production || typeof production !== "object") {
     fail("wrangler.jsonc must define an env.production deployment");
@@ -282,6 +293,7 @@ export function validateWorkerDeploymentEndpoints(
     adminHost: endpoints.admin.host,
     publicOrigin: production.vars.PUBLIC_ORIGIN,
     routeHosts: Object.freeze([...routeHosts]),
+    stagingOrigin: endpoints.staging.origin,
   });
 }
 

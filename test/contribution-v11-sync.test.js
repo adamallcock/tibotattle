@@ -12,6 +12,7 @@ import {
   ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
   createTelemetryV11Day, readTelemetryV11Capabilities, runTelemetryV11Sync, telemetryV11FieldInventory,
 } from "../src/contribution/index.js";
+import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 
 const day = "2026-08-28";
 const now = Date.parse(day + "T13:00:00.000Z");
@@ -248,6 +249,43 @@ test("accountless policy authorization requires an explicit destination and neve
     await assert.rejects(runTelemetryV11Sync({ ...rejectedOptions, ...unsafe }), {
       code: "contribution_incremental_sync_authorization_invalid",
     });
+    assert.equal(rejected.calls.length, 0);
+  }
+});
+
+test("accountless policy authorization accepts only the fixed rehearsal destination", async () => {
+  const rehearsalOrigin = DEPLOYMENT_ENDPOINTS.staging.origin;
+  const accountlessAuthorization = {
+    schemaVersion: ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION,
+    policyVersion: ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION,
+    authorizationBasis: ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS,
+    telemetrySchemaVersion: ACCOUNTLESS_UPLOAD_OWNER_TELEMETRY_SCHEMA_VERSION,
+  };
+  const fixture = server({ destinationOrigin: rehearsalOrigin, capabilitiesChange: {
+    consentCurrent: false, authorityKind: "accountless", authorizationCurrent: true,
+  } });
+  const { consent: ignoredConsent, ...options } = fixture.options;
+  void ignoredConsent;
+  const result = await runTelemetryV11Sync({
+    ...options,
+    rehearsal: true,
+    authorization: accountlessAuthorization,
+  });
+  assert.equal(result.status, "complete");
+  assert.equal(result.recordsUploaded, 1);
+
+  for (const unsafe of [
+    { rehearsal: false }, { rehearsal: "true" }, { rehearsal: true, laboratory: true },
+    { rehearsal: true, production: true },
+  ]) {
+    const rejected = server({ destinationOrigin: rehearsalOrigin });
+    const { consent: ignored, ...rejectedOptions } = rejected.options;
+    void ignored;
+    await assert.rejects(runTelemetryV11Sync({
+      ...rejectedOptions,
+      ...unsafe,
+      authorization: accountlessAuthorization,
+    }), { code: "contribution_incremental_sync_authorization_invalid" });
     assert.equal(rejected.calls.length, 0);
   }
 });
