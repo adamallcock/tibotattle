@@ -124,11 +124,12 @@ function emitRefresh(cdp, {
   origin,
   requestId,
   loaderId,
+  pathname = "/api/local/refresh",
 }) {
   cdp.emit("Network.requestWillBeSent", {
     request: {
       method: "POST",
-      url: `${origin}/api/local/refresh`,
+      url: `${origin}${pathname}`,
     },
     requestId,
     loaderId,
@@ -703,8 +704,19 @@ test("Linux startup refresh evidence requires the validated origin and active lo
     origin: dashboardOrigin,
     requestId: "fresh-valid",
     loaderId: "loader-fresh",
+    // The fresh renderer changes from detailed to quick after the first
+    // verified projection. Its fixed local route remains valid evidence.
+    pathname: "/api/local/refresh/quick",
   });
   assert.equal(observer.snapshot().length, 1);
+  emitRefresh(cdp, {
+    origin: dashboardOrigin,
+    requestId: "fresh-unrelated-route",
+    loaderId: "loader-fresh",
+    pathname: "/api/local/refresh/cancel",
+  });
+  assert.equal(observer.snapshot().length, 1,
+    "only the two automatic-refresh routes can satisfy the startup receipt");
   observer.seal();
   emitRefresh(cdp, {
     origin: dashboardOrigin,

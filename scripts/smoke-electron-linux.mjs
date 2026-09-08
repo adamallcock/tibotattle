@@ -1583,9 +1583,13 @@ export function observeLocalRefreshRequests(cdp) {
       } catch {
         return;
       }
+      // A startup pass is detailed before a verified projection exists, then
+      // quick after that projection survives a fresh document. Both routes
+      // mutate the same guarded local controller; keeping the route set
+      // closed prevents another loopback POST from becoming smoke evidence.
       if (parsed.protocol !== "http:"
           || parsed.hostname !== "127.0.0.1"
-          || parsed.pathname !== "/api/local/refresh") return;
+          || !["/api/local/refresh", "/api/local/refresh/quick"].includes(parsed.pathname)) return;
       if (activeOrigin !== null && parsed.origin !== activeOrigin) return;
       requests.push(Object.freeze({
         requestId: typeof requestId === "string" ? requestId : null,
