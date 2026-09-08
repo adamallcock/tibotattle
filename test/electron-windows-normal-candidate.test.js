@@ -33,6 +33,8 @@ import {
   prepareWindowsNormalCandidateProfile,
   runWindowsNormalCandidateSmoke,
   releaseWindowsNormalCandidateStartupRefreshGate,
+  inspectWindowsNormalCandidateStartupRefreshGate,
+  waitForWindowsNormalCandidateStartupRefreshGate,
   seedWindowsNormalCandidateCodexFixture,
   selectWindowsNormalCandidateDashboardTarget,
   selectWindowsNormalCandidateSettingsTarget,
@@ -70,7 +72,7 @@ test("normal candidate releases its startup gate only through the fixed Windows 
   assert.equal(await releaseWindowsNormalCandidateStartupRefreshGate({
     async evaluate(expression) {
       expressions.push(expression);
-      return true;
+      return "released";
     },
   }), true);
   assert.equal(expressions.length, 1);
@@ -80,6 +82,37 @@ test("normal candidate releases its startup gate only through the fixed Windows 
     async evaluate() { return false; },
   }), false);
   assert.equal(await releaseWindowsNormalCandidateStartupRefreshGate(null), false);
+  assert.equal(await inspectWindowsNormalCandidateStartupRefreshGate({
+    async evaluate() { return "unavailable"; },
+  }), "unavailable");
+});
+
+test("normal candidate waits for its preload gate before releasing the startup refresh", async () => {
+  let attempts = 0;
+  let now = 0;
+  const cdp = {
+    async evaluate() {
+      attempts += 1;
+      return attempts === 1 ? "unavailable" : "released";
+    },
+  };
+  const released = await waitForWindowsNormalCandidateStartupRefreshGate(cdp, {
+    timeoutMs: 321,
+    clock: () => now,
+    async sleep(milliseconds) {
+      assert.equal(milliseconds, 150);
+      now += milliseconds;
+    },
+  });
+  assert.deepEqual(released, { released: true, failureCode: null });
+  assert.equal(attempts, 2);
+  assert.deepEqual(await waitForWindowsNormalCandidateStartupRefreshGate({
+    async evaluate() { return "already_released"; },
+  }), { released: false, failureCode: "LOCAL_STARTUP_REFRESH_GATE_ALREADY_RELEASED" });
+  assert.deepEqual(await waitForWindowsNormalCandidateStartupRefreshGate({
+    async evaluate() { return "evaluation_failed"; },
+  }, { timeoutMs: 1, clock: (() => { let tick = 0; return () => tick++; })(), sleep: async () => {} }),
+  { released: false, failureCode: "LOCAL_STARTUP_REFRESH_GATE_EVALUATION_FAILED" });
 });
 
 function smokeOptions() {

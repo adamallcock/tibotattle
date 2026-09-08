@@ -391,10 +391,11 @@ export function buildWindowsDevelopmentEnvironment({
  *
  * This shares only the owned profile layout with the development launcher.
  * The allowlist intentionally drops all inherited test, qualification,
- * contribution, endpoint, and Node-option selectors. The sole retained smoke
- * control is the existing quit-only lifecycle request; it does not expose
- * renderer or private-storage capabilities. The packaged main process must
- * make its ordinary manifest-based selection itself.
+ * contribution, endpoint, and Node-option selectors. The only retained smoke
+ * control supplies the inherited lifecycle quit request and a one-shot
+ * renderer startup-observation barrier; it exposes no credential or storage
+ * capability. The packaged main process must make its ordinary manifest-based
+ * selection itself.
  */
 export function buildWindowsNormalCandidateEnvironment({
   environment = process.env,

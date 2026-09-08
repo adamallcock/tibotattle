@@ -1378,18 +1378,67 @@ function localNetworkObserver(cdp, dashboardOrigin) {
  * control; production and Windows qualification use disjoint environment
  * gates. This does not start, complete, or otherwise fabricate a refresh.
  */
-export async function releaseWindowsNormalCandidateStartupRefreshGate(cdp) {
-  if (cdp === null || typeof cdp !== "object" || typeof cdp.evaluate !== "function") return false;
+export async function inspectWindowsNormalCandidateStartupRefreshGate(cdp) {
+  if (cdp === null || typeof cdp !== "object" || typeof cdp.evaluate !== "function") {
+    return "unavailable";
+  }
   try {
-    return await cdp.evaluate(`(() => {
+    const result = await cdp.evaluate(`(() => {
       const bridge = globalThis.__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__;
       if (!bridge || bridge.version !== "v1" || typeof bridge.releaseStartupRefresh !== "function") {
-        return false;
+        return "unavailable";
       }
-      return bridge.releaseStartupRefresh() === true;
-    })()`) === true;
+      try {
+        return bridge.releaseStartupRefresh() === true ? "released" : "already_released";
+      } catch {
+        return "evaluation_failed";
+      }
+    })()`);
+    return result === "released" || result === "already_released" || result === "unavailable"
+      || result === "evaluation_failed"
+      ? result
+      : "evaluation_failed";
   } catch {
-    return false;
+    return "evaluation_failed";
+  }
+}
+
+export async function releaseWindowsNormalCandidateStartupRefreshGate(cdp) {
+  return await inspectWindowsNormalCandidateStartupRefreshGate(cdp) === "released";
+}
+
+/**
+ * Wait for the page's preload context to finish installing the exact
+ * normal-candidate barrier, then release it once. CDP may advertise the
+ * loopback navigation before that context is available; the renderer cannot
+ * issue its startup refresh until this barrier is released.
+ */
+export async function waitForWindowsNormalCandidateStartupRefreshGate(cdp, {
+  clock = () => Date.now(),
+  sleep = wait,
+  timeoutMs = STARTUP_TIMEOUT_MS,
+} = {}) {
+  if (typeof clock !== "function" || typeof sleep !== "function"
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    return Object.freeze({ released: false, failureCode: "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE" });
+  }
+  const deadline = clock() + timeoutMs;
+  let latest = "unavailable";
+  while (true) {
+    latest = await inspectWindowsNormalCandidateStartupRefreshGate(cdp);
+    if (latest === "released") return Object.freeze({ released: true, failureCode: null });
+    if (latest === "already_released") {
+      return Object.freeze({ released: false, failureCode: "LOCAL_STARTUP_REFRESH_GATE_ALREADY_RELEASED" });
+    }
+    if (clock() >= deadline) {
+      return Object.freeze({
+        released: false,
+        failureCode: latest === "evaluation_failed"
+          ? "LOCAL_STARTUP_REFRESH_GATE_EVALUATION_FAILED"
+          : "LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE",
+      });
+    }
+    await sleep(Math.min(150, Math.max(1, deadline - clock())));
   }
 }
 
@@ -1527,8 +1576,9 @@ async function assertDashboard({ cdp, target, fetchImpl }) {
     // The exact normal-candidate preload is now holding automatic refresh at
     // its existing smoke gate. Releasing only after Network.enable closes the
     // fast-renderer race without accepting an unobserved startup POST.
-    if (!await releaseWindowsNormalCandidateStartupRefreshGate(cdp)) {
-      fail("LOCAL_STARTUP_REFRESH_GATE_UNAVAILABLE");
+    const startupGate = await waitForWindowsNormalCandidateStartupRefreshGate(cdp);
+    if (startupGate.released !== true) {
+      fail(startupGate.failureCode);
     }
     const ready = await waitFor(async () => {
       const value = await cdp.evaluate(`(() => ({
