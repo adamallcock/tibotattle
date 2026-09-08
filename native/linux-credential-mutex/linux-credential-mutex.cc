@@ -2085,6 +2085,9 @@ class AccountObservationDeadlineGuard {
       g_mutex_unlock(&mutex_);
       return false;
     }
+    expires_at_ = g_get_monotonic_time()
+        + static_cast<gint64>(kAccountObservationOperationDeadline.count())
+            * G_TIME_SPAN_MILLISECOND;
     GError* error = nullptr;
     GThread* watchdog = g_thread_try_new(
         "tibotattle-observation-deadline",
@@ -2111,22 +2114,39 @@ class AccountObservationDeadlineGuard {
   }
 
   // Stop the aggregate deadline before a caller commits an otherwise-normal
-  // local settlement. Joining first means an already-expired watchdog is
-  // observed while the lease can still be latched as recovery-required.
+  // local settlement. The deadline was fixed before watchdog scheduling; check
+  // it on both sides of the join while the lease can still be latched as
+  // recovery-required.
   bool StopDeadline() noexcept {
+    GCancellable* cancellation = nullptr;
     g_mutex_lock(&mutex_);
+    const bool expired_before_join = DeadlineElapsedLocked();
     if (!finished_) {
       finished_ = true;
       g_cond_broadcast(&condition_);
     }
     GThread* watchdog = watchdog_;
     watchdog_ = nullptr;
+    if (expired_before_join && cancellable_ != nullptr
+        && !g_cancellable_is_cancelled(cancellable_)) {
+      cancellation = cancellable_;
+    }
     g_mutex_unlock(&mutex_);
+    if (cancellation != nullptr) g_cancellable_cancel(cancellation);
     if (watchdog != nullptr) g_thread_join(watchdog);
     g_mutex_lock(&mutex_);
+    const bool expired_after_join = DeadlineElapsedLocked();
+    if (expired_after_join && cancellable_ != nullptr
+        && !g_cancellable_is_cancelled(cancellable_)) {
+      cancellation = cancellable_;
+    } else {
+      cancellation = nullptr;
+    }
     const bool cancelled = cancellable_ == nullptr
-        || g_cancellable_is_cancelled(cancellable_);
+        || g_cancellable_is_cancelled(cancellable_)
+        || expired_after_join;
     g_mutex_unlock(&mutex_);
+    if (cancellation != nullptr) g_cancellable_cancel(cancellation);
     return cancelled;
   }
 
@@ -2141,16 +2161,22 @@ class AccountObservationDeadlineGuard {
   }
 
  private:
+  bool DeadlineElapsedLocked() const {
+    return cancellable_ != nullptr
+        && expires_at_ > 0
+        && g_get_monotonic_time() >= expires_at_;
+  }
+
   static gpointer Watch(gpointer data) {
     auto* deadline = static_cast<AccountObservationDeadlineGuard*>(data);
     if (deadline == nullptr) return nullptr;
     bool timed_out = false;
-    const gint64 expires_at = g_get_monotonic_time()
-        + static_cast<gint64>(kAccountObservationOperationDeadline.count())
-            * G_TIME_SPAN_MILLISECOND;
     g_mutex_lock(&deadline->mutex_);
     while (!deadline->finished_) {
-      if (!g_cond_wait_until(&deadline->condition_, &deadline->mutex_, expires_at)) {
+      if (!g_cond_wait_until(
+              &deadline->condition_,
+              &deadline->mutex_,
+              deadline->expires_at_)) {
         timed_out = !deadline->finished_;
         break;
       }
@@ -2165,6 +2191,7 @@ class AccountObservationDeadlineGuard {
   GCond condition_;
   GCancellable* cancellable_ = nullptr;
   GThread* watchdog_ = nullptr;
+  gint64 expires_at_ = 0;
   bool finished_ = false;
 };
 

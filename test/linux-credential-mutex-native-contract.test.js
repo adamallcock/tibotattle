@@ -130,6 +130,16 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /g_thread_try_new\(/u);
   assert.match(source, /g_thread_join\(watchdog\)/u);
   assert.match(source, /g_cond_wait_until\(/u);
+  assert.match(
+    source,
+    /expires_at_ = g_get_monotonic_time\(\)[\s\S]*?g_thread_try_new\(/u,
+  );
+  assert.match(source, /const bool expired_before_join = DeadlineElapsedLocked\(\)/u);
+  assert.match(source, /const bool expired_after_join = DeadlineElapsedLocked\(\)/u);
+  assert.match(
+    source,
+    /g_mutex_unlock\(&mutex_\);\s*if \(cancellation != nullptr\) g_cancellable_cancel\(cancellation\);\s*if \(watchdog != nullptr\) g_thread_join\(watchdog\)/u,
+  );
   assert.doesNotMatch(source, /std::thread/u);
   assert.doesNotMatch(source, /\bcatch\s*\(/u);
   assert.match(source, /FinishAccountObservationCancellation/u);
@@ -187,6 +197,7 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(readme, /modeled interruption states/u);
   assert.match(readme, /five-second\s+aggregate deadline/u);
   assert.match(readme, /fallible thread constructor/u);
+  assert.match(readme, /watchdog-thread creation failure/u);
   assert.match(readme, /never replies/u);
   assert.match(readme, /not a\s+selected credential\s+backend/u);
 });
