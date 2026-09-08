@@ -455,6 +455,14 @@ body {
   gap: 3px;
 }
 
+.electron-tray-popup-history-detail {
+  min-height: 15px;
+  margin: 3px 0 0;
+  color: var(--tray-muted);
+  font-size: 10.5px;
+  line-height: 1.35;
+}
+
 .electron-tray-popup-history-endpoints {
   /* Native chart geometry is an 82pt plot plus a 3pt gap and 19pt date axis. */
   min-height: 19px;
