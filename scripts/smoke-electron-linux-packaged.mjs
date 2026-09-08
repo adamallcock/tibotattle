@@ -24,6 +24,7 @@ import {
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES,
   assertContainerContract,
   runSmoke,
+  validateRendererReadinessDiagnostics,
 } from "./smoke-electron-linux.mjs";
 import {
   boundedCapture,
@@ -39,6 +40,8 @@ const SHA = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const TARGET = "linux-x64";
 const RECEIPT_SCHEMA = "tibotattle-electron-linux-normal-packaged-smoke-v1";
+const RENDERER_READINESS_DIAGNOSTIC_SCHEMA =
+  "tibotattle-electron-linux-normal-packaged-renderer-readiness-diagnostic-v1";
 const CLI_FAILURE = "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_FAILED";
 const MAX_JSON_BYTES = 1_048_576;
 // Two source-smoke journeys each retain their existing 30s startup, two 45s
@@ -422,6 +425,7 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
   let observed = "invalid";
   let observationFailure = null;
   let smokeFailureStage = null;
+  let rendererReadinessDiagnostics = null;
   let result;
   try {
     result = await runSmoke({
@@ -435,6 +439,9 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
       ],
       environmentFactory: ({ fixture }) => normalPackagedSmokeEnvironment({ environment, fixture, service }),
       onFailureStage: (stage) => { smokeFailureStage = stage; },
+      onRendererReadinessDiagnostics: (diagnostic) => {
+        rendererReadinessDiagnostics = validateRendererReadinessDiagnostics(diagnostic);
+      },
       sourceRevision: identity.sourceRevision,
       qualification: "candidate-only",
       afterRefresh: async ({ fixture }) => {
@@ -451,7 +458,12 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
   } catch (error) {
     if (observationFailure !== null) fail(observationFailure);
     const stageCode = normalPackagedSmokeFailureStageCode(smokeFailureStage);
-    if (stageCode !== null) fail(stageCode);
+    if (stageCode !== null) {
+      const classified = validateRendererReadinessDiagnostics(rendererReadinessDiagnostics);
+      const fixed = failure(stageCode);
+      if (classified !== null) fixed.rendererReadinessDiagnostics = classified;
+      throw fixed;
+    }
     throw error;
   }
   if (result?.status !== "passed") fail("UNEXPECTED");
@@ -596,12 +608,32 @@ function expectedInsideReceipt(value, identity) {
   return Object.freeze(expected);
 }
 
+function diagnosticEnvelope(value) {
+  const diagnostic = validateRendererReadinessDiagnostics(value);
+  return diagnostic === null ? null : Object.freeze({
+    schemaVersion: RENDERER_READINESS_DIAGNOSTIC_SCHEMA,
+    rendererReadinessDiagnostics: diagnostic,
+  });
+}
+
 function classifiedInnerFailure(stderr) {
   if (!Buffer.isBuffer(stderr) || stderr.byteLength === 0) return null;
-  const matches = stderr.toString("utf8").split("\n")
+  const lines = stderr.toString("utf8").split("\n");
+  const matches = lines
     .filter((line) => /^ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_[A-Z_]+$/u.test(line))
     .filter((line) => CODES.has(line.replace("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_", "")));
-  return matches.length === 1 ? matches[0] : null;
+  if (matches.length !== 1) return null;
+  const diagnostics = lines.map((line) => {
+    try { return JSON.parse(line); } catch { return null; }
+  }).map((value) => (
+    value?.schemaVersion === RENDERER_READINESS_DIAGNOSTIC_SCHEMA
+      ? validateRendererReadinessDiagnostics(value.rendererReadinessDiagnostics)
+      : null
+  )).filter((value) => value !== null);
+  return Object.freeze({
+    code: matches[0],
+    rendererReadinessDiagnostics: diagnostics.length === 1 ? diagnostics[0] : null,
+  });
 }
 
 export async function runLinuxNormalPackagedSmokeSession(identity, {
@@ -632,8 +664,11 @@ export async function runLinuxNormalPackagedSmokeSession(identity, {
   if (result[0] !== 0 || result[1] !== null || output === null || errors === null) {
     const innerFailure = classifiedInnerFailure(errors);
     if (result[0] !== 0 && result[1] === null && innerFailure !== null) {
-      const error = new Error(innerFailure);
-      error.code = innerFailure;
+      const error = new Error(innerFailure.code);
+      error.code = innerFailure.code;
+      if (innerFailure.rendererReadinessDiagnostics !== null) {
+        error.rendererReadinessDiagnostics = innerFailure.rendererReadinessDiagnostics;
+      }
       throw error;
     }
     fail("SESSION_EXECUTION_FAILED");
@@ -663,8 +698,15 @@ async function writeLinuxNormalPackagedReceipt(handle, receipt) {
   }
 }
 
-function outerReceipt({ sourceRevision, identity = null, inner = null, errorCode = null }) {
-  return Object.freeze({
+function outerReceipt({
+  sourceRevision,
+  identity = null,
+  inner = null,
+  errorCode = null,
+  rendererReadinessDiagnostics = null,
+}) {
+  const diagnostic = validateRendererReadinessDiagnostics(rendererReadinessDiagnostics);
+  const receipt = {
     schemaVersion: RECEIPT_SCHEMA, status: errorCode === null ? "passed" : "failed",
     scope: "candidate_only", target: TARGET, sourceRevision,
     artifactSha256: identity?.artifactSha256 ?? null, executableSha256: identity?.executableSha256 ?? null,
@@ -672,7 +714,9 @@ function outerReceipt({ sourceRevision, identity = null, inner = null, errorCode
     accountObservationLifecycleVerified: inner?.accountObservationLifecycle === "available",
     unavailableServiceResponseVerified: inner?.unavailableServiceResponse === "bounded",
     sessionCleanupConfirmed: inner?.cleanup === "owned_apps_stopped", errorCode, productionReady: false,
-  });
+  };
+  if (diagnostic !== null) receipt.rendererReadinessDiagnostics = diagnostic;
+  return Object.freeze(receipt);
 }
 
 export async function runLinuxNormalPackagedSmoke(options, {
@@ -688,13 +732,23 @@ export async function runLinuxNormalPackagedSmoke(options, {
   let identity = null;
   let inner = null;
   let errorCode = null;
+  let rendererReadinessDiagnostics = null;
   try {
     identity = await verifyPackage(options);
     inner = await runSession(identity, { appPath: options.appPath, environment });
   } catch (error) {
     errorCode = fixedCode(error);
+    rendererReadinessDiagnostics = validateRendererReadinessDiagnostics(
+      error?.rendererReadinessDiagnostics,
+    );
   }
-  const receipt = outerReceipt({ sourceRevision: options.sourceRevision, identity, inner, errorCode });
+  const receipt = outerReceipt({
+    sourceRevision: options.sourceRevision,
+    identity,
+    inner,
+    errorCode,
+    rendererReadinessDiagnostics,
+  });
   await write(handle, receipt);
   return receipt;
 }
@@ -712,9 +766,12 @@ async function main() {
 
 if (resolve(process.argv[1] ?? "") === SCRIPT_FILE) {
   main().catch((error) => {
-    process.stderr.write(`${fixedCode(error) === "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_UNEXPECTED"
+    const code = fixedCode(error) === "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_UNEXPECTED"
       ? CLI_FAILURE
-      : fixedCode(error)}\n`);
+      : fixedCode(error);
+    process.stderr.write(`${code}\n`);
+    const diagnostic = diagnosticEnvelope(error?.rendererReadinessDiagnostics);
+    if (diagnostic !== null) process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
     process.exitCode = 1;
   });
 }

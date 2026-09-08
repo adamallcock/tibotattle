@@ -14,11 +14,15 @@ import {
   createLinuxNormalPackagedSmokeFixture,
   normalPackagedSmokeEnvironment,
   normalPackagedSmokeFailureStageCode,
+  runLinuxNormalPackagedSmoke,
   parseLinuxNormalPackagedSmokeArguments,
   runLinuxNormalPackagedSmokeSession,
   validateLinuxNormalPackagedSmokeMetadata,
   verifyLinuxNormalPackagedSmokePackage,
 } from "../scripts/smoke-electron-linux-packaged.mjs";
+import {
+  validateRendererReadinessDiagnostics,
+} from "../scripts/smoke-electron-linux.mjs";
 import {
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES,
   terminateLinuxSmokeChild,
@@ -67,6 +71,31 @@ function validInnerReceipt() {
     cleanup: "owned_apps_stopped",
     productionReady: false,
   };
+}
+
+function validRendererReadinessDiagnostics() {
+  const assets = [
+    "app.js", "community-data.js", "data-client.js", "desktop-shell.js",
+    "i18n.generated.js", "install-cta.js", "lib.js", "localization.js",
+    "navigation.js", "telemetry-envelope.js", "telemetry-shared.generated.js",
+    "ui-format.js",
+  ].map((asset) => ({
+    asset,
+    responseClass: asset === "app.js" ? "2xx" : "unobserved",
+    completion: asset === "app.js" ? "finished" : "unobserved",
+  }));
+  return validateRendererReadinessDiagnostics({
+    exception: {
+      observed: true, classification: "type", asset: "app.js", line: 24,
+    },
+    assets,
+    primaryApis: [
+      { endpoint: "overview", responseClass: "5xx", completion: "finished" },
+      { endpoint: "gradient", responseClass: "2xx", completion: "finished" },
+      { endpoint: "weekly", responseClass: "unobserved", completion: "failed" },
+      { endpoint: "quality", responseClass: "unobserved", completion: "unobserved" },
+    ],
+  });
 }
 
 function sessionChild() {
@@ -322,6 +351,54 @@ test("normal packaged Linux smoke maps each shared source failure boundary to a 
     quit_cleanup: "SOURCE_SMOKE_QUIT_CLEANUP_FAILED",
   });
   assert.equal(normalPackagedSmokeFailureStageCode("private renderer detail"), null);
+});
+
+test("normal packaged Linux session and outer receipt retain only validated renderer readiness diagnostics", async () => {
+  const diagnostic = validRendererReadinessDiagnostics();
+  assert.notEqual(diagnostic, null);
+  const child = sessionChild();
+  queueMicrotask(() => {
+    child.stdout.end();
+    child.stderr.write("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_TRUE_FAILED\n");
+    child.stderr.write(`${JSON.stringify({
+      schemaVersion: "tibotattle-electron-linux-normal-packaged-renderer-readiness-diagnostic-v1",
+      rendererReadinessDiagnostics: diagnostic,
+    })}\n`);
+    child.stderr.end();
+    child.exitCode = 1;
+    child.emit("exit", 1, null);
+  });
+  let sessionFailure = null;
+  await assert.rejects(runLinuxNormalPackagedSmokeSession({
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+  }, { appPath: APP_PATH, spawnSession: () => child }), (error) => {
+    sessionFailure = error;
+    return error?.code
+      === "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_TRUE_FAILED";
+  });
+  assert.deepEqual(sessionFailure?.rendererReadinessDiagnostics, diagnostic);
+
+  let written = null;
+  const receipt = await runLinuxNormalPackagedSmoke({
+    appPath: APP_PATH,
+    receiptPath: "/private/tmp/tibotattle-linux-receipt.json",
+    sourceRevision: SOURCE_REVISION,
+  }, {
+    verifyPackage: async () => ({
+      sourceRevision: SOURCE_REVISION,
+      artifactSha256: ARTIFACT_SHA256,
+      executableSha256: "b".repeat(64),
+    }),
+    runSession: async () => { throw sessionFailure; },
+    reserve: async () => Object.freeze({}),
+    write: async (_handle, value) => { written = value; },
+  });
+  assert.equal(receipt.status, "failed");
+  assert.equal(receipt.errorCode,
+    "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_TRUE_FAILED");
+  assert.deepEqual(receipt.rendererReadinessDiagnostics, diagnostic);
+  assert.deepEqual(written, receipt);
 });
 
 test("forced Linux child cleanup never acts as the normal clean-quit proof", async () => {

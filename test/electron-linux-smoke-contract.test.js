@@ -11,6 +11,7 @@ import {
   assertContainerContract,
   classifyAutomaticStartupRefreshReceipt,
   combineStartupRefreshEvidence,
+  createRendererReadinessDiagnostics,
   createSyntheticHome,
   ELECTRON_LINUX_SMOKE_DEGRADED_FAILURE_CODES,
   ELECTRON_LINUX_SMOKE_FAILURE_STAGES,
@@ -23,6 +24,7 @@ import {
   reserveLinuxInspectablePageTargets,
   runSmoke,
   selectLinuxDashboardTarget,
+  validateRendererReadinessDiagnostics,
   waitFor,
 } from "../scripts/smoke-electron-linux.mjs";
 
@@ -57,6 +59,69 @@ function emitRefresh(cdp, {
     loaderId,
   });
 }
+
+test("Linux renderer readiness diagnostics retain only allowlisted module and primary API states", () => {
+  const cdp = new FakeCdp();
+  const diagnostics = createRendererReadinessDiagnostics({
+    cdp,
+    dashboardUrl: "http://127.0.0.1:45678/",
+  });
+  const request = (requestId, path) => cdp.emit("Network.requestWillBeSent", {
+    requestId,
+    request: { url: `http://127.0.0.1:45678/${path}` },
+  });
+  const response = (requestId, status) => cdp.emit("Network.responseReceived", {
+    requestId,
+    response: { status },
+  });
+  request("asset-app", "app.js");
+  response("asset-app", 200);
+  cdp.emit("Network.loadingFinished", { requestId: "asset-app" });
+  request("overview", "api/local/overview");
+  response("overview", 503);
+  cdp.emit("Network.loadingFinished", { requestId: "overview" });
+  request("gradient", "api/local/gradient");
+  response("gradient", 200);
+  cdp.emit("Network.loadingFinished", { requestId: "gradient" });
+  request("weekly", "api/local/weekly");
+  cdp.emit("Network.loadingFailed", { requestId: "weekly" });
+  cdp.emit("Runtime.exceptionThrown", {
+    exceptionDetails: {
+      url: "http://127.0.0.1:45678/app.js",
+      lineNumber: 23,
+      exception: { className: "TypeError" },
+    },
+  });
+  // Unknown paths and later exceptions cannot enter the retained diagnostic.
+  request("outside", "private-value.js");
+  cdp.emit("Runtime.exceptionThrown", {
+    exceptionDetails: {
+      url: "http://127.0.0.1:45678/private-value.js",
+      lineNumber: 99,
+      exception: { className: "ReferenceError" },
+    },
+  });
+
+  const snapshot = diagnostics.snapshot();
+  assert.deepEqual(snapshot.exception, {
+    observed: true, classification: "type", asset: "app.js", line: 24,
+  });
+  assert.deepEqual(snapshot.assets.find(({ asset }) => asset === "app.js"), {
+    asset: "app.js", responseClass: "2xx", completion: "finished",
+  });
+  assert.deepEqual(snapshot.primaryApis, [
+    { endpoint: "overview", responseClass: "5xx", completion: "finished" },
+    { endpoint: "gradient", responseClass: "2xx", completion: "finished" },
+    { endpoint: "weekly", responseClass: "unobserved", completion: "failed" },
+    { endpoint: "quality", responseClass: "unobserved", completion: "unobserved" },
+  ]);
+  assert.equal(JSON.stringify(snapshot).includes("127.0.0.1"), false);
+  assert.equal(validateRendererReadinessDiagnostics({
+    ...snapshot,
+    exception: { ...snapshot.exception, asset: "private-value.js" },
+  }), null);
+  diagnostics.dispose();
+});
 
 test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
   const source = await readFile("scripts/smoke-electron-linux.mjs", "utf8");

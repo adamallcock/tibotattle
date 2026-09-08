@@ -94,6 +94,203 @@ const ELECTRON_LINUX_SMOKE_FAILURE_STAGE_SET = new Set(ELECTRON_LINUX_SMOKE_FAIL
 const DEGRADED_FAILURE_CODE_SET = new Set(
   ELECTRON_LINUX_SMOKE_DEGRADED_FAILURE_CODES,
 );
+const RENDERER_READINESS_ASSETS = Object.freeze([
+  "app.js",
+  "community-data.js",
+  "data-client.js",
+  "desktop-shell.js",
+  "i18n.generated.js",
+  "install-cta.js",
+  "lib.js",
+  "localization.js",
+  "navigation.js",
+  "telemetry-envelope.js",
+  "telemetry-shared.generated.js",
+  "ui-format.js",
+]);
+const RENDERER_READINESS_ASSET_SET = new Set(RENDERER_READINESS_ASSETS);
+const RENDERER_READINESS_PRIMARY_ENDPOINTS = Object.freeze([
+  Object.freeze({ name: "overview", path: "/api/local/overview" }),
+  Object.freeze({ name: "gradient", path: "/api/local/gradient" }),
+  Object.freeze({ name: "weekly", path: "/api/local/weekly" }),
+  Object.freeze({ name: "quality", path: "/api/local/quality" }),
+]);
+const RENDERER_READINESS_ENDPOINT_BY_PATH = new Map(
+  RENDERER_READINESS_PRIMARY_ENDPOINTS.map((endpoint) => [endpoint.path, endpoint.name]),
+);
+const RENDERER_READINESS_RESPONSE_CLASSES = new Set([
+  "unobserved", "1xx", "2xx", "3xx", "4xx", "5xx", "other",
+]);
+const RENDERER_READINESS_COMPLETIONS = new Set([
+  "unobserved", "finished", "failed",
+]);
+const RENDERER_READINESS_EXCEPTION_CLASSES = new Set([
+  "unobserved", "syntax", "reference", "type", "other",
+]);
+const MAX_RENDERER_DIAGNOSTIC_LINE = 250_000;
+
+function rendererResponseClass(status) {
+  if (!Number.isFinite(status)) return "unobserved";
+  const normalized = Math.trunc(status);
+  if (normalized >= 100 && normalized < 600) return `${Math.floor(normalized / 100)}xx`;
+  return "other";
+}
+
+function rendererExceptionClass(value) {
+  if (value === "SyntaxError") return "syntax";
+  if (value === "ReferenceError") return "reference";
+  if (value === "TypeError") return "type";
+  return "other";
+}
+
+function rendererDiagnosticTarget(value, origin) {
+  if (typeof value !== "string" || typeof origin !== "string") return null;
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return null;
+  }
+  if (parsed.origin !== origin || parsed.search !== "" || parsed.hash !== "") return null;
+  const endpoint = RENDERER_READINESS_ENDPOINT_BY_PATH.get(parsed.pathname);
+  if (endpoint !== undefined) return { kind: "endpoint", name: endpoint };
+  const asset = parsed.pathname.startsWith("/") ? parsed.pathname.slice(1) : "";
+  return RENDERER_READINESS_ASSET_SET.has(asset) ? { kind: "asset", name: asset } : null;
+}
+
+function rendererDiagnosticLine(value) {
+  return Number.isInteger(value) && value >= 0 && value < MAX_RENDERER_DIAGNOSTIC_LINE
+    ? value + 1
+    : null;
+}
+
+function isRendererReadinessFailureStage(stage) {
+  return stage === "renderer_readiness_unobserved"
+    || typeof stage === "string" && stage.startsWith("renderer_readiness_marker_");
+}
+
+/**
+ * Return only fixed renderer startup evidence.  It deliberately contains no
+ * URL, exception text, stack, response body, or fixture value.  "unobserved"
+ * means CDP attached too late to prove the event was absent.
+ */
+export function validateRendererReadinessDiagnostics(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const exception = value.exception;
+  if (!exception || typeof exception !== "object" || Array.isArray(exception)
+      || typeof exception.observed !== "boolean"
+      || !RENDERER_READINESS_EXCEPTION_CLASSES.has(exception.classification)
+      || (exception.asset !== null && !RENDERER_READINESS_ASSET_SET.has(exception.asset))
+      || (exception.line !== null && (!Number.isInteger(exception.line)
+        || exception.line < 1 || exception.line > MAX_RENDERER_DIAGNOSTIC_LINE))) {
+    return null;
+  }
+  if (!exception.observed && (exception.classification !== "unobserved"
+      || exception.asset !== null || exception.line !== null)
+      || exception.observed && exception.classification === "unobserved") {
+    return null;
+  }
+  if (!Array.isArray(value.assets) || value.assets.length !== RENDERER_READINESS_ASSETS.length
+      || !Array.isArray(value.primaryApis)
+      || value.primaryApis.length !== RENDERER_READINESS_PRIMARY_ENDPOINTS.length) {
+    return null;
+  }
+  const validateRows = (rows, expected, key) => rows.every((row, index) => (
+    row && typeof row === "object" && !Array.isArray(row)
+      && row[key] === expected[index]
+      && RENDERER_READINESS_RESPONSE_CLASSES.has(row.responseClass)
+      && RENDERER_READINESS_COMPLETIONS.has(row.completion)
+  ));
+  if (!validateRows(value.assets, RENDERER_READINESS_ASSETS, "asset")
+      || !validateRows(value.primaryApis,
+        RENDERER_READINESS_PRIMARY_ENDPOINTS.map((endpoint) => endpoint.name), "endpoint")) {
+    return null;
+  }
+  return Object.freeze({
+    exception: Object.freeze({
+      observed: exception.observed,
+      classification: exception.classification,
+      asset: exception.asset,
+      line: exception.line,
+    }),
+    assets: Object.freeze(value.assets.map((row) => Object.freeze({
+      asset: row.asset,
+      responseClass: row.responseClass,
+      completion: row.completion,
+    }))),
+    primaryApis: Object.freeze(value.primaryApis.map((row) => Object.freeze({
+      endpoint: row.endpoint,
+      responseClass: row.responseClass,
+      completion: row.completion,
+    }))),
+  });
+}
+
+export function createRendererReadinessDiagnostics({ cdp, dashboardUrl }) {
+  const origin = new URL(dashboardUrl).origin;
+  const assets = new Map(RENDERER_READINESS_ASSETS.map((asset) => [asset, {
+    responseClass: "unobserved", completion: "unobserved", requestId: null,
+  }]));
+  const primaryApis = new Map(RENDERER_READINESS_PRIMARY_ENDPOINTS.map(({ name }) => [name, {
+    responseClass: "unobserved", completion: "unobserved", requestId: null,
+  }]));
+  const requests = new Map();
+  let exception = {
+    observed: false, classification: "unobserved", asset: null, line: null,
+  };
+  const observeRequest = ({ request, requestId } = {}) => {
+    if (typeof requestId !== "string" || requestId.length === 0) return;
+    const target = rendererDiagnosticTarget(request?.url, origin);
+    if (target === null) return;
+    const rows = target.kind === "asset" ? assets : primaryApis;
+    const row = rows.get(target.name);
+    if (row === undefined || row.requestId !== null) return;
+    row.requestId = requestId;
+    requests.set(requestId, row);
+  };
+  const observeResponse = ({ requestId, response } = {}) => {
+    const row = requests.get(requestId);
+    if (row === undefined) return;
+    row.responseClass = rendererResponseClass(response?.status);
+  };
+  const observeCompletion = ({ requestId } = {}, completion) => {
+    const row = requests.get(requestId);
+    if (row === undefined) return;
+    row.completion = completion;
+  };
+  const observeException = ({ exceptionDetails } = {}) => {
+    if (exception.observed) return;
+    const target = rendererDiagnosticTarget(exceptionDetails?.url, origin);
+    exception = {
+      observed: true,
+      classification: rendererExceptionClass(exceptionDetails?.exception?.className),
+      asset: target?.kind === "asset" ? target.name : null,
+      line: target?.kind === "asset" ? rendererDiagnosticLine(exceptionDetails?.lineNumber) : null,
+    };
+  };
+  const listeners = [
+    cdp.on("Network.requestWillBeSent", observeRequest),
+    cdp.on("Network.responseReceived", observeResponse),
+    cdp.on("Network.loadingFinished", (event) => observeCompletion(event, "finished")),
+    cdp.on("Network.loadingFailed", (event) => observeCompletion(event, "failed")),
+    cdp.on("Runtime.exceptionThrown", observeException),
+  ];
+  return Object.freeze({
+    snapshot() {
+      return validateRendererReadinessDiagnostics({
+        exception,
+        assets: RENDERER_READINESS_ASSETS.map((asset) => ({ asset, ...assets.get(asset) })),
+        primaryApis: RENDERER_READINESS_PRIMARY_ENDPOINTS.map(({ name }) => ({
+          endpoint: name,
+          ...primaryApis.get(name),
+        })),
+      });
+    },
+    dispose() {
+      for (const dispose of listeners) dispose();
+    },
+  });
+}
 
 /**
  * Classify one renderer startup-refresh observation without consulting the
@@ -1130,6 +1327,7 @@ export async function runSmoke({
   fixtureFactory = createSyntheticHome,
   launchArguments = defaultSmokeLaunchArguments,
   onFailureStage = null,
+  onRendererReadinessDiagnostics = null,
   qualification = "development-only",
   sourceRevision = null,
   writeResult = defaultSmokeResultWriter,
@@ -1140,6 +1338,7 @@ export async function runSmoke({
       || typeof environmentFactory !== "function" || typeof fixtureFactory !== "function"
       || typeof launchArguments !== "function"
       || onFailureStage !== null && typeof onFailureStage !== "function"
+      || onRendererReadinessDiagnostics !== null && typeof onRendererReadinessDiagnostics !== "function"
       || typeof writeResult !== "function"
       || typeof qualification !== "string" || qualification.length === 0
       || (sourceRevision !== null && !/^[0-9a-f]{40}$/u.test(sourceRevision))) {
@@ -1192,6 +1391,7 @@ export async function runSmoke({
   let forcedShutdown = false;
   let cleanupConfirmed = false;
   let failureStage = null;
+  let rendererReadinessDiagnostics = null;
   try {
     failureStage = "startup";
     if (!child.pid) fail("Electron did not provide a process id");
@@ -1224,9 +1424,14 @@ export async function runSmoke({
       await Promise.all(inspectablePages.map(async (target) => {
         let pageCdp;
         let pageRefreshObserver;
+        let pageRendererReadinessDiagnostics;
         try {
           pageCdp = await connectCdp(target);
           pageRefreshObserver = observeLocalRefreshRequests(pageCdp);
+          pageRendererReadinessDiagnostics = createRendererReadinessDiagnostics({
+            cdp: pageCdp,
+            dashboardUrl: target.url,
+          });
           const observedNetworkUrls = [];
           let networkEvidenceInvalid = false;
           const observeNetworkURL = (url) => {
@@ -1250,14 +1455,17 @@ export async function runSmoke({
           // merged into the dashboard receipt.
           await pageCdp.request("Page.enable");
           await pageCdp.request("Network.enable");
+          await pageCdp.request("Runtime.enable");
           attachedPages.set(target.id, Object.freeze({
             targetId: target.id,
             cdp: pageCdp,
             refreshObserver: pageRefreshObserver,
+            rendererReadinessDiagnostics: pageRendererReadinessDiagnostics,
             observedNetworkUrls,
             networkEvidenceInvalid: () => networkEvidenceInvalid,
           }));
         } catch {
+          pageRendererReadinessDiagnostics?.dispose?.();
           pageRefreshObserver?.dispose?.();
           pageCdp?.close?.();
         }
@@ -1271,6 +1479,7 @@ export async function runSmoke({
     const { target, page: selectedPage } = dashboardSelection;
     cdp = selectedPage.cdp;
     refreshObserver = selectedPage.refreshObserver;
+    rendererReadinessDiagnostics = selectedPage.rendererReadinessDiagnostics;
     const observedNetworkUrls = selectedPage.observedNetworkUrls;
     const selectedDashboardUrl = new URL(target.url);
     selectRequiredRefreshLoader(refreshObserver, await waitFor(
@@ -1473,6 +1682,14 @@ export async function runSmoke({
     return result;
   } catch (error) {
     forcedShutdown = true;
+    if (isRendererReadinessFailureStage(failureStage)
+        && onRendererReadinessDiagnostics !== null) {
+      try {
+        onRendererReadinessDiagnostics(rendererReadinessDiagnostics?.snapshot?.() ?? null);
+      } catch {
+        // A diagnostic listener must not alter the underlying smoke failure.
+      }
+    }
     if (failureStage !== null && ELECTRON_LINUX_SMOKE_FAILURE_STAGE_SET.has(failureStage)
         && onFailureStage !== null) {
       try {
@@ -1484,6 +1701,7 @@ export async function runSmoke({
     throw error;
   } finally {
     for (const page of attachedPages.values()) {
+      page.rendererReadinessDiagnostics?.dispose?.();
       page.refreshObserver?.dispose?.();
       page.cdp?.close?.();
     }
