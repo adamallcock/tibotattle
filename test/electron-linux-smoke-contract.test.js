@@ -28,6 +28,8 @@ import {
   reserveLinuxInspectablePageTargets,
   runSmoke,
   selectLinuxDashboardTarget,
+  startupRefreshTimeoutDiagnostic,
+  validateStartupRefreshTimeoutDiagnostic,
   validateRendererReadinessDiagnostics,
   validateLinuxCompanionProcessDiagnostics,
   validateLinuxDashboardFailureDiagnostic,
@@ -907,6 +909,35 @@ test("Linux startup refresh receipt semantics are stateful and content-free", ()
     ),
     { code: codes.degradedInvalid },
   );
+});
+
+test("Linux startup refresh timeout diagnostics retain only closed observation categories", () => {
+  const accepted = startupRefreshTimeoutDiagnostic({
+    phase: "acceptance",
+    requestCount: 0,
+    refresh: { status: "succeeded", refreshId: "private-refresh-id" },
+  });
+  assert.deepEqual(accepted, {
+    phase: "acceptance",
+    requestCount: "zero",
+    refreshStatus: "not_observed",
+  });
+  assert.deepEqual(startupRefreshTimeoutDiagnostic({
+    phase: "completion", requestCount: 3, refresh: { status: "private-status" },
+  }), {
+    phase: "completion",
+    requestCount: "multiple",
+    refreshStatus: "other",
+  });
+  assert.equal(startupRefreshTimeoutDiagnostic({ phase: "private-phase", requestCount: 1 }), null);
+  assert.deepEqual(validateStartupRefreshTimeoutDiagnostic({
+    phase: "completion", requestCount: "one", refreshStatus: "unavailable", private: "detail",
+  }), {
+    phase: "completion", requestCount: "one", refreshStatus: "unavailable",
+  });
+  assert.equal(validateStartupRefreshTimeoutDiagnostic({
+    phase: "completion", requestCount: "zero", refreshStatus: "succeeded-but-private",
+  }), null);
 });
 
 test("Linux initial dashboard loader waits through a transient null", async () => {

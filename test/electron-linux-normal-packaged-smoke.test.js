@@ -199,6 +199,44 @@ test("Linux session retains only fixed automatic refresh failure classifiers", a
   }
 });
 
+test("Linux session retains only bounded automatic refresh timeout diagnostics", async () => {
+  const identity = { sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256 };
+  const timeout = "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_COMPLETION_TIMEOUT";
+  const diagnostic = { phase: "completion", requestCount: "one", refreshStatus: "running" };
+  for (const value of [diagnostic, { ...diagnostic, refreshStatus: "private-status", private: "detail" }]) {
+    const child = sessionChild();
+    const receipt = await runLinuxNormalPackagedSmoke({ sourceRevision: SOURCE_REVISION }, {
+      verifyPackage: async () => identity,
+      runSession: () => runLinuxNormalPackagedSmokeSession(identity, {
+        appPath: APP_PATH, spawnSession: () => {
+          queueMicrotask(() => {
+            child.stdout.end();
+            child.stderr.write("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RELOAD_REFRESH_FAILED\n");
+            child.stderr.write(`${JSON.stringify({
+              schemaVersion: "tibotattle-electron-linux-normal-packaged-automatic-refresh-failure-v1",
+              automaticRefreshFailure: timeout,
+            })}\n`);
+            child.stderr.end(`${JSON.stringify({
+              schemaVersion: "tibotattle-electron-linux-normal-packaged-automatic-refresh-timeout-diagnostic-v1",
+              automaticRefreshTimeoutDiagnostic: value,
+            })}\n`);
+            child.exitCode = 1;
+            child.emit("exit", 1, null);
+          });
+          return child;
+        },
+      }),
+      reserve: async () => ({}), write: async () => {},
+    });
+    assert.equal(receipt.errorCode,
+      "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RELOAD_REFRESH_FAILED");
+    assert.equal(receipt.automaticRefreshFailure, timeout);
+    assert.deepEqual(receipt.automaticRefreshTimeoutDiagnostic, value === diagnostic ? diagnostic : undefined);
+    assert.equal(JSON.stringify(receipt).includes("private-status"), false);
+    assert.equal(JSON.stringify(receipt).includes("detail"), false);
+  }
+});
+
 function productionMetadata(sourceRevision = SOURCE_REVISION) {
   return createProductionDistributionMetadata({
     buildNumber: "12345",

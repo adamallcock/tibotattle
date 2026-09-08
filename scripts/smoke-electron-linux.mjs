@@ -153,11 +153,19 @@ export const ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES = Object.freeze({
   duplicate: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_DUPLICATED",
   invalidReceipt: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_RECEIPT_INVALID",
   changedReceipt: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED",
+  acceptanceTimeout: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ACCEPTANCE_TIMEOUT",
+  completionTimeout: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_COMPLETION_TIMEOUT",
   failed: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_FAILED",
   cancelled: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_CANCELLED",
   degradedInvalid: "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_DEGRADED_INVALID",
   boundaryInvalid: "ELECTRON_LINUX_SMOKE_REFRESH_BOUNDARY_INVALID",
 });
+const STARTUP_REFRESH_TIMEOUT_PHASES = new Set(["acceptance", "completion"]);
+const STARTUP_REFRESH_TIMEOUT_REQUEST_COUNTS = new Set(["zero", "one", "multiple", "invalid"]);
+const STARTUP_REFRESH_TIMEOUT_STATUSES = new Set([
+  "not_observed", "missing", "idle", "running", "succeeded", "degraded", "failed", "cancelled",
+  "other", "unavailable",
+]);
 export const ELECTRON_LINUX_SMOKE_DEGRADED_FAILURE_CODES = Object.freeze([
   "codex_rollout_compression_unsupported",
   "codex_rollout_filename_identity_mismatch",
@@ -882,6 +890,42 @@ export function classifyAutomaticStartupRefreshReceipt({
     });
   }
   return Object.freeze({ status: "pending", refreshId: refresh.refreshId });
+}
+
+/**
+ * Retain only bounded, content-free state when a startup-refresh phase reaches
+ * its existing deadline. A missing observation remains a timeout failure; it
+ * is never interpreted as a successful zero-request pass.
+ */
+export function startupRefreshTimeoutDiagnostic({ phase, requestCount, refresh } = {}) {
+  if (!STARTUP_REFRESH_TIMEOUT_PHASES.has(phase)) return null;
+  const requestCountCategory = !Number.isInteger(requestCount) || requestCount < 0
+    ? "invalid"
+    : requestCount === 0 ? "zero" : requestCount === 1 ? "one" : "multiple";
+  const status = requestCountCategory === "zero"
+    ? "not_observed"
+    : refresh === null || refresh === undefined
+      ? "missing"
+      : typeof refresh.status !== "string"
+        ? "other"
+        : STARTUP_REFRESH_TIMEOUT_STATUSES.has(refresh.status) ? refresh.status : "other";
+  return Object.freeze({
+    phase,
+    requestCount: requestCountCategory,
+    refreshStatus: status,
+  });
+}
+
+export function validateStartupRefreshTimeoutDiagnostic(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || !STARTUP_REFRESH_TIMEOUT_PHASES.has(value.phase)
+      || !STARTUP_REFRESH_TIMEOUT_REQUEST_COUNTS.has(value.requestCount)
+      || !STARTUP_REFRESH_TIMEOUT_STATUSES.has(value.refreshStatus)) return null;
+  return Object.freeze({
+    phase: value.phase,
+    requestCount: value.requestCount,
+    refreshStatus: value.refreshStatus,
+  });
 }
 
 function fail(message) {
@@ -1666,61 +1710,113 @@ async function assertAutomaticStartupRefresh({
   let refreshId = null;
   let terminalStatus = null;
   let degradedFailureCode = null;
-  await waitFor(async () => {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      fail("Electron exited before automatic startup refresh");
-    }
-    const requests = refreshObserver.snapshot();
-    if (requests.length === 0) return null;
-    const noReceiptDecision = classifyAutomaticStartupRefreshReceipt({
-      phase: "acceptance",
-      requestCount: requests.length,
-      refresh: { status: "idle" },
-      previousRefreshId,
-    });
-    if (noReceiptDecision.status === "failed") failFixed(noReceiptDecision.errorCode);
-    const status = await jsonFetch(refreshUrl);
-    const refresh = status?.refresh;
-    const decision = classifyAutomaticStartupRefreshReceipt({
-      phase: "acceptance",
-      requestCount: requests.length,
-      refresh,
-      previousRefreshId,
-    });
-    if (decision.status === "pending") return null;
-    if (decision.status === "failed") failFixed(decision.errorCode);
-    refreshId = decision.refreshId;
-    return true;
-  }, MAX_REFRESH_MS, "automatic startup refresh acceptance");
+  let acceptanceTimeoutDiagnostic = startupRefreshTimeoutDiagnostic({
+    phase: "acceptance", requestCount: -1, refresh: null,
+  });
+  try {
+    await waitFor(async () => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        fail("Electron exited before automatic startup refresh");
+      }
+      const requests = refreshObserver.snapshot();
+      if (requests.length === 0) {
+        acceptanceTimeoutDiagnostic = startupRefreshTimeoutDiagnostic({
+          phase: "acceptance", requestCount: requests.length, refresh: null,
+        });
+        return null;
+      }
+      const noReceiptDecision = classifyAutomaticStartupRefreshReceipt({
+        phase: "acceptance",
+        requestCount: requests.length,
+        refresh: { status: "idle" },
+        previousRefreshId,
+      });
+      if (noReceiptDecision.status === "failed") failFixed(noReceiptDecision.errorCode);
+      let status;
+      try {
+        status = await jsonFetch(refreshUrl);
+      } catch (error) {
+        acceptanceTimeoutDiagnostic = startupRefreshTimeoutDiagnostic({
+          phase: "acceptance", requestCount: requests.length, refresh: { status: "unavailable" },
+        });
+        throw error;
+      }
+      const refresh = status?.refresh;
+      acceptanceTimeoutDiagnostic = startupRefreshTimeoutDiagnostic({
+        phase: "acceptance", requestCount: requests.length, refresh,
+      });
+      const decision = classifyAutomaticStartupRefreshReceipt({
+        phase: "acceptance",
+        requestCount: requests.length,
+        refresh,
+        previousRefreshId,
+      });
+      if (decision.status === "pending") return null;
+      if (decision.status === "failed") failFixed(decision.errorCode);
+      refreshId = decision.refreshId;
+      return true;
+    }, MAX_REFRESH_MS, "automatic startup refresh acceptance");
+  } catch (error) {
+    if (typeof error?.code === "string" && error.code.startsWith("ELECTRON_LINUX_SMOKE_")) throw error;
+    const timeout = new Error(ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.acceptanceTimeout);
+    timeout.code = ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.acceptanceTimeout;
+    timeout.startupRefreshTimeoutDiagnostic = acceptanceTimeoutDiagnostic;
+    throw timeout;
+  }
 
-  await waitFor(async () => {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      fail("Electron exited before automatic startup refresh completed");
-    }
-    const requests = refreshObserver.snapshot();
-    if (requests.length !== 1) {
-      const requestDecision = classifyAutomaticStartupRefreshReceipt({
+  let completionTimeoutDiagnostic = startupRefreshTimeoutDiagnostic({
+    phase: "completion", requestCount: -1, refresh: null,
+  });
+  try {
+    await waitFor(async () => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        fail("Electron exited before automatic startup refresh completed");
+      }
+      const requests = refreshObserver.snapshot();
+      if (requests.length !== 1) {
+        completionTimeoutDiagnostic = startupRefreshTimeoutDiagnostic({
+          phase: "completion", requestCount: requests.length, refresh: null,
+        });
+        const requestDecision = classifyAutomaticStartupRefreshReceipt({
+          phase: "completion",
+          requestCount: requests.length,
+          expectedRefreshId: refreshId,
+        });
+        if (requestDecision.status === "failed") failFixed(requestDecision.errorCode);
+        return false;
+      }
+      let status;
+      try {
+        status = await jsonFetch(refreshUrl);
+      } catch (error) {
+        completionTimeoutDiagnostic = startupRefreshTimeoutDiagnostic({
+          phase: "completion", requestCount: requests.length, refresh: { status: "unavailable" },
+        });
+        throw error;
+      }
+      const refresh = status?.refresh;
+      completionTimeoutDiagnostic = startupRefreshTimeoutDiagnostic({
+        phase: "completion", requestCount: requests.length, refresh,
+      });
+      const decision = classifyAutomaticStartupRefreshReceipt({
         phase: "completion",
         requestCount: requests.length,
+        refresh,
         expectedRefreshId: refreshId,
       });
-      if (requestDecision.status === "failed") failFixed(requestDecision.errorCode);
-      return false;
-    }
-    const status = await jsonFetch(refreshUrl);
-    const refresh = status?.refresh;
-    const decision = classifyAutomaticStartupRefreshReceipt({
-      phase: "completion",
-      requestCount: requests.length,
-      refresh,
-      expectedRefreshId: refreshId,
-    });
-    if (decision.status === "pending") return false;
-    if (decision.status === "failed") failFixed(decision.errorCode);
-    terminalStatus = decision.terminalStatus;
-    degradedFailureCode = decision.degradedFailureCode ?? null;
-    return true;
-  }, MAX_REFRESH_MS, "automatic startup refresh completion");
+      if (decision.status === "pending") return false;
+      if (decision.status === "failed") failFixed(decision.errorCode);
+      terminalStatus = decision.terminalStatus;
+      degradedFailureCode = decision.degradedFailureCode ?? null;
+      return true;
+    }, MAX_REFRESH_MS, "automatic startup refresh completion");
+  } catch (error) {
+    if (typeof error?.code === "string" && error.code.startsWith("ELECTRON_LINUX_SMOKE_")) throw error;
+    const timeout = new Error(ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.completionTimeout);
+    timeout.code = ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.completionTimeout;
+    timeout.startupRefreshTimeoutDiagnostic = completionTimeoutDiagnostic;
+    throw timeout;
+  }
   // A completed pass may schedule an intentional bounded reindex continuation.
   // It is a separate operation, not a second startup trigger; stop counting
   // this document once the startup receipt has reached its terminal outcome.
