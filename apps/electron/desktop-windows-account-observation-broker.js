@@ -9,8 +9,9 @@ import {
   isWindowsAccountObservationCredentialError,
 } from "../../src/platform/windows-account-observation-credential.js";
 
-// This is a dormant composition seam. Only a later qualified Electron main
-// composition may attach it to owned Node IPC; the companion never loads Keytar.
+// The qualification lane and exact stable Windows candidate attach this fixed
+// broker to owned Node IPC. The companion never loads Keytar; the backend's
+// native production-safety claim remains false.
 export const WINDOWS_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS = PLATFORM_INTEGRATION_STATUS;
 
 function fail(code) {

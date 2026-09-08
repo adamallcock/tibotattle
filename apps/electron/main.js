@@ -695,9 +695,10 @@ export async function launchElectronShell({
     // A local-QA launch must never inherit production sending or updating.
     const productionEnabled = productionDistribution !== null
       && environment.USAGE_MONITOR_TEST_LANE === undefined;
-    // An exact stable package may select its fixed platform-native credential
-    // handover. Installed lifecycle evidence and the native sidecars' false
-    // production-safety facts remain separate from this source selection.
+    // Native-to-Electron handover fixtures retain the signed migration/FD4
+    // path without enabling accountless FD3 uploads. Exact stable candidates
+    // select their fixed native adapters; installed lifecycle and release
+    // evidence remain separate from this source selection.
     const accountlessProductionEnabled = productionEnabled
       && productionDistribution.channel === PRODUCTION_ELECTRON_CHANNEL;
     const linuxQualificationSupervisorOptions =

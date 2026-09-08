@@ -40,24 +40,21 @@ one. The Mac daily-use tester is available; that is not full cutover readiness.
    accountless public-sample/overlapping-history decisions. Preserve accepted
    automatic-sharing and persistent opt-out behavior throughout.
 
-Windows next composition boundary (read-only verification at `8b84e971`):
-normal startup does not yet connect the fixed FD3 installation credential,
-FD4 account-observation broker, and existing protected settings store. These
-native backends can execute with their current false production-safety flags;
-the missing normal selection is distinct from release qualification. The
-reported final-rename race also affects protected settings/credential journal
-replacement, and the current sidecar does not establish authenticated signed
-native provenance. Preserve those limits and legacy ciphertext recovery; do
-not manufacture a full-readiness attestation or select legacy identity/device
-routes to make the candidate run.
+Windows normal candidate composition is integrated at `d23f17e9`: exact stable
+Windows/x64 metadata selects the fixed FD3 installation credential, fixed FD4
+account-observation broker and existing protected settings/notification stores.
+The native production-safety flags remain false and legacy ciphertext still
+requires explicit recovery. Source/facade tests pass; normal packaged startup
+has not been exercised natively. The current native sidecar does not establish
+authenticated signed provenance. Preserve those limits; do not manufacture a
+full-readiness attestation or select legacy identity/device routes.
 
 The maintained native binding contract limits replacement safety to cooperating
 writers holding the capability lease; deliberate same-owner mutation is outside
 that contract (`native/windows-filesystem/README.md`). Do not expand this into
 a privileged service or claim a hostile-writer atomic replacement guarantee.
-Prepare the fixed normal Windows composition within the existing contract,
-keeping both native production-safety flags false and qualifying actual startup
-separately from release trust.
+The fixed normal Windows composition stays within that existing contract;
+qualify actual startup separately from release trust.
 
 Across these three streams, freeze release candidates, verify four-target
 installation/update evidence, then request the concrete staged
@@ -69,7 +66,39 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest combined result: `b356656c` in
+Latest combined result: `c70b5af7` in
+[run 34245534377](https://github.com/adamallcock/tibotattle/actions/runs/34245534377)
+passes both Mac package jobs and the Windows producer. Windows again proves
+installation, two launches and credential persistence. The longer registry
+budget resolves the unavailable probe; its final cleanup result now reports
+`both_predicates_present` after a settled uninstaller exit. Installation-root
+and uninstall-registration absence are not established. Inspect the actual
+uninstaller invocation and bounded observation before changing another limit.
+
+Linux normal startup reaches the correct title and overview heading, but the
+first dashboard readiness marker remains false for the full thirty-second
+wait (`SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_TRUE_FAILED`).
+The exact ASAR contains the primary web assets. The remaining distinction is
+module/bootstrap evaluation versus the initial split local API reads, which
+wait for the startup data snapshot. Preserve unavailable evidence; do not turn
+the static heading into a successful app-load claim.
+
+Next repairs are integrated at `f4ba5f96` (Windows) and `de27af48`/`a87c346b`
+(Linux). The Windows harness now invokes the uninstaller in NSIS's documented
+in-place mode with the validated installation root as the final argument. It
+may remove only the unchanged, digest-bound uninstaller after registry removal
+and proof that no other entries remain; directory removal is non-recursive and
+the final independent absence checks remain authoritative. Linux's failed
+readiness receipt now includes only allowlisted asset/API response classes,
+completion states and exception location, plus four concurrent read-only local
+API probes under a shared two-second diagnostic deadline. Existing readiness
+and success predicates remain unchanged. Integrated source, staging, verifier,
+gate and credential tests pass 119 cases with seven native/artifact-only cases
+deferred. Architecture, documentation and preflight checks pass. The owning
+runtime suite separately passes 43 cases with synthetic loopback enabled.
+These repairs still need native proof.
+
+Previous combined result: `b356656c` in
 [run 34242621490](https://github.com/adamallcock/tibotattle/actions/runs/34242621490)
 passes both Mac package jobs and the Windows producer. Windows again completes
 installation, both app launches, FD3/FD4 credential continuity and uninstaller
