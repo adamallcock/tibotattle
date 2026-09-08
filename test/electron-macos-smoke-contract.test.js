@@ -10,8 +10,13 @@ import { DESKTOP_DEFAULT_CODEX_ROOT_ID } from "../apps/electron/desktop-codex-ro
 import {
   assertMacAppContract,
   assertMacSyntheticFixtureSettings,
+  capturedMacSmokeDescendantPidsGone,
+  capturedMacSmokeDescendantPidsValid,
   classifyMacTraySettingsEvidence,
+  MACOS_SMOKE_RELAUNCH_FAILURE_STAGES,
   MACOS_SMOKE_TRAY_EVIDENCE_KEYS,
+  macSmokeProcessAlive,
+  observeMacSmokeChildExit,
   readMacSyntheticFixtureTray,
   buildClosedReceipt,
   classifyMacDashboardParityEvidence,
@@ -245,6 +250,17 @@ test("macOS Electron smoke is an explicit packaged arm64 lane", async () => {
   assert.doesNotMatch(source, /querySelector\("#electron-share-button"\)\?\.click/u);
   assert.match(source, /electron-settings/u);
   assert.match(source, /SIGUSR2/u);
+  assert.match(source, /capturedMacSmokeDescendantPidsGone/u);
+  assert.match(source, /const primaryDescendantPids = captureMacSmokeDescendantPids\(child\);/u);
+  assert.match(source, /capturedDescendantPids: primaryDescendantPids/u);
+  assert.match(source, /return await cleanQuitMacSmokeChild\(child, \{ label: "relaunch", relaunch: true \}\);/u);
+  assert.match(
+    source,
+    /const exitObservation = observeMacSmokeChildExit\([\s\S]*?await runStep\("quit_signal", \(\) => \{[\s\S]*?child\.kill\("SIGUSR2"\)/u,
+  );
+  assert.match(source, /catch \(error\) \{\s+exitObservation\.dispose\(\);\s+throw error;/u);
+  assert.match(source, /MACOS_SMOKE_RELAUNCH_FAILURE_STAGES/u);
+  assert.match(source, /relaunchFailureStage/u);
   assert.match(source, /contentFree: true/u);
   assert.match(source, /qualification: "development-only"/u);
   assert.ok(ELECTRON_MACOS_SMOKE_FAILURE_REASONS.includes("dashboard_data_unavailable"));
@@ -1314,11 +1330,12 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
       canvas: true,
     },
   });
-  assert.equal(receipt.schemaVersion, "tibotattle-electron-macos-smoke-v4");
+  assert.equal(receipt.schemaVersion, "tibotattle-electron-macos-smoke-v5");
   assert.equal(receipt.status, "passed");
   assert.equal(receipt.cleanQuit, true);
   assert.equal(receipt.contentFree, true);
   assert.equal(receipt.failureReason, null);
+  assert.equal(receipt.relaunchFailureStage, null);
   assert.deepEqual(receipt.source, {
     revision: TEST_SOURCE_REVISION,
     identified: true,
@@ -1364,6 +1381,7 @@ test("closed macOS receipt is content-free and has no runtime identifiers", () =
   assert.equal(Object.hasOwn(receipt, "refreshId"), false);
   assert.equal(Object.hasOwn(receipt, "dashboardOrigin"), false);
   assert.equal(Object.hasOwn(receipt, "fixtureRoot"), false);
+  assert.equal(Object.hasOwn(receipt, "relaunchError"), false);
   assert.equal(Object.isFrozen(receipt), true);
   assert.equal(Object.isFrozen(receipt.startupRefresh), true);
 });
@@ -1455,6 +1473,46 @@ test("failed macOS receipt keeps an allowlisted fixed reason", () => {
   assert.equal(Object.hasOwn(receipt, "error"), false);
 });
 
+test("macOS relaunch failure stage is closed and content-free", () => {
+  assert.deepEqual(MACOS_SMOKE_RELAUNCH_FAILURE_STAGES, [
+    "spawn",
+    "dashboard_target",
+    "settings_bridge",
+    "settings_target",
+    "tray_preference",
+    "tray_render",
+    "fixture_persistence",
+    "quit_signal",
+    "process_exit",
+    "companion_cleanup",
+  ]);
+  const receipt = buildClosedReceipt({
+    status: "failed",
+    failureStage: "settings",
+    failureReason: "settings_flow_invalid",
+    relaunchFailureStage: "settings_target",
+  });
+  assert.equal(receipt.relaunchFailureStage, "settings_target");
+  for (const invalid of [null, "", "unknown", "/private/synthetic", "http://127.0.0.1:9222"]) {
+    const closed = buildClosedReceipt({
+      status: "failed",
+      failureStage: "settings",
+      failureReason: "settings_flow_invalid",
+      relaunchFailureStage: invalid,
+    });
+    assert.equal(closed.relaunchFailureStage, null);
+    if (typeof invalid === "string" && invalid.length > 0 && invalid !== "unknown") {
+      assert.equal(JSON.stringify(closed).includes(invalid), false);
+    }
+  }
+  const passed = buildClosedReceipt({
+    status: "passed",
+    ...TEST_RECEIPT_IDENTITY,
+    relaunchFailureStage: "settings_target",
+  });
+  assert.equal(passed.relaunchFailureStage, null);
+});
+
 test("failed renderer readiness receipt retains completed chrome and refresh progress", () => {
   const receipt = buildClosedReceipt({
     status: "failed",
@@ -1494,6 +1552,59 @@ test("tray smoke proof requires rendered changes, save, undo, restore, reopen an
   assert.equal(JSON.stringify(classifyMacTraySettingsEvidence({ ...complete, path: "/private/synthetic" })).includes("/private"), false);
   const receipt = buildClosedReceipt({ settings: { trayCustomization: complete } });
   assert.deepEqual(receipt.settings.trayCustomization, { status: "passed", ...complete });
+});
+
+test("macOS smoke rejects incomplete captured descendant cleanup", () => {
+  for (const invalid of [undefined, [], [1, 1], [0], [-1], [1.5], ["1"]]) {
+    assert.equal(capturedMacSmokeDescendantPidsValid(invalid), false);
+    assert.equal(capturedMacSmokeDescendantPidsGone(invalid, () => false), false);
+  }
+  assert.equal(capturedMacSmokeDescendantPidsValid([101, 202]), true);
+  assert.equal(
+    capturedMacSmokeDescendantPidsGone([101, 202], (pid) => pid === 202),
+    false,
+  );
+  assert.equal(capturedMacSmokeDescendantPidsGone([101, 202], () => false), true);
+  assert.equal(capturedMacSmokeDescendantPidsGone([101, 202], null), false);
+});
+
+test("macOS companion probing fails closed on inaccessible or unknown PIDs", () => {
+  const failingProbe = (code) => () => {
+    const error = new Error(code);
+    error.code = code;
+    throw error;
+  };
+  assert.equal(macSmokeProcessAlive(101, () => {}), true);
+  assert.equal(macSmokeProcessAlive(101, failingProbe("ESRCH")), false);
+  assert.equal(macSmokeProcessAlive(101, failingProbe("EPERM")), true);
+  assert.equal(macSmokeProcessAlive(101, failingProbe("UNKNOWN")), true);
+  assert.equal(macSmokeProcessAlive(0, () => assert.fail("invalid PID must not probe")), false);
+});
+
+test("macOS child-exit observation removes listeners after exit, disposal, and timeout", async () => {
+  const completed = new EventEmitter();
+  completed.exitCode = null; completed.signalCode = null;
+  const completedObservation = observeMacSmokeChildExit(completed, 100, "synthetic clean quit");
+  assert.equal(completed.listenerCount("exit"), 1);
+  assert.equal(completed.listenerCount("error"), 1);
+  completed.emit("exit", 0, null);
+  assert.equal(await completedObservation.promise, true);
+  assert.equal(completed.listenerCount("exit"), 0);
+  assert.equal(completed.listenerCount("error"), 0);
+
+  const signalFailed = new EventEmitter();
+  signalFailed.exitCode = null; signalFailed.signalCode = null;
+  const failedObservation = observeMacSmokeChildExit(signalFailed, 100, "synthetic clean quit");
+  failedObservation.dispose();
+  assert.equal(signalFailed.listenerCount("exit"), 0);
+  assert.equal(signalFailed.listenerCount("error"), 0);
+
+  const timedOut = new EventEmitter();
+  timedOut.exitCode = null; timedOut.signalCode = null;
+  const timeoutObservation = observeMacSmokeChildExit(timedOut, 1, "synthetic clean quit");
+  await assert.rejects(timeoutObservation.promise, /synthetic clean quit timed out/u);
+  assert.equal(timedOut.listenerCount("exit"), 0);
+  assert.equal(timedOut.listenerCount("error"), 0);
 });
 
 test("tray smoke fixture reader returns only the validated preference and rejects future fields", async () => {

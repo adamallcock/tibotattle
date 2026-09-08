@@ -57,7 +57,7 @@ const MAX_STARTUP_MS = 30_000;
 const MAX_OPERATION_MS = 10_000;
 const MAX_REFRESH_MS = 45_000;
 const MAX_SHUTDOWN_MS = 10_000;
-const MACOS_SMOKE_SCHEMA_VERSION = "tibotattle-electron-macos-smoke-v4";
+const MACOS_SMOKE_SCHEMA_VERSION = "tibotattle-electron-macos-smoke-v5";
 const MACOS_SMOKE_CONTROL = "quit-v1";
 const MACOS_LOCAL_QA_TEST_LANE = "macos-electron-local-qa-v1";
 const REQUIRED_APP_NAME = "TiboTattle Dev";
@@ -134,6 +134,22 @@ export const ELECTRON_MACOS_SMOKE_FAILURE_REASONS = Object.freeze([
   "quit_signal_failed",
   "non_loopback_request",
   "runtime_failed",
+]);
+
+// This stays deliberately narrower than the broad receipt failure stage. It
+// identifies a bounded relaunch hand-off without retaining a timeout message,
+// a process identifier, a local path, or a debugging endpoint.
+export const MACOS_SMOKE_RELAUNCH_FAILURE_STAGES = Object.freeze([
+  "spawn",
+  "dashboard_target",
+  "settings_bridge",
+  "settings_target",
+  "tray_preference",
+  "tray_render",
+  "fixture_persistence",
+  "quit_signal",
+  "process_exit",
+  "companion_cleanup",
 ]);
 
 const FAILURE_REASON_BY_CODE = Object.freeze({
@@ -217,6 +233,27 @@ function fixedError(code, stage = "launch", reason = undefined) {
 
 function fail(code, stage = "launch", reason = undefined) {
   throw fixedError(code, stage, reason);
+}
+
+function relaunchFailure(error, relaunchFailureStage) {
+  if (MACOS_SMOKE_RELAUNCH_FAILURE_STAGES.includes(
+    error?.smokeRelaunchFailureStage,
+  )) {
+    return error;
+  }
+  const selected = error && typeof error === "object"
+    ? error
+    : fixedError("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
+  selected.smokeRelaunchFailureStage = relaunchFailureStage;
+  return selected;
+}
+
+async function runRelaunchPhase(relaunchFailureStage, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    throw relaunchFailure(error, relaunchFailureStage);
+  }
 }
 
 function wait(milliseconds) {
@@ -2123,42 +2160,78 @@ async function exerciseTraySettings(cdp, settingsPath) {
 }
 
 async function assertTrayProcessRelaunch({ executable, appPath, environment, fixture, expected }) {
-  const port = await freeTcpPort();
-  const child = spawn(executable, [
-    `--user-data-dir=${fixture.userData}`, `--remote-debugging-port=${port}`,
-    "--remote-debugging-address=127.0.0.1", "--disable-gpu",
-  ], { cwd: join(appPath, "Contents", "Resources"),
-    env: Object.fromEntries(Object.entries(environment).filter(([, value]) => value !== undefined)),
-    stdio: ["ignore", "ignore", "ignore", "ipc"] });
-  child.on("error", () => {});
+  const port = await runRelaunchPhase("spawn", () => freeTcpPort());
+  const child = await runRelaunchPhase("spawn", () => {
+    const launched = spawn(executable, [
+      `--user-data-dir=${fixture.userData}`, `--remote-debugging-port=${port}`,
+      "--remote-debugging-address=127.0.0.1", "--disable-gpu",
+    ], { cwd: join(appPath, "Contents", "Resources"),
+      env: Object.fromEntries(Object.entries(environment).filter(([, value]) => value !== undefined)),
+      stdio: ["ignore", "ignore", "ignore", "ipc"] });
+    launched.on("error", () => {});
+    if (!launched.pid) fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
+    return launched;
+  });
   let dashboard = null; let settings = null;
   try {
-    if (!child.pid) fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
-    const target = await waitFor(async () => selectMacDashboardTarget(
-      await jsonFetch(`http://127.0.0.1:${port}/json`), port,
-    ), MAX_STARTUP_MS, "relaunch dashboard target");
-    dashboard = await connectCdp(target);
-    await waitFor(() => dashboard.evaluate('typeof globalThis.tibotattleDesktop?.openTraySettings === "function"'), MAX_STARTUP_MS, "relaunch settings bridge");
-    await dashboard.evaluate('globalThis.tibotattleDesktop.openTraySettings()');
-    const origin = new URL(target.url).origin;
-    const settingsTarget = await waitFor(() => findSettingsTarget(port, origin), MAX_STARTUP_MS, "relaunch tray settings target");
-    settings = await connectCdp(settingsTarget);
-    await assertTraySettingsChoice(settings, expected);
-    const rendered = await waitFor(() => settings.evaluate(`(() => {
+    const target = await runRelaunchPhase(
+      "dashboard_target",
+      () => waitFor(async () => selectMacDashboardTarget(
+        await jsonFetch(`http://127.0.0.1:${port}/json`), port,
+      ), MAX_STARTUP_MS, "relaunch dashboard target"),
+    );
+    dashboard = await runRelaunchPhase("dashboard_target", () => connectCdp(target));
+    await runRelaunchPhase(
+      "settings_bridge",
+      () => waitFor(
+        () => dashboard.evaluate('typeof globalThis.tibotattleDesktop?.openTraySettings === "function"'),
+        MAX_STARTUP_MS,
+        "relaunch settings bridge",
+      ),
+    );
+    await runRelaunchPhase(
+      "settings_bridge",
+      () => dashboard.evaluate('globalThis.tibotattleDesktop.openTraySettings()'),
+    );
+    const origin = await runRelaunchPhase(
+      "settings_target",
+      () => new URL(target.url).origin,
+    );
+    const settingsTarget = await runRelaunchPhase(
+      "settings_target",
+      () => waitFor(
+        () => findSettingsTarget(port, origin),
+        MAX_STARTUP_MS,
+        "relaunch tray settings target",
+      ),
+    );
+    settings = await runRelaunchPhase("settings_target", () => connectCdp(settingsTarget));
+    await runRelaunchPhase(
+      "tray_preference",
+      () => assertTraySettingsChoice(settings, expected),
+    );
+    const rendered = await runRelaunchPhase(
+      "tray_render",
+      () => waitFor(() => settings.evaluate(`(() => {
       const panel = document.querySelector('[data-settings-panel="tray"]');
       return panel?.hidden === false && document.querySelector("#tray-preset")?.value === ${JSON.stringify(expected.preset)}
         && document.querySelector("#tray-historyRange")?.value === ${JSON.stringify(expected.historyRange)}
         && document.querySelector("#tray-density")?.value === ${JSON.stringify(expected.density)};
-    })()`), MAX_OPERATION_MS, "relaunch tray panel rendered");
-    if (rendered !== true || JSON.stringify(await readMacSyntheticFixtureTray(fixture.settingsPath)) !== JSON.stringify(expected)) {
-      fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
-    }
-    settings.close(); settings = null; dashboard.close(); dashboard = null;
-    if (!child.kill("SIGUSR2")) fail("ELECTRON_MACOS_SMOKE_QUIT_SIGNAL_FAILED", "quit");
-    await withTimeout(once(child, "exit"), MAX_SHUTDOWN_MS, "relaunch clean quit");
-    await waitFor(() => descendantsOf(child.pid).length === 0, MAX_SHUTDOWN_MS, "relaunch companion cleanup");
-    if (child.signalCode !== null || child.exitCode !== 0) fail("ELECTRON_MACOS_SMOKE_CLEAN_QUIT_INVALID", "quit");
-    return true;
+    })()`), MAX_OPERATION_MS, "relaunch tray panel rendered"),
+    );
+    await runRelaunchPhase("tray_render", () => {
+      if (rendered !== true) fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
+    });
+    await runRelaunchPhase("fixture_persistence", async () => {
+      if (JSON.stringify(await readMacSyntheticFixtureTray(fixture.settingsPath))
+          !== JSON.stringify(expected)) {
+        fail("ELECTRON_MACOS_SMOKE_SETTINGS_FLOW_INVALID", "settings");
+      }
+    });
+    await runRelaunchPhase("tray_render", () => {
+      settings.close(); settings = null; dashboard.close(); dashboard = null;
+    });
+    return await cleanQuitMacSmokeChild(child, { label: "relaunch", relaunch: true });
   } finally {
     dashboard?.close(); settings?.close();
     if (child.exitCode === null && child.signalCode === null) {
@@ -2684,6 +2757,141 @@ function descendantsOf(parentPid) {
   }
 }
 
+export function macSmokeProcessAlive(
+  pid,
+  probe = (targetPid) => process.kill(targetPid, 0),
+) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    probe(pid);
+    return true;
+  } catch (error) {
+    // Permission and unknown probe failures cannot qualify a companion as
+    // stopped. Only the kernel's missing-process result is evidence of exit.
+    return error?.code !== "ESRCH";
+  }
+}
+
+export function observeMacSmokeChildExit(child, timeoutMs, label) {
+  let timer = null;
+  let settled = false;
+  let resolveWait;
+  let rejectWait;
+  const cleanup = () => {
+    clearTimeout(timer);
+    child.removeListener("exit", onExit);
+    child.removeListener("error", onError);
+  };
+  const settle = (callback, value) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    callback(value);
+  };
+  const onExit = () => settle(resolveWait, true);
+  const onError = (error) => settle(rejectWait, error);
+  const promise = new Promise((resolveWaitPromise, rejectWaitPromise) => {
+    resolveWait = resolveWaitPromise;
+    rejectWait = rejectWaitPromise;
+  });
+  // This keeps an error delivered between registration and the caller's
+  // awaited hand-off from becoming an unhandled rejection.
+  void promise.catch(() => {});
+  child.once("exit", onExit);
+  child.once("error", onError);
+  timer = setTimeout(
+    () => settle(rejectWait, new Error(`${label} timed out`)),
+    timeoutMs,
+  );
+  if (child.exitCode !== null || child.signalCode !== null) onExit();
+  return Object.freeze({
+    promise,
+    dispose() {
+      if (settled) return;
+      settled = true;
+      cleanup();
+    },
+  });
+}
+
+export function capturedMacSmokeDescendantPidsValid(pids) {
+  return Array.isArray(pids)
+    && pids.length > 0
+    && new Set(pids).size === pids.length
+    && pids.every((pid) => Number.isSafeInteger(pid) && pid > 0);
+}
+
+export function capturedMacSmokeDescendantPidsGone(
+  pids,
+  isAlive = macSmokeProcessAlive,
+) {
+  return capturedMacSmokeDescendantPidsValid(pids)
+    && typeof isAlive === "function"
+    && pids.every((pid) => isAlive(pid) === false);
+}
+
+function captureMacSmokeDescendantPids(child) {
+  const pids = descendantsOf(child?.pid);
+  if (!capturedMacSmokeDescendantPidsValid(pids)) {
+    fail("ELECTRON_MACOS_SMOKE_COMPANION_NOT_RUNNING", "quit");
+  }
+  return pids;
+}
+
+async function cleanQuitMacSmokeChild(child, {
+  label,
+  capturedDescendantPids = null,
+  relaunch = false,
+} = {}) {
+  const runStep = (relaunchFailureStage, operation) => relaunch
+    ? runRelaunchPhase(relaunchFailureStage, operation)
+    : operation();
+  await runStep("process_exit", () => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      fail("ELECTRON_MACOS_SMOKE_EXITED_BEFORE_QUIT", "quit");
+    }
+  });
+  const expectedDescendantPids = capturedDescendantPids ?? await runStep(
+    "companion_cleanup",
+    () => captureMacSmokeDescendantPids(child),
+  );
+  await runStep("companion_cleanup", () => {
+    if (!capturedMacSmokeDescendantPidsValid(expectedDescendantPids)) {
+      fail("ELECTRON_MACOS_SMOKE_COMPANION_NOT_RUNNING", "quit");
+    }
+  });
+  const exitObservation = observeMacSmokeChildExit(
+    child,
+    MAX_SHUTDOWN_MS,
+    `${label} clean quit`,
+  );
+  try {
+    await runStep("quit_signal", () => {
+      if (!child.kill("SIGUSR2")) {
+        fail("ELECTRON_MACOS_SMOKE_QUIT_SIGNAL_FAILED", "quit");
+      }
+    });
+  } catch (error) {
+    exitObservation.dispose();
+    throw error;
+  }
+  await runStep("process_exit", () => exitObservation.promise);
+  await runStep(
+    "companion_cleanup",
+    () => waitFor(
+      () => capturedMacSmokeDescendantPidsGone(expectedDescendantPids),
+      MAX_SHUTDOWN_MS,
+      `${label} companion cleanup`,
+    ),
+  );
+  await runStep("process_exit", () => {
+    if (child.signalCode !== null || child.exitCode !== 0) {
+      fail("ELECTRON_MACOS_SMOKE_CLEAN_QUIT_INVALID", "quit");
+    }
+  });
+  return true;
+}
+
 const SMOKE_PROGRESS_KEYS = new Set([
   "dashboard",
   "startupRefresh",
@@ -2716,6 +2924,7 @@ export function buildClosedReceipt({
   share = {},
   failureStage = null,
   failureReason = null,
+  relaunchFailureStage = null,
 } = {}) {
   const sourceIdentified = SOURCE_REVISION_PATTERN.test(sourceRevision ?? "");
   const artifactIdentified = artifactIdentityVerified === true
@@ -2740,6 +2949,10 @@ export function buildClosedReceipt({
       ? failureReason
       : "runtime_failed"))
     : null;
+  const normalizedRelaunchFailureStage = normalizedStatus === "failed"
+    && MACOS_SMOKE_RELAUNCH_FAILURE_STAGES.includes(relaunchFailureStage)
+    ? relaunchFailureStage
+    : null;
   return Object.freeze({
     schemaVersion: MACOS_SMOKE_SCHEMA_VERSION,
     status: normalizedStatus,
@@ -2757,6 +2970,7 @@ export function buildClosedReceipt({
     contentFree: true,
     failureStage: normalizedStage,
     failureReason: normalizedReason,
+    relaunchFailureStage: normalizedRelaunchFailureStage,
     startupRefresh: Object.freeze({
       requestCount: Number.isInteger(startupRefresh.requestCount)
         ? startupRefresh.requestCount
@@ -3142,19 +3356,14 @@ async function runSmoke(appPath, progress = {}, {
     cdp.close();
     cdp = null;
     stage = "quit";
-    if (child.exitCode !== null || child.signalCode !== null) {
-      fail("ELECTRON_MACOS_SMOKE_EXITED_BEFORE_QUIT", "quit");
-    }
-    if (!child.kill("SIGUSR2")) fail("ELECTRON_MACOS_SMOKE_QUIT_SIGNAL_FAILED", "quit");
-    await withTimeout(once(child, "exit"), MAX_SHUTDOWN_MS, "Electron clean quit");
-    await waitFor(
-      () => descendantsOf(child.pid).length === 0,
-      MAX_SHUTDOWN_MS,
-      "Electron companion cleanup",
-    );
-    if (child.signalCode !== null || child.exitCode !== 0) {
-      fail("ELECTRON_MACOS_SMOKE_CLEAN_QUIT_INVALID", "quit");
-    }
+    // Capture while the Electron parent still owns the companion. Once the
+    // parent exits, a surviving companion can be reparented and disappear
+    // from a PPID walk before the fresh-process persistence check begins.
+    const primaryDescendantPids = captureMacSmokeDescendantPids(child);
+    await cleanQuitMacSmokeChild(child, {
+      label: "Electron",
+      capturedDescendantPids: primaryDescendantPids,
+    });
     cleanQuit = true;
     stage = "settings";
     const relaunched = await assertTrayProcessRelaunch({ executable, appPath, environment, fixture, expected: trayBeforeRelaunch });
@@ -3248,6 +3457,7 @@ if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
         error,
         FAILURE_STAGES.has(error?.smokeStage) ? error.smokeStage : "launch",
       ),
+      relaunchFailureStage: error?.smokeRelaunchFailureStage,
       dashboard: progress.dashboard,
       parity: progress.parity,
       startupRefresh: progress.startupRefresh,
