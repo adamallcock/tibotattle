@@ -14,7 +14,41 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Latest completed native run: `7731a6e3` in
+Cutover focus as of 2026-09-08: freeze the tested feature set at `98a5256d`.
+Do not add cosmetic work, optional platform abstractions, or broader audits.
+Change only a reproduced cutover blocker or the smallest test needed to resolve
+one. The Mac daily-use tester is available; that is not full cutover readiness.
+
+1. Close the real native Mac -> signed Electron -> next signed Electron
+   installed rehearsal. Four signed private fixtures are prepared. Installation
+   approval remains pending; keep data/choice preservation, single ownership,
+   startup and credential continuity as the acceptance boundary.
+2. Resolve the current Linux native creation failure and execute the integrated
+   disposable Windows installer journey. Fix observed failures, then complete
+   required production credential/trust composition and installed updates.
+3. Complete one authorized hosted contribution rehearsal and explicit
+   accountless public-sample/overlapping-history decisions. Preserve accepted
+   automatic-sharing and persistent opt-out behavior throughout.
+4. Freeze release candidates, verify four-target installation/update evidence,
+   then request the concrete staged publication/activation decision.
+
+Planning estimate, not a release commitment: 1–3 focused working days for a Mac
+cutover candidate if migration reveals no major defect; approximately 1–2
+working weeks for the complete four-target cutover, conditional on platform
+access, trust material, activation decisions and no major new runtime defects.
+Re-estimate after the first installed migration and Windows installer results.
+
+Latest completed four-target run: `43c59fdd` in
+[run 34202605849](https://github.com/adamallcock/tibotattle/actions/runs/34202605849)
+passes both Mac builds and Windows packaged credential checks. Windows's new
+native PowerShell contract passes, but two portable contract cases fail before
+installation: relative NSIS targets were resolved into valid-looking Windows
+paths, and the template fixture assumed slash separators. The original failed
+run is preserved. Both repairs pass locally (19 tests, one native-only exclusion),
+and the installer remains unexecuted pending the next native run. Linux still
+fails its credential qualification step.
+
+The preceding direct Linux diagnostic run: `7731a6e3` in
 [run 34200413924](https://github.com/adamallcock/tibotattle/actions/runs/34200413924)
 passes both Macs and Windows. Linux compiles and packages, then refuses
 account-observation creation with `CREATE_MUTATION_UNAVAILABLE`. Both read
@@ -23,7 +57,10 @@ exists and is unlocked at that snapshot. The remaining failure lies inside
 the native pre-intent creation path. The five-second service-deadline fixture
 is later in the journey and has not yet executed. Its original failure log and
 source-bound fixed receipt remain preserved; the probe adds no product API or
-credential mutation. The preceding `bff275fb` run fails at the same creation
+credential mutation. Temporary fixed native error categories now identify the
+actual lease/read/collection boundary in the isolated test lane. Public failures
+and mutation safeguards remain the same. Remove this diagnostic seam after the
+concrete cause and its regression are verified. The preceding `bff275fb` run fails at the same creation
 boundary before this additional prerequisite evidence existed.
 
 The preceding `b103ef6d` run stopped at compilation because the timeout watchdog

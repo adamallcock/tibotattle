@@ -149,12 +149,14 @@ export function parseWindowsNsisLifecycleArguments(argv) {
 
 /** The special NSIS /D switch is final and receives a closed, space-free path. */
 export function buildWindowsNsisInstallArguments(installationRoot) {
-  const normalized = typeof installationRoot === "string"
-    ? win32.resolve(installationRoot)
-    : "";
-  if (!/^[A-Za-z]:\\(?:[A-Za-z0-9._-]+\\)*[A-Za-z0-9._-]+$/u.test(normalized)) {
+  // Validate before resolution: Windows would otherwise turn a relative
+  // target into a valid-looking path under the runner's current directory.
+  if (typeof installationRoot !== "string"
+      || !/^[A-Za-z]:\\(?:[A-Za-z0-9._-]+\\)*[A-Za-z0-9._-]+$/u.test(installationRoot)
+      || installationRoot.split("\\").some((part) => part === "." || part === "..")) {
     fail("INSTALL_ROOT_INVALID");
   }
+  const normalized = win32.resolve(installationRoot);
   return Object.freeze(["/S", `/D=${normalized}`]);
 }
 

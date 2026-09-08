@@ -97,13 +97,17 @@ test("NSIS command keeps /D final and rejects whitespace or quote-bearing instal
     "C:\\runner temp\\app",
     "C:\\runner\\quote\"\\app",
     "relative\\app",
+    "C:relative\\app",
+    "\\runner\\app",
+    "C:\\runner\\..\\app",
   ]) {
     assert.throws(() => buildWindowsNsisInstallArguments(path), /INSTALL_ROOT_INVALID/u);
   }
 });
 
 test("pinned NSIS source proves a silent install cannot start the app without force-run", async () => {
-  const packagePath = "/trusted/node_modules/app-builder-lib/package.json";
+  const packageRoot = resolve("trusted", "node_modules", "app-builder-lib");
+  const packagePath = join(packageRoot, "package.json");
   const installSection = [
     "!ifdef ONE_CLICK",
     "  !ifdef RUN_AFTER_FINISH",
@@ -138,8 +142,8 @@ test("pinned NSIS source proves a silent install cannot start the app without fo
     }),
     readText: async (path) => {
       if (path === packagePath) return JSON.stringify({ name: "app-builder-lib", version: "26.15.7" });
-      if (path.endsWith("templates/nsis/installSection.nsh")) return installSection;
-      if (path.endsWith("out/targets/nsis/NsisTarget.js")) return target;
+      if (path === join(packageRoot, "templates", "nsis", "installSection.nsh")) return installSection;
+      if (path === join(packageRoot, "out", "targets", "nsis", "NsisTarget.js")) return target;
       throw new Error("unexpected source");
     },
   }));
