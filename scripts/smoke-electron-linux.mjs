@@ -197,6 +197,63 @@ function wait(ms) {
   return new Promise((resolveWait) => setTimeout(resolveWait, ms));
 }
 
+function childHasExited(child) {
+  return child !== null && typeof child === "object"
+    && ((child.exitCode !== null && child.exitCode !== undefined)
+      || (child.signalCode !== null && child.signalCode !== undefined));
+}
+
+async function waitForSmokeChildExit(child, deadlineMs) {
+  if (childHasExited(child)) return true;
+  return new Promise((resolveWait) => {
+    let timer = null;
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      child.removeListener?.("exit", onExit);
+      child.removeListener?.("error", onError);
+      resolveWait(value);
+    };
+    const onExit = () => finish(true);
+    const onError = () => finish(false);
+    child.once?.("exit", onExit);
+    child.once?.("error", onError);
+    if (childHasExited(child)) {
+      finish(true);
+      return;
+    }
+    timer = setTimeout(() => finish(false), deadlineMs);
+  });
+}
+
+/**
+ * Stop only the owned Electron parent after a failed smoke journey. A forced
+ * stop never contributes the normal clean-quit proof; the caller decides
+ * whether a verified exit permits fixture cleanup.
+ */
+export async function terminateLinuxSmokeChild(child, {
+  graceMs = 2_000,
+  waitForExit = waitForSmokeChildExit,
+} = {}) {
+  if (!child || typeof child.kill !== "function" || typeof waitForExit !== "function"
+      || !Number.isSafeInteger(graceMs) || graceMs < 1) return false;
+  if (childHasExited(child)) return true;
+  try {
+    if (child.kill("SIGTERM") !== true) return false;
+  } catch {
+    return false;
+  }
+  if (await waitForExit(child, graceMs)) return true;
+  try {
+    if (child.kill("SIGKILL") !== true) return false;
+  } catch {
+    return false;
+  }
+  return waitForExit(child, graceMs);
+}
+
 function isLoopbackAddress(value) {
   const address = String(value ?? "").toLowerCase();
   const family = isIP(address);
@@ -985,12 +1042,8 @@ export function combineStartupRefreshEvidence(first, second) {
   });
 }
 
-export async function runSmoke() {
-  const containerContract = assertContainerContract();
-  const fixture = await createSyntheticHome();
-  const port = await freeTcpPort();
-  const binary = electronBinary();
-  const environment = {
+function defaultSmokeEnvironment({ fixture }) {
+  return {
     PATH: process.env.PATH,
     LANG: "C.UTF-8",
     HOME: fixture.home,
@@ -1011,17 +1064,78 @@ export async function runSmoke() {
     DISPLAY: process.env.DISPLAY,
     XAUTHORITY: process.env.XAUTHORITY,
   };
-  const child = spawn(binary, [
+}
+
+function defaultSmokeLaunchArguments({ fixture, port }) {
+  return [
     `--user-data-dir=${fixture.userData}`,
     `--remote-debugging-port=${port}`,
     "--remote-debugging-address=127.0.0.1",
     "--disable-gpu",
     ELECTRON_MAIN,
+  ];
+}
+
+async function defaultSmokeResultWriter(value) {
+  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+/**
+ * Run the established renderer/refresh/clean-quit proof with an injected
+ * fixture and ordinary Electron launch shape. The default remains the source
+ * checkout lane above; the narrow packaged candidate wrapper reuses this
+ * runner rather than duplicating its CDP and lifecycle assertions.
+ */
+export async function runSmoke({
+  afterRefresh = null,
+  binary = electronBinary(),
+  environmentFactory = defaultSmokeEnvironment,
+  fixtureFactory = createSyntheticHome,
+  launchArguments = defaultSmokeLaunchArguments,
+  qualification = "development-only",
+  sourceRevision = null,
+  writeResult = defaultSmokeResultWriter,
+} = {}) {
+  if (afterRefresh !== null && typeof afterRefresh !== "function"
+      || typeof binary !== "string" || binary.length === 0
+      || typeof environmentFactory !== "function" || typeof fixtureFactory !== "function"
+      || typeof launchArguments !== "function" || typeof writeResult !== "function"
+      || typeof qualification !== "string" || qualification.length === 0
+      || (sourceRevision !== null && !/^[0-9a-f]{40}$/u.test(sourceRevision))) {
+    fail("Electron Linux smoke runner options are invalid");
+  }
+  const containerContract = assertContainerContract();
+  if (sourceRevision !== null && sourceRevision !== containerContract.sourceRevision) {
+    fail("Electron Linux source revision does not match the container");
+  }
+  const selectedSourceRevision = sourceRevision ?? containerContract.sourceRevision;
+  const fixture = await fixtureFactory();
+  const port = await freeTcpPort();
+  let environment;
+  let argumentsForLaunch;
+  try {
+    environment = environmentFactory({ fixture, port });
+    argumentsForLaunch = launchArguments({ fixture, port });
+  } catch {
+    await rm(fixture.root, { recursive: true, force: true }).catch(() => {});
+    fail("Electron Linux smoke launch configuration is invalid");
+  }
+  if (!environment || typeof environment !== "object" || Array.isArray(environment)
+      || !Array.isArray(argumentsForLaunch)
+      || argumentsForLaunch.some((value) => typeof value !== "string" || value.length === 0)) {
+    await rm(fixture.root, { recursive: true, force: true }).catch(() => {});
+    fail("Electron Linux smoke launch configuration is invalid");
+  }
+  const child = spawn(binary, [
+    ...argumentsForLaunch,
   ], {
     cwd: REPOSITORY_ROOT,
     env: Object.fromEntries(Object.entries(environment).filter(([, value]) => value !== undefined)),
     stdio: ["ignore", "pipe", "pipe"],
   });
+  // Register before the first await so a failed spawn cannot become an
+  // unhandled EventEmitter error while all emitted bytes are discarded.
+  child.once?.("error", () => {});
   let stdoutProduced = false;
   let stderrProduced = false;
   child.stdout?.on("data", () => { stdoutProduced = true; });
@@ -1031,6 +1145,7 @@ export async function runSmoke() {
   let cdp = null;
   let refreshObserver = null;
   let forcedShutdown = false;
+  let cleanupConfirmed = false;
   try {
     if (!child.pid) fail("Electron did not provide a process id");
     const version = await waitFor(
@@ -1213,6 +1328,11 @@ export async function runSmoke() {
       initialStartupRefresh,
       reloadStartupRefresh,
     );
+    await afterRefresh?.({
+      dashboardOrigin: dashboardUrl.origin,
+      fixture,
+      startupRefresh,
+    });
     if (selectedPage.networkEvidenceInvalid()
         || observedNetworkUrls.some((url) => !isAllowedRendererNetworkURL(url, dashboardUrl.origin))) {
       fail("renderer attempted a non-loopback network request");
@@ -1267,12 +1387,13 @@ export async function runSmoke() {
       MAX_SHUTDOWN_MS,
       "companion cleanup",
     );
+    cleanupConfirmed = true;
     if (child.signalCode !== null || child.exitCode !== 0) {
       fail(child.signalCode === null
         ? `Electron exited with code ${child.exitCode}`
         : `Electron exited via ${child.signalCode}`);
     }
-    process.stdout.write(`${JSON.stringify({
+    const result = Object.freeze({
       status: "passed",
       electron: version.Browser,
       dashboardOrigin: dashboardUrl.origin,
@@ -1284,10 +1405,12 @@ export async function runSmoke() {
       networkBoundaryEvidence: containerContract.networkBoundaryEvidence,
       imagePlatform: process.env.USAGE_MONITOR_LINUX_IMAGE_PLATFORM,
       runtimeArchitecture: process.arch,
-      sourceRevision: containerContract.sourceRevision,
-      qualification: "development-only",
+      sourceRevision: selectedSourceRevision,
+      qualification,
       startupRefresh,
-    }, null, 2)}\n`);
+    });
+    await writeResult(result);
+    return result;
   } catch (error) {
     forcedShutdown = true;
     throw error;
@@ -1296,14 +1419,13 @@ export async function runSmoke() {
       page.refreshObserver?.dispose?.();
       page.cdp?.close?.();
     }
-    if (child.exitCode === null && child.signalCode === null) {
-      child.kill(forcedShutdown ? "SIGKILL" : "SIGTERM");
-      await Promise.race([once(child, "exit"), wait(2_000)]);
+    if (!childHasExited(child)) await terminateLinuxSmokeChild(child);
+    if (cleanupConfirmed) {
+      await rm(fixture.root, { recursive: true, force: true });
     }
-    await rm(fixture.root, { recursive: true, force: true });
     if (forcedShutdown) {
-      // Keep diagnostics content-free; the app itself owns all local state
-      // under the deleted fixture root. Do not forward either captured stream.
+      // Keep diagnostics content-free. The fixture is retained after a failed
+      // journey, and neither Electron nor companion output is forwarded.
       for (const diagnostic of fixedRuntimeFailureDiagnostics({
         stdoutProduced,
         stderrProduced,

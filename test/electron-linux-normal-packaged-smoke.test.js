@@ -1,0 +1,366 @@
+import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
+import { EventEmitter, once } from "node:events";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { PassThrough } from "node:stream";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import test from "node:test";
+
+import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
+import {
+  assertSyntheticCodexFixture,
+  classifyLinuxNormalPackagedObservation,
+  createLinuxNormalPackagedSmokeFixture,
+  normalPackagedSmokeEnvironment,
+  parseLinuxNormalPackagedSmokeArguments,
+  runLinuxNormalPackagedSmokeSession,
+  validateLinuxNormalPackagedSmokeMetadata,
+  verifyLinuxNormalPackagedSmokePackage,
+} from "../scripts/smoke-electron-linux-packaged.mjs";
+import { terminateLinuxSmokeChild } from "../scripts/smoke-electron-linux.mjs";
+
+const SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567";
+const ARTIFACT_SHA256 = "a".repeat(64);
+const APP_PATH = "/private/tmp/tibotattle-linux-unpacked/tibotattle";
+const FIXTURE_BINARY = resolve("test/fixtures/linux-packaged-codex/codex");
+
+function productionMetadata(sourceRevision = SOURCE_REVISION) {
+  return createProductionDistributionMetadata({
+    buildNumber: "12345",
+    sourceRevision,
+    target: "linux-x64",
+  });
+}
+
+function sourceCandidate({ sourceRevision = SOURCE_REVISION, version = "0.1.0" } = {}) {
+  return {
+    status: "production_source_staged",
+    target: "linux-x64",
+    sourceRevision,
+    version,
+    stagingDirectory: ".release-build/electron-production/linux-x64/app",
+    builderConfiguration: "apps/electron/electron-builder.production.config.cjs",
+    updaterEnabled: true,
+    signingRequired: false,
+    signingPerformed: false,
+    publishingPerformed: false,
+  };
+}
+
+function validInnerReceipt() {
+  return {
+    schemaVersion: "tibotattle-electron-linux-normal-packaged-smoke-v1",
+    status: "passed",
+    scope: "candidate_only",
+    target: "linux-x64",
+    execution: "packaged_electron_normal",
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+    availableServiceRefresh: "completed",
+    accountObservationLifecycle: "available",
+    unavailableServiceResponse: "bounded",
+    cleanup: "owned_apps_stopped",
+    productionReady: false,
+  };
+}
+
+function sessionChild() {
+  const child = new EventEmitter();
+  child.pid = 48_321;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  return child;
+}
+
+test("normal packaged Linux smoke accepts only closed outer and inner arguments", () => {
+  assert.deepEqual(parseLinuxNormalPackagedSmokeArguments([
+    "--app", APP_PATH,
+    "--staged-app", "/private/tmp/tibotattle-linux-stage/app",
+    "--source-candidate", "/private/tmp/tibotattle-linux-stage/production-source-candidate.json",
+    "--source-revision", SOURCE_REVISION,
+    "--receipt", "/private/tmp/tibotattle-linux-receipt.json",
+  ]), {
+    mode: "outer",
+    appPath: APP_PATH,
+    stagedAppPath: "/private/tmp/tibotattle-linux-stage/app",
+    sourceCandidatePath: "/private/tmp/tibotattle-linux-stage/production-source-candidate.json",
+    sourceRevision: SOURCE_REVISION,
+    receiptPath: "/private/tmp/tibotattle-linux-receipt.json",
+  });
+  assert.deepEqual(parseLinuxNormalPackagedSmokeArguments([
+    "--inside-isolated-session",
+    "--app", APP_PATH,
+    "--source-revision", SOURCE_REVISION,
+    "--artifact-digest", ARTIFACT_SHA256,
+  ]), {
+    mode: "inside",
+    appPath: APP_PATH,
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+  });
+  for (const invalid of [
+    ["--app", APP_PATH],
+    ["--inside-isolated-session", "--app", APP_PATH, "--source-revision", SOURCE_REVISION,
+      "--artifact-digest", ARTIFACT_SHA256, "--receipt", "/private/tmp/extra.json"],
+    ["--app", APP_PATH, "--app", APP_PATH,
+      "--staged-app", "/private/tmp/stage", "--source-candidate", "/private/tmp/source.json",
+      "--source-revision", SOURCE_REVISION, "--receipt", "/private/tmp/receipt.json"],
+  ]) {
+    assert.throws(() => parseLinuxNormalPackagedSmokeArguments(invalid), {
+      code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_ARGUMENT_INVALID",
+    });
+  }
+});
+
+test("normal packaged Linux smoke binds staged and archived stable metadata to the candidate", () => {
+  const metadata = productionMetadata();
+  const manifest = { version: "0.1.0", tibotattleDistribution: metadata };
+  const valid = validateLinuxNormalPackagedSmokeMetadata({
+    sourceCandidate: sourceCandidate(), stagedManifest: manifest, archiveManifest: structuredClone(manifest),
+    sourceRevision: SOURCE_REVISION,
+  });
+  assert.equal(valid.target, "linux-x64");
+  assert.equal(valid.sourceRevision, SOURCE_REVISION);
+  assert.throws(() => validateLinuxNormalPackagedSmokeMetadata({
+    sourceCandidate: sourceCandidate(), stagedManifest: manifest,
+    archiveManifest: { ...manifest, tibotattleDistribution: productionMetadata("fedcba9876543210fedcba9876543210fedcba98") },
+    sourceRevision: SOURCE_REVISION,
+  }), { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_PACKAGE_IDENTITY_INVALID" });
+  assert.throws(() => validateLinuxNormalPackagedSmokeMetadata({
+    sourceCandidate: { ...sourceCandidate(), target: "darwin-arm64" },
+    stagedManifest: manifest, archiveManifest: manifest, sourceRevision: SOURCE_REVISION,
+  }), { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_CANDIDATE_INVALID" });
+});
+
+test("normal packaged Linux smoke verifies the exact source, ASAR, executable, and native pair before launch", async () => {
+  const metadata = productionMetadata();
+  const manifest = { version: "0.1.0", tibotattleDistribution: metadata };
+  let nativeInputs = null;
+  const result = await verifyLinuxNormalPackagedSmokePackage({
+    appPath: APP_PATH,
+    stagedAppPath: "/private/tmp/tibotattle-linux-stage/app",
+    sourceCandidatePath: "/private/tmp/tibotattle-linux-stage/production-source-candidate.json",
+    sourceRevision: SOURCE_REVISION,
+  }, {
+    platform: "linux",
+    architecture: "x64",
+    readJsonFile: async (path) => path.endsWith("production-source-candidate.json")
+      ? sourceCandidate() : manifest,
+    readArchiveManifest: async () => structuredClone(manifest),
+    digest: async (path) => ({ bytes: path.endsWith("app.asar") ? 22 : 11, sha256: "b".repeat(64) }),
+    validateNative: async (inputs) => {
+      nativeInputs = inputs;
+      return { keytarSha256: "c".repeat(64), mutexSha256: "d".repeat(64) };
+    },
+  });
+  assert.deepEqual(nativeInputs, {
+    appPath: APP_PATH,
+    stagedAppPath: "/private/tmp/tibotattle-linux-stage/app",
+  });
+  assert.deepEqual(result, {
+    artifactSha256: "b".repeat(64),
+    executableSha256: "b".repeat(64),
+    native: { keytarSha256: "c".repeat(64), mutexSha256: "d".repeat(64) },
+    sourceRevision: SOURCE_REVISION,
+    target: "linux-x64",
+  });
+});
+
+test("normal packaged Linux smoke uses an image-owned codex fixture and strips inherited selectors", async () => {
+  assert.equal(await assertSyntheticCodexFixture({
+    metadata: async () => ({
+      isFile: () => true,
+      isSymbolicLink: () => false,
+      uid: 0,
+      mode: 0o100555,
+    }),
+  }), "/opt/tibotattle-linux-packaged-smoke/bin");
+  await assert.rejects(assertSyntheticCodexFixture({
+    metadata: async () => ({
+      isFile: () => true,
+      isSymbolicLink: () => false,
+      uid: 1000,
+      mode: 0o100755,
+    }),
+  }), { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_CONTAINER_INVALID" });
+
+  const fixture = {
+    claudeHome: "/private/tmp/private-claude",
+    codexHome: "/private/tmp/private-codex",
+    root: "/private/tmp/private-root",
+    unavailableBusAddress: "unix:path=/private/tmp/private-root/absent-session-bus",
+  };
+  const selected = normalPackagedSmokeEnvironment({
+    fixture,
+    service: "unavailable",
+    environment: {
+      PATH: "/usr/bin",
+      HOME: "/private/tmp/home",
+      XDG_CONFIG_HOME: "/private/tmp/config",
+      XDG_CACHE_HOME: "/private/tmp/cache",
+      XDG_DATA_HOME: "/private/tmp/data",
+      XDG_RUNTIME_DIR: "/private/tmp/runtime",
+      CODEX_BIN: "/private/tmp/ambient-codex",
+      ELECTRON_RUN_AS_NODE: "1",
+      USAGE_MONITOR_RESOURCE_ROOT: "/private/tmp/ambient-resource",
+      USAGE_MONITOR_STATE_ROOT: "/private/tmp/ambient-state",
+      USAGE_MONITOR_TEST_LANE: "ambient",
+      USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BROKER_IPC: "1",
+      XDG_STATE_HOME: "/private/tmp/ambient-xdg-state",
+    },
+  });
+  assert.equal(selected.PATH, "/opt/tibotattle-linux-packaged-smoke/bin:/usr/bin");
+  assert.equal(selected.DBUS_SESSION_BUS_ADDRESS, fixture.unavailableBusAddress);
+  assert.equal(selected.CODEX_HOME, fixture.codexHome);
+  assert.equal(selected.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL, "quit-v1");
+  for (const key of [
+    "CODEX_BIN", "ELECTRON_RUN_AS_NODE", "USAGE_MONITOR_RESOURCE_ROOT",
+    "USAGE_MONITOR_STATE_ROOT", "USAGE_MONITOR_TEST_LANE",
+    "USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BROKER_IPC", "XDG_STATE_HOME",
+  ]) assert.equal(Object.hasOwn(selected, key), false, key);
+});
+
+test("normal packaged Linux smoke fixture keeps raw input private and the app-server dependency image-owned", async () => {
+  const runtime = await mkdtemp(join(tmpdir(), "tibotattle-linux-normal-packaged-test-"));
+  try {
+    const fixture = await createLinuxNormalPackagedSmokeFixture({ runtimeDirectory: runtime });
+    assert.equal(Object.hasOwn(fixture, "binaryDirectory"), false);
+    assert.equal((await stat(fixture.root)).mode & 0o777, 0o700);
+    assert.equal((await stat(join(fixture.codexHome, "sessions", "synthetic-linux-smoke.jsonl"))).mode & 0o777, 0o600);
+    assert.equal((await stat(join(fixture.userData, "desktop-settings", "desktop-first-run-v1.json"))).mode & 0o777, 0o600);
+  } finally {
+    await rm(runtime, { recursive: true, force: true });
+  }
+});
+
+test("image fixture answers only the minimal synthetic app-server contract", async () => {
+  const version = spawnSync(FIXTURE_BINARY, ["--version"], { encoding: "utf8" });
+  assert.equal(version.status, 0);
+  assert.match(version.stdout, /^codex [0-9]+\.[0-9]+\.[0-9]+\n$/u);
+  const child = spawn(FIXTURE_BINARY, ["app-server"], { stdio: ["pipe", "pipe", "pipe"] });
+  const output = [];
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => output.push(...chunk.trim().split("\n").filter(Boolean)));
+  child.stdin.write(`${JSON.stringify({ id: 0, method: "initialize", params: {} })}\n`);
+  child.stdin.write(`${JSON.stringify({ id: 1, method: "account/read", params: {} })}\n`);
+  child.stdin.write(`${JSON.stringify({ id: 2, method: "account/rateLimits/read", params: {} })}\n`);
+  child.stdin.write(`${JSON.stringify({ id: 3, method: "account/usage/read", params: {} })}\n`);
+  await new Promise((resolveReady, rejectReady) => {
+    const timer = setTimeout(() => rejectReady(new Error("fixture response timeout")), 2_000);
+    const ready = () => {
+      if (output.length !== 4) return;
+      clearTimeout(timer);
+      resolveReady();
+    };
+    child.stdout.on("data", ready);
+    child.once("error", rejectReady);
+    ready();
+  });
+  child.stdin.end();
+  await once(child, "exit");
+  assert.equal(child.exitCode, 0);
+  const messages = output.map((line) => JSON.parse(line));
+  assert.deepEqual(messages.map((message) => message.id), [0, 1, 2, 3]);
+  assert.equal(messages[0].result !== undefined, true);
+  assert.equal(messages[1].result?.account?.planType, "pro");
+  assert.equal(messages[2].result?.rateLimits?.limitId, "codex");
+  assert.equal(Array.isArray(messages[3].result?.dailyUsageBuckets), true);
+});
+
+test("normal packaged Linux smoke keeps available and unavailable observation evidence distinct", () => {
+  const available = {
+    accountScopeMarker: {
+      accountScope: {
+        status: "available",
+        version: "openai-account-v1",
+        scopeId: `openai-account:v1:${"A".repeat(43)}`,
+      },
+    },
+  };
+  assert.equal(classifyLinuxNormalPackagedObservation(available, "available"), "available");
+  assert.equal(classifyLinuxNormalPackagedObservation({ accountScopeMarker: null }, "unavailable"), "unavailable");
+  assert.equal(classifyLinuxNormalPackagedObservation(available, "unavailable"), "invalid");
+  assert.equal(classifyLinuxNormalPackagedObservation({ accountScopeMarker: null }, "available"), "invalid");
+});
+
+test("forced Linux child cleanup never acts as the normal clean-quit proof", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  const signals = [];
+  child.kill = (signal) => {
+    signals.push(signal);
+    if (signal === "SIGTERM") {
+      child.exitCode = 143;
+      queueMicrotask(() => child.emit("exit", 143, null));
+    }
+    return true;
+  };
+  assert.equal(await terminateLinuxSmokeChild(child, { graceMs: 20 }), true);
+  assert.deepEqual(signals, ["SIGTERM"]);
+  assert.equal(child.exitCode, 143);
+});
+
+test("normal packaged Linux session timeout requires owned-session cleanup and remains failed", async () => {
+  const child = sessionChild();
+  let cleanupCalls = 0;
+  await assert.rejects(runLinuxNormalPackagedSmokeSession({
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+  }, {
+    appPath: APP_PATH,
+    deadlineMs: 1,
+    spawnSession: () => child,
+    stopSession: async (owned) => {
+      cleanupCalls += 1;
+      assert.equal(owned, child);
+      return true;
+    },
+  }), { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SESSION_DEADLINE_EXCEEDED" });
+  assert.equal(cleanupCalls, 1);
+  await assert.rejects(runLinuxNormalPackagedSmokeSession({
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+  }, {
+    appPath: APP_PATH,
+    deadlineMs: 1,
+    spawnSession: () => sessionChild(),
+    stopSession: async () => false,
+  }), { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SESSION_CLEANUP_UNCONFIRMED" });
+});
+
+test("normal packaged Linux session accepts only the fixed clean inner receipt", async () => {
+  const child = sessionChild();
+  queueMicrotask(() => {
+    child.stdout.write(`${JSON.stringify(validInnerReceipt())}\n`);
+    child.stdout.end();
+    child.stderr.end();
+    child.exitCode = 0;
+    child.emit("exit", 0, null);
+  });
+  const receipt = await runLinuxNormalPackagedSmokeSession({
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+  }, { appPath: APP_PATH, spawnSession: () => child });
+  assert.deepEqual(receipt, validInnerReceipt());
+});
+
+test("normal packaged Linux session retains a closed observation failure stage", async () => {
+  const child = sessionChild();
+  queueMicrotask(() => {
+    child.stdout.end();
+    child.stderr.write("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_OBSERVATION_UNAVAILABLE\n");
+    child.stderr.end();
+    child.exitCode = 1;
+    child.emit("exit", 1, null);
+  });
+  await assert.rejects(runLinuxNormalPackagedSmokeSession({
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+  }, { appPath: APP_PATH, spawnSession: () => child }), {
+    code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_OBSERVATION_UNAVAILABLE",
+  });
+});

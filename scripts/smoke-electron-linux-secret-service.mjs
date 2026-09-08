@@ -311,7 +311,7 @@ async function safeRegularFile(path, { maxBytes = MAX_ARTIFACT_BYTES } = {}) {
   return metadata;
 }
 
-async function digestRegularFile(path, options = {}) {
+export async function digestRegularFile(path, options = {}) {
   const metadata = await safeRegularFile(path, options);
   const handle = await open(path, "r");
   try {
@@ -369,7 +369,7 @@ async function digestPhysicalAsar(path, {
   }
 }
 
-async function readSafeJson(path) {
+export async function readSafeJson(path) {
   await safeRegularFile(path, { maxBytes: MAX_PACKAGE_RECEIPT_BYTES });
   let bytes;
   try {
@@ -496,7 +496,7 @@ export function selectedSessionEnvironment(environment) {
   return selected;
 }
 
-function boundedCapture(stream, limit = MAX_RECEIPT_BYTES) {
+export function boundedCapture(stream, limit = MAX_RECEIPT_BYTES) {
   const chunks = [];
   let total = 0;
   let overflow = false;
@@ -717,7 +717,7 @@ export async function runLinuxPackagedSecretServiceSession(identity, {
   return receipt;
 }
 
-async function reserveReceipt(path) {
+export async function reserveReceipt(path) {
   if (!absolutePath(path)) fail("ARGUMENT_INVALID");
   let parent;
   try {
@@ -738,7 +738,7 @@ async function reserveReceipt(path) {
   }
 }
 
-async function writeReceipt(handle, receipt) {
+export async function writeReceipt(handle, receipt) {
   try {
     await handle.writeFile(`${JSON.stringify(receipt)}\n`);
     await handle.sync();
