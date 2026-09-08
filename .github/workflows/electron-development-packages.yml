@@ -1,7 +1,19 @@
 name: Electron four-target development packages
+run-name: Electron ${{ inputs.qualification || 'full' }} checks (${{ github.ref_name }})
 
 on:
   workflow_dispatch:
+    inputs:
+      qualification:
+        description: Full qualification or an independent diagnostic runtime lane
+        required: true
+        default: full
+        type: choice
+        options:
+          - full
+          - windows-runtime
+          - linux-runtime
+          - native-runtime
   push:
     branches:
       - codex/unified-desktop-accountless
@@ -10,11 +22,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: electron-development-packages-${{ github.ref }}
+  group: electron-development-packages-${{ github.ref }}-${{ inputs.qualification || 'full' }}
   cancel-in-progress: false
 
 jobs:
   darwin-arm64:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full'
     name: darwin-arm64 unsigned development packages
     runs-on: macos-26
     timeout-minutes: 45
@@ -60,6 +73,7 @@ jobs:
           retention-days: 14
 
   darwin-x64:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full'
     name: darwin-x64 unsigned development packages
     runs-on: macos-26-intel
     timeout-minutes: 45
@@ -105,6 +119,7 @@ jobs:
           retention-days: 14
 
   win32-x64:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full'
     name: win32-x64 unsigned development packages
     runs-on: windows-2025
     timeout-minutes: 45
@@ -308,6 +323,7 @@ jobs:
   # This fresh hosted account never runs the credential qualification probes.
   # Normal credentials and preferences belong only to its disposable lifetime.
   win32-x64-normal-candidate:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full' || inputs.qualification == 'windows-runtime' || inputs.qualification == 'native-runtime'
     name: win32-x64 unsigned normal app journey
     runs-on: windows-2025
     timeout-minutes: 30
@@ -396,6 +412,7 @@ jobs:
   # disposable runner account lifetime. Run the installed lifecycle in a fresh
   # hosted account so it never shares the packaged-smoke record above.
   win32-x64-nsis-lifecycle:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full'
     name: win32-x64 unsigned NSIS installed lifecycle
     needs: win32-x64
     runs-on: windows-2025
@@ -464,6 +481,7 @@ jobs:
           retention-days: 14
 
   linux-x64:
+    if: github.event_name != 'workflow_dispatch' || inputs.qualification == 'full' || inputs.qualification == 'linux-runtime' || inputs.qualification == 'native-runtime'
     name: linux-x64 unsigned development packages
     runs-on: ubuntu-24.04
     timeout-minutes: 45

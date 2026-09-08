@@ -47,13 +47,19 @@ test("the exact embedded Linux proof accepts real TAP lines and refuses zero-exi
 test("packaged Linux image admits only the chosen app and verifier inputs", async () => {
   const dockerfile = await read("containers/electron-linux-packaged/Dockerfile");
   const copies = dockerfile.split("\n").filter((line) => line.startsWith("COPY "));
-  assert.equal(copies.length, 7);
+  assert.equal(copies.length, 11);
   assert.ok(copies.every((line) => !line.includes("--chown")));
   assert.equal(copies.filter((line) => line.startsWith("COPY scripts ")).length, 1);
   assert.equal(copies.filter((line) => line.startsWith("COPY .release-build/electron-dev/linux-x64/app ")).length, 1);
   assert.deepEqual(copies.filter((line) => line.startsWith("COPY test/")), [
     "COPY test/linux-credential-mutex-native.test.js ./test/linux-credential-mutex-native.test.js",
     "COPY test/linux-account-observation-credential-native.test.js ./test/linux-account-observation-credential-native.test.js",
+    "COPY test/fixtures/linux-packaged-codex/codex /opt/tibotattle-linux-packaged-smoke/bin/codex",
+  ]);
+  assert.deepEqual(copies.filter((line) => line.startsWith("COPY .release-build/electron-production/")), [
+    "COPY .release-build/electron-production/linux-x64/app ./.release-build/electron-production/linux-x64/app",
+    "COPY .release-build/electron-production/linux-x64/production-source-candidate.json ./.release-build/electron-production/linux-x64/production-source-candidate.json",
+    "COPY .release-build/electron-production/linux-x64/artifacts/linux-unpacked ./.release-build/electron-production/linux-x64/artifacts/linux-unpacked",
   ]);
   assert.deepEqual(copies.filter((line) => line.startsWith(
     "COPY .release-build/electron-dev/linux-x64/app/native/linux-credential-mutex/",
@@ -78,11 +84,15 @@ test("packaged Linux image admits only the chosen app and verifier inputs", asyn
   assert.deepEqual(recursive.sort(), [
     "!.release-build/electron-candidates/*/linux-x64/distribution/linux-unpacked/**",
     "!.release-build/electron-dev/linux-x64/app/**",
+    "!.release-build/electron-production/linux-x64/app/**",
+    "!.release-build/electron-production/linux-x64/artifacts/linux-unpacked/**",
     "!scripts/**",
   ]);
   assert.deepEqual(exceptions.filter((line) => line.startsWith("!test")), [
     "!test/", "!test/linux-credential-mutex-native.test.js",
     "!test/linux-account-observation-credential-native.test.js",
+    "!test/fixtures/", "!test/fixtures/linux-packaged-codex/",
+    "!test/fixtures/linux-packaged-codex/codex",
   ]);
   assert.ok(exceptions.every((line) => !/profile|\.git|\.usage-monitor|\.release-deps|darwin|win32/u.test(line)));
 });

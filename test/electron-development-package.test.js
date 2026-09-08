@@ -5,11 +5,36 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import { developmentBuildEnvironment, developmentPackagePlan, executableArchitecture, parseDevelopmentPackageArguments, writeDevelopmentHandoff } from "../scripts/package-electron-development.mjs";
 
 import { parseProductionCandidateArguments } from "../scripts/package-electron-production.mjs";
 
 const sourceRevision = "a".repeat(40);
+
+test("targeted diagnostic runs retain full push qualification and use the same runtime jobs", async () => {
+  const workflow = await readFile(new URL("../.github/workflows/electron-development-packages.yml", import.meta.url), "utf8");
+  assert.match(workflow, /qualification:\n\s+description:[^\n]+\n\s+required: true\n\s+default: full\n\s+type: choice/u);
+  assert.match(workflow, /group: electron-development-packages-\$\{\{ github.ref \}\}-\$\{\{ inputs.qualification \|\| 'full' \}\}/u);
+  assert.match(workflow, /cancel-in-progress: false/u);
+  const jobs = [...workflow.matchAll(/^  ([a-z][a-z0-9-]+):\n    if: ([^\n]+)$/gmu)];
+  const all = ["darwin-arm64", "darwin-x64", "win32-x64", "win32-x64-normal-candidate", "win32-x64-nsis-lifecycle", "linux-x64"];
+  assert.deepEqual(jobs.map(([, id]) => id), all);
+  const selected = (eventName, qualification) => jobs.filter(([, , expression]) => {
+    // These simple predicates use only syntax shared by JS and Actions.
+    assert.match(expression, /^[a-zA-Z0-9_.' =!|\-]+$/u);
+    return runInNewContext(expression, { github: { event_name: eventName }, inputs: { qualification } }, { timeout: 100 });
+  }).map(([, id]) => id);
+  for (const qualification of [undefined, "full", "windows-runtime", "linux-runtime", "native-runtime"]) {
+    assert.deepEqual(selected("push", qualification), all, "pushes always require every job");
+  }
+  assert.deepEqual(selected("workflow_dispatch", "full"), all);
+  assert.deepEqual(selected("workflow_dispatch", "windows-runtime"), ["win32-x64-normal-candidate"]);
+  assert.deepEqual(selected("workflow_dispatch", "linux-runtime"), ["linux-x64"]);
+  assert.deepEqual(selected("workflow_dispatch", "native-runtime"), ["win32-x64-normal-candidate", "linux-x64"]);
+  assert.deepEqual(selected("workflow_dispatch", "unknown"), []);
+  assert.match(workflow, /win32-x64-nsis-lifecycle:[\s\S]*?needs: win32-x64/u);
+});
 
 test("one development packaging contract covers the four actual target architectures", () => {
   for (const [target, flag, packages] of [
