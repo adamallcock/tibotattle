@@ -699,6 +699,40 @@ test("normal candidate runner preserves a package stage in its content-free rece
   assert.equal(receipt.packagedElectronExecutionVerified, false);
 });
 
+test("normal candidate receipt retains distinct terminal startup-gate causes", async () => {
+  for (const suffix of [
+    "LOCAL_STARTUP_REFRESH_GATE_ALREADY_RELEASED",
+    "LOCAL_STARTUP_REFRESH_GATE_EVALUATION_FAILED",
+  ]) {
+    const expected = `ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_${suffix}`;
+    let receipt = null;
+    await assert.rejects(runWindowsNormalCandidateSmoke(smokeOptions(), {
+      platform: "win32",
+      architecture: "x64",
+      environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: String.raw`C:\\runner\\temp` },
+      ensureReceiptParent: async () => {},
+      reserveReceipt: async () => ({
+        writeFile: async (value) => { receipt = JSON.parse(value); },
+        sync: async () => {},
+        close: async () => {},
+      }),
+      verifyPackage: async () => ({ sourceRevision: SOURCE_REVISION, artifactSha256: "a".repeat(64), executableSha256: "b".repeat(64) }),
+      createRoot: async () => String.raw`C:\\runner\\temp\\owned`,
+      prepareProfile: async () => ({ root: String.raw`C:\\runner\\temp\\owned\\profile` }),
+      seedCodexFixture: async () => {},
+      seedProfile: async () => ({ shareBackend: {} }),
+      assertProcessAbsence: async () => true,
+      installFirewall: async () => FIREWALL_RULE,
+      launchJourney: async () => { throw Object.assign(new Error("private failure"), { code: expected }); },
+      verifyOptOut: async () => true,
+      removeFirewall: async () => true,
+      removeProfile: async () => {},
+    }), { code: expected });
+    assert.equal(receipt.errorCode, expected);
+    assert.doesNotMatch(JSON.stringify(receipt), /private failure/u);
+  }
+});
+
 test("normal candidate launcher keeps only the private profile, unified mode, and quit-only control", async () => {
   const root = await mkdtemp(join(
     await realpath(tmpdir()),

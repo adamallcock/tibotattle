@@ -4480,10 +4480,20 @@ test("preload exposes platform-qualified one-shot startup gates and rejects host
   ]);
   await assertSmokeGate(windowsSmoke, "__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__");
 
+  const windowsNormalSmoke = runPreload({
+    platform: "win32",
+    control: "quit-v1",
+    lexicalProcess: true,
+  });
+  assert.deepEqual(Object.keys(windowsNormalSmoke.exposed), [
+    "__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__",
+    "tibotattleDesktop",
+  ]);
+  await assertSmokeGate(windowsNormalSmoke, "__TIBOTATTLE_ELECTRON_WINDOWS_SMOKE__");
+
   for (const options of [
     { platform: "linux", control: "quit-v1" },
     { platform: "linux", control: "windows-v1" },
-    { platform: "win32", control: "quit-v1" },
     { platform: "win32", control: "windows-v1" },
     { platform: "win32", control: undefined },
     {
