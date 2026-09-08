@@ -64,6 +64,7 @@ const SHELL_FILES = [
   "apps/electron/desktop-keychain-broker.js",
   "apps/electron/desktop-linux-secret-service-broker.js",
   "apps/electron/desktop-linux-secret-service.js",
+  "apps/electron/desktop-windows-account-observation-broker.js",
   "apps/electron/desktop-owned-downloads.js",
   "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
@@ -111,6 +112,8 @@ const SHELL_FILES = [
   "src/platform/linux-secret-service.js",
   "src/platform/windows-accountless-installation-credential.js",
   "src/platform/windows-credential-manager-probe.js",
+  "src/platform/windows-account-observation-broker.js",
+  "src/platform/windows-account-observation-credential.js",
 ];
 const KEYTAR = Object.freeze({
   "darwin-arm64": "node_modules/@github/keytar/prebuilds/darwin-arm64/keytar.node",

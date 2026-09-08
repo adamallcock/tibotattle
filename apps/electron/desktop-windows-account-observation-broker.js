@@ -3,9 +3,11 @@ import {
   WindowsAccountObservationBrokerError,
   decodeWindowsAccountObservationBrokerSecret,
   encodeWindowsAccountObservationBrokerSecret,
+} from "../../src/platform/index.js";
+import {
   isWindowsAccountObservationCredentialBackend,
   isWindowsAccountObservationCredentialError,
-} from "../../src/platform/index.js";
+} from "../../src/platform/windows-account-observation-credential.js";
 
 // This is a dormant composition seam. Only a later qualified Electron main
 // composition may attach it to FD4; the companion never loads Keytar itself.

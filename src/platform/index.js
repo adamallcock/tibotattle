@@ -65,14 +65,6 @@ export {
   windowsAccountObservationBrokerConfiguration,
 } from "./windows-account-observation-broker.js";
 export {
-  WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_INTEGRATION_STATUS,
-  WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_PRODUCTION_SAFE,
-  WindowsAccountObservationCredentialError,
-  createWindowsAccountObservationCredentialBackend,
-  isWindowsAccountObservationCredentialBackend,
-  isWindowsAccountObservationCredentialError,
-} from "./windows-account-observation-credential.js";
-export {
   assertWindowsQualificationResourceAuthority,
   createWindowsQualificationModeContext,
   isWindowsQualificationModeContext,

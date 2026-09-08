@@ -67,6 +67,7 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
       "src/local-collector-projection-off-main.js",
       "src/local-collector-projection-off-main-worker.js",
       "src/platform/linux-secret-service-broker.js",
+      "src/platform/windows-account-observation-broker.js",
       "src/local-archive-accounting-index.js",
       "src/replay-safe-accounting-cache.js",
       "src/local-unified-contribution-attribution.js",

@@ -90,6 +90,7 @@ export const ELECTRON_SHELL_FILES = Object.freeze([
   "apps/electron/desktop-keychain-broker.js",
   "apps/electron/desktop-linux-secret-service-broker.js",
   "apps/electron/desktop-linux-secret-service.js",
+  "apps/electron/desktop-windows-account-observation-broker.js",
   "apps/electron/desktop-owned-downloads.js",
   "apps/electron/desktop-menu.js",
   "apps/electron/desktop-lifecycle.js",
@@ -136,6 +137,8 @@ export const ELECTRON_SHELL_FILES = Object.freeze([
   "src/platform/linux-secret-service.js",
   "src/platform/windows-accountless-installation-credential.js",
   "src/platform/windows-credential-manager-probe.js",
+  "src/platform/windows-account-observation-broker.js",
+  "src/platform/windows-account-observation-credential.js",
 ]);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const INVENTORY_KINDS = new Set([

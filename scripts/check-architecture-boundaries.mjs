@@ -97,6 +97,9 @@ const REVIEWED_SOURCE_OWNER_PUBLIC_ENTRYPOINTS = new Set([
   "src/platform/linux-secret-service.js",
   "src/platform/linux-secret-service-broker.js",
   "src/platform/windows-accountless-installation-credential.js",
+  // Fixed main-process qualification facade; keep its native manager closure
+  // out of the shared index used by portable/local-only client exports.
+  "src/platform/windows-account-observation-credential.js",
   "src/platform/windows-credential-manager-probe.js",
   "src/platform/claude-callback-lifecycle.js",
   "src/platform/export-identity-keychain.js",
