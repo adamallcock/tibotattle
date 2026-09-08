@@ -101,9 +101,12 @@ launch remain the next gates. No source or native-only result establishes
 installed Linux readiness.
 
 The Linux production startup block remains intact. Automatic approval review
-refused replacing it before installed-artifact evidence existed. The next
-reviewable slice prepares the fixed FD3 and observation composition and an
-ordinary packaged launch harness behind that block. Enabling the narrowly
+refused replacing it before installed-artifact evidence existed and separately
+refused the dormant credential-composition patch, citing the earlier read-only
+assignment. No such source edits were applied. The next reviewable slice is
+the fixed FD3 and observation composition plus an ordinary packaged launch
+harness. The explicit approval question now covers those source changes and
+enabling the narrowly
 validated stable Linux/x64 candidate for an isolated, network-disabled CI run
 needs explicit approval; it must continue to refuse malformed metadata,
 other targets, rehearsal selections and mixed test/qualification lanes.
