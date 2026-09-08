@@ -38,6 +38,7 @@ const BLACKHOLE_CHILD_ENABLED = NATIVE_TEST_PREREQUISITES && BLACKHOLE_CHILD;
 const OPERATION_JOURNAL = "account-observation-operation-5-v1";
 const BLACKHOLE_CHILD_DEADLINE_MS = 9_000;
 const BLACKHOLE_MINIMUM_DELAY_MS = 4_000;
+const BLACKHOLE_CHILD_MAX_OUTPUT_BYTES = 4_096;
 const NESTED_CONTEXT_CHILD_DELAY_MS = 175;
 const NESTED_CONTEXT_CHILD_MINIMUM_DELAY_MS = 125;
 const NESTED_CONTEXT_CHILD_TEST_NAME = "native Linux account-observation nested test child waits";
@@ -91,6 +92,12 @@ const CREATE_NATIVE_UNAVAILABLE_PHASES = new Set([
   "COLLECTION_NULL",
   "COLLECTION_LOCKED",
   "COLLECTION_POST_CANCELLED",
+]);
+const BLACKHOLE_NATIVE_PHASES = new Set([
+  "WATCHDOG",
+  "LEASE",
+  "READ",
+  "DEADLINE",
 ]);
 const OPERATION_MAGIC = Buffer.from([
   0x54, 0x49, 0x42, 0x4f, 0x54, 0x41, 0x54, 0x54,
@@ -173,6 +180,31 @@ function closedNativeUnavailablePhase(error) {
     return CREATE_NATIVE_UNAVAILABLE_PHASES.has(phase) ? phase : null;
   } catch {
     return null;
+  }
+}
+
+function closedBlackholeNativePhase(error) {
+  const phase = closedNativeUnavailablePhase(error);
+  return BLACKHOLE_NATIVE_PHASES.has(phase) ? phase : "OTHER";
+}
+
+function extractBlackholeNativePhase(chunks, totalBytes, overflow) {
+  let output = null;
+  try {
+    if (overflow || !Number.isSafeInteger(totalBytes) || totalBytes < 0) return "OTHER";
+    output = Buffer.concat(chunks, totalBytes);
+    const markers = output.toString("utf8").split(/\r?\n/u).filter((line) => (
+      /^# LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_NATIVE_(WATCHDOG|LEASE|READ|DEADLINE|OTHER)$/u
+        .test(line)
+    ));
+    if (markers.length !== 1) return "OTHER";
+    const phase = markers[0].slice("# LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_NATIVE_".length);
+    return BLACKHOLE_NATIVE_PHASES.has(phase) || phase === "OTHER" ? phase : "OTHER";
+  } catch {
+    return "OTHER";
+  } finally {
+    if (output !== null) output.fill(0);
+    for (const chunk of chunks) chunk.fill(0);
   }
 }
 
@@ -386,6 +418,24 @@ test("native account-observation default collection probe has only closed non-mu
   assert.equal(defaultCollectionState({ spawnCommand: () => lockedReplies.shift() }), "LOCKED");
 });
 
+test("native account-observation blackhole child diagnostics accept one closed phase only", () => {
+  const accepted = Buffer.from("# LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_NATIVE_DEADLINE\n");
+  assert.equal(extractBlackholeNativePhase([accepted], accepted.byteLength, false), "DEADLINE");
+  assert.equal(accepted.every((byte) => byte === 0), true);
+
+  const repeated = Buffer.from([
+    "# LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_NATIVE_LEASE",
+    "# LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_NATIVE_READ",
+    "",
+  ].join("\n"));
+  assert.equal(extractBlackholeNativePhase([repeated], repeated.byteLength, false), "OTHER");
+  assert.equal(repeated.every((byte) => byte === 0), true);
+
+  const overflowed = Buffer.from("# LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_NATIVE_READ\n");
+  assert.equal(extractBlackholeNativePhase([overflowed], overflowed.byteLength, true), "OTHER");
+  assert.equal(overflowed.every((byte) => byte === 0), true);
+});
+
 async function assertMissing(path) {
   try {
     await lstat(path);
@@ -503,9 +553,25 @@ async function runBlackholeChild({ stateBase, sessionBusAddress }) {
         XDG_STATE_HOME: stateBase,
       }),
       shell: false,
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "ignore"],
     },
   );
+  const outputChunks = [];
+  let outputBytes = 0;
+  let outputOverflow = false;
+  child.stdout?.on("data", (chunk) => {
+    if (outputOverflow || !Buffer.isBuffer(chunk)) {
+      outputOverflow = true;
+      return;
+    }
+    if (outputBytes + chunk.byteLength > BLACKHOLE_CHILD_MAX_OUTPUT_BYTES) {
+      outputOverflow = true;
+      return;
+    }
+    const copy = Buffer.from(chunk);
+    outputChunks.push(copy);
+    outputBytes += copy.byteLength;
+  });
   const startedAt = Date.now();
   const outcome = await new Promise((resolve) => {
     let settled = false;
@@ -527,10 +593,11 @@ async function runBlackholeChild({ stateBase, sessionBusAddress }) {
     child.once("close", (code, signal) => finish({ code, signal }));
   });
   const elapsedMs = Date.now() - startedAt;
-  assert.equal(outcome.signal, null);
-  assert.equal(outcome.code, 0);
-  assert.ok(elapsedMs >= BLACKHOLE_MINIMUM_DELAY_MS);
-  assert.ok(elapsedMs < BLACKHOLE_CHILD_DEADLINE_MS);
+  return Object.freeze({
+    elapsedMs,
+    nativePhase: extractBlackholeNativePhase(outputChunks, outputBytes, outputOverflow),
+    outcome: Object.freeze(outcome),
+  });
 }
 
 test(NESTED_CONTEXT_CHILD_TEST_NAME, {
@@ -570,12 +637,21 @@ test("native Linux account-observation blackhole child clears a parent test cont
 
 test("native Linux account-observation child maps an unresponsive D-Bus service to unavailable", {
   skip: !BLACKHOLE_CHILD_ENABLED,
-}, async () => {
-  const backend = createLinuxAccountObservationCredentialBackend();
-  await assert.rejects(
-    backend.read(EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation),
-    nativeError("unavailable"),
-  );
+}, async (t) => {
+  const candidate = Buffer.alloc(32, 73);
+  let error = null;
+  try {
+    await createLinuxAccountObservationCredentialBackend().createIfMissing(
+      EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
+      candidate,
+    );
+  } catch (caught) {
+    error = caught;
+  } finally {
+    candidate.fill(0);
+  }
+  t.diagnostic(`LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_NATIVE_${closedBlackholeNativePhase(error)}`);
+  assert.equal(nativeError("unavailable")(error), true);
 });
 
 test("native Linux account-observation credential refuses an absent retained intent before creation, creates once, and reconciles only a matching digest intent", {
@@ -734,10 +810,17 @@ test("native Linux account-observation credential refuses an absent retained int
   const blackholePaths = await prepareOwnerPrivateState(blackholeStateBase);
   const blackholeBus = await startBlackholeSessionBus(blackholeSocket);
   try {
-    await runBlackholeChild({
+    const blackholeChild = await runBlackholeChild({
       stateBase: blackholeStateBase,
       sessionBusAddress: `unix:path=${blackholeSocket}`,
     });
+    t.diagnostic(
+      `LINUX_ACCOUNT_OBSERVATION_PHASE_SERVICE_DEADLINE_NATIVE_${blackholeChild.nativePhase}`,
+    );
+    assert.equal(blackholeChild.outcome.signal, null);
+    assert.equal(blackholeChild.outcome.code, 0);
+    assert.ok(blackholeChild.elapsedMs >= BLACKHOLE_MINIMUM_DELAY_MS);
+    assert.ok(blackholeChild.elapsedMs < BLACKHOLE_CHILD_DEADLINE_MS);
     assert.equal(blackholeBus.reachedMessagePhase(), true);
   } finally {
     await blackholeBus.close();
