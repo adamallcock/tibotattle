@@ -12,15 +12,24 @@ cost, quota windows, and trends. Local analysis works without an account and
 keeps session content on this Mac. Optional community contribution is a separate,
 content-free, consented feature.
 
-Current support is macOS 14 or later on Apple silicon. Windows and Linux are not
+Current support is macOS 14 or later on Apple silicon or Intel. Windows and Linux are not
 supported; see [platform support](./reference/platform-support.md).
 
 ## Install and first launch
 
-Download the current stable DMG from `https://tibotattle.com` or the latest
-GitHub release. For checksum and artifact checks, follow
-[verify-release.md](./verify-release.md). Move TiboTattle to Applications and
-launch it normally.
+Both Mac architectures use the same Homebrew command; the cask selects the
+matching installer and checksum:
+
+```bash
+brew install --cask adamallcock/tap/tibotattle
+```
+
+Alternatively, download the Apple silicon or Intel DMG for your Mac from
+[tibotattle.com](https://tibotattle.com/) or the
+[latest GitHub release](https://github.com/adamallcock/tibotattle/releases/latest).
+For checksum and artifact checks, follow [verify-release.md](./verify-release.md).
+Move TiboTattle to Applications and launch it normally. The published app
+includes its runtime; Node.js, pnpm and Xcode are needed only for development.
 
 On first launch, the app explains which local sources it may inspect. Those are
 the selected OpenAI Codex session and archived-session directories, the Codex

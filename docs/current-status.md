@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-07
+date: 2026-09-08
 type: status
 status: current
-source_commit: a4b6cbb4a236654ccc3f1c06c674481936057a2e
-observation_date: 2026-09-07
+source_commit: 080142f65918b7abdd6e346332cbad42bcb31fbc
+observation_date: 2026-09-08
 ---
 
 # Current product and release status
@@ -43,42 +43,53 @@ substitutes for SLSA build provenance. Follow
 
 ### Current presentation and live-data availability
 
-At 22:24 UTC on 2026-09-07, the guarded deployment published historical-model
-progress repair `a4b6cbb4a236654ccc3f1c06c674481936057a2e`. History now receives
-first use of the optional budget once per three-minute cycle; current work and
-publication keep their own priority slots. Account attempts rotate fairly, and
-new complete historical dates bypass the preview's ordinary refresh throttle.
-Existing valid graphs remain published. No migration or desktop change occurred.
-Natural scheduled runs advanced August 31 from 10 completed account results
-before deployment to 14 of 15 at 22:32 UTC. This proves resumed durable progress,
-not yet an expanded public date range or completed backfill. See the
-[repair receipt](./receipts/2026-09-07-historical-model-progress.md).
+The hosted incremental-refresh repair and owner progress detail are deployed at
+`080142f65918b7abdd6e346332cbad42bcb31fbc`. The final guarded deployment completed
+at 02:52:46 UTC on 2026-09-08, following core deployment `2e3fbdc7` and reviewed
+forward migrations 0050–0053. Both migration ledgers have no pending migrations;
+health, exact public asset bytes, public-route isolation and live public/admin
+rendering passed. See the
+[publication receipt](./receipts/2026-09-08-incremental-refresh-publication.md).
 
-On 2026-09-07 the owner-authorized migration 0049 and guarded deployment
-published source `7f541517a79b2746596d4a2e70754eec8716aa8f`, independently
-verified at 20:31 UTC. Public and admin aggregate/plan/model graphs, including
-Astra, render. Ordinary append-only v1 contributions preserve the published
-snapshot without age-only expiration or a new "last good" label; corrections,
-withdrawals and policy changes still invalidate it. All public allowance views
-now use one complete snapshot, separate from daily activity publication.
+Authorized published graphs remain visible while ordinary uploads and accepted
+same-device corrections prepare a successor. Erasure, withdrawal, changed
+authority and policy invalidation still take effect immediately; temporary
+request failure does not masquerade as confirmed invalidation. There is no new
+"last good" label or age-only expiry. All allowance modes use one complete
+published snapshot, separate from daily activity.
 
-Unchanged pure-v1 accounts reuse a strictly validated joined cache read before
-loading source vectors. Only changed accounts re-enter acquisition/calculation;
-compact cohort fits must still be recombined for medians. Existing bounded
-scheduler resource limits remain. Open public pages refresh automatically and retain
-the graph across transient request failure. The 839 Worker, 562 web and 207
-operations tests, real-D1 migration rehearsal and live source/assets/browser
-checks are recorded in the
-[deployment receipt](./receipts/2026-09-07-incremental-graph-publication.md).
+Historical work now reuses exact, prepared daily inputs across overlapping
+windows. Unaffected work can continue after unrelated contributions; unchanged
+current/daily lanes avoid raw reads, calculations and publication. Three natural
+core refreshes and a final-deployment refresh completed without exceptions,
+skipped unchanged current calculations and used one query for the daily lane.
+The final observed history pass used 225 queries in 17.027 seconds; the entire
+optional phase used 268 queries in 20.693 seconds, within the existing
+900-statement/40-second limits. This is bounded live evidence, not a throughput
+guarantee or a claim that all historical processing has finished.
 
-The public snapshot has 69 closed allowance dates through September 6; admin
-also includes September 7. Model history begins September 1 (Astra September 5)
-and historical backfill remains separate. Activity has 318 published days, 279
-with price data that can still be partial. This is not proof of complete
-historical recovery or a production throughput benchmark. Both 0.1.18 downloads,
-Intel Homebrew guidance, consent, retention and v1.1 staging remain unchanged.
-The earlier scheduler-starvation repair and owner-history recovery remain
-documented in the [prior recovery receipt](./receipts/2026-09-07-cache-publisher-repair.md).
+The owner Graph reconstruction panel independently shows requested/published
+generations, historical completion and reusable-source preparation. Live saved
+steps increased from 448 at 02:35 UTC to 2,048 at 03:00 UTC, while completed
+source days increased from 13 to 42. Historical completion still read 11 of 69
+days, with 14 of 15 accounts complete for August 27: preparation can advance
+before that account count changes. The original query-free progress contract
+remains compatible; the new detail is opt-in, owner-only and read-only. The
+user's selected refresh interval is preserved; 15 seconds is the request
+timeout, not the polling interval.
+
+The preserved public snapshot contains 69 allowance dates from July 1 through
+September 7. Identified GPT-5.5 and GPT-5.6 histories now cover August 28 through
+September 7; Astra covers September 5–7. Earlier backfill remains in progress,
+and unsupported or unstable estimates remain gaps. Public Aggregate, By plan
+and By model and the authenticated admin chart all render. Both 0.1.18 downloads,
+the architecture-selecting Homebrew cask, consent, retention and v1.1 staging
+remain unchanged. No desktop app was rebuilt or republished.
+
+Earlier milestones retain their dated boundaries in the
+[history repair](./receipts/2026-09-07-historical-model-progress.md),
+[initial incremental publication](./receipts/2026-09-07-incremental-graph-publication.md)
+and [scheduler recovery](./receipts/2026-09-07-cache-publisher-repair.md) receipts.
 
 ### Earlier verified public graph state
 
@@ -126,7 +137,9 @@ activating v1.1 transport. Applied migration files must not be rewritten.
 [PR #105](https://github.com/adamallcock/tibotattle/pull/105) repaired the
 authenticated admin module dependency and atomic weekly revision replacement.
 Its merged source `26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad` is the
-schema-compatible code rollback target, with both 0.1.18 website downloads.
+then-schema-compatible code rollback target, with both 0.1.18 website downloads.
+It is not a rollback target for the subsequently upgraded prepared-work protocol;
+current recovery requires the compatibility checks in the operations runbook.
 Public downloads and the optional hosted analyzer have separate gates.
 
 [PR #106](https://github.com/adamallcock/tibotattle/pull/106) deployed quota
@@ -216,8 +229,9 @@ and `deletionSafeRestoreReplay: true`; these flags do not prove every route.
 - **Supported:** macOS 14+ Apple silicon and Intel through the published 0.1.18
   artifacts and their independent update feeds.
 - **Not released or supported:** Windows, Linux or Electron.
-- Homebrew support remains Apple silicon only; the Intel DMG is distributed
-  directly through the website and GitHub release.
+- The live first-party Homebrew cask was rechecked on 2026-09-08: version 0.1.18
+  selects Apple silicon or Intel with each release's exact checksum. Both use
+  `brew install --cask adamallcock/tap/tibotattle`.
 
 The owner explicitly accepted the unavailable disposable-profile/manual Login
 Item matrix and formal physical Intel install/runtime/update/upload evidence

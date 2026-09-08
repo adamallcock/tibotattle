@@ -44,11 +44,16 @@ an exact local review and explicit send step.
 
 ## Install
 
-For a published macOS release, install the signed, notarized app with Homebrew:
+On macOS 14 or later, Apple silicon and Intel Macs use the same Homebrew command
+to install the signed, notarized app. The cask selects the matching installer
+and checksum automatically:
 
 ```bash
 brew install --cask adamallcock/tap/tibotattle
 ```
+
+The installed app includes its runtime; Node.js, pnpm and Xcode are not needed
+to use the release.
 
 Or, when the website exposes a current download, download the DMG from
 [tibotattle.com](https://tibotattle.com) or the
@@ -61,17 +66,21 @@ leave SBOM or provenance fields `null`; source-to-binary provenance is claimed
 only when a trusted hosted workflow generated/finalized and cryptographically
 verified the exact final bytes for that specific release. This repository is
 the source of truth for the public app and its releases. To build from source
-instead, follow the quick start below.
+instead, follow the developer setup below.
 See [Verify a TiboTattle release](docs/verify-release.md) to check the downloaded
 bytes, Apple signature and notarization, and any non-null release-specific
 GitHub provenance evidence yourself.
 
-## Quick start (macOS, Apple Silicon)
+## Developer setup (Apple silicon build host)
 
 Requirements: macOS 14 or later on arm64, Node.js ≥ 22.13 for the repository tooling,
 [pnpm](https://pnpm.io) 11, and the Xcode command-line tools. The app-bundle
 build itself requires exactly Node v26.2.0 on macOS arm64: it fails on any
 other runtime rather than producing an unverifiable bundle.
+These are source-build requirements, not restrictions on the published Intel
+app. The same pinned Apple silicon builder can target Intel with a separately
+verified x64 runtime; see the
+[native developer build](apps/macos/README.md#developer-build).
 
 The root workspace uses pnpm; the Worker keeps its own npm lockfile, which is
 needed only for hosted-service checks and the full gates:

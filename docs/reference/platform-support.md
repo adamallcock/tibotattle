@@ -79,8 +79,11 @@ record private artifact qualification, not final stable publication. The waiver
 does not authorize relabeling those candidates as stable, fabricating a v2
 manual receipt, ignoring data-loss or integrity failures, weakening native
 signing/updater checks, or approving unexpected automatic Keychain prompts.
-Future releases must apply their normal gates unless separately decided; no
-new Homebrew Intel support is declared here.
+Future releases must apply their normal gates unless separately decided.
+The published [first-party cask](https://github.com/adamallcock/homebrew-tap/blob/main/Casks/tibotattle.rb)
+selects the stable Apple silicon or Intel installer and its own checksum with
+the same `brew install --cask adamallcock/tap/tibotattle` command. This does not
+replace either artifact's independent native-trust or update-feed requirements.
 
 ## Windows
 
