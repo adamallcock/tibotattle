@@ -35,6 +35,7 @@ import {
   sampleTimerAndControlPlaneConcurrently,
   waitForLaunchGate,
   waitFor,
+  waitForUsageParitySnapshot,
   verifyPackagedArtifactIdentity,
   usageParitySnapshotValid,
 } from "../scripts/qa-electron-macos-real-history.mjs";
@@ -1557,6 +1558,34 @@ test("real-history parity helpers reject blank model metrics, hidden advanced mo
     }, localHealth),
     false,
   );
+});
+
+test("real-history Usage parity polls from an incomplete view to the strict terminal view", async () => {
+  const qualifying = {
+    route: "#accounting",
+    pageVisible: true,
+    periodCount: 4,
+    summaryCardCount: 4,
+    tokenCountRows: 1,
+    costContributionRows: 1,
+    modelIdentityRows: 1,
+    meaningfulTokenRows: 1,
+    meaningfulCostRows: 1,
+    meaningfulModelRows: 1,
+    meaningfulModelMetricCells: 2,
+    priceCoverage: true,
+    advancedModuleShellCount: 3,
+    advancedModulesExplicit: true,
+    advancedModulesReady: true,
+  };
+  const snapshots = [
+    { ...qualifying, meaningfulModelMetricCells: 0, advancedModulesReady: false },
+    qualifying,
+  ];
+  let reads = 0;
+  const result = await waitForUsageParitySnapshot(async () => snapshots[reads++]);
+  assert.deepEqual(result, qualifying);
+  assert.equal(reads, 2);
 });
 
 test("community service gate accepts only exact local or production states", () => {

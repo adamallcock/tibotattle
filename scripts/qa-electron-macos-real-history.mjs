@@ -2370,6 +2370,16 @@ export function usageParitySnapshotValid(snapshot) {
     && snapshot?.advancedModulesReady === true;
 }
 
+// The overview can be populated before the accounting route has finished
+// rendering its detailed rows. Keep the existing bounded UI operation alive
+// until the complete, strict parity snapshot is available.
+export async function waitForUsageParitySnapshot(readSnapshot) {
+  return waitFor(async () => {
+    const snapshot = await readSnapshot();
+    return usageParitySnapshotValid(snapshot) ? snapshot : null;
+  }, REAL_HISTORY_QA_TIMEOUTS.uiMs, "real-history Usage parity");
+}
+
 // The QA lane has two valid, deliberately disjoint service states.  A local
 // test app must expose an exact all-disabled capability set; a production
 // service proof must expose the complete enabled set and a successful bounded
@@ -2463,7 +2473,9 @@ export function localQaCommunityParitySnapshotValid(
 }
 
 async function assertUsage(session) {
-  const usage = await waitFor(async () => session.cdp.evaluate(`(() => {
+  let usage;
+  try {
+    usage = await waitForUsageParitySnapshot(async () => session.cdp.evaluate(`(() => {
     const visible = ${visibleInRenderer.toString()};
     const positiveNumber = (value) => {
       const matches = String(value ?? '').match(/(?:^|[^0-9])([1-9][0-9]*(?:[.,][0-9]+)?|0\\.[0-9]+)/u);
@@ -2520,7 +2532,10 @@ async function assertUsage(session) {
       advancedModulesReady: advanced.length === 3 && advanced.every((item) =>
         item.present && item.visible && item.terminalEvidence),
     };
-  })()`), REAL_HISTORY_QA_TIMEOUTS.uiMs, "real-history Usage parity");
+    })()`));
+  } catch {
+    fail("REAL_HISTORY_QA_USAGE_INVALID", "parity", "usage_invalid");
+  }
   const valid = usageParitySnapshotValid(usage);
   if (!valid) fail("REAL_HISTORY_QA_USAGE_INVALID", "parity", "usage_invalid");
   return Object.freeze({
