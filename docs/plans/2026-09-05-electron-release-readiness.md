@@ -14,17 +14,18 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Current gate: all four development packages pass at `82cd7a1f` in
-[run 34187627525](https://github.com/adamallcock/tibotattle/actions/runs/34187627525).
-The downloaded Windows and Linux packages match their content-free runtime
-receipts. Windows proves both credential channels and retained records in new
-children; Linux proves native default-state setup and packaged Secret Service
-first launch. These do not establish production selection, installed lifecycle,
-or release readiness. The next source integrates the Windows companion's
-parent-owned observation selector and Linux fixed-installation-record recovery.
-The daily Mac launcher still selects verified `1f74bbb6`; the newer `e2c4a784`
-app passes full copied-history qualification, while its separate synthetic
-restart test needs a readiness-order correction before promotion.
+Current gate: all four development packages pass at `de8965d5` in
+[run 34189342330](https://github.com/adamallcock/tibotattle/actions/runs/34189342330).
+The downloaded Windows and Linux apps, distributions and launchers match their
+receipts. Linux's fixed-record v2 recovery compiles and passes native tests;
+Windows passes both credential channels and retained records in new children.
+Production selection, installed lifecycle and release remain separate gates.
+The newer frozen Mac app `e2c4a784` passes full copied-history refresh and,
+with independently reviewed harness fixes, synthetic tray/settings restart and
+copied-history cancellation/retry. A separate copied-history relaunch run fails
+a startup control-plane request at the existing three-second ceiling. Its
+receipt is preserved and the stall is being investigated. The daily launcher
+therefore still selects verified `1f74bbb6`.
 
 The earlier all-four development packaging baseline passes at
 `f26146aaf7fe34845ed7192ae0100e88b9d9b660` in
@@ -214,15 +215,30 @@ endpoints pass 20 active samples each with p95 1 ms; their maxima are 455 and
 Cancellation mode separately accepts both cancel requests and a new refresh
 on retry, but the overall run fails its timer gate; its original receipt is
 preserved. The sampler remains active across cancellation and the retry's
-reset elapsed counter, so generation-scoped sampling needs investigation before
-this can qualify cancellation end to end. Copied-history relaunch is a separate
-mode. The fresh
-synthetic test passes initial settings, persisted controls, and tray editing,
+reset elapsed counter; that run alone cannot qualify cancellation end to end.
+Copied-history relaunch is a separate mode. The fresh synthetic test passes initial settings, persisted controls, and tray editing,
 but its restart fails at `settings_target`. Review finds the test invokes the
 settings bridge before lifecycle startup finishes; the first-launch test already
-waits for the app-owned rendered-ready marker. The proposed correction uses
+waits for the app-owned rendered-ready marker. The correction uses
 that same predicate before the one relaunch invocation, without retries or
-changed deadlines. The failed receipt is preserved; launcher promotion waits.
+changed deadlines. The failed receipt is preserved. The correction at
+`d4aa4bee` passes all 31 smoke contracts and a fresh native synthetic run against
+identical `e2c4a784` bytes, including tray process relaunch and clean quit. The
+rendered dashboard/tray captures are inspected, with separate harness provenance.
+
+The cancellation sampler is subsequently bounded to its initial refresh at
+`985459c3`. It stops as soon the unchanged four-distinct-values/three-second
+span is demonstrated, refuses decreasing counters, and discards CDP snapshots
+that resolve after cancellation closes that sampling window. No extra status
+poll, delayed cancel, timeout change or product behavior is introduced. All
+33 focused contracts and independent review pass. A fresh native cancel/retry
+run against the same app passes: advancing timer, 20 active samples per
+endpoint at p95 1 ms/max 441 ms, acknowledged cancellation, accepted retry with
+a new refresh identity, second cancellation, and clean quit. A separate original
+harness relaunch run fails during its first refresh: one request exceeds the
+3,000 ms per-request ceiling (serialized as the bounded 3,001 marker), although
+refresh later succeeds. That failure remains preserved; it does not qualify
+relaunch or clean quit. Launcher promotion waits for diagnosis of this stall.
 
 The Windows production observation selector at `8789b50c` now accepts only the
 explicit parent-owned read/create IPC adapter in the accountless companion.
@@ -239,8 +255,15 @@ Recovery-state tests cover interrupted create/delete and malformed, mismatched,
 or unsafe residues. These model on-disk interruption states, not actual power
 loss. All 120 portable foundation tests pass with six expected native exclusions,
 plus 36 packaging tests with two optional artifact exclusions and architecture
-checks. Native compilation and recovery execution require the next CI run.
-Linux's narrow observation adapter and final production composition remain open.
+checks. Native compilation and recovery execution pass at `de8965d5` in run
+`34189342330`, followed by isolated default-state and packaged Secret Service
+journeys. The downloaded Linux ASAR is
+`ab8a64210660710fbe474477278400360f36a2c928555729902f8c0eb18466ca`;
+Windows ASAR is
+`f61fa088aa9669945216c865cc095dd11b12ba9174624d962916b2c61a2de8cd`.
+Both independently match package/smoke receipts; each target's two distributions
+and three launcher/handoff files also match sizes and hashes. Linux's narrow
+observation adapter and final production composition remain open.
 
 The accountless production companion profile is now integrated at `b3643991`.
 It requires the exact production mode/origin and a connected private IPC
@@ -331,9 +354,9 @@ present; the external Codex navigation postcondition remains unqualified.
 | Workstream | Remaining work | Required demonstration |
 | --- | --- | --- |
 | 1. Product and background parity | Finish a fixed page/action matrix against native 0.1.18: overview, allowance, trends, usage/cost/cache, community, settings/about and tray. Compare accounting, quota, refresh, retry/cancel, persistence and relevant hosted/admin behavior on the same evidence. Record intentional visual differences. | Exact packaged candidate passes journeys, with no unexplained data/behavior differences or unresolved blocking interaction defects. Cold, active-refresh and recovery behavior remain usable. |
-| 2. Native Mac handover | Implement production state/credential migration, stable app identity, exclusive writer ownership and old login-item handover. Preserve history, identity salt, settings and sharing choices; test interrupted migration and recovery. | Supported native predecessor upgrades to signed Electron without loss, duplicate writers/uploads or reset choices; restart and interrupted migration recover. Cover both Mac architectures. A copied development profile does not satisfy this gate. |
-| 3. Accountless contributions | Implement the reviewed ownership/schema bridge; connect enrollment, private credentials, authorization and the existing encrypted upload pipeline. Preserve old social clients. Complete disclosure/reminder delivery and production activation controls. | Fresh automatic sharing; three actual notices for existing undecided installs; persistent explicit opt-out; usage/quota linkage across provider/account changes; deduplicated lost-response retries; bounded abuse; revocation/expiry and no unexpected public aggregate admission. Test first against disposable synthetic Worker databases, then an authorized controlled hosted rehearsal. |
-| 4. Production packaging and updates | Turn the four-target development pipeline into one production pipeline: final app identity, signing/trust, compatible pinned updater, architecture-correct feeds, protected release metadata and safe interrupted-update handling. | A signed/trusted Electron candidate updates to a subsequent signed/trusted Electron candidate on each claimed target. Installers, update payloads, checksums and support/download metadata identify the same frozen source/version. |
+| 2. Native Mac handover | Exercise the prepared signed private handover installers against the supported native predecessor after installation authorization. Verify the implemented migration, exclusive ownership, login-item handover, silent credential continuity and interrupted recovery on both Mac architectures. | Supported native predecessor upgrades to signed Electron without loss, duplicate writers/uploads or reset choices; restart and interrupted migration recover. Cover both Mac architectures. A copied development profile does not satisfy this gate. |
+| 3. Accountless contributions | Complete production platform credential selection and an authorized controlled hosted rehearsal of the locally verified enrollment, encrypted upload, renewal, replay and opt-out paths. Resolve public sample admission and overlapping-history policy; verify rendered production disclosures and three-notice delivery. | Fresh automatic sharing; three actual notices for existing undecided installs; persistent explicit opt-out; usage/quota linkage across provider/account changes; deduplicated lost-response retries; bounded abuse; revocation/expiry and no unexpected public aggregate admission. Test first against disposable synthetic Worker databases, then an authorized controlled hosted rehearsal. |
+| 4. Production packaging and updates | Extend the prepared Mac private signing/update rehearsal to Windows and Linux production trust/finalization; verify installed current-to-next updates and interruption on each claimed target. Keep final identity, feeds, release metadata and payloads bound to one source/version. | A signed/trusted Electron candidate updates to a subsequent signed/trusted Electron candidate on each claimed target. Installers, update payloads, checksums and support/download metadata identify the same frozen source/version. |
 | 5. Platform runtime qualification | Finish Windows/Linux production adapter composition where still gated. Exercise actual credentials, filesystem permissions, tray, notifications, login startup, sleep/resume, install/upgrade/uninstall and recovery on declared environments. | Reproducible native runtime/lifecycle receipts for Apple Silicon, Intel, Windows x64 and the explicitly supported Linux environment(s). A build or container pass alone is insufficient. |
 | 6. Rollout and native retirement | Integrate through one source/release line; prepare compatible backend rollout, tester cohorts, support/privacy copy, recovery instructions and a defined observation window. Retain long-tail native migration access. | Controlled rollout succeeds, subsequent Electron update succeeds, all advertised targets qualify, and the observation/recovery gate passes before the active native feature/build lane retires. |
 
