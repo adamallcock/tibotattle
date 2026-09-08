@@ -34,8 +34,10 @@ import {
   installWindowsSmokeControl,
   installWindowsSmokeControlForTest,
   launchElectronShell,
+  createLinuxSmokeCompanionProcessObserver,
   readAccountlessHostedRehearsal,
   readProductionDistribution,
+  ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX,
   MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
 } from "../main.js";
 import { createProductionDistributionMetadata } from "../desktop-updater.js";
@@ -1424,6 +1426,138 @@ test("companion supervisor settles immediately when its child exits before ready
     hasChild: false,
     origin: null,
   });
+});
+
+test("companion lifecycle observer projects only closed start and exit states", async () => {
+  const child = new FakeChild();
+  const events = [];
+  const supervisor = createCompanionSupervisor({
+    spawnChild: () => child,
+    onChildLifecycleEvent(value) { events.push(value); },
+    startupTimeoutMs: 1_000,
+    shutdownTimeoutMs: 1_000,
+  });
+  const starting = supervisor.start();
+  assert.deepEqual(events, [{
+    event: "started",
+    phase: "starting",
+    outcome: null,
+  }]);
+  child.stdout.emit("data", "USAGE_MONITOR_READY http://127.0.0.1:4567/\n");
+  await starting;
+  child.emit("exit", null, "SIGSEGV");
+  assert.deepEqual(events, [
+    { event: "started", phase: "starting", outcome: null },
+    { event: "exited", phase: "ready", outcome: "signal_segv" },
+  ]);
+  assert.equal(events.every((value) => Object.isFrozen(value)), true);
+  assert.equal(supervisor.state.state, "stopped");
+});
+
+test("companion lifecycle observer retains fixed exit outcomes while starting", async () => {
+  for (const [exitCode, signalCode, outcome] of [
+    [0, null, "exit_zero"],
+    [1, null, "exit_nonzero"],
+    [null, "SIGABRT", "signal_abrt"],
+    [null, "SIGSEGV", "signal_segv"],
+    [null, "SIGKILL", "signal_kill"],
+    [null, "SIGTERM", "signal_term"],
+    [null, "SIGUSR1", "signal_other"],
+  ]) {
+    const child = new FakeChild();
+    const events = [];
+    const supervisor = createCompanionSupervisor({
+      spawnChild: () => child,
+      onChildLifecycleEvent(value) { events.push(value); },
+      startupTimeoutMs: 1_000,
+      shutdownTimeoutMs: 1_000,
+    });
+    const starting = supervisor.start();
+    child.emit("exit", exitCode, signalCode);
+    await assert.rejects(starting, errorCode("companion_exit_before_ready"));
+    assert.deepEqual(events, [
+      { event: "started", phase: "starting", outcome: null },
+      { event: "exited", phase: "starting", outcome },
+    ]);
+  }
+});
+
+test("companion lifecycle observer marks quiet owned shutdown and cannot alter it", async () => {
+  const child = new FakeChild();
+  const events = [];
+  const supervisor = createCompanionSupervisor({
+    spawnChild: () => child,
+    onChildLifecycleEvent(value) { events.push(value); },
+    startupTimeoutMs: 1_000,
+    shutdownTimeoutMs: 1_000,
+  });
+  const starting = supervisor.start();
+  child.stdout.emit("data", "USAGE_MONITOR_READY http://127.0.0.1:4567/\n");
+  await starting;
+  const stopping = supervisor.stop();
+  child.emit("exit", 0, null);
+  await stopping;
+  assert.deepEqual(events, [
+    { event: "started", phase: "starting", outcome: null },
+    { event: "exited", phase: "stopping", outcome: "exit_zero" },
+  ]);
+  assert.equal(supervisor.state.state, "stopped");
+
+  const throwingChild = new FakeChild();
+  const throwingSupervisor = createCompanionSupervisor({
+    spawnChild: () => throwingChild,
+    onChildLifecycleEvent() { throw new Error("observer failure"); },
+    startupTimeoutMs: 1_000,
+    shutdownTimeoutMs: 1_000,
+  });
+  const throwingStart = throwingSupervisor.start();
+  throwingChild.stdout.emit("data", "USAGE_MONITOR_READY http://127.0.0.1:4568/\n");
+  await throwingStart;
+  const throwingStop = throwingSupervisor.stop();
+  throwingChild.emit("exit", 0, null);
+  await throwingStop;
+  assert.equal(throwingSupervisor.state.state, "stopped");
+});
+
+test("Linux companion lifecycle diagnostic is scoped to the normal quit smoke marker", () => {
+  const writes = [];
+  const observer = createLinuxSmokeCompanionProcessObserver({
+    environment: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1" },
+    platform: "linux",
+    architecture: "x64",
+    writeDiagnostic(value) { writes.push(value); },
+  });
+  assert.equal(typeof observer, "function");
+  observer({ event: "started", phase: "starting", outcome: null });
+  observer({ event: "exited", phase: "ready", outcome: "signal_segv" });
+  observer({ event: "exited", phase: "ready", outcome: "not-closed" });
+  observer({ event: "started", phase: "starting", outcome: null, private: "must-not-write" });
+  assert.deepEqual(writes, [
+    `${ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX}{"event":"started","phase":"starting","outcome":null}\n`,
+    `${ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX}{"event":"exited","phase":"ready","outcome":"signal_segv"}\n`,
+  ]);
+
+  for (const options of [
+    { environment: {} },
+    { environment: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "other-v1" } },
+    {
+      environment: {
+        USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1",
+        USAGE_MONITOR_TEST_LANE: undefined,
+      },
+    },
+    { environment: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1" }, platform: "darwin" },
+    { environment: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1" }, architecture: "arm64" },
+  ]) {
+    const blocked = createLinuxSmokeCompanionProcessObserver({
+      platform: "linux",
+      architecture: "x64",
+      writeDiagnostic(value) { writes.push(value); },
+      ...options,
+    });
+    assert.equal(blocked, undefined);
+  }
+  assert.equal(writes.length, 2, "ordinary and non-Linux launches remain quiet");
 });
 
 test("platform gate leaves macOS/Linux available and refuses unqualified Windows readiness", () => {

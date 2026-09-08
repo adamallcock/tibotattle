@@ -12,6 +12,37 @@ import { createCompanionReadyLineParser } from "./ready-line.js";
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
 
+const COMPANION_PROCESS_LIFECYCLE_PHASES = new Set([
+  "starting",
+  "ready",
+  "stopping",
+]);
+
+function companionProcessExitOutcome(exitCode, signalCode) {
+  if (signalCode === "SIGABRT") return "signal_abrt";
+  if (signalCode === "SIGSEGV") return "signal_segv";
+  if (signalCode === "SIGKILL") return "signal_kill";
+  if (signalCode === "SIGTERM") return "signal_term";
+  if (typeof signalCode === "string") return "signal_other";
+  return exitCode === 0 ? "exit_zero" : "exit_nonzero";
+}
+
+function emitCompanionProcessLifecycleEvent(observer, event, phase, exitCode, signalCode) {
+  if (typeof observer !== "function") return;
+  const selectedPhase = COMPANION_PROCESS_LIFECYCLE_PHASES.has(phase)
+    ? phase : "starting";
+  const value = Object.freeze({
+    event,
+    phase: selectedPhase,
+    outcome: event === "started" ? null : companionProcessExitOutcome(exitCode, signalCode),
+  });
+  try {
+    observer(value);
+  } catch {
+    // The optional diagnostic observer cannot alter supervisor lifecycle.
+  }
+}
+
 // The renderer/launcher environment is not a credential transport. Keep the
 // child input explicit: platform runtime discovery plus the reviewed
 // TiboTattle/Codex/Claude configuration knobs only. NODE_OPTIONS, arbitrary
@@ -138,6 +169,7 @@ export function createCompanionSupervisor({
   shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS,
   parentPid = process.pid,
   onUnexpectedExit,
+  onChildLifecycleEvent,
   setTimer = setTimeout,
   clearTimer = clearTimeout,
   attachPrivateChannel,
@@ -187,6 +219,9 @@ export function createCompanionSupervisor({
   if (onUnexpectedExit !== undefined && typeof onUnexpectedExit !== "function") {
     throw new TypeError("onUnexpectedExit must be a function");
   }
+  if (onChildLifecycleEvent !== undefined && typeof onChildLifecycleEvent !== "function") {
+    throw new TypeError("onChildLifecycleEvent must be a function");
+  }
 
   let state = "stopped";
   let child = null;
@@ -197,6 +232,7 @@ export function createCompanionSupervisor({
   let unexpectedExitHandler = onUnexpectedExit;
   let privateChannel = null;
   let credentialBroker = null;
+  let activeChildLifecycleObservation = null;
   const selectedCredentialBroker = attachCredentialBroker ?? attachLinuxSecretServiceBroker;
   const selectedAccountObservationBroker = attachWindowsAccountObservationBroker
     ?? attachLinuxAccountObservationBroker;
@@ -215,6 +251,46 @@ export function createCompanionSupervisor({
     });
   }
 
+  function observeChildStarted(currentChild) {
+    if (typeof onChildLifecycleEvent !== "function") return null;
+    const observation = {
+      child: currentChild,
+      phase: "starting",
+      exited: false,
+    };
+    activeChildLifecycleObservation = observation;
+    emitCompanionProcessLifecycleEvent(onChildLifecycleEvent, "started", observation.phase);
+    return observation;
+  }
+
+  function observeChildReady(observation) {
+    if (observation !== null && observation.exited !== true) {
+      observation.phase = "ready";
+    }
+  }
+
+  function observeChildStopping(currentChild) {
+    if (activeChildLifecycleObservation?.child === currentChild
+        && activeChildLifecycleObservation.exited !== true) {
+      activeChildLifecycleObservation.phase = "stopping";
+    }
+  }
+
+  function observeChildExit(observation, exitCode, signalCode) {
+    if (observation === null || observation.exited === true) return;
+    observation.exited = true;
+    if (activeChildLifecycleObservation === observation) {
+      activeChildLifecycleObservation = null;
+    }
+    emitCompanionProcessLifecycleEvent(
+      onChildLifecycleEvent,
+      "exited",
+      observation.phase,
+      exitCode,
+      signalCode,
+    );
+  }
+
   function start() {
     if (state === "ready") return Promise.resolve(ready);
     if (state === "starting" && startPromise !== null) return startPromise;
@@ -228,6 +304,7 @@ export function createCompanionSupervisor({
       let currentChild = null;
       let currentPrivateChannel = null;
       let currentCredentialBroker = null;
+      let currentChildLifecycleObservation = null;
       let parser;
 
       const cleanupStartup = () => {
@@ -236,23 +313,30 @@ export function createCompanionSupervisor({
         currentChild?.stdout?.off?.("data", onStdout);
       };
 
-      const terminateStartupChild = (target, done, { alreadyExited = false } = {}) => {
+      const terminateStartupChild = (target, done, {
+        alreadyExited = false,
+        lifecycleObservation = null,
+      } = {}) => {
         if (alreadyExited || !target || typeof target.once !== "function") {
+          if (alreadyExited) {
+            observeChildExit(lifecycleObservation, target?.exitCode, target?.signalCode);
+          }
           done();
           return;
         }
         let finished = false;
         let timer = null;
-        const finish = () => {
+        const finish = (exitCode, signalCode, { exited = true } = {}) => {
           if (finished) return;
           finished = true;
           if (timer !== null) clearTimer(timer);
           target.removeListener?.("exit", finish);
+          if (exited) observeChildExit(lifecycleObservation, exitCode, signalCode);
           done();
         };
         target.once("exit", finish);
         killChild(target, "SIGKILL");
-        timer = setTimer(finish, shutdownTimeoutMs);
+        timer = setTimer(() => finish(undefined, undefined, { exited: false }), shutdownTimeoutMs);
         timer?.unref?.();
       };
 
@@ -270,7 +354,10 @@ export function createCompanionSupervisor({
         terminateStartupChild(
           currentChild,
           () => rejectStart(error),
-          { alreadyExited: childAlreadyExited },
+          {
+            alreadyExited: childAlreadyExited,
+            lifecycleObservation: currentChildLifecycleObservation,
+          },
         );
       };
 
@@ -290,6 +377,7 @@ export function createCompanionSupervisor({
         state = "ready";
         child = currentChild;
         ready = value;
+        observeChildReady(currentChildLifecycleObservation);
         resolveStart(value);
       };
 
@@ -305,7 +393,8 @@ export function createCompanionSupervisor({
         fail(shellError("companion_spawn_failed"));
       };
 
-      const onExit = () => {
+      const onExit = (exitCode, signalCode) => {
+        observeChildExit(currentChildLifecycleObservation, exitCode, signalCode);
         disposeCredentialBroker(currentCredentialBroker);
         if (credentialBroker === currentCredentialBroker) credentialBroker = null;
         currentPrivateChannel?.dispose();
@@ -350,6 +439,7 @@ export function createCompanionSupervisor({
         fail(shellError("companion_spawn_failed"));
         return;
       }
+      currentChildLifecycleObservation = observeChildStarted(currentChild);
       const childAlreadyExited = Number.isSafeInteger(currentChild.exitCode)
         || typeof currentChild.signalCode === "string";
       if (childAlreadyExited || (requiresNodeIpc && currentChild.connected === false)) {
@@ -404,6 +494,7 @@ export function createCompanionSupervisor({
 
     const currentChild = child;
     const currentGeneration = generation;
+    observeChildStopping(currentChild);
     state = "stopping";
     disposeCredentialBroker(credentialBroker);
     credentialBroker = null;

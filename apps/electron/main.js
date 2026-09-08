@@ -44,6 +44,8 @@ const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_COMPANION_SCRIPT = resolve(MODULE_DIRECTORY, "../local/server.js");
 const DEFAULT_RESOURCE_ROOT = resolve(MODULE_DIRECTORY, "../..");
 const ELECTRON_SMOKE_CONTROL = "quit-v1";
+export const ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX =
+  "TIBOTATTLE_ELECTRON_COMPANION_PROCESS ";
 export const MACOS_ELECTRON_LOCAL_QA_TEST_LANE =
   "macos-electron-local-qa-v1";
 const MACOS_ELECTRON_SMOKE_OBSERVE_MESSAGE_TYPE =
@@ -224,6 +226,62 @@ function emitEntryFailureDiagnostic(writeDiagnostic = process.stderr?.write?.bin
       // Diagnostic delivery must never prevent fail-closed shutdown.
     }
   }
+}
+
+function isCompanionProcessLifecycleEvent(value) {
+  return value !== null
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.getPrototypeOf(value) === Object.prototype
+    && Reflect.ownKeys(value).length === 3
+    && Object.hasOwn(value, "event")
+    && Object.hasOwn(value, "phase")
+    && Object.hasOwn(value, "outcome")
+    && (value.event === "started" || value.event === "exited")
+    && (value.phase === "starting" || value.phase === "ready" || value.phase === "stopping")
+    && (value.event === "started"
+      ? value.phase === "starting" && value.outcome === null
+      : value.outcome === "exit_zero"
+        || value.outcome === "exit_nonzero"
+        || value.outcome === "signal_abrt"
+        || value.outcome === "signal_segv"
+        || value.outcome === "signal_kill"
+        || value.outcome === "signal_term"
+        || value.outcome === "signal_other");
+}
+
+/**
+ * Emit only fixed companion process lifecycle facts for the exact Linux
+ * normal-candidate smoke control. This observer neither changes child
+ * supervision nor exposes a renderer, loopback, or general test interface.
+ */
+export function createLinuxSmokeCompanionProcessObserver({
+  environment = process.env,
+  platform = process.platform,
+  architecture = process.arch,
+  writeDiagnostic = process.stderr?.write?.bind(process.stderr),
+} = {}) {
+  if (environment === null || typeof environment !== "object"
+      || platform !== "linux"
+      || architecture !== "x64"
+      || environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL !== ELECTRON_SMOKE_CONTROL
+      || Object.hasOwn(environment, "USAGE_MONITOR_TEST_LANE")
+      || typeof writeDiagnostic !== "function") {
+    return undefined;
+  }
+  return (event) => {
+    if (!isCompanionProcessLifecycleEvent(event)) return;
+    const value = {
+      event: event.event,
+      phase: event.phase,
+      outcome: event.outcome,
+    };
+    try {
+      writeDiagnostic(`${ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX}${JSON.stringify(value)}\n`);
+    } catch {
+      // Diagnostic delivery must never affect the normal desktop lifecycle.
+    }
+  };
 }
 
 export function assertElectronQualificationLaunchOptions({
@@ -757,6 +815,12 @@ export async function launchElectronShell({
       && productionDistribution.channel === PRODUCTION_ELECTRON_CHANNEL;
     const linuxQualificationSupervisorOptions =
       createLinuxQualificationSupervisorOptions({ linuxQualificationContext });
+    const linuxSmokeCompanionProcessObserver = createLinuxSmokeCompanionProcessObserver({
+      environment,
+      platform: process.platform,
+      architecture: process.arch,
+      writeDiagnostic,
+    });
     // readProductionDistribution has already validated the package-local
     // target against this process. Keep the fixed Linux handover dormant for
     // every development, rehearsal, test-lane, non-x64, and non-stable path.
@@ -798,6 +862,9 @@ export async function launchElectronShell({
       supervisorOptions: {
         ...supervisorOptions,
         ...linuxQualificationSupervisorOptions,
+        ...(linuxSmokeCompanionProcessObserver === undefined ? {} : {
+          onChildLifecycleEvent: linuxSmokeCompanionProcessObserver,
+        }),
         ...(linuxProductionCredentialHandover === null ? {} : {
           attachLinuxAccountObservationBroker:
             linuxProductionCredentialHandover.attachLinuxAccountObservationBroker,
