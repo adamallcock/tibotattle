@@ -112,10 +112,13 @@ not be signed on the basis of their pending request.
 
 The updater selection repair is integrated and frozen at `d8845172`. Its new
 runtime regression fails against the preceding source at the real updater
-contract check and passes with the fix. An earlier owning runtime run passed all
-44 tests; a separate worktree rerun now reports four accountless child-readiness
-failures. Their cause is under investigation and that rerun is not presented as
-passing. Corrected unsigned Mac source candidates for `.3`/`.4` on both Mac
+contract check and passes with the fix. Four later accountless child-readiness
+failures were traced to the synthetic fixture's unused loopback listener:
+the sandbox rejects its bind with `EPERM` before scheduler IPC starts. The same
+failure reproduces on the older `d5dc8025` source. The fixture-only repair at
+`82122044` removes that unnecessary listener; all 44 runtime tests now pass
+under pinned Node 26.2.0, preserving the five-second readiness assertions.
+Corrected unsigned Mac source candidates for `.3`/`.4` on both Mac
 architectures are prepared from `d8845172`. All 49 focused Mac tests pass;
 root independently verifies all four receipt hashes, staged updater/verifier
 source, candidate versions and thin native helper/adapter architectures.
@@ -126,6 +129,28 @@ focused checks pass; native proof is pending. Mac preparation proceeds
 independently while native Windows/Linux tests qualify the shared application.
 A harness failure is recorded separately from an app defect; neither is
 silently relabelled as a successful release gate.
+
+The latest user-requested tray corrections from the parallel task (`c1c83618`)
+are merged with both startup repairs at `3eb09cc5`; all 34 focused tray tests
+pass. Its native qualification is
+[run 34276107974](https://github.com/adamallcock/tibotattle/actions/runs/34276107974).
+The run has started after the preceding tray-only run's NSIS lifecycle. The newer
+`82122044` changes only the test fixture described above. Mac source candidates
+are refreshed from that integrated source with the tray corrections included.
+All 49 focused Mac checks pass again. Root independently verifies the staged
+updater, verifier and tray files, candidate versions, thin native architectures,
+disabled hosted uploads and unsigned boundaries. Exact-source authorization
+for signing/notarizing these `.3`/`.4` replacements has been requested. The existing daily-use
+tester at `98a5256d` and earlier unsigned source receipts remain preserved.
+
+Refreshed source receipt SHA-256 values at `82122044`:
+
+| Candidate | Target | Receipt SHA-256 |
+| --- | --- | --- |
+| `.3` / `2026090803` | darwin-arm64 | `41cec175b94193cd6f2537efd5ab8457042db4ad40397656c356d395eb4616ca` |
+| `.3` / `2026090803` | darwin-x64 | `55c39b03cf8b1ba9f395c50bd6235e1a01339324bb03895b54c17d055894a586` |
+| `.4` / `2026090804` | darwin-arm64 | `1c9bbb427777dc9096ede09d80ee9dbd12456da5eb5b20a48eab2956b1f9f73d` |
+| `.4` / `2026090804` | darwin-x64 | `218fc1238008ad43496081aad93ff9d1bbcaaf00345ebd77442f4da18af42445` |
 
 1. Close the real native Mac -> signed Electron -> next signed Electron
    installed rehearsal. The original signed private fixtures exposed the
