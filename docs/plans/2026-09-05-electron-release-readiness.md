@@ -14,21 +14,48 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-The latest completed native packaging run is
-[`34172410440`](https://github.com/adamallcock/tibotattle/actions/runs/34172410440)
-at `a17d235ffd11179668e9189f0960d4cf70985b1d`. Both Mac jobs and Windows pass.
-Windows now passes the actual packaged accountless credential journey, including
-read/create, a retained record in a separate child, deletion, status and clean
-quit. This qualifies the fixed synthetic credential path, not a full installed
-application restart or production activation.
+All four development packaging jobs pass at
+`f86f0f187da06172f930b1ac56b55c077f9fc0fa` in
+[run 34179148807](https://github.com/adamallcock/tibotattle/actions/runs/34179148807):
+Apple Silicon Mac, Intel Mac, Windows x64 and Linux x64. Windows passes the
+actual packaged accountless credential journey: create/read, retained record in
+a separate child, deletion, status and clean quit. Linux now passes its actual
+packaged two-capability Secret Service journey over the inherited channel,
+including conditional mutations, final absence and owned process cleanup.
+These are development runtime receipts, not installer, whole-application
+restart, trust, updater or production-selection qualification.
 
-Linux passes native component checks, packaging, artifact verification and
-container construction, but the actual packaged session fails with
-`ELECTRON_LINUX_SECRET_SERVICE_SMOKE_SESSION_EXECUTION_FAILED`. Its cause was not
-visible in the old receipt. Commits `39dc4b48` and `4dbf7f21` add closed stage and
-Node bootstrap classifications without emitting raw errors or making stderr a
-success; all 37 focused qualification/container tests pass. A native rerun is
-required. No ABI or module-loader cause is asserted before that evidence.
+The Linux failure at `1f74bbb6` was narrowed to credential creation. The native
+mutex requires an existing safe XDG state base, but the fresh disposable home
+had no default `.local/state`. The harness now explicitly uses its already
+verified owner-private home tmpfs as `XDG_STATE_HOME`; the session passes that
+value and rejects any other state root before native access. Native filesystem
+checks and isolation remain intact. All 30 focused tests and 78 release-trust
+tests pass. Earlier archive-identity, generic-round-trip and create-stage failure
+receipts remain preserved. The successful native rerun establishes this test
+fixture repair; normal Linux first-launch/state setup is still a separate gate.
+
+The later dormant Windows account-observation foundation is integrated at
+`f94161f4`, with packaging/source-export separation at `209a545e`. Its fixed
+read/create-only channel uses the main-owned legacy observation capability and
+mutation lease; production selection is unchanged. The main wrapper can reuse
+the generic manager's journal recovery, so its narrow wire does not imply that
+manager startup has only one capability's audit scope. Portable client exports
+include only the child communication module; the native wrapper has its own
+reviewed platform entrypoint. The agent's 87 focused tests, root's 84 shell/
+observation tests, 35 packaging/broker tests (two optional skips), and 75
+architecture/export tests pass. Native Windows Credential Manager continuity
+and activation of this channel remain unqualified; the `f86f0f18` native run
+predates this foundation.
+
+The accountless production companion profile is now integrated at `b3643991`.
+It requires the exact production mode/origin and a connected private IPC
+channel, closes legacy sign-in and contribution routes, and avoids constructing
+legacy queue/preparation/participant controllers. Current account observations
+and the shared companion single-writer lock remain intact. All 332 local
+companion tests pass, including the new profile's route, startup-failure,
+observation and ownership checks. This is source/local-runtime evidence;
+hosted activation and new packaged-profile qualification remain separate.
 
 The current daily Mac tester is frozen `0f03c121ba1102314ae674be23f4b2c009bd3ed5`,
 with ASAR `2216a54ddf6315fcc52c4982542e12ffa5406ce4520c3842b92774054245a3db`.
@@ -40,8 +67,8 @@ package with hosted contributions disabled and a separate copied profile. Its
 previous d5 launcher is preserved as a versioned backup. No installed native app
 has been replaced. No current source is yet a production replacement.
 
-The latest completed four-target successful development build is
-`ae8f5bb60f011d3d14300beb026560d417eb2370`. Its unsigned packages passed
+The earlier four-target successful development build
+`ae8f5bb60f011d3d14300beb026560d417eb2370` remains historical evidence. Its unsigned packages passed
 [CI run 34163441097](https://github.com/adamallcock/tibotattle/actions/runs/34163441097),
 including Linux native lock/crash-recovery and fixed accountless-record
 qualification, the maintained Mac packaging regressions, and the Windows
