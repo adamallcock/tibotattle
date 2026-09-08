@@ -47,8 +47,8 @@ jobs:
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
-      - name: Validate macOS signing-order and final metadata contracts without credentials
-        run: node --test test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js
+      - name: Validate macOS startup, signing-order and final metadata without credentials
+        run: node --test test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js apps/electron/test/desktop-macos-keychain.test.mjs
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target darwin-arm64 --format distribution --replace-staging
       - name: Retain verified development packages and receipts
@@ -92,8 +92,8 @@ jobs:
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
-      - name: Validate macOS signing-order and final metadata contracts without credentials
-        run: node --test test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js
+      - name: Validate macOS startup, signing-order and final metadata without credentials
+        run: node --test test/electron-macos-sign-order.test.mjs test/electron-macos-production-finalization.test.js apps/electron/test/desktop-macos-keychain.test.mjs
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target darwin-x64 --format distribution --replace-staging
       - name: Retain verified development packages and receipts
