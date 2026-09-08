@@ -24,6 +24,9 @@ import {
   buildWindowsDevelopmentLaunchSpec,
   prepareWindowsDevelopmentProfile,
 } from "./launch-electron-windows-development.mjs";
+import {
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_SMOKE_FAILURE_STAGES,
+} from "../apps/electron/windows-account-observation-qualification-smoke.js";
 
 const PREFIX = "ELECTRON_WINDOWS_NSIS_LIFECYCLE_";
 const require = createRequire(import.meta.url);
@@ -56,6 +59,67 @@ const REGISTRY_OTHER = "other-v1";
 const WINDOWS_PROCESS_ID_MAX = 0xffff_ffff;
 const PROCESS_SNAPSHOT_MAX_TARGETS = 4096;
 const WINDOWS_POWER_SHELL_UTILITY_MODULE = "Microsoft.PowerShell.Utility";
+const FIRST_LAUNCH_PHASES = new Set([
+  "not_reached",
+  "installed_executable_prelaunch_read",
+  "launcher_child_spawn",
+  "ready_private_ipc",
+  "ready_process_identity",
+  "accountless_storage_private_ipc",
+  "account_observation_storage_private_ipc",
+  "quit_private_ipc",
+  "quit_child_exit",
+  "process_identity_post_exit",
+  "installed_executable_post_exit_read",
+  "launcher_child_cleanup",
+  "completed",
+]);
+const POST_UNINSTALL_PHASES = new Set([
+  "not_attempted",
+  "both_predicates_absent",
+  "install_root_present",
+  "uninstall_registry_present",
+  "both_predicates_present",
+  "postcondition_probe_unavailable",
+  "postcondition_budget_exhausted",
+]);
+const POST_UNINSTALL_FAILURE_CODES = Object.freeze({
+  install_root_present: `${PREFIX}POST_UNINSTALL_INSTALL_ROOT_PRESENT`,
+  uninstall_registry_present: `${PREFIX}POST_UNINSTALL_UNINSTALL_REGISTRY_PRESENT`,
+  both_predicates_present: `${PREFIX}POST_UNINSTALL_PREDICATES_PRESENT`,
+  postcondition_probe_unavailable: `${PREFIX}POST_UNINSTALL_PROBE_UNAVAILABLE`,
+  postcondition_budget_exhausted: `${PREFIX}POST_UNINSTALL_BUDGET_EXHAUSTED`,
+});
+const FIRST_LAUNCH_FAILURE_CODES = new Set([
+  `${PREFIX}FAILED`,
+  `${PREFIX}APPLICATION_LAUNCH_UNAVAILABLE`,
+  `${PREFIX}APPLICATION_STARTUP_TIMEOUT`,
+  `${PREFIX}APPLICATION_QUIT_TIMEOUT`,
+  `${PREFIX}APPLICATION_CHILD_FAILED`,
+  `${PREFIX}PROCESS_PROOF_UNAVAILABLE`,
+  `${PREFIX}PROCESS_CLEANUP_UNCONFIRMED`,
+  `${PREFIX}INSTALLED_EXECUTABLE_PRESENT_BEFORE_LAUNCH`,
+  `${PREFIX}INSTALLED_EXECUTABLE_REMAINS`,
+  `${PREFIX}OWNED_PROCESS_REMAINS`,
+  "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_CHILD_EXITED",
+  "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_RESPONSE_INVALID",
+  "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_STORAGE_FAILED",
+  "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_OBSERVATION_STORAGE_FAILED",
+  "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_COMMAND_REFUSED",
+  "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_TIMEOUT",
+  "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_SEND_FAILED",
+  "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_CLOSED",
+]);
+const FIRST_LAUNCH_SEND_FAILURE_CODES = new Set([
+  "EPIPE",
+  "ECONNRESET",
+  "ERR_IPC_CHANNEL_CLOSED",
+  "ERR_IPC_DISCONNECTED",
+  "unclassified",
+]);
+const FIRST_LAUNCH_OBSERVATION_FAILURE_STAGES = new Set(
+  WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION_SMOKE_FAILURE_STAGES,
+);
 // This value is injected only into the two fixed read-only PowerShell probes.
 // It is deliberately not inherited from the parent environment by any child.
 export const WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY =
@@ -91,6 +155,84 @@ function fixedCode(error) {
   return /^ELECTRON_WINDOWS_NSIS_LIFECYCLE_[A-Z_]+$/u.test(error?.code ?? "")
     ? error.code
     : `${PREFIX}FAILED`;
+}
+
+function fixedDiagnosticCode(error) {
+  return FIRST_LAUNCH_FAILURE_CODES.has(error?.code)
+    ? error.code
+    : `${PREFIX}FAILED`;
+}
+
+function createFirstLaunchDiagnostic() {
+  return { phase: "not_reached", failureCode: null, observations: null };
+}
+
+function setFirstLaunchPhase(diagnostic, phase) {
+  if (diagnostic === null || diagnostic === undefined) return;
+  if (typeof diagnostic !== "object" || !FIRST_LAUNCH_PHASES.has(phase)) return;
+  diagnostic.phase = phase;
+}
+
+function recordFirstLaunchFailure(diagnostic, error) {
+  if (diagnostic === null || diagnostic === undefined) return;
+  if (typeof diagnostic !== "object") return;
+  diagnostic.failureCode = fixedDiagnosticCode(error);
+}
+
+function recordFirstLaunchObservations(diagnostic, observations) {
+  if (diagnostic === null || diagnostic === undefined || typeof diagnostic !== "object") return;
+  diagnostic.observations = observations;
+}
+
+function boundedFirstLaunchObservations(observations) {
+  return Object.freeze({
+    entryFailureObserved: observations?.entryFailureObserved === true,
+    statusResponseObserved: observations?.statusResponseObserved === true,
+    storageRequested: observations?.storageRequested === true,
+    storagePassed: observations?.storagePassed === true,
+    accountObservationStorageRequested: observations?.accountObservationStorageRequested === true,
+    accountObservationStoragePassed: observations?.accountObservationStoragePassed === true,
+    accountObservationFailureStage: FIRST_LAUNCH_OBSERVATION_FAILURE_STAGES
+      .has(observations?.accountObservationFailureStage)
+      ? observations.accountObservationFailureStage
+      : null,
+    quitAcknowledged: observations?.quitAcknowledged === true,
+    sendFailureCode: FIRST_LAUNCH_SEND_FAILURE_CODES.has(observations?.sendFailureCode)
+      ? observations.sendFailureCode
+      : null,
+  });
+}
+
+function boundedFirstLaunchDiagnostic(diagnostic) {
+  const phase = FIRST_LAUNCH_PHASES.has(diagnostic?.phase)
+    ? diagnostic.phase
+    : "not_reached";
+  const failureCode = FIRST_LAUNCH_FAILURE_CODES.has(diagnostic?.failureCode)
+    ? diagnostic.failureCode
+    : null;
+  return Object.freeze({
+    phase,
+    failureCode,
+    observations: boundedFirstLaunchObservations(diagnostic?.observations),
+  });
+}
+
+function postUninstallResult(phase) {
+  if (!POST_UNINSTALL_PHASES.has(phase)) fail("POST_UNINSTALL_DIAGNOSTIC_INVALID");
+  return Object.freeze({
+    installRootAbsent: phase === "both_predicates_absent",
+    uninstallRegistryAbsent: phase === "both_predicates_absent",
+    phase,
+    failureCode: POST_UNINSTALL_FAILURE_CODES[phase] ?? null,
+  });
+}
+
+function boundedPostUninstallDiagnostic(diagnostic) {
+  const phase = POST_UNINSTALL_PHASES.has(diagnostic?.phase)
+    ? diagnostic.phase
+    : "not_attempted";
+  const failureCode = POST_UNINSTALL_FAILURE_CODES[phase] ?? null;
+  return Object.freeze({ phase, failureCode });
 }
 
 function validAbsolutePath(value) {
@@ -1144,15 +1286,26 @@ export async function exerciseWindowsNsisLifecycleSmoke(child, {
   timeoutMs = 60_000,
   observations = null,
   readyBarrier,
+  firstLaunchDiagnostic = null,
 } = {}) {
   if (typeof readyBarrier !== "function") fail("PROCESS_PROOF_UNAVAILABLE");
   const protocol = createWindowsAccountlessSmokeProtocol(child, { timeoutMs, observations });
+  const request = async (command, phase) => {
+    setFirstLaunchPhase(firstLaunchDiagnostic, phase);
+    try {
+      return await protocol.request(command);
+    } catch (error) {
+      recordFirstLaunchFailure(firstLaunchDiagnostic, error);
+      throw error;
+    }
+  };
   try {
     const deadline = Date.now() + timeoutMs;
     let tracked = null;
     while (true) {
-      const state = await protocol.request("status-v1");
+      const state = await request("status-v1", "ready_private_ipc");
       if (state.started && state.primary && state.window && state.tray) {
+        setFirstLaunchPhase(firstLaunchDiagnostic, "ready_process_identity");
         tracked = await readyBarrier();
         if (!Array.isArray(tracked)) fail("PROCESS_PROOF_UNAVAILABLE");
         break;
@@ -1161,13 +1314,14 @@ export async function exerciseWindowsNsisLifecycleSmoke(child, {
       await delay(250);
     }
     if (observations) observations.storageRequested = true;
-    await protocol.request("accountless-storage-v1");
+    await request("accountless-storage-v1", "accountless_storage_private_ipc");
     if (observations) observations.storagePassed = true;
     if (observations) observations.accountObservationStorageRequested = true;
-    await protocol.request("account-observation-storage-v1");
+    await request("account-observation-storage-v1", "account_observation_storage_private_ipc");
     if (observations) observations.accountObservationStoragePassed = true;
-    await protocol.request("quit-v1");
+    await request("quit-v1", "quit_private_ipc");
     if (observations) observations.quitAcknowledged = true;
+    setFirstLaunchPhase(firstLaunchDiagnostic, "quit_child_exit");
     if (!await waitForChildExit(child, PROCESS_CLEANUP_TIMEOUT_MS)) fail("APPLICATION_QUIT_TIMEOUT");
     if (child.exitCode !== 0) fail("APPLICATION_CHILD_FAILED");
     return tracked;
@@ -1188,10 +1342,12 @@ export async function defaultLaunchAndExercise({
   readInstalledExecutableProcesses = defaultReadInstalledExecutableProcesses,
   stopChild = defaultStopOwnedChild,
   runProgram = defaultRunProgram,
+  firstLaunchDiagnostic = null,
 }) {
   const spec = buildWindowsDevelopmentLaunchSpec({ appPath, profile, environment });
   let child = null;
   let tracker = null;
+  let primaryError = null;
   const observations = {
     entryFailureObserved: false,
     statusResponseObserved: false,
@@ -1203,24 +1359,31 @@ export async function defaultLaunchAndExercise({
     quitAcknowledged: false,
     sendFailureCode: null,
   };
+  recordFirstLaunchObservations(firstLaunchDiagnostic, observations);
   try {
     // This is a point-in-time read immediately before each top-level spawn.
     // It prevents a later launch from accepting an exact installed Electron
     // executable that survived the preceding lifecycle step.
+    setFirstLaunchPhase(firstLaunchDiagnostic, "installed_executable_prelaunch_read");
     if ((await readInstalledExecutableProcesses({ appPath, environment, runProgram })).length !== 0) {
       fail("INSTALLED_EXECUTABLE_PRESENT_BEFORE_LAUNCH");
     }
-    child = spawnApplication(spec.command, spec.args, {
-      ...spec.options,
-      env: {
-        ...spec.options.env,
-        GITHUB_ACTIONS: "true",
-        USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
-        USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION: "windows-account-observation-fd4-v1",
-        USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: randomUUID(),
-      },
-      stdio: ["ignore", "ignore", "pipe", "ipc"],
-    });
+    setFirstLaunchPhase(firstLaunchDiagnostic, "launcher_child_spawn");
+    try {
+      child = spawnApplication(spec.command, spec.args, {
+        ...spec.options,
+        env: {
+          ...spec.options.env,
+          GITHUB_ACTIONS: "true",
+          USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "windows-v1",
+          USAGE_MONITOR_WINDOWS_ACCOUNT_OBSERVATION_QUALIFICATION: "windows-account-observation-fd4-v1",
+          USAGE_MONITOR_WINDOWS_QUALIFICATION_RUN_ID: randomUUID(),
+        },
+        stdio: ["ignore", "ignore", "pipe", "ipc"],
+      });
+    } catch {
+      fail("APPLICATION_LAUNCH_UNAVAILABLE");
+    }
     if (!Number.isSafeInteger(child?.pid) || child.pid <= 0) fail("APPLICATION_LAUNCH_UNAVAILABLE");
     observeStderr(child.stderr, observations);
     tracker = observeOwnedProcessTreeAtReady(
@@ -1232,10 +1395,13 @@ export async function defaultLaunchAndExercise({
         retainedProcessIds: null,
       }),
     );
+    setFirstLaunchPhase(firstLaunchDiagnostic, "ready_private_ipc");
     const tracked = await exercise(child, {
       observations,
       readyBarrier: () => tracker.wait(),
+      firstLaunchDiagnostic,
     });
+    setFirstLaunchPhase(firstLaunchDiagnostic, "process_identity_post_exit");
     assertWindowsProcessTreeExited(
       tracked,
       await readProcessSnapshot({
@@ -1245,9 +1411,11 @@ export async function defaultLaunchAndExercise({
         retainedProcessIds: tracked.map(({ pid }) => pid),
       }),
     );
+    setFirstLaunchPhase(firstLaunchDiagnostic, "installed_executable_post_exit_read");
     if ((await readInstalledExecutableProcesses({ appPath, environment, runProgram })).length !== 0) {
       fail("INSTALLED_EXECUTABLE_REMAINS");
     }
+    setFirstLaunchPhase(firstLaunchDiagnostic, "completed");
     return Object.freeze({
       pid: child.pid,
       observedProcessTreeExited: true,
@@ -1256,9 +1424,24 @@ export async function defaultLaunchAndExercise({
       storageJourneyCompleted: observations.storagePassed === true
         && observations.accountObservationStoragePassed === true,
     });
+  } catch (error) {
+    primaryError = error;
+    recordFirstLaunchFailure(firstLaunchDiagnostic, error);
+    throw error;
   } finally {
     tracker?.close();
-    if (!await stopChild(child, { environment, runProgram })) fail("PROCESS_CLEANUP_UNCONFIRMED");
+    let stopped = false;
+    try {
+      stopped = await stopChild(child, { environment, runProgram });
+    } catch {
+      stopped = false;
+    }
+    if (!stopped && primaryError === null) {
+      setFirstLaunchPhase(firstLaunchDiagnostic, "launcher_child_cleanup");
+      const cleanupError = fixedError("PROCESS_CLEANUP_UNCONFIRMED");
+      recordFirstLaunchFailure(firstLaunchDiagnostic, cleanupError);
+      throw cleanupError;
+    }
   }
 }
 
@@ -1349,16 +1532,16 @@ async function observeUninstallPostconditions({
   if (typeof monotonicNow !== "function"
       || !Number.isSafeInteger(budgetMs) || budgetMs <= terminationGraceMs
       || !Number.isSafeInteger(terminationGraceMs) || terminationGraceMs <= 0) {
-    return Object.freeze({ installRootAbsent: false, uninstallRegistryAbsent: false });
+    return postUninstallResult("postcondition_probe_unavailable");
   }
   let startedAt;
   try {
     startedAt = monotonicNow();
   } catch {
-    return Object.freeze({ installRootAbsent: false, uninstallRegistryAbsent: false });
+    return postUninstallResult("postcondition_probe_unavailable");
   }
   if (!Number.isFinite(startedAt)) {
-    return Object.freeze({ installRootAbsent: false, uninstallRegistryAbsent: false });
+    return postUninstallResult("postcondition_probe_unavailable");
   }
   const deadline = startedAt + budgetMs;
   const remainingBudget = () => {
@@ -1369,9 +1552,15 @@ async function observeUninstallPostconditions({
       return null;
     }
   };
+  let lastPhase = "postcondition_budget_exhausted";
   for (let attempt = 0; attempt < UNINSTALL_POSTCONDITION_ATTEMPTS; attempt += 1) {
     if (!(remainingBudget() > 0)) break;
-    const installRootAbsent = await isMissing(installationRoot);
+    let installRootAbsent;
+    try {
+      installRootAbsent = await isMissing(installationRoot);
+    } catch {
+      return postUninstallResult("postcondition_probe_unavailable");
+    }
     const remainingBeforeProbe = remainingBudget();
     // runWindowsNsisLifecycleProgram can spend its timeout plus a termination
     // grace period. Reserve that full grace within the one shared budget.
@@ -1382,26 +1571,40 @@ async function observeUninstallPostconditions({
         Math.floor(remainingBeforeProbe - terminationGraceMs),
       );
     if (registryTimeoutMs <= 0) break;
-    const uninstallRegistryAbsent = (await inspectRegistry({
-      environment,
-      runProgram,
-      expectedInstallationRoot: installationRoot,
-      timeoutMs: registryTimeoutMs,
-    })) === REGISTRY_ABSENT;
+    let uninstallRegistryAbsent;
+    try {
+      uninstallRegistryAbsent = (await inspectRegistry({
+        environment,
+        runProgram,
+        expectedInstallationRoot: installationRoot,
+        timeoutMs: registryTimeoutMs,
+      })) === REGISTRY_ABSENT;
+    } catch {
+      return postUninstallResult("postcondition_probe_unavailable");
+    }
     if (!(remainingBudget() >= 0)) break;
     if (installRootAbsent && uninstallRegistryAbsent) {
-      return Object.freeze({ installRootAbsent, uninstallRegistryAbsent });
+      return postUninstallResult("both_predicates_absent");
     }
+    lastPhase = installRootAbsent
+      ? "uninstall_registry_present"
+      : uninstallRegistryAbsent
+        ? "install_root_present"
+        : "both_predicates_present";
     if (attempt + 1 < UNINSTALL_POSTCONDITION_ATTEMPTS) {
       const remainingBeforeWait = remainingBudget();
       const delayMs = remainingBeforeWait === null
         ? 0
         : Math.min(UNINSTALL_POSTCONDITION_INTERVAL_MS, Math.floor(remainingBeforeWait));
       if (delayMs <= 0) break;
-      await waitForCleanupPoll(delayMs);
+      try {
+        await waitForCleanupPoll(delayMs);
+      } catch {
+        return postUninstallResult("postcondition_probe_unavailable");
+      }
     }
   }
-  return Object.freeze({ installRootAbsent: false, uninstallRegistryAbsent: false });
+  return postUninstallResult(lastPhase);
 }
 
 function lifecycleReceipt({
@@ -1416,16 +1619,20 @@ function lifecycleReceipt({
   secondInstalledBytesVerified,
   sameInstalledApplicationBytesBound,
   firstRunAcknowledgementPrepared,
+  firstLaunchDiagnostic,
   launches,
   uninstallationAttempted,
   uninstallationPerformed,
   uninstallerSettled,
   installRootAbsent,
   uninstallRegistryAbsent,
+  postUninstallDiagnostic,
   ownedTemporaryRootRemoved,
 }) {
   const first = launches[0] ?? null;
   const second = launches[1] ?? null;
+  const boundedFirstLaunch = boundedFirstLaunchDiagnostic(firstLaunchDiagnostic);
+  const boundedPostUninstall = boundedPostUninstallDiagnostic(postUninstallDiagnostic);
   return {
     schemaVersion: "windows-electron-nsis-lifecycle-v1",
     status: errorCode ? "failed" : "passed",
@@ -1445,6 +1652,9 @@ function lifecycleReceipt({
     secondInstalledBytesVerified,
     sameInstalledApplicationBytesBound,
     firstRunAcknowledgementPrepared,
+    firstLaunchPhase: boundedFirstLaunch.phase,
+    firstLaunchFailureCode: boundedFirstLaunch.failureCode,
+    firstLaunchObservations: boundedFirstLaunch.observations,
     topLevelLaunches: launches.length,
     topLevelProcessIdsDistinct: first !== null && second !== null && first.pid !== second.pid,
     firstObservedApplicationProcessTreeExited: first?.observedProcessTreeExited === true,
@@ -1475,6 +1685,8 @@ function lifecycleReceipt({
     uninstallerSettled,
     installRootAbsent,
     uninstallRegistryAbsent,
+    postUninstallPhase: boundedPostUninstall.phase,
+    postUninstallFailureCode: boundedPostUninstall.failureCode,
     cleanupVerificationSkippedBecauseOperationUnsettled:
       installerSettled !== true
       || (uninstallationAttempted === true && uninstallationPerformed !== true),
@@ -1487,6 +1699,21 @@ function lifecycleReceipt({
     ownedTemporaryRootRemoved,
     errorCode,
   };
+}
+
+function lifecycleEntrypointRunning() {
+  return resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url);
+}
+
+function emitLifecycleFailureDiagnostics(receipt) {
+  if (!lifecycleEntrypointRunning() || receipt?.status !== "failed") return;
+  try {
+    process.stderr.write(`${PREFIX}DIAGNOSTIC_FIRST_LAUNCH_PHASE=${receipt.firstLaunchPhase.toUpperCase()}\n`);
+    process.stderr.write(`${PREFIX}DIAGNOSTIC_FIRST_LAUNCH_FAILURE=${receipt.firstLaunchFailureCode ?? "NONE"}\n`);
+    process.stderr.write(`${PREFIX}DIAGNOSTIC_POST_UNINSTALL_PHASE=${receipt.postUninstallPhase.toUpperCase()}\n`);
+  } catch {
+    // The reserved receipt is the durable evidence if CI stderr is unavailable.
+  }
 }
 
 /**
@@ -1535,12 +1762,14 @@ export async function runWindowsNsisLifecycle(options, {
   let secondInstalledBytesVerified = false;
   let sameInstalledApplicationBytesBound = false;
   let firstRunAcknowledgementPrepared = false;
+  const firstLaunchDiagnostic = createFirstLaunchDiagnostic();
   const launches = [];
   let uninstallationAttempted = false;
   let uninstallationPerformed = false;
   let uninstallerSettled = null;
   let installRootAbsent = false;
   let uninstallRegistryAbsent = false;
+  let postUninstallDiagnostic = postUninstallResult("not_attempted");
   let ownedTemporaryRootRemoved = false;
   try {
     installerIdentity = await verifyInstaller(selectedOptions);
@@ -1598,13 +1827,16 @@ export async function runWindowsNsisLifecycle(options, {
       sourceRevision: selectedOptions.sourceRevision,
     });
     firstInstalledBytesVerified = true;
+    setFirstLaunchPhase(firstLaunchDiagnostic, "launcher_child_spawn");
     const first = assertLaunchResult(await launchAndExercise({
       appPath,
       profile,
       launchOrdinal: 1,
       environment,
       runProgram,
+      firstLaunchDiagnostic,
     }));
+    setFirstLaunchPhase(firstLaunchDiagnostic, "completed");
     launches.push(first);
     const secondIdentity = await verifyInstalledPackageBeforeLaunch({
       verifyInstalledPackage,
@@ -1643,6 +1875,11 @@ export async function runWindowsNsisLifecycle(options, {
     if (!checkedUninstallerOutcome.succeeded) fail("UNINSTALLER_FAILED");
     uninstallationPerformed = true;
   } catch (error) {
+    if (firstLaunchDiagnostic.phase !== "not_reached"
+        && firstLaunchDiagnostic.phase !== "completed"
+        && !FIRST_LAUNCH_FAILURE_CODES.has(firstLaunchDiagnostic.failureCode)) {
+      recordFirstLaunchFailure(firstLaunchDiagnostic, error);
+    }
     errorCode = fixedCode(error);
   } finally {
     const recordCleanupFailure = () => {
@@ -1691,7 +1928,7 @@ export async function runWindowsNsisLifecycle(options, {
     }
     if (uninstallationPerformed === true && installationRoot !== null) {
       try {
-        ({ installRootAbsent, uninstallRegistryAbsent } = await observeUninstallPostconditions({
+        postUninstallDiagnostic = await observeUninstallPostconditions({
           installationRoot,
           environment,
           runProgram,
@@ -1701,11 +1938,13 @@ export async function runWindowsNsisLifecycle(options, {
           monotonicNow,
           budgetMs: uninstallPostconditionBudgetMs,
           terminationGraceMs: uninstallProgramTerminationGraceMs,
-        }));
+        });
+        ({ installRootAbsent, uninstallRegistryAbsent } = postUninstallDiagnostic);
         if (!installRootAbsent || !uninstallRegistryAbsent) {
           recordCleanupFailure();
         }
       } catch {
+        postUninstallDiagnostic = postUninstallResult("postcondition_probe_unavailable");
         recordCleanupFailure();
       }
     }
@@ -1731,12 +1970,14 @@ export async function runWindowsNsisLifecycle(options, {
       secondInstalledBytesVerified,
       sameInstalledApplicationBytesBound,
       firstRunAcknowledgementPrepared,
+      firstLaunchDiagnostic,
       launches,
       uninstallationAttempted,
       uninstallationPerformed,
       uninstallerSettled,
       installRootAbsent,
       uninstallRegistryAbsent,
+      postUninstallDiagnostic,
       ownedTemporaryRootRemoved,
     });
     try {
@@ -1745,12 +1986,13 @@ export async function runWindowsNsisLifecycle(options, {
     } finally {
       await receiptHandle.close();
     }
+    emitLifecycleFailureDiagnostics(receipt);
   }
   if (errorCode) throw Object.assign(new Error(errorCode), { code: errorCode });
   return Object.freeze({ status: "passed", ...installerIdentity, ...identity });
 }
 
-if (resolve(process.argv[1] ?? "") === fileURLToPath(import.meta.url)) {
+if (lifecycleEntrypointRunning()) {
   try {
     process.stdout.write(`${JSON.stringify(await runWindowsNsisLifecycle(
       parseWindowsNsisLifecycleArguments(process.argv.slice(2)),

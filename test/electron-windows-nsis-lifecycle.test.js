@@ -734,6 +734,27 @@ test("lifecycle smoke establishes its ready proof before any storage or quit com
   assert.equal(observations.accountObservationStoragePassed, true);
 });
 
+test("lifecycle smoke records a closed child-exit code at the ready private-IPC boundary", async () => {
+  const child = new FixedSmokeChild(405);
+  const firstLaunchDiagnostic = { phase: "not_reached", failureCode: null };
+  child.send = (message, callback) => {
+    child.commands.push(message.command);
+    queueMicrotask(() => {
+      child.exitCode = 1;
+      child.emit("exit", 1, null);
+      callback?.(null);
+    });
+  };
+  await assert.rejects(exerciseWindowsNsisLifecycleSmoke(child, {
+    firstLaunchDiagnostic,
+    readyBarrier: async () => { throw new Error("must not reach ready proof"); },
+  }), (error) => error?.code === "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_CHILD_EXITED");
+  assert.deepEqual(firstLaunchDiagnostic, {
+    phase: "ready_private_ipc",
+    failureCode: "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_CHILD_EXITED",
+  });
+});
+
 test("launch proof fences ready snapshot and rejects a lingering exact installed executable", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-launch-test-"));
   const appPath = join(root, "TiboTattle Dev.exe");
@@ -973,12 +994,92 @@ test("lifecycle binds installed bytes, uses two distinct top-level processes in 
     assert.equal(receipt.firstInstalledBytesVerified, true);
     assert.equal(receipt.secondInstalledBytesVerified, true);
     assert.equal(receipt.sameInstalledApplicationBytesBound, true);
+    assert.equal(receipt.firstLaunchPhase, "completed");
+    assert.equal(receipt.firstLaunchFailureCode, null);
     assert.equal(receipt.persistentApplicationCredentialStateVerified, false);
     assert.equal(receipt.accountlessSyntheticRecordDeleted, true);
     assert.equal(receipt.accountObservationCredentialCleanup, "disposable_runner_account_lifetime");
     assert.equal(receipt.uninstallRegistryAbsent, true);
+    assert.equal(receipt.postUninstallPhase, "both_predicates_absent");
+    assert.equal(receipt.postUninstallFailureCode, null);
     assert.equal(receipt.cleanupConfirmed, true);
     assert.equal(receipt.productionReady, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a first installed-launch failure retains its closed IPC code and phase in the receipt", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-first-launch-diagnostic-"));
+  const receiptPath = join(root, "receipt.json");
+  const ownedRoot = join(root, "owned");
+  let missingQueries = 0;
+  let registryQueries = 0;
+  try {
+    await assert.rejects(runWindowsNsisLifecycle({
+      installerPath: join(root, "installer.exe"),
+      stagedAppPath: join(root, "staged"),
+      packageReceiptPath: join(root, "development-package.json"),
+      sourceRevision: revision,
+      receiptPath,
+    }, {
+      platform: "win32",
+      architecture: "x64",
+      environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: root, SystemRoot: "C:\\Windows" },
+      verifyInstaller: async () => ({ sourceRevision: revision, installerBytes: 123, installerSha256: "b".repeat(64) }),
+      verifySilentNsisTemplate: async () => true,
+      createOwnedRoot: async () => ownedRoot,
+      isMissing: async () => {
+        missingQueries += 1;
+        return missingQueries === 1 || missingQueries >= 3;
+      },
+      inspectRegistry: async () => {
+        registryQueries += 1;
+        return registryQueries === 1 || registryQueries >= 4 ? "absent-v1" : "expected-v1";
+      },
+      executeInstaller: async () => ({ settled: true, succeeded: true }),
+      assertUninstaller: async () => {},
+      verifyInstalledPackage: async () => installedIdentity,
+      prepareProfile: async ({ profilePath }) => profile(profilePath),
+      prepareFirstRun: async () => {},
+      launchAndExercise: async ({ firstLaunchDiagnostic }) => {
+        firstLaunchDiagnostic.phase = "ready_private_ipc";
+        firstLaunchDiagnostic.failureCode = "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_NOT_ALLOWLISTED";
+        firstLaunchDiagnostic.observations = {
+          entryFailureObserved: true,
+          statusResponseObserved: true,
+          storageRequested: false,
+          storagePassed: false,
+          accountObservationStorageRequested: false,
+          accountObservationStoragePassed: false,
+          accountObservationFailureStage: "child_create",
+          quitAcknowledged: false,
+          sendFailureCode: "EPIPE",
+        };
+        const error = new Error("ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_CHILD_EXITED");
+        error.code = "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_CHILD_EXITED";
+        throw error;
+      },
+      executeUninstaller: async () => ({ settled: true, succeeded: true }),
+      removeOwnedRoot: async () => {},
+    }), /ELECTRON_WINDOWS_NSIS_LIFECYCLE_FAILED/u);
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NSIS_LIFECYCLE_FAILED");
+    assert.equal(receipt.firstLaunchPhase, "ready_private_ipc");
+    assert.equal(receipt.firstLaunchFailureCode, "ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_CHILD_EXITED");
+    assert.deepEqual(receipt.firstLaunchObservations, {
+      entryFailureObserved: true,
+      statusResponseObserved: true,
+      storageRequested: false,
+      storagePassed: false,
+      accountObservationStorageRequested: false,
+      accountObservationStoragePassed: false,
+      accountObservationFailureStage: "child_create",
+      quitAcknowledged: false,
+      sendFailureCode: "EPIPE",
+    });
+    assert.equal(receipt.uninstallationPerformed, true);
+    assert.equal(receipt.postUninstallPhase, "both_predicates_absent");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1180,6 +1281,11 @@ test("post-uninstall polling uses one monotonic budget across fixed probes", asy
     assert.equal(receipt.cleanupConfirmed, false);
     assert.equal(receipt.installRootAbsent, false);
     assert.equal(receipt.uninstallRegistryAbsent, false);
+    assert.equal(receipt.postUninstallPhase, "both_predicates_present");
+    assert.equal(
+      receipt.postUninstallFailureCode,
+      "ELECTRON_WINDOWS_NSIS_LIFECYCLE_POST_UNINSTALL_PREDICATES_PRESENT",
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
