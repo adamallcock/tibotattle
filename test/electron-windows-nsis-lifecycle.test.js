@@ -23,6 +23,7 @@ import {
   runWindowsNsisLifecycle,
   WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY,
   WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY,
+  WINDOWS_NSIS_LIFECYCLE_UNINSTALL_REGISTRY_SUBKEY,
 } from "../scripts/smoke-electron-windows-nsis-lifecycle.mjs";
 
 const revision = "a".repeat(40);
@@ -171,7 +172,9 @@ test("registry and exact-executable probes use fixed read-only PowerShell contra
   assert.equal(registryArguments.includes(installationRoot), false);
   assert.match(registryArguments[4], /Registry\]::CurrentUser\.OpenSubKey/u);
   assert.ok(registryArguments[4].includes(WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY));
-  assert.doesNotMatch(registryArguments[4], /CurrentVersion\\Uninstall/u);
+  assert.ok(registryArguments[4].includes(WINDOWS_NSIS_LIFECYCLE_UNINSTALL_REGISTRY_SUBKEY));
+  assert.match(registryArguments[4], /\(\$null -eq \$installKey\) -and \(\$null -eq \$uninstallKey\)/u);
+  assert.doesNotMatch(registryArguments[4], /\$uninstallKey\.GetValue/u);
   assert.match(registryArguments[4], new RegExp(WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY, "u"));
   assert.match(registryArguments[4], /ConvertTo-CanonicalLifecyclePath/u);
   assert.match(registryArguments[4], /\$observed=ConvertTo-CanonicalLifecyclePath\(\$value\)/u);
@@ -250,7 +253,7 @@ test("Windows PowerShell fixed path probe rejects missing and malformed child va
   }
 });
 
-test("Windows hosted CI classifies a disposable present install-location key", {
+test("Windows hosted CI refuses an orphaned uninstall key before classifying a disposable installation", {
   skip: process.platform !== "win32" || process.arch !== "x64" || process.env.GITHUB_ACTIONS !== "true",
 }, () => {
   const systemRoot = process.env.SystemRoot;
@@ -284,7 +287,20 @@ test("Windows hosted CI classifies a disposable present install-location key", {
   // It never replaces an existing development installation record.
   assert.equal(parseWindowsNsisRegistryInspectionResult(preexisting.stdout), "absent-v1");
   const expectedPathLookup = `[Environment]::GetEnvironmentVariable('${WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY}','Process')`;
-  const create = [
+  const markerName = "TiboTattleNsisLifecycleOwnedV1";
+  const markerValue = "tibotattle-nsis-lifecycle-owned-v1";
+  const createUninstall = [
+    "$ErrorActionPreference='Stop';",
+    `$subKey='${WINDOWS_NSIS_LIFECYCLE_UNINSTALL_REGISTRY_SUBKEY}';`,
+    `$markerName='${markerName}';`,
+    `$markerValue='${markerValue}';`,
+    "$existing=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subKey,$false);",
+    "if($null -ne $existing){try{throw 'preexisting'}finally{$existing.Dispose()}};",
+    "$key=[Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey,$true);",
+    "if($null -eq $key){throw 'create'};",
+    "try{$key.SetValue($markerName,$markerValue,[Microsoft.Win32.RegistryValueKind]::String)}finally{$key.Dispose()}",
+  ].join("");
+  const createInstall = [
     "$ErrorActionPreference='Stop';",
     `$subKey='${WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY}';`,
     `$expected=${expectedPathLookup};`,
@@ -297,23 +313,33 @@ test("Windows hosted CI classifies a disposable present install-location key", {
   ].join("");
   const remove = [
     "$ErrorActionPreference='Stop';",
-    `$subKey='${WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY}';`,
     `$expected=${expectedPathLookup};`,
-    "$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($subKey,$true);",
-    "if($null -eq $key){throw 'missing'};",
-    "try{$value=$key.GetValue('InstallLocation',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($value -cne $expected){throw 'ownership'}}finally{$key.Dispose()};",
-    "[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($subKey,$false)",
+    `$markerName='${markerName}';`,
+    `$markerValue='${markerValue}';`,
+    `$installSubKey='${WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY}';`,
+    `$uninstallSubKey='${WINDOWS_NSIS_LIFECYCLE_UNINSTALL_REGISTRY_SUBKEY}';`,
+    "$uninstallKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($uninstallSubKey,$true);",
+    "if($null -eq $uninstallKey){throw 'missing-uninstall'};",
+    "try{$marker=$uninstallKey.GetValue($markerName,$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($marker -cne $markerValue){throw 'uninstall-ownership'}}finally{$uninstallKey.Dispose()};",
+    "$installKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($installSubKey,$true);",
+    "if($null -ne $installKey){try{$value=$installKey.GetValue('InstallLocation',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($value -cne $expected){throw 'install-ownership'}}finally{$installKey.Dispose()};[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($installSubKey,$false)};",
+    "[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($uninstallSubKey,$false)",
   ].join("");
-  let created = false;
+  let ownedUninstall = false;
   try {
-    const setup = invoke(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", create]);
-    assertSuccess(setup);
-    created = true;
+    const orphanSetup = invoke(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", createUninstall]);
+    assertSuccess(orphanSetup);
+    ownedUninstall = true;
+    const orphaned = inspect();
+    assertSuccess(orphaned);
+    assert.equal(parseWindowsNsisRegistryInspectionResult(orphaned.stdout), "other-v1");
+    const installSetup = invoke(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", createInstall]);
+    assertSuccess(installSetup);
     const present = inspect();
     assertSuccess(present);
     assert.equal(parseWindowsNsisRegistryInspectionResult(present.stdout), "expected-v1");
   } finally {
-    if (created) {
+    if (ownedUninstall) {
       const cleanup = invoke(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", remove]);
       assertSuccess(cleanup);
     }

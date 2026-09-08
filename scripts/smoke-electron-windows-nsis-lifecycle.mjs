@@ -39,6 +39,8 @@ const APP_BUILDER_LIB_VERSION = "26.15.7";
 // creates, repairs, or removes registry entries.
 export const WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY =
   "Software\\962AD905-00AD-56CE-85F1-F2541D787AC7";
+export const WINDOWS_NSIS_LIFECYCLE_UNINSTALL_REGISTRY_SUBKEY =
+  "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\962AD905-00AD-56CE-85F1-F2541D787AC7";
 const PROCESS_SNAPSHOT_TIMEOUT_MS = 20_000;
 const INSTALLER_TIMEOUT_MS = 180_000;
 const UNINSTALLER_TIMEOUT_MS = 120_000;
@@ -584,7 +586,7 @@ function fixedPowerShellExpectedPathPrelude() {
 /** A fixed, read-only Registry API probe with no raw registry value in stdout. */
 export function buildWindowsNsisRegistryInspectionArguments(expectedInstallationRoot) {
   if (!validAbsolutePath(expectedInstallationRoot)) fail("REGISTRY_UNAVAILABLE");
-  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('${WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY}',$false);if($null -eq $key){[Console]::Out.Write('absent-v1');exit 0};try{$value=$key.GetValue('InstallLocation',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($value -isnot [string]){throw 'install-location'};$observed=ConvertTo-CanonicalLifecyclePath($value);if([string]::Equals($observed,$expected,[System.StringComparison]::OrdinalIgnoreCase)){[Console]::Out.Write('expected-v1')}else{[Console]::Out.Write('other-v1')}}finally{$key.Dispose()}`;
+  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$installKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('${WINDOWS_NSIS_LIFECYCLE_INSTALL_REGISTRY_SUBKEY}',$false);$uninstallKey=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('${WINDOWS_NSIS_LIFECYCLE_UNINSTALL_REGISTRY_SUBKEY}',$false);try{if(($null -eq $installKey) -and ($null -eq $uninstallKey)){[Console]::Out.Write('absent-v1')}elseif(($null -eq $installKey) -or ($null -eq $uninstallKey)){[Console]::Out.Write('other-v1')}else{$value=$installKey.GetValue('InstallLocation',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($value -isnot [string]){throw 'install-location'};$observed=ConvertTo-CanonicalLifecyclePath($value);if([string]::Equals($observed,$expected,[System.StringComparison]::OrdinalIgnoreCase)){[Console]::Out.Write('expected-v1')}else{[Console]::Out.Write('other-v1')}}}finally{if($null -ne $installKey){$installKey.Dispose()};if($null -ne $uninstallKey){$uninstallKey.Dispose()}}`;
   return Object.freeze([
     "-NoLogo",
     "-NoProfile",
