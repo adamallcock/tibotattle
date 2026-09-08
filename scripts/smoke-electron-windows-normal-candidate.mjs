@@ -14,7 +14,7 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { lstat, mkdir, mkdtemp, open, readFile, rm } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { dirname, join, resolve, win32 } from "node:path";
@@ -66,6 +66,11 @@ const FIRST_RUN_ACKNOWLEDGEMENT = validateDesktopFirstRunReceipt({
   schemaVersion: DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
   acknowledged: true,
 });
+const SYNTHETIC_CODEX_SESSION_FILE = "synthetic-windows-normal-candidate.jsonl";
+const SYNTHETIC_CODEX_SESSION = `${JSON.stringify({
+  type: "session_meta",
+  id: "synthetic-windows-normal-candidate",
+})}\n`;
 const SOURCE_REVISION = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const FIREWALL_RULE_PREFIX = "tibotattle-normal-candidate-";
@@ -142,6 +147,7 @@ const FAILURE_CODES = new Set([
   "ASAR_UNAVAILABLE",
   "PROFILE_INVALID",
   "PROFILE_NOT_ABSENT",
+  "SYNTHETIC_FIXTURE_UNAVAILABLE",
   "PROTECTED_OPT_OUT_UNAVAILABLE",
   "FIREWALL_UNAVAILABLE",
   "FIREWALL_RULE_DIRTY",
@@ -631,6 +637,46 @@ async function protectedOptOutStage(stage, operation) {
     const cause = protectedOptOutCause(error);
     fail(cause === null ? stage : `${stage}_${cause}`);
   }
+}
+
+/**
+ * Supply the normal candidate's fresh, owned Codex root with one content-free
+ * rollout-shaped source. The dashboard refuses a refresh until its ordinary
+ * onboarding preflight sees a readable JSONL source, so an empty profile
+ * would only exercise that preflight rather than the local refresh journey.
+ */
+export async function seedWindowsNormalCandidateCodexFixture({ profile } = {}, {
+  createDirectory = mkdir,
+  metadata = lstat,
+  writeFixture = writeFile,
+} = {}) {
+  const codexHome = exactWindowsPath(profile?.codex);
+  if (codexHome === null || typeof createDirectory !== "function"
+      || typeof metadata !== "function" || typeof writeFixture !== "function") {
+    fail("PROFILE_INVALID");
+  }
+  const sessions = win32.join(codexHome, "sessions");
+  const fixture = win32.join(sessions, SYNTHETIC_CODEX_SESSION_FILE);
+  try {
+    await createDirectory(sessions, { recursive: true, mode: 0o700 });
+    const directory = await metadata(sessions);
+    if (!directory?.isDirectory?.() || directory.isSymbolicLink?.()) {
+      fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
+    }
+    await writeFixture(fixture, SYNTHETIC_CODEX_SESSION, {
+      mode: 0o600,
+      flag: "wx",
+    });
+    const file = await metadata(fixture);
+    if (!file?.isFile?.() || file.isSymbolicLink?.() || file.nlink !== 1
+        || file.size !== Buffer.byteLength(SYNTHETIC_CODEX_SESSION)) {
+      fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
+    }
+  } catch (error) {
+    if (String(error?.code ?? "").startsWith(PREFIX)) throw error;
+    fail("SYNTHETIC_FIXTURE_UNAVAILABLE");
+  }
+  return Object.freeze({ codexHome, fixture, sessions });
 }
 
 /** Seed only the fixed acknowledgement and durable contribution opt-out. */
@@ -1812,6 +1858,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
   verifyPackage = verifyWindowsNormalCandidateSmokePackage,
   createRoot = createOwnedRoot,
   prepareProfile = prepareWindowsDevelopmentProfile,
+  seedCodexFixture = seedWindowsNormalCandidateCodexFixture,
   seedProfile = prepareWindowsNormalCandidateProfile,
   launchJourney = launchAndRenderCandidate,
   verifyOptOut = verifyWindowsNormalCandidateOptOut,
@@ -1824,7 +1871,8 @@ export async function runWindowsNormalCandidateSmoke(options, {
 } = {}) {
   assertHost({ platform, architecture, environment });
   if (!options || typeof verifyPackage !== "function" || typeof createRoot !== "function"
-      || typeof prepareProfile !== "function" || typeof seedProfile !== "function"
+      || typeof prepareProfile !== "function" || typeof seedCodexFixture !== "function"
+      || typeof seedProfile !== "function"
       || typeof launchJourney !== "function" || typeof verifyOptOut !== "function"
       || typeof installFirewall !== "function" || typeof removeFirewall !== "function"
       || typeof assertProcessAbsence !== "function" || typeof ensureReceiptParent !== "function"
@@ -1848,6 +1896,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
     identity = await verifyPackage(options);
     root = await createRoot(environment.RUNNER_TEMP);
     const profile = await prepareProfile({ appPath: options.appPath, profilePath: win32.join(root, "profile") });
+    await seedCodexFixture({ profile });
     const seed = await seedProfile({ profile, stagedAppPath: options.stagedAppPath });
     await assertProcessAbsence({ appPath: options.appPath, environment });
     candidateState.quiescent = true;

@@ -25,6 +25,7 @@ import {
   parseWindowsNormalCandidateSmokeArguments,
   prepareWindowsNormalCandidateProfile,
   runWindowsNormalCandidateSmoke,
+  seedWindowsNormalCandidateCodexFixture,
   selectWindowsNormalCandidateDashboardTarget,
   selectWindowsNormalCandidateSettingsTarget,
   validateWindowsNormalCandidateSmokeMetadata,
@@ -165,6 +166,52 @@ function normalCandidateSeedDependencies(overrides = {}) {
 
 const NORMAL_CANDIDATE_PROFILE = Object.freeze({
   userData: String.raw`C:\tibotattle-normal-candidate-test-${randomUUID()}\user-data`,
+});
+
+test("normal candidate adds one content-free Codex source before launch", async () => {
+  const profile = Object.freeze({
+    codex: String.raw`C:\runner\owned\profile\codex`,
+  });
+  const calls = [];
+  const fixture = await seedWindowsNormalCandidateCodexFixture({ profile }, {
+    createDirectory: async (path, options) => {
+      calls.push({ kind: "directory", path, options });
+    },
+    metadata: async (path) => path.endsWith("sessions")
+      ? { isDirectory: () => true, isSymbolicLink: () => false }
+      : {
+        isFile: () => true,
+        isSymbolicLink: () => false,
+        nlink: 1,
+        size: Buffer.byteLength('{"type":"session_meta","id":"synthetic-windows-normal-candidate"}\n'),
+      },
+    writeFixture: async (path, value, options) => {
+      calls.push({ kind: "file", path, value, options });
+    },
+  });
+  assert.equal(fixture.codexHome, profile.codex);
+  assert.equal(fixture.sessions, String.raw`C:\runner\owned\profile\codex\sessions`);
+  assert.equal(fixture.fixture, String.raw`C:\runner\owned\profile\codex\sessions\synthetic-windows-normal-candidate.jsonl`);
+  assert.deepEqual(calls, [
+    {
+      kind: "directory",
+      path: fixture.sessions,
+      options: { recursive: true, mode: 0o700 },
+    },
+    {
+      kind: "file",
+      path: fixture.fixture,
+      value: '{"type":"session_meta","id":"synthetic-windows-normal-candidate"}\n',
+      options: { mode: 0o600, flag: "wx" },
+    },
+  ]);
+  await assert.rejects(seedWindowsNormalCandidateCodexFixture({ profile }, {
+    createDirectory: async () => {},
+    metadata: async () => ({ isDirectory: () => false, isSymbolicLink: () => false }),
+    writeFixture: async () => {},
+  }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SYNTHETIC_FIXTURE_UNAVAILABLE",
+  });
 });
 
 test("Windows normal candidate smoke accepts only its exact unpacked invocation", () => {
@@ -651,6 +698,7 @@ test("normal candidate runner orders firewall coverage around both ordinary laun
     },
     createRoot: async () => { events.push("root"); return String.raw`C:\runner\temp\owned`; },
     prepareProfile: async () => ({ root: String.raw`C:\runner\temp\owned\profile` }),
+    seedCodexFixture: async () => { events.push("fixture"); },
     seedProfile: async () => ({ shareBackend: {} }),
     assertProcessAbsence: async () => { events.push("absent"); return true; },
     installFirewall: async () => { events.push("firewall-add"); return FIREWALL_RULE; },
@@ -671,7 +719,7 @@ test("normal candidate runner orders firewall coverage around both ordinary laun
   assert.ok(events.indexOf("firewall-add") < events.indexOf("first"));
   assert.ok(events.indexOf("second") < events.indexOf("firewall-remove"));
   assert.deepEqual(events, [
-    "receipt-parent", "package", "root", "absent", "firewall-add", "first", "second", "opt-out", "firewall-remove", "profile-remove",
+    "receipt-parent", "package", "root", "fixture", "absent", "firewall-add", "first", "second", "opt-out", "firewall-remove", "profile-remove",
   ]);
   assert.deepEqual(receipt, {
     schemaVersion: "tibotattle-electron-windows-normal-candidate-smoke-v1",
@@ -714,6 +762,7 @@ test("normal candidate runner retains the outbound block and profile when proces
     verifyPackage: async () => ({ sourceRevision: SOURCE_REVISION, artifactSha256: "a".repeat(64), executableSha256: "b".repeat(64) }),
     createRoot: async () => String.raw`C:\runner\temp\owned`,
     prepareProfile: async () => ({ root: String.raw`C:\runner\temp\owned\profile` }),
+    seedCodexFixture: async () => {},
     seedProfile: async () => ({ shareBackend: {} }),
     assertProcessAbsence: async () => true,
     installFirewall: async () => FIREWALL_RULE,
@@ -758,6 +807,7 @@ test("normal candidate refuses to launch before the outbound block is verified",
     verifyPackage: async () => ({ sourceRevision: SOURCE_REVISION, artifactSha256: "a".repeat(64), executableSha256: "b".repeat(64) }),
     createRoot: async () => String.raw`C:\runner\temp\owned`,
     prepareProfile: async () => ({ root: String.raw`C:\runner\temp\owned\profile` }),
+    seedCodexFixture: async () => {},
     seedProfile: async () => ({ shareBackend: {} }),
     assertProcessAbsence: async () => true,
     installFirewall: (options) => installOutboundFirewallBlock({
