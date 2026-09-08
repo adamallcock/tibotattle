@@ -21,6 +21,7 @@ import {
 } from "../apps/electron/desktop-first-run.js";
 import { validateProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import {
+  ELECTRON_LINUX_SMOKE_FAILURE_STAGES,
   assertContainerContract,
   runSmoke,
 } from "./smoke-electron-linux.mjs";
@@ -47,6 +48,16 @@ const SESSION_DEADLINE_MS = 300_000;
 const SESSION_TERMINATION_MS = 5_000;
 const SESSION_KILL_MS = 1_000;
 const DBUS_RUN_SESSION = "/usr/bin/dbus-run-session";
+const SOURCE_SMOKE_STAGE_CODES = Object.freeze({
+  startup: "SOURCE_SMOKE_STARTUP_FAILED",
+  target: "SOURCE_SMOKE_TARGET_FAILED",
+  renderer: "SOURCE_SMOKE_RENDERER_FAILED",
+  initial_refresh: "SOURCE_SMOKE_INITIAL_REFRESH_FAILED",
+  reload_refresh: "SOURCE_SMOKE_RELOAD_REFRESH_FAILED",
+  observation: "SOURCE_SMOKE_OBSERVATION_FAILED",
+  quit_cleanup: "SOURCE_SMOKE_QUIT_CLEANUP_FAILED",
+});
+const SOURCE_SMOKE_STAGE_CODE_VALUES = new Set(Object.values(SOURCE_SMOKE_STAGE_CODES));
 const SYNTHETIC_CODEX_DIRECTORY = "/opt/tibotattle-linux-packaged-smoke/bin";
 const SYNTHETIC_CODEX_BINARY = join(SYNTHETIC_CODEX_DIRECTORY, "codex");
 const NATIVE_FILES = Object.freeze([
@@ -58,8 +69,9 @@ const CODES = new Set([
   "ARGUMENT_INVALID", "CONTAINER_INVALID", "SOURCE_CANDIDATE_INVALID",
   "PACKAGE_IDENTITY_INVALID", "NATIVE_PAIR_INVALID", "ASAR_UNAVAILABLE",
   "FIXTURE_INVALID", "OBSERVATION_UNAVAILABLE", "UNAVAILABLE_RESPONSE_INVALID",
-  "SESSION_START_FAILED", "SESSION_OUTPUT_INVALID", "SESSION_DEADLINE_EXCEEDED",
-  "SESSION_CLEANUP_UNCONFIRMED",
+  "SESSION_START_FAILED", "SESSION_EXECUTION_FAILED", "SESSION_RECEIPT_INVALID",
+  "PASS_RECEIPT_STDERR_REJECTED", "SESSION_DEADLINE_EXCEEDED", "SESSION_CLEANUP_UNCONFIRMED",
+  ...SOURCE_SMOKE_STAGE_CODE_VALUES,
   "RECEIPT_PATH_INVALID", "UNEXPECTED",
 ]);
 
@@ -79,6 +91,13 @@ function fixedCode(error) {
   return CODES.has(value.replace("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_", ""))
     ? value
     : "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_UNEXPECTED";
+}
+
+/** Map the shared source runner's closed failure stage to this receipt's vocabulary. */
+export function normalPackagedSmokeFailureStageCode(stage) {
+  return typeof stage === "string" && ELECTRON_LINUX_SMOKE_FAILURE_STAGES.includes(stage)
+    ? SOURCE_SMOKE_STAGE_CODES[stage] ?? null
+    : null;
 }
 
 function absolutePath(value) {
@@ -383,6 +402,7 @@ async function readCheckpoint(path) {
 async function runOneNormalApp(identity, { appPath, environment, service, readState = readCheckpoint } = {}) {
   let observed = "invalid";
   let observationFailure = null;
+  let smokeFailureStage = null;
   let result;
   try {
     result = await runSmoke({
@@ -395,6 +415,7 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
         "--disable-gpu",
       ],
       environmentFactory: ({ fixture }) => normalPackagedSmokeEnvironment({ environment, fixture, service }),
+      onFailureStage: (stage) => { smokeFailureStage = stage; },
       sourceRevision: identity.sourceRevision,
       qualification: "candidate-only",
       afterRefresh: async ({ fixture }) => {
@@ -410,6 +431,8 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
     });
   } catch (error) {
     if (observationFailure !== null) fail(observationFailure);
+    const stageCode = normalPackagedSmokeFailureStageCode(smokeFailureStage);
+    if (stageCode !== null) fail(stageCode);
     throw error;
   }
   if (result?.status !== "passed") fail("UNEXPECTED");
@@ -587,19 +610,20 @@ export async function runLinuxNormalPackagedSmokeSession(identity, {
   }
   const output = stdout.bytes();
   const errors = stderr.bytes();
-  if (result[0] !== 0 || result[1] !== null || output === null || errors === null || errors.byteLength !== 0) {
+  if (result[0] !== 0 || result[1] !== null || output === null || errors === null) {
     const innerFailure = classifiedInnerFailure(errors);
     if (result[0] !== 0 && result[1] === null && innerFailure !== null) {
       const error = new Error(innerFailure);
       error.code = innerFailure;
       throw error;
     }
-    fail("SESSION_OUTPUT_INVALID");
+    fail("SESSION_EXECUTION_FAILED");
   }
   let parsed;
-  try { parsed = JSON.parse(output.toString("utf8")); } catch { fail("SESSION_OUTPUT_INVALID"); }
+  try { parsed = JSON.parse(output.toString("utf8")); } catch { fail("SESSION_RECEIPT_INVALID"); }
   const receipt = expectedInsideReceipt(parsed, identity);
-  if (receipt === null) fail("SESSION_OUTPUT_INVALID");
+  if (receipt === null) fail("SESSION_RECEIPT_INVALID");
+  if (errors.byteLength !== 0) fail("PASS_RECEIPT_STDERR_REJECTED");
   return receipt;
 }
 

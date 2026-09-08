@@ -13,6 +13,7 @@ import {
   combineStartupRefreshEvidence,
   createSyntheticHome,
   ELECTRON_LINUX_SMOKE_DEGRADED_FAILURE_CODES,
+  ELECTRON_LINUX_SMOKE_FAILURE_STAGES,
   ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES,
   fixedRuntimeFailureDiagnostics,
   isAllowedRendererNetworkURL,
@@ -564,6 +565,19 @@ test("Linux smoke polling bounds a predicate that never settles", async () => {
     /bounded predicate timed out/u,
   );
   assert.equal(Date.now() - started < 1_000, true);
+});
+
+test("Linux smoke exposes only closed failure-stage boundaries to callers", () => {
+  assert.deepEqual(ELECTRON_LINUX_SMOKE_FAILURE_STAGES, [
+    "startup",
+    "target",
+    "renderer",
+    "initial_refresh",
+    "reload_refresh",
+    "observation",
+    "quit_cleanup",
+  ]);
+  assert.equal(Object.isFrozen(ELECTRON_LINUX_SMOKE_FAILURE_STAGES), true);
 });
 
 test("Linux Electron smoke refuses an unbounded host checkout", () => {

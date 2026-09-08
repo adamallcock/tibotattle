@@ -13,12 +13,16 @@ import {
   classifyLinuxNormalPackagedObservation,
   createLinuxNormalPackagedSmokeFixture,
   normalPackagedSmokeEnvironment,
+  normalPackagedSmokeFailureStageCode,
   parseLinuxNormalPackagedSmokeArguments,
   runLinuxNormalPackagedSmokeSession,
   validateLinuxNormalPackagedSmokeMetadata,
   verifyLinuxNormalPackagedSmokePackage,
 } from "../scripts/smoke-electron-linux-packaged.mjs";
-import { terminateLinuxSmokeChild } from "../scripts/smoke-electron-linux.mjs";
+import {
+  ELECTRON_LINUX_SMOKE_FAILURE_STAGES,
+  terminateLinuxSmokeChild,
+} from "../scripts/smoke-electron-linux.mjs";
 
 const SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567";
 const ARTIFACT_SHA256 = "a".repeat(64);
@@ -286,6 +290,21 @@ test("normal packaged Linux smoke keeps available and unavailable observation ev
   assert.equal(classifyLinuxNormalPackagedObservation({ accountScopeMarker: null }, "available"), "invalid");
 });
 
+test("normal packaged Linux smoke maps each shared source failure boundary to a closed receipt code", () => {
+  assert.deepEqual(Object.fromEntries(ELECTRON_LINUX_SMOKE_FAILURE_STAGES.map(
+    (stage) => [stage, normalPackagedSmokeFailureStageCode(stage)],
+  )), {
+    startup: "SOURCE_SMOKE_STARTUP_FAILED",
+    target: "SOURCE_SMOKE_TARGET_FAILED",
+    renderer: "SOURCE_SMOKE_RENDERER_FAILED",
+    initial_refresh: "SOURCE_SMOKE_INITIAL_REFRESH_FAILED",
+    reload_refresh: "SOURCE_SMOKE_RELOAD_REFRESH_FAILED",
+    observation: "SOURCE_SMOKE_OBSERVATION_FAILED",
+    quit_cleanup: "SOURCE_SMOKE_QUIT_CLEANUP_FAILED",
+  });
+  assert.equal(normalPackagedSmokeFailureStageCode("private renderer detail"), null);
+});
+
 test("forced Linux child cleanup never acts as the normal clean-quit proof", async () => {
   const child = new EventEmitter();
   child.exitCode = null;
@@ -362,5 +381,73 @@ test("normal packaged Linux session retains a closed observation failure stage",
     artifactSha256: ARTIFACT_SHA256,
   }, { appPath: APP_PATH, spawnSession: () => child }), {
     code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_OBSERVATION_UNAVAILABLE",
+  });
+});
+
+test("normal packaged Linux session retains a closed source-smoke phase", async () => {
+  const child = sessionChild();
+  queueMicrotask(() => {
+    child.stdout.end();
+    child.stderr.write("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_INITIAL_REFRESH_FAILED\n");
+    child.stderr.end();
+    child.exitCode = 1;
+    child.emit("exit", 1, null);
+  });
+  await assert.rejects(runLinuxNormalPackagedSmokeSession({
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+  }, { appPath: APP_PATH, spawnSession: () => child }), {
+    code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_INITIAL_REFRESH_FAILED",
+  });
+});
+
+test("normal packaged Linux session separates execution, receipt, and passing-receipt stderr failures", async () => {
+  const failedChild = sessionChild();
+  queueMicrotask(() => {
+    failedChild.stdout.end();
+    failedChild.stderr.write("private runner detail\nELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_FAILED\n");
+    failedChild.stderr.end();
+    failedChild.exitCode = 1;
+    failedChild.emit("exit", 1, null);
+  });
+  let executionFailure;
+  await assert.rejects(runLinuxNormalPackagedSmokeSession({
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+  }, { appPath: APP_PATH, spawnSession: () => failedChild }), (error) => {
+    executionFailure = error;
+    return error?.code === "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SESSION_EXECUTION_FAILED";
+  });
+  assert.equal(String(executionFailure?.message).includes("private runner detail"), false);
+
+  const invalidReceiptChild = sessionChild();
+  queueMicrotask(() => {
+    invalidReceiptChild.stdout.write("not-json\n");
+    invalidReceiptChild.stdout.end();
+    invalidReceiptChild.stderr.end();
+    invalidReceiptChild.exitCode = 0;
+    invalidReceiptChild.emit("exit", 0, null);
+  });
+  await assert.rejects(runLinuxNormalPackagedSmokeSession({
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+  }, { appPath: APP_PATH, spawnSession: () => invalidReceiptChild }), {
+    code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SESSION_RECEIPT_INVALID",
+  });
+
+  const stderrChild = sessionChild();
+  queueMicrotask(() => {
+    stderrChild.stdout.write(`${JSON.stringify(validInnerReceipt())}\n`);
+    stderrChild.stdout.end();
+    stderrChild.stderr.write("D-Bus activation diagnostic\n");
+    stderrChild.stderr.end();
+    stderrChild.exitCode = 0;
+    stderrChild.emit("exit", 0, null);
+  });
+  await assert.rejects(runLinuxNormalPackagedSmokeSession({
+    sourceRevision: SOURCE_REVISION,
+    artifactSha256: ARTIFACT_SHA256,
+  }, { appPath: APP_PATH, spawnSession: () => stderrChild }), {
+    code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_PASS_RECEIPT_STDERR_REJECTED",
   });
 });

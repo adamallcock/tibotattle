@@ -64,6 +64,21 @@ export const ELECTRON_LINUX_SMOKE_DEGRADED_FAILURE_CODES = Object.freeze([
   "codex_rollout_content_invalid",
   "codex_rollout_tail_incomplete",
 ]);
+/**
+ * A caller can retain only one of these coarse journey boundaries when a
+ * shared source smoke fails. The value identifies the assertion region, never
+ * an Electron, renderer, or fixture error.
+ */
+export const ELECTRON_LINUX_SMOKE_FAILURE_STAGES = Object.freeze([
+  "startup",
+  "target",
+  "renderer",
+  "initial_refresh",
+  "reload_refresh",
+  "observation",
+  "quit_cleanup",
+]);
+const ELECTRON_LINUX_SMOKE_FAILURE_STAGE_SET = new Set(ELECTRON_LINUX_SMOKE_FAILURE_STAGES);
 const DEGRADED_FAILURE_CODE_SET = new Set(
   ELECTRON_LINUX_SMOKE_DEGRADED_FAILURE_CODES,
 );
@@ -1092,6 +1107,7 @@ export async function runSmoke({
   environmentFactory = defaultSmokeEnvironment,
   fixtureFactory = createSyntheticHome,
   launchArguments = defaultSmokeLaunchArguments,
+  onFailureStage = null,
   qualification = "development-only",
   sourceRevision = null,
   writeResult = defaultSmokeResultWriter,
@@ -1099,7 +1115,9 @@ export async function runSmoke({
   if (afterRefresh !== null && typeof afterRefresh !== "function"
       || typeof binary !== "string" || binary.length === 0
       || typeof environmentFactory !== "function" || typeof fixtureFactory !== "function"
-      || typeof launchArguments !== "function" || typeof writeResult !== "function"
+      || typeof launchArguments !== "function"
+      || onFailureStage !== null && typeof onFailureStage !== "function"
+      || typeof writeResult !== "function"
       || typeof qualification !== "string" || qualification.length === 0
       || (sourceRevision !== null && !/^[0-9a-f]{40}$/u.test(sourceRevision))) {
     fail("Electron Linux smoke runner options are invalid");
@@ -1146,7 +1164,9 @@ export async function runSmoke({
   let refreshObserver = null;
   let forcedShutdown = false;
   let cleanupConfirmed = false;
+  let failureStage = null;
   try {
+    failureStage = "startup";
     if (!child.pid) fail("Electron did not provide a process id");
     const version = await waitFor(
       () => jsonFetch(`http://127.0.0.1:${port}/json/version`),
@@ -1166,6 +1186,7 @@ export async function runSmoke({
     // debugger-owned page before deciding what it is. Electron can expose an
     // auxiliary or recovery page first; only an exact target-id match to the
     // loopback dashboard below may contribute evidence.
+    failureStage = "target";
     const dashboardSelection = await waitFor(async () => {
       const targets = await jsonFetch(`http://127.0.0.1:${port}/json`);
       const inspectablePages = reserveLinuxInspectablePageTargets(
@@ -1230,6 +1251,7 @@ export async function runSmoke({
       MAX_STARTUP_MS,
       "Electron dashboard frame",
     ));
+    failureStage = "renderer";
     const ready = await waitFor(
       async () => {
         const snapshot = await cdp.evaluate(`(() => ({
@@ -1271,6 +1293,7 @@ export async function runSmoke({
       fail("renderer requested a non-loopback resource");
     }
     await assertRendererShell(cdp);
+    failureStage = "initial_refresh";
     const initialStartupRefresh = await assertAutomaticStartupRefresh({
       child,
       dashboardUrl,
@@ -1285,6 +1308,7 @@ export async function runSmoke({
       fail("Electron had no companion descendant after readiness");
     }
 
+    failureStage = "reload_refresh";
     const previousStatus = await jsonFetch(new URL("/api/local/refresh", dashboardUrl));
     const previousRefreshId = typeof previousStatus?.refresh?.refreshId === "string"
       ? previousStatus.refresh.refreshId
@@ -1328,11 +1352,13 @@ export async function runSmoke({
       initialStartupRefresh,
       reloadStartupRefresh,
     );
+    failureStage = "observation";
     await afterRefresh?.({
       dashboardOrigin: dashboardUrl.origin,
       fixture,
       startupRefresh,
     });
+    failureStage = "renderer";
     if (selectedPage.networkEvidenceInvalid()
         || observedNetworkUrls.some((url) => !isAllowedRendererNetworkURL(url, dashboardUrl.origin))) {
       fail("renderer attempted a non-loopback network request");
@@ -1342,6 +1368,7 @@ export async function runSmoke({
     // in a headless desktop lane. A real desktop can additionally exercise the
     // tray's hide/show actions; this lane proves that minimizing/restoring does
     // not lose the renderer or companion.
+    failureStage = "quit_cleanup";
     let windowMinimizedAndRestored = false;
     try {
       const windowInfo = await cdp.request("Browser.getWindowForTarget");
@@ -1413,6 +1440,14 @@ export async function runSmoke({
     return result;
   } catch (error) {
     forcedShutdown = true;
+    if (failureStage !== null && ELECTRON_LINUX_SMOKE_FAILURE_STAGE_SET.has(failureStage)
+        && onFailureStage !== null) {
+      try {
+        onFailureStage(failureStage);
+      } catch {
+        // A diagnostic listener must not alter the underlying smoke failure.
+      }
+    }
     throw error;
   } finally {
     for (const page of attachedPages.values()) {
