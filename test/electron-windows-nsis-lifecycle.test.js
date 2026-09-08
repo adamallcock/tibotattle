@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -20,6 +21,7 @@ import {
   parseWindowsProcessSnapshot,
   runWindowsNsisLifecycleProgram,
   runWindowsNsisLifecycle,
+  WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY,
 } from "../scripts/smoke-electron-windows-nsis-lifecycle.mjs";
 
 const revision = "a".repeat(40);
@@ -153,8 +155,13 @@ test("pinned NSIS source proves a silent install cannot start the app without fo
 test("registry and exact-executable probes use fixed read-only PowerShell contracts", () => {
   const installationRoot = resolve("tibotattle-nsis-app");
   const registryArguments = buildWindowsNsisRegistryInspectionArguments(installationRoot);
-  assert.equal(registryArguments.at(-1), installationRoot);
+  assert.equal(registryArguments.includes(installationRoot), false);
   assert.match(registryArguments[4], /Registry\]::CurrentUser\.OpenSubKey/u);
+  assert.match(registryArguments[4], new RegExp(WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY, "u"));
+  assert.match(registryArguments[4], /ConvertTo-CanonicalLifecyclePath/u);
+  assert.match(registryArguments[4], /\$observed=ConvertTo-CanonicalLifecyclePath\(\$value\)/u);
+  assert.match(registryArguments[4], /TrimEnd\(\[System\.IO\.Path\]::DirectorySeparatorChar/u);
+  assert.doesNotMatch(registryArguments[4], /\$args\[0\]/u);
   assert.doesNotMatch(registryArguments[4], /reg\.exe|Remove-Item|Set-Item/u);
   assert.equal(parseWindowsNsisRegistryInspectionResult("absent-v1"), "absent-v1");
   assert.equal(parseWindowsNsisRegistryInspectionResult("expected-v1"), "expected-v1");
@@ -163,9 +170,69 @@ test("registry and exact-executable probes use fixed read-only PowerShell contra
 
   const appPath = join(installationRoot, "TiboTattle Dev.exe");
   const processArguments = buildWindowsExactExecutableProcessQueryArguments(appPath);
-  assert.equal(processArguments.at(-1), appPath);
+  assert.equal(processArguments.includes(appPath), false);
   assert.match(processArguments[4], /Get-CimInstance Win32_Process/u);
+  assert.match(processArguments[4], new RegExp(WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY, "u"));
+  assert.doesNotMatch(processArguments[4], /\$args\[0\]/u);
   assert.doesNotMatch(processArguments[4], /Remove-|Stop-Process|Start-Process/u);
+});
+
+test("read-only PowerShell probes receive only an explicit fixed child path", async () => {
+  const expectedPath = resolve("tibotattle-nsis-probe-path");
+  const captured = [];
+  const spawnProcess = (_command, _argumentsList, options) => {
+    captured.push(options.env);
+    const child = new EventEmitter();
+    queueMicrotask(() => child.emit("close", 0));
+    return child;
+  };
+  await runWindowsNsisLifecycleProgram(resolve("powershell.exe"), ["-Command", "exit 0"], {
+    timeoutMs: 100,
+    environment: {
+      SystemRoot: "/synthetic/windows",
+      [WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY]: "/ambient/must-not-pass",
+    },
+  }, { spawnProcess });
+  await runWindowsNsisLifecycleProgram(resolve("powershell.exe"), ["-Command", "exit 0"], {
+    timeoutMs: 100,
+    environment: { SystemRoot: "/synthetic/windows" },
+    fixedProbePath: expectedPath,
+  }, { spawnProcess });
+  assert.equal(Object.hasOwn(captured[0], WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY), false);
+  assert.equal(captured[1][WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY], expectedPath);
+});
+
+test("Windows PowerShell fixed path probe rejects missing and malformed child values", {
+  skip: process.platform !== "win32",
+}, () => {
+  const systemRoot = process.env.SystemRoot;
+  assert.equal(typeof systemRoot, "string");
+  const executable = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const expectedPath = join(process.env.TEMP ?? systemRoot, "tibotattle-nsis-probe-path");
+  const argumentsList = buildWindowsNsisRegistryInspectionArguments(expectedPath);
+  const invoke = (value) => {
+    const environment = { ...process.env };
+    delete environment[WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY];
+    if (value !== undefined) environment[WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY] = value;
+    return spawnSync(executable, argumentsList, {
+      encoding: "utf8",
+      timeout: 20_000,
+      shell: false,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: environment,
+    });
+  };
+  const valid = invoke(expectedPath);
+  assert.equal(valid.error, undefined);
+  assert.equal(valid.signal, null);
+  assert.equal(valid.status, 0);
+  assert.doesNotThrow(() => parseWindowsNsisRegistryInspectionResult(valid.stdout));
+  for (const malformed of [undefined, "relative-path", "C:\\invalid|path"]) {
+    const result = invoke(malformed);
+    assert.notEqual(result.status, 0);
+    assert.equal(result.stdout, "");
+  }
 });
 
 test("a non-closing installer process produces a bounded unsettled result", async () => {
@@ -339,6 +406,7 @@ test("launch proof fences ready snapshot and rejects a lingering exact installed
   const appPath = join(root, "TiboTattle Dev.exe");
   const child = new FixedSmokeChild(505);
   const processCalls = [];
+  let snapshots = 0;
   try {
     const result = await defaultLaunchAndExercise({
       appPath,
@@ -364,7 +432,8 @@ test("launch proof fences ready snapshot and rejects a lingering exact installed
       },
       readProcessSnapshot: async () => {
         processCalls.push("snapshot");
-        return processCalls.length === 1
+        snapshots += 1;
+        return snapshots === 1
           ? [{ pid: child.pid, parentPid: 1, creation: "started" }]
           : [];
       },
@@ -375,8 +444,9 @@ test("launch proof fences ready snapshot and rejects a lingering exact installed
       stopChild: async () => true,
     });
     assert.equal(result.observedProcessTreeExited, true);
-    assert.equal(result.installedExecutableAbsent, true);
-    assert.deepEqual(processCalls, ["snapshot", "snapshot", "exact-executable"]);
+    assert.equal(result.installedExecutableAbsentAtPreLaunchSnapshot, true);
+    assert.equal(result.installedExecutableAbsentAtPostExitSnapshot, true);
+    assert.deepEqual(processCalls, ["exact-executable", "snapshot", "snapshot", "exact-executable"]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -414,13 +484,43 @@ test("launch proof refuses a later exact installed-executable process before the
         snapshots += 1;
         return snapshots === 1 ? [{ pid: child.pid, parentPid: 1, creation: "started" }] : [];
       },
-      readInstalledExecutableProcesses: async () => [{
-        pid: 707,
-        parentPid: 1,
-        creation: "orphan",
-      }],
+      readInstalledExecutableProcesses: async () => {
+        const checks = snapshots;
+        return checks === 0 ? [] : [{
+          pid: 707,
+          parentPid: 1,
+          creation: "orphan",
+        }];
+      },
       stopChild: async () => true,
     }), /INSTALLED_EXECUTABLE_REMAINS/u);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("launch refuses an exact installed executable at its immediate pre-spawn snapshot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-prelaunch-test-"));
+  const appPath = join(root, "TiboTattle Dev.exe");
+  let launches = 0;
+  try {
+    await assert.rejects(defaultLaunchAndExercise({
+      appPath,
+      profile: profile(join(root, "profile")),
+      launchOrdinal: 2,
+      environment: { SystemRoot: "C:\\Windows" },
+      spawnApplication: () => {
+        launches += 1;
+        return new FixedSmokeChild(707);
+      },
+      readInstalledExecutableProcesses: async () => [{
+        pid: 606,
+        parentPid: 1,
+        creation: "still-running",
+      }],
+      stopChild: async () => true,
+    }), /INSTALLED_EXECUTABLE_PRESENT_BEFORE_LAUNCH/u);
+    assert.equal(launches, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -484,7 +584,8 @@ test("lifecycle binds installed bytes, uses two distinct top-level processes in 
         return {
           pid: launchOrdinal === 1 ? 101 : 202,
           observedProcessTreeExited: true,
-          installedExecutableAbsent: true,
+          installedExecutableAbsentAtPreLaunchSnapshot: true,
+          installedExecutableAbsentAtPostExitSnapshot: true,
           storageJourneyCompleted: true,
         };
       },
@@ -506,10 +607,11 @@ test("lifecycle binds installed bytes, uses two distinct top-level processes in 
     assert.deepEqual(calls.map(([name]) => name), [
       "install",
       "uninstaller",
-      "verify-installed",
       "profile",
       "first-run",
+      "verify-installed",
       "launch",
+      "verify-installed",
       "launch",
       "uninstall",
       "cleanup-poll",
@@ -523,16 +625,222 @@ test("lifecycle binds installed bytes, uses two distinct top-level processes in 
     assert.equal(receipt.topLevelProcessIdsDistinct, true);
     assert.equal(receipt.firstObservedApplicationProcessTreeExited, true);
     assert.equal(receipt.secondObservedApplicationProcessTreeExited, true);
-    assert.equal(receipt.firstInstalledExecutableAbsentBeforeSecondLaunch, true);
-    assert.equal(receipt.secondInstalledExecutableAbsentBeforeUninstall, true);
+    assert.equal(receipt.firstInstalledExecutableAbsentAtPreLaunchSnapshot, true);
+    assert.equal(receipt.firstInstalledExecutableAbsentAtPostExitSnapshot, true);
+    assert.equal(receipt.secondInstalledExecutableAbsentAtPreLaunchSnapshot, true);
+    assert.equal(receipt.secondInstalledExecutableAbsentAtPostExitSnapshot, true);
     assert.equal(receipt.fullOwnedDescendantCleanupVerified, false);
     assert.equal(receipt.profileReusedAcrossLaunches, true);
+    assert.equal(receipt.firstInstalledBytesVerified, true);
+    assert.equal(receipt.secondInstalledBytesVerified, true);
     assert.equal(receipt.sameInstalledApplicationBytesBound, true);
     assert.equal(receipt.persistentApplicationCredentialStateVerified, false);
-    assert.equal(receipt.storageJourneyDeletesSyntheticRecord, true);
+    assert.equal(receipt.accountlessSyntheticRecordDeleted, true);
+    assert.equal(receipt.accountObservationCredentialCleanup, "disposable_runner_account_lifetime");
     assert.equal(receipt.uninstallRegistryAbsent, true);
     assert.equal(receipt.cleanupConfirmed, true);
     assert.equal(receipt.productionReady, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a mismatched reverify refuses the second launch and preserves the first failure", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-reverify-test-"));
+  const receiptPath = join(root, "receipt.json");
+  const ownedRoot = join(root, "owned");
+  let missingCalls = 0;
+  let registryCalls = 0;
+  let packageVerifications = 0;
+  let launches = 0;
+  let uninstallerRuns = 0;
+  try {
+    await assert.rejects(runWindowsNsisLifecycle({
+      installerPath: join(root, "installer.exe"),
+      stagedAppPath: join(root, "staged"),
+      packageReceiptPath: join(root, "development-package.json"),
+      sourceRevision: revision,
+      receiptPath,
+    }, {
+      platform: "win32",
+      architecture: "x64",
+      environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: root, SystemRoot: "C:\\Windows" },
+      verifyInstaller: async () => ({ sourceRevision: revision, installerBytes: 123, installerSha256: "b".repeat(64) }),
+      verifySilentNsisTemplate: async () => true,
+      createOwnedRoot: async () => ownedRoot,
+      isMissing: async () => {
+        missingCalls += 1;
+        return missingCalls === 1 || missingCalls >= 3;
+      },
+      inspectRegistry: async () => {
+        registryCalls += 1;
+        return registryCalls === 1 || registryCalls >= 4 ? "absent-v1" : "expected-v1";
+      },
+      executeInstaller: async () => ({ settled: true, succeeded: true }),
+      assertUninstaller: async () => {},
+      verifyInstalledPackage: async () => {
+        packageVerifications += 1;
+        return packageVerifications === 1
+          ? installedIdentity
+          : { ...installedIdentity, artifactSha256: "e".repeat(64) };
+      },
+      prepareProfile: async ({ profilePath }) => profile(profilePath),
+      prepareFirstRun: async () => {},
+      launchAndExercise: async ({ launchOrdinal }) => {
+        launches += 1;
+        return {
+          pid: launchOrdinal === 1 ? 111 : 222,
+          observedProcessTreeExited: true,
+          installedExecutableAbsentAtPreLaunchSnapshot: true,
+          installedExecutableAbsentAtPostExitSnapshot: true,
+          storageJourneyCompleted: true,
+        };
+      },
+      executeUninstaller: async () => {
+        uninstallerRuns += 1;
+        return { settled: true, succeeded: true };
+      },
+      removeOwnedRoot: async () => {},
+    }), /INSTALLED_PACKAGE_IDENTITY_INVALID/u);
+    assert.equal(packageVerifications, 2);
+    assert.equal(launches, 1);
+    assert.equal(uninstallerRuns, 1);
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NSIS_LIFECYCLE_INSTALLED_PACKAGE_IDENTITY_INVALID");
+    assert.equal(receipt.topLevelLaunches, 1);
+    assert.equal(receipt.firstInstalledBytesVerified, true);
+    assert.equal(receipt.secondInstalledBytesVerified, true);
+    assert.equal(receipt.sameInstalledApplicationBytesBound, false);
+    assert.equal(receipt.cleanupConfirmed, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a failed uninstaller is terminal and retains its original cleanup uncertainty", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-uninstaller-failure-test-"));
+  const receiptPath = join(root, "receipt.json");
+  const ownedRoot = join(root, "owned");
+  let registryCalls = 0;
+  let uninstallerRuns = 0;
+  let cleanupPolls = 0;
+  let rootRemovals = 0;
+  try {
+    await assert.rejects(runWindowsNsisLifecycle({
+      installerPath: join(root, "installer.exe"),
+      stagedAppPath: join(root, "staged"),
+      packageReceiptPath: join(root, "development-package.json"),
+      sourceRevision: revision,
+      receiptPath,
+    }, {
+      platform: "win32",
+      architecture: "x64",
+      environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: root, SystemRoot: "C:\\Windows" },
+      verifyInstaller: async () => ({ sourceRevision: revision, installerBytes: 123, installerSha256: "b".repeat(64) }),
+      verifySilentNsisTemplate: async () => true,
+      createOwnedRoot: async () => ownedRoot,
+      isMissing: async () => true,
+      inspectRegistry: async () => {
+        registryCalls += 1;
+        return registryCalls === 1 ? "absent-v1" : "expected-v1";
+      },
+      executeInstaller: async () => ({ settled: true, succeeded: true }),
+      assertUninstaller: async () => {},
+      verifyInstalledPackage: async () => installedIdentity,
+      prepareProfile: async ({ profilePath }) => profile(profilePath),
+      prepareFirstRun: async () => {},
+      launchAndExercise: async ({ launchOrdinal }) => ({
+        pid: launchOrdinal === 1 ? 333 : 444,
+        observedProcessTreeExited: true,
+        installedExecutableAbsentAtPreLaunchSnapshot: true,
+        installedExecutableAbsentAtPostExitSnapshot: true,
+        storageJourneyCompleted: true,
+      }),
+      executeUninstaller: async () => {
+        uninstallerRuns += 1;
+        return { settled: true, succeeded: false };
+      },
+      waitForCleanupPoll: async () => { cleanupPolls += 1; },
+      removeOwnedRoot: async () => { rootRemovals += 1; },
+    }), /UNINSTALLER_FAILED/u);
+    assert.equal(uninstallerRuns, 1);
+    assert.equal(cleanupPolls, 0);
+    assert.equal(rootRemovals, 0);
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NSIS_LIFECYCLE_UNINSTALLER_FAILED");
+    assert.equal(receipt.uninstallationAttempted, true);
+    assert.equal(receipt.uninstallationPerformed, false);
+    assert.equal(receipt.cleanupVerificationSkippedBecauseOperationUnsettled, true);
+    assert.equal(receipt.cleanupConfirmed, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("post-uninstall polling uses one monotonic budget across fixed probes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-postcondition-budget-test-"));
+  const receiptPath = join(root, "receipt.json");
+  const ownedRoot = join(root, "owned");
+  let now = 0;
+  let missingCalls = 0;
+  let registryCalls = 0;
+  const postconditionTimeouts = [];
+  const cleanupPolls = [];
+  try {
+    await assert.rejects(runWindowsNsisLifecycle({
+      installerPath: join(root, "installer.exe"),
+      stagedAppPath: join(root, "staged"),
+      packageReceiptPath: join(root, "development-package.json"),
+      sourceRevision: revision,
+      receiptPath,
+    }, {
+      platform: "win32",
+      architecture: "x64",
+      environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: root, SystemRoot: "C:\\Windows" },
+      verifyInstaller: async () => ({ sourceRevision: revision, installerBytes: 123, installerSha256: "b".repeat(64) }),
+      verifySilentNsisTemplate: async () => true,
+      createOwnedRoot: async () => ownedRoot,
+      isMissing: async () => {
+        missingCalls += 1;
+        return missingCalls === 1;
+      },
+      inspectRegistry: async ({ timeoutMs } = {}) => {
+        registryCalls += 1;
+        if (timeoutMs !== undefined) {
+          postconditionTimeouts.push(timeoutMs);
+          now += 11;
+        }
+        return registryCalls === 1 ? "absent-v1" : "expected-v1";
+      },
+      executeInstaller: async () => ({ settled: true, succeeded: true }),
+      assertUninstaller: async () => {},
+      verifyInstalledPackage: async () => installedIdentity,
+      prepareProfile: async ({ profilePath }) => profile(profilePath),
+      prepareFirstRun: async () => {},
+      launchAndExercise: async ({ launchOrdinal }) => ({
+        pid: launchOrdinal === 1 ? 555 : 666,
+        observedProcessTreeExited: true,
+        installedExecutableAbsentAtPreLaunchSnapshot: true,
+        installedExecutableAbsentAtPostExitSnapshot: true,
+        storageJourneyCompleted: true,
+      }),
+      executeUninstaller: async () => ({ settled: true, succeeded: true }),
+      waitForCleanupPoll: async (milliseconds) => {
+        cleanupPolls.push(milliseconds);
+        now += milliseconds;
+      },
+      monotonicNow: () => now,
+      uninstallPostconditionBudgetMs: 10_010,
+      uninstallProgramTerminationGraceMs: 10_000,
+      removeOwnedRoot: async () => { throw new Error("must not remove on unconfirmed cleanup"); },
+    }), /CLEANUP_UNCONFIRMED/u);
+    assert.deepEqual(postconditionTimeouts, [10]);
+    assert.deepEqual(cleanupPolls, [250]);
+    assert.equal(registryCalls, 3);
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.cleanupConfirmed, false);
+    assert.equal(receipt.installRootAbsent, false);
+    assert.equal(receipt.uninstallRegistryAbsent, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -612,7 +920,8 @@ test("a repeated top-level PID refuses success and still runs the exact uninstal
       launchAndExercise: async () => ({
         pid: 101,
         observedProcessTreeExited: true,
-        installedExecutableAbsent: true,
+        installedExecutableAbsentAtPreLaunchSnapshot: true,
+        installedExecutableAbsentAtPostExitSnapshot: true,
         storageJourneyCompleted: true,
       }),
       executeUninstaller: async () => {

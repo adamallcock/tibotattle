@@ -3,13 +3,15 @@
 // Disposable hosted-runner proof for an unsigned Windows development installer.
 // It never signs, enables production selection, or accepts a user-selected
 // install location. The only NSIS /D target is a new private child of
-// RUNNER_TEMP, and the receipt intentionally keeps credential persistence
-// unproven because the fixed storage smoke removes its synthetic record.
+// RUNNER_TEMP. The receipt keeps application credential persistence unproven:
+// the accountless FD3 journey deletes its synthetic record, while the
+// observation credential is scoped to the disposable runner account lifetime.
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdtemp, open, readFile, rm } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, join, relative, resolve, win32 } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -41,10 +43,15 @@ const PROCESS_CLEANUP_TIMEOUT_MS = 10_000;
 const PROGRAM_TERMINATION_GRACE_MS = 10_000;
 const UNINSTALL_POSTCONDITION_ATTEMPTS = 40;
 const UNINSTALL_POSTCONDITION_INTERVAL_MS = 250;
+const UNINSTALL_POSTCONDITION_BUDGET_MS = 20_000;
 const PROGRAM_OUTPUT_LIMIT_BYTES = 64 * 1024;
 const REGISTRY_ABSENT = "absent-v1";
 const REGISTRY_EXPECTED = "expected-v1";
 const REGISTRY_OTHER = "other-v1";
+// This value is injected only into the two fixed read-only PowerShell probes.
+// It is deliberately not inherited from the parent environment by any child.
+export const WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY =
+  "TIBOTATTLE_NSIS_LIFECYCLE_EXPECTED_PATH_V1";
 const INSTALLER_ENVIRONMENT_KEYS = Object.freeze([
   "SystemRoot",
   "WINDIR",
@@ -410,13 +417,19 @@ async function defaultCreateOwnedRoot(runnerTemp) {
   return root;
 }
 
-function selectedInstallerEnvironment(environment) {
+function selectedInstallerEnvironment(environment, fixedProbePath = null) {
   const selected = {};
   for (const key of INSTALLER_ENVIRONMENT_KEYS) {
     const value = environment?.[key];
     if (typeof value === "string" && value.length > 0 && !value.includes("\0")) {
       selected[key] = value;
     }
+  }
+  // Do not forward an ambient value with this name. Only the fixed read-only
+  // probe call below can add its prevalidated path to a child environment.
+  if (fixedProbePath !== null) {
+    if (!validAbsolutePath(fixedProbePath)) fail("PROGRAM_INVALID");
+    selected[WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY] = fixedProbePath;
   }
   return selected;
 }
@@ -452,6 +465,7 @@ export async function runWindowsNsisLifecycleProgram(command, args, {
   timeoutMs,
   captureOutput = false,
   environment = process.env,
+  fixedProbePath = null,
 } = {}, {
   spawnProcess = spawn,
   terminationGraceMs = PROGRAM_TERMINATION_GRACE_MS,
@@ -459,6 +473,7 @@ export async function runWindowsNsisLifecycleProgram(command, args, {
   if (!validAbsolutePath(command) || !Array.isArray(args)
       || args.some((value) => typeof value !== "string" || value.includes("\0"))
       || !Number.isSafeInteger(timeoutMs) || timeoutMs <= 0
+      || (fixedProbePath !== null && !validAbsolutePath(fixedProbePath))
       || typeof spawnProcess !== "function"
       || !Number.isSafeInteger(terminationGraceMs) || terminationGraceMs <= 0) {
     fail("PROGRAM_INVALID");
@@ -469,7 +484,7 @@ export async function runWindowsNsisLifecycleProgram(command, args, {
       child = spawnProcess(command, args, {
         shell: false,
         windowsHide: true,
-        env: selectedInstallerEnvironment(environment),
+        env: selectedInstallerEnvironment(environment, fixedProbePath),
         stdio: captureOutput ? ["ignore", "pipe", "ignore"] : "ignore",
       });
     } catch {
@@ -547,21 +562,32 @@ export function parseWindowsNsisRegistryInspectionResult(output) {
   fail("REGISTRY_UNAVAILABLE");
 }
 
+function fixedPowerShellExpectedPathPrelude() {
+  return `function ConvertTo-CanonicalLifecyclePath([string]$path){$full=[System.IO.Path]::GetFullPath($path);$root=[System.IO.Path]::GetPathRoot($full);if([string]::IsNullOrWhiteSpace($root) -or -not [System.IO.Path]::IsPathRooted($full)){throw 'expected-path'};if($full.Length -gt $root.Length){return $full.TrimEnd([System.IO.Path]::DirectorySeparatorChar,[System.IO.Path]::AltDirectorySeparatorChar)};return $full};$expectedPathRaw=[Environment]::GetEnvironmentVariable('${WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY}','Process');if($expectedPathRaw -isnot [string] -or [string]::IsNullOrWhiteSpace($expectedPathRaw) -or -not [System.IO.Path]::IsPathRooted($expectedPathRaw)){throw 'expected-path'};$expected=ConvertTo-CanonicalLifecyclePath($expectedPathRaw);`;
+}
+
 /** A fixed, read-only Registry API probe with no raw registry value in stdout. */
 export function buildWindowsNsisRegistryInspectionArguments(expectedInstallationRoot) {
   if (!validAbsolutePath(expectedInstallationRoot)) fail("REGISTRY_UNAVAILABLE");
-  const query = "$ErrorActionPreference='Stop';$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\962AD905-00AD-56CE-85F1-F2541D787AC7',$false);if($null -eq $key){[Console]::Out.Write('absent-v1');exit 0};try{$value=$key.GetValue('InstallLocation',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($value -isnot [string]){throw 'install-location'};$expected=[System.IO.Path]::GetFullPath([string]$args[0]);$observed=[System.IO.Path]::GetFullPath($value);if([string]::Equals($observed,$expected,[System.StringComparison]::OrdinalIgnoreCase)){[Console]::Out.Write('expected-v1')}else{[Console]::Out.Write('other-v1')}}finally{$key.Dispose()}";
+  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\962AD905-00AD-56CE-85F1-F2541D787AC7',$false);if($null -eq $key){[Console]::Out.Write('absent-v1');exit 0};try{$value=$key.GetValue('InstallLocation',$null,[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames);if($value -isnot [string]){throw 'install-location'};$observed=ConvertTo-CanonicalLifecyclePath($value);if([string]::Equals($observed,$expected,[System.StringComparison]::OrdinalIgnoreCase)){[Console]::Out.Write('expected-v1')}else{[Console]::Out.Write('other-v1')}}finally{$key.Dispose()}`;
   return Object.freeze([
     "-NoLogo",
     "-NoProfile",
     "-NonInteractive",
     "-Command",
     query,
-    expectedInstallationRoot,
   ]);
 }
 
-async function defaultInspectRegistry({ environment, runProgram, expectedInstallationRoot }) {
+async function defaultInspectRegistry({
+  environment,
+  runProgram,
+  expectedInstallationRoot,
+  timeoutMs = PROCESS_SNAPSHOT_TIMEOUT_MS,
+}) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > PROCESS_SNAPSHOT_TIMEOUT_MS) {
+    fail("REGISTRY_UNAVAILABLE");
+  }
   const command = systemExecutable(environment, [
     "System32",
     "WindowsPowerShell",
@@ -569,9 +595,10 @@ async function defaultInspectRegistry({ environment, runProgram, expectedInstall
     "powershell.exe",
   ]);
   const result = await runProgram(command, buildWindowsNsisRegistryInspectionArguments(expectedInstallationRoot), {
-    timeoutMs: PROCESS_SNAPSHOT_TIMEOUT_MS,
+    timeoutMs,
     captureOutput: true,
     environment,
+    fixedProbePath: expectedInstallationRoot,
   });
   if (!validProgramResult(result, true)) fail("REGISTRY_UNAVAILABLE");
   if (!result.settled || result.timedOut || result.exitCode !== 0) fail("REGISTRY_UNAVAILABLE");
@@ -627,19 +654,19 @@ async function defaultReadWindowsProcessSnapshot({ environment, runProgram }) {
 
 /**
  * Ask WMI only whether the exact installed Electron executable remains. The
- * app path is a separate argv value, never interpolated into the command.
+ * app path is a fixed, validated child-only environment value, never
+ * interpolated into the command or copied from the parent environment.
  * Output deliberately keeps paths out of receipts and logs.
  */
 export function buildWindowsExactExecutableProcessQueryArguments(appPath) {
   if (!validAbsolutePath(appPath)) fail("PROCESS_PROOF_UNAVAILABLE");
-  const query = "$ErrorActionPreference='Stop';$expected=[System.IO.Path]::GetFullPath([string]$args[0]);$rows=@(Get-CimInstance Win32_Process|Where-Object {$null -ne $_.CreationDate -and $null -ne $_.ExecutablePath -and [string]::Equals($_.ExecutablePath,$expected,[System.StringComparison]::OrdinalIgnoreCase)}|Select-Object ProcessId,ParentProcessId,CreationDate);[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))";
+  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$rows=@(Get-CimInstance Win32_Process|Where-Object {$null -ne $_.CreationDate -and $null -ne $_.ExecutablePath -and [string]::Equals($_.ExecutablePath,$expected,[System.StringComparison]::OrdinalIgnoreCase)}|Select-Object ProcessId,ParentProcessId,CreationDate);[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
   return Object.freeze([
     "-NoLogo",
     "-NoProfile",
     "-NonInteractive",
     "-Command",
     query,
-    appPath,
   ]);
 }
 
@@ -654,6 +681,7 @@ async function defaultReadInstalledExecutableProcesses({ appPath, environment, r
     timeoutMs: PROCESS_SNAPSHOT_TIMEOUT_MS,
     captureOutput: true,
     environment,
+    fixedProbePath: appPath,
   });
   if (!validProgramResult(result, true) || !result.settled || result.timedOut || result.exitCode !== 0) {
     fail("PROCESS_PROOF_UNAVAILABLE");
@@ -810,6 +838,12 @@ export async function defaultLaunchAndExercise({
     sendFailureCode: null,
   };
   try {
+    // This is a point-in-time read immediately before each top-level spawn.
+    // It prevents a later launch from accepting an exact installed Electron
+    // executable that survived the preceding lifecycle step.
+    if ((await readInstalledExecutableProcesses({ appPath, environment, runProgram })).length !== 0) {
+      fail("INSTALLED_EXECUTABLE_PRESENT_BEFORE_LAUNCH");
+    }
     child = spawnApplication(spec.command, spec.args, {
       ...spec.options,
       env: {
@@ -841,7 +875,8 @@ export async function defaultLaunchAndExercise({
     return Object.freeze({
       pid: child.pid,
       observedProcessTreeExited: true,
-      installedExecutableAbsent: true,
+      installedExecutableAbsentAtPreLaunchSnapshot: true,
+      installedExecutableAbsentAtPostExitSnapshot: true,
       storageJourneyCompleted: observations.storagePassed === true
         && observations.accountObservationStoragePassed === true,
     });
@@ -865,18 +900,64 @@ function assertLaunchResult(result) {
       || !Number.isSafeInteger(result.pid)
       || result.pid <= 0
       || result.observedProcessTreeExited !== true
-      || result.installedExecutableAbsent !== true
+      || result.installedExecutableAbsentAtPreLaunchSnapshot !== true
+      || result.installedExecutableAbsentAtPostExitSnapshot !== true
       || result.storageJourneyCompleted !== true) {
     fail("APPLICATION_LIFECYCLE_INVALID");
   }
   return result;
 }
 
+function assertInstalledLaunchPackageIdentity(value, sourceRevision) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)
+      || Object.keys(value).length !== 3
+      || value.sourceRevision !== sourceRevision
+      || !SHA256.test(value.artifactSha256 ?? "")
+      || !SHA256.test(value.executableSha256 ?? "")) {
+    fail("INSTALLED_PACKAGE_IDENTITY_INVALID");
+  }
+  return Object.freeze({
+    sourceRevision: value.sourceRevision,
+    artifactSha256: value.artifactSha256,
+    executableSha256: value.executableSha256,
+  });
+}
+
+async function verifyInstalledPackageBeforeLaunch({
+  verifyInstalledPackage,
+  appPath,
+  stagedAppPath,
+  packageReceiptPath,
+  sourceRevision,
+}) {
+  let verified;
+  try {
+    verified = await verifyInstalledPackage({
+      appPath,
+      stagedAppPath,
+      packageReceiptPath,
+      sourceRevision,
+    });
+  } catch {
+    fail("INSTALLED_PACKAGE_IDENTITY_INVALID");
+  }
+  return assertInstalledLaunchPackageIdentity(verified, sourceRevision);
+}
+
+function sameInstalledLaunchPackageIdentity(left, right) {
+  return left !== null && right !== null
+    && left.sourceRevision === right.sourceRevision
+    && left.artifactSha256 === right.artifactSha256
+    && left.executableSha256 === right.executableSha256;
+}
+
 /**
  * NSIS can finish its visible process shortly before its own temporary clone
  * releases the app tree or uninstall key. Observe only the two fixed
- * postconditions for a short bounded interval; never reinstall or replay a
- * mutation to make a late cleanup appear successful.
+ * postconditions under one monotonic budget; never reinstall or replay a
+ * mutation to make a late cleanup appear successful. A local filesystem read
+ * itself is not cancellable, so an expired budget after that read refuses the
+ * result rather than claiming a strict wall-clock bound for local I/O.
  */
 async function observeUninstallPostconditions({
   installationRoot,
@@ -885,19 +966,63 @@ async function observeUninstallPostconditions({
   isMissing,
   inspectRegistry,
   waitForCleanupPoll,
+  monotonicNow = () => performance.now(),
+  budgetMs = UNINSTALL_POSTCONDITION_BUDGET_MS,
+  terminationGraceMs = PROGRAM_TERMINATION_GRACE_MS,
 }) {
+  if (typeof monotonicNow !== "function"
+      || !Number.isSafeInteger(budgetMs) || budgetMs <= terminationGraceMs
+      || !Number.isSafeInteger(terminationGraceMs) || terminationGraceMs <= 0) {
+    return Object.freeze({ installRootAbsent: false, uninstallRegistryAbsent: false });
+  }
+  let startedAt;
+  try {
+    startedAt = monotonicNow();
+  } catch {
+    return Object.freeze({ installRootAbsent: false, uninstallRegistryAbsent: false });
+  }
+  if (!Number.isFinite(startedAt)) {
+    return Object.freeze({ installRootAbsent: false, uninstallRegistryAbsent: false });
+  }
+  const deadline = startedAt + budgetMs;
+  const remainingBudget = () => {
+    try {
+      const now = monotonicNow();
+      return Number.isFinite(now) ? deadline - now : null;
+    } catch {
+      return null;
+    }
+  };
   for (let attempt = 0; attempt < UNINSTALL_POSTCONDITION_ATTEMPTS; attempt += 1) {
+    if (!(remainingBudget() > 0)) break;
     const installRootAbsent = await isMissing(installationRoot);
+    const remainingBeforeProbe = remainingBudget();
+    // runWindowsNsisLifecycleProgram can spend its timeout plus a termination
+    // grace period. Reserve that full grace within the one shared budget.
+    const registryTimeoutMs = remainingBeforeProbe === null
+      ? 0
+      : Math.min(
+        PROCESS_SNAPSHOT_TIMEOUT_MS,
+        Math.floor(remainingBeforeProbe - terminationGraceMs),
+      );
+    if (registryTimeoutMs <= 0) break;
     const uninstallRegistryAbsent = (await inspectRegistry({
       environment,
       runProgram,
       expectedInstallationRoot: installationRoot,
+      timeoutMs: registryTimeoutMs,
     })) === REGISTRY_ABSENT;
+    if (!(remainingBudget() >= 0)) break;
     if (installRootAbsent && uninstallRegistryAbsent) {
       return Object.freeze({ installRootAbsent, uninstallRegistryAbsent });
     }
     if (attempt + 1 < UNINSTALL_POSTCONDITION_ATTEMPTS) {
-      await waitForCleanupPoll(UNINSTALL_POSTCONDITION_INTERVAL_MS);
+      const remainingBeforeWait = remainingBudget();
+      const delayMs = remainingBeforeWait === null
+        ? 0
+        : Math.min(UNINSTALL_POSTCONDITION_INTERVAL_MS, Math.floor(remainingBeforeWait));
+      if (delayMs <= 0) break;
+      await waitForCleanupPoll(delayMs);
     }
   }
   return Object.freeze({ installRootAbsent: false, uninstallRegistryAbsent: false });
@@ -911,7 +1036,9 @@ function lifecycleReceipt({
   installationPerformed,
   installerSettled,
   preexistingRegistryAbsent,
-  installedBytesVerified,
+  firstInstalledBytesVerified,
+  secondInstalledBytesVerified,
+  sameInstalledApplicationBytesBound,
   firstRunAcknowledgementPrepared,
   launches,
   uninstallationAttempted,
@@ -936,34 +1063,48 @@ function lifecycleReceipt({
     installationPerformed,
     installerSettled,
     preexistingRegistryAbsent,
-    installedBytesVerified,
-    sameInstalledApplicationBytesBound: installedBytesVerified && launches.length === 2,
+    // Each launch receives a fresh package verification. These are snapshots,
+    // not a claim that installed bytes remained unchanged continuously.
+    firstInstalledBytesVerified,
+    secondInstalledBytesVerified,
+    sameInstalledApplicationBytesBound,
     firstRunAcknowledgementPrepared,
     topLevelLaunches: launches.length,
     topLevelProcessIdsDistinct: first !== null && second !== null && first.pid !== second.pid,
     firstObservedApplicationProcessTreeExited: first?.observedProcessTreeExited === true,
     secondObservedApplicationProcessTreeExited: second?.observedProcessTreeExited === true,
-    firstInstalledExecutableAbsentBeforeSecondLaunch: first?.installedExecutableAbsent === true,
-    secondInstalledExecutableAbsentBeforeUninstall: second?.installedExecutableAbsent === true,
+    firstInstalledExecutableAbsentAtPreLaunchSnapshot:
+      first?.installedExecutableAbsentAtPreLaunchSnapshot === true,
+    firstInstalledExecutableAbsentAtPostExitSnapshot:
+      first?.installedExecutableAbsentAtPostExitSnapshot === true,
+    secondInstalledExecutableAbsentAtPreLaunchSnapshot:
+      second?.installedExecutableAbsentAtPreLaunchSnapshot === true,
+    secondInstalledExecutableAbsentAtPostExitSnapshot:
+      second?.installedExecutableAbsentAtPostExitSnapshot === true,
     // The query covers every process still running this exact installed
     // Electron executable. It cannot prove cleanup of arbitrary helper
     // executables, so that broader process-tree claim remains unavailable.
     fullOwnedDescendantCleanupVerified: false,
     profileReusedAcrossLaunches: launches.length === 2,
-    // The fixed storage journey intentionally removes its synthetic record at
-    // exit, so same-profile relaunch is not evidence of retained credentials.
+    // The accountless FD3 journey intentionally removes its synthetic record
+    // at exit. The FD4 observation credential is scoped only to this
+    // disposable runner account, so same-profile relaunch is not evidence of
+    // retained application credentials.
     persistentApplicationCredentialStateVerified: false,
-    storageJourneyDeletesSyntheticRecord: true,
+    accountlessSyntheticRecordDeleted: true,
+    accountObservationCredentialCleanup: "disposable_runner_account_lifetime",
     uninstallationAttempted,
     uninstallationPerformed,
     uninstallerSettled,
     installRootAbsent,
     uninstallRegistryAbsent,
     cleanupVerificationSkippedBecauseOperationUnsettled:
-      installerSettled !== true || uninstallerSettled === false,
+      installerSettled !== true
+      || (uninstallationAttempted === true && uninstallationPerformed !== true),
     cleanupConfirmed: installationAttempted === true
       && installerSettled === true
-      && uninstallerSettled !== false
+      && uninstallerSettled === true
+      && uninstallationPerformed === true
       && installRootAbsent === true
       && uninstallRegistryAbsent === true,
     ownedTemporaryRootRemoved,
@@ -996,6 +1137,9 @@ export async function runWindowsNsisLifecycle(options, {
   removeOwnedRoot = (path) => rm(path, { recursive: true, force: false }),
   runProgram = defaultRunProgram,
   waitForCleanupPoll = delay,
+  monotonicNow = () => performance.now(),
+  uninstallPostconditionBudgetMs = UNINSTALL_POSTCONDITION_BUDGET_MS,
+  uninstallProgramTerminationGraceMs = PROGRAM_TERMINATION_GRACE_MS,
 } = {}) {
   const runnerTemp = assertLifecycleHost({ platform, architecture, environment });
   const selectedOptions = assertLifecycleOptions(options);
@@ -1010,7 +1154,9 @@ export async function runWindowsNsisLifecycle(options, {
   let installationPerformed = false;
   let installerSettled = null;
   let preexistingRegistryAbsent = false;
-  let installedBytesVerified = false;
+  let firstInstalledBytesVerified = false;
+  let secondInstalledBytesVerified = false;
+  let sameInstalledApplicationBytesBound = false;
   let firstRunAcknowledgementPrepared = false;
   const launches = [];
   let uninstallationAttempted = false;
@@ -1056,13 +1202,6 @@ export async function runWindowsNsisLifecycle(options, {
     }
     const appPath = join(installationRoot, APP_EXECUTABLE);
     await assertUninstaller(uninstallerPath);
-    identity = await verifyInstalledPackage({
-      appPath,
-      stagedAppPath: selectedOptions.stagedAppPath,
-      packageReceiptPath: selectedOptions.packageReceiptPath,
-      sourceRevision: selectedOptions.sourceRevision,
-    });
-    installedBytesVerified = true;
     const profile = await prepareProfile({
       appPath,
       profilePath: join(ownedRoot, "profile"),
@@ -1074,6 +1213,14 @@ export async function runWindowsNsisLifecycle(options, {
       stagedAppPath: selectedOptions.stagedAppPath,
     });
     firstRunAcknowledgementPrepared = true;
+    identity = await verifyInstalledPackageBeforeLaunch({
+      verifyInstalledPackage,
+      appPath,
+      stagedAppPath: selectedOptions.stagedAppPath,
+      packageReceiptPath: selectedOptions.packageReceiptPath,
+      sourceRevision: selectedOptions.sourceRevision,
+    });
+    firstInstalledBytesVerified = true;
     const first = assertLaunchResult(await launchAndExercise({
       appPath,
       profile,
@@ -1082,6 +1229,18 @@ export async function runWindowsNsisLifecycle(options, {
       runProgram,
     }));
     launches.push(first);
+    const secondIdentity = await verifyInstalledPackageBeforeLaunch({
+      verifyInstalledPackage,
+      appPath,
+      stagedAppPath: selectedOptions.stagedAppPath,
+      packageReceiptPath: selectedOptions.packageReceiptPath,
+      sourceRevision: selectedOptions.sourceRevision,
+    });
+    secondInstalledBytesVerified = true;
+    if (!sameInstalledLaunchPackageIdentity(identity, secondIdentity)) {
+      fail("INSTALLED_PACKAGE_IDENTITY_INVALID");
+    }
+    sameInstalledApplicationBytesBound = true;
     const second = assertLaunchResult(await launchAndExercise({
       appPath,
       profile,
@@ -1092,7 +1251,10 @@ export async function runWindowsNsisLifecycle(options, {
     launches.push(second);
     if (first.pid === second.pid) fail("APPLICATION_PID_REUSED");
     if (!first.observedProcessTreeExited || !second.observedProcessTreeExited
-        || !first.installedExecutableAbsent || !second.installedExecutableAbsent) {
+        || !first.installedExecutableAbsentAtPreLaunchSnapshot
+        || !first.installedExecutableAbsentAtPostExitSnapshot
+        || !second.installedExecutableAbsentAtPreLaunchSnapshot
+        || !second.installedExecutableAbsentAtPostExitSnapshot) {
       fail("OWNED_PROCESS_REMAINS");
     }
 
@@ -1103,25 +1265,21 @@ export async function runWindowsNsisLifecycle(options, {
     if (!checkedUninstallerOutcome.settled) fail("UNINSTALLER_UNSETTLED");
     if (!checkedUninstallerOutcome.succeeded) fail("UNINSTALLER_FAILED");
     uninstallationPerformed = true;
-    ({ installRootAbsent, uninstallRegistryAbsent } = await observeUninstallPostconditions({
-      installationRoot,
-      environment,
-      runProgram,
-      isMissing,
-      inspectRegistry,
-      waitForCleanupPoll,
-    }));
-    if (!installRootAbsent || !uninstallRegistryAbsent) fail("UNINSTALL_POSTCONDITION_INVALID");
   } catch (error) {
     errorCode = fixedCode(error);
   } finally {
+    const recordCleanupFailure = () => {
+      // Keep the primary failed operation in the receipt. Cleanup cannot make
+      // a failed install, package check, launch, or uninstaller look repaired.
+      if (errorCode === null) errorCode = `${PREFIX}CLEANUP_UNCONFIRMED`;
+    };
     // A failed installer can still leave its exact owned app tree and registry
     // entry. If either exists, use only the generated uninstaller; never
     // delete a registry key or a non-owned installation to repair the runner.
-    // A program that did not settle may still be mutating both locations, so
-    // do not race it with an uninstaller, a cleanup probe, or root deletion.
-    const cleanupMayProceed = installerSettled === true && uninstallerSettled !== false;
-    if (cleanupMayProceed && installationAttempted && !uninstallationPerformed && uninstallerPath !== null) {
+    // Once an uninstaller has been attempted, its failure is terminal: do not
+    // replay that mutation merely to obtain a cleaner receipt.
+    if (installerSettled === true && installationAttempted
+        && uninstallationAttempted === false && uninstallerPath !== null) {
       try {
         const partialAppPresent = installationRoot !== null && !await isMissing(installationRoot);
         const partialRegistryPresent = (await inspectRegistry({
@@ -1146,13 +1304,15 @@ export async function runWindowsNsisLifecycle(options, {
             fail("CLEANUP_UNCONFIRMED");
           }
           uninstallationPerformed = true;
+        } else {
+          installRootAbsent = true;
+          uninstallRegistryAbsent = true;
         }
       } catch {
-        errorCode = `${PREFIX}CLEANUP_UNCONFIRMED`;
+        recordCleanupFailure();
       }
     }
-    if (cleanupMayProceed && installationAttempted && installationRoot !== null
-        && uninstallerSettled !== false) {
+    if (uninstallationPerformed === true && installationRoot !== null) {
       try {
         ({ installRootAbsent, uninstallRegistryAbsent } = await observeUninstallPostconditions({
           installationRoot,
@@ -1161,22 +1321,25 @@ export async function runWindowsNsisLifecycle(options, {
           isMissing,
           inspectRegistry,
           waitForCleanupPoll,
+          monotonicNow,
+          budgetMs: uninstallPostconditionBudgetMs,
+          terminationGraceMs: uninstallProgramTerminationGraceMs,
         }));
         if (!installRootAbsent || !uninstallRegistryAbsent) {
-          errorCode = `${PREFIX}CLEANUP_UNCONFIRMED`;
+          recordCleanupFailure();
         }
       } catch {
-        errorCode = `${PREFIX}CLEANUP_UNCONFIRMED`;
+        recordCleanupFailure();
       }
     }
     if (ownedRoot !== null && (!installationAttempted
-        || (cleanupMayProceed && uninstallerSettled !== false
+        || (uninstallationPerformed === true && uninstallerSettled === true
           && installRootAbsent && uninstallRegistryAbsent))) {
       try {
         await removeOwnedRoot(ownedRoot);
         ownedTemporaryRootRemoved = true;
       } catch {
-        errorCode = `${PREFIX}CLEANUP_UNCONFIRMED`;
+        recordCleanupFailure();
       }
     }
     const receipt = lifecycleReceipt({
@@ -1187,7 +1350,9 @@ export async function runWindowsNsisLifecycle(options, {
       installationPerformed,
       installerSettled,
       preexistingRegistryAbsent,
-      installedBytesVerified,
+      firstInstalledBytesVerified,
+      secondInstalledBytesVerified,
+      sameInstalledApplicationBytesBound,
       firstRunAcknowledgementPrepared,
       launches,
       uninstallationAttempted,
