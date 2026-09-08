@@ -98,13 +98,27 @@ on the native source.
 
 The helper in
 [`NativeElectronHandoverHelper.swift`](../../apps/macos/Helpers/NativeElectronHandoverHelper.swift)
-accepts one operation only: `--prepare --native-app <absolute bundle path>`.
+accepts one mutating operation: `--prepare --native-app <absolute bundle path>`.
 It verifies the enclosing Electron app identity and selected old app, asks
 `NSRunningApplication` to terminate only processes with the exact old bundle
 URL, unregisters the same-identity native login item and confirms removal, and
 returns bounded language, appearance, refresh, and login-preference values. It
 does not accept arbitrary commands, kill by name, receive state paths, query
 Keychain, copy credentials, reset credentials, or enable sharing.
+
+The diagnostic `--prepare-preflight --native-app <absolute bundle path>` checks
+the helper's bundle context, predecessor, login-item status, preference validity
+and writer absence without stopping apps, changing registration or writing state.
+Its closed result is a point-in-time observation, not permission or proof that
+preparation will succeed. A running selected predecessor blocks this read-only
+probe even though the mutating preparation is designed to stop that predecessor.
+Preparation rechecks its prerequisites and validates preferences before any
+termination or login-item change. Private failures retain only fixed stage codes;
+approval-pending, service-not-found and unknown service states remain distinct.
+Another running bundle with the same identity blocks preparation; the helper
+never terminates it by name or bundle identifier alone.
+the user-facing recovery message remains generic. Nonzero helper exits cannot
+be accepted as success, even when their output resembles a successful reply.
 
 After that result, the coordinator:
 

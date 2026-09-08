@@ -16,7 +16,7 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-08 (supersedes the historical entries below):
 
-Latest continuation checkpoint (source pushed through `1937ea04`):
+Latest continuation checkpoint (source pushed through `1ff67d51`):
 
 - Linux targeted run [34288818674](https://github.com/adamallcock/tibotattle/actions/runs/34288818674)
   passed at `34087112`. Its normal packaged receipt verifies package execution,
@@ -37,8 +37,14 @@ Latest continuation checkpoint (source pushed through `1937ea04`):
   targets, but still failed Windows automatic observation. The observer counted
   only the detailed route, missing the legitimate quick route used after a
   projection exists. The closed route-set repair passes 40 focused tests;
-  targeted run `34290975094` is now verifying it at `1937ea04`. NSIS remained
-  running when the full run was last inspected.
+  targeted run `34290975094` still failed. Expanded fixed-field receipt from
+  `34291528984` identifies the immediate blocker: first launch, zero requests,
+  idle controller, onboarding needs attention, source unreadable, no rollout,
+  writable state, Electron marker present. The test seeded the development
+  override while ordinary settings selected `HOME/.codex`. The normal fixture
+  and environment now match that actual default; 30 focused checks pass.
+  Targeted run `34292088445` verifies this at `1ff67d51`. The earlier full
+  `34290262917` NSIS installed lifecycle subsequently passed.
 - Corrected Mac `.5` arm64/x64 and `.6` arm64 from frozen `ba1e7cba` have complete
   signing, notarization and artifact receipts. `.6` x64 subsequently completed;
   all four final archives were independently hash-verified and preserved under
@@ -53,12 +59,19 @@ Latest continuation checkpoint (source pushed through `1937ea04`):
   Rollback restored native 0.1.18 and verified state against the stopped backup.
   The blocked candidate and started journal are preserved. Do not remove the
   journal or assume a changed candidate digest can resume it automatically.
+  Read-only helper preparation and fixed private failure stages are integrated
+  at `7083d719`, with 16 helper/adapter and 46 migration/credential/distribution
+  tests passing. Review caught and fixed acceptance of success JSON with a
+  nonzero helper exit. ServiceManagement status categories are now separate;
+  other same-identity writers block preparation without being terminated.
 - The signed staging scheduler remains unqualified. Source review confirms the
   unsigned hosted profile uses generic safeStorage; reusing the production native
-  binary would share fixed production identity/services. Any native staging proof
-  needs a separately signed, accountless-only staging identity and credential
-  namespace, with no native migration or FD4 access. This is a design finding,
-  not an implemented or approved production change.
+  binary would share fixed production identity/services. Two unimplemented
+  options remain: a separately signed accountless-only staging identity/namespace,
+  or a disposable OS user with the existing native adapter and a fixed signed
+  staging package policy. The latter avoids a second adapter but still requires
+  transport-policy work; no existing profile can safely select it today. These
+  are design options, not completed qualification or production changes.
 - Agent execution and privileged approval review temporarily stopped at the
   account usage limit. No usage-reset credit was requested or consumed. The
   user approved continuation; privileged tools and both Mac investigation agents
