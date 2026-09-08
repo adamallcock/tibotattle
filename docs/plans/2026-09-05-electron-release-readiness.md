@@ -20,17 +20,26 @@ Change only a reproduced cutover blocker or the smallest test needed to resolve
 one. The Mac daily-use tester is available; that is not full cutover readiness.
 
 1. Close the real native Mac -> signed Electron -> next signed Electron
-   installed rehearsal. Four signed private fixtures are prepared. Installation
-   approval remains pending; keep data/choice preservation, single ownership,
-   startup and credential continuity as the acceptance boundary.
-2. Resolve the current Linux native creation failure and execute the integrated
-   disposable Windows installer journey. Fix observed failures, then complete
+   installed rehearsal. Four signed private fixtures are prepared. The user
+   approved proceeding with the backed-up installed Mac rehearsal on 2026-09-08;
+   the signed current fixture reached the installed startup gate but stopped
+   before migration because the credential verifier supplied a signing rule as
+   a filename. Native 0.1.18 has been restored and reopened; its stopped-state
+   backup matches all original files. Repair and rebuild this exact blocker,
+   then resume data/choice preservation, single ownership, startup and
+   credential continuity checks.
+2. Finish the Linux native deadline fixture and the integrated disposable
+   Windows installer journey. Observation creation/recovery now passes; the
+   remaining failures are a nested-test environment and a process query.
+   Fix and rerun these observed failures, then complete
    required production credential/trust composition and installed updates.
 3. Complete one authorized hosted contribution rehearsal and explicit
    accountless public-sample/overlapping-history decisions. Preserve accepted
    automatic-sharing and persistent opt-out behavior throughout.
-4. Freeze release candidates, verify four-target installation/update evidence,
-   then request the concrete staged publication/activation decision.
+
+Across these three streams, freeze release candidates, verify four-target
+installation/update evidence, then request the concrete staged
+publication/activation decision.
 
 Planning estimate, not a release commitment: 1–3 focused working days for a Mac
 cutover candidate if migration reveals no major defect; approximately 1–2
@@ -38,7 +47,44 @@ working weeks for the complete four-target cutover, conditional on platform
 access, trust material, activation decisions and no major new runtime defects.
 Re-estimate after the first installed migration and Windows installer results.
 
-Latest four-target results: `40c21ade` in
+Latest four-target results: `45fde21e` in
+[run 34206887816](https://github.com/adamallcock/tibotattle/actions/runs/34206887816)
+passes both Mac builds. Linux now passes observation creation, readback,
+no-replace and recovery/refusal phases; its terminal service-deadline fixture
+fails before reaching the expected five-second wait. Windows passes installation,
+paired registry inspection, uninstaller availability and the first installed-byte
+identity check, then its exact-process pre-launch probe fails. No installed app
+launch or restart is qualified. Each platform owner is repairing the reproduced
+fixture/probe failure while root executes the Mac installed rehearsal. Hosted
+work is confined to preparing a fixed nonproduction synthetic rehearsal;
+no remote deployment or public aggregate-policy change is authorized by this
+source preparation.
+
+Installed Mac rehearsal on 2026-09-08: the exact signed `d5dc8025` current
+fixture was placed at the native application path after a stopped, verified
+backup. Its bundle, archive identity and Gatekeeper checks pass. The startup
+verifier invokes `codesign -R` with an unprefixed requirement, which Apple's
+tool interprets as a filename; the same exact app passes when the inline
+requirement uses the `=` prefix. This rejects the app before the Keychain
+preflight and before a migration journal or working profile is created. No
+credential continuity or installed migration is qualified. Native `0.1.18`
+build `1026` is restored, its signature and all original state files match the
+preserved stopped backup, and its actual dashboard has reopened. The failed
+Electron bundle and private receipts are retained. The source repair and a
+replacement signed pair are the next Mac gate; no update feed changed.
+
+The Windows process probe now uses a fixed executable-name filter before its
+exact installed-path comparison. Nineteen focused tests pass locally, with
+three native-only exclusions. Linux's nested `node --test` child inherited
+`NODE_TEST_CONTEXT` and exited successfully before executing the required
+wait; a portable reproduction distinguishes that immediate exit from the
+actual delayed child. The fixture now removes that variable and completes
+D-Bus authentication before deliberately withholding service responses.
+Twenty-three integrated Linux tests pass, with three native-only exclusions.
+The five-second native deadline and production policies are unchanged; neither
+repair closes its platform until the native CI journey passes.
+
+The preceding four-target results: `40c21ade` in
 [run 34204270030](https://github.com/adamallcock/tibotattle/actions/runs/34204270030)
 passes both Mac builds. Windows passes native, companion, packaging, packaged
 credential and installer-contract checks, then the actual NSIS journey fails
