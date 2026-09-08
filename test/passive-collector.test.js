@@ -406,6 +406,151 @@ test("unified quota-only collection does not resume an inherited rollout backfil
   }
 });
 
+test("pooled quota collection awaits its off-main integrity proof before success", async () => {
+  const fixture = await collectorFixture();
+  let startVerification;
+  const verificationStarted = new Promise((resolve) => {
+    startVerification = resolve;
+  });
+  let allowVerification;
+  const allow = new Promise((resolve) => {
+    allowVerification = resolve;
+  });
+  const calls = [];
+  class MinimalClient {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return null; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  try {
+    const collecting = runCollectorOnce({
+      ...fixture,
+      skipRolloutIngestion: true,
+      staleAfterMs: 0,
+      appServerFactory: () => new MinimalClient(),
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+      integrityVerifier: async ({ expectedIdentity }) => {
+        calls.push(Object.keys(expectedIdentity).sort());
+        startVerification();
+        await allow;
+      },
+    });
+    await verificationStarted;
+    let settled = false;
+    collecting.then(() => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    allowVerification();
+    const result = await collecting;
+    assert.equal(result.status, "complete");
+    assert.deepEqual(calls, [["dev", "ino"]]);
+    assert.equal(
+      (await readLocalCollectorState({ stateFile: fixture.stateFile })).records
+        .filter((row) => row.kind === "codex_quota_snapshot").length,
+      1,
+    );
+  } finally {
+    allowVerification?.();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("cancelling a committed pooled quota pass still waits for integrity before releasing its lock", async () => {
+  const fixture = await collectorFixture();
+  const controller = new AbortController();
+  let startVerification;
+  const verificationStarted = new Promise((resolve) => {
+    startVerification = resolve;
+  });
+  let allowVerification;
+  const allow = new Promise((resolve) => {
+    allowVerification = resolve;
+  });
+  class MinimalClient {
+    async start() {}
+    async readRateLimits() { return appPayload(2); }
+    async readAccount() { return null; }
+    async readAccountUsage() { return { dailyUsageBuckets: [] }; }
+    close() {}
+  }
+  const integrityVerifier = async () => {
+    startVerification();
+    await allow;
+  };
+  try {
+    const collecting = runCollectorOnce({
+      ...fixture,
+      skipRolloutIngestion: true,
+      staleAfterMs: 0,
+      signal: controller.signal,
+      appServerFactory: () => new MinimalClient(),
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+      integrityVerifier,
+    });
+    await verificationStarted;
+    controller.abort();
+    let settled = false;
+    collecting.then(() => { settled = true; }, () => { settled = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(settled, false);
+    await assert.rejects(
+      runCollectorOnce({
+        ...fixture,
+        refreshStale: false,
+        integrityVerifier,
+      }),
+      { code: "local_collector_state_lock_held" },
+    );
+    allowVerification();
+    const result = await collecting;
+    assert.equal(result.status, "bounded_pause");
+    assert.equal(result.pauseReason, "collector_aborted");
+  } finally {
+    allowVerification?.();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("cancellation during a normal pooled close is surfaced as a bounded pause", async () => {
+  const fixture = await collectorFixture([
+    tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),
+  ]);
+  const controller = new AbortController();
+  let startVerification;
+  const verificationStarted = new Promise((resolve) => {
+    startVerification = resolve;
+  });
+  let allowVerification;
+  const allow = new Promise((resolve) => {
+    allowVerification = resolve;
+  });
+  try {
+    const collecting = runCollectorOnce({
+      ...fixture,
+      backfill: true,
+      refreshStale: false,
+      signal: controller.signal,
+      clock: () => Date.parse("2026-07-23T00:01:00.000Z"),
+      integrityVerifier: async () => {
+        startVerification();
+        await allow;
+      },
+    });
+    await verificationStarted;
+    controller.abort();
+    allowVerification();
+    const result = await collecting;
+    assert.equal(result.status, "bounded_pause");
+    assert.equal(result.pauseReason, "collector_aborted");
+    assert.equal(result.rolloutRecordsWritten, 1);
+  } finally {
+    allowVerification?.();
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("fresh recent backfill selects only overlapping archives and reports content-free progress", async () => {
   const fixture = await collectorFixture([
     tokenRecord("2026-07-23T00:00:01.000Z", usage(10), usage(10), 1),

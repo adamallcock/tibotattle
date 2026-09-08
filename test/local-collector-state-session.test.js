@@ -101,6 +101,55 @@ test("closing a session runs the integrity check exactly once and fails closed",
   }
 });
 
+test("an injected integrity verifier retains the settled close contract", async () => {
+  const { root, stateFile } = await fixture();
+  const calls = [];
+  try {
+    const session = await openLocalCollectorStateSession({
+      stateFile,
+      clock: CLOCK,
+      integrityVerifier: async ({ stateFile: verifiedFile, expectedIdentity }) => {
+        calls.push({
+          sameStateFile: verifiedFile === stateFile,
+          identityKeys: Object.keys(expectedIdentity).sort(),
+        });
+      },
+    });
+    session.commit({ checkpoint: checkpointFor(1), records: [record(0)] });
+    const settled = await session.close();
+    assert.deepEqual(settled, { batches: 1, inserted: 1, verified: true });
+    assert.deepEqual(calls, [{
+      sameStateFile: true,
+      identityKeys: ["dev", "ino"],
+    }]);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
+test("an off-main integrity failure leaves its committed batch durable and fails closed", async () => {
+  const { root, stateFile } = await fixture();
+  try {
+    const session = await openLocalCollectorStateSession({
+      stateFile,
+      clock: CLOCK,
+      integrityVerifier: async () => {
+        const error = new Error("local_collector_state_integrity_failed");
+        error.code = "local_collector_state_integrity_failed";
+        throw error;
+      },
+    });
+    session.commit({ checkpoint: checkpointFor(1), records: [record(0)] });
+    await assert.rejects(
+      session.close(),
+      { code: "local_collector_state_integrity_failed" },
+    );
+    assert.equal((await readLocalCollectorRecords({ stateFile })).records.length, 1);
+  } finally {
+    await rm(root, { recursive: true });
+  }
+});
+
 test("an aborted session leaves already-committed batches intact", async () => {
   const { root, stateFile } = await fixture();
   try {
@@ -183,6 +232,10 @@ test("session options are validated", async () => {
   );
   await assert.rejects(
     () => openLocalCollectorStateSession({ stateFile: "/tmp/x", clock: "not-a-clock" }),
+    TypeError,
+  );
+  await assert.rejects(
+    () => openLocalCollectorStateSession({ stateFile: "/tmp/x", integrityVerifier: true }),
     TypeError,
   );
 });
