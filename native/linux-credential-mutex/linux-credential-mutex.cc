@@ -2719,6 +2719,12 @@ AccountObservationOperationJournalRemoveOutcome SettleAccountObservationMutation
       || lease->operation_journal_fd < 0) {
     return AccountObservationOperationJournalRemoveOutcome::kInvalid;
   }
+  // Recovery can begin from a normal v1 journal with a retained valid intent.
+  // Persist the active refusal before the unlink, so a crash after removal
+  // cannot leave an exact remote record with neither a v5 intent nor a fence.
+  if (!LatchAccountObservationRecovery(lease)) {
+    return AccountObservationOperationJournalRemoveOutcome::kInvalid;
+  }
   const AccountObservationOperationJournalRemoveOutcome removal =
       RemoveAccountObservationOperationJournal(
           lease->persistent_state_fd,

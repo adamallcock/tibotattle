@@ -114,6 +114,10 @@ test("native Linux credential mutex keeps a fixed x64, durable, opaque contract"
   assert.match(source, /kAccountObservationOperationCreate = 1/u);
   assert.match(source, /DigestAccountObservationCredential/u);
   assert.match(source, /RecoverAccountObservationOperationJournal/u);
+  assert.match(
+    source,
+    /SettleAccountObservationMutation[\s\S]*?LatchAccountObservationRecovery\(lease\)[\s\S]*?RemoveAccountObservationOperationJournal/u,
+  );
   assert.match(source, /SECRET_SEARCH_ALL \| SECRET_SEARCH_LOAD_SECRETS/u);
   assert.match(source, /secret_collection_get_locked\(collection\)/u);
   assert.match(source, /secret_item_create_sync/u);

@@ -102,6 +102,7 @@ test("native Linux account-observation credential refuses an absent retained int
   const root = await mkdtemp(join(tmpdir(), "tibotattle-linux-account-observation-"));
   const absentStateBase = join(root, "absent-state");
   const successStateBase = join(root, "success-state");
+  const interruptedStateBase = join(root, "interrupted-state");
   const previousState = process.env.XDG_STATE_HOME;
   const absentCandidate = Buffer.alloc(32, 70);
   const first = Buffer.alloc(32, 71);
@@ -170,6 +171,45 @@ test("native Linux account-observation credential refuses an absent retained int
     "linux-credential-mutex-journal-v1:normal\n",
   );
 
+  // Model a crash after recovery removed a matching digest intent and before
+  // its final active-to-normal settlement. The durable active fence must keep
+  // the exact existing Secret Service record from being silently adopted.
+  const interruptedPaths = await prepareOwnerPrivateState(interruptedStateBase);
+  process.env.XDG_STATE_HOME = interruptedStateBase;
+  const interruptedBackend = createLinuxAccountObservationCredentialBackend();
+  const interruptedObserved = await interruptedBackend.read(capability);
+  equalSecret(interruptedObserved, first);
+  interruptedObserved.fill(0);
+  let interruptedIntent = operationJournal(first);
+  try {
+    await writeOwnerOnlyFile(interruptedPaths.operationJournal, interruptedIntent);
+  } finally {
+    interruptedIntent.fill(0);
+  }
+  const interruptedReconciled = await interruptedBackend.read(capability);
+  equalSecret(interruptedReconciled, first);
+  interruptedReconciled.fill(0);
+  await assertMissing(interruptedPaths.operationJournal);
+  assert.equal(
+    await readFile(interruptedPaths.legacyJournal, "utf8"),
+    "linux-credential-mutex-journal-v1:normal\n",
+  );
+  let activeJournal = Buffer.from("linux-credential-mutex-journal-v1:active\n");
+  try {
+    await writeOwnerOnlyFile(interruptedPaths.legacyJournal, activeJournal);
+  } finally {
+    activeJournal.fill(0);
+  }
+  // The preceding matching recovery has removed its intent. Replacing only
+  // the v1 state with active models an interruption before final settlement.
+  await assertMissing(interruptedPaths.operationJournal);
+  await assert.rejects(interruptedBackend.read(capability), nativeError("recovery_required"));
+  assert.equal(
+    await readFile(interruptedPaths.legacyJournal, "utf8"),
+    "linux-credential-mutex-journal-v1:active\n",
+  );
+
+  process.env.XDG_STATE_HOME = successStateBase;
   let unresolved = operationJournal(different);
   try {
     await writeOwnerOnlyFile(paths.operationJournal, unresolved);

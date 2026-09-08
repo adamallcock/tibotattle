@@ -200,6 +200,12 @@ other mismatch likewise stays refused. The state journal makes the local
 intent/recovery boundary durable; it does not prove a remote Secret Service
 write survived a service or storage failure.
 
+Before slot-five removes a matching digest intent, it persists
+`journal-5-v1` as `active`. This includes recovery that started from a normal
+v1 journal plus a retained valid intent. A modeled interruption after removal
+therefore remains an `active`-without-intent refusal instead of silently
+adopting the remote record on the next call.
+
 The slot-five source and native tests are qualification-only. The native test
 requires an explicitly isolated disposable Secret Service session and emits
 its fixed pass marker only after read/create/readback, existing-value, matching
