@@ -147,7 +147,7 @@ export function isAllowedCompanionBlobDownload(details, allowedOrigin, webConten
 /**
  * Electron event handlers for the private dashboard. Navigation is allowed
  * only inside the exact companion origin selected from its ready line;
- * permission requests and new windows are denied unconditionally.
+ * permission requests and new windows are denied by default.
  */
 export function createLoopbackNavigationPolicy({ origin } = {}) {
   const allowedOrigin = exactLoopbackOrigin(origin);
@@ -209,6 +209,7 @@ export function installLoopbackNavigationPolicy({
   session,
   policy,
   allowBlobDownloads = false,
+  allowNotificationPermission = false,
 } = {}) {
   if (!webContents || typeof webContents.on !== "function") {
     throw new TypeError("webContents is required");
@@ -233,6 +234,10 @@ export function installLoopbackNavigationPolicy({
     && Number.isSafeInteger(webContents.id)
     ? webContents.id
     : null;
+  const notificationPermissionWebContentsId = allowNotificationPermission
+    && Number.isSafeInteger(webContents.id)
+    ? webContents.id
+    : null;
   const canTrackSession = session !== null
     && session !== undefined
     && (typeof session === "object" || typeof session === "function");
@@ -240,11 +245,18 @@ export function installLoopbackNavigationPolicy({
     sessionInstallation = sessionPolicyInstallations.get(session);
     if (sessionInstallation === undefined) {
       const requestFilter = { urls: ["<all_urls>"] };
-      const onPermissionRequest = (_contents, _permission, callback) => {
-        policy.handlePermissionRequest({ callback });
+      const onPermissionRequest = (contents, permission, callback) => {
+        const allowed = permission === "notifications"
+          && notificationPermissionWebContentsIds.has(contents?.id);
+        if (allowed) callback?.(true);
+        else policy.handlePermissionRequest({ callback });
       };
-      const onPermissionCheck = () => policy.handlePermissionCheck();
+      const onPermissionCheck = (contents, permission) => (
+        permission === "notifications"
+          && notificationPermissionWebContentsIds.has(contents?.id)
+      );
       const blobDownloadWebContentsIds = new Set();
+      const notificationPermissionWebContentsIds = new Set();
       const onBeforeRequest = (details, callback) => (
         policy.handleBeforeRequest(details, callback, {
           allowBlobDownloadWebContentsId: blobDownloadWebContentsIds.has(details?.webContentsId)
@@ -263,6 +275,7 @@ export function installLoopbackNavigationPolicy({
         onPermissionCheck,
         onBeforeRequest,
         blobDownloadWebContentsIds,
+        notificationPermissionWebContentsIds,
       };
       sessionPolicyInstallations.set(session, sessionInstallation);
     } else if (sessionInstallation.policyOrigin !== (policy.origin ?? null)) {
@@ -280,6 +293,11 @@ export function installLoopbackNavigationPolicy({
     if (blobDownloadWebContentsId !== null) {
       sessionInstallation.blobDownloadWebContentsIds.add(blobDownloadWebContentsId);
     }
+    if (notificationPermissionWebContentsId !== null) {
+      sessionInstallation.notificationPermissionWebContentsIds.add(
+        notificationPermissionWebContentsId,
+      );
+    }
   }
 
   let removed = false;
@@ -294,6 +312,11 @@ export function installLoopbackNavigationPolicy({
       if (sessionInstallation === undefined) return;
       if (blobDownloadWebContentsId !== null) {
         sessionInstallation.blobDownloadWebContentsIds.delete(blobDownloadWebContentsId);
+      }
+      if (notificationPermissionWebContentsId !== null) {
+        sessionInstallation.notificationPermissionWebContentsIds.delete(
+          notificationPermissionWebContentsId,
+        );
       }
       sessionInstallation.count -= 1;
       if (sessionInstallation.count > 0) return;

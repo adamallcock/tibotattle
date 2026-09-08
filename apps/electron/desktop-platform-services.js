@@ -400,12 +400,20 @@ export function createDesktopPlatformServices({
   }
 
   function notificationStatus() {
-    // The prototype intentionally does not evaluate thresholds or deliver
-    // notifications. OS capability is not enough to claim that alerts work.
-    const permission = "unavailable";
+    // Electron's main process can establish whether desktop notifications are
+    // supported, but macOS authorization belongs to the BrowserWindow's
+    // Notification API. The Settings page requests it from a user gesture and
+    // reports the resulting granted/denied state. Do not present the absence
+    // of a main-process permission query as an operating-system denial.
+    let available = false;
+    try {
+      available = Notification?.isSupported?.() === true;
+    } catch {
+      available = false;
+    }
     return Object.freeze({
-      permission,
-      available: false,
+      permission: available ? "unknown" : "unavailable",
+      available,
       detail: notificationDetail(textOptions),
     });
   }

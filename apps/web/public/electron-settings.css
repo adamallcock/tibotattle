@@ -23,7 +23,7 @@
   z-index: 50;
 }
 
-.electron-settings-page #settings-content:focus {
+.electron-settings-page #settings-content:focus-visible {
   outline: 3px solid var(--blue);
   outline-offset: 4px;
 }
@@ -783,7 +783,7 @@
   .settings-project-links a:focus-visible,
   .settings-root-primary:focus-visible,
   .settings-root-actions .button:focus-visible,
-  .electron-settings-page #settings-content:focus {
+  .electron-settings-page #settings-content:focus-visible {
     outline: 3px solid Highlight;
     outline-offset: 3px;
   }
@@ -796,29 +796,257 @@
   }
 }
 
-.settings-tray-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-.settings-tray-group { display: flex; flex-direction: column; gap: 15px; min-width: 0; }
-.settings-tray-group legend { font-weight: 700; padding: 0 6px; }
-.settings-tray-checkbox { display: flex; align-items: center; gap: 9px; }
-.settings-tray-checkbox input { width: 18px; height: 18px; accent-color: #267466; }
-.settings-tray-section-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
-.settings-tray-section-row label { flex: 1; }
-.settings-tray-section-row button { padding: 6px 10px; }
-.settings-tray-totals { border: 0; padding: 0; display: grid; gap: 8px; }
-.settings-tray-note { font-size: .9rem; color: var(--muted, #626962); }
-.settings-tray-preview { display: block; margin-top: 20px; }
-.settings-tray-preview-bar { display: flex; align-items: center; gap: 10px; border: 1px solid currentColor; border-radius: 9px; padding: 9px 14px; width: fit-content; min-height: 40px; margin: 15px 0; font-variant-numeric: tabular-nums; }
-.settings-tray-preview-icon { display: inline-flex; align-items: center; gap: 3px; }
-.settings-tray-preview-meters { display: flex; flex-direction: column; gap: 3px; }
-.settings-tray-preview-meter { display: block; width: 18px; height: 5px; border: 1px solid currentColor; border-radius: 2px; }
-.settings-tray-preview-meter > span { display: block; height: 100%; background: currentColor; }
+/* The native customization panel uses the system UI face for its functional
+   hierarchy. Keep this Electron equivalent in the same family: the rest of
+   Settings can use editorial display headings, while this dense control page
+   stays recognizably platform-native. */
+.settings-panel[data-settings-panel="tray"] .settings-panel-heading h2 {
+  font-family: var(--sans);
+  font-weight: var(--weight-semibold);
+  letter-spacing: -.015em;
+}
+
+.settings-tray-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+
+.settings-tray-group {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  gap: var(--space-3);
+  color: var(--ink);
+  font-family: var(--sans);
+}
+
+.settings-tray-group legend {
+  padding: 0 var(--space-1);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 1rem;
+  font-weight: var(--weight-semibold);
+  letter-spacing: -.01em;
+  line-height: 1.2;
+}
+
+.settings-tray-group .settings-field,
+.settings-tray-preview .settings-field {
+  width: min(240px, 100%);
+  color: var(--muted);
+  font-family: var(--sans);
+}
+
+.settings-tray-group .settings-field select,
+.settings-tray-preview .settings-field select {
+  font-family: var(--sans);
+  font-weight: var(--weight-medium);
+}
+
+.settings-tray-checkbox {
+  display: flex;
+  align-items: center;
+  min-height: 24px;
+  gap: var(--space-2);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: .88rem;
+  font-weight: var(--weight-medium);
+  line-height: 1.35;
+}
+
+.settings-tray-checkbox input {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--green-2);
+}
+
+.settings-tray-section-row {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.settings-tray-section-row .settings-tray-checkbox {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.settings-tray-section-row .button {
+  flex: 0 0 auto;
+  min-width: 32px;
+  min-height: 32px;
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--sans);
+  font-size: .9rem;
+  line-height: 1;
+}
+
+.settings-tray-totals {
+  display: grid;
+  gap: var(--space-2);
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  border: 0;
+}
+
+.settings-tray-totals legend {
+  color: var(--muted);
+  font-size: .75rem;
+  font-weight: var(--weight-semibold);
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.settings-tray-note {
+  margin: 0;
+  color: var(--muted);
+  font-family: var(--sans);
+  font-size: .78rem;
+  line-height: 1.4;
+}
+
+.settings-tray-preview {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  margin-top: var(--space-4);
+  gap: var(--space-3);
+  font-family: var(--sans);
+}
+
+.settings-tray-preview h3 {
+  font-family: var(--sans);
+  font-weight: var(--weight-semibold);
+}
+
+.settings-tray-preview-bar {
+  display: flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 40px;
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  gap: var(--space-2);
+  color: var(--green);
+  background: var(--green-soft);
+  border: 1px solid rgba(23, 79, 69, .24);
+  border-radius: var(--radius-sm);
+  font-family: var(--sans);
+  font-size: .82rem;
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+}
+
+.settings-tray-preview-icon {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.settings-tray-preview-meters {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.settings-tray-preview-meter {
+  display: block;
+  width: 18px;
+  height: 5px;
+  overflow: hidden;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+}
+
+.settings-tray-preview-meter > span {
+  display: block;
+  height: 100%;
+  background: currentColor;
+}
+
 .settings-tray-preview-meter.is-unknown { border-style: dashed; }
-.settings-tray-preview-bar .is-low { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 3px; }
-.settings-tray-preview-popup { border: 1px solid var(--line, #aaa); border-radius: 14px; max-width: 380px; padding: 18px; }
-.settings-tray-preview-popup section { border-top: 1px solid var(--line, #aaa); padding: 10px 0; }
-.settings-tray-preview-popup h4, .settings-tray-preview-popup p { margin: 5px 0; }
-.settings-tray-preview-popup[data-density="compact"] section { padding: 4px 0; }
-.settings-tray-example-chart { color: #267466; font-size: 24px; letter-spacing: 4px; }
-.settings-tray-actions { display: flex; gap: 10px; margin-top: 16px; }
-.settings-tray-notice { min-height: 1.5em; }
-@media (max-width: 680px) { .settings-tray-grid { grid-template-columns: 1fr; } }
+
+.settings-tray-preview-bar .is-low {
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+}
+
+.settings-tray-preview-popup {
+  max-width: 380px;
+  padding: var(--space-3);
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-family: var(--sans);
+}
+
+.settings-tray-preview-popup > strong {
+  display: block;
+  font-family: var(--sans);
+  font-size: .88rem;
+  font-weight: var(--weight-semibold);
+}
+
+.settings-tray-preview-popup section {
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--line);
+}
+
+.settings-tray-preview-popup h4,
+.settings-tray-preview-popup p {
+  margin: var(--space-1) 0;
+}
+
+.settings-tray-preview-popup h4 {
+  color: var(--green);
+  font-family: var(--sans);
+  font-size: .8rem;
+  font-weight: var(--weight-semibold);
+}
+
+.settings-tray-preview-popup p {
+  color: var(--muted);
+  font-size: .76rem;
+  line-height: 1.4;
+}
+
+.settings-tray-preview-popup[data-density="compact"] section {
+  padding: var(--space-1) 0;
+}
+
+.settings-tray-example-chart {
+  color: var(--green);
+  font-family: var(--sans);
+  font-size: 1.25rem;
+  letter-spacing: .16em;
+}
+
+.settings-tray-actions {
+  display: flex;
+  flex-wrap: wrap;
+  margin-top: var(--space-4);
+  gap: var(--space-2);
+}
+
+.settings-tray-actions .button {
+  font-family: var(--sans);
+}
+
+.settings-tray-notice {
+  min-height: 1.5em;
+  margin: var(--space-3) 0 0;
+  color: var(--muted);
+  font-family: var(--sans);
+  font-size: .82rem;
+}
+
+@media (max-width: 680px) {
+  .settings-tray-grid { grid-template-columns: 1fr; }
+}

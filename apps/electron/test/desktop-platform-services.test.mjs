@@ -116,8 +116,8 @@ test("platform services use only native-picker paths and fixed open targets", as
     );
   }
   assert.deepEqual(services.notificationStatus(), {
-    permission: "unavailable",
-    available: false,
+    permission: "unknown",
+    available: true,
     detail: "Operating-system permission is shown here; local alert capability is reported above.",
   });
   assert.deepEqual(services.about(), {
