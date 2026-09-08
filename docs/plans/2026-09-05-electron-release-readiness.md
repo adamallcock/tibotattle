@@ -14,6 +14,21 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
+Latest integration update: native run
+[34276107974](https://github.com/adamallcock/tibotattle/actions/runs/34276107974)
+passes both Mac packaging jobs, Windows development packaging and the Windows
+NSIS installed lifecycle. Linux now passes initial dashboard readiness: the
+shared updater repair removed the premature quit. Its remaining failure is
+`SOURCE_SMOKE_RELOAD_REFRESH_FAILED`; packaged credential checks still pass.
+The next run preserves the existing fixed inner refresh failure code to identify
+the reload issue without capturing response content. Windows now passes strict
+COM firewall setup/removal but its empty synthetic Codex root keeps Refresh
+disabled. The integrated fixture repair adds one content-free session metadata
+record before launch. Combined owning Windows/Linux checks pass 45/45.
+These followups preserve the newer parallel tray commits through `a60b5fa1`.
+Mac `.3`/`.4` signing authorization remains pending for frozen source `82122044`;
+those migration candidates do not include the subsequent tray-only refinements.
+
 Cutover focus as of 2026-09-08: freeze the tested feature set at `98a5256d`.
 Do not add cosmetic work, optional platform abstractions, or broader audits.
 Change only a reproduced cutover blocker or the smallest test needed to resolve
