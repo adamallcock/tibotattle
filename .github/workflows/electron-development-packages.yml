@@ -259,13 +259,34 @@ jobs:
             --input-type=module --eval '
               import { spawnSync } from "node:child_process";
               import { proveLinuxSecretServiceContainerIsolation } from "./scripts/qualify-linux-secret-service.mjs";
-              if (proveLinuxSecretServiceContainerIsolation().status !== "isolated") process.exit(1);
-              if (process.env.XDG_STATE_HOME !== undefined) process.exit(1);
-              const result = spawnSync(process.execPath, [
-                "--test", "--test-name-pattern=^native Linux credential state bootstrap creates the absent passwd-home default only in the isolated lane$",
-                "./test/linux-credential-mutex-native.test.js",
-              ], { stdio: "inherit", timeout: 15000, shell: false });
-              if (result.error || result.signal || result.status !== 0) process.exit(1);
+              const fail = () => {
+                process.stderr.write("LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_EVIDENCE_FAILED\\n");
+                process.exit(1);
+              };
+              try {
+                if (proveLinuxSecretServiceContainerIsolation().status !== "isolated") fail();
+                if (process.env.XDG_STATE_HOME !== undefined) fail();
+                const result = spawnSync(process.execPath, [
+                  "--test", "--test-reporter=tap",
+                  "--test-name-pattern=^native Linux credential state bootstrap creates the absent passwd-home default only in the isolated lane$",
+                  "./test/linux-credential-mutex-native.test.js",
+                ], {
+                  encoding: "utf8",
+                  maxBuffer: 16 * 1024,
+                  shell: false,
+                  stdio: ["ignore", "pipe", "pipe"],
+                  timeout: 15000,
+                });
+                const marker = "# LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_BOOTSTRAP_PASSED";
+                const markers = typeof result.stdout === "string"
+                  ? result.stdout.split(/\\r?\\n/u).filter((line) => line === marker)
+                  : [];
+                if (result.error || result.signal !== null || result.status !== 0
+                    || markers.length !== 1) fail();
+                process.stdout.write("LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_EVIDENCE_PASSED\\n");
+              } catch {
+                fail();
+              }
             '
           docker run --rm --init --platform=linux/amd64 --network none \
             --tmpfs /home/node:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=0700 \

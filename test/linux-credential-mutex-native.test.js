@@ -39,6 +39,10 @@ const CHILD = fileURLToPath(new URL(
 const NATIVE_TEST_ENABLED = process.platform === "linux"
   && process.arch === "x64"
   && process.env.USAGE_MONITOR_LINUX_CREDENTIAL_MUTEX_NATIVE_TEST === "1";
+const DEFAULT_STATE_TEST_NAME =
+  "native Linux credential state bootstrap creates the absent passwd-home default only in the isolated lane";
+const DEFAULT_STATE_TEST_SUCCESS_MARKER =
+  "LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_BOOTSTRAP_PASSED";
 // The passwd-home fallback must never be exercised against the GitHub runner
 // or a developer's real home. Root enables this only for the existing
 // network-isolated packaged Docker lane, whose disposable owner-private tmpfs
@@ -609,7 +613,34 @@ test("native Linux credential state bootstrap fails closed for an owner-bit-mask
   ]);
 });
 
-test("native Linux credential state bootstrap creates the absent passwd-home default only in the isolated lane", {
+test("a skipped default-state native test cannot emit success evidence", () => {
+  const environment = { ...process.env };
+  delete environment.USAGE_MONITOR_LINUX_CREDENTIAL_MUTEX_DEFAULT_STATE_TEST;
+  delete environment.NODE_TEST_CONTEXT;
+  const result = spawnSync(process.execPath, [
+    "--test",
+    "--test-reporter=tap",
+    `--test-name-pattern=^${DEFAULT_STATE_TEST_NAME}$`,
+    fileURLToPath(import.meta.url),
+  ], {
+    encoding: "utf8",
+    env: environment,
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 15_000,
+  });
+  assert.equal(result.error, undefined);
+  assert.equal(result.signal, null);
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /# SKIP/u);
+  assert.equal(
+    result.stdout.split(/\r?\n/u)
+      .filter((line) => line === `# ${DEFAULT_STATE_TEST_SUCCESS_MARKER}`).length,
+    0,
+  );
+});
+
+test(DEFAULT_STATE_TEST_NAME, {
   skip: !DEFAULT_STATE_TEST_ENABLED,
 }, async () => {
   const localDirectory = "/home/node/.local";
@@ -641,6 +672,8 @@ test("native Linux credential state bootstrap creates the absent passwd-home def
       )),
     ]);
   } finally {
-    process.env.HOME = previousHome;
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
   }
+  process.stdout.write(`${DEFAULT_STATE_TEST_SUCCESS_MARKER}\n`);
 });
