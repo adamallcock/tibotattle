@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { TRAY_DEFAULTS, normalizeTrayPreferences, validTrayPreferences } from "../public/electron-tray-preferences.js";
 import { createTraySettingsController } from "../public/electron-tray-settings.js";
@@ -119,6 +120,15 @@ test("every customization message is present in each shipped language", () => {
       assert.notEqual(translate(id, { value: 80 }, locale), id);
     }
   }
+});
+
+test("tray customization uses the shared Settings typography instead of browser defaults", async () => {
+  const css = await readFile(new URL("../public/electron-settings.css", import.meta.url), "utf8");
+  assert.match(css, /settings-panel\[data-settings-panel="tray"\][\s\S]*?font-family: var\(--sans\)/u);
+  assert.match(css, /\.settings-tray-group legend[\s\S]*?font-family: var\(--sans\)/u);
+  assert.match(css, /\.settings-tray-checkbox[\s\S]*?font-family: var\(--sans\)/u);
+  assert.match(css, /\.settings-tray-preview-popup > strong[\s\S]*?font-family: var\(--sans\)/u);
+  assert.doesNotMatch(css, /#267466/u);
 });
 
 
