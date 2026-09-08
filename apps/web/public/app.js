@@ -435,6 +435,11 @@ let returnRefreshDeferrals = 0;
 // running. The controller watchdog remains the outer safety bound.
 const ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS = 1_000;
 let electronStartupRefreshTriggered = false;
+// A qualified startup observer can release while the first local-dashboard
+// load still owns the action lock. Keep that one launch pass pending until the
+// owner clears the lock instead of treating its harmless early return as the
+// completed Electron refresh.
+let electronStartupRefreshDeferred = false;
 let globalState = null;
 let visibleConnectionNotice = null;
 let dashboardUnavailableState = null;
@@ -11936,6 +11941,10 @@ async function loadLocalDashboard() {
       load.pending = false;
       localActionBusy = load.previousBusy;
       updateLocalActionButtons();
+      if (electronStartupRefreshDeferred) {
+        electronStartupRefreshDeferred = false;
+        startElectronStartupRefresh();
+      }
     }
   }
   if (isCurrent()) {
@@ -12546,6 +12555,11 @@ function startElectronStartupRefresh() {
     ? {}
     : { detailed: true };
   const runStartupRefresh = () => {
+    if (localActionBusy) {
+      electronStartupRefreshTriggered = false;
+      electronStartupRefreshDeferred = true;
+      return;
+    }
     void requestRefresh(startupRefreshOptions);
   };
   const macSmokeBridge = globalThis.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__;
@@ -12584,7 +12598,8 @@ function scheduleReturningUserRefresh() {
   // What the shell owes in return is a signal when its refresh finished, which
   // `tibotattle:local-evidence-updated` carries.
   if (runsInsideNativeDashboard()) return;
-  if (runsInsideElectronDashboard() && electronStartupRefreshTriggered) return;
+  if (runsInsideElectronDashboard()
+      && (electronStartupRefreshTriggered || electronStartupRefreshDeferred)) return;
   const priorEvidence = dashboard?.mode !== "demo"
     && Boolean(
       dashboard?.activity?.lastScanAt

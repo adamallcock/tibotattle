@@ -47,6 +47,7 @@ function refreshHarness({
     returnRefreshScheduled: false,
     returnRefreshDeferrals: 0,
     electronStartupRefreshTriggered: false,
+    electronStartupRefreshDeferred: false,
     ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS: 1_000,
     tibotattleDesktop: bridge,
     $: (selector) => {
@@ -212,6 +213,45 @@ test("qualified Electron startup waits for the preload smoke barrier", async () 
   await new Promise(setImmediate);
   assert.deepEqual(harness.calls, ["detailed", "status", "reload", "continuation-check"]);
   assert.deepEqual(harness.routes, ["/api/local/refresh"]);
+});
+
+test("qualified Electron startup deferred by the initial dashboard lock runs once it clears", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const harness = refreshHarness({ electron: true });
+  harness.context.__TIBOTATTLE_ELECTRON_MACOS_SMOKE__ = {
+    version: "v1",
+    waitForStartupRefresh: () => gate,
+  };
+  runInContext(productionFunction("startElectronStartupRefresh"), harness.context);
+
+  harness.context.localActionBusy = true;
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  release();
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.calls, [], "the lock cannot consume the one startup pass");
+  assert.equal(harness.context.electronStartupRefreshTriggered, false);
+  assert.equal(harness.context.electronStartupRefreshDeferred, true);
+
+  harness.context.localActionBusy = false;
+  harness.context.electronStartupRefreshDeferred = false;
+  assert.equal(harness.context.startElectronStartupRefresh(), true);
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.deepEqual(harness.routes, ["/api/local/refresh"]);
+  assert.equal(harness.context.electronStartupRefreshTriggered, true);
+
+  const startupFinalizer = source.match(/localActionBusy = load\.previousBusy;\n\s*updateLocalActionButtons\(\);\n\s*if \(electronStartupRefreshDeferred\) \{\n\s*electronStartupRefreshDeferred = false;\n\s*startElectronStartupRefresh\(\);/u);
+  assert.ok(startupFinalizer,
+    "the real dashboard owner retries the deferred launch pass after releasing its lock");
+});
+
+test("a deferred Electron startup pass suppresses the browser return timer", () => {
+  const harness = refreshHarness({ electron: true });
+  harness.context.electronStartupRefreshDeferred = true;
+  harness.context.scheduleReturningUserRefresh();
+  assert.deepEqual(harness.timers, []);
 });
 
 test("accepted Electron refreshes acquire and settle the main-process lease", async () => {
