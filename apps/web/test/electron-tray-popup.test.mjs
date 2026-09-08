@@ -947,20 +947,16 @@ test("tray bridge admits only the reviewed no-secret actions", () => {
 });
 
 
-test("missing allowance explanations wrap naturally while compact hides only reset detail", async () => {
+test("allowance list includes only current provider-reported windows", async () => {
   const documentRef = new FakeDocument();
   const data = fixture();
   data.quotaWindows = data.quotaWindows.filter((row) => row.durationMinutes !== 300);
   renderTrayPopup(documentRef, createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" }));
-  const [missing, current] = documentRef.getElementById("allowance-lanes").children;
-  assert.match(missing.className, /is-unavailable/u);
-  assert.match(missing.children[0].textContent, /—/u);
-  assert.match(missing.children[1].className, /allowance-missing-detail/u);
-  assert.doesNotMatch(missing.children[1].className, /(?:^| )electron-tray-popup-allowance-detail(?: |$)/u);
+  const [current] = documentRef.getElementById("allowance-lanes").children;
+  assert.equal(documentRef.getElementById("allowance-lanes").children.length, 1);
+  assert.equal(current.children[0].children[0].textContent, "Seven-day allowance");
   assert.match(current.children[1].className, /electron-tray-popup-allowance-detail/u);
   const css = await readFile(new URL("../public/electron-tray-popup.css", import.meta.url), "utf8");
   assert.match(css, /\[data-density="compact"\] \.electron-tray-popup-allowance-detail \{ display: none; \}/u);
-  assert.match(css, /\.electron-tray-popup-allowance\.is-unavailable \{[^}]*height: auto;/u);
-  assert.match(css, /\.electron-tray-popup-allowance-missing-detail \{ display: block; white-space: normal;/u);
-  assert.match(css, /\[data-density="compact"\] \.electron-tray-popup-allowance:not\(\.is-unavailable\) \{ height: 30px; \}/u);
+  assert.match(css, /\[data-density="compact"\] \.electron-tray-popup-allowance \{ height: 30px; \}/u);
 });

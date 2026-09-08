@@ -1127,21 +1127,10 @@ function renderAllowances(documentRef, projection, t, numberFormatter, preferenc
   const list = documentRef.getElementById("allowance-lanes");
   if (!list) return;
   list.replaceChildren();
-  for (const duration of NORMAL_CODEX_ALLOWANCE_DURATIONS) {
-    const allowance = projection.allowances.find((item) => item.durationMinutes === duration);
-    if (!allowance) {
-      const missing = documentRef.createElement("article");
-      missing.className = "electron-tray-popup-allowance is-unavailable";
-      const labelKey = duration === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
-        ? "dashboard.quota.windowFiveHour" : "dashboard.quota.windowSevenDay";
-      const heading = textNode(documentRef, `${t(labelKey)} —`);
-      heading.className = "electron-tray-popup-allowance-title";
-      const detail = textNode(documentRef, allowanceUnavailableCopy(projection.freshness, t));
-      detail.className = "electron-tray-popup-muted electron-tray-popup-allowance-missing-detail";
-      missing.append(heading, detail);
-      list.append(missing);
-      continue;
-    }
+  // A provider may expose only one normal Codex window for a plan. Do not
+  // invent a missing five-hour (or weekly) allowance: the popup reports only
+  // current, independently observed windows.
+  for (const allowance of projection.allowances) {
     const article = documentRef.createElement("article");
     article.className = "electron-tray-popup-allowance";
     if (preferences.emphasizeLow && allowance.remainingPercent <= 10) article.className += " is-low";
@@ -1174,8 +1163,9 @@ function renderAllowances(documentRef, projection, t, numberFormatter, preferenc
     article.append(heading, detail, track);
     list.append(article);
   }
-  setHidden(documentRef, "allowance-unavailable", true);
-  if (projection.allowances.length === 0) {
+  const noAllowances = projection.allowances.length === 0;
+  setHidden(documentRef, "allowance-unavailable", !noAllowances);
+  if (noAllowances) {
     setElementText(
       documentRef,
       "allowance-unavailable",
