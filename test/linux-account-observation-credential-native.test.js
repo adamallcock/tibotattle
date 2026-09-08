@@ -27,6 +27,8 @@ import {
 
 const BLACKHOLE_CHILD = process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_CHILD
   === "1";
+const NESTED_CONTEXT_CHILD = process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NESTED_CONTEXT_CHILD
+  === "1";
 const NATIVE_TEST_PREREQUISITES = process.platform === "linux"
   && process.arch === "x64"
   && process.env.TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED === "1"
@@ -36,6 +38,9 @@ const BLACKHOLE_CHILD_ENABLED = NATIVE_TEST_PREREQUISITES && BLACKHOLE_CHILD;
 const OPERATION_JOURNAL = "account-observation-operation-5-v1";
 const BLACKHOLE_CHILD_DEADLINE_MS = 9_000;
 const BLACKHOLE_MINIMUM_DELAY_MS = 4_000;
+const NESTED_CONTEXT_CHILD_DELAY_MS = 175;
+const NESTED_CONTEXT_CHILD_MINIMUM_DELAY_MS = 125;
+const NESTED_CONTEXT_CHILD_TEST_NAME = "native Linux account-observation nested test child waits";
 const BLACKHOLE_AUTH_MAX_BYTES = 4_096;
 const BLACKHOLE_AUTH_OK = "OK 0123456789abcdef0123456789abcdef\r\n";
 const BLACKHOLE_AUTH_REJECTED = "REJECTED EXTERNAL\r\n";
@@ -477,18 +482,26 @@ async function startBlackholeSessionBus(socketPath) {
   };
 }
 
+function createIsolatedTestChildEnvironment(overrides) {
+  const environment = { ...process.env, ...overrides };
+  // A nested `node --test` process must initialize its own runner context.
+  // Inheriting the parent context makes Node report an immediate success before
+  // the selected child test runs.
+  delete environment.NODE_TEST_CONTEXT;
+  return environment;
+}
+
 async function runBlackholeChild({ stateBase, sessionBusAddress }) {
   const child = spawn(
     process.execPath,
     ["--test", "--test-reporter=tap", fileURLToPath(import.meta.url)],
     {
       cwd: process.cwd(),
-      env: {
-        ...process.env,
+      env: createIsolatedTestChildEnvironment({
         DBUS_SESSION_BUS_ADDRESS: sessionBusAddress,
         USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_CHILD: "1",
         XDG_STATE_HOME: stateBase,
-      },
+      }),
       shell: false,
       stdio: "ignore",
     },
@@ -519,6 +532,41 @@ async function runBlackholeChild({ stateBase, sessionBusAddress }) {
   assert.ok(elapsedMs >= BLACKHOLE_MINIMUM_DELAY_MS);
   assert.ok(elapsedMs < BLACKHOLE_CHILD_DEADLINE_MS);
 }
+
+test(NESTED_CONTEXT_CHILD_TEST_NAME, {
+  skip: !NESTED_CONTEXT_CHILD,
+}, async () => {
+  await new Promise((resolve) => setTimeout(resolve, NESTED_CONTEXT_CHILD_DELAY_MS));
+});
+
+test("native Linux account-observation blackhole child clears a parent test context", () => {
+  const startedAt = Date.now();
+  const child = spawnSync(
+    process.execPath,
+    [
+      "--test",
+      "--test-reporter=tap",
+      `--test-name-pattern=^${NESTED_CONTEXT_CHILD_TEST_NAME}$`,
+      fileURLToPath(import.meta.url),
+    ],
+    {
+      cwd: process.cwd(),
+      env: createIsolatedTestChildEnvironment({
+        USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NESTED_CONTEXT_CHILD: "1",
+      }),
+      encoding: "utf8",
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: BLACKHOLE_CHILD_DEADLINE_MS,
+    },
+  );
+  const elapsedMs = Date.now() - startedAt;
+  assert.equal(child.error, undefined);
+  assert.equal(child.signal, null);
+  assert.equal(child.status, 0);
+  assert.ok(elapsedMs >= NESTED_CONTEXT_CHILD_MINIMUM_DELAY_MS);
+  assert.ok(elapsedMs < BLACKHOLE_CHILD_DEADLINE_MS);
+});
 
 test("native Linux account-observation child maps an unresponsive D-Bus service to unavailable", {
   skip: !BLACKHOLE_CHILD_ENABLED,
