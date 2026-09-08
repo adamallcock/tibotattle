@@ -22,6 +22,7 @@ import {
 import {
   createLinuxAccountObservationCredentialBackend,
   LinuxAccountObservationCredentialError,
+  isLinuxAccountObservationCredentialError,
 } from "../src/platform/linux-account-observation-credential.js";
 
 const BLACKHOLE_CHILD = process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_CHILD
@@ -35,6 +36,10 @@ const BLACKHOLE_CHILD_ENABLED = NATIVE_TEST_PREREQUISITES && BLACKHOLE_CHILD;
 const OPERATION_JOURNAL = "account-observation-operation-5-v1";
 const BLACKHOLE_CHILD_DEADLINE_MS = 9_000;
 const BLACKHOLE_MINIMUM_DELAY_MS = 4_000;
+const CREATE_DIAGNOSTIC_PHASES = new Set([
+  "CREATE_PRECHECK",
+  "CREATE_MUTATION",
+]);
 const OPERATION_MAGIC = Buffer.from([
   0x54, 0x49, 0x42, 0x4f, 0x54, 0x41, 0x54, 0x54,
   0x4c, 0x45, 0x2d, 0x46, 0x44, 0x34, 0x00, 0x00,
@@ -94,6 +99,73 @@ function nativeError(code) {
     return true;
   };
 }
+
+function closedObservationDiagnosticSuffix(error) {
+  if (!isLinuxAccountObservationCredentialError(error)) return "OTHER";
+  if (error.code === "linux_account_observation_credential_unavailable") {
+    return "UNAVAILABLE";
+  }
+  if (error.code === "linux_account_observation_credential_recovery_required") {
+    return "RECOVERY_REQUIRED";
+  }
+  return "OTHER";
+}
+
+async function runClosedObservationDiagnosticPhase(testContext, phase, operation) {
+  if (!CREATE_DIAGNOSTIC_PHASES.has(phase)) {
+    throw new TypeError("Unknown closed account-observation diagnostic phase");
+  }
+  testContext.diagnostic(`LINUX_ACCOUNT_OBSERVATION_PHASE_${phase}`);
+  try {
+    return await operation();
+  } catch (error) {
+    // Keep the runner receipt content-free while preserving the fixed facade
+    // outcome that follows this exact native boundary.
+    testContext.diagnostic(
+      `LINUX_ACCOUNT_OBSERVATION_PHASE_${phase}_${closedObservationDiagnosticSuffix(error)}`,
+    );
+    throw error;
+  }
+}
+
+test("native account-observation CREATE diagnostics retain only closed facade outcomes", async () => {
+  const diagnostics = [];
+  const testContext = {
+    diagnostic(value) {
+      diagnostics.push(value);
+    },
+  };
+  await assert.rejects(
+    runClosedObservationDiagnosticPhase(testContext, "CREATE_PRECHECK", async () => {
+      throw new LinuxAccountObservationCredentialError("unavailable");
+    }),
+    nativeError("unavailable"),
+  );
+  await assert.rejects(
+    runClosedObservationDiagnosticPhase(testContext, "CREATE_MUTATION", async () => {
+      throw new LinuxAccountObservationCredentialError("recovery_required");
+    }),
+    nativeError("recovery_required"),
+  );
+  await assert.rejects(
+    runClosedObservationDiagnosticPhase(testContext, "CREATE_MUTATION", async () => {
+      throw new Error("synthetic private native detail");
+    }),
+  );
+  await assert.rejects(
+    runClosedObservationDiagnosticPhase(testContext, "UNREVIEWED", async () => {}),
+    TypeError,
+  );
+  assert.deepEqual(diagnostics, [
+    "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_PRECHECK",
+    "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_PRECHECK_UNAVAILABLE",
+    "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION",
+    "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION_RECOVERY_REQUIRED",
+    "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION",
+    "LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE_MUTATION_OTHER",
+  ]);
+  assert.equal(diagnostics.join("\n").includes("synthetic private native detail"), false);
+});
 
 async function assertMissing(path) {
   try {
@@ -243,9 +315,12 @@ test("native Linux account-observation credential refuses an absent retained int
   process.env.XDG_STATE_HOME = successStateBase;
   const backend = createLinuxAccountObservationCredentialBackend();
 
-  t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_CREATE");
-  assert.equal(await backend.read(capability), null);
-  assert.equal(await backend.createIfMissing(capability, first), "created");
+  await runClosedObservationDiagnosticPhase(t, "CREATE_PRECHECK", async () => {
+    assert.equal(await backend.read(capability), null);
+  });
+  await runClosedObservationDiagnosticPhase(t, "CREATE_MUTATION", async () => {
+    assert.equal(await backend.createIfMissing(capability, first), "created");
+  });
   t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_READBACK");
   const stored = await backend.read(capability);
   equalSecret(stored, first);
