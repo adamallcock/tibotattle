@@ -72,10 +72,22 @@ export const ELECTRON_LINUX_SMOKE_DEGRADED_FAILURE_CODES = Object.freeze([
 export const ELECTRON_LINUX_SMOKE_FAILURE_STAGES = Object.freeze([
   "startup",
   "target",
-  "renderer",
+  "renderer_readiness_unobserved",
+  "renderer_readiness_marker_false_title_false_heading_false",
+  "renderer_readiness_marker_false_title_false_heading_true",
+  "renderer_readiness_marker_false_title_true_heading_false",
+  "renderer_readiness_marker_false_title_true_heading_true",
+  "renderer_readiness_marker_true_title_false_heading_false",
+  "renderer_readiness_marker_true_title_false_heading_true",
+  "renderer_readiness_marker_true_title_true_heading_false",
+  "renderer_origin",
+  "renderer_health",
+  "renderer_resource",
+  "renderer_navigation",
   "initial_refresh",
   "reload_refresh",
   "observation",
+  "renderer_late_network",
   "quit_cleanup",
 ]);
 const ELECTRON_LINUX_SMOKE_FAILURE_STAGE_SET = new Set(ELECTRON_LINUX_SMOKE_FAILURE_STAGES);
@@ -793,6 +805,14 @@ function assertRendererShellSnapshot(snapshot) {
   if (snapshot?.language !== true) fail("Electron Linux language control is missing");
 }
 
+function rendererReadinessFailureStage(snapshot) {
+  const marker = snapshot?.readyMarker === true;
+  const title = snapshot?.titleMatches === true;
+  const heading = snapshot?.overviewHeadingPresent === true;
+  if (marker && title && heading) return null;
+  return `renderer_readiness_marker_${marker}_title_${title}_heading_${heading}`;
+}
+
 async function assertRendererShell(cdp) {
   const snapshot = await cdp.evaluate(`(() => {
     const visible = (element) => {
@@ -1258,23 +1278,26 @@ export async function runSmoke({
       MAX_STARTUP_MS,
       "Electron dashboard frame",
     ));
-    failureStage = "renderer";
+    // Only booleans cross the CDP boundary here. A readiness timeout retains
+    // their last observed true/false state as a closed stage, never a title,
+    // heading, URL, or page content.
+    failureStage = "renderer_readiness_unobserved";
     const ready = await waitFor(
       async () => {
         const snapshot = await cdp.evaluate(`(() => ({
-          ready: document.documentElement?.dataset?.localDashboardReady === "true",
-          title: document.title,
-          heading: document.querySelector("#overview-title")?.textContent?.trim() ?? "",
+          readyMarker: document.documentElement?.dataset?.localDashboardReady === "true",
+          titleMatches: document.title === "TiboTattle",
+          overviewHeadingPresent: Boolean(document.querySelector("#overview-title")?.textContent?.trim()),
           location: location.href,
           resources: performance.getEntriesByType("resource").map((entry) => entry.name),
         }))()`);
-        return snapshot.ready && snapshot.title === "TiboTattle" && snapshot.heading
-          ? snapshot
-          : null;
+        failureStage = rendererReadinessFailureStage(snapshot);
+        return failureStage === null ? snapshot : null;
       },
       MAX_STARTUP_MS,
       "dashboard renderer readiness",
     );
+    failureStage = "renderer_origin";
     selectRequiredRefreshLoader(refreshObserver, await mainFrameLoaderId(cdp));
     const dashboardUrl = new URL(ready.location);
     if (dashboardUrl.origin !== selectedDashboardUrl.origin
@@ -1286,8 +1309,10 @@ export async function runSmoke({
     if (refreshObserver.selectOrigin(dashboardUrl.origin) !== dashboardUrl.origin) {
       fail("dashboard origin was not accepted as the validated loopback origin");
     }
+    failureStage = "renderer_health";
     const health = await jsonFetch(new URL("/api/local/health", dashboardUrl));
     if (health.status !== "ready") fail("companion health was not ready");
+    failureStage = "renderer_resource";
     const remoteResources = ready.resources.filter((resource) => {
       try {
         const parsed = new URL(resource);
@@ -1299,6 +1324,7 @@ export async function runSmoke({
     if (remoteResources.some((resource) => new URL(resource).origin !== dashboardUrl.origin)) {
       fail("renderer requested a non-loopback resource");
     }
+    failureStage = "renderer_navigation";
     await assertRendererShell(cdp);
     failureStage = "initial_refresh";
     const initialStartupRefresh = await assertAutomaticStartupRefresh({
@@ -1365,7 +1391,7 @@ export async function runSmoke({
       fixture,
       startupRefresh,
     });
-    failureStage = "renderer";
+    failureStage = "renderer_late_network";
     if (selectedPage.networkEvidenceInvalid()
         || observedNetworkUrls.some((url) => !isAllowedRendererNetworkURL(url, dashboardUrl.origin))) {
       fail("renderer attempted a non-loopback network request");

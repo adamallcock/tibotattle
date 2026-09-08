@@ -88,6 +88,9 @@ test("Linux Electron smoke keeps the desktop boundary explicit", async () => {
     "the first available page cannot stand in for the dashboard",
   );
   assert.match(source, /localDashboardReady/u);
+  assert.match(source, /readyMarker:[\s\S]*titleMatches:[\s\S]*overviewHeadingPresent:/u);
+  assert.match(source, /failureStage = rendererReadinessFailureStage\(snapshot\)/u);
+  assert.match(source, /failureStage = "renderer_late_network"/u);
   assert.match(source, /MAX_REFRESH_MS/u);
   assert.match(source, /Page\.enable/u);
   assert.match(source, /Page\.getFrameTree/u);
@@ -572,10 +575,22 @@ test("Linux smoke exposes only closed failure-stage boundaries to callers", () =
   assert.deepEqual(ELECTRON_LINUX_SMOKE_FAILURE_STAGES, [
     "startup",
     "target",
-    "renderer",
+    "renderer_readiness_unobserved",
+    "renderer_readiness_marker_false_title_false_heading_false",
+    "renderer_readiness_marker_false_title_false_heading_true",
+    "renderer_readiness_marker_false_title_true_heading_false",
+    "renderer_readiness_marker_false_title_true_heading_true",
+    "renderer_readiness_marker_true_title_false_heading_false",
+    "renderer_readiness_marker_true_title_false_heading_true",
+    "renderer_readiness_marker_true_title_true_heading_false",
+    "renderer_origin",
+    "renderer_health",
+    "renderer_resource",
+    "renderer_navigation",
     "initial_refresh",
     "reload_refresh",
     "observation",
+    "renderer_late_network",
     "quit_cleanup",
   ]);
   assert.equal(Object.isFrozen(ELECTRON_LINUX_SMOKE_FAILURE_STAGES), true);

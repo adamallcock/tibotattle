@@ -51,10 +51,29 @@ const DBUS_RUN_SESSION = "/usr/bin/dbus-run-session";
 const SOURCE_SMOKE_STAGE_CODES = Object.freeze({
   startup: "SOURCE_SMOKE_STARTUP_FAILED",
   target: "SOURCE_SMOKE_TARGET_FAILED",
-  renderer: "SOURCE_SMOKE_RENDERER_FAILED",
+  renderer_readiness_unobserved: "SOURCE_SMOKE_RENDERER_READINESS_UNOBSERVED_FAILED",
+  renderer_readiness_marker_false_title_false_heading_false:
+    "SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_FALSE_HEADING_FALSE_FAILED",
+  renderer_readiness_marker_false_title_false_heading_true:
+    "SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_FALSE_HEADING_TRUE_FAILED",
+  renderer_readiness_marker_false_title_true_heading_false:
+    "SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_FALSE_FAILED",
+  renderer_readiness_marker_false_title_true_heading_true:
+    "SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_TRUE_FAILED",
+  renderer_readiness_marker_true_title_false_heading_false:
+    "SOURCE_SMOKE_RENDERER_READINESS_MARKER_TRUE_TITLE_FALSE_HEADING_FALSE_FAILED",
+  renderer_readiness_marker_true_title_false_heading_true:
+    "SOURCE_SMOKE_RENDERER_READINESS_MARKER_TRUE_TITLE_FALSE_HEADING_TRUE_FAILED",
+  renderer_readiness_marker_true_title_true_heading_false:
+    "SOURCE_SMOKE_RENDERER_READINESS_MARKER_TRUE_TITLE_TRUE_HEADING_FALSE_FAILED",
+  renderer_origin: "SOURCE_SMOKE_RENDERER_ORIGIN_FAILED",
+  renderer_health: "SOURCE_SMOKE_RENDERER_HEALTH_FAILED",
+  renderer_resource: "SOURCE_SMOKE_RENDERER_RESOURCE_FAILED",
+  renderer_navigation: "SOURCE_SMOKE_RENDERER_NAVIGATION_FAILED",
   initial_refresh: "SOURCE_SMOKE_INITIAL_REFRESH_FAILED",
   reload_refresh: "SOURCE_SMOKE_RELOAD_REFRESH_FAILED",
   observation: "SOURCE_SMOKE_OBSERVATION_FAILED",
+  renderer_late_network: "SOURCE_SMOKE_RENDERER_LATE_NETWORK_FAILED",
   quit_cleanup: "SOURCE_SMOKE_QUIT_CLEANUP_FAILED",
 });
 const SOURCE_SMOKE_STAGE_CODE_VALUES = new Set(Object.values(SOURCE_SMOKE_STAGE_CODES));
