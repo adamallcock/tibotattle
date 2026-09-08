@@ -12556,8 +12556,13 @@ function startElectronStartupRefresh() {
     : { detailed: true };
   const runStartupRefresh = () => {
     if (localActionBusy) {
-      electronStartupRefreshTriggered = false;
-      electronStartupRefreshDeferred = true;
+      // Only the bootstrap owner is guaranteed to call us again after it
+      // clears its lock. Preserve the established one-shot suppression for
+      // every other busy owner rather than leaving a deferred launch stuck.
+      if (activeLocalDashboardLoad?.pending) {
+        electronStartupRefreshTriggered = false;
+        electronStartupRefreshDeferred = true;
+      }
       return;
     }
     void requestRefresh(startupRefreshOptions);
