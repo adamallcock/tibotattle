@@ -71,6 +71,13 @@ const WINDOWS_ELECTRON_SMOKE_CREDENTIAL_OPERATIONS = Object.freeze({
   "credential-read-v1": "read-v1",
   "credential-delete-v1": "delete-v1",
 });
+const MACOS_CREDENTIAL_PREFLIGHT_FAILURE_CODES = new Set([
+  "KEYCHAIN_LOCKED",
+  "KEYCHAIN_DENIED",
+  "KEYCHAIN_MIGRATION_REQUIRED",
+  "broker_timeout",
+  "broker_unavailable",
+]);
 
 function isPackagedElectronApp(app) {
   return app?.isPackaged === true;
@@ -537,7 +544,15 @@ export function createProductionMacCredentialHandover({
     async prepareNativeHandover({ homeDirectory }) {
       brokerBackend = null;
       createAccountlessCredentialBackend = null;
-      const selected = await loadBackend({ app, resourcesPath });
+      let selected;
+      try {
+        selected = await loadBackend({ app, resourcesPath });
+      } catch (error) {
+        if (MACOS_CREDENTIAL_PREFLIGHT_FAILURE_CODES.has(error?.code)) {
+          return Object.freeze({ status: "credential_preflight_blocked" });
+        }
+        throw error;
+      }
       const handover = await runHandover({ electronApp: app, resourcesPath, homeDirectory });
       if (["no_legacy_state", "migrated", "already_migrated"].includes(handover?.status)) {
         brokerBackend = selected?.broker ?? selected;

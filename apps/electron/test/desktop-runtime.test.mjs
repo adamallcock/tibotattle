@@ -526,6 +526,48 @@ test("native handover blocks before settings writes and companion start when exi
   assert.match(notices[0].detail, /existing data has been preserved/u);
 });
 
+test("credential preflight blocks before settings writes without mislabeling it as migration", {
+  skip: process.platform === "win32" ? "Exercises macOS handover composition" : false,
+}, async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "native-credential-preflight-runtime-"));
+  t.after(() => rm(profile, { recursive: true, force: true }));
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  app.getPath = () => profile;
+  let settingsReads = 0;
+  let settingsWrites = 0;
+  const notices = [];
+  const fixture = await launchFixture({ app,
+    load: async () => { settingsReads += 1; return null; },
+    save: async () => { settingsWrites += 1; },
+    environment: { HOME: profile },
+    runtimeOverrides: { dialog: {
+      showMessageBox: async (notice) => { notices.push(notice); return { response: 0 }; },
+      showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+    } },
+    productionDistribution: createProductionDistributionMetadata({
+      target: `darwin-${process.arch}`, sourceRevision: "e".repeat(40), buildNumber: "20260906",
+    }),
+    prepareNativeHandover: async () => ({ status: "credential_preflight_blocked" }),
+  });
+  assert.equal(fixture.desktop.status, "native_handover_blocked");
+  assert.equal(fixture.children.length, 0);
+  assert.equal(settingsReads, 0);
+  assert.equal(settingsWrites, 0);
+  assert.equal(app.quitCalls, 1);
+  assert.deepEqual(notices[0], {
+    type: "warning",
+    title: "Unable to prepare secure storage",
+    message: "TiboTattle could not complete its secure startup checks.",
+    detail: "Your existing app data has not been changed. Quit and try again.",
+    buttons: ["Quit"],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+  });
+});
+
 test("handover rehearsal keeps the packaged updater but omits the FD3 accountless path", async (t) => {
   const profile = await mkdtemp(join(tmpdir(), "handover-rehearsal-runtime-"));
   const app = new FakeApp();

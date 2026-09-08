@@ -171,7 +171,7 @@ export function createDesktopMacOSAccountlessCredentialBackend({
 
 function createDesktopMacOSCredentialBackends({ binding } = {}) {
   const adapter = createMacOSKeychainAdapterFacade(binding);
-  if (adapter.identityStatus() !== "valid") throw failure();
+  if (adapter.identityStatus() !== "valid") throw failure("broker_unavailable");
   const broker = createDesktopMacOSCredentialBackendFromAdapter(adapter);
   return Object.freeze({
     broker,
@@ -181,8 +181,24 @@ function createDesktopMacOSCredentialBackends({ binding } = {}) {
   });
 }
 
-function verifySignedApplication(appBundle, { spawnProcess = spawn } = {}) {
+/**
+ * The enclosing Electron app must retain the same durable Developer ID
+ * requirement as the native Keychain adapter. `-R=` supplies a requirement
+ * expression; bare `-R` instead treats its next argument as a file path.
+ */
+export function macOSCredentialApplicationVerificationArguments(appBundle) {
   const requirement = `identifier "${PRODUCTION_ELECTRON_APP_ID}" and anchor apple generic and certificate leaf[subject.OU] = "${CONTRIBUTION_DEVICE_READER_TEAM_IDENTIFIER}"`;
+  return Object.freeze([
+    "--verify",
+    "--deep",
+    "--strict",
+    `-R=${requirement}`,
+    "--",
+    appBundle,
+  ]);
+}
+
+function verifySignedApplication(appBundle, { spawnProcess = spawn } = {}) {
   return new Promise((resolveResult) => {
     let child;
     let timer;
@@ -194,7 +210,7 @@ function verifySignedApplication(appBundle, { spawnProcess = spawn } = {}) {
       resolveResult(valid);
     };
     try {
-      child = spawnProcess("/usr/bin/codesign", ["--verify", "--deep", "--strict", "-R", requirement, appBundle], {
+      child = spawnProcess("/usr/bin/codesign", macOSCredentialApplicationVerificationArguments(appBundle), {
         stdio: "ignore", env: { PATH: "/usr/bin:/bin" },
       });
       child.once("error", () => finish(false));
@@ -233,7 +249,7 @@ export async function loadDesktopMacOSCredentialBackends({
       || app?.isPackaged !== true || typeof resourcesPath !== "string"
       || !isAbsolute(resourcesPath) || resourcesPath.includes("\0")
       || basename(resourcesPath) !== "Resources" || basename(dirname(resourcesPath)) !== "Contents") {
-    throw failure();
+    throw failure("broker_unavailable");
   }
   const appBundle = dirname(dirname(resourcesPath));
   const binary = join(resourcesPath, ...DESKTOP_MACOS_KEYCHAIN_RESOURCE_PATH);
@@ -241,15 +257,15 @@ export async function loadDesktopMacOSCredentialBackends({
     const appPath = app.getAppPath?.();
     if (!appBundle.endsWith(".app") || typeof appPath !== "string"
         || !isAbsolute(appPath) || appPath.includes("\0")
-        || resolve(appPath) !== join(resourcesPath, "app.asar")) throw failure();
+        || resolve(appPath) !== join(resourcesPath, "app.asar")) throw failure("broker_unavailable");
     const before = await inspectFile(binary);
     if (!safeBinary(before) || await resolveRealPath(binary) !== binary
-        || await verifyApplication(appBundle) !== true) throw failure();
+        || await verifyApplication(appBundle) !== true) throw failure("broker_unavailable");
     const verified = await inspectFile(binary);
-    if (!safeBinary(verified) || !sameFile(before, verified)) throw failure();
+    if (!safeBinary(verified) || !sameFile(before, verified)) throw failure("broker_unavailable");
     const binding = requireBinding(binary);
     const after = await inspectFile(binary);
-    if (!safeBinary(after) || !sameFile(verified, after)) throw failure();
+    if (!safeBinary(after) || !sameFile(verified, after)) throw failure("broker_unavailable");
     const backends = createDesktopMacOSCredentialBackends({ binding });
     let timer;
     try {

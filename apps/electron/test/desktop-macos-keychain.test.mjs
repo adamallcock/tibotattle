@@ -1,10 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   createDesktopMacOSAccountlessCredentialBackend,
   createDesktopMacOSCredentialBackend,
   loadDesktopMacOSCredentialBackend,
   loadDesktopMacOSCredentialBackends,
+  macOSCredentialApplicationVerificationArguments,
 } from "../desktop-macos-keychain.js";
 import {
   MACOS_KEYCHAIN_ADAPTER_BROKER_CAPABILITIES,
@@ -13,8 +18,43 @@ import {
 } from "../../../native/macos-keychain/contract.js";
 import { createProductionMacCredentialHandover } from "../main.js";
 import { Duplex } from "node:stream";
+import { PRODUCTION_ELECTRON_APP_ID } from "../desktop-updater.js";
 
 const SECRET = Buffer.alloc(32, 7).toString("base64url");
+const MACOS_CODESIGN_SKIP = process.platform === "darwin"
+  ? false
+  : "requires macOS codesign";
+
+async function createAdHocApplicationFixture() {
+  const root = await mkdtemp(join(tmpdir(), "desktop-macos-keychain-codesign-"));
+  const appBundle = join(root, "TiboTattle.app");
+  const resourcesPath = join(appBundle, "Contents", "Resources");
+  const executable = join(appBundle, "Contents", "MacOS", "TiboTattle");
+  await Promise.all([
+    mkdir(join(resourcesPath, "native"), { recursive: true }),
+    mkdir(join(appBundle, "Contents", "MacOS"), { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(join(appBundle, "Contents", "Info.plist"), [
+      '<?xml version="1.0" encoding="UTF-8"?>',
+      '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+      '<plist version="1.0"><dict>',
+      `<key>CFBundleIdentifier</key><string>${PRODUCTION_ELECTRON_APP_ID}</string>`,
+      '<key>CFBundleExecutable</key><string>TiboTattle</string>',
+      "</dict></plist>",
+    ].join("\n")),
+    writeFile(executable, "#!/bin/sh\nexit 0\n", { mode: 0o700 }),
+    writeFile(join(resourcesPath, "app.asar"), "synthetic", { mode: 0o600 }),
+    writeFile(join(resourcesPath, "native", "macos-keychain.node"), "synthetic", { mode: 0o700 }),
+  ]);
+  await chmod(executable, 0o700);
+  const signing = spawnSync("/usr/bin/codesign", [
+    "--force", "--sign", "-", "--identifier", PRODUCTION_ELECTRON_APP_ID, appBundle,
+  ], { encoding: "utf8" });
+  assert.equal(signing.status, 0);
+  return { appBundle, resourcesPath, root };
+}
+
 function bindingFixture() {
   const items = new Map();
   const calls = [];
@@ -152,6 +192,53 @@ const RESOURCES = `${APP_BUNDLE}/Contents/Resources`;
 const METADATA = { isFile: () => true, isSymbolicLink: () => false, nlink: 1,
   size: 1024, mode: 0o755, dev: 1, ino: 5, mtimeMs: 10, ctimeMs: 10 };
 
+test("production application verification supplies a codesign requirement expression", () => {
+  assert.deepEqual([...macOSCredentialApplicationVerificationArguments(APP_BUNDLE)], [
+    "--verify",
+    "--deep",
+    "--strict",
+    `-R=identifier "${PRODUCTION_ELECTRON_APP_ID}" and anchor apple generic and certificate leaf[subject.OU] = "43RTH622SB"`,
+    "--",
+    APP_BUNDLE,
+  ]);
+});
+
+test("the default application verifier uses native codesign requirement syntax", {
+  skip: MACOS_CODESIGN_SKIP,
+}, async (t) => {
+  const fixture = await createAdHocApplicationFixture();
+  t.after(() => rm(fixture.root, { recursive: true, force: true }));
+
+  // This disposable ad-hoc bundle deliberately cannot satisfy the production
+  // Developer ID requirement. Native codesign must nevertheless parse the
+  // expression, rather than treating it as a requirement-file path.
+  const nativeVerification = spawnSync("/usr/bin/codesign",
+    macOSCredentialApplicationVerificationArguments(fixture.appBundle), {
+      encoding: "utf8",
+    });
+  assert.notEqual(nativeVerification.status, 0);
+  assert.equal(
+    /No such file or directory|invalid requirement specification/iu.test(
+      `${nativeVerification.stdout ?? ""}${nativeVerification.stderr ?? ""}`,
+    ),
+    false,
+  );
+
+  let bindingLoaded = false;
+  await assert.rejects(loadDesktopMacOSCredentialBackend({
+    app: { isPackaged: true, getAppPath: () => join(fixture.resourcesPath, "app.asar") },
+    resourcesPath: fixture.resourcesPath,
+    platform: "darwin",
+    architecture: process.arch,
+    requireBinding() {
+      bindingLoaded = true;
+      return bindingFixture().binding;
+    },
+  }), { code: "broker_unavailable" });
+  assert.equal(bindingLoaded, false,
+    "the real default verifier must refuse before loading a native credential adapter");
+});
+
 test("both Mac targets verify the enclosing application before loading and preflight", async () => {
   for (const architecture of ["arm64", "x64"]) {
     const f = bindingFixture();
@@ -212,7 +299,7 @@ test("unsigned, replaced, linked, development and wrong-target candidates cannot
     let loaded = false;
     await assert.rejects(loadDesktopMacOSCredentialBackend({ ...base, ...patch,
       requireBinding() { loaded = true; return bindingFixture().binding; },
-    }));
+    }), { code: "broker_unavailable" });
     assert.equal(loaded, false);
   }
 });
@@ -260,12 +347,37 @@ test("production composition establishes credentials before touching the predece
   }), accountless);
 });
 
-test("credential refusal and failed handover never open a child credential channel", async () => {
-  for (const failureMode of ["credentials", "handover", "blocked"]) {
+test("fixed credential preflight failures never start handover or open a child credential channel", async () => {
+  for (const code of [
+    "KEYCHAIN_LOCKED",
+    "KEYCHAIN_DENIED",
+    "KEYCHAIN_MIGRATION_REQUIRED",
+    "broker_timeout",
+    "broker_unavailable",
+  ]) {
     let handovers = 0;
     const bridge = createProductionMacCredentialHandover({
       async loadBackend() {
-        if (failureMode === "credentials") throw Object.assign(new Error("Unavailable"), { code: "KEYCHAIN_LOCKED" });
+        throw Object.assign(new Error("Unavailable"), { code });
+      },
+      async runHandover() {
+        handovers += 1;
+        return { status: "migration_blocked" };
+      },
+    });
+    assert.deepEqual(await bridge.prepareNativeHandover({ homeDirectory: "/synthetic/home" }), {
+      status: "credential_preflight_blocked",
+    });
+    assert.equal(handovers, 0);
+    assert.throws(() => bridge.attachCredentialBroker({}));
+  }
+});
+
+test("failed or blocked state handover never opens a child credential channel", async () => {
+  for (const failureMode of ["handover", "blocked"]) {
+    let handovers = 0;
+    const bridge = createProductionMacCredentialHandover({
+      async loadBackend() {
         return { get: async () => null, set: async () => {}, delete: async () => {} };
       },
       async runHandover() {
@@ -277,7 +389,7 @@ test("credential refusal and failed handover never open a child credential chann
     const preparation = bridge.prepareNativeHandover({ homeDirectory: "/synthetic/home" });
     if (failureMode === "blocked") assert.deepEqual(await preparation, { status: "migration_blocked" });
     else await assert.rejects(preparation);
-    assert.equal(handovers, failureMode === "credentials" ? 0 : 1);
+    assert.equal(handovers, 1);
     assert.throws(() => bridge.attachCredentialBroker({}));
   }
 });
