@@ -36,6 +36,10 @@ const BLACKHOLE_CHILD_ENABLED = NATIVE_TEST_PREREQUISITES && BLACKHOLE_CHILD;
 const OPERATION_JOURNAL = "account-observation-operation-5-v1";
 const BLACKHOLE_CHILD_DEADLINE_MS = 9_000;
 const BLACKHOLE_MINIMUM_DELAY_MS = 4_000;
+const BLACKHOLE_AUTH_MAX_BYTES = 4_096;
+const BLACKHOLE_AUTH_OK = "OK 0123456789abcdef0123456789abcdef\r\n";
+const BLACKHOLE_AUTH_REJECTED = "REJECTED EXTERNAL\r\n";
+const BLACKHOLE_AUTH_AGREED_UNIX_FD = "AGREE_UNIX_FD\r\n";
 const DBUS_SEND = "/usr/bin/dbus-send";
 const DBUS_REPLY_TIMEOUT_MS = 1_000;
 const DBUS_MAX_OUTPUT_BYTES = 4_096;
@@ -387,16 +391,68 @@ async function assertMissing(path) {
   assert.fail("expected fixed native journal to be absent");
 }
 
+function handleBlackholeAuthentication(socket, state, chunk) {
+  if (state.messagePhase || !Buffer.isBuffer(chunk) || chunk.byteLength === 0) return;
+  if (state.pending.byteLength + chunk.byteLength > BLACKHOLE_AUTH_MAX_BYTES) {
+    state.pending.fill(0);
+    state.pending = Buffer.alloc(0);
+    socket.destroy();
+    return;
+  }
+  const previous = state.pending;
+  state.pending = Buffer.concat([previous, chunk]);
+  previous.fill(0);
+  while (!state.messagePhase) {
+    const lineEnd = state.pending.indexOf("\r\n", 0, "ascii");
+    if (lineEnd < 0) return;
+    const line = state.pending.subarray(0, lineEnd).toString("ascii");
+    const remaining = Buffer.from(state.pending.subarray(lineEnd + 2));
+    state.pending.fill(0);
+    state.pending = remaining;
+    const command = line.startsWith("\0") ? line.slice(1) : line;
+    if (command.startsWith("AUTH EXTERNAL")) {
+      socket.write(BLACKHOLE_AUTH_OK);
+      continue;
+    }
+    if (command === "AUTH" || command.startsWith("AUTH ") || command === "CANCEL") {
+      socket.write(BLACKHOLE_AUTH_REJECTED);
+      continue;
+    }
+    if (command === "NEGOTIATE_UNIX_FD") {
+      socket.write(BLACKHOLE_AUTH_AGREED_UNIX_FD);
+      continue;
+    }
+    if (command === "BEGIN") {
+      state.messagePhase = true;
+      state.pending.fill(0);
+      state.pending = Buffer.alloc(0);
+      socket.pause();
+      return;
+    }
+    socket.destroy();
+    return;
+  }
+}
+
+// Complete only the fixed D-Bus authentication exchange. Once the client has
+// entered its binary message phase, this local synthetic endpoint never
+// responds, so the child must settle through the native aggregate deadline.
 async function startBlackholeSessionBus(socketPath) {
   const sockets = new Set();
+  let reachedMessagePhase = false;
   const server = createServer((socket) => {
     sockets.add(socket);
-    socket.on("close", () => sockets.delete(socket));
+    const state = { messagePhase: false, pending: Buffer.alloc(0) };
+    socket.on("close", () => {
+      state.pending.fill(0);
+      state.pending = Buffer.alloc(0);
+      sockets.delete(socket);
+    });
     socket.on("error", () => {});
-    // A D-Bus client can connect and start authentication, but this fixed
-    // fixture intentionally never responds. The child must settle through the
-    // native aggregate cancellation deadline rather than an outer test kill.
-    socket.resume();
+    socket.on("data", (chunk) => {
+      handleBlackholeAuthentication(socket, state, chunk);
+      if (state.messagePhase) reachedMessagePhase = true;
+    });
   });
   await new Promise((resolve, reject) => {
     const fail = (error) => {
@@ -412,9 +468,12 @@ async function startBlackholeSessionBus(socketPath) {
     server.listen(socketPath);
   });
   server.on("error", () => {});
-  return async () => {
-    for (const socket of sockets) socket.destroy();
-    await new Promise((resolve) => server.close(() => resolve()));
+  return {
+    reachedMessagePhase: () => reachedMessagePhase,
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(() => resolve()));
+    },
   };
 }
 
@@ -625,14 +684,15 @@ test("native Linux account-observation credential refuses an absent retained int
   // not contact a real account service or expose secret material.
   t.diagnostic("LINUX_ACCOUNT_OBSERVATION_PHASE_SERVICE_DEADLINE");
   const blackholePaths = await prepareOwnerPrivateState(blackholeStateBase);
-  const closeBlackholeBus = await startBlackholeSessionBus(blackholeSocket);
+  const blackholeBus = await startBlackholeSessionBus(blackholeSocket);
   try {
     await runBlackholeChild({
       stateBase: blackholeStateBase,
       sessionBusAddress: `unix:path=${blackholeSocket}`,
     });
+    assert.equal(blackholeBus.reachedMessagePhase(), true);
   } finally {
-    await closeBlackholeBus();
+    await blackholeBus.close();
   }
   await assertMissing(blackholePaths.operationJournal);
   assert.equal(
