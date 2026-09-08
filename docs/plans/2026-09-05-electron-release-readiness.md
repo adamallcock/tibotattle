@@ -7,14 +7,21 @@ status: in-progress
 
 # Objective and current position
 
-Updated 2026-09-07. Deliver one primary Electron application for Apple Silicon
+Updated 2026-09-08. Deliver one primary Electron application for Apple Silicon
 Mac, Intel Mac, Windows x64 and Linux x64, with one shared product and release
 process. Provider support stays inside that app. The accepted
 [sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md) remains
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-All four development packaging jobs pass at
+Current gate: the latest completed run (`eeb74786`) passes both Mac packages and
+Linux's native and packaged first-install credential checks, but stops Windows
+in the observation-channel contract test. The IPC replacement is integrated
+locally at `cc15807d`, with startup refusal at `b28d0cda`; its native rerun is pending. Production selection and
+release remain gated. The daily Mac tester remains the verified `1f74bbb6`
+artifact described below.
+
+The earlier all-four development packaging baseline passes at
 `f26146aaf7fe34845ed7192ae0100e88b9d9b660` in
 [run 34179604251](https://github.com/adamallcock/tibotattle/actions/runs/34179604251):
 Apple Silicon Mac, Intel Mac, Windows x64 and Linux x64. Windows passes the
@@ -58,8 +65,10 @@ passes native compilation, explicit-XDG and umask tests, the separate absent
 passwd-home test, and the packaged first-run Secret Service journey. The downloaded ASAR matches both package and smoke receipts at
 `5dc652fef50c4713655e15c0c0c44b14655f2b98b3455bf4fd74fce5f6f7f506`. The actual
 default native test log records one pass and zero skips. Its standalone
-workflow acceptance is being tightened so a future skipped test cannot be
-accepted merely because Node exits zero. The repaired source-level Linux guard
+workflow now requires a fixed success marker emitted after all assertions.
+An executed-program regression verifies real TAP line endings and rejects
+skips, duplicate or absent markers, nonzero exits and process failures; a zero
+exit alone cannot qualify the check. This later marker is awaiting native CI. The repaired source-level Linux guard
 now checks the exact qualification dependency closure and proves that ordinary
 launch options expose no broker while production Linux selection stays closed;
 all 119 portable foundation tests pass (five expected native/optional skips). An owner-bit-masking umask deliberately
@@ -75,8 +84,10 @@ account-unknown evidence. Legacy export-identity, Claude callback and paired
 device credentials are not required by this profile and must stay unselected.
 A dedicated observation facade and create/readback recovery can therefore be
 qualified without activating or claiming recovery for the generic four-capability
-backend. The Linux observation selector currently asks for unused replace/delete
-methods and needs a narrow contract update alongside that facade. The separate
+backend. The Linux observation selector now accepts the actual narrow contract at
+`2b4e3464`: read-only for existing-only loads, read/create for collection. All
+22 observation tests pass, including refusal and existing generic compatibility.
+No default backend or production platform selection is enabled. The separate
 installation record still needs its own interruption/recovery proof. This scope
 reduction is a source-backed implementation plan, not production activation.
 
@@ -99,8 +110,8 @@ focused packaging tests pass, with two optional skips.
 The later `1d631abf` source adds the actual qualification-only Windows
 observation composition: an authenticated packaged context constructs the fixed
 Credential Manager facade with its native mutex, durable audit and completed
-startup recovery. The packaged smoke now runs FD3 upload storage followed by
-FD4 observation create/read and a fresh child reading the retained record.
+startup recovery. At that revision the packaged smoke runs FD3 upload storage
+followed by FD4 observation create/read and a fresh child reading the retained record.
 The new v2 receipt separates their results and fixed failure stages. This is
 confined to a disposable CI account; the fixed observation wire has no delete
 operation, so that synthetic record's cleanup boundary is the runner account's
@@ -127,9 +138,19 @@ the failing child/broker test exposes a duplex-transport mismatch. The extra
 Windows pipe supports child-to-parent traffic, while this protocol requires
 replies. The repair replaces that Windows-only channel with a fixed observation
 protocol on the already-owned Node IPC channel, preserving independent upload
-messages and parent-owned credentials. That repair and native validation are
-in progress. No native credential safety check, deadline or production
-selector has been relaxed.
+messages and parent-owned credentials. The replacement is integrated at
+`cc15807d`. A real child-process test exercises both protocols together, with
+bounded ordered requests, delivery callbacks that handle backpressure, and
+independent listener disposal. Local integration passes 94 tests with one
+Windows-only exclusion, 62 packaging/platform regression tests with two optional
+artifact exclusions, and all 78 release-trust checks. The independent review
+identified a pre-disconnected-child startup race, corrected at `b28d0cda` before
+native backend construction and independently checked with 71 passing IPC/shell
+tests. The unchanged qualification-authority marker retains its older FD4 name;
+the wire has a distinct IPC announcement/schema. Linux foundation now passes
+120 tests with five expected native/optional exclusions, and all 20 preflight
+checks pass. Native Windows validation is pending. No native credential safety
+check, deadline or production selector has been relaxed.
 
 The accountless production companion profile is now integrated at `b3643991`.
 It requires the exact production mode/origin and a connected private IPC
