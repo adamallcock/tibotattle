@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -7,6 +7,8 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
+import { DesktopSettingsBackendError } from "../apps/electron/desktop-settings-backends.js";
+import { WindowsProtectedStateStoreError } from "../src/platform/windows-protected-state-store.js";
 import {
   buildWindowsNormalCandidateEnvironment,
   buildWindowsNormalCandidateLaunchSpec,
@@ -18,6 +20,7 @@ import {
   createWindowsNormalCandidateQuitProtocol,
   jsonFetch,
   parseWindowsNormalCandidateSmokeArguments,
+  prepareWindowsNormalCandidateProfile,
   runWindowsNormalCandidateSmoke,
   selectWindowsNormalCandidateDashboardTarget,
   selectWindowsNormalCandidateSettingsTarget,
@@ -129,6 +132,35 @@ function passedJourney() {
     cleanQuit: true,
   };
 }
+
+function normalCandidateSeedDependencies(overrides = {}) {
+  let receipt = null;
+  return {
+    createAdapter: () => Object.freeze({ productionSafe: false }),
+    createStore: () => Object.freeze({}),
+    createReceiptBackend: () => Object.freeze({
+      async load() { return receipt; },
+      async save(value) { receipt = value; return value; },
+    }),
+    createSharingBackend: () => Object.freeze({
+      async load() { return null; },
+      async save() {},
+    }),
+    createCoordinator: () => Object.freeze({
+      async initialize() {},
+      async setEnabled() { return Object.freeze({ enabled: false }); },
+      async readAuthorization() {
+        return Object.freeze({ enabled: false, transportStatus: "off" });
+      },
+      dispose() {},
+    }),
+    ...overrides,
+  };
+}
+
+const NORMAL_CANDIDATE_PROFILE = Object.freeze({
+  userData: String.raw`C:\tibotattle-normal-candidate-test-${randomUUID()}\user-data`,
+});
 
 test("Windows normal candidate smoke accepts only its exact unpacked invocation", () => {
   assert.deepEqual(parseWindowsNormalCandidateSmokeArguments([
@@ -276,6 +308,58 @@ test("normal candidate package verification uses Windows ASAR separators for the
   );
   assert.equal(result.target, "win32-x64");
   assert.deepEqual(members, ["package.json", virtualManifest]);
+});
+
+test("normal candidate protected opt-out seeding retains closed source causes by stage", async () => {
+  const seed = (dependencies) => prepareWindowsNormalCandidateProfile({
+    profile: NORMAL_CANDIDATE_PROFILE,
+    stagedAppPath: STAGED_APP_PATH,
+  }, normalCandidateSeedDependencies(dependencies));
+
+  await assert.rejects(seed({
+    createAdapter() {
+      throw Object.assign(new Error("unavailable"), {
+        code: "WINDOWS_FILESYSTEM_BINDING_UNAVAILABLE",
+      });
+    },
+  }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PROTECTED_OPT_OUT_ADAPTER_UNAVAILABLE_WINDOWS_FILESYSTEM_BINDING_UNAVAILABLE",
+  });
+
+  await assert.rejects(seed({
+    createStore() { throw new WindowsProtectedStateStoreError("security_policy"); },
+  }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PROTECTED_OPT_OUT_STORE_UNAVAILABLE_WINDOWS_PROTECTED_STATE_STORE_SECURITY_POLICY",
+  });
+
+  await assert.rejects(seed({
+    createReceiptBackend: () => Object.freeze({
+      async load() { throw new DesktopSettingsBackendError("store_unsafe"); },
+      async save() {},
+    }),
+  }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PROTECTED_OPT_OUT_INITIAL_READ_UNAVAILABLE_DESKTOP_SETTINGS_BACKEND_STORE_UNSAFE",
+  });
+
+  await assert.rejects(seed({
+    createReceiptBackend: () => Object.freeze({
+      async load() { return null; },
+      async save() { throw new DesktopSettingsBackendError("write_failed"); },
+    }),
+  }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PROTECTED_OPT_OUT_FIRST_RUN_UNAVAILABLE_DESKTOP_SETTINGS_BACKEND_WRITE_FAILED",
+  });
+
+  await assert.rejects(seed({
+    createCoordinator: () => Object.freeze({
+      async initialize() {},
+      async setEnabled() { throw new DesktopSettingsBackendError("unavailable"); },
+      async readAuthorization() { return null; },
+      dispose() {},
+    }),
+  }), {
+    code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PROTECTED_OPT_OUT_SHARING_UNAVAILABLE_DESKTOP_SETTINGS_BACKEND_UNAVAILABLE",
+  });
 });
 
 test("normal candidate runner preserves a package stage in its content-free receipt", async () => {

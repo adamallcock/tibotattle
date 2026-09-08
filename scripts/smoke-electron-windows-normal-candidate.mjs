@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import {
   createWindowsFilesystemAdapter,
   createWindowsProtectedStateStore,
+  isWindowsProtectedStateStoreError,
 } from "../src/platform/index.js";
 import {
   createDesktopFirstRunReceiptBackend,
@@ -33,6 +34,7 @@ import {
   createDesktopSharingBackend,
   createDesktopSharingCoordinator,
 } from "../apps/electron/desktop-sharing.js";
+import { isDesktopSettingsBackendError } from "../apps/electron/desktop-settings-backends.js";
 import { validateProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import {
@@ -79,6 +81,47 @@ const OPERATION_TIMEOUT_MS = 20_000;
 const PROCESS_EXIT_TIMEOUT_MS = 15_000;
 const POWERSHELL_TIMEOUT_MS = 20_000;
 const CLEANUP_TIMEOUT_MS = 10_000;
+const PROTECTED_OPT_OUT_STAGES = new Set([
+  "PROTECTED_OPT_OUT_ADAPTER_UNAVAILABLE",
+  "PROTECTED_OPT_OUT_STORE_UNAVAILABLE",
+  "PROTECTED_OPT_OUT_INITIAL_READ_UNAVAILABLE",
+  "PROTECTED_OPT_OUT_FIRST_RUN_UNAVAILABLE",
+  "PROTECTED_OPT_OUT_SHARING_UNAVAILABLE",
+]);
+const WINDOWS_FILESYSTEM_SEED_CAUSES = new Set([
+  "WINDOWS_FILESYSTEM_BINDING_INTEGRITY_MISMATCH",
+  "WINDOWS_FILESYSTEM_BINDING_UNAVAILABLE",
+  "WINDOWS_FILESYSTEM_INVALID_BINDING",
+  "WINDOWS_FILESYSTEM_INVALID_BINDING_BYTES",
+  "WINDOWS_FILESYSTEM_INVALID_BINDING_PATH",
+  "WINDOWS_FILESYSTEM_INVALID_CONFIGURATION",
+  "WINDOWS_FILESYSTEM_INVALID_MANIFEST",
+  "WINDOWS_FILESYSTEM_MANIFEST_BINDING_MISMATCH",
+  "WINDOWS_FILESYSTEM_MANIFEST_UNAVAILABLE",
+  "WINDOWS_FILESYSTEM_UNSUPPORTED_ARCHITECTURE",
+  "WINDOWS_FILESYSTEM_UNSUPPORTED_PLATFORM",
+]);
+const WINDOWS_PROTECTED_STATE_SEED_CAUSES = new Set([
+  "WINDOWS_PROTECTED_STATE_STORE_INVALID_ADAPTER",
+  "WINDOWS_PROTECTED_STATE_STORE_INVALID_CONFIGURATION",
+  "WINDOWS_PROTECTED_STATE_STORE_INVALID_IDENTITY",
+  "WINDOWS_PROTECTED_STATE_STORE_INVALID_ROOT",
+  "WINDOWS_PROTECTED_STATE_STORE_SECURITY_POLICY",
+  "WINDOWS_PROTECTED_STATE_STORE_UNAVAILABLE",
+]);
+const DESKTOP_SETTINGS_SEED_CAUSES = new Set([
+  "DESKTOP_SETTINGS_BACKEND_CORRUPT",
+  "DESKTOP_SETTINGS_BACKEND_STORE_INVALID",
+  "DESKTOP_SETTINGS_BACKEND_STORE_UNSAFE",
+  "DESKTOP_SETTINGS_BACKEND_TOO_LARGE",
+  "DESKTOP_SETTINGS_BACKEND_UNAVAILABLE",
+  "DESKTOP_SETTINGS_BACKEND_WRITE_FAILED",
+]);
+const PROTECTED_OPT_OUT_CAUSES = new Set([
+  ...WINDOWS_FILESYSTEM_SEED_CAUSES,
+  ...WINDOWS_PROTECTED_STATE_SEED_CAUSES,
+  ...DESKTOP_SETTINGS_SEED_CAUSES,
+]);
 const FAILURE_CODES = new Set([
   "ARGUMENT_INVALID",
   "WINDOWS_X64_REQUIRED",
@@ -115,8 +158,23 @@ const FAILURE_CODES = new Set([
   "UNEXPECTED",
 ]);
 
+function protectedOptOutFailureCode(code) {
+  if (typeof code !== "string") return false;
+  for (const stage of PROTECTED_OPT_OUT_STAGES) {
+    const prefix = `${stage}_`;
+    if (code.startsWith(prefix) && PROTECTED_OPT_OUT_CAUSES.has(code.slice(prefix.length))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function knownFailureCode(code) {
+  return FAILURE_CODES.has(code) || protectedOptOutFailureCode(code);
+}
+
 function failure(code) {
-  const selected = FAILURE_CODES.has(code) ? code : "UNEXPECTED";
+  const selected = knownFailureCode(code) ? code : "UNEXPECTED";
   const error = new Error(`${PREFIX}${selected}`);
   error.code = error.message;
   return error;
@@ -128,7 +186,7 @@ function fail(code) {
 
 function fixedCode(error) {
   const value = String(error?.code ?? "");
-  return FAILURE_CODES.has(value.replace(PREFIX, "")) ? value : `${PREFIX}UNEXPECTED`;
+  return knownFailureCode(value.replace(PREFIX, "")) ? value : `${PREFIX}UNEXPECTED`;
 }
 
 function exactWindowsPath(value) {
@@ -512,20 +570,15 @@ function createStagedWindowsAdapter(stagedAppPath, {
   createAdapter = createWindowsFilesystemAdapter,
 } = {}) {
   const bindingPath = win32.join(stagedAppPath, ...WINDOWS_ELECTRON_BINDING_RELATIVE_PATH.split("/"));
-  let adapter;
-  try {
-    adapter = createAdapter({
-      platform: "win32",
-      architecture: "x64",
-      bindingPath,
-      resolveBinding: (path) => path,
-      requireBinding: (path) => require(path),
-      readManifest: (path) => readFileSync(path, "utf8"),
-      readBindingBytes: (path) => readFileSync(path),
-    });
-  } catch {
-    fail("PROTECTED_OPT_OUT_UNAVAILABLE");
-  }
+  const adapter = createAdapter({
+    platform: "win32",
+    architecture: "x64",
+    bindingPath,
+    resolveBinding: (path) => path,
+    requireBinding: (path) => require(path),
+    readManifest: (path) => readFileSync(path, "utf8"),
+    readBindingBytes: (path) => readFileSync(path),
+  });
   if (adapter === null || typeof adapter !== "object" || adapter.productionSafe !== false) {
     fail("PROTECTED_OPT_OUT_UNAVAILABLE");
   }
@@ -543,6 +596,35 @@ function sharingCoordinator(backend, {
     });
   } catch {
     fail("PROTECTED_OPT_OUT_UNAVAILABLE");
+  }
+}
+
+function protectedOptOutCause(error) {
+  let code = "";
+  try { code = typeof error?.code === "string" ? error.code : ""; }
+  catch { return null; }
+  if (WINDOWS_FILESYSTEM_SEED_CAUSES.has(code)) return code;
+  if (isWindowsProtectedStateStoreError(error)) {
+    const normalized = code.toUpperCase();
+    return WINDOWS_PROTECTED_STATE_SEED_CAUSES.has(normalized) ? normalized : null;
+  }
+  if (isDesktopSettingsBackendError(error)) {
+    const normalized = code.toUpperCase();
+    return DESKTOP_SETTINGS_SEED_CAUSES.has(normalized) ? normalized : null;
+  }
+  return null;
+}
+
+async function protectedOptOutStage(stage, operation) {
+  try {
+    return await operation();
+  } catch (error) {
+    const code = String(error?.code ?? "");
+    if (code.startsWith(PREFIX) && code !== `${PREFIX}PROTECTED_OPT_OUT_UNAVAILABLE`) {
+      throw error;
+    }
+    const cause = protectedOptOutCause(error);
+    fail(cause === null ? stage : `${stage}_${cause}`);
   }
 }
 
@@ -568,28 +650,61 @@ export async function prepareWindowsNormalCandidateProfile({
   let receiptBackend;
   let shareBackend;
   try {
-    adapter = createAdapter(stagedAppPath);
-    store = createStore({ adapter, rootPath: settingsRoot });
-    receiptBackend = createReceiptBackend({
-      platform: "win32",
-      windowsProtectedStateStore: store,
-    });
-    shareBackend = createSharingBackend({
-      platform: "win32",
-      rootPath: settingsRoot,
-      windowsProtectedStateStore: store,
-    });
-    if (await receiptBackend.load() !== null || await shareBackend.load() !== null) {
+    adapter = await protectedOptOutStage("PROTECTED_OPT_OUT_ADAPTER_UNAVAILABLE", () =>
+      createAdapter(stagedAppPath));
+    ({ store, receiptBackend, shareBackend } = await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_STORE_UNAVAILABLE",
+      () => {
+        const selectedStore = createStore({ adapter, rootPath: settingsRoot });
+        return {
+          store: selectedStore,
+          receiptBackend: createReceiptBackend({
+            platform: "win32",
+            windowsProtectedStateStore: selectedStore,
+          }),
+          shareBackend: createSharingBackend({
+            platform: "win32",
+            rootPath: settingsRoot,
+            windowsProtectedStateStore: selectedStore,
+          }),
+        };
+      },
+    ));
+    const initialReceipt = await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_INITIAL_READ_UNAVAILABLE",
+      () => receiptBackend.load(),
+    );
+    const initialSharing = await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_INITIAL_READ_UNAVAILABLE",
+      () => shareBackend.load(),
+    );
+    if (initialReceipt !== null || initialSharing !== null) {
       fail("PROFILE_NOT_ABSENT");
     }
-    await receiptBackend.save(FIRST_RUN_ACKNOWLEDGEMENT);
-    const receipt = validateDesktopFirstRunReceipt(await receiptBackend.load());
+    await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_FIRST_RUN_UNAVAILABLE",
+      () => receiptBackend.save(FIRST_RUN_ACKNOWLEDGEMENT),
+    );
+    const receipt = await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_FIRST_RUN_UNAVAILABLE",
+      async () => validateDesktopFirstRunReceipt(await receiptBackend.load()),
+    );
     if (receipt.acknowledged !== true) fail("PROTECTED_OPT_OUT_UNAVAILABLE");
-    const coordinator = sharingCoordinator(shareBackend, { createCoordinator });
+    const coordinator = await protectedOptOutStage(
+      "PROTECTED_OPT_OUT_SHARING_UNAVAILABLE",
+      () => sharingCoordinator(shareBackend, { createCoordinator }),
+    );
     try {
-      await coordinator.initialize();
-      const selection = await coordinator.setEnabled(false);
-      const authorization = await coordinator.readAuthorization();
+      const { selection, authorization } = await protectedOptOutStage(
+        "PROTECTED_OPT_OUT_SHARING_UNAVAILABLE",
+        async () => {
+          await coordinator.initialize();
+          return {
+            selection: await coordinator.setEnabled(false),
+            authorization: await coordinator.readAuthorization(),
+          };
+        },
+      );
       if (selection?.enabled !== false || authorization?.enabled !== false
           || authorization?.transportStatus !== "off") {
         fail("PROTECTED_OPT_OUT_UNAVAILABLE");
