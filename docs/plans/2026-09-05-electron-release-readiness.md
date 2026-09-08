@@ -14,7 +14,16 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Latest native run: `90486dc6` in
+Latest completed native run: `b103ef6d` in
+[run 34197062178](https://github.com/adamallcock/tibotattle/actions/runs/34197062178)
+passes both Macs and Windows. Linux stops at compilation because the new timeout
+watchdog used C++ exception handling under the existing no-exceptions build. Its
+fixed compiler-failure record is retained; this run never reached credential
+execution or produced a Linux package. The repair keeps that build policy and
+uses GLib’s fallible thread constructor, with deadline timing anchored to the
+operation and expiry checked before normal settlement. Native proof is pending.
+
+The preceding native run: `90486dc6` in
 [run 34194270068](https://github.com/adamallcock/tibotattle/actions/runs/34194270068)
 passes both Macs and Windows, including the repaired packager's real runtime
 configuration tests. Linux compiles and packages successfully, then fails the new
