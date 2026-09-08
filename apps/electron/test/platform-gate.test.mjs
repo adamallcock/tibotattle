@@ -88,6 +88,41 @@ test("Linux permits development and an exact stable x64 source candidate without
   }
 });
 
+test("Windows permits only an exact stable x64 candidate without upgrading native readiness", () => {
+  const productionDistribution = createProductionDistributionMetadata({
+    target: "win32-x64",
+    sourceRevision: "c".repeat(40),
+    buildNumber: "2026090703",
+  });
+  assert.deepEqual(assertElectronPlatformGate({
+    platform: "win32",
+    architecture: "x64",
+    productionDistribution,
+    environment: {},
+  }), {
+    platform: "win32",
+    architecture: "x64",
+    windowsProductionReady: false,
+    windowsQualificationOnly: false,
+  });
+  for (const override of [
+    { architecture: "arm64" },
+    { qualificationContext: { qualificationOnly: true } },
+    { environment: { USAGE_MONITOR_TEST_LANE: "windows-local-qa" } },
+    { productionDistribution: { ...productionDistribution, target: "linux-x64" } },
+    { productionDistribution: { ...productionDistribution, updateFeed: "https://example.invalid" } },
+    { productionDistribution: { ...productionDistribution, unexpected: true } },
+  ]) {
+    assert.throws(() => assertElectronPlatformGate({
+      platform: "win32",
+      architecture: "x64",
+      productionDistribution,
+      environment: {},
+      ...override,
+    }), refusal("windows_readiness_unavailable"));
+  }
+});
+
 test("an invalid packaged Linux manifest quits before companion or credential composition", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-linux-production-gate-"));
   const productionDistribution = createProductionDistributionMetadata({

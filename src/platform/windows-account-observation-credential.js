@@ -22,6 +22,10 @@ import {
   createWindowsCredentialAuditFileGuardContext,
 } from "./windows-credential-audit-file-guard.js";
 import {
+  createWindowsFilesystemAdapter,
+  isWindowsFilesystemAdapter,
+} from "./windows-filesystem.js";
+import {
   isWindowsQualificationModeContextFor,
 } from "./windows-qualification-mode.js";
 
@@ -46,6 +50,21 @@ const QUALIFIED_TEST_DEPENDENCY_KEYS = Object.freeze([
   "createMutexContext",
   "defaultAuditFile",
   "isQualificationModeContextFor",
+]);
+const NORMAL_CANDIDATE_PRODUCTION_OPTION_KEYS = Object.freeze([]);
+const NORMAL_CANDIDATE_TEST_OPTION_KEYS = Object.freeze([
+  "architecture",
+  "platform",
+]);
+const NORMAL_CANDIDATE_TEST_DEPENDENCY_KEYS = Object.freeze([
+  "createAdapter",
+  "createAuditFileGuardContext",
+  "createAuditStore",
+  "createCredentialManagerBackend",
+  "createLeaseContext",
+  "createMutexContext",
+  "defaultAuditFile",
+  "isFilesystemAdapter",
 ]);
 
 export const WINDOWS_ACCOUNT_OBSERVATION_CREDENTIAL_INTEGRATION_STATUS = "qualification_only";
@@ -252,7 +271,7 @@ function validRecoveryReceipt(value) {
  * the existing fixed wrapper already snapshots, and it never forwards an
  * arbitrary credential capability or binding.
  */
-function wrapLeaseOwningQualifiedManager(manager, leaseContext) {
+function wrapLeaseOwningManager(manager, leaseContext) {
   const selected = snapshotManager(manager);
   let closed = false;
   return Object.freeze({
@@ -277,6 +296,24 @@ function wrapLeaseOwningQualifiedManager(manager, leaseContext) {
     startupRecoveryComplete: true,
     productionSafe: false,
   });
+}
+
+function normalCandidateAdapter(adapter, isFilesystemAdapter) {
+  let valid = false;
+  try {
+    valid = typeof isFilesystemAdapter === "function"
+      && isFilesystemAdapter(adapter) === true
+      // This candidate reuses the reviewed fixed mutex and audit-file guard,
+      // but it does not upgrade either filesystem production claim.
+      && adapter.productionSafe === false
+      && adapter.pathWalkRaceSafe === false
+      && adapter.credentialMutexSafe === true
+      && adapter.credentialAuditFileGuardSafe === true;
+  } catch {
+    valid = false;
+  }
+  if (!valid) fail("unavailable");
+  return adapter;
 }
 
 function snapshotManager(manager) {
@@ -313,11 +350,11 @@ function snapshotManager(manager) {
  * It intentionally reuses the audited manager's ID-1 mutex and durable
  * prepared/settled/recovered journal, while exposing neither generic manager
  * capabilities nor raw Credential Manager service/account inputs. The
- * manager constructor is explicit: only a later app-owned, branded
- * qualification composition may provide it. This injected constructor never
- * discovers a native binding, state root, or ambient credential route on its
- * own; the separate qualified constructor below verifies both authorities
- * before it composes the reviewed native factories internally.
+ * manager constructor is explicit. This injected constructor never discovers
+ * a native binding, state root, or ambient credential route on its own; the
+ * separate internally composed qualification and normal-candidate
+ * constructors below verify their reviewed authorities before they construct
+ * the generic manager privately.
  */
 export function createWindowsAccountObservationCredentialBackend(options = {}) {
   const configuration = exactOptions(options);
@@ -419,7 +456,7 @@ export function createWindowsAccountObservationCredentialBackend(options = {}) {
   return backend;
 }
 
-function createQualifiedBackend({
+function createAuditedBackend({
   adapter,
   architecture,
   createAuditFileGuardContext,
@@ -428,10 +465,8 @@ function createQualifiedBackend({
   createLeaseContext,
   createMutexContext,
   defaultAuditFile,
-  isQualificationContextFor,
   platform,
-  resourceRoot,
-  windowsQualificationModeContext,
+  auditStateRoot = null,
 }) {
   if (platform !== "win32") fail("unsupported_platform");
   if (architecture !== "x64") fail("unsupported_architecture");
@@ -442,16 +477,12 @@ function createQualifiedBackend({
     createLeaseContext,
     createMutexContext,
     defaultAuditFile,
-    isQualificationContextFor,
   ].some((value) => typeof value !== "function")) {
     fail("invalid_configuration");
   }
-  const qualifiedContext = qualifiedModeContext({
-    adapter,
-    resourceRoot,
-    windowsQualificationModeContext,
-    isQualificationContextFor,
-  });
+  if (auditStateRoot !== null && (typeof auditStateRoot !== "string" || auditStateRoot.length === 0)) {
+    fail("invalid_configuration");
+  }
 
   let auditStore = null;
   let leaseContext = null;
@@ -459,13 +490,15 @@ function createQualifiedBackend({
     const mutexContext = createMutexContext({ platform, architecture });
     const fileGuardContext = createAuditFileGuardContext({ platform, architecture });
     auditStore = createAuditStore({
-      filePath: defaultAuditFile({
-        platform,
-        // The launcher-created state container has ordinary inherited ACLs.
-        // The audit guard must create its own fixed, owner-only root rather
-        // than treating that existing container as a protected directory.
-        stateRoot: win32.join(qualifiedContext.stateRoot, "account-observation-fd4-v1"),
-      }),
+      filePath: defaultAuditFile(auditStateRoot === null
+        ? { platform }
+        : {
+          platform,
+          // The launcher-created state container has ordinary inherited ACLs.
+          // The audit guard must create its own fixed, owner-only root rather
+          // than treating that existing container as a protected directory.
+          stateRoot: auditStateRoot,
+        }),
       fileGuardContext,
     });
     const candidateLeaseContext = createLeaseContext({
@@ -491,7 +524,7 @@ function createQualifiedBackend({
       architecture,
       operationLeaseContext: leaseContext,
     });
-    const manager = wrapLeaseOwningQualifiedManager(qualifiedManager, leaseContext);
+    const manager = wrapLeaseOwningManager(qualifiedManager, leaseContext);
     // The explicit fixed factory still performs its own trusted-manager
     // snapshot and retains the capability restriction in one place.
     return createWindowsAccountObservationCredentialBackend({
@@ -508,6 +541,45 @@ function createQualifiedBackend({
     if (isWindowsAccountObservationCredentialError(error)) throw error;
     fail(qualifiedFailureCode(error));
   }
+}
+
+function createQualifiedBackend({
+  adapter,
+  architecture,
+  createAuditFileGuardContext,
+  createAuditStore,
+  createCredentialManagerBackend,
+  createLeaseContext,
+  createMutexContext,
+  defaultAuditFile,
+  isQualificationContextFor,
+  platform,
+  resourceRoot,
+  windowsQualificationModeContext,
+}) {
+  // Preserve the original external contract: architecture rejection happens
+  // before a branded qualification context or any native factory is touched.
+  if (platform !== "win32") fail("unsupported_platform");
+  if (architecture !== "x64") fail("unsupported_architecture");
+  if (typeof isQualificationContextFor !== "function") fail("invalid_configuration");
+  const qualifiedContext = qualifiedModeContext({
+    adapter,
+    resourceRoot,
+    windowsQualificationModeContext,
+    isQualificationContextFor,
+  });
+  return createAuditedBackend({
+    adapter,
+    architecture,
+    createAuditFileGuardContext,
+    createAuditStore,
+    createCredentialManagerBackend,
+    createLeaseContext,
+    createMutexContext,
+    defaultAuditFile,
+    platform,
+    auditStateRoot: win32.join(qualifiedContext.stateRoot, "account-observation-fd4-v1"),
+  });
 }
 
 /**
@@ -563,5 +635,103 @@ export function createQualifiedWindowsAccountObservationCredentialBackendForTest
     platform: source.platform,
     resourceRoot: source.resourceRoot,
     windowsQualificationModeContext: source.windowsQualificationModeContext,
+  });
+}
+
+function createNormalCandidateBackend({
+  architecture,
+  createAdapter,
+  createAuditFileGuardContext,
+  createAuditStore,
+  createCredentialManagerBackend,
+  createLeaseContext,
+  createMutexContext,
+  defaultAuditFile,
+  isFilesystemAdapter,
+  platform,
+}) {
+  if (platform !== "win32") fail("unsupported_platform");
+  if (architecture !== "x64") fail("unsupported_architecture");
+  if ([
+    createAdapter,
+    createAuditFileGuardContext,
+    createAuditStore,
+    createCredentialManagerBackend,
+    createLeaseContext,
+    createMutexContext,
+    defaultAuditFile,
+    isFilesystemAdapter,
+  ].some((value) => typeof value !== "function")) {
+    fail("invalid_configuration");
+  }
+  let adapter;
+  try {
+    adapter = normalCandidateAdapter(
+      createAdapter({ platform, architecture }),
+      isFilesystemAdapter,
+    );
+  } catch (error) {
+    if (isWindowsAccountObservationCredentialError(error)) throw error;
+    fail("unavailable");
+  }
+  return createAuditedBackend({
+    adapter,
+    architecture,
+    createAuditFileGuardContext,
+    createAuditStore,
+    createCredentialManagerBackend,
+    createLeaseContext,
+    createMutexContext,
+    defaultAuditFile,
+    platform,
+  });
+}
+
+/**
+ * Construct the fixed FD4 observation backend for a separately selected
+ * packaged Windows/x64 normal-startup candidate. The candidate still requires
+ * the repository-owned filesystem sidecar and preserves all of its current
+ * `productionSafe: false` and `pathWalkRaceSafe: false` facts. It accepts no
+ * caller-selected binding, audit path, capability, service, or account; the
+ * generic Credential Manager remains private to this fixed facade.
+ */
+export function createWindowsNormalCandidateAccountObservationCredentialBackend(options = {}) {
+  exactObject(options, NORMAL_CANDIDATE_PRODUCTION_OPTION_KEYS);
+  return createNormalCandidateBackend({
+    architecture: process.arch,
+    createAdapter: createWindowsFilesystemAdapter,
+    createAuditFileGuardContext: createWindowsCredentialAuditFileGuardContext,
+    createAuditStore: createWindowsCredentialOperationAuditStore,
+    createCredentialManagerBackend: createWindowsCredentialManagerBackend,
+    createLeaseContext: createWindowsCredentialOperationLeaseContext,
+    createMutexContext: createWindowsCredentialMutexContext,
+    defaultAuditFile: defaultWindowsCredentialOperationAuditFile,
+    isFilesystemAdapter: isWindowsFilesystemAdapter,
+    platform: process.platform,
+  });
+}
+
+/**
+ * Plain-Node seam for the fixed normal-candidate contract. It permits only
+ * disposable native factory replacements; no application caller can supply
+ * such a seam, a state root, or a credential capability.
+ */
+export function createWindowsNormalCandidateAccountObservationCredentialBackendForTest(
+  options = {},
+  dependencies = {},
+) {
+  const source = exactObject(options, NORMAL_CANDIDATE_TEST_OPTION_KEYS);
+  const factories = exactObject(dependencies, NORMAL_CANDIDATE_TEST_DEPENDENCY_KEYS);
+  return createNormalCandidateBackend({
+    architecture: source.architecture,
+    createAdapter: factories.createAdapter,
+    createAuditFileGuardContext: factories.createAuditFileGuardContext,
+    createAuditStore: factories.createAuditStore,
+    createCredentialManagerBackend: factories.createCredentialManagerBackend,
+    createLeaseContext: factories.createLeaseContext,
+    createMutexContext: factories.createMutexContext,
+    defaultAuditFile: factories.defaultAuditFile,
+    isFilesystemAdapter: factories.isFilesystemAdapter,
+    platform: source.platform,
   });
 }

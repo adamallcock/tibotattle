@@ -19,6 +19,9 @@ import {
   createLinuxProductionCredentialHandover,
   createLinuxQualificationAccountObservationHandover,
 } from "./desktop-linux-secret-service.js";
+import {
+  createWindowsNormalCandidateCredentialHandover,
+} from "./desktop-windows-accountless-credential.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, shellError } from "./errors.js";
 import { assertElectronPlatformGate } from "./platform-gate.js";
 import {
@@ -692,10 +695,9 @@ export async function launchElectronShell({
     // A local-QA launch must never inherit production sending or updating.
     const productionEnabled = productionDistribution !== null
       && environment.USAGE_MONITOR_TEST_LANE === undefined;
-    // A native-to-Electron handover candidate retains the signed handover and
-    // FD4 continuity path, but it never enables the accountless FD3/upload
-    // path. The separate unsigned hosted scheduler rehearsal is selected
-    // below from its own packaged Dev manifest.
+    // An exact stable package may select its fixed platform-native credential
+    // handover. Installed lifecycle evidence and the native sidecars' false
+    // production-safety facts remain separate from this source selection.
     const accountlessProductionEnabled = productionEnabled
       && productionDistribution.channel === PRODUCTION_ELECTRON_CHANNEL;
     const linuxQualificationSupervisorOptions =
@@ -708,6 +710,11 @@ export async function launchElectronShell({
       && process.arch === "x64"
       && productionDistribution.target === "linux-x64"
       ? createLinuxProductionCredentialHandover() : null;
+    const windowsNormalCandidateCredentialHandover = accountlessProductionEnabled
+      && process.platform === "win32"
+      && process.arch === "x64"
+      && productionDistribution.target === "win32-x64"
+      ? createWindowsNormalCandidateCredentialHandover() : null;
     const macCredentialHandover = productionEnabled && process.platform === "darwin"
       ? createProductionMacCredentialHandover({
         app,
@@ -740,6 +747,10 @@ export async function launchElectronShell({
           attachLinuxAccountObservationBroker:
             linuxProductionCredentialHandover.attachLinuxAccountObservationBroker,
         }),
+        ...(windowsNormalCandidateCredentialHandover === null ? {} : {
+          attachWindowsAccountObservationBroker:
+            windowsNormalCandidateCredentialHandover.attachWindowsAccountObservationBroker,
+        }),
         ...(macCredentialHandover === null ? {} : {
           attachCredentialBroker: macCredentialHandover.attachCredentialBroker,
         }),
@@ -767,6 +778,10 @@ export async function launchElectronShell({
         ...(linuxProductionCredentialHandover === null ? {} : {
           createLinuxCredentialBackend:
             linuxProductionCredentialHandover.createAccountlessCredentialBackend,
+        }),
+        ...(windowsNormalCandidateCredentialHandover === null ? {} : {
+          createWindowsCredentialBackend:
+            windowsNormalCandidateCredentialHandover.createAccountlessCredentialBackend,
         }),
       } : undefined,
       accountlessHostedRehearsal: accountlessHostedRehearsal ?? undefined,

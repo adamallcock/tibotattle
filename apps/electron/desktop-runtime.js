@@ -347,6 +347,7 @@ function createNotificationPolicyBackend({
   rootPath,
   windowsProtectedStateStore,
   qualificationContext,
+  windowsNormalCandidate = false,
   architecture = process.arch,
 } = {}) {
   if (notificationBackend !== undefined) {
@@ -358,10 +359,11 @@ function createNotificationPolicyBackend({
   const selectedRootPath = rootPath ?? join(userDataPath(app), DESKTOP_SETTINGS_DIRECTORY);
   const codec = createDesktopNotificationPolicyCodec();
   if (platform === "win32") {
-    // The qualified Windows lane must use the branded protected store for
-    // every desktop record. A test backend is intentionally impossible in
-    // that lane, and there is no ordinary Node filesystem fallback.
-    if (qualificationContext === null || qualificationContext === undefined) {
+    // The qualified and exact stable-candidate Windows lanes must use the
+    // branded protected store for every desktop record. There is no ordinary
+    // Node filesystem fallback.
+    if ((qualificationContext === null || qualificationContext === undefined)
+        && windowsNormalCandidate !== true) {
       throw shellError("windows_readiness_unavailable");
     }
     const adapter = createWindowsFilesystemAdapter({
@@ -465,6 +467,7 @@ function createSettingsBackend({
   rootPath,
   windowsProtectedStateStore,
   qualificationContext,
+  windowsNormalCandidate = false,
   architecture = process.arch,
 } = {}) {
   if (settingsBackend !== undefined) return settingsBackend;
@@ -472,7 +475,8 @@ function createSettingsBackend({
   if (platform === "win32") {
     // Windows never falls back to Node filesystem state. The repository's
     // branded adapter and protected store are the only accepted backend.
-    if (qualificationContext === null || qualificationContext === undefined) {
+    if ((qualificationContext === null || qualificationContext === undefined)
+        && windowsNormalCandidate !== true) {
       // The platform gate normally prevents this branch. Keeping the check
       // explicit prevents a future caller from silently enabling an unqualified
       // Windows desktop state path.
@@ -643,6 +647,12 @@ export async function launchDesktopRuntime({
       throw shellError("electron_configuration_invalid");
     }
   }
+  // `productionDistribution` has just passed the exact package identity,
+  // platform, architecture, test-lane, and qualification-context checks.
+  // This permits the protected Windows state route for the one stable
+  // candidate without changing the native sidecar's own safety claims.
+  const windowsNormalCandidate = platform === "win32"
+    && productionDistribution !== undefined;
   if (prepareNativeHandover !== undefined && (typeof prepareNativeHandover !== "function"
       || productionDistribution === undefined || platform !== "darwin")) {
     throw shellError("electron_configuration_invalid");
@@ -911,10 +921,10 @@ export async function launchDesktopRuntime({
       rootPath: settingsRootPath,
     })
     : null;
-  // Production macOS, Linux, and Windows composition uses a main-process
-  // native adapter. Windows has no selected factory today, so an explicit
-  // factory requirement prevents a future production flag from falling back
-  // to Electron safeStorage before its native credential route qualifies.
+  // Production macOS, Linux, and the exact Windows candidate use a
+  // main-process native adapter. The explicit factory requirement prevents a
+  // fallback to Electron safeStorage before a reviewed native route is
+  // selected.
   // Do not call Electron safeStorage there: its asynchronous availability probe
   // can initialize a platform credential provider. Existing encrypted records
   // are inspected without decrypting or changing them so a prior installation
@@ -936,6 +946,9 @@ export async function launchDesktopRuntime({
             : "createWindowsCredentialBackend"
       ]({
         legacyCredentialProbe: legacyCredentialProbe.inspect,
+        ...(accountlessProductionUsesWindowsNativeCredential
+          ? { rootPath: settingsRootPath }
+          : {}),
       });
       if (!nativeBackend
           || typeof nativeBackend !== "object"
@@ -1027,6 +1040,7 @@ export async function launchDesktopRuntime({
       settingsBackend,
       rootPath: settingsRootPath,
       qualificationContext,
+      windowsNormalCandidate,
       architecture,
       windowsProtectedStateStore,
     })
@@ -1048,6 +1062,7 @@ export async function launchDesktopRuntime({
     notificationBackend,
     rootPath: settingsRootPath,
     qualificationContext,
+    windowsNormalCandidate,
     architecture,
     windowsProtectedStateStore,
   });

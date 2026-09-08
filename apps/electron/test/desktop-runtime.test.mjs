@@ -994,9 +994,10 @@ test("Windows native accountless recovery remains FD3-only and never initializes
     accountlessProduction: {
       origin: "https://tibotattle.com",
       policyVersion: "accountless-opt-out-v1",
-      createWindowsCredentialBackend({ legacyCredentialProbe }) {
+      createWindowsCredentialBackend({ legacyCredentialProbe, rootPath }) {
         factoryCalls += 1;
         assert.equal(typeof legacyCredentialProbe, "function");
+        assert.equal(rootPath, join(profile, "desktop-settings"));
         return {
           async read() { nativeCalls += 1; throw new Error("must not access native credential"); },
           async createIfMissing() { nativeCalls += 1; throw new Error("must not access native credential"); },

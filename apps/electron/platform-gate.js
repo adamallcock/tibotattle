@@ -11,11 +11,11 @@ import {
 } from "./windows-qualification.js";
 
 /**
- * Electron does not authorize Windows production storage. On Windows the
- * shell may launch only after the same branded readiness attestation used by
- * the credential consumers is supplied. Linux source candidates select the
- * fixed native composition through exact stable packaged metadata. This
- * selection does not establish installed lifecycle or release evidence.
+ * Electron does not authorize Windows production storage. An exact stable
+ * Windows/x64 package may select the fixed candidate composition while native
+ * filesystem claims remain false; installed lifecycle and release evidence
+ * stay separate. All other Windows launches require the branded qualification
+ * context or an independently established readiness attestation.
  */
 export function assertElectronPlatformGate({
   platform = process.platform,
@@ -45,6 +45,28 @@ export function assertElectronPlatformGate({
       platform,
       architecture,
       windowsProductionReady: false,
+    });
+  }
+  if (productionDistribution !== null && productionDistribution !== undefined) {
+    try {
+      if (architecture !== "x64" || qualificationContext !== null
+          || environment?.USAGE_MONITOR_TEST_LANE !== undefined) {
+        throw new Error("Mixed Windows candidate selection");
+      }
+      validateProductionDistributionMetadata(productionDistribution, {
+        platform,
+        architecture,
+      });
+    } catch {
+      throw shellError("windows_readiness_unavailable");
+    }
+    return Object.freeze({
+      platform,
+      architecture,
+      // Candidate selection does not upgrade the native sidecar's own
+      // productionSafe/pathWalkRaceSafe facts or make a release claim.
+      windowsProductionReady: false,
+      windowsQualificationOnly: false,
     });
   }
   try {
