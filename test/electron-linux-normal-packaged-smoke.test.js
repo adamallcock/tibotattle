@@ -27,6 +27,7 @@ import {
 } from "../scripts/smoke-electron-linux-packaged.mjs";
 import {
   LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA,
+  LINUX_DASHBOARD_FAILURE_DIAGNOSTIC_SCHEMA,
   validateRendererReadinessDiagnostics,
 } from "../scripts/smoke-electron-linux.mjs";
 import {
@@ -132,6 +133,7 @@ test("Linux session and outer receipt preserve closed process observations and r
     firstUnexpectedExit: { event: "exited", phase: "ready", outcome: "signal_abrt" },
   };
   const identity = { sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256 };
+  const dashboardFailure = { stage: "render_process_gone", reason: "oom" };
   for (const value of [diagnostic, { ...diagnostic, stderr: "private payload" }]) {
     const child = sessionChild();
     const receipt = await runLinuxNormalPackagedSmoke({ sourceRevision: SOURCE_REVISION }, {
@@ -141,9 +143,14 @@ test("Linux session and outer receipt preserve closed process observations and r
           queueMicrotask(() => {
             child.stdout.end();
             child.stderr.write("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SOURCE_SMOKE_RENDERER_READINESS_MARKER_FALSE_TITLE_TRUE_HEADING_TRUE_FAILED\n");
-            child.stderr.end(`${JSON.stringify({
+            child.stderr.write(`${JSON.stringify({
               schemaVersion: LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA,
               companionProcessDiagnostics: value,
+            })}\n`);
+            child.stderr.end(`${JSON.stringify({
+              schemaVersion: LINUX_DASHBOARD_FAILURE_DIAGNOSTIC_SCHEMA,
+              dashboardLoadFailure: value === diagnostic ? dashboardFailure
+                : { ...dashboardFailure, private: "payload" },
             })}\n`);
             child.exitCode = 1;
             child.emit("exit", 1, null);
@@ -156,6 +163,7 @@ test("Linux session and outer receipt preserve closed process observations and r
     assert.equal(receipt.status, "failed");
     assert.equal(receipt.packagedElectronExecutionVerified, false);
     assert.deepEqual(receipt.companionProcessDiagnostics, value === diagnostic ? diagnostic : undefined);
+    assert.deepEqual(receipt.dashboardLoadFailure, value === diagnostic ? dashboardFailure : undefined);
     assert.equal(JSON.stringify(receipt).includes("private payload"), false);
   }
 });

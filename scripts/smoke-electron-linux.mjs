@@ -49,7 +49,13 @@ const CLI_FAILURE_STATUS = "ELECTRON_LINUX_SMOKE_FAILED";
 const NETWORK_BOUNDARY = "network-none";
 export const LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA =
   "tibotattle-electron-linux-companion-process-diagnostic-v1";
+export const LINUX_DASHBOARD_FAILURE_DIAGNOSTIC_SCHEMA =
+  "tibotattle-electron-linux-dashboard-failure-diagnostic-v1";
 const COMPANION_PROCESS_PREFIX = "TIBOTATTLE_ELECTRON_COMPANION_PROCESS ";
+const DASHBOARD_FAILURE_PREFIX = "TIBOTATTLE_ELECTRON_DASHBOARD_FAILURE ";
+const RENDER_PROCESS_FAILURE_REASONS = new Set([
+  "clean-exit", "abnormal-exit", "killed", "crashed", "oom", "launch-failed", "integrity-failure", "unknown",
+]);
 const COMPANION_PROCESS_OUTCOMES = new Set([
   "exit_zero", "exit_nonzero", "signal_abrt", "signal_segv", "signal_kill", "signal_term", "signal_other",
 ]);
@@ -78,10 +84,49 @@ export function validateLinuxCompanionProcessDiagnostics(value) {
   return Object.freeze({ lastEvent, firstUnexpectedExit });
 }
 
-/** Consume only a closed main-process marker; discard every other stderr byte. */
-export function createLinuxCompanionProcessDiagnostics() {
+function createDiagnosticLineReader(onLine) {
   let pending = "";
   let discarding = false;
+  return (chunk) => {
+    const pieces = Buffer.from(chunk).toString("utf8").split("\n");
+    for (let index = 0; index < pieces.length; index += 1) {
+      if (!discarding) {
+        if (pending.length + pieces[index].length > 512) { pending = ""; discarding = true; }
+        else pending += pieces[index];
+      }
+      if (index < pieces.length - 1) {
+        if (!discarding) onLine(pending);
+        pending = ""; discarding = false;
+      }
+    }
+  };
+}
+
+export function validateLinuxDashboardFailureDiagnostic(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+      || Reflect.ownKeys(value).length !== 2) return null;
+  const boundedNetworkCode = Number.isInteger(value.reason) && value.reason >= -999 && value.reason <= -1;
+  if ((value.stage === "load_url" || value.stage === "did_fail_load") && (value.reason === null || boundedNetworkCode)
+      || value.stage === "render_process_gone" && RENDER_PROCESS_FAILURE_REASONS.has(value.reason)) {
+    return Object.freeze({ stage: value.stage, reason: value.reason });
+  }
+  return null;
+}
+
+export function createLinuxDashboardFailureDiagnostics() {
+  let failure = null;
+  return Object.freeze({
+    feed: createDiagnosticLineReader((line) => {
+      if (failure !== null || !line.startsWith(DASHBOARD_FAILURE_PREFIX)) return;
+      try { failure = validateLinuxDashboardFailureDiagnostic(JSON.parse(line.slice(DASHBOARD_FAILURE_PREFIX.length))); }
+      catch { /* Other stderr is discarded. */ }
+    }),
+    snapshot: () => failure,
+  });
+}
+
+/** Consume only a closed main-process marker; discard every other stderr byte. */
+export function createLinuxCompanionProcessDiagnostics() {
   let lastEvent = null;
   let firstUnexpectedExit = null;
   function line(value) {
@@ -96,19 +141,7 @@ export function createLinuxCompanionProcessDiagnostics() {
     }
   }
   return Object.freeze({
-    feed(chunk) {
-      const pieces = Buffer.from(chunk).toString("utf8").split("\n");
-      for (let index = 0; index < pieces.length; index += 1) {
-        if (!discarding) {
-          if (pending.length + pieces[index].length > 512) { pending = ""; discarding = true; }
-          else pending += pieces[index];
-        }
-        if (index < pieces.length - 1) {
-          if (!discarding) line(pending);
-          pending = ""; discarding = false;
-        }
-      }
-    },
+    feed: createDiagnosticLineReader(line),
     snapshot: () => validateLinuxCompanionProcessDiagnostics({ lastEvent, firstUnexpectedExit }),
   });
 }
@@ -1773,6 +1806,7 @@ export async function runSmoke({
   onFailureStage = null,
   onRendererReadinessDiagnostics = null,
   onCompanionProcessDiagnostics = null,
+  onDashboardFailureDiagnostic = null,
   qualification = "development-only",
   sourceRevision = null,
   writeResult = defaultSmokeResultWriter,
@@ -1785,6 +1819,7 @@ export async function runSmoke({
       || onFailureStage !== null && typeof onFailureStage !== "function"
       || onRendererReadinessDiagnostics !== null && typeof onRendererReadinessDiagnostics !== "function"
       || onCompanionProcessDiagnostics !== null && typeof onCompanionProcessDiagnostics !== "function"
+      || onDashboardFailureDiagnostic !== null && typeof onDashboardFailureDiagnostic !== "function"
       || typeof writeResult !== "function"
       || typeof qualification !== "string" || qualification.length === 0
       || (sourceRevision !== null && !/^[0-9a-f]{40}$/u.test(sourceRevision))) {
@@ -1830,10 +1865,13 @@ export async function runSmoke({
   let stderrProduced = false;
   const companionProcessDiagnostics = onCompanionProcessDiagnostics === null
     ? null : createLinuxCompanionProcessDiagnostics();
+  const dashboardFailureDiagnostics = onDashboardFailureDiagnostic === null
+    ? null : createLinuxDashboardFailureDiagnostics();
   child.stdout?.on("data", () => { stdoutProduced = true; });
   child.stderr?.on("data", (chunk) => {
     stderrProduced = true;
     companionProcessDiagnostics?.feed(chunk);
+    dashboardFailureDiagnostics?.feed(chunk);
   });
   const attachedPages = new Map();
   const attemptedPageTargetIds = new Set();
@@ -2161,6 +2199,10 @@ export async function runSmoke({
     if (onCompanionProcessDiagnostics !== null) {
       try { onCompanionProcessDiagnostics(companionProcessDiagnostics.snapshot()); }
       catch { /* Never replace the smoke failure. Captured before forced cleanup. */ }
+    }
+    if (onDashboardFailureDiagnostic !== null) {
+      try { onDashboardFailureDiagnostic(dashboardFailureDiagnostics.snapshot()); }
+      catch { /* Never replace the smoke failure. */ }
     }
     if (failureStage !== null && ELECTRON_LINUX_SMOKE_FAILURE_STAGE_SET.has(failureStage)
         && onFailureStage !== null) {

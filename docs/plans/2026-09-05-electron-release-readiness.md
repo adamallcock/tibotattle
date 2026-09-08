@@ -48,7 +48,7 @@ failures, or contained a failure. The next workflow also retains the same
 closed Linux receipt separately, avoiding a large development-package download
 for every diagnosis. No normal candidate binaries are added to artifact upload.
 
-Latest completed native candidate: `610bc97c`,
+Earlier native candidate: `610bc97c`,
 [run 34266665792](https://github.com/adamallcock/tibotattle/actions/runs/34266665792).
 Both Mac package/artifact jobs, Windows development packaging and a sixth
 fresh Windows NSIS lifecycle pass. The normal Windows package now verifies,
@@ -66,6 +66,26 @@ preserving the first unexpected exit across automatic retries. Observation is
 scoped to the existing Linux/x64 quit-only smoke control and captures no raw
 process output, paths or credentials. It does not change startup or success
 criteria. Neither normal application journey is qualified yet.
+
+Latest completed native candidate: `5d0774fb`,
+[run 34269016362](https://github.com/adamallcock/tibotattle/actions/runs/34269016362).
+Both Mac package/artifact jobs, Windows development packaging and a seventh
+fresh Windows NSIS lifecycle pass. Normal Windows again passes package
+verification, then fails the runner's opt-out assertion. Source inspection
+finds a concrete test contract mismatch: `readAuthorization()` returns raw
+policy state, while `inspect()` provides `transportStatus`. The runner now
+checks current/available/disabled authorization separately from the projected
+off state; a regression uses the real sharing coordinator for seed and reread.
+The failed Windows receipt SHA-256 is
+`784bd0f70a0c413e9fe2365ee0118cc80a28b538840353ea6a07f271c54f5d4c`.
+Linux records `exited/stopping/exit_zero` with no unexpected companion exit.
+This precedes harness cleanup and identifies an app-requested stop, while the
+startup journal remains absent. Its receipt SHA-256 is
+`e0f169bafb29ede23442d77e6714da2b60a96bc1a70238d6adeccea41b009abf`.
+The next isolated diagnostic distinguishes dashboard load rejection,
+main-frame load failure and renderer-process loss using fixed categories;
+these currently converge on the same startup recovery handler. The renderer
+crash/shared-memory explanation remains a hypothesis until that test runs.
 
 1. Close the real native Mac -> signed Electron -> next signed Electron
    installed rehearsal. The original signed private fixtures exposed the

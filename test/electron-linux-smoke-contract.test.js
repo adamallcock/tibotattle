@@ -11,6 +11,7 @@ import {
   assertContainerContract,
   classifyAutomaticStartupRefreshReceipt,
   createLinuxCompanionProcessDiagnostics,
+  createLinuxDashboardFailureDiagnostics,
   createRendererReadinessCompanionSnapshotObserver,
   combineStartupRefreshEvidence,
   createRendererReadinessDiagnostics,
@@ -29,8 +30,37 @@ import {
   selectLinuxDashboardTarget,
   validateRendererReadinessDiagnostics,
   validateLinuxCompanionProcessDiagnostics,
+  validateLinuxDashboardFailureDiagnostic,
   waitFor,
 } from "../scripts/smoke-electron-linux.mjs";
+
+test("Linux dashboard failure diagnostics retain the first closed window failure only", () => {
+  const collector = createLinuxDashboardFailureDiagnostics();
+  const marker = (value) => `TIBOTATTLE_ELECTRON_DASHBOARD_FAILURE ${JSON.stringify(value)}\n`;
+  const crashed = { stage: "render_process_gone", reason: "crashed" };
+  assert.equal(collector.snapshot(), null);
+  for (const invalid of [
+    { stage: "load_url", reason: "private message" },
+    { stage: "did_fail_load", reason: -1000 },
+    { stage: "load_url", reason: 1 },
+    { stage: "render_process_gone", reason: "private native value" },
+    { ...crashed, path: "/private/path" },
+  ]) {
+    assert.equal(validateLinuxDashboardFailureDiagnostic(invalid), null);
+    collector.feed(marker(invalid));
+  }
+  collector.feed("private stderr\nTIBOTATTLE_ELECTRON_DASHBOARD_FAILURE " + " ".repeat(600));
+  collector.feed(marker(crashed));
+  assert.equal(collector.snapshot(), null);
+  const input = marker(crashed) + marker({ stage: "load_url", reason: null });
+  for (let offset = 0; offset < input.length; offset += 9) collector.feed(input.slice(offset, offset + 9));
+  assert.deepEqual(collector.snapshot(), crashed);
+  assert.equal(JSON.stringify(collector.snapshot()).includes("private"), false);
+  assert.deepEqual(validateLinuxDashboardFailureDiagnostic({ stage: "did_fail_load", reason: null }),
+    { stage: "did_fail_load", reason: null });
+  assert.deepEqual(validateLinuxDashboardFailureDiagnostic({ stage: "did_fail_load", reason: -3 }),
+    { stage: "did_fail_load", reason: -3 });
+});
 
 test("Linux companion process diagnostics preserve the first unexpected exit across restarts", () => {
   const collector = createLinuxCompanionProcessDiagnostics();
