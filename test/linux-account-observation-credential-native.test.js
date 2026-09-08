@@ -27,6 +27,8 @@ import {
 
 const BLACKHOLE_CHILD = process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_CHILD
   === "1";
+const BLACKHOLE_CREATE_DIAGNOSTIC_CHILD = process.env
+  .USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_CREATE_DIAGNOSTIC_CHILD === "1";
 const NESTED_CONTEXT_CHILD = process.env.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_NESTED_CONTEXT_CHILD
   === "1";
 const NATIVE_TEST_PREREQUISITES = process.platform === "linux"
@@ -541,37 +543,43 @@ function createIsolatedTestChildEnvironment(overrides) {
   return environment;
 }
 
-async function runBlackholeChild({ stateBase, sessionBusAddress }) {
+async function runBlackholeChild({ stateBase, sessionBusAddress, createDiagnostic = false }) {
+  const childEnvironment = {
+    DBUS_SESSION_BUS_ADDRESS: sessionBusAddress,
+    USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_CHILD: "1",
+    XDG_STATE_HOME: stateBase,
+  };
+  if (createDiagnostic) {
+    childEnvironment.USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_CREATE_DIAGNOSTIC_CHILD = "1";
+  }
   const child = spawn(
     process.execPath,
     ["--test", "--test-reporter=tap", fileURLToPath(import.meta.url)],
     {
       cwd: process.cwd(),
-      env: createIsolatedTestChildEnvironment({
-        DBUS_SESSION_BUS_ADDRESS: sessionBusAddress,
-        USAGE_MONITOR_LINUX_ACCOUNT_OBSERVATION_BLACKHOLE_CHILD: "1",
-        XDG_STATE_HOME: stateBase,
-      }),
+      env: createIsolatedTestChildEnvironment(childEnvironment),
       shell: false,
-      stdio: ["ignore", "pipe", "ignore"],
+      stdio: createDiagnostic ? ["ignore", "pipe", "ignore"] : "ignore",
     },
   );
   const outputChunks = [];
   let outputBytes = 0;
   let outputOverflow = false;
-  child.stdout?.on("data", (chunk) => {
-    if (outputOverflow || !Buffer.isBuffer(chunk)) {
-      outputOverflow = true;
-      return;
-    }
-    if (outputBytes + chunk.byteLength > BLACKHOLE_CHILD_MAX_OUTPUT_BYTES) {
-      outputOverflow = true;
-      return;
-    }
-    const copy = Buffer.from(chunk);
-    outputChunks.push(copy);
-    outputBytes += copy.byteLength;
-  });
+  if (createDiagnostic) {
+    child.stdout?.on("data", (chunk) => {
+      if (outputOverflow || !Buffer.isBuffer(chunk)) {
+        outputOverflow = true;
+        return;
+      }
+      if (outputBytes + chunk.byteLength > BLACKHOLE_CHILD_MAX_OUTPUT_BYTES) {
+        outputOverflow = true;
+        return;
+      }
+      const copy = Buffer.from(chunk);
+      outputChunks.push(copy);
+      outputBytes += copy.byteLength;
+    });
+  }
   const startedAt = Date.now();
   const outcome = await new Promise((resolve) => {
     let settled = false;
@@ -595,7 +603,9 @@ async function runBlackholeChild({ stateBase, sessionBusAddress }) {
   const elapsedMs = Date.now() - startedAt;
   return Object.freeze({
     elapsedMs,
-    nativePhase: extractBlackholeNativePhase(outputChunks, outputBytes, outputOverflow),
+    nativePhase: createDiagnostic
+      ? extractBlackholeNativePhase(outputChunks, outputBytes, outputOverflow)
+      : null,
     outcome: Object.freeze(outcome),
   });
 }
@@ -638,10 +648,23 @@ test("native Linux account-observation blackhole child clears a parent test cont
 test("native Linux account-observation child maps an unresponsive D-Bus service to unavailable", {
   skip: !BLACKHOLE_CHILD_ENABLED,
 }, async (t) => {
+  const backend = createLinuxAccountObservationCredentialBackend();
+  if (!BLACKHOLE_CREATE_DIAGNOSTIC_CHILD) {
+    await assert.rejects(
+      backend.read(EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation),
+      nativeError("unavailable"),
+    );
+    return;
+  }
+
+  // This second child runs only after the original fixed read proof has
+  // failed. Its create preflight shares the native read boundary and exposes
+  // the existing closed create phase. The synthetic endpoint never replies;
+  // the parent separately rejects any retained intent.
   const candidate = Buffer.alloc(32, 73);
   let error = null;
   try {
-    await createLinuxAccountObservationCredentialBackend().createIfMissing(
+    await backend.createIfMissing(
       EXPORT_IDENTITY_KEYCHAIN_CAPABILITIES.accountObservation,
       candidate,
     );
@@ -662,6 +685,7 @@ test("native Linux account-observation credential refuses an absent retained int
   const successStateBase = join(root, "success-state");
   const interruptedStateBase = join(root, "interrupted-state");
   const blackholeStateBase = join(root, "blackhole-state");
+  const blackholeDiagnosticStateBase = join(root, "blackhole-diagnostic-state");
   const blackholeSocket = join(root, "blackhole-session-bus.sock");
   const previousState = process.env.XDG_STATE_HOME;
   const absentCandidate = Buffer.alloc(32, 70);
@@ -814,9 +838,34 @@ test("native Linux account-observation credential refuses an absent retained int
       stateBase: blackholeStateBase,
       sessionBusAddress: `unix:path=${blackholeSocket}`,
     });
-    t.diagnostic(
-      `LINUX_ACCOUNT_OBSERVATION_PHASE_SERVICE_DEADLINE_NATIVE_${blackholeChild.nativePhase}`,
-    );
+    const readDeadlineProved = blackholeChild.outcome.signal === null
+      && blackholeChild.outcome.code === 0
+      && blackholeChild.elapsedMs >= BLACKHOLE_MINIMUM_DELAY_MS
+      && blackholeChild.elapsedMs < BLACKHOLE_CHILD_DEADLINE_MS
+      && blackholeBus.reachedMessagePhase();
+    if (!readDeadlineProved && blackholeChild.elapsedMs < BLACKHOLE_MINIMUM_DELAY_MS) {
+      const blackholeDiagnosticPaths = await prepareOwnerPrivateState(
+        blackholeDiagnosticStateBase,
+      );
+      const diagnosticChild = await runBlackholeChild({
+        stateBase: blackholeDiagnosticStateBase,
+        sessionBusAddress: `unix:path=${blackholeSocket}`,
+        createDiagnostic: true,
+      });
+      t.diagnostic(
+        `LINUX_ACCOUNT_OBSERVATION_PHASE_SERVICE_DEADLINE_NATIVE_${diagnosticChild.nativePhase}`,
+      );
+      await assertMissing(blackholeDiagnosticPaths.operationJournal);
+      try {
+        assert.equal(
+          await readFile(blackholeDiagnosticPaths.legacyJournal, "utf8"),
+          "linux-credential-mutex-journal-v1:normal\n",
+        );
+      } catch (error) {
+        // A LEASE boundary fails before it can create the fixed v1 journal.
+        assert.equal(error?.code, "ENOENT");
+      }
+    }
     assert.equal(blackholeChild.outcome.signal, null);
     assert.equal(blackholeChild.outcome.code, 0);
     assert.ok(blackholeChild.elapsedMs >= BLACKHOLE_MINIMUM_DELAY_MS);
