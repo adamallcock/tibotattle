@@ -189,10 +189,15 @@ test("registry and exact-executable probes use fixed read-only PowerShell contra
   const appPath = join(installationRoot, "TiboTattle Dev.exe");
   const processArguments = buildWindowsExactExecutableProcessQueryArguments(appPath);
   assert.equal(processArguments.includes(appPath), false);
-  assert.match(processArguments[4], /Get-CimInstance Win32_Process/u);
+  assert.match(processArguments[4], /Get-CimInstance -ClassName Win32_Process -Filter "Name = 'TiboTattle Dev\.exe'"/u);
+  assert.doesNotMatch(processArguments[4], /Get-CimInstance Win32_Process\|Where-Object/u);
   assert.match(processArguments[4], new RegExp(WINDOWS_NSIS_LIFECYCLE_EXPECTED_PATH_ENVIRONMENT_KEY, "u"));
   assert.doesNotMatch(processArguments[4], /\$args\[0\]/u);
   assert.doesNotMatch(processArguments[4], /Remove-|Stop-Process|Start-Process/u);
+  assert.throws(
+    () => buildWindowsExactExecutableProcessQueryArguments(join(installationRoot, "other.exe")),
+    /PROCESS_PROOF_UNAVAILABLE/u,
+  );
 });
 
 test("read-only PowerShell probes receive only an explicit fixed child path", async () => {
@@ -251,6 +256,37 @@ test("Windows PowerShell fixed path probe rejects missing and malformed child va
     assert.notEqual(result.status, 0);
     assert.equal(result.stdout, "");
   }
+});
+
+test("Windows hosted CI runs the narrow exact-executable proof in its closed child environment", {
+  skip: process.platform !== "win32" || process.arch !== "x64" || process.env.GITHUB_ACTIONS !== "true",
+}, async () => {
+  const systemRoot = process.env.SystemRoot;
+  const runnerTemp = process.env.RUNNER_TEMP;
+  assert.equal(typeof systemRoot, "string");
+  assert.equal(typeof runnerTemp, "string");
+  const executable = join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  // The generated child does not exist and is never created. The query still
+  // receives it only through the runner's explicitly injected child variable.
+  const expectedPath = join(
+    runnerTemp,
+    `tibotattle-nsis-exact-process-probe-${process.pid}`,
+    "TiboTattle Dev.exe",
+  );
+  const result = await runWindowsNsisLifecycleProgram(
+    executable,
+    buildWindowsExactExecutableProcessQueryArguments(expectedPath),
+    {
+      timeoutMs: 20_000,
+      captureOutput: true,
+      environment: process.env,
+      fixedProbePath: expectedPath,
+    },
+  );
+  assert.equal(result.settled, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(parseWindowsProcessSnapshot(result.stdout), []);
 });
 
 test("Windows hosted CI refuses an orphaned uninstall key before classifying a disposable installation", {

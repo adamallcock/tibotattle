@@ -676,8 +676,13 @@ async function defaultReadWindowsProcessSnapshot({ environment, runProgram }) {
  * Output deliberately keeps paths out of receipts and logs.
  */
 export function buildWindowsExactExecutableProcessQueryArguments(appPath) {
-  if (!validAbsolutePath(appPath)) fail("PROCESS_PROOF_UNAVAILABLE");
-  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$rows=@(Get-CimInstance Win32_Process|Where-Object {$null -ne $_.CreationDate -and $null -ne $_.ExecutablePath -and [string]::Equals($_.ExecutablePath,$expected,[System.StringComparison]::OrdinalIgnoreCase)}|Select-Object ProcessId,ParentProcessId,CreationDate);[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
+  if (!validAbsolutePath(appPath) || basename(appPath) !== APP_EXECUTABLE) {
+    fail("PROCESS_PROOF_UNAVAILABLE");
+  }
+  // The fixed image name lets CIM perform the narrow selection before reading
+  // ExecutablePath. The exact expected path remains a validated child-only
+  // value, so this query never interpolates a caller-controlled path.
+  const query = `$ErrorActionPreference='Stop';${fixedPowerShellExpectedPathPrelude()}$rows=@(Get-CimInstance -ClassName Win32_Process -Filter "Name = 'TiboTattle Dev.exe'"|Where-Object {$null -ne $_.CreationDate -and $null -ne $_.ExecutablePath -and [string]::Equals($_.ExecutablePath,$expected,[System.StringComparison]::OrdinalIgnoreCase)}|Select-Object ProcessId,ParentProcessId,CreationDate);[Console]::Out.Write((ConvertTo-Json -InputObject @($rows) -Compress -Depth 2))`;
   return Object.freeze([
     "-NoLogo",
     "-NoProfile",
