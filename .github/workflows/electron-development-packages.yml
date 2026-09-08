@@ -230,7 +230,34 @@ jobs:
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js
       - name: Build and verify development distributions
         run: node scripts/package-electron-development.mjs --target linux-x64 --format distribution --replace-staging
+      - name: Exercise packaged Linux credentials in disposable Secret Service
+        run: |
+          set -euo pipefail
+          node scripts/build-electron-linux-container.mjs --architecture amd64
+          docker build --platform=linux/amd64 \
+            --file containers/electron-linux-packaged/Dockerfile \
+            --build-arg "TIBOTATTLE_QUALIFICATION_REVISION=$GITHUB_SHA" \
+            --tag tibotattle-electron-linux-packaged:test .
+          package_root="/workspace/.release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution"
+          host_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/secret-service-storage-smoke.json"
+          docker run --rm --init --platform=linux/amd64 --network none \
+            --tmpfs /home/node:rw,noexec,nosuid,size=32m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=16m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 \
+            --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config \
+            --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share \
+            --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            tibotattle-electron-linux-packaged:test \
+            --app "$package_root/linux-unpacked/tibotattle-dev" \
+            --staged-app /workspace/.release-build/electron-dev/linux-x64/app \
+            --package-receipt "$package_root/development-package.json" \
+            --source-revision "$GITHUB_SHA" \
+            --receipt /run/user/1000/packaged-credential-receipt.json \
+            > "$host_receipt"
       - name: Retain verified development packages and receipts
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: electron-development-linux-x64-${{ github.sha }}

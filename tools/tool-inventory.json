@@ -2005,6 +2005,23 @@
     {
       "classification": "build_release_operation",
       "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-linux-secret-service.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Exact Linux package inputs and a disposable container with private D-Bus and tmpfs roots are required for native credential qualification.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-development-packages.yml",
+        "containers/electron-linux-packaged/Dockerfile",
+        "test/electron-linux-secret-service-smoke.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
       "canonicalPath": "scripts/build-electron-macos-keychain-adapter.mjs",
       "stableAlias": null,
       "stableAliasReason": "Compile the fixed unsigned macOS adapter for a prepared source candidate; signing remains separate.",

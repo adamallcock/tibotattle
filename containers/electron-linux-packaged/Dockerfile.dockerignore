@@ -1,0 +1,15 @@
+*
+!scripts/
+!scripts/**
+!.release-build/
+!.release-build/electron-dev/
+!.release-build/electron-dev/linux-x64/
+!.release-build/electron-dev/linux-x64/app/
+!.release-build/electron-dev/linux-x64/app/**
+!.release-build/electron-candidates/
+!.release-build/electron-candidates/*/
+!.release-build/electron-candidates/*/linux-x64/
+!.release-build/electron-candidates/*/linux-x64/distribution/
+!.release-build/electron-candidates/*/linux-x64/distribution/linux-unpacked/
+!.release-build/electron-candidates/*/linux-x64/distribution/linux-unpacked/**
+!.release-build/electron-candidates/*/linux-x64/distribution/development-package.json

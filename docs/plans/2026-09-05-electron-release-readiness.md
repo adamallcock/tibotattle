@@ -14,7 +14,19 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-The latest four-target successful development build is
+The current integrated test source is
+`0f03c121ba1102314ae674be23f4b2c009bd3ed5` in
+[run 34171149724](https://github.com/adamallcock/tibotattle/actions/runs/34171149724).
+It includes the collector-worker responsiveness repair, Windows first-run/native
+claim integration and the complete packaged Linux credential module/binary set.
+Both Mac jobs and Linux packaging pass. Windows native and package checks pass,
+but its packaged IPC storage journey reports `ELECTRON_WINDOWS_ACCOUNTLESS_SMOKE_STORAGE_FAILED`.
+A fresh
+Mac app from this same source is being qualified separately against a copied
+profile. The new Linux container smoke is prepared but has not executed. No current
+source is yet declared a production replacement.
+
+The latest completed four-target successful development build is
 `ae8f5bb60f011d3d14300beb026560d417eb2370`. Its unsigned packages passed
 [CI run 34163441097](https://github.com/adamallcock/tibotattle/actions/runs/34163441097),
 including Linux native lock/crash-recovery and fixed accountless-record
@@ -699,6 +711,30 @@ source validation passes 495 Electron tests, 329 local companion tests, 29 focus
 Windows/worker tests, 60 package checks with two optional artifact exclusions,
 78 release-trust checks, and architecture validation. Explicit runtime and
 independent verifier inventories include all new modules.
+
+The packaged Linux smoke now independently binds the selected distribution,
+executable, ASAR and physical native files to the staged source. Its outer process
+proves the reviewed container marker and distinct owner-private tmpfs roots
+before process enumeration or creation. Only then does it start a disposable
+D-Bus session and run the packaged Electron executable in Node mode. The inner
+process repeats the existing full isolation/daemon proof before constructing the
+branded context and loading the fixed two-capability FD4 journey from ASAR.
+The thin container preserves root ownership and immutable readable modes for
+the exact copied app/staging trees; it admits no profiles or signing inputs.
+The workflow runs with no network, no user directory bind mounts and a bounded,
+content-free receipt retained on failure. Thirty-one harness/qualification tests
+and 20 container/package/workflow checks pass. Actual container/native ABI,
+credential execution and cleanup remain pending a fresh CI run; normal Linux
+production selection is unchanged.
+
+The `0f03c121` ARM app passes its synthetic rendered/relaunch smoke with ASAR
+`2216a54ddf6315fcc52c4982542e12ffa5406ce4520c3842b92774054245a3db`.
+Its first real-history attempt fails before performance sampling because the
+test accepted an incomplete Usage DOM snapshot immediately. The harness now
+waits for the existing full parity predicate within the original 30-second
+timeout. All 34 owning profile/QA tests pass. A separate fresh retry profile and
+provenance record bind the unchanged app to the reviewed `feac3e67` harness;
+the original failed profile and receipt remain intact.
 
 The larger [desktop convergence plan](2026-09-04-desktop-convergence.md) and
 [contribution integration plan](2026-09-04-accountless-integration-and-responsiveness.md)
