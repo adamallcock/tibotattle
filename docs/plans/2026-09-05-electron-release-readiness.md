@@ -14,14 +14,17 @@ process. Provider support stays inside that app. The accepted
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Latest native run: `5d57f4e3` in
-[run 34193035717](https://github.com/adamallcock/tibotattle/actions/runs/34193035717)
+Latest native run: `90486dc6` in
+[run 34194270068](https://github.com/adamallcock/tibotattle/actions/runs/34194270068)
 passes both Macs and Windows, including the repaired packager's real runtime
 configuration tests. Linux compiles and packages successfully, then fails the new
-fixed account-observation test after the default-state marker passes. Its empty
-raw qualification file and fixed failure are preserved with exact package hashes.
-The following source adds reviewed, closed phase diagnostics; it does not print
-raw native errors or weaken the success marker. The previous all-four baseline
+fixed account-observation test at the first `CREATE`, after initial read,
+absent-intent refusal and the separate default-state marker pass. The preceding
+`5d57f4e3` failure remains preserved with exact package hashes; the newer fixed
+diagnostic localizes the failure without printing native errors or weakening
+the success marker. A separate reviewed five-second aggregate service deadline
+is integrated at `c6c03866`, with a native blackhole-service test, but is not yet
+qualified on Linux. The previous all-four baseline
 remains `de8965d5` in
 [run 34189342330](https://github.com/adamallcock/tibotattle/actions/runs/34189342330).
 The downloaded Windows and Linux apps, distributions and launchers match their
@@ -35,16 +38,23 @@ a startup control-plane request at the existing three-second ceiling. Its
 receipt is preserved. A consistent disposable copy isolates the blocker to the
 synchronous post-write SQLite `PRAGMA quick_check`: a cold scan blocks the event
 loop for 8,545 ms, while open, mutation commit, ordinary reads, projection and
-publication do not reproduce that stall. The in-progress repair moves only the
+publication do not reproduce that stall. The repair moves only the
 read-only integrity scan into a worker and retains the collector lock and success
 gate. The repair is integrated at `dd7058e9`, with export closure at `ad0e1333`.
 It passes 195 focused collector tests and 149 integrated worker, refresh, export
 and packaging tests (two artifact exclusions), plus architecture and preflight.
 A real read-only scan over the disposable copied-state database takes 8,794 ms
 with a 12 ms maximum main-loop gap. The frozen unsigned Mac `ad0e1333` package
-matches ASAR `dd21fc6ed3824a13113b161478e2f5e51c1f2bbf1013d58c0aa4c6677cdabff0`;
-its new copied-profile GUI qualification is in progress. The daily launcher still
-selects verified `1f74bbb6`.
+matches ASAR `dd21fc6ed3824a13113b161478e2f5e51c1f2bbf1013d58c0aa4c6677cdabff0`.
+Its synthetic UI/tray/settings restart and separate copied-profile full refresh,
+cancellation/retry and relaunch journeys all pass. All runs quit cleanly. Status
+and health requests reach maxima of 1–2 ms; timers advance. Cancellation is
+acknowledged in 3 ms and settles after mandatory integrity verification in
+5,162 ms. Relaunch retains the dashboard and starts a new successful automatic
+refresh. These fixed receipts bind source and ASAR and contain no session data.
+The regular test launcher now selects this qualified `ad0e1333` package with
+uploads and the updater disabled, using its separate copied profile. The former
+`1f74bbb6` launcher and profile remain preserved; system installation is unchanged.
 
 The actual accountless client-to-disposable-Worker journey is reverified at
 `5d57f4e3`: enrollment, encrypted upload, renewal, retained identity, no duplicate
@@ -58,7 +68,9 @@ harness runs its exact native test in a separate disposable Secret Service
 container and requires the success marker after assertions; a skipped test
 cannot qualify it. Portable integration passes 46 tests with one native-only
 exclusion, 32 packaging tests with two artifact exclusions, and architecture
-checks. Native compilation now passes in `34193035717`; its fixed observation execution fails and is being localized with closed phase diagnostics.
+checks. Native compilation passes; `34194270068` localizes the fixed observation
+execution failure to its first creation. The remaining repair must pass that
+native journey before any runtime-readiness claim.
 
 Windows signing configuration is repaired at `48da8404` and `261bfa83`. The
 pinned packager previously rejected the configured Azure boolean switches and
@@ -317,7 +329,7 @@ observation and ownership checks. This is source/local-runtime evidence;
 hosted activation remains separate. The new Mac daily tester below also
 qualifies the current packaged Community/accountless-profile presentation.
 
-The current daily Mac tester is frozen `1f74bbb68f8c0ea88f1610e2da02cee4524f3c86`,
+The previous daily Mac tester was frozen `1f74bbb68f8c0ea88f1610e2da02cee4524f3c86`,
 with ASAR `771c0f16a9936737eb62d249e13c6e4e67d852139447d1b0b8573ba4351ff357`.
 Its synthetic rendered journeys and copied-history Usage/Community, timer,
 active-refresh responsiveness and clean-quit qualification pass. Both endpoints
@@ -331,8 +343,9 @@ registered before signaling, fail-closed PID probes and fixed relaunch-stage
 diagnostics. Its 33 focused tests and a fresh native synthetic run against the
 same `1f74bbb6` app pass with clean quit and tray relaunch. The first receipt
 does not establish the underlying cause; it remains preserved.
-The default durable launcher now selects this
-package with hosted contributions disabled and a separate copied profile. Its
+The default durable launcher selected that
+package with hosted contributions disabled and a separate copied profile; the
+opening status records its qualified `ad0e1333` successor. Its
 previous `0f03c121` launcher and app/profile are preserved, as is the older d5
 backup. The earlier 0f run's 524 ms response remains in its original receipt.
 No installed native app
@@ -384,7 +397,7 @@ The exact `d5dc8025` Mac package subsequently passed settings/About and shared
 sharing-destination inspection, both cache-table pages, refresh cancellation
 with completed results retained, native-menu Quit and restart through the
 durable launcher. Sharing remained off after restart. At that stage the launcher selected
-this package; it now selects the qualified `1f74bbb6` package described above.
+this package; it now selects the qualified `ad0e1333` package described above.
 The earlier packages, profiles and versioned launchers remain preserved.
 All 180 active-refresh samples in 45 seconds passed: health and status p95 were
 1 ms, maxima 28 ms, with no failures and the unchanged 250 ms p95 budget.
