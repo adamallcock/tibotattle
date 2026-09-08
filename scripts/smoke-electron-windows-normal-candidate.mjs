@@ -170,7 +170,9 @@ function protectedOptOutFailureCode(code) {
 }
 
 function knownFailureCode(code) {
-  return FAILURE_CODES.has(code) || protectedOptOutFailureCode(code);
+  return FAILURE_CODES.has(code)
+    || PROTECTED_OPT_OUT_STAGES.has(code)
+    || protectedOptOutFailureCode(code);
 }
 
 function failure(code) {

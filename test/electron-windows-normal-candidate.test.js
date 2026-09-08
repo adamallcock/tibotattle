@@ -360,6 +360,58 @@ test("normal candidate protected opt-out seeding retains closed source causes by
   }), {
     code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_PROTECTED_OPT_OUT_SHARING_UNAVAILABLE_DESKTOP_SETTINGS_BACKEND_UNAVAILABLE",
   });
+
+  const unknownStages = [
+    {
+      stage: "PROTECTED_OPT_OUT_ADAPTER_UNAVAILABLE",
+      dependencies: {
+        createAdapter() { throw new Error("private adapter detail"); },
+      },
+    },
+    {
+      stage: "PROTECTED_OPT_OUT_STORE_UNAVAILABLE",
+      dependencies: {
+        createStore() { throw new Error("private store detail"); },
+      },
+    },
+    {
+      stage: "PROTECTED_OPT_OUT_INITIAL_READ_UNAVAILABLE",
+      dependencies: {
+        createReceiptBackend: () => Object.freeze({
+          async load() { throw new Error("private initial detail"); },
+          async save() {},
+        }),
+      },
+    },
+    {
+      stage: "PROTECTED_OPT_OUT_FIRST_RUN_UNAVAILABLE",
+      dependencies: {
+        createReceiptBackend: () => Object.freeze({
+          async load() { return null; },
+          async save() { throw new Error("private receipt detail"); },
+        }),
+      },
+    },
+    {
+      stage: "PROTECTED_OPT_OUT_SHARING_UNAVAILABLE",
+      dependencies: {
+        createCoordinator: () => Object.freeze({
+          async initialize() {},
+          async setEnabled() { throw new Error("private sharing detail"); },
+          async readAuthorization() { return null; },
+          dispose() {},
+        }),
+      },
+    },
+  ];
+  for (const { stage, dependencies } of unknownStages) {
+    await assert.rejects(seed(dependencies), (error) => {
+      assert.equal(error.code, `ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_${stage}`);
+      assert.equal(error.message, error.code);
+      assert.doesNotMatch(error.message, /private/u);
+      return true;
+    });
+  }
 });
 
 test("normal candidate runner preserves a package stage in its content-free receipt", async () => {
