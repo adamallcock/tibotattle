@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
+
+import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
+import { productionElectronCandidatePlan } from "../scripts/package-electron-production.mjs";
 
 const require = createRequire(import.meta.url);
 const electronBuilderRequire = createRequire(require.resolve("electron-builder/package.json"));
@@ -17,6 +21,11 @@ const { WindowsSignAzureManager } = appBuilderRequire(
 );
 const RELEASE_CONFIG_PATH = resolve("apps/electron/electron-builder.release.config.cjs");
 const PACKAGE_VERSION = require("../package.json").version;
+const RELEASE_SOURCE_REVISION = "a".repeat(40);
+const RELEASE_BUILD_NUMBER = "20260909";
+const RELEASE_STAGING_ROOT = resolve(".release-build/electron-production/win32-x64");
+const RELEASE_CANDIDATE_PATH = join(RELEASE_STAGING_ROOT, "production-source-candidate.json");
+const POLICY = require("../config/electron-production-distribution.cjs");
 
 async function loadPatchedWinPackagerRuntime() {
   const sourcePath = appBuilderRequire.resolve("./out/winPackager");
@@ -93,9 +102,11 @@ function readReleaseConfigConstant(source, name) {
 async function releaseConfigEnvironment(overrides = {}) {
   const source = await fsPromises.readFile(RELEASE_CONFIG_PATH, "utf8");
   return {
-    TIBOTATTLE_ELECTRON_TARGET: "win32",
+    TIBOTATTLE_ELECTRON_TARGET: "win32-x64",
     TIBOTATTLE_ELECTRON_SIGNING_MODE: "azure-trusted-signing",
     TIBOTATTLE_ELECTRON_VERSION: PACKAGE_VERSION,
+    TIBOTATTLE_ELECTRON_SOURCE_REVISION: RELEASE_SOURCE_REVISION,
+    TIBOTATTLE_ELECTRON_BUILD_NUMBER: RELEASE_BUILD_NUMBER,
     TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME:
       readReleaseConfigConstant(source, "AZURE_EXPECTED_PUBLISHER"),
     TIBOTATTLE_ELECTRON_AZURE_ENDPOINT:
@@ -108,11 +119,72 @@ async function releaseConfigEnvironment(overrides = {}) {
   };
 }
 
+async function withReleaseConfigFixture(run) {
+  let created = false;
+  try {
+    await fsPromises.lstat(RELEASE_STAGING_ROOT);
+    throw new Error("Windows release-config fixture root already exists");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  try {
+    const plan = productionElectronCandidatePlan({
+      target: "win32-x64",
+      sourceRevision: RELEASE_SOURCE_REVISION,
+      buildNumber: RELEASE_BUILD_NUMBER,
+      hostPlatform: "win32",
+      hostArchitecture: "x64",
+    });
+    const candidate = {
+      ...plan,
+      status: "production_source_staged",
+      stagedManifest: "app/package.json",
+      runtimeManifest: "app/electron-runtime-manifest.json",
+    };
+    const distribution = createProductionDistributionMetadata({
+      target: "win32-x64",
+      sourceRevision: RELEASE_SOURCE_REVISION,
+      buildNumber: RELEASE_BUILD_NUMBER,
+    });
+    await fsPromises.mkdir(join(RELEASE_STAGING_ROOT, "app"), { recursive: true, mode: 0o700 });
+    created = true;
+    await fsPromises.writeFile(
+      join(RELEASE_STAGING_ROOT, "app", "package.json"),
+      `${JSON.stringify({
+        name: "app-usagemonitor",
+        version: PACKAGE_VERSION,
+        tibotattleDistribution: distribution,
+      }, null, 2)}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+    const candidateBytes = Buffer.from(`${JSON.stringify(candidate, null, 2)}\n`, "utf8");
+    await fsPromises.writeFile(RELEASE_CANDIDATE_PATH, candidateBytes, {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    const environment = await releaseConfigEnvironment({
+      TIBOTATTLE_ELECTRON_WINDOWS_SOURCE_CANDIDATE_RECEIPT: RELEASE_CANDIDATE_PATH,
+      TIBOTATTLE_ELECTRON_WINDOWS_SOURCE_CANDIDATE_SHA256:
+        createHash("sha256").update(candidateBytes).digest("hex"),
+    });
+    return await run({ candidate, environment, plan });
+  } finally {
+    if (created) await fsPromises.rm(RELEASE_STAGING_ROOT, { recursive: true, force: true });
+  }
+}
+
 function loadReleaseConfig(environment) {
   const source = [
     `const config = require(${JSON.stringify(RELEASE_CONFIG_PATH)});`,
     "process.stdout.write(JSON.stringify({",
+    "  appId: config.appId,",
+    "  buildNumber: config.buildNumber,",
+    "  buildVersion: config.buildVersion,",
+    "  directories: config.directories,",
+    "  extraMetadata: config.extraMetadata,",
     "  forceCodeSigning: config.forceCodeSigning,",
+    "  nsisGuid: config.nsis.guid,",
+    "  publish: config.publish,",
     "  signExts: config.win.signExts,",
     "  ledgerLeaf: config.win.windowsSigningOperationLedgerLeaf,",
     "  ledgerRoot: config.win.windowsSigningOperationEvidenceRoot,",
@@ -146,36 +218,67 @@ function validateReleaseConfig(environment) {
 }
 
 test("Windows release config requires the patched signing runtime contract", async () => {
-  const environment = await releaseConfigEnvironment();
-  const result = loadReleaseConfig(environment);
-  assert.equal(result.status, 0, result.stderr);
-  const config = JSON.parse(result.stdout);
-  assert.equal(config.forceCodeSigning, true);
-  assert.deepEqual(config.signExts, [".dll", "!.node"]);
-  assert.equal(config.ledgerLeaf, "windows-signing-operation-ledger.json");
-  assert.equal(basename(config.ledgerRoot), "evidence");
-  assert.equal(config.azureSignOptions.ExcludeAzureCliCredential, undefined);
-  for (const name of [
-    "ExcludeEnvironmentCredential",
-    "ExcludeWorkloadIdentityCredential",
-    "ExcludeManagedIdentityCredential",
-    "ExcludeSharedTokenCacheCredential",
-    "ExcludeVisualStudioCredential",
-    "ExcludeVisualStudioCodeCredential",
-    "ExcludeAzurePowerShellCredential",
-    "ExcludeAzureDeveloperCliCredential",
-    "ExcludeInteractiveBrowserCredential",
-  ]) {
-    assert.equal(config.azureSignOptions[name], true, name);
-  }
-  const validated = validateReleaseConfig(environment);
-  assert.equal(validated.status, 0, validated.stderr);
-  assert.equal(validated.stdout, "WINDOWS_RELEASE_BUILDER_SCHEMA_VALID\n");
+  await withReleaseConfigFixture(async ({ candidate, environment }) => {
+    const result = loadReleaseConfig(environment);
+    assert.equal(result.status, 0, result.stderr);
+    const config = JSON.parse(result.stdout);
+    assert.equal(config.appId, POLICY.PRODUCTION_ELECTRON_APP_ID);
+    assert.equal(config.buildNumber, RELEASE_BUILD_NUMBER);
+    assert.equal(
+      config.buildVersion,
+      POLICY.productionElectronBuildVersionForTarget({
+        target: "win32-x64",
+        version: PACKAGE_VERSION,
+        buildNumber: RELEASE_BUILD_NUMBER,
+      }),
+    );
+    assert.deepEqual(config.directories, {
+      app: join(RELEASE_STAGING_ROOT, "app"),
+      output: join(RELEASE_STAGING_ROOT, "artifacts"),
+    });
+    assert.deepEqual(config.publish, [{ provider: "generic", url: candidate.updateFeed }]);
+    assert.equal(config.nsisGuid, POLICY.PRODUCTION_ELECTRON_WINDOWS_TOAST_ACTIVATOR_CLSID);
+    assert.equal(config.extraMetadata.tibotattleDistribution.target, "win32-x64");
+    assert.equal(config.forceCodeSigning, true);
+    assert.deepEqual(config.signExts, [".dll", "!.node"]);
+    assert.equal(config.ledgerLeaf, "windows-signing-operation-ledger.json");
+    assert.equal(basename(config.ledgerRoot), "evidence");
+    assert.equal(config.azureSignOptions.ExcludeAzureCliCredential, undefined);
+    for (const name of [
+      "ExcludeEnvironmentCredential",
+      "ExcludeWorkloadIdentityCredential",
+      "ExcludeManagedIdentityCredential",
+      "ExcludeSharedTokenCacheCredential",
+      "ExcludeVisualStudioCredential",
+      "ExcludeVisualStudioCodeCredential",
+      "ExcludeAzurePowerShellCredential",
+      "ExcludeAzureDeveloperCliCredential",
+      "ExcludeInteractiveBrowserCredential",
+    ]) {
+      assert.equal(config.azureSignOptions[name], true, name);
+    }
+    const validated = validateReleaseConfig(environment);
+    assert.equal(validated.status, 0, validated.stderr);
+    assert.equal(validated.stdout, "WINDOWS_RELEASE_BUILDER_SCHEMA_VALID\n");
 
-  const forbidden = loadReleaseConfig(await releaseConfigEnvironment({
-    CSC_IDENTITY_AUTO_DISCOVERY: "false",
-  }));
-  assert.notEqual(forbidden.status, 0);
+    const forbidden = loadReleaseConfig({
+      ...environment,
+      CSC_IDENTITY_AUTO_DISCOVERY: "false",
+    });
+    assert.notEqual(forbidden.status, 0);
+
+    const mismatchedReceiptDigest = loadReleaseConfig({
+      ...environment,
+      TIBOTATTLE_ELECTRON_WINDOWS_SOURCE_CANDIDATE_SHA256: "b".repeat(64),
+    });
+    assert.notEqual(mismatchedReceiptDigest.status, 0);
+
+    const wrongTarget = loadReleaseConfig({
+      ...environment,
+      TIBOTATTLE_ELECTRON_TARGET: "win32",
+    });
+    assert.notEqual(wrongTarget.status, 0);
+  });
 });
 
 test("patched Azure signer serializes credential exclusions as switches and pins the module", async () => {
