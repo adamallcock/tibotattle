@@ -110,6 +110,55 @@ against every transient allocation peak. Failed validation never emits a
 completed receipt. The result always says `productionReadiness: false` and
 `remoteSyntax: "not-exercised"`.
 
+## Explicit local 5 GiB stress profile
+
+For the exact primary 0056 / deletion-ledger 0002 prefix, an optional local-only
+profile measures storage, rollback recovery and whole migration transaction time:
+
+```sh
+node apps/worker/scripts/rehearse-release-migrations.mjs local \
+  --prefix /private/tmp/reviewed-migration-prefix.json \
+  --profile production-scale-5gib
+```
+
+The profile pins the reviewed 0057–0059 source hashes and rejects dimension or
+limit overrides. Standard defaults and the one-million-record/1 GiB database
+input guards remain unchanged. The profile uses the same valid 1,000-account,
+100,000-record-per-table fixture, then updates only synthetic `record_json`
+values in 200-row prepared-update blocks until the primary reaches at least
+5 GiB (at most 64 MiB overshoot). Padding is applied in ascending record-ID order
+to both retained telemetry tables. The receipt records padded and unpadded row
+counts and bytes. This is a **synthetic legacy/v1-heavy storage stress fixture**,
+not an observed or representative production distribution.
+
+The preservation baseline is taken after padding. Original-column hashes stream
+rows rather than retaining the corpus in memory. Exact migration SQL, foreign
+keys, ledger append, interruption rollback and forward transaction boundaries
+stay unchanged. SQL duration and whole transaction duration are recorded
+separately from full preservation/integrity checks. Per-statement timings and
+index/page-category measurements are explicitly not collected.
+
+Admission requires at least 22 GiB available on the canonical scratch filesystem.
+The isolated run has a 600-second deadline, 10,000,000,000-byte primary page
+ceiling, 512 MiB deletion-database ceiling, 20 GiB total scratch ceiling and
+2 GiB free-space reserve. SQLite uses a 32 MiB page cache, DELETE journals and
+in-memory temporary structures. The external observer samples combined parent
+and child RSS (2 GiB ceiling), all owned scratch files including journals, and
+free space every 250 ms. These are sampled bounds; short transient peaks between
+samples are not proven absent. Missing disk observations fail closed. A bounded
+phase record identifies the migration and interrupted/forward pass when a
+resource failure occurs; closed failure receipts retain observed peak metrics.
+Only confirmed process termination permits deleting the owned scratch directory.
+No remote calls or production data are used, and ordinary regression tests do
+not run this multi-gigabyte workload.
+
+A locally fast transaction does **not** qualify the hosted operation. D1 limits
+the entire API query batch to 30 seconds and explicitly advises batching large
+modifications; unchanged 0058 also failed the separately tested asynchronous
+import route. Local evidence informs storage/recovery design and cannot replace
+a supported, qualified hosted migration path. See
+[Cloudflare D1 limits](https://developers.cloudflare.com/d1/platform/limits/).
+
 ## Separately approved disposable remote syntax check
 
 This mode **writes remote D1** and requires separate approval for the exact two

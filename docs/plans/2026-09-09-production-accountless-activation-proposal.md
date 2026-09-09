@@ -358,8 +358,19 @@ an import transaction/batch-boundary explanation, but does not establish the
 provider's exact batch size or uniquely explain every 0058 interaction. The
 unchanged async import route remains unsuitable. Do not weaken foreign-key
 enforcement or edit applied migration provenance to bypass the result. Assess
-the normal query transaction against its 30-second/storage limits before
-choosing a more complex, explicitly reviewed phased maintenance design.
+local storage, rollback and whole-transaction costs to inform a supported hosted
+upgrade design. The explicit local `production-scale-5gib` profile is implemented
+with fixed 20 GiB scratch / 2 GiB combined sampled RSS / 600-second admission;
+its actual large workload has not yet run. It pads the existing valid synthetic
+legacy/v1 fixture before preservation hashing and leaves migration transactions
+unchanged. Per-statement and index/free-page breakdowns are not collected.
+
+Even a local transaction below 30 seconds would not qualify a production query.
+[D1 limits](https://developers.cloudflare.com/d1/platform/limits/) apply the
+30-second API limit to the entire batch and advise splitting large modifications
+into smaller batches. The normal migration CLI sends unchanged 0058 plus its
+ledger append in one API query batch. Local stress evidence is therefore design
+input, not a workaround for either hosted failure or execution limits.
 
 # Live configuration and recovery preparation
 

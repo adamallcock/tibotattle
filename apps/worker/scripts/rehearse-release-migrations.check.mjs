@@ -6,12 +6,12 @@ import { DatabaseSync } from "node:sqlite";
 import { readFileSync, readdirSync, rmSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "jsonc-parser";
-import { inspectMigrationPrefix, main, observeMigrationPrefix, rehearseRemoteSyntax, runMigrationRehearsal, runMigrationRehearsalProcess } from "./rehearse-release-migrations.mjs";
+import { inspectMigrationPrefix, main, observeMigrationPrefix, rehearseRemoteSyntax, runMigrationRehearsal, runMigrationRehearsalProcess, LOCAL_SCALE_PROFILE, observeRehearsalScratch, padSyntheticRehearsal } from "./rehearse-release-migrations.mjs";
 
 const workerRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const sha = value => createHash("sha256").update(value).digest("hex");
@@ -329,5 +329,135 @@ test("file import refuses malformed, partial, false and arbitrary progress resul
       assert.equal(fake.imported.length, 1);
       assert.ok(!fake.applied.includes("0057_accountless_enrollment_ledger.sql"));
     } finally { fake.close(); }
+  }
+});
+
+
+test("fixed scale admission rejects unknown profiles, override dimensions and wrong lineage before spawning", async () => {
+  const p = await prefix(56, 2);
+  for (const options of [{ profile: "unknown" }, { profile: LOCAL_SCALE_PROFILE.name, accounts: 2 },
+    { profile: LOCAL_SCALE_PROFILE.name, timeoutMs: 1 }, { profile: LOCAL_SCALE_PROFILE.name, maxDatabaseBytes: 3 * 2 ** 30 }]) {
+    await assert.rejects(runMigrationRehearsalProcess({ prefix: p, ...options, spawn: () => assert.fail("must not spawn") }), /PROFILE_/);
+  }
+  await assert.rejects(runMigrationRehearsalProcess({ prefix: await prefix(55, 2), profile: LOCAL_SCALE_PROFILE.name,
+    spawn: () => assert.fail("must not spawn") }), /SCALE_PREFIX_INVALID/);
+  await assert.rejects(runMigrationRehearsalProcess({ prefix: p, maxDatabaseBytes: 2 ** 30 + 1,
+    spawn: () => assert.fail("standard cap must remain") }), /LIMITS_INVALID/);
+  await assert.rejects(main(["remote-syntax", "--profile", LOCAL_SCALE_PROFILE.name]), /USAGE_INVALID/);
+});
+
+test("scale disk admission refuses insufficient or unavailable space before starting a child", async () => {
+  for (const sample of [{ freeBytes: LOCAL_SCALE_PROFILE.minInitialFreeBytes - 1, scratchBytes: 0 },
+    { freeBytes: null, scratchBytes: 0 }, { freeBytes: 30 * 2 ** 30, scratchBytes: 1 }]) {
+    await assert.rejects(runMigrationRehearsalProcess({ prefix: await prefix(56, 2), profile: LOCAL_SCALE_PROFILE.name,
+      disk: () => sample, spawn: () => assert.fail("must not spawn") }), /DISK_ADMISSION_FAILED/);
+  }
+});
+
+test("prepared padding preserves real fixture chains and bounded row counts without creating a large test", async () => {
+  const dir = await realpath(await mkdtemp(join(tmpdir(), "migration-small-padding-")));
+  await chmod(dir, 0o700);
+  try {
+    await runMigrationRehearsal({ prefix: await prefix(56, 2), accounts: 2, events: 20, temporaryDirectory: dir });
+    const db = new DatabaseSync(join(dir, "USAGE_MONITOR_DB.sqlite"));
+    try {
+      db.exec("PRAGMA foreign_keys=ON");
+      const before = db.prepare("SELECT id,participant_id,chunk_row_id,occurrence_id FROM telemetry_v1_records ORDER BY id").all();
+      const baseline = db.prepare("PRAGMA page_count").get().page_count * db.prepare("PRAGMA page_size").get().page_size;
+      const result = padSyntheticRehearsal(db, { targetBytes: baseline + 256 * 1024 });
+      assert.equal(result.paddedRowsPerTable, 20); assert.equal(result.rowsPerTelemetryTable, 20);
+      assert.equal(result.productionRepresentative, false); assert.equal(result.blocks, 1);
+      assert.ok(result.baselineBytes >= result.targetBytes);
+      assert.deepEqual(db.prepare("SELECT id,participant_id,chunk_row_id,occurrence_id FROM telemetry_v1_records ORDER BY id").all(), before);
+      assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
+      assert.equal(db.prepare("SELECT count(*) AS n FROM telemetry_records WHERE length(record_json)>26000").get().n, 20);
+      assert.throws(() => padSyntheticRehearsal(db, { targetBytes: 0 }), /TARGET_INVALID/);
+      assert.throws(() => padSyntheticRehearsal(db, { targetBytes: LOCAL_SCALE_PROFILE.targetBytes }), /TARGET_NOT_MET/);
+    } finally { db.close(); }
+    const observation = observeRehearsalScratch(dir);
+    assert.ok(observation.scratchBytes > 0); assert.ok(observation.freeBytes > 0);
+  } finally { await rm(dir, { recursive: true }); }
+});
+
+test("external scale scratch/free-space and combined RSS guards terminate a blocked child", async () => {
+  for (const mode of ["scratch", "free", "missing", "rss"]) {
+    let samples = 0;
+    await assert.rejects(runMigrationRehearsalProcess({ prefix: await prefix(56, 2), profile: LOCAL_SCALE_PROFILE.name,
+      disk: () => ++samples === 1 ? { scratchBytes: 0, freeBytes: 30 * 2 ** 30 }
+        : mode === "missing" ? null : { scratchBytes: mode === "scratch" ? LOCAL_SCALE_PROFILE.maxScratchBytes + 1 : 0,
+          freeBytes: mode === "free" ? LOCAL_SCALE_PROFILE.minFreeBytes - 1 : 30 * 2 ** 30 },
+      memory: () => mode === "rss" ? LOCAL_SCALE_PROFILE.maxRssBytes - 1 : 1024,
+      spawn: (_node, _args, options) => spawn(process.execPath, ["-e", "setInterval(()=>{},1000);"], options),
+    }), error => {
+      assert.match(error.code, mode === "rss" ? /MEMORY_EXCEEDED/ : /DISK_/);
+      assert.equal(error.scaleEvidence.terminationConfirmed, true);
+      assert.equal(error.scaleEvidence.profile, LOCAL_SCALE_PROFILE.name);
+      if (mode === "scratch") assert.ok(error.scaleEvidence.peakScratchBytes > LOCAL_SCALE_PROFILE.maxScratchBytes);
+      return true;
+    });
+  }
+});
+
+test("scale keeps metrics and scratch when termination cannot be confirmed", async () => {
+  let directory, sample = 0;
+  try {
+    await assert.rejects(runMigrationRehearsalProcess({ prefix: await prefix(56, 2), profile: LOCAL_SCALE_PROFILE.name,
+      disk: () => ({ scratchBytes: ++sample === 1 ? 0 : LOCAL_SCALE_PROFILE.maxScratchBytes + 1, freeBytes: 30 * 2 ** 30 }),
+      memory: () => 1024, terminationGraceMs: 30, signal: () => {},
+      spawn: () => {
+        const child = new EventEmitter(); child.pid = 999999999; child.stdout = new PassThrough(); child.stderr = new PassThrough(); child.stdin = new PassThrough();
+        child.stdin.on("data", bytes => { directory = JSON.parse(bytes).temporaryDirectory; }); return child;
+      },
+    }), error => error.code === "REHEARSAL_TERMINATION_UNCONFIRMED" && error.scaleEvidence.terminationConfirmed === false);
+    assert.deepEqual(await readdir(directory), []);
+  } finally { if (directory) await rm(directory, { recursive: true }); }
+});
+
+test("scale rejects malformed phase evidence and retains the last valid phase on failure", async () => {
+  let ownedDirectory;
+  await assert.rejects(runMigrationRehearsalProcess({ prefix: await prefix(56, 2), profile: LOCAL_SCALE_PROFILE.name,
+    memory: () => 1024, disk: () => ({ scratchBytes: 0, freeBytes: 30 * 2 ** 30 }),
+    spawn: (_node, _args, options) => {
+      const script = `const fs=require('node:fs');let input='';process.stdin.on('data',b=>input+=b);process.stdin.on('end',()=>{
+        const dir=JSON.parse(input).temporaryDirectory;
+        fs.writeFileSync(dir+'/progress.json',JSON.stringify({sequence:1,phase:'migration',migration:'0058_accountless_upload_ownership.sql',pass:'forward',state:'started',elapsedMs:1}));
+        setTimeout(()=>fs.writeFileSync(dir+'/progress.json',JSON.stringify({sequence:2,phase:'unknown',migration:null,pass:null,state:'started',elapsedMs:2})),700);
+        setInterval(()=>{},1000);
+      });`;
+      const child = spawn(process.execPath, ["-e", script], options);
+      const originalEnd = child.stdin.end.bind(child.stdin);
+      child.stdin.end = bytes => { ownedDirectory = JSON.parse(bytes).temporaryDirectory; return originalEnd(bytes); };
+      return child;
+    },
+  }), error => {
+    assert.equal(error.code, "REHEARSAL_PROCESS_DISK_UNAVAILABLE");
+    assert.equal(error.scaleEvidence.lastProgress.migration, "0058_accountless_upload_ownership.sql");
+    assert.equal(error.scaleEvidence.lastProgress.pass, "forward");
+    assert.equal(error.scaleEvidence.terminationConfirmed, true);
+    assert.ok(error.scaleEvidence.sampledPeakRssBytes > 0);
+    assert.equal(error.scaleEvidence.rssScope, "parent-and-child");
+    return true;
+  });
+  await assert.rejects(readdir(ownedDirectory), { code: "ENOENT" });
+});
+
+
+test("scale retains only allowlisted closed child failures, never raw or malformed stderr", async () => {
+  for (const [stderr, expected] of [
+    [JSON.stringify({ok:false,code:"REHEARSAL_RESOURCE_CEILING_EXCEEDED"}), "REHEARSAL_RESOURCE_CEILING_EXCEEDED"],
+    [JSON.stringify({ok:false,code:"REHEARSAL_LOCAL_SQL_FAILED"}), "REHEARSAL_LOCAL_SQL_FAILED"],
+    ["private-source-text", null],
+    [JSON.stringify({ok:false,code:"REHEARSAL_LOCAL_SQL_FAILED",details:"private-source-text"}), null],
+    [JSON.stringify({ok:false,code:"REHEARSAL_PRIVATE_SOURCE_TEXT"}), null],
+  ]) {
+    await assert.rejects(runMigrationRehearsalProcess({prefix:await prefix(56,2),profile:LOCAL_SCALE_PROFILE.name,
+      disk:()=>({scratchBytes:0,freeBytes:30*2**30}),memory:()=>1024,
+      spawn:(_node,_args,options)=>spawn(process.execPath,["-e",`process.stdin.resume();process.stdin.on('end',()=>{process.stderr.write(${JSON.stringify(stderr)});process.exitCode=1;});`],options),
+    }),error=>{
+      assert.equal(error.code,"REHEARSAL_PROCESS_FAILED");
+      assert.equal(error.scaleEvidence.childFailureCode,expected);
+      assert.equal(JSON.stringify(error.scaleEvidence).includes("private-source-text"),false);
+      return true;
+    });
   }
 });
