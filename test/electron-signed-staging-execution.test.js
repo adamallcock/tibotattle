@@ -99,3 +99,13 @@ test('fresh-only receipt does not claim the seeded restart or upload journey', a
   assert.ok(source.indexOf("stage = 'credential_restart'") < source.indexOf('proof.controlledRestart = true'));
   assert.ok(source.indexOf('return proof;', source.indexOf('if (untouched) {')) < source.indexOf('proof.controlledRestart = true'));
 });
+
+
+test('unverified launch cleanup refuses surviving detached descendants without signaling them', async () => {
+  const { stopOwnedMacSharingApp } = await import('../scripts/run-signed-electron-staging.mjs');
+  const state = { pid: 1234, groupVerified: false, sessions: [], stopped: () => true,
+    child: { kill() { assert.fail('must not signal a stopped or unverified process'); } } };
+  await assert.rejects(stopOwnedMacSharingApp(state, { processTableImpl: () => [{ pid: 1235, group: 1234 }] }),
+    { stage: 'unverified_group_remaining' });
+  assert.equal(await stopOwnedMacSharingApp(state, { processTableImpl: () => [{ pid: 9999, group: 9999 }] }), true);
+});

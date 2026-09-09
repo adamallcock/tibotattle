@@ -189,27 +189,31 @@ async function launch(verified, environment, { untouched = false } = {}) {
     state.readSharing = () => state.settings.evaluate('globalThis.tibotattleDesktop.getSharingPreference()');
     return state;
   } catch (error) {
-    await stop(state);
+    const stopped = await stop(state);
+    error.ownedMacProcessesStopped = stopped === true;
     throw error;
   }
 }
 
-async function stop(state) {
+async function stop(state, { processTableImpl = processTable } = {}) {
   if (!state) return true;
   for (const session of state.sessions) session.close();
   if (!state.groupVerified) {
     if (!state.stopped()) state.child.kill('SIGTERM');
     await waitFor(state.stopped, OPERATION, 'unstarted process stop');
+    // The child may have spawned descendants before group identity was observed.
+    // Do not signal unverified descendants or claim that stopping one PID removed them.
+    if (processTableImpl().some((row) => row.group === state.pid)) fail('unverified_group_remaining');
     return true;
   }
   // This is an explicitly recorded controlled process restart, not a native menu-quit proof.
-  if (processTable().some((row) => row.group === state.pid)) {
+  if (processTableImpl().some((row) => row.group === state.pid)) {
     try { process.kill(-state.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
   }
-  try { await waitFor(() => !processTable().some((row) => row.group === state.pid), OPERATION, 'group stop'); }
+  try { await waitFor(() => !processTableImpl().some((row) => row.group === state.pid), OPERATION, 'group stop'); }
   catch {
     try { process.kill(-state.pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-    await waitFor(() => !processTable().some((row) => row.group === state.pid), OPERATION, 'group cleanup');
+    await waitFor(() => !processTableImpl().some((row) => row.group === state.pid), OPERATION, 'group cleanup');
   }
   return true;
 }
@@ -309,6 +313,10 @@ export async function runSignedStagingExecution(options) {
   }
   return proof;
 }
+// Shared qualification mechanics only. Callers must verify their own signed
+// artifact and account/profile boundary before launch; staging intake stays closed.
+export { launch as launchVerifiedMacSharingApp, stop as stopOwnedMacSharingApp };
+
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
     const receipt = await runSignedStagingExecution(parseSignedStagingExecutionArguments(process.argv.slice(2)));
