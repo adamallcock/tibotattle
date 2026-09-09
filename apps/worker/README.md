@@ -288,6 +288,14 @@ receipt, and bounded post-deploy observations as separate evidence.
 
 ## Validation
 
+The independent npm lockfile pins the Worker test toolchain. Vitest 4.1.11
+includes the [mock-path boundary fix](https://github.com/vitest-dev/vitest/security/advisories/GHSA-82fw-gwwq-j7x9).
+The scoped `miniflare` override selects sharp 0.35.4 for its
+[patched image-decoding dependencies](https://github.com/lovell/sharp/security/advisories/GHSA-rgj7-g3m4-5g8c).
+Retain that override until the selected Miniflare version itself requires a
+patched sharp release; verify dependency scanning and the complete Worker gate
+before removing it. These are development dependencies, not a deployment.
+
 Focused iteration:
 
 ```bash
