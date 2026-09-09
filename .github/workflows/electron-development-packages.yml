@@ -531,7 +531,7 @@ jobs:
       - name: Validate private Linux credential channel and identity selection
         run: node --test apps/electron/test/desktop-linux-secret-service-broker.test.mjs apps/electron/test/desktop-linux-secret-service-composition.test.mjs test/linux-credential-state.test.js test/export-identity-production.test.js test/account-observation-secret.test.js test/linux-account-observation-credential.test.js
       - name: Validate the normal Linux candidate and packaged harness contracts
-        run: node --test apps/electron/test/platform-gate.test.mjs test/linux-portability-workflow.test.js test/electron-linux-normal-packaged-smoke.test.js
+        run: node --test apps/electron/test/platform-gate.test.mjs test/linux-portability-workflow.test.js test/electron-linux-normal-packaged-smoke.test.js test/electron-linux-appimage-updater.test.js
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
       - name: Build and verify development distributions
@@ -546,6 +546,11 @@ jobs:
           export TIBOTATTLE_ELECTRON_VERSION="$(node -p 'require("./package.json").version')"
           pnpm exec electron-builder --config apps/electron/electron-builder.production.config.cjs \
             --linux dir --x64 --publish never
+      - name: Exercise the pinned Linux AppImage updater adapter on loopback
+        run: |
+          set -euo pipefail
+          receipt="$GITHUB_WORKSPACE/.release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/linux-appimage-updater-smoke.json"
+          timeout 90s node scripts/smoke-electron-linux-appimage-updater.mjs --self-test --receipt "$receipt"
       - name: Exercise packaged Linux credentials in disposable Secret Service
         run: |
           set -euo pipefail
