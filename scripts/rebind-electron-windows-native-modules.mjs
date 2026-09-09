@@ -27,10 +27,46 @@ const REBIND_METADATA = Object.freeze([SIDECAR, MANIFEST]);
 const MAX_FILE = 128 * 1024 * 1024;
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const jsonBytes = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
+const AUTHENTICODE_STATUS = Object.freeze({
+  Valid: "valid",
+  NotSigned: "not_signed",
+  HashMismatch: "hash_mismatch",
+  NotTrusted: "not_trusted",
+  NotSupported: "not_supported",
+  Incompatible: "incompatible",
+  NotAllowed: "not_allowed",
+});
+const AUTHENTICODE_DIAGNOSTIC = /^status=(valid|not_signed|hash_mismatch|not_trusted|not_supported|incompatible|not_allowed|other);signer=(present|absent);timestamp=(present|absent);publisher=(match|mismatch|not_checked)$/u;
 function fail(code) {
   const error = new Error(`WINDOWS_NATIVE_REBIND_${code}`);
   error.code = error.message;
   throw error;
+}
+function parseAuthenticodeDiagnostic(value) {
+  const matched = typeof value === "string" ? AUTHENTICODE_DIAGNOSTIC.exec(value.trim()) : null;
+  if (!matched) return null;
+  return Object.freeze({ status: matched[1], signer: matched[2], timestamp: matched[3], publisher: matched[4] });
+}
+function authenticodeFailureCode(value) {
+  if (!value) return "SIGNATURE_PROBE_INVALID";
+  if (value.status !== "valid") return `SIGNATURE_STATUS_${value.status.toUpperCase()}`;
+  if (value.signer !== "present") return "SIGNATURE_SIGNER_ABSENT";
+  if (value.timestamp !== "present") return "SIGNATURE_TIMESTAMP_ABSENT";
+  if (value.publisher !== "match") return "SIGNATURE_PUBLISHER_MISMATCH";
+  return null;
+}
+function assertAuthenticodeDiagnostic(value) {
+  const code = authenticodeFailureCode(value);
+  if (code) fail(code);
+}
+function closedAuthenticodeDiagnostic(value) {
+  return `status=${value.status};signer=${value.signer};timestamp=${value.timestamp};publisher=${value.publisher}`;
+}
+/** Synthetic-only test seam; the live signer emits no certificate text. */
+export function classifyWindowsAuthenticodeForTest(value) {
+  const diagnostic = parseAuthenticodeDiagnostic(value);
+  assertAuthenticodeDiagnostic(diagnostic);
+  return diagnostic;
 }
 function exactKeys(value, keys) {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -195,12 +231,28 @@ function verifyAuthenticode(path) {
   // Fixed script and environment-carried path avoid shell/path interpolation.
   // This checks Windows trust, publisher and timestamp presence only. The
   // final signer must separately qualify SHA-256 file/timestamp algorithms.
-  const script = "$ErrorActionPreference='Stop'; $s=Get-AuthenticodeSignature -LiteralPath $env:TIBOTATTLE_NATIVE_VERIFY_PATH; if ($s.Status -ne 'Valid' -or $null -eq $s.SignerCertificate -or $null -eq $s.TimeStamperCertificate -or $s.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,$false) -cne 'Adam Allcock') { exit 3 }; exit 0";
+  // The probe emits a fixed, content-free diagnostic rather than certificate
+  // fields so a trust failure is actionable without disclosing signer data.
+  const statusCases = Object.entries(AUTHENTICODE_STATUS)
+    .map(([source, target]) => ` '${source}' { '${target}' }`).join(";");
+  const script = "$ErrorActionPreference='Stop'; $s=Get-AuthenticodeSignature -LiteralPath $env:TIBOTATTLE_NATIVE_VERIFY_PATH; "
+    + `$status=switch ([string]$s.Status) {${statusCases};default{'other'}}; `
+    + "$signer=if($null -eq $s.SignerCertificate){'absent'}else{'present'}; "
+    + "$timestamp=if($null -eq $s.TimeStamperCertificate){'absent'}else{'present'}; "
+    + "$publisher=if($signer -eq 'absent'){'not_checked'}elseif($s.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,$false) -ceq 'Adam Allcock'){'match'}else{'mismatch'}; "
+    + "[Console]::Out.Write(\"status=$status;signer=$signer;timestamp=$timestamp;publisher=$publisher\"); exit 0";
   const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-    env: { ...process.env, TIBOTATTLE_NATIVE_VERIFY_PATH: path }, stdio: "ignore", timeout: 30000,
+    env: { ...process.env, TIBOTATTLE_NATIVE_VERIFY_PATH: path }, encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"], timeout: 30000,
     windowsHide: true,
   });
-  if (result.error || result.signal || result.status !== 0) fail("SIGNATURE_UNVERIFIED");
+  if (result.error || result.signal || result.status !== 0) fail("SIGNATURE_PROBE_FAILED");
+  const diagnostic = parseAuthenticodeDiagnostic(result.stdout);
+  const code = authenticodeFailureCode(diagnostic);
+  if (code) {
+    if (diagnostic) console.error(`WINDOWS_NATIVE_REBIND_AUTHENTICODE ${closedAuthenticodeDiagnostic(diagnostic)}`);
+    fail(code);
+  }
 }
 async function assertInventory(context, manifest, replacements) {
   const expectedFiles = new Set([MANIFEST, ...manifest.files.map((row) => row.path)]);

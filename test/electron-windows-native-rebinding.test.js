@@ -10,6 +10,7 @@ import { WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS } from "../src/platform/win
 import { verifyStagedElectronRuntime } from "../scripts/build-electron-runtime.mjs";
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import {
+  classifyWindowsAuthenticodeForTest,
   inspectWindowsNativeRebinding, parseWindowsNativeRebindingArguments,
   prepareWindowsNativeRebinding, rebindWindowsNativeModules, rebindWindowsNativeModulesForTest,
   windowsNativeUnsignedContentDigest,
@@ -96,6 +97,42 @@ test("native content digest permits Authenticode fields only and rejects malform
   const truncated = pe(true); truncated.writeUInt32LE(32, 236);
   assert.throws(() => windowsNativeUnsignedContentDigest(truncated), { code: "WINDOWS_NATIVE_REBIND_PE_INVALID" });
   assert.throws(() => windowsNativeUnsignedContentDigest(Buffer.alloc(512)), { code: "WINDOWS_NATIVE_REBIND_PE_INVALID" });
+});
+test("Authenticode diagnostics remain closed while distinguishing trust failures", () => {
+  assert.deepEqual(
+    classifyWindowsAuthenticodeForTest("\uFEFF status=valid;signer=present;timestamp=present;publisher=match\r\n"),
+    { status: "valid", signer: "present", timestamp: "present", publisher: "match" },
+  );
+  for (const [status, code] of [
+    ["not_signed", "NOT_SIGNED"],
+    ["hash_mismatch", "HASH_MISMATCH"],
+    ["not_trusted", "NOT_TRUSTED"],
+    ["not_supported", "NOT_SUPPORTED"],
+    ["incompatible", "INCOMPATIBLE"],
+    ["not_allowed", "NOT_ALLOWED"],
+    ["other", "OTHER"],
+  ]) {
+    assert.throws(
+      () => classifyWindowsAuthenticodeForTest(`status=${status};signer=present;timestamp=present;publisher=match`),
+      { code: `WINDOWS_NATIVE_REBIND_SIGNATURE_STATUS_${code}` },
+    );
+  }
+  assert.throws(
+    () => classifyWindowsAuthenticodeForTest("status=valid;signer=absent;timestamp=present;publisher=not_checked"),
+    { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_SIGNER_ABSENT" },
+  );
+  assert.throws(
+    () => classifyWindowsAuthenticodeForTest("status=valid;signer=present;timestamp=absent;publisher=match"),
+    { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_TIMESTAMP_ABSENT" },
+  );
+  assert.throws(
+    () => classifyWindowsAuthenticodeForTest("status=valid;signer=present;timestamp=present;publisher=mismatch"),
+    { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_PUBLISHER_MISMATCH" },
+  );
+  assert.throws(
+    () => classifyWindowsAuthenticodeForTest("status=valid;signer=present;timestamp=present;publisher=unexpected-name"),
+    { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE_INVALID" },
+  );
 });
 test("inspect uses the exact Windows keytar prebuild selected for packaging, then prepare is no-clobber", async () => {
   const releaseConfig = await readFile(
