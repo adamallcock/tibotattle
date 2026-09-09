@@ -16,6 +16,49 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
+
+Latest test-feed and platform continuation:
+
+- Approved corrected publication completed: all eight `.13`/`.14` Mac ZIP/DMGs
+  and both `.14` test manifests were verified in R2, then independently streamed
+  through public HTTPS and matched against expected size, MIME type and SHA-256.
+  Private publication and public-readback receipts are retained under
+  `mac-updater-publication-proposal-9be7da8d`. Stable feeds remain unchanged.
+- R11 independently backed up the stopped `.13` app and complete profile. Normal
+  About-page discovery and download of `.14` passed. **Install and Restart did
+  not terminate `.13`.** A normal menu Quit released ShipIt; the updater then
+  installed `.14` and relaunched it automatically. The installed ASAR matches
+  the signed `.14` ZIP, signature/Gatekeeper checks pass, installation salt and
+  scheduler opt-out are unchanged, About identifies `.14` /
+  `content-6c9e5f12ea46`, and refresh completed FRESH. Both failure and manual-Quit
+  recovery receipts are retained under `mac-updater-installed-rehearsal-9be7da8d-r11`.
+  This closes archive replacement and relaunch, not the one-click update gate.
+- The remaining update blocker is native event ordering: Electron emits
+  `autoUpdater.before-quit-for-update` before window closes, and `app.before-quit`
+  afterward. Source now forwards the earlier native signal into prepared
+  lifecycle shutdown. Recovery/dashboard/Settings and production-composition
+  regression coverage passes; 73 focused tests pass. A new signed sender must
+  still prove the corrected one-click path; installed `.14` predates this fix.
+- All six CI jobs for `fb19164f` passed in run
+  [34335037428](https://github.com/adamallcock/tibotattle/actions/runs/34335037428).
+  Linux includes disposable Secret Service and normal packaged runtime checks;
+  Windows includes normal UI behavior and NSIS installation/two launches/uninstall.
+- Linux follow-on `5c2724cb` adds a real cold process restart with one retained
+  disposable profile: change refresh interval and save opt-out through the
+  ordinary bridge, cleanly stop, relaunch, then verify both persisted choices.
+  `bbbddb4a` preserves a specific persistence failure code through the runner.
+  Existing operation deadlines remain unchanged; only the total session budget
+  grows to cover the additional launch. The new journey awaits fresh Linux CI.
+- Windows follow-on `b0c1ddf2` records synthetic account-observation credential
+  reads across two top-level launches without claiming retained application
+  credentials. Full descendant ownership still needs a launch-before-resume
+  Windows Job Object boundary; existing snapshot checks do not prove that.
+  Windows signing and genuine desktop integration remain separate gates.
+
+The earlier `.13` installation and pending-feed checkpoint below is retained as
+stage history; this continuation supersedes its installed-version/publication
+status. Platform development evidence does not establish public release support.
+
 Latest continuation checkpoint (frozen candidate and installed signed Mac source `9be7da8d`; updater tooling `8a70e38c`):
 
 - **The frozen source now passes all six development CI jobs.** Run

@@ -282,10 +282,19 @@ created as a local phase journal before any remote operation and retained on
 partial failure. Wrangler exposes no
 conditional R2 write, so that flag is an operational assertion: the tool reads
 the target feed before and immediately before replacement, then reads it back;
-it does not claim a cross-writer atomic update. It accepts only an absent or
-known `.11` feed for initial publication, and only known `.11` to advance to
-`.12`. Rollback restores the recorded `.11` bytes only from known `.12` (or is
-a no-op for a target already at known `.11` after an interrupted advance).
+it does not claim a cross-writer atomic update. The historical source family
+accepts only an absent or known `.11` feed for initial publication, advances
+`.11` to `.12`, and rolls `.12` back to `.11`.
+
+The corrected source family `9be7da8d` accepts exactly `.13` and `.14`. Initial
+publication binds the exact historical proposal and completed `.12` advance
+receipt (or an explicitly selected completed `.11` rollback receipt) before
+replacing those known predecessor bytes with `.13`. A target already at the
+exact `.13` bytes is a safe retry. Advance replaces only `.13` with `.14`;
+rollback replaces only `.14` with `.13`, or leaves a target already at `.13`
+unchanged. Both families refuse arbitrary versions, source revisions, feed
+paths and unknown remote bytes. Immutable archives are verified before a feed
+is replaced, and a new journal records each attempt.
 
 The rehearsal namespace is isolated from stable paths, but it is not evidence
 that `updates.tibotattle.com` is access-controlled. Confirm the route and R2
