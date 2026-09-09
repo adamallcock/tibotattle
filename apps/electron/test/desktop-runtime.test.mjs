@@ -2418,6 +2418,56 @@ test("runtime truthfully gates development and Windows notification identity", a
   await windows.desktop.lifecycle.dispose();
 });
 
+test("runtime enables Windows delivery only after the installed identity matches and retains it across language changes", async () => {
+  const fake = fakeNotification();
+  const calls = [];
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  const originalGetPath = app.getPath.bind(app);
+  app.getPath = (name) => ({
+    appData: "C:\\Users\\adam\\AppData\\Roaming",
+    exe: "C:\\Users\\adam\\AppData\\Local\\Programs\\TiboTattle\\TiboTattle.exe",
+  })[name] ?? originalGetPath(name);
+  app.setAppUserModelId = (value) => calls.push(["appUserModelId", value]);
+  app.setToastActivatorCLSID = (value) => calls.push(["toastActivatorClsid", value]);
+  const windows = await launchFixture({
+    app,
+    platform: "win32",
+    platformServices: { ...platformServices(), defaultCodexHome: "C:\\Users\\adam\\.codex" },
+    runtimeOverrides: {
+      Notification: fake.Notification,
+      shell: {
+        readShortcutLink(path) {
+          calls.push(["shortcut", path]);
+          return {
+            target: "C:\\Users\\adam\\AppData\\Local\\Programs\\TiboTattle\\TiboTattle.exe",
+            appUserModelId: distribution.PRODUCTION_ELECTRON_APP_ID,
+          };
+        },
+      },
+    },
+    notificationBackend: notificationBackendFixture(),
+    load: async () => null,
+    environment: { USERPROFILE: "C:\\Users\\adam", USAGE_MONITOR_RESOURCE_ROOT: "/repo" },
+  });
+  assert.equal(
+    (await windows.desktop.controller.handlers.getSettings({})).settings.notifications.delivery,
+    "ready",
+  );
+  await windows.desktop.controller.handlers.setLanguage({ value: "es" });
+  assert.equal(
+    (await windows.desktop.controller.handlers.getSettings({})).settings.notifications.delivery,
+    "ready",
+  );
+  assert.deepEqual(calls, [
+    ["shortcut", "C:\\Users\\adam\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\TiboTattle.lnk"],
+    ["appUserModelId", distribution.PRODUCTION_ELECTRON_APP_ID],
+    ["toastActivatorClsid", distribution.PRODUCTION_ELECTRON_WINDOWS_TOAST_ACTIVATOR_CLSID],
+  ]);
+  await windows.desktop.lifecycle.dispose();
+});
+
 test("fresh first-run login choice is applied once without changing the receipt", async () => {
   const calls = [];
   let loginEnabled = false;
