@@ -54,6 +54,7 @@ import {
   DESKTOP_NOTIFICATION_POLICY_FILE_NAME,
 } from "./desktop-notification-coordinator.js";
 import { createDesktopNotificationDelivery } from "./desktop-notification-delivery.js";
+import { prepareWindowsNotificationIdentity } from "./desktop-windows-notification-identity.js";
 import { shellError } from "./errors.js";
 import {
   createProductionDesktopUpdater,
@@ -1285,6 +1286,11 @@ export async function launchDesktopRuntime({
   });
   const store = settingsStore ?? createDesktopSettingsStore({ backend });
 
+  const windowsNotificationIdentityReady = prepareWindowsNotificationIdentity({
+    app,
+    shell: runtime.shell,
+    platform,
+  });
   let activeDesktopLocale = lifecycleOptions.desktopLocale ?? firstRunLocale;
   let activeNotificationDelivery = createDesktopNotificationDelivery({
     Notification: electronNotificationConstructor(runtime),
@@ -1292,10 +1298,7 @@ export async function launchDesktopRuntime({
     platform,
     locale: activeDesktopLocale,
     systemLocales: desktopSystemLocales,
-    // A directory/qualification artifact does not prove the installed
-    // Windows notification identity. Keep this false until the signed
-    // installed identity is independently qualified.
-    windowsIdentityReady: false,
+    windowsIdentityReady: windowsNotificationIdentityReady,
   });
   const notificationDelivery = Object.freeze({
     status() {
@@ -1303,6 +1306,9 @@ export async function launchDesktopRuntime({
     },
     deliver(value) {
       return activeNotificationDelivery.deliver(value);
+    },
+    sendTest() {
+      return activeNotificationDelivery.sendTest();
     },
   });
   const notificationCoordinator = createDesktopNotificationCoordinator({
@@ -1399,7 +1405,7 @@ export async function launchDesktopRuntime({
         platform,
         locale: value,
         systemLocales: desktopSystemLocales,
-        windowsIdentityReady: false,
+        windowsIdentityReady: windowsNotificationIdentityReady,
       });
     } catch {
       // A copy/catalog failure must not make a persisted language change
@@ -1528,6 +1534,7 @@ export async function launchDesktopRuntime({
     platformServices: services,
     desktopPlatform: platform,
     notificationCoordinator,
+    notificationDelivery,
     getLifecycle: () => facade ?? lifecycle,
     applyCodexHome,
     applyCodexHomes,
@@ -1702,7 +1709,7 @@ export async function launchDesktopRuntime({
             return lifecycle?.state.windowVisible === true
               && lifecycle.isAuthorizedDashboardFrame?.(event?.senderFrame, context) === true;
           }
-          if (SETTINGS_CODEX_ROOT_ACTIONS.has(action)) {
+          if (action === "sendTestNotification" || SETTINGS_CODEX_ROOT_ACTIONS.has(action)) {
             return lifecycle?.isAuthorizedSettingsFrame?.(
               event?.senderFrame,
               { sender: event?.sender },

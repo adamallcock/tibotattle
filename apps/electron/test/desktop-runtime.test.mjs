@@ -2537,3 +2537,55 @@ test("production contributions reject development identity, ambient QA and confl
     assert.equal(app.readyCalls, 0);
   }
 });
+
+test("runtime authorizes a manual notification test only from the live Settings frame", async () => {
+  const fake = fakeNotification();
+  const ipcMain = {
+    handler: null,
+    handle(channel, handler) {
+      assert.equal(channel, "tibotattle:desktop:v1");
+      this.handler = handler;
+    },
+    removeHandler() {
+      this.handler = null;
+    },
+  };
+  const app = new FakeApp();
+  app.isPackaged = true;
+  const { desktop } = await launchFixture({
+    app,
+    load: async () => null,
+    runtimeOverrides: { ipcMain, Notification: fake.Notification },
+  });
+  await desktop.controller.handlers.openSettings({});
+  const settings = FakeWindow.instances.find((candidate) => (
+    candidate.webContents.url.endsWith("/electron-settings.html#general")
+  ));
+  const dashboard = FakeWindow.instances.find((candidate) => candidate !== settings);
+  assert.notEqual(settings, undefined);
+  assert.notEqual(dashboard, undefined);
+
+  const settingsEvent = {
+    sender: settings.webContents,
+    senderFrame: settings.webContents.mainFrame,
+  };
+  const dashboardEvent = {
+    sender: dashboard.webContents,
+    senderFrame: dashboard.webContents.mainFrame,
+  };
+  await assert.rejects(
+    ipcMain.handler(dashboardEvent, { action: "sendTestNotification", args: {} }),
+    (error) => error?.code === "desktop_ipc_untrusted_context",
+  );
+  assert.deepEqual(
+    await ipcMain.handler(settingsEvent, { action: "sendTestNotification", args: {} }),
+    { status: "requested" },
+  );
+  assert.equal(fake.shown.length, 1);
+  settings.webContents.url = "http://127.0.0.1:4811/other";
+  await assert.rejects(
+    ipcMain.handler(settingsEvent, { action: "sendTestNotification", args: {} }),
+    (error) => error?.code === "desktop_ipc_untrusted_context",
+  );
+  await desktop.lifecycle.dispose();
+});
