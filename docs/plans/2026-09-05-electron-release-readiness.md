@@ -19,6 +19,33 @@ Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
 Latest continuation, 2026-09-09:
 
+- **Automatic contributions now pass one continuous signed fresh-install journey.**
+  [34412723158](https://github.com/adamallcock/tibotattle/actions/runs/34412723158)
+  used runner `990b7fc9` and the unchanged signed staging app `c0c98040`.
+  The untouched profile completed the actual native introduction, created
+  default-on sharing without a seeded preference, automatically enrolled and
+  uploaded, reused its installation credential after controlled restart, then
+  retained opt-out after another restart. No social sign-in was used. Server
+  readback found one new synthetic enrollment, two accepted chunks, two usage
+  records and two quota records; all 23 retained staging records joined to
+  consistent installation ownership, with zero duplicate occurrence groups and
+  zero public daily aggregates. Staging is restored to revision 16, all four
+  collection flags off, v1.1 staged and both accountless modes disabled. The
+  synthetic records/authority remain retained; this is not erasure/revocation.
+- **The authorized production migration attempt identified the remaining blocker.**
+  The one ordinary invocation completed 0057, then Cloudflare refused 0058 with
+  CPU-limit/reset code 7429. The terminal command, migration ledgers, exact
+  canonical schema comparison and health checks reconciled primary prefix 57
+  and deletion prefix 2, with no partial 0058 objects. Under the approved
+  conditional restoration, collection returned to revision 3/all enabled and
+  public health passed. No retry, database restore, accountless activation or
+  release publication occurred. The next migration must bound the actual row
+  work; another whole-database attempt is not planned.
+- **Release priority narrowed by the user:** Windows/Linux notification appearance
+  and remaining physical desktop acceptance are deferred. The immediate path is
+  the bounded production migration, accountless activation and one production
+  synthetic canary, followed by protected qualification and release approval.
+
 - **Windows signed-installed runtime now passes.** Exact source `4d8d551b`,
   build `2026090937`, passed signing, installation, dashboard rendering,
   synthetic usage ingestion, retained totals/settings/opt-out across restart,

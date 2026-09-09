@@ -7,6 +7,34 @@ status: proposed
 
 # Scope and evidence
 
+## Current outcome — 2026-09-09
+
+The user approved the exact single production migration attempt. Operation
+`production-atomic-attempt-20260909-02` paused collection at revision 2 and
+retained both recovery bookmarks. The ordinary migration invocation completed
+0057, then 0058 failed with Cloudflare CPU-limit/reset code 7429. It was not
+retried. Bounded reconciliation found primary prefix 57, deletion prefix 2 and
+an exact canonical prefix-57 schema (327 objects; no missing, unexpected or
+changed objects against the captured baseline plus 0057). The deployed compatible
+Worker remained `32cd6317` and health/storage/lifecycle checks passed. Collection
+was conditionally restored to its original enabled state at revision 3, then
+public health was verified again. No database restore, new accountless authority,
+production canary or public release was performed. This is schema/health evidence,
+not a claim of full production row hashes. The historical prefix-56 admission
+and single-attempt SQL below must not be reused as a new production operation.
+
+In parallel, signed fresh-install run
+[34412723158](https://github.com/adamallcock/tibotattle/actions/runs/34412723158)
+passed the complete untouched-profile → native introduction → automatic accepted
+upload → authenticated credential reuse after restart → persistent opt-out
+journey. Staging server readback confirmed one new installation with two usage
+and two quota records linked consistently; duplicate occurrence groups and public
+daily aggregates remained zero. Staging was restored to revision 16/all collection
+off and disabled accountless modes. Synthetic staging records remain retained.
+The remaining production blocker is a migration whose row work is bounded under
+Cloudflare's limit, followed by separately approved activation/canary/erasure.
+
+
 Prepare production collection for the accepted [Electron sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md). This proposal authorizes no remote write, credential renewal, migration, deployment, public admission, or release publication. Public health was read on 2026-09-09: deployment `32cd6317622c9aef9b7bf015b376b4cdb93c91fc`, operational collection with enrollment/upload registration/processing/publication enabled, and passing reported storage/lifecycle checks. This endpoint does not expose accountless mode fields. A read-only production ledger observation at `2026-09-09T18:10:17.308Z` found primary migrations 0001–0056 applied and deletion-ledger migrations 0001–0002 applied. Read-only deployment and secret-name inspection at 18:19 UTC confirmed both accountless mode variables are absent (therefore disabled), collection revision 1 is operational with all four stages enabled, and all five required secret names are present and bound. No secret values were read. The credential-free observation is retained in the private qualification artifact directory.
 
 The [Electron readiness record](2026-09-05-electron-release-readiness.md) records the signed staging pass: automatic accepted upload, authenticated restart with retained installation binding, and persistent opt-out. The separate signed untouched-install run [34386204318](https://github.com/adamallcock/tibotattle/actions/runs/34386204318), using runner `e33c6b37` and signed app `c0c98040`, also passed: the real native introduction was completed and the app created default-on sharing without a seeded preference or acknowledgement. The three-visible-notice transition has focused source/composition evidence; no seven-day signed migration run is claimed.
