@@ -48,12 +48,28 @@ Latest test-feed and platform continuation:
   ordinary bridge, cleanly stop, relaunch, then verify both persisted choices.
   `bbbddb4a` preserves a specific persistence failure code through the runner.
   Existing operation deadlines remain unchanged; only the total session budget
-  grows to cover the additional launch. The new journey awaits fresh Linux CI.
+  grows to cover the additional launch. The real new journey passed on
+  `dcf2d6ca` in [34337369739](https://github.com/adamallcock/tibotattle/actions/runs/34337369739),
+  as did all other five jobs. Linux receipt SHA-256:
+  `437665f84ef4aee27dbf2ed1e618156fdd3717a779c1a3a65a140530f9eef2b1`.
 - Windows follow-on `b0c1ddf2` records synthetic account-observation credential
   reads across two top-level launches without claiming retained application
   credentials. Full descendant ownership still needs a launch-before-resume
   Windows Job Object boundary; existing snapshot checks do not prove that.
   Windows signing and genuine desktop integration remain separate gates.
+  The new Windows NSIS receipt passed on `dcf2d6ca` and explicitly confirms
+  both synthetic credential acknowledgements; receipt SHA-256:
+  `517af6a07fba1ebe6af8376b0fa72513ace07089a4f966c1b9d25276f77cbc86`.
+  The separate normal UI/restart/opt-out receipt has SHA-256:
+  `3799ad1963a5ce1db3b629100f44ae2ce353322918c1e1c0f2dfa6fc4a0835c4`.
+- Both Windows and Linux development distributions were downloaded and checked
+  against the exact packaging manifests, including installer/archive bytes,
+  launchers, main executables and ASARs. A private test handoff under
+  `platform-test-installers-dcf2d6ca` explains the retained 0.1.18 filename,
+  exact newer source revision, launchers, isolated profiles and unavailable
+  hosted uploads. The Windows installer hash matches the successful NSIS
+  receipt. The Linux normal-runtime receipt belongs to a separately prepared
+  candidate and is not substituted for physical AppImage lifecycle evidence.
 
 The earlier `.13` installation and pending-feed checkpoint below is retained as
 stage history; this continuation supersedes its installed-version/publication

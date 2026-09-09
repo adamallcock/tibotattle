@@ -10,6 +10,9 @@ import {
   CORRECTED_HANDOVER_SOURCE_REVISION,
   CORRECTED_NEXT_VERSION,
   CURRENT_VERSION,
+  FOLLOW_UP_CURRENT_VERSION,
+  FOLLOW_UP_HANDOVER_SOURCE_REVISION,
+  FOLLOW_UP_NEXT_VERSION,
   HANDOVER_PREFIX,
   HANDOVER_SOURCE_REVISION,
   NEXT_VERSION,
@@ -19,6 +22,7 @@ import {
 
 const sha256 = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const sha512 = (bytes) => createHash("sha512").update(bytes).digest("base64");
+const TARGETS = Object.freeze(["darwin-arm64", "darwin-x64"]);
 
 function yaml(version, files) {
   return Buffer.from([
@@ -27,114 +31,182 @@ function yaml(version, files) {
     `path: ${files[0].name}`, `sha512: ${sha512(files[0].bytes)}`, "releaseDate: '2026-09-09T00:00:00.000Z'", "",
   ].join("\n"));
 }
+
+async function writeCandidate({ root, directory, sourceRevision, kind, target, version }) {
+  const arch = target.slice("darwin-".length);
+  const relativeDirectory = `${directory}/${kind}/${target}`;
+  const candidateDirectory = join(root, relativeDirectory);
+  await mkdir(candidateDirectory, { recursive: true });
+  const zip = { name: `TiboTattle-${version}-mac-${arch}.zip`, bytes: Buffer.from(`${directory}-${kind}-${arch}-zip`) };
+  const dmg = { name: `TiboTattle-${version}-mac-${arch}.dmg`, bytes: Buffer.from(`${directory}-${kind}-${arch}-dmg`) };
+  const manifest = yaml(version, [zip, dmg]);
+  for (const file of [zip, dmg]) await writeFile(join(candidateDirectory, file.name), file.bytes);
+  await writeFile(join(candidateDirectory, "native-to-electron-handover-mac.yml"), manifest);
+  await writeFile(join(candidateDirectory, "production-finalization-receipt.json"), JSON.stringify({
+    sourceRevision, version, candidate: kind, target, checks: { checked: true },
+    artifacts: {
+      dmg: { file: dmg.name, bytes: dmg.bytes.length, sha256: sha256(dmg.bytes) },
+      zip: { file: zip.name, bytes: zip.bytes.length, sha256: sha256(zip.bytes) },
+    },
+  }));
+  const object = (file, primaryForUpdater) => ({
+    localPath: `${relativeDirectory}/${file.name}`,
+    objectKey: `${HANDOVER_PREFIX}/${target}/${file.name}`,
+    sha256: sha256(file.bytes),
+    bytes: file.bytes.length,
+    primaryForUpdater,
+  });
+  return {
+    version,
+    finalizationReceipt: `${relativeDirectory}/production-finalization-receipt.json`,
+    finalizationChecksAllTrue: true,
+    manifest: {
+      localPath: `${relativeDirectory}/native-to-electron-handover-mac.yml`,
+      objectKey: `${HANDOVER_PREFIX}/${target}/native-to-electron-handover-mac.yml`,
+      sha256: sha256(manifest),
+      bytes: manifest.length,
+    },
+    objects: [object(zip, true), object(dmg, false)],
+  };
+}
+
+function selectedPublication(proposal, target, state) {
+  if (state === "rollback") {
+    const current = proposal.initialPublication[target];
+    return { manifest: current.manifest, objects: current.objects };
+  }
+  const next = proposal.feedAdvance[target];
+  return { manifest: next.replaceOnlyManifest, objects: next.prepositionImmutableObjects };
+}
+
+function completedPublicationReceipt({ proposal, sourceRevision, state }) {
+  return {
+    schema: "tibotattle-electron-handover-feed-publication-receipt-v1",
+    sourceRevision,
+    stage: state,
+    bucket: "tibotattle-updates",
+    status: "completed",
+    mutation: "wrangler-unconditional-put-with-exclusive-control-pre-post-readback",
+    targets: Object.fromEntries(TARGETS.map((target) => {
+      const selected = selectedPublication(proposal, target, state);
+      return [target, {
+        feedKey: selected.manifest.objectKey,
+        feedSha256: selected.manifest.sha256,
+        immutableKeys: selected.objects.map((object) => object.objectKey),
+        phase: "feed_readback_passed",
+      }];
+    })),
+  };
+}
+
+async function makeFamilyProposal({
+  root,
+  directory,
+  sourceRevision,
+  currentVersion,
+  nextVersion,
+  predecessor = null,
+}) {
+  const proposal = {
+    schema: predecessor === null
+      ? "tibotattle-private-updater-publication-proposal-v1"
+      : "tibotattle-private-updater-publication-proposal-v2",
+    disposition: "proposal-only-no-network-write",
+    sourceRevision,
+    r2Bucket: "tibotattle-updates",
+    publicOrigin: "https://updates.tibotattle.com",
+    feedPrefix: HANDOVER_PREFIX,
+    channel: "native-to-electron-handover-rehearsal-v1",
+    privacy: { namespaceIsolatedFromStable: true, accessControlProven: false, note: "fixture" },
+    ...(predecessor === null ? {} : { predecessor }),
+    initialPublication: {},
+    feedAdvance: {},
+    rollback: {},
+    stableMustRemainUntouched: ["electron/stable/**", "appcast.xml", "intel/appcast.xml", "preview/**"],
+  };
+  for (const target of TARGETS) {
+    const current = await writeCandidate({ root, directory, sourceRevision, kind: "current", target, version: currentVersion });
+    const next = await writeCandidate({ root, directory, sourceRevision, kind: "next", target, version: nextVersion });
+    const rollbackDirectory = join(root, directory, "rollback");
+    const rollbackPath = join(rollbackDirectory, `${target}.yml`);
+    await mkdir(rollbackDirectory, { recursive: true });
+    await writeFile(rollbackPath, await readFile(join(root, current.manifest.localPath)));
+    proposal.initialPublication[target] = current;
+    proposal.feedAdvance[target] = {
+      prepositionImmutableObjects: next.objects,
+      replaceOnlyManifest: next.manifest,
+      expectedPreviousManifestSha256: current.manifest.sha256,
+    };
+    proposal.rollback[target] = {
+      restoreOnlyManifest: {
+        localPath: `${directory}/rollback/${target}.yml`,
+        objectKey: current.manifest.objectKey,
+        sha256: current.manifest.sha256,
+        bytes: current.manifest.bytes,
+      },
+      expectedCurrentManifestSha256: next.manifest.sha256,
+      retainImmutableObjects: true,
+    };
+  }
+  const proposalPath = join(root, `${directory}.proposal.json`);
+  await writeFile(proposalPath, JSON.stringify(proposal));
+  return { proposal, proposalPath };
+}
+
 async function fixture(run) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-feed-"));
   try {
-    const proposal = {
-      schema: "tibotattle-private-updater-publication-proposal-v1", disposition: "proposal-only-no-network-write",
-      sourceRevision: HANDOVER_SOURCE_REVISION, r2Bucket: "tibotattle-updates", publicOrigin: "https://updates.tibotattle.com",
-      feedPrefix: HANDOVER_PREFIX, channel: "native-to-electron-handover-rehearsal-v1", privacy: { namespaceIsolatedFromStable: true, accessControlProven: false, note: "fixture" },
-      initialPublication: {}, feedAdvance: {}, rollback: {}, stableMustRemainUntouched: ["electron/stable/**", "appcast.xml", "intel/appcast.xml", "preview/**"],
-    };
-    for (const target of ["darwin-arm64", "darwin-x64"]) {
-      const arch = target.slice("darwin-".length);
-      const currentDir = join(root, "signed", "current", target); const nextDir = join(root, "signed", "next", target); const rollbackDir = join(root, "rollback");
-      await Promise.all([mkdir(currentDir, { recursive: true }), mkdir(nextDir, { recursive: true }), mkdir(rollbackDir, { recursive: true })]);
-      const make = async (dir, version, kind) => {
-        const zip = { name: `TiboTattle-${version}-mac-${arch}.zip`, bytes: Buffer.from(`${kind}-${arch}-zip`) };
-        const dmg = { name: `TiboTattle-${version}-mac-${arch}.dmg`, bytes: Buffer.from(`${kind}-${arch}-dmg`) };
-        const manifest = yaml(version, [zip, dmg]);
-        for (const file of [zip, dmg]) await writeFile(join(dir, file.name), file.bytes);
-        await writeFile(join(dir, "native-to-electron-handover-mac.yml"), manifest);
-        await writeFile(join(dir, "production-finalization-receipt.json"), JSON.stringify({
-          sourceRevision: HANDOVER_SOURCE_REVISION, version, candidate: kind, target, checks: { checked: true },
-          artifacts: {
-            dmg: { file: dmg.name, bytes: dmg.bytes.length, sha256: sha256(dmg.bytes) },
-            zip: { file: zip.name, bytes: zip.bytes.length, sha256: sha256(zip.bytes) },
-          },
-        }));
-        const object = (file, primaryForUpdater) => ({ localPath: `signed/${kind}/${target}/${file.name}`, objectKey: `${HANDOVER_PREFIX}/${target}/${file.name}`, sha256: sha256(file.bytes), bytes: file.bytes.length, primaryForUpdater });
-        return { version, finalizationReceipt: `signed/${kind}/${target}/production-finalization-receipt.json`, finalizationChecksAllTrue: true, manifest: { localPath: `signed/${kind}/${target}/native-to-electron-handover-mac.yml`, objectKey: `${HANDOVER_PREFIX}/${target}/native-to-electron-handover-mac.yml`, sha256: sha256(manifest), bytes: manifest.length }, objects: [object(zip, true), object(dmg, false)] };
-      };
-      const current = await make(currentDir, CURRENT_VERSION, "current"); const next = await make(nextDir, NEXT_VERSION, "next");
-      const rollback = join(rollbackDir, `${target}.yml`); await writeFile(rollback, await readFile(join(currentDir, "native-to-electron-handover-mac.yml")));
-      proposal.initialPublication[target] = current;
-      proposal.feedAdvance[target] = { prepositionImmutableObjects: next.objects, replaceOnlyManifest: next.manifest, expectedPreviousManifestSha256: current.manifest.sha256 };
-      proposal.rollback[target] = { restoreOnlyManifest: { localPath: `rollback/${target}.yml`, objectKey: current.manifest.objectKey, sha256: current.manifest.sha256, bytes: current.manifest.bytes }, expectedCurrentManifestSha256: next.manifest.sha256, retainImmutableObjects: true };
-    }
-    const proposalPath = join(root, "proposal.json"); await writeFile(proposalPath, JSON.stringify(proposal));
+    const { proposal, proposalPath } = await makeFamilyProposal({
+      root,
+      directory: "signed",
+      sourceRevision: HANDOVER_SOURCE_REVISION,
+      currentVersion: CURRENT_VERSION,
+      nextVersion: NEXT_VERSION,
+    });
     const makeCorrected = async ({ predecessorState = "advance" } = {}) => {
       const predecessorReceiptPath = join(root, `legacy-${predecessorState}.receipt.json`);
-      const predecessorTargets = {};
-      for (const target of ["darwin-arm64", "darwin-x64"]) {
-        const selected = predecessorState === "rollback"
-          ? proposal.initialPublication[target]
-          : proposal.feedAdvance[target];
-        const manifest = predecessorState === "rollback"
-          ? selected.manifest
-          : selected.replaceOnlyManifest;
-        const objects = predecessorState === "rollback"
-          ? selected.objects
-          : selected.prepositionImmutableObjects;
-        predecessorTargets[target] = {
-          feedKey: manifest.objectKey,
-          feedSha256: manifest.sha256,
-          immutableKeys: objects.map((object) => object.objectKey),
-          phase: "feed_readback_passed",
-        };
-      }
-      const predecessorReceipt = {
-        schema: "tibotattle-electron-handover-feed-publication-receipt-v1",
+      await writeFile(predecessorReceiptPath, JSON.stringify(completedPublicationReceipt({
+        proposal,
         sourceRevision: HANDOVER_SOURCE_REVISION,
-        stage: predecessorState,
-        bucket: "tibotattle-updates",
-        status: "completed",
-        mutation: "wrangler-unconditional-put-with-exclusive-control-pre-post-readback",
-        targets: predecessorTargets,
-      };
-      await writeFile(predecessorReceiptPath, JSON.stringify(predecessorReceipt));
-      const corrected = {
-        schema: "tibotattle-private-updater-publication-proposal-v2", disposition: "proposal-only-no-network-write",
-        sourceRevision: CORRECTED_HANDOVER_SOURCE_REVISION, r2Bucket: "tibotattle-updates", publicOrigin: "https://updates.tibotattle.com",
-        feedPrefix: HANDOVER_PREFIX, channel: "native-to-electron-handover-rehearsal-v1", privacy: { namespaceIsolatedFromStable: true, accessControlProven: false, note: "fixture" },
+        state: predecessorState,
+      })));
+      const corrected = await makeFamilyProposal({
+        root,
+        directory: "corrected",
+        sourceRevision: CORRECTED_HANDOVER_SOURCE_REVISION,
+        currentVersion: CORRECTED_CURRENT_VERSION,
+        nextVersion: CORRECTED_NEXT_VERSION,
         predecessor: {
           state: predecessorState,
-          proposal: { localPath: "proposal.json", sha256: sha256(await readFile(proposalPath)) },
+          proposal: { localPath: "signed.proposal.json", sha256: sha256(await readFile(proposalPath)) },
           publicationReceipt: { localPath: `legacy-${predecessorState}.receipt.json`, sha256: sha256(await readFile(predecessorReceiptPath)) },
         },
-        initialPublication: {}, feedAdvance: {}, rollback: {}, stableMustRemainUntouched: ["electron/stable/**", "appcast.xml", "intel/appcast.xml", "preview/**"],
-      };
-      for (const target of ["darwin-arm64", "darwin-x64"]) {
-        const arch = target.slice("darwin-".length);
-        const make = async (kind, version) => {
-          const dir = join(root, "corrected", kind, target);
-          await mkdir(dir, { recursive: true });
-          const zip = { name: `TiboTattle-${version}-mac-${arch}.zip`, bytes: Buffer.from(`corrected-${kind}-${arch}-zip`) };
-          const dmg = { name: `TiboTattle-${version}-mac-${arch}.dmg`, bytes: Buffer.from(`corrected-${kind}-${arch}-dmg`) };
-          const manifest = yaml(version, [zip, dmg]);
-          for (const file of [zip, dmg]) await writeFile(join(dir, file.name), file.bytes);
-          await writeFile(join(dir, "native-to-electron-handover-mac.yml"), manifest);
-          await writeFile(join(dir, "production-finalization-receipt.json"), JSON.stringify({
-            sourceRevision: CORRECTED_HANDOVER_SOURCE_REVISION, version, candidate: kind, target, checks: { checked: true },
-            artifacts: { dmg: { file: dmg.name, bytes: dmg.bytes.length, sha256: sha256(dmg.bytes) }, zip: { file: zip.name, bytes: zip.bytes.length, sha256: sha256(zip.bytes) } },
-          }));
-          const object = (file, primaryForUpdater) => ({ localPath: `corrected/${kind}/${target}/${file.name}`, objectKey: `${HANDOVER_PREFIX}/${target}/${file.name}`, sha256: sha256(file.bytes), bytes: file.bytes.length, primaryForUpdater });
-          return { version, finalizationReceipt: `corrected/${kind}/${target}/production-finalization-receipt.json`, finalizationChecksAllTrue: true, manifest: { localPath: `corrected/${kind}/${target}/native-to-electron-handover-mac.yml`, objectKey: `${HANDOVER_PREFIX}/${target}/native-to-electron-handover-mac.yml`, sha256: sha256(manifest), bytes: manifest.length }, objects: [object(zip, true), object(dmg, false)] };
-        };
-        const current = await make("current", CORRECTED_CURRENT_VERSION);
-        const next = await make("next", CORRECTED_NEXT_VERSION);
-        const rollbackPath = join(root, "corrected", "rollback", `${target}.yml`);
-        await mkdir(join(root, "corrected", "rollback"), { recursive: true });
-        await writeFile(rollbackPath, await readFile(join(root, current.manifest.localPath)));
-        corrected.initialPublication[target] = current;
-        corrected.feedAdvance[target] = { prepositionImmutableObjects: next.objects, replaceOnlyManifest: next.manifest, expectedPreviousManifestSha256: current.manifest.sha256 };
-        corrected.rollback[target] = { restoreOnlyManifest: { localPath: `corrected/rollback/${target}.yml`, objectKey: current.manifest.objectKey, sha256: current.manifest.sha256, bytes: current.manifest.bytes }, expectedCurrentManifestSha256: next.manifest.sha256, retainImmutableObjects: true };
-      }
-      const correctedPath = join(root, `corrected-${predecessorState}.proposal.json`);
-      await writeFile(correctedPath, JSON.stringify(corrected));
-      return { proposal: corrected, proposalPath: correctedPath, predecessorReceiptPath };
+      });
+      return { ...corrected, predecessorReceiptPath };
     };
-    return await run({ root, proposal, proposalPath, makeCorrected });
+    const makeFollowUp = async ({ predecessorState = "advance" } = {}) => {
+      const corrected = await makeCorrected({ predecessorState });
+      const predecessorReceiptPath = join(root, `corrected-${predecessorState}.receipt.json`);
+      await writeFile(predecessorReceiptPath, JSON.stringify(completedPublicationReceipt({
+        proposal: corrected.proposal,
+        sourceRevision: CORRECTED_HANDOVER_SOURCE_REVISION,
+        state: predecessorState,
+      })));
+      const followUp = await makeFamilyProposal({
+        root,
+        directory: "follow-up",
+        sourceRevision: FOLLOW_UP_HANDOVER_SOURCE_REVISION,
+        currentVersion: FOLLOW_UP_CURRENT_VERSION,
+        nextVersion: FOLLOW_UP_NEXT_VERSION,
+        predecessor: {
+          state: predecessorState,
+          proposal: { localPath: "corrected.proposal.json", sha256: sha256(await readFile(corrected.proposalPath)) },
+          publicationReceipt: { localPath: `corrected-${predecessorState}.receipt.json`, sha256: sha256(await readFile(predecessorReceiptPath)) },
+        },
+      });
+      return { ...followUp, corrected, predecessorReceiptPath };
+    };
+    return await run({ root, proposal, proposalPath, makeCorrected, makeFollowUp });
   } finally { await rm(root, { recursive: true, force: true }); }
 }
 function fakeWrangler(objects, calls, { failPut = () => false } = {}) {
@@ -291,4 +363,157 @@ test("corrected family refuses missing, unknown, or tampered predecessor evidenc
   }
   const newCorrected = await makeCorrected({ predecessorState: "rollback" });
   await assert.rejects(() => publishElectronHandoverRehearsalFeed({ artifactRoot: root, proposalPath: newCorrected.proposalPath, stage: "initial", publish: true, confirmExclusiveRehearsalControl: true, receiptPath: join(root, "corrected-unknown.json"), runWrangler: fakeWrangler(unknown, []) }), { code: "ELECTRON_HANDOVER_FEED_FEED_CONFLICT" });
+}));
+
+test("follow-up family starts only from .14, then advances and rolls back without replacing historical archives", async () => fixture(async ({ root, makeFollowUp }) => {
+  const followUp = await makeFollowUp();
+  const objects = new Map(); const calls = []; const runner = fakeWrangler(objects, calls);
+  for (const target of TARGETS) {
+    const predecessor = followUp.corrected.proposal.feedAdvance[target].replaceOnlyManifest;
+    objects.set(`tibotattle-updates/${predecessor.objectKey}`, await readFile(join(root, predecessor.localPath)));
+  }
+  const initialReceiptPath = join(root, "follow-up-initial.json");
+  await publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: followUp.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: initialReceiptPath,
+    runWrangler: runner,
+  });
+  const initialReceipt = JSON.parse(await readFile(initialReceiptPath));
+  assert.equal(initialReceipt.sourceRevision, FOLLOW_UP_HANDOVER_SOURCE_REVISION);
+  for (const target of TARGETS) {
+    const key = `tibotattle-updates/${followUp.proposal.initialPublication[target].manifest.objectKey}`;
+    assert.deepEqual(objects.get(key), await readFile(join(root, followUp.proposal.initialPublication[target].manifest.localPath)));
+  }
+  await publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: followUp.proposalPath,
+    stage: "advance",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "follow-up-advance.json"),
+    runWrangler: runner,
+  });
+  await publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: followUp.proposalPath,
+    stage: "rollback",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "follow-up-rollback.json"),
+    runWrangler: runner,
+  });
+  for (const target of TARGETS) {
+    const key = `tibotattle-updates/${followUp.proposal.initialPublication[target].manifest.objectKey}`;
+    assert.deepEqual(objects.get(key), await readFile(join(root, followUp.proposal.rollback[target].restoreOnlyManifest.localPath)));
+  }
+  const historicalArchivePuts = calls.filter((args) => (
+    args[2] === "put"
+    && /native-to-electron-handover\.(?:11|12|13|14)-mac-/u.test(args[3])
+  ));
+  assert.deepEqual(historicalArchivePuts, []);
+}));
+
+test("follow-up family refuses forged source or receipt, a .13 proof, and a .13 remote feed before puts", async () => fixture(async ({ root, makeFollowUp }) => {
+  const calls = [];
+  const forgedSource = await makeFollowUp();
+  forgedSource.proposal.sourceRevision = "0".repeat(40);
+  await writeFile(forgedSource.proposalPath, JSON.stringify(forgedSource.proposal));
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: forgedSource.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "forged-source.json"),
+    runWrangler: fakeWrangler(new Map(), calls),
+  }), { code: "ELECTRON_HANDOVER_FEED_INVALID" });
+  assert.equal(calls.filter((args) => args[2] === "put").length, 0);
+
+  const rollbackProof = await makeFollowUp({ predecessorState: "rollback" });
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: rollbackProof.proposalPath,
+    stage: "initial",
+  }), { code: "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID" });
+
+  const forgedPredecessorSource = await makeFollowUp();
+  forgedPredecessorSource.corrected.proposal.sourceRevision = "f".repeat(40);
+  await writeFile(forgedPredecessorSource.corrected.proposalPath, JSON.stringify(forgedPredecessorSource.corrected.proposal));
+  forgedPredecessorSource.proposal.predecessor.proposal.sha256 = sha256(await readFile(forgedPredecessorSource.corrected.proposalPath));
+  await writeFile(forgedPredecessorSource.proposalPath, JSON.stringify(forgedPredecessorSource.proposal));
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: forgedPredecessorSource.proposalPath,
+    stage: "initial",
+  }), { code: "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID" });
+
+  const forgedReceipt = await makeFollowUp();
+  const receipt = JSON.parse(await readFile(forgedReceipt.predecessorReceiptPath));
+  receipt.targets["darwin-arm64"].immutableKeys.reverse();
+  await writeFile(forgedReceipt.predecessorReceiptPath, JSON.stringify(receipt));
+  forgedReceipt.proposal.predecessor.publicationReceipt.sha256 = sha256(await readFile(forgedReceipt.predecessorReceiptPath));
+  await writeFile(forgedReceipt.proposalPath, JSON.stringify(forgedReceipt.proposal));
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: forgedReceipt.proposalPath,
+    stage: "initial",
+  }), { code: "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID" });
+
+  const valid = await makeFollowUp();
+  const remoteObjects = new Map();
+  for (const target of TARGETS) {
+    const old = valid.corrected.proposal.initialPublication[target].manifest;
+    remoteObjects.set(`tibotattle-updates/${old.objectKey}`, await readFile(join(root, old.localPath)));
+  }
+  const remoteCalls = [];
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: valid.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "remote-.13.json"),
+    runWrangler: fakeWrangler(remoteObjects, remoteCalls),
+  }), { code: "ELECTRON_HANDOVER_FEED_FEED_CONFLICT" });
+  assert.equal(remoteCalls.filter((args) => args[2] === "put").length, 0);
+}));
+
+test("follow-up initial retry writes only the target still at the bound .14 feed", async () => fixture(async ({ root, makeFollowUp }) => {
+  const followUp = await makeFollowUp();
+  const objects = new Map(); const calls = [];
+  for (const target of TARGETS) {
+    const predecessor = followUp.corrected.proposal.feedAdvance[target].replaceOnlyManifest;
+    objects.set(`tibotattle-updates/${predecessor.objectKey}`, await readFile(join(root, predecessor.localPath)));
+  }
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: followUp.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "follow-up-mixed-first.json"),
+    runWrangler: fakeWrangler(objects, calls, {
+      failPut: (key) => key.endsWith("darwin-x64/native-to-electron-handover-mac.yml"),
+    }),
+  }), { code: "ELECTRON_HANDOVER_FEED_R2_WRITE_FAILED" });
+  const retryCalls = [];
+  await publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: followUp.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "follow-up-mixed-retry.json"),
+    runWrangler: fakeWrangler(objects, retryCalls),
+  });
+  const retryFeedPuts = retryCalls.filter((args) => (
+    args[2] === "put" && args[3].endsWith("native-to-electron-handover-mac.yml")
+  ));
+  assert.deepEqual(retryFeedPuts.map((args) => args[3]), [
+    `tibotattle-updates/${followUp.proposal.initialPublication["darwin-x64"].manifest.objectKey}`,
+  ]);
 }));

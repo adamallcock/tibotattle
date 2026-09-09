@@ -27,8 +27,8 @@ enrollment or contribution.
 |---|---|---|---|---|
 | macOS 14+ arm64 | Implemented | Native macOS product and retained qualification paths; 0.1.18 disposable-profile/manual matrix explicitly waived, not passed | Stable 0.1.18 / 1026 published with exact final native trust, installed refresh/restart, signed update feed and public-delivery checks | **Supported** |
 | macOS 14+ x86_64 | Explicit thin Intel build, native broker, packaging and isolated updater contracts | Cross-compilation and Rosetta checks; formal physical Intel/manual matrix explicitly waived for 0.1.18, not passed | Stable 0.1.18 / 1026 published with its own final native trust, independent signed update feed and public-delivery checks | **Supported under the release-specific waiver** |
-| Windows x64 | Portable core and fail-closed native filesystem/credential adapter exist | Partial qualification evidence; not a standing release gate | No supported signed installer, clean install/upgrade/uninstall receipt, updater, or stable artifact | **Unsupported** |
-| Linux x86_64 | Portable/core and packaged native credential checks pass; an exact stable Linux/x64 source candidate may select the fixed credential composition, with mixed qualification/test lanes refused | Normal packaged candidate qualification is pending; contract or container results are not physical desktop qualification | No supported signed package/repository, clean install/uninstall receipt, updater boundary, or stable artifact | **Unsupported** |
+| Windows x64 | Portable core and fail-closed native filesystem/credential adapter exist | Packaged normal startup, refresh, persisted settings and opt-out pass on native Windows CI; synthetic Credential Manager and unsigned NSIS lifecycle evidence is retained | Unsigned installer qualification exists; signed production installer, retained-data upgrade, updater and stable release remain open | **Unsupported** |
+| Linux x86_64 | Portable/core and packaged native credential checks pass; an exact stable Linux/x64 source candidate may select the fixed credential composition, with mixed qualification/test lanes refused | Packaged startup, cold process restart with persisted settings/opt-out, disposable Secret Service and cleanup pass in Ubuntu container CI; physical desktop qualification remains open | No supported signed package/repository, clean install/uninstall receipt, updater boundary, or stable artifact | **Unsupported** |
 
 “Unsupported” is not “known broken.” It means the repository does not hold the
 complete, current evidence required to ask users to rely on that platform.
@@ -95,6 +95,14 @@ physical Intel, update or upload observations. See the
 
 ## Windows
 
+On 2026-09-09, source `dcf2d6ca` passed normal packaged UI/refresh/settings and
+opt-out persistence, plus an unsigned NSIS install/two-launch/uninstall journey
+in [run 34337369739](https://github.com/adamallcock/tibotattle/actions/runs/34337369739).
+The installer receipt confirms a synthetic observation credential was read
+across the two launches. It explicitly does not establish existing application
+credential continuity or exhaustive descendant ownership after process exit.
+Native signing, retained-data upgrade and desktop integration remain open.
+
 The Windows native security adapter is deliberately fail-closed and remains a
 readiness component. Source-level portability, a local Electron run, or an alpha
 artifact may inform development but does not create a supported product. Before
@@ -105,12 +113,16 @@ the public-document sweep.
 
 ## Linux
 
-Linux container checks validate only the contracts they execute. They do not
-prove a graphical desktop, native key storage, packaging, signing, distribution
-repository, desktop integration, upgrade, or uninstall. Before changing the
-status, qualify a selected native x86_64 artifact and distribution path on a
-physical Linux desktop, then satisfy the complete evidence ladder. ARM64 Linux
-is a later, independent matrix entry.
+Linux container checks validate only the contracts they execute. On 2026-09-09,
+source `dcf2d6ca` passed the real packaged normal-app journey with isolated
+Secret Service, unavailable-service handling, a cold process restart retaining
+settings and opt-out, and owned-session cleanup in
+[run 34337369739](https://github.com/adamallcock/tibotattle/actions/runs/34337369739).
+That proves the named container journey; it does not establish a user's desktop
+session, distribution trust, tray/notification/login integration, upgrade or
+uninstall. Before changing support status, qualify the selected x86_64 artifact
+and distribution path on a physical Linux desktop and satisfy the complete
+evidence ladder. ARM64 Linux remains an independent matrix entry.
 
 ## Maintenance rule
 

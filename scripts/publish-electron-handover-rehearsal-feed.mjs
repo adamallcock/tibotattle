@@ -25,24 +25,44 @@ export const NEXT_VERSION = "0.1.19-native-to-electron-handover.12";
 export const CORRECTED_HANDOVER_SOURCE_REVISION = "9be7da8d2b84f41693b65d982b61ffa71507201c";
 export const CORRECTED_CURRENT_VERSION = "0.1.19-native-to-electron-handover.13";
 export const CORRECTED_NEXT_VERSION = "0.1.19-native-to-electron-handover.14";
+export const FOLLOW_UP_HANDOVER_SOURCE_REVISION = "dcf2d6caddbcded88dcadfe6c52282a6cd21afb5";
+export const FOLLOW_UP_CURRENT_VERSION = "0.1.19-native-to-electron-handover.15";
+export const FOLLOW_UP_NEXT_VERSION = "0.1.19-native-to-electron-handover.16";
 const PROPOSAL_SCHEMA = "tibotattle-private-updater-publication-proposal-v1";
-const CORRECTED_PROPOSAL_SCHEMA = "tibotattle-private-updater-publication-proposal-v2";
+// A successor family retains this same proposal shape. Its source revision and
+// statically selected predecessor family remain the closed authority.
+const PREDECESSOR_PROPOSAL_SCHEMA = "tibotattle-private-updater-publication-proposal-v2";
 const LEGACY_FAMILY = Object.freeze({
   id: "c938a654-11-12",
   sourceRevision: HANDOVER_SOURCE_REVISION,
   schema: PROPOSAL_SCHEMA,
   currentVersion: CURRENT_VERSION,
   nextVersion: NEXT_VERSION,
-  requiresPredecessor: false,
+  predecessorFamily: null,
+  predecessorStates: Object.freeze([]),
 });
 const CORRECTED_FAMILY = Object.freeze({
   id: "9be7da8d-13-14",
   sourceRevision: CORRECTED_HANDOVER_SOURCE_REVISION,
-  schema: CORRECTED_PROPOSAL_SCHEMA,
+  schema: PREDECESSOR_PROPOSAL_SCHEMA,
   currentVersion: CORRECTED_CURRENT_VERSION,
   nextVersion: CORRECTED_NEXT_VERSION,
-  requiresPredecessor: true,
+  predecessorFamily: LEGACY_FAMILY,
+  predecessorStates: Object.freeze(["rollback", "advance"]),
 });
+const FOLLOW_UP_FAMILY = Object.freeze({
+  id: "dcf2d6ca-15-16",
+  sourceRevision: FOLLOW_UP_HANDOVER_SOURCE_REVISION,
+  schema: PREDECESSOR_PROPOSAL_SCHEMA,
+  currentVersion: FOLLOW_UP_CURRENT_VERSION,
+  nextVersion: FOLLOW_UP_NEXT_VERSION,
+  // The corrected .14 advance is the only allowed remote predecessor. A
+  // completed corrected rollback leaves .13 in the feed and cannot start this
+  // family.
+  predecessorFamily: CORRECTED_FAMILY,
+  predecessorStates: Object.freeze(["advance"]),
+});
+const FAMILIES = Object.freeze([LEGACY_FAMILY, CORRECTED_FAMILY, FOLLOW_UP_FAMILY]);
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024;
 const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -150,26 +170,29 @@ async function candidate(root, input, target, kind, family) {
 }
 
 function proposalFamily(proposal) {
-  if (proposal?.schema === LEGACY_FAMILY.schema && proposal?.sourceRevision === LEGACY_FAMILY.sourceRevision) return LEGACY_FAMILY;
-  if (proposal?.schema === CORRECTED_FAMILY.schema && proposal?.sourceRevision === CORRECTED_FAMILY.sourceRevision) return CORRECTED_FAMILY;
+  const family = FAMILIES.find((item) => (
+    proposal?.schema === item.schema && proposal?.sourceRevision === item.sourceRevision
+  ));
+  if (family !== undefined) return family;
   fail("proposal is not an accepted closed candidate family");
 }
 
-async function predecessorForCorrectedFamily(root, predecessor) {
+async function predecessorForFamily(root, predecessor, family) {
+  const predecessorFamily = family.predecessorFamily;
   if (!exactKeys(predecessor, ["state", "proposal", "publicationReceipt"])
-      || !["rollback", "advance"].includes(predecessor.state)
+      || predecessorFamily === null || !family.predecessorStates.includes(predecessor.state)
       || !exactKeys(predecessor.proposal, ["localPath", "sha256"])
       || !exactKeys(predecessor.publicationReceipt, ["localPath", "sha256"])
       || !safeHash(predecessor.proposal.sha256) || !safeHash(predecessor.publicationReceipt.sha256)) {
-    fail("corrected predecessor proof is invalid", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID");
+    fail("bound predecessor proof is invalid", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID");
   }
   const proposalBytes = await bytesAt(root, predecessor.proposal.localPath, MAX_MANIFEST_BYTES, "predecessor proposal");
   if (proposalBytes.sha256 !== predecessor.proposal.sha256) fail("predecessor proposal changed after binding", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID");
-  let legacyProposal;
-  try { legacyProposal = JSON.parse(proposalBytes.bytes.toString("utf8")); } catch { fail("predecessor proposal is invalid", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID"); }
-  let legacy;
+  let predecessorProposal;
+  try { predecessorProposal = JSON.parse(proposalBytes.bytes.toString("utf8")); } catch { fail("predecessor proposal is invalid", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID"); }
+  let validatedPredecessor;
   try {
-    legacy = await validateProposal(root, legacyProposal, LEGACY_FAMILY);
+    validatedPredecessor = await validateProposal(root, predecessorProposal, predecessorFamily);
   } catch {
     fail("predecessor proposal is outside the closed history", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID");
   }
@@ -178,15 +201,15 @@ async function predecessorForCorrectedFamily(root, predecessor) {
   let receipt;
   try { receipt = JSON.parse(receiptBytes.bytes.toString("utf8")); } catch { fail("predecessor publication receipt is invalid", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID"); }
   const expected = predecessor.state === "rollback"
-    ? Object.fromEntries(TARGETS.map((target) => [target, legacy.targets[target].current.manifest]))
-    : Object.fromEntries(TARGETS.map((target) => [target, legacy.targets[target].next.manifest]));
+    ? Object.fromEntries(TARGETS.map((target) => [target, validatedPredecessor.targets[target].current.manifest]))
+    : Object.fromEntries(TARGETS.map((target) => [target, validatedPredecessor.targets[target].next.manifest]));
   const expectedImmutableKeys = Object.fromEntries(TARGETS.map((target) => [target,
-    (predecessor.state === "rollback" ? legacy.targets[target].current.objects : legacy.targets[target].next.objects)
+    (predecessor.state === "rollback" ? validatedPredecessor.targets[target].current.objects : validatedPredecessor.targets[target].next.objects)
       .map((object) => object.objectKey),
   ]));
   if (!exactKeys(receipt, ["schema", "sourceRevision", "stage", "bucket", "status", "mutation", "targets"])
       || receipt.schema !== "tibotattle-electron-handover-feed-publication-receipt-v1"
-      || receipt.sourceRevision !== LEGACY_FAMILY.sourceRevision || receipt.stage !== predecessor.state
+      || receipt.sourceRevision !== predecessorFamily.sourceRevision || receipt.stage !== predecessor.state
       || receipt.status !== "completed" || receipt.bucket !== DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket
       || receipt.mutation !== "wrangler-unconditional-put-with-exclusive-control-pre-post-readback"
       || !plain(receipt.targets) || Reflect.ownKeys(receipt.targets).length !== TARGETS.length) {
@@ -204,14 +227,16 @@ async function predecessorForCorrectedFamily(root, predecessor) {
 }
 
 async function validateProposal(root, proposal, family = proposalFamily(proposal)) {
-  const expectedKeys = family.requiresPredecessor
+  const expectedKeys = family.predecessorFamily !== null
     ? ["schema", "disposition", "sourceRevision", "r2Bucket", "publicOrigin", "feedPrefix", "channel", "privacy", "predecessor", "initialPublication", "feedAdvance", "rollback", "stableMustRemainUntouched"]
     : ["schema", "disposition", "sourceRevision", "r2Bucket", "publicOrigin", "feedPrefix", "channel", "privacy", "initialPublication", "feedAdvance", "rollback", "stableMustRemainUntouched"];
   if (!exactKeys(proposal, expectedKeys) || proposal.schema !== family.schema || proposal.disposition !== "proposal-only-no-network-write"
       || proposal.sourceRevision !== family.sourceRevision || proposal.r2Bucket !== DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket
       || proposal.publicOrigin !== "https://updates.tibotattle.com" || proposal.feedPrefix !== HANDOVER_PREFIX || proposal.channel !== HANDOVER_CHANNEL
       || !Array.isArray(proposal.stableMustRemainUntouched) || proposal.stableMustRemainUntouched.join("|") !== "electron/stable/**|appcast.xml|intel/appcast.xml|preview/**") fail("proposal is outside the closed rehearsal policy");
-  const predecessor = family.requiresPredecessor ? await predecessorForCorrectedFamily(root, proposal.predecessor) : null;
+  const predecessor = family.predecessorFamily !== null
+    ? await predecessorForFamily(root, proposal.predecessor, family)
+    : null;
   const resolved = {};
   for (const target of TARGETS) {
     const current = await candidate(root, proposal.initialPublication?.[target], target, "current", family);
@@ -338,13 +363,14 @@ export async function publishElectronHandoverRehearsalFeed({ artifactRoot, propo
       const currentFeed = await remoteObject({ bucket: validated.bucket, key: item.current.manifest.objectKey, maximumBytes: MAX_MANIFEST_BYTES, runWrangler, temporaryRoot });
       if (stage === "initial") {
         let initialAlreadyCurrent = false;
-        const initialExpected = validated.family.requiresPredecessor
+        const requiresPredecessor = validated.family.predecessorFamily !== null;
+        const initialExpected = requiresPredecessor
           ? item.predecessor
           : currentFeed === null ? null : item.current.manifest;
-        if (validated.family.requiresPredecessor) {
+        if (requiresPredecessor) {
           const predecessorMatches = sameBytes(currentFeed?.bytes ?? null, initialExpected.bytes);
           const currentMatches = sameBytes(currentFeed?.bytes ?? null, item.current.manifest.bytes);
-          if (!predecessorMatches && !currentMatches) fail(`existing feed is not the bound predecessor or corrected current candidate: ${target}`, "ELECTRON_HANDOVER_FEED_FEED_CONFLICT");
+          if (!predecessorMatches && !currentMatches) fail(`existing feed is not the bound predecessor or family current candidate: ${target}`, "ELECTRON_HANDOVER_FEED_FEED_CONFLICT");
           initialAlreadyCurrent = currentMatches;
         } else if (currentFeed !== null && !sameBytes(currentFeed.bytes, initialExpected.bytes)) {
           fail(`existing feed is not the known current candidate: ${target}`, "ELECTRON_HANDOVER_FEED_FEED_CONFLICT");
@@ -354,7 +380,7 @@ export async function publishElectronHandoverRehearsalFeed({ artifactRoot, propo
         for (const object of item.current.objects) await ensureImmutable({ bucket: validated.bucket, object, runWrangler, temporaryRoot });
         journal.targets[target].phase = "assets_readback_passed";
         await persistReceiptJournal(journalPath, journal);
-        if ((validated.family.requiresPredecessor && !initialAlreadyCurrent) || currentFeed === null) await writeFeed({ bucket: validated.bucket, expected: initialExpected?.bytes ?? null, next: item.current.manifest, runWrangler, temporaryRoot });
+        if ((requiresPredecessor && !initialAlreadyCurrent) || currentFeed === null) await writeFeed({ bucket: validated.bucket, expected: initialExpected?.bytes ?? null, next: item.current.manifest, runWrangler, temporaryRoot });
         const verified = await remoteObject({ bucket: validated.bucket, key: item.current.manifest.objectKey, maximumBytes: MAX_MANIFEST_BYTES, runWrangler, temporaryRoot });
         if (!sameBytes(verified?.bytes ?? null, item.current.manifest.bytes)) fail(`existing initial feed differs after asset work: ${target}`, "ELECTRON_HANDOVER_FEED_READBACK_FAILED");
       } else if (stage === "advance") {

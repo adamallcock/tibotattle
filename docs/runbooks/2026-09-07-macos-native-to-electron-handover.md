@@ -296,6 +296,14 @@ unchanged. Both families refuse arbitrary versions, source revisions, feed
 paths and unknown remote bytes. Immutable archives are verified before a feed
 is replaced, and a new journal records each attempt.
 
+The follow-up source family `dcf2d6ca` accepts exactly `.15` and `.16`.
+It uses the same predecessor proposal shape and permits only the corrected
+family's completed `.14` advance as its predecessor. The static lineage
+validator checks both predecessor proposals and their completed receipts.
+Initial publication moves exact `.14` bytes to `.15`; an already verified
+`.15` target is a safe retry. Advance and rollback operate only between `.15`
+and `.16`. Historical archives and stable feed paths remain untouched.
+
 The rehearsal namespace is isolated from stable paths, but it is not evidence
 that `updates.tibotattle.com` is access-controlled. Confirm the route and R2
 ACL separately before treating a rehearsal asset as private. Never use the
