@@ -16,7 +16,58 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-08 (supersedes the historical entries below):
 
-Latest continuation checkpoint (Mac fix `1a9e8913`; Windows publication fix `102a3dbe`):
+Latest continuation checkpoint (integrated source `153e2c55`; signed Mac fixture `1a9e8913`):
+
+- Full Mac installed rehearsal r8 now proves native state migration through
+  `prepared`, `backed_up` and `completed`, with the new candidate-bound journal
+  and completion marker verified through the product API. The signed `.9` app
+  then displayed startup recovery: `companion_exit_before_ready`. A synthetic
+  profile reproduces the cause: the packaged handover prerelease version is
+  rejected by the companion's stable-only release metadata reader before the
+  server starts. Repair `c938a654` keeps the canonical source version separate from the
+  private app version and validates the closed handover metadata. The integrated
+  package suite passes 20/20, including both staged current/next server starts
+  and malformed metadata rejection. Root also ran the ordinary staged server
+  entrypoint under Electron 43.2.0-as-Node: ready line, local health HTTP 200 and
+  clean shutdown all pass with synthetic state. Frozen `source-c938a654` is
+  preparing corrected `.11`/`.12` fixtures; `.11` arm64 signing/notarization is
+  running. This does not yet prove the corrected signed/installed Mac runtime. The unresponsive recovery actions are repaired at `7a90c6be`: the guard
+  now checks the actual main-frame identity instead of assuming routing ID zero.
+  Actual Electron 43.2.0 supplied ID one; the identical synthetic click was
+  rejected before and accepted after the repair. All 29 focused recovery and
+  diagnostics tests pass; a fresh signed app still needs this repair.
+- Native 0.1.18 build 1026 is restored and rendered. Its source state matched
+  the stopped r8 backup before relaunch; the completed Electron journal and
+  failed signed app remain preserved. Refreshed native Settings confirms its
+  login-item switch remains off, matching the pre-rehearsal observation. A later
+  cutover must account for native observations recorded after this rollback;
+  the completed Electron copy must not be assumed to contain them.
+- Historical r1/r3/r4 stopped-state copies have been replaced by independently
+  verified private archives after complete source byte and metadata comparisons.
+  Explicit `tar --fflags -p` restore behavior was tested; recovery pointers and
+  a completed replacement journal are retained. Latest r6/r7/r8 backups remain.
+  The operator recovery tool's old numeric journal-schema fixture was corrected
+  in v2 to use the real exported named schema; all 10 synthetic recovery tests
+  pass. The old `.5` journal was archived by that guarded workflow, never reset
+  or substituted for the completed `.9` journal.
+
+- Windows normal packaged qualification **passes** at `153e2c55` in
+  [34297534989](https://github.com/adamallcock/tibotattle/actions/runs/34297534989):
+  dashboard rendering, refresh terminal `succeeded`, settings after restart,
+  persistent opt-out, loopback journey, outbound firewall and owned cleanup all
+  verify. The receipt is preserved under ignored `windows-normal-153e2c55`,
+  SHA-256 `76b5b02c51f890d7e6d73cffc67aa0ae5d5ab5eb4176abd0e532b86c6049e004`.
+  This supersedes the Windows blockers described below. Candidate-only scope
+  and `productionReady=false` remain. All six jobs in the same-source run
+  subsequently passed: four development package targets, Windows normal journey
+  and Windows NSIS installed lifecycle. Linux runtime also passes at this source;
+  its preserved receipt SHA-256 is
+  `5763cc752ba6d0b4d969bc30b138db02d845b26cab4415847106cc876a64e149`.
+  The NSIS receipt is preserved under ignored `windows-nsis-153e2c55`,
+  SHA-256 `d6ad6adb7e5ea83aba84be0f24692f7fbe32da890e1af574375e57336503fdf6`.
+  It is unsigned development evidence: its persistent-application-credential
+  and full-owned-descendant-cleanup fields remain explicitly false. A passing
+  installed lifecycle is not proof for those stronger claims or signed release.
 
 - Live GitHub verification confirms current `main` is `dffe64d6` (native tray
   PR #112), and it is an ancestor of this candidate. Electron tray PR #113
@@ -79,7 +130,7 @@ Latest continuation checkpoint (Mac fix `1a9e8913`; Windows publication fix `102
   app emits `#general`, while the harness rejects every nonempty hash. Repair `fdd7ebde` selects the exact expected
   route without changing the app route or weakening origin/path checks. Its
   receipt also retains completed dashboard/refresh evidence when a later
-  settings step fails. Native qualification of this repair remains next. The earlier full `34290262917` NSIS installed
+  settings step fails. Its native qualification subsequently passes as recorded above. The earlier full `34290262917` NSIS installed
   lifecycle subsequently passed.
 - Corrected Mac `.5` arm64/x64 and `.6` arm64 from frozen `ba1e7cba` have complete
   signing, notarization and artifact receipts. `.6` x64 subsequently completed;
