@@ -26,17 +26,20 @@ import {
 import {
   buildWindowsNormalCandidateFirewallCreateArguments,
   buildWindowsNormalCandidateFirewallRemoveArguments,
+  buildWindowsNormalCandidateStartupNativeProbeArguments,
   createWindowsNormalCandidateQuitProtocol,
   createWindowsNormalCandidateStartupStderrObserver,
   classifyWindowsNormalCandidateStartupCdpChild,
   installOutboundFirewallBlock,
   inspectWindowsNormalCandidateCdpEndpoint,
+  inspectWindowsNormalCandidateStartupNativeDiagnostic,
   jsonFetch,
   launchAndRenderCandidate,
   localNetworkObserver,
   inspectWindowsNormalCandidateStartupRefreshCompletion,
   normalizeStartupCompletionDiagnostic,
   normalizeStartupCdpDiagnostic,
+  normalizeStartupCdpNativeDiagnostic,
   normalizeStartupFailureDiagnostic,
   normalizeStartupPhase,
   removeOutboundFirewallBlock,
@@ -96,6 +99,181 @@ test("CDP startup diagnostics retain only fixed child, endpoint, and entry-marke
   ]) {
     assert.equal(normalizeStartupCdpDiagnostic(changed), null);
   }
+});
+
+test("native CDP startup diagnostics retain only exact, coherent native categories", () => {
+  const value = {
+    rootIdentity: "matched",
+    listener: "owned",
+    desktop: "observed",
+    ownedWindow: "present",
+    dialog: "js_main_error",
+    dialogCause: "module_not_found",
+  };
+  assert.deepEqual(normalizeStartupCdpNativeDiagnostic(value), value);
+  for (const changed of [
+    null,
+    { ...value, raw: "private" },
+    { ...value, rootIdentity: "private" },
+    { ...value, listener: "127.0.0.1:9222" },
+    { ...value, dialogCause: "C:\\private" },
+    { ...value, rootIdentity: "absent" },
+    { ...value, desktop: "unobserved" },
+    { ...value, ownedWindow: "absent", dialog: "none", dialogCause: "module_not_found" },
+    { ...value, dialog: "other_owned_window", dialogCause: "native_load" },
+  ]) {
+    assert.equal(normalizeStartupCdpNativeDiagnostic(changed), null);
+  }
+  assert.deepEqual(normalizeStartupCdpNativeDiagnostic({
+    rootIdentity: "matched",
+    listener: "absent",
+    desktop: "unobserved",
+    ownedWindow: "unavailable",
+    dialog: "unavailable",
+    dialogCause: "unavailable",
+  }), {
+    rootIdentity: "matched",
+    listener: "absent",
+    desktop: "unobserved",
+    ownedWindow: "unavailable",
+    dialog: "unavailable",
+    dialogCause: "unavailable",
+  });
+});
+
+test("native startup probe is fixed, encoded, bounded, and never reads arbitrary window text", () => {
+  const args = buildWindowsNormalCandidateStartupNativeProbeArguments({
+    rootPid: 8123,
+    remoteDebuggingPort: 9222,
+  });
+  assert.deepEqual(args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+  const script = Buffer.from(args[4], "base64").toString("utf16le");
+  for (const value of [
+    "EnumDesktopWindows",
+    "OpenInputDesktop(0, $false, 0x41)",
+    "GetWindowThreadProcessId",
+    "ControlViewWalker",
+    "Current.ProcessId",
+    "Get-NetTCPConnection -State Listen",
+    "A JavaScript error occurred in the main process",
+    "ERR_MODULE_NOT_FOUND",
+    "Cannot find module ",
+    "ERR_DLOPEN_FAILED",
+    "ERR_UNKNOWN_FILE_EXTENSION",
+    "does not provide an export named",
+    "SyntaxError",
+  ]) assert.ok(script.includes(value), value);
+  assert.equal(script.includes("FindAll"), false);
+  assert.equal(script.includes("GetWindowText"), false);
+  assert.throws(() => buildWindowsNormalCandidateStartupNativeProbeArguments({
+    rootPid: 0,
+    remoteDebuggingPort: 9222,
+  }), { code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_ARGUMENT_INVALID" });
+});
+
+test("native startup inspection binds closed observations to one unchanged exact child", async () => {
+  const expected = {
+    rootIdentity: "matched",
+    listener: "owned",
+    desktop: "observed",
+    ownedWindow: "present",
+    dialog: "js_main_error",
+    dialogCause: "native_load",
+  };
+  const calls = [];
+  const inspection = await inspectWindowsNormalCandidateStartupNativeDiagnostic({
+    appPath: APP_PATH,
+    rootPid: 8123,
+    remoteDebuggingPort: 9222,
+    environment: { SystemRoot: String.raw`C:\Windows` },
+    readExactProcesses: async (options) => {
+      calls.push({ type: "exact", timeoutMs: options.timeoutMs });
+      return [{ pid: 8123, parentPid: 1, creation: "100" }];
+    },
+    runProgram: async (_command, args, options) => {
+      calls.push({ type: "probe", args, options });
+      return {
+        settled: true,
+        timedOut: false,
+        exitCode: 0,
+        stdout: JSON.stringify({
+          listener: "owned",
+          desktop: "observed",
+          ownedWindow: "present",
+          dialog: "js_main_error",
+          dialogCause: "native_load",
+        }),
+      };
+    },
+  });
+  assert.deepEqual(inspection, expected);
+  assert.deepEqual(calls.map((entry) => entry.type), ["exact", "probe", "exact"]);
+  assert.ok(calls.every((entry) => entry.type !== "exact" || entry.timeoutMs > 0 && entry.timeoutMs <= 10_000));
+  assert.deepEqual(calls[1].args.slice(0, 4), ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+  assert.ok(calls[1].options.timeoutMs > 0 && calls[1].options.timeoutMs <= 10_000);
+  assert.equal(calls[1].options.fixedProbePath, APP_PATH);
+  assert.equal(calls[1].options.fixedPowerShellUtilityModules, true);
+
+  let reads = 0;
+  const changed = await inspectWindowsNormalCandidateStartupNativeDiagnostic({
+    appPath: APP_PATH,
+    rootPid: 8123,
+    remoteDebuggingPort: 9222,
+    environment: { SystemRoot: String.raw`C:\Windows` },
+    readExactProcesses: async () => {
+      reads += 1;
+      return [{ pid: 8123, parentPid: 1, creation: reads === 1 ? "100" : "101" }];
+    },
+    runProgram: async () => ({
+      settled: true,
+      timedOut: false,
+      exitCode: 0,
+      stdout: JSON.stringify({
+        listener: "owned",
+        desktop: "observed",
+        ownedWindow: "present",
+        dialog: "js_main_error",
+        dialogCause: "native_load",
+      }),
+    }),
+  });
+  assert.deepEqual(changed, {
+    rootIdentity: "changed",
+    listener: "unavailable",
+    desktop: "unavailable",
+    ownedWindow: "unavailable",
+    dialog: "unavailable",
+    dialogCause: "unavailable",
+  });
+
+  const unexpectedField = await inspectWindowsNormalCandidateStartupNativeDiagnostic({
+    appPath: APP_PATH,
+    rootPid: 8123,
+    remoteDebuggingPort: 9222,
+    environment: { SystemRoot: String.raw`C:\Windows` },
+    readExactProcesses: async () => [{ pid: 8123, parentPid: 1, creation: "100" }],
+    runProgram: async () => ({
+      settled: true,
+      timedOut: false,
+      exitCode: 0,
+      stdout: JSON.stringify({
+        rootIdentity: "absent",
+        listener: "owned",
+        desktop: "observed",
+        ownedWindow: "present",
+        dialog: "js_main_error",
+        dialogCause: "native_load",
+      }),
+    }),
+  });
+  assert.deepEqual(unexpectedField, {
+    rootIdentity: "matched",
+    listener: "unavailable",
+    desktop: "unavailable",
+    ownedWindow: "unavailable",
+    dialog: "unavailable",
+    dialogCause: "unavailable",
+  });
 });
 
 test("CDP startup child classifier omits exit numbers and signal values", () => {
@@ -158,6 +336,15 @@ test("normal candidate snapshots the closed CDP diagnostic before owned cleanup"
   child.stderr = new EventEmitter();
   child.send = (_message, callback) => callback?.();
   let cleanupSnapshot = null;
+  let nativeSnapshot = null;
+  const nativeDiagnostic = {
+    rootIdentity: "matched",
+    listener: "absent",
+    desktop: "observed",
+    ownedWindow: "absent",
+    dialog: "none",
+    dialogCause: "none",
+  };
   try {
     await assert.rejects(launchAndRenderCandidate({
       appPath,
@@ -182,6 +369,10 @@ test("normal candidate snapshots the closed CDP diagnostic before owned cleanup"
       WebSocketConstructor: class { constructor() { throw new Error("private socket failure"); } },
       processProof: async () => [],
       processAbsence: async () => true,
+      inspectStartupNativeDiagnostic: async () => {
+        nativeSnapshot = { exitCode: child.exitCode, signalCode: child.signalCode };
+        return nativeDiagnostic;
+      },
       stopChild: async (ownedChild) => {
         cleanupSnapshot = { exitCode: ownedChild.exitCode, signalCode: ownedChild.signalCode };
         ownedChild.exitCode = 0;
@@ -195,8 +386,10 @@ test("normal candidate snapshots the closed CDP diagnostic before owned cleanup"
         endpoint: "version_available",
         entryMarker: "entry_failure_marked",
       });
+      assert.deepEqual(error.startupCdpNativeDiagnostic, nativeDiagnostic);
       return true;
     });
+    assert.deepEqual(nativeSnapshot, { exitCode: null, signalCode: null });
     assert.deepEqual(cleanupSnapshot, { exitCode: null, signalCode: null });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1785,6 +1978,14 @@ test("normal candidate runner retains the outbound block and profile when proces
     indexStatus: "missing",
     degradedContractUnmet: [],
   };
+  const startupCdpNativeDiagnostic = {
+    rootIdentity: "matched",
+    listener: "foreign",
+    desktop: "observed",
+    ownedWindow: "present",
+    dialog: "other_owned_window",
+    dialogCause: "none",
+  };
   let removedFirewall = false;
   let removedProfile = false;
   await assert.rejects(() => runWindowsNormalCandidateSmoke(smokeOptions(), {
@@ -1810,6 +2011,7 @@ test("normal candidate runner retains the outbound block and profile when proces
       throw Object.assign(new Error("dashboard"), {
         code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_DASHBOARD_UNAVAILABLE",
         startupDiagnostic,
+        startupCdpNativeDiagnostic,
         startupCompletionDiagnostic,
       });
     },
@@ -1828,6 +2030,7 @@ test("normal candidate runner retains the outbound block and profile when proces
   assert.equal(receipt.startupFailureCode, "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_DASHBOARD_UNAVAILABLE");
   assert.equal(receipt.startupPhase, "settings_target");
   assert.deepEqual(receipt.startupDiagnostic, startupDiagnostic);
+  assert.deepEqual(receipt.startupCdpNativeDiagnostic, startupCdpNativeDiagnostic);
   assert.deepEqual(receipt.startupCompletionDiagnostic, startupCompletionDiagnostic);
 });
 

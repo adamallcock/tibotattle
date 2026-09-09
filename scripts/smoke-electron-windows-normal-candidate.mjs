@@ -136,6 +136,10 @@ const OPERATION_TIMEOUT_MS = 20_000;
 // A one-shot diagnostic must not extend the existing startup acceptance
 // deadline. It only classifies the already-failed loopback endpoint.
 const STARTUP_CDP_DIAGNOSTIC_TIMEOUT_MS = 1_000;
+// This probe runs only after the ordinary 30-second CDP acceptance path has
+// already failed. It records fixed native observations before cleanup without
+// extending or relaxing that acceptance condition.
+const STARTUP_CDP_NATIVE_DIAGNOSTIC_TIMEOUT_MS = 10_000;
 const PROCESS_EXIT_TIMEOUT_MS = 15_000;
 const POWERSHELL_TIMEOUT_MS = 20_000;
 // Firewall setup/readback has an independent bounded preparation budget. The
@@ -183,6 +187,44 @@ const STARTUP_CDP_ENTRY_MARKER_STATES = new Set([
   "entry_failure_marked",
   "marker_absent",
   "stream_unavailable",
+]);
+const STARTUP_CDP_NATIVE_ROOT_IDENTITY_STATES = new Set([
+  "matched",
+  "absent",
+  "changed",
+  "unavailable",
+]);
+const STARTUP_CDP_NATIVE_LISTENER_STATES = new Set([
+  "owned",
+  "foreign",
+  "absent",
+  "unavailable",
+]);
+const STARTUP_CDP_NATIVE_DESKTOP_STATES = new Set([
+  "observed",
+  "unobserved",
+  "unavailable",
+]);
+const STARTUP_CDP_NATIVE_OWNED_WINDOW_STATES = new Set([
+  "present",
+  "absent",
+  "unavailable",
+]);
+const STARTUP_CDP_NATIVE_DIALOG_STATES = new Set([
+  "js_main_error",
+  "other_owned_window",
+  "none",
+  "unavailable",
+]);
+const STARTUP_CDP_NATIVE_DIALOG_CAUSE_STATES = new Set([
+  "module_not_found",
+  "native_load",
+  "unknown_file_extension",
+  "named_export",
+  "syntax_error",
+  "other",
+  "none",
+  "unavailable",
 ]);
 const PROTECTED_OPT_OUT_STAGES = new Set([
   "PROTECTED_OPT_OUT_ADAPTER_UNAVAILABLE",
@@ -1147,8 +1189,10 @@ async function readNormalCandidateExactProcesses({
   appPath,
   environment,
   runProgram = runWindowsNsisLifecycleProgram,
+  timeoutMs = POWERSHELL_TIMEOUT_MS,
 } = {}) {
-  if (!exactWindowsPath(appPath) || typeof runProgram !== "function") {
+  if (!exactWindowsPath(appPath) || typeof runProgram !== "function"
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
     fail("PROCESS_PROOF_UNAVAILABLE");
   }
   let result;
@@ -1159,7 +1203,7 @@ async function readNormalCandidateExactProcesses({
         executableName: WINDOWS_NORMAL_CANDIDATE_APP_NAME,
       }),
       {
-        timeoutMs: POWERSHELL_TIMEOUT_MS,
+        timeoutMs,
         captureOutput: true,
         environment,
         fixedProbePath: appPath,
@@ -1350,6 +1394,328 @@ function startupCdpDiagnostic({ child, endpoint, entryMarker }) {
     endpoint: STARTUP_CDP_ENDPOINT_STATES.has(endpoint) ? endpoint : "unavailable",
     entryMarker: STARTUP_CDP_ENTRY_MARKER_STATES.has(entryMarker) ? entryMarker : "stream_unavailable",
   }) ?? Object.freeze({ child: "unavailable", endpoint: "unavailable", entryMarker: "stream_unavailable" });
+}
+
+function unavailableStartupCdpNativeDiagnostic(rootIdentity = "unavailable") {
+  return Object.freeze({
+    rootIdentity: STARTUP_CDP_NATIVE_ROOT_IDENTITY_STATES.has(rootIdentity)
+      ? rootIdentity : "unavailable",
+    listener: "unavailable",
+    desktop: "unavailable",
+    ownedWindow: "unavailable",
+    dialog: "unavailable",
+    dialogCause: "unavailable",
+  });
+}
+
+/**
+ * Keep a failed normal-candidate launch receipt content-free while separating
+ * an owned Chromium listener from a native dialog that can block Electron
+ * before the application entry module runs. No window text, path, PID, port,
+ * or exception detail crosses this boundary.
+ */
+export function normalizeStartupCdpNativeDiagnostic(value) {
+  if (!exactObject(value) || Object.keys(value).length !== 6
+      || !STARTUP_CDP_NATIVE_ROOT_IDENTITY_STATES.has(value.rootIdentity)
+      || !STARTUP_CDP_NATIVE_LISTENER_STATES.has(value.listener)
+      || !STARTUP_CDP_NATIVE_DESKTOP_STATES.has(value.desktop)
+      || !STARTUP_CDP_NATIVE_OWNED_WINDOW_STATES.has(value.ownedWindow)
+      || !STARTUP_CDP_NATIVE_DIALOG_STATES.has(value.dialog)
+      || !STARTUP_CDP_NATIVE_DIALOG_CAUSE_STATES.has(value.dialogCause)) return null;
+  if (value.rootIdentity !== "matched"
+      && [value.listener, value.desktop, value.ownedWindow, value.dialog, value.dialogCause]
+        .some((entry) => entry !== "unavailable")) return null;
+  if (value.desktop !== "observed"
+      && [value.ownedWindow, value.dialog, value.dialogCause]
+        .some((entry) => entry !== "unavailable")) return null;
+  if (value.desktop === "observed" && value.ownedWindow === "absent"
+      && (value.dialog !== "none" || value.dialogCause !== "none")) return null;
+  if (value.desktop === "observed" && value.ownedWindow === "unavailable"
+      && (value.dialog !== "unavailable" || value.dialogCause !== "unavailable")) return null;
+  if (value.desktop === "observed" && value.ownedWindow === "present") {
+    if (value.dialog === "js_main_error"
+        && ["none", "unavailable"].includes(value.dialogCause)) return null;
+    if (value.dialog === "other_owned_window" && value.dialogCause !== "none") return null;
+    if (value.dialog === "unavailable" && value.dialogCause !== "unavailable") return null;
+    if (value.dialog === "none") return null;
+  }
+  return Object.freeze({
+    rootIdentity: value.rootIdentity,
+    listener: value.listener,
+    desktop: value.desktop,
+    ownedWindow: value.ownedWindow,
+    dialog: value.dialog,
+    dialogCause: value.dialogCause,
+  });
+}
+
+/**
+ * Build one fixed, encoded Windows PowerShell observation. Numeric launch
+ * values are validated before they enter this source-defined command; all
+ * native observations are reduced to the closed JSON shape above before the
+ * process writes stdout.
+ */
+export function buildWindowsNormalCandidateStartupNativeProbeArguments({
+  rootPid,
+  remoteDebuggingPort,
+} = {}) {
+  if (!Number.isSafeInteger(rootPid) || rootPid < 1 || rootPid > 0xffff_ffff
+      || !Number.isSafeInteger(remoteDebuggingPort)
+      || remoteDebuggingPort < 1 || remoteDebuggingPort > 65_535) {
+    fail("ARGUMENT_INVALID");
+  }
+  const script = String.raw`
+$ErrorActionPreference = 'Stop'
+$rootPid = [uint32]${rootPid}
+$debugPort = [uint16]${remoteDebuggingPort}
+$result = [ordered]@{
+  listener = 'unavailable'
+  desktop = 'unavailable'
+  ownedWindow = 'unavailable'
+  dialog = 'unavailable'
+  dialogCause = 'unavailable'
+}
+try {
+  Import-Module NetTCPIP -ErrorAction Stop
+  $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+    Where-Object { [int]$_.LocalPort -eq $debugPort -and [string]$_.LocalAddress -eq '127.0.0.1' })
+  if ($listeners.Count -eq 0) {
+    $result.listener = 'absent'
+  } elseif ($listeners.Count -eq 1 -and [uint32]$listeners[0].OwningProcess -eq $rootPid) {
+    $result.listener = 'owned'
+  } else {
+    $result.listener = 'foreign'
+  }
+} catch {}
+try {
+  Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class TiboTattleNormalCandidateStartupProbe {
+  public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+  [DllImport("user32.dll", SetLastError=true)] public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+  [DllImport("user32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool CloseDesktop(IntPtr desktop);
+  [DllImport("user32.dll", SetLastError=true)] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool EnumDesktopWindows(IntPtr desktop, EnumWindowsProc callback, IntPtr lParam);
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+  [DllImport("user32.dll")] [return: MarshalAs(UnmanagedType.Bool)] public static extern bool IsWindowVisible(IntPtr window);
+}
+'@ -ErrorAction Stop
+  # EnumDesktopWindows requires both DESKTOP_READOBJECTS and DESKTOP_ENUMERATE.
+  $desktop = [TiboTattleNormalCandidateStartupProbe]::OpenInputDesktop(0, $false, 0x41)
+  if ($desktop -eq [IntPtr]::Zero) {
+    $result.desktop = 'unobserved'
+  } else {
+    try {
+      $result.desktop = 'observed'
+      $script:ownedWindows = @()
+      $script:windowEnumerationComplete = $true
+      $callback = [TiboTattleNormalCandidateStartupProbe+EnumWindowsProc]{
+        param([IntPtr]$window, [IntPtr]$unused)
+        try {
+          [uint32]$owner = 0
+          [void][TiboTattleNormalCandidateStartupProbe]::GetWindowThreadProcessId($window, [ref]$owner)
+          if ($owner -eq $rootPid -and [TiboTattleNormalCandidateStartupProbe]::IsWindowVisible($window)) {
+            if ($script:ownedWindows.Count -ge 16) {
+              $script:windowEnumerationComplete = $false
+              return $false
+            }
+            $script:ownedWindows += ,$window
+          }
+          return $true
+        } catch {
+          $script:windowEnumerationComplete = $false
+          return $false
+        }
+      }
+      $enumerated = [TiboTattleNormalCandidateStartupProbe]::EnumDesktopWindows(
+        $desktop, $callback, [IntPtr]::Zero
+      )
+      if (-not $enumerated -and $script:windowEnumerationComplete) {
+        $script:windowEnumerationComplete = $false
+      }
+      if (-not $script:windowEnumerationComplete) {
+        $result.ownedWindow = 'unavailable'
+      } elseif ($script:ownedWindows.Count -eq 0) {
+        $result.ownedWindow = 'absent'
+        $result.dialog = 'none'
+        $result.dialogCause = 'none'
+      } else {
+        $result.ownedWindow = 'present'
+        $scanComplete = $true
+        $headingSeen = $false
+        $cause = $null
+        try {
+          Add-Type -AssemblyName UIAutomationClient -ErrorAction Stop
+          $walker = [Windows.Automation.TreeWalker]::ControlViewWalker
+          $nodeCount = 0
+          foreach ($handle in $script:ownedWindows) {
+            $element = [Windows.Automation.AutomationElement]::FromHandle($handle)
+            if ($null -eq $element) { throw [System.InvalidOperationException]::new() }
+            $queue = New-Object System.Collections.Queue
+            $queue.Enqueue([pscustomobject]@{ Element = $element; Depth = 0 })
+            while ($queue.Count -gt 0) {
+              $node = $queue.Dequeue()
+              $nodeCount += 1
+              if ($nodeCount -gt 128) { $scanComplete = $false; break }
+              [uint32]$providerProcessId = $node.Element.Current.ProcessId
+              if ($providerProcessId -ne $rootPid) { throw [System.InvalidOperationException]::new() }
+              $name = [string]$node.Element.Current.Name
+              if ([string]::Equals($name, 'A JavaScript error occurred in the main process', [System.StringComparison]::Ordinal)) {
+                $headingSeen = $true
+              }
+              if ($null -eq $cause) {
+                if ($name.IndexOf('ERR_MODULE_NOT_FOUND', [System.StringComparison]::Ordinal) -ge 0 -or
+                    $name.IndexOf('Cannot find module ', [System.StringComparison]::Ordinal) -ge 0 -or
+                    $name.IndexOf('Cannot find package ', [System.StringComparison]::Ordinal) -ge 0) { $cause = 'module_not_found' }
+                elseif ($name.IndexOf('ERR_DLOPEN_FAILED', [System.StringComparison]::Ordinal) -ge 0) { $cause = 'native_load' }
+                elseif ($name.IndexOf('ERR_UNKNOWN_FILE_EXTENSION', [System.StringComparison]::Ordinal) -ge 0) { $cause = 'unknown_file_extension' }
+                elseif ($name.IndexOf('does not provide an export named', [System.StringComparison]::Ordinal) -ge 0) { $cause = 'named_export' }
+                elseif ($name.IndexOf('SyntaxError', [System.StringComparison]::Ordinal) -ge 0) { $cause = 'syntax_error' }
+              }
+              $child = $walker.GetFirstChild($node.Element)
+              if ($null -ne $child) {
+                if ($node.Depth -ge 8) { $scanComplete = $false; break }
+                while ($null -ne $child) {
+                  if (($nodeCount + $queue.Count) -ge 128) { $scanComplete = $false; break }
+                  $queue.Enqueue([pscustomobject]@{ Element = $child; Depth = ($node.Depth + 1) })
+                  $child = $walker.GetNextSibling($child)
+                }
+              }
+              if (-not $scanComplete) { break }
+            }
+            if (-not $scanComplete) { break }
+          }
+        } catch {
+          $scanComplete = $false
+        }
+        if (-not $scanComplete) {
+          $result.dialog = 'unavailable'
+          $result.dialogCause = 'unavailable'
+        } elseif ($headingSeen) {
+          $result.dialog = 'js_main_error'
+          if ($null -eq $cause) { $result.dialogCause = 'other' } else { $result.dialogCause = $cause }
+        } else {
+          $result.dialog = 'other_owned_window'
+          $result.dialogCause = 'none'
+        }
+      }
+    } finally {
+      [void][TiboTattleNormalCandidateStartupProbe]::CloseDesktop($desktop)
+    }
+  }
+} catch {}
+[Console]::Out.Write((ConvertTo-Json -InputObject ([pscustomobject]$result) -Compress -Depth 2))
+`;
+
+  return Object.freeze([
+    "-NoLogo",
+    "-NoProfile",
+    "-NonInteractive",
+    "-EncodedCommand",
+    Buffer.from(script, "utf16le").toString("base64"),
+  ]);
+}
+
+function sameNormalCandidateProcessIdentity(entries, rootPid, creation) {
+  return Array.isArray(entries) && entries.some((entry) => entry?.pid === rootPid
+    && entry?.creation === creation);
+}
+
+/**
+ * Inspect the exact pre-cleanup root only after the ordinary CDP acceptance
+ * path has failed. The exact-path/creation query wraps both native calls so a
+ * recycled PID or an unrelated window cannot become receipt evidence.
+ */
+export async function inspectWindowsNormalCandidateStartupNativeDiagnostic({
+  appPath,
+  rootPid,
+  remoteDebuggingPort,
+  environment,
+  readExactProcesses = readNormalCandidateExactProcesses,
+  runProgram = runWindowsNsisLifecycleProgram,
+} = {}) {
+  if (!exactWindowsPath(appPath) || !Number.isSafeInteger(rootPid) || rootPid < 1
+      || rootPid > 0xffff_ffff
+      || !Number.isSafeInteger(remoteDebuggingPort) || remoteDebuggingPort < 1
+      || remoteDebuggingPort > 65_535 || typeof readExactProcesses !== "function"
+      || typeof runProgram !== "function") {
+    return unavailableStartupCdpNativeDiagnostic();
+  }
+  const deadline = Date.now() + STARTUP_CDP_NATIVE_DIAGNOSTIC_TIMEOUT_MS;
+  const remainingBudget = () => Math.max(0, deadline - Date.now());
+  const readBeforeDeadline = async () => {
+    const timeoutMs = remainingBudget();
+    if (timeoutMs < 1) throw new Error("native diagnostic budget elapsed");
+    return readExactProcesses({ appPath, environment, runProgram, timeoutMs });
+  };
+  let before;
+  try {
+    before = await readBeforeDeadline();
+  } catch {
+    return unavailableStartupCdpNativeDiagnostic();
+  }
+  if (!Array.isArray(before)) return unavailableStartupCdpNativeDiagnostic();
+  const root = before.filter((entry) => entry?.pid === rootPid);
+  if (root.length === 0) return unavailableStartupCdpNativeDiagnostic("absent");
+  if (root.length !== 1) return unavailableStartupCdpNativeDiagnostic();
+  const creation = root[0].creation;
+  if (typeof creation !== "string" || creation.length === 0 || creation.length > 256) {
+    return unavailableStartupCdpNativeDiagnostic();
+  }
+  let result;
+  try {
+    const timeoutMs = remainingBudget();
+    if (timeoutMs < 1) throw new Error("native diagnostic budget elapsed");
+    result = await runProgram(
+      systemPowerShell(environment),
+      buildWindowsNormalCandidateStartupNativeProbeArguments({ rootPid, remoteDebuggingPort }),
+      {
+        timeoutMs,
+        captureOutput: true,
+        environment,
+        fixedProbePath: appPath,
+        fixedPowerShellUtilityModules: true,
+      },
+    );
+  } catch {
+    result = null;
+  }
+  let after;
+  try {
+    after = await readBeforeDeadline();
+  } catch {
+    return unavailableStartupCdpNativeDiagnostic();
+  }
+  if (!Array.isArray(after)) return unavailableStartupCdpNativeDiagnostic();
+  const sameIdentity = sameNormalCandidateProcessIdentity(after, rootPid, creation);
+  if (!sameIdentity) {
+    return unavailableStartupCdpNativeDiagnostic(after.some((entry) => entry?.pid === rootPid)
+      ? "changed" : "absent");
+  }
+  if (result?.settled !== true || result?.timedOut !== false || result?.exitCode !== 0
+      || typeof result.stdout !== "string" || result.stdout.length === 0
+      || result.stdout.length > MAXIMUM_PROGRAM_OUTPUT_BYTES) {
+    return unavailableStartupCdpNativeDiagnostic("matched");
+  }
+  try {
+    const parsed = JSON.parse(result.stdout);
+    const fields = ["listener", "desktop", "ownedWindow", "dialog", "dialogCause"];
+    if (!exactObject(parsed) || Object.keys(parsed).length !== fields.length
+        || !fields.every((field) => Object.hasOwn(parsed, field))) {
+      return unavailableStartupCdpNativeDiagnostic("matched");
+    }
+    return normalizeStartupCdpNativeDiagnostic({
+      rootIdentity: "matched",
+      listener: parsed.listener,
+      desktop: parsed.desktop,
+      ownedWindow: parsed.ownedWindow,
+      dialog: parsed.dialog,
+      dialogCause: parsed.dialogCause,
+    })
+      ?? unavailableStartupCdpNativeDiagnostic("matched");
+  } catch {
+    return unavailableStartupCdpNativeDiagnostic("matched");
+  }
 }
 
 /** Scan only the one exact, source-defined entry failure marker. The bounded
@@ -2652,6 +3018,7 @@ export async function launchAndRenderCandidate({
   processAbsence = assertCandidateProcessAbsence,
   stopChild = stopOwnedCandidate,
   processRunProgram = runWindowsNsisLifecycleProgram,
+  inspectStartupNativeDiagnostic = inspectWindowsNormalCandidateStartupNativeDiagnostic,
   createQuitProtocol = createWindowsNormalCandidateQuitProtocol,
 } = {}) {
   if (candidateState !== null && (typeof candidateState !== "object" || Array.isArray(candidateState))) {
@@ -2708,6 +3075,20 @@ export async function launchAndRenderCandidate({
             : stdoutObserver.state() === "stream_unavailable" && stderrObserver.state() === "stream_unavailable"
               ? "stream_unavailable" : "marker_absent",
         });
+        try {
+          error.startupCdpNativeDiagnostic = await inspectStartupNativeDiagnostic({
+            appPath,
+            rootPid: child.pid,
+            remoteDebuggingPort: port,
+            environment,
+            runProgram: processRunProgram,
+          });
+        } catch {
+          error.startupCdpNativeDiagnostic = unavailableStartupCdpNativeDiagnostic();
+        }
+        error.startupCdpNativeDiagnostic = normalizeStartupCdpNativeDiagnostic(
+          error.startupCdpNativeDiagnostic,
+        ) ?? unavailableStartupCdpNativeDiagnostic();
       }
       throw error;
     }
@@ -2856,6 +3237,7 @@ function candidateReceipt({
   cleanup = {},
   startupDiagnostic = null,
   startupCdpDiagnostic = null,
+  startupCdpNativeDiagnostic = null,
   startupCompletionDiagnostic = null,
   startupFailureCode = null,
   startupPhase = null,
@@ -2899,6 +3281,9 @@ function candidateReceipt({
     }),
     ...(normalizeStartupCdpDiagnostic(startupCdpDiagnostic) === null ? {} : {
       startupCdpDiagnostic: normalizeStartupCdpDiagnostic(startupCdpDiagnostic),
+    }),
+    ...(normalizeStartupCdpNativeDiagnostic(startupCdpNativeDiagnostic) === null ? {} : {
+      startupCdpNativeDiagnostic: normalizeStartupCdpNativeDiagnostic(startupCdpNativeDiagnostic),
     }),
     ...(normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic) === null ? {} : {
       startupCompletionDiagnostic: normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic),
@@ -2956,6 +3341,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
   let startupFailureCode = null;
   let startupDiagnostic = null;
   let startupCdpDetail = null;
+  let startupCdpNativeDetail = null;
   let startupCompletionDiagnostic = null;
   const cleanup = { firewallInstalled: false, firewallRemoved: false, profileRemoved: false };
   const candidateState = {
@@ -3020,6 +3406,9 @@ export async function runWindowsNormalCandidateSmoke(options, {
     startupFailureCode = normalizeStartupFailureCode(errorCode);
     startupDiagnostic = normalizeStartupFailureDiagnostic(error?.startupDiagnostic);
     startupCdpDetail = normalizeStartupCdpDiagnostic(error?.startupCdpDiagnostic);
+    startupCdpNativeDetail = normalizeStartupCdpNativeDiagnostic(
+      error?.startupCdpNativeDiagnostic,
+    );
     startupCompletionDiagnostic = normalizeStartupCompletionDiagnostic(
       error?.startupCompletionDiagnostic,
     );
@@ -3052,6 +3441,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
       cleanup,
       startupDiagnostic,
       startupCdpDiagnostic: startupCdpDetail,
+      startupCdpNativeDiagnostic: startupCdpNativeDetail,
       startupCompletionDiagnostic,
       startupFailureCode,
       startupPhase: candidateState.startupPhase,
