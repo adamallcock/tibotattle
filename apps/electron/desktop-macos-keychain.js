@@ -239,6 +239,7 @@ function sameFile(left, right) {
 export async function loadDesktopMacOSCredentialBackends({
   app,
   resourcesPath,
+  preflightBroker = true,
   platform = process.platform,
   architecture = process.arch,
   verifyApplication = verifySignedApplication,
@@ -246,6 +247,9 @@ export async function loadDesktopMacOSCredentialBackends({
   inspectFile = lstat,
   resolveRealPath = realpath,
 } = {}) {
+  if (preflightBroker !== true && preflightBroker !== false) {
+    throw failure("broker_unavailable");
+  }
   if (platform !== "darwin" || !["arm64", "x64"].includes(architecture)
       || app?.isPackaged !== true || typeof resourcesPath !== "string"
       || !isAbsolute(resourcesPath) || resourcesPath.includes("\0")
@@ -268,13 +272,18 @@ export async function loadDesktopMacOSCredentialBackends({
     const after = await inspectFile(binary);
     if (!safeBinary(after) || !sameFile(verified, after)) throw failure("broker_unavailable");
     const backends = createDesktopMacOSCredentialBackends({ binding });
-    let timer;
-    try {
-      await Promise.race([
-        backends.broker.preflight(),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(failure("broker_timeout")), TIMEOUT_MS); }),
-      ]);
-    } finally { clearTimeout(timer); }
+    // Accountless signed staging verifies this exact adapter before using its
+    // main-process installation capability, but does not need normal FD4
+    // broker service reads. Stable production keeps the default preflight.
+    if (preflightBroker) {
+      let timer;
+      try {
+        await Promise.race([
+          backends.broker.preflight(),
+          new Promise((_, reject) => { timer = setTimeout(() => reject(failure("broker_timeout")), TIMEOUT_MS); }),
+        ]);
+      } finally { clearTimeout(timer); }
+    }
     return backends;
   } catch (error) {
     if (["KEYCHAIN_LOCKED", "KEYCHAIN_DENIED", "KEYCHAIN_MIGRATION_REQUIRED", "broker_timeout"].includes(error?.code)) throw error;

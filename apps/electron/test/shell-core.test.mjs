@@ -564,6 +564,67 @@ class RuntimeChild extends FakeChild {
   }
 }
 
+const SIGNED_STAGING_SOURCE_REVISION = "d".repeat(40);
+
+function githubHostedMacOSArm64Environment(overrides = {}) {
+  return {
+    GITHUB_ACTIONS: "true",
+    RUNNER_ARCH: "ARM64",
+    RUNNER_ENVIRONMENT: "github-hosted",
+    RUNNER_OS: "macOS",
+    ...overrides,
+  };
+}
+
+async function createSignedStagingShellFixture(t) {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-signed-staging-shell-"));
+  const resourcesPath = join(root, "TiboTattle.app", "Contents", "Resources");
+  const appPath = join(resourcesPath, "app.asar");
+  const userData = join(root, "user-data");
+  const metadata = createAccountlessSignedStagingRehearsalMetadata({
+    expectedTestUID: 501,
+    expectedTestUsername: "ci-runner",
+    sourceRevision: SIGNED_STAGING_SOURCE_REVISION,
+  });
+  await Promise.all([
+    mkdir(appPath, { recursive: true }),
+    mkdir(userData, { recursive: true }),
+  ]);
+  await writeFile(join(appPath, "package.json"), `${JSON.stringify({
+    name: "tibotattle",
+    tibotattleAccountlessSignedStagingRehearsal: metadata,
+    version: "0.1.19",
+  })}\n`, "utf8");
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const app = new RuntimeApp();
+  app.isPackaged = true;
+  app.getAppPath = () => appPath;
+  app.getName = () => "TiboTattle";
+  app.getVersion = () => "0.1.19";
+  app.getPath = (name) => name === "userData" ? userData : join(root, name);
+  return { app, metadata, resourcesPath, root, userData };
+}
+
+function signedStagingElectronRuntime(app) {
+  return {
+    app,
+    BrowserWindow: RuntimeWindow,
+    Tray: FakeTray,
+    Menu: { buildFromTemplate: (template) => ({ template }) },
+    dialog: {
+      showMessageBox: async () => ({ response: 0 }),
+      showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
+    },
+    nativeImage: {
+      createFromPath: () => ({
+        isEmpty: () => false,
+        resize: () => ({ isEmpty: () => false, setTemplateImage() {} }),
+      }),
+    },
+  };
+}
+
 function runtimePlatformServices() {
   return {
     defaultCodexHome: "/Users/adam/.codex",
@@ -3930,6 +3991,148 @@ test("Electron entry still quits when its fixed diagnostic cannot be written", a
     electronEntryCompositionFailure,
   );
   assert.equal(app.quitCalls, 1);
+});
+
+test("signed staging rejects a wrong operating account and hostile test lane before native factory creation", async (t) => {
+  for (const [name, environment, getUserInfo] of [
+    ["wrong account", githubHostedMacOSArm64Environment({
+      HOME: "/host/home",
+      PATH: "/usr/bin:/bin",
+    }), () => ({ uid: 501, username: "builder" })],
+    ["inherited test lane", githubHostedMacOSArm64Environment({
+      HOME: "/host/home",
+      PATH: "/usr/bin:/bin",
+      USAGE_MONITOR_TEST_LANE: "hostile-lane",
+    }), () => ({ uid: 501, username: "ci-runner" })],
+  ]) {
+    const fixture = await createSignedStagingShellFixture(t);
+    let nativeFactoryCalls = 0;
+    await assert.rejects(launchElectronShell({
+      electron: { app: fixture.app },
+      environment,
+      platform: "darwin",
+      architecture: "arm64",
+      getuid: () => 501,
+      getUserInfo,
+      createMacCredentialHandover() {
+        nativeFactoryCalls += 1;
+        return assert.fail("rejected signed staging must not create a native handover");
+      },
+    }), errorCode("electron_configuration_invalid"), name);
+    assert.equal(nativeFactoryCalls, 0, name);
+    assert.equal(fixture.app.readyCalls, 0, name);
+  }
+});
+
+test("signed staging composes only the accountless native adapter and scrubs hostile child authority", async (t) => {
+  RuntimeWindow.instances = [];
+  const fixture = await createSignedStagingShellFixture(t);
+  const child = new RuntimeChild();
+  const spawnCalls = [];
+  let factoryOptions = null;
+  let handoverCalls = 0;
+  let brokerCalls = 0;
+  let accountlessFactoryCalls = 0;
+  const nativeBackend = Object.freeze({
+    read: async () => null,
+    createIfMissing: async () => "created",
+    deleteExact: async () => "missing",
+  });
+  const environment = githubHostedMacOSArm64Environment({
+    CODEX_HOME: "/host/.codex",
+    HOME: "/host/home",
+    NODE_OPTIONS: "--require=/host/unsafe.js",
+    PATH: "/usr/bin:/bin",
+    USAGE_MONITOR_CENTRAL_ORIGIN: "https://hostile.example",
+    USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE: "/host/queue",
+    USAGE_MONITOR_KEYCHAIN_BROKER_FD: "99",
+    USAGE_MONITOR_PREPARED_DIRECTORY: "/host/prepared",
+    USERPROFILE: "/host/profile",
+  });
+  const launch = launchElectronShell({
+    electron: signedStagingElectronRuntime(fixture.app),
+    environment,
+    platform: "darwin",
+    architecture: "arm64",
+    getuid: () => 501,
+    getUserInfo: () => ({ uid: 501, username: "ci-runner" }),
+    resourcesPath: fixture.resourcesPath,
+    createMacCredentialHandover(options) {
+      factoryOptions = options;
+      return {
+        async prepareNativeHandover({ homeDirectory }) {
+          handoverCalls += 1;
+          assert.equal(homeDirectory, join(
+            fixture.userData,
+            "accountless-signed-staging-rehearsal-v1",
+            "synthetic-home",
+          ));
+          return { status: "no_legacy_state" };
+        },
+        attachCredentialBroker() {
+          brokerCalls += 1;
+          throw new Error("signed staging must not compose FD4");
+        },
+        createAccountlessCredentialBackend({ legacyCredentialProbe }) {
+          accountlessFactoryCalls += 1;
+          assert.equal(typeof legacyCredentialProbe, "function");
+          return nativeBackend;
+        },
+      };
+    },
+    supervisorOptions: {
+      spawnChild(_command, _args, options) {
+        spawnCalls.push(options);
+        queueMicrotask(() => {
+          child.stdout.emit("data", Buffer.from("USAGE_MONITOR_READY http://127.0.0.1:4941/\n"));
+        });
+        return child;
+      },
+      startupTimeoutMs: 1_000,
+      shutdownTimeoutMs: 1_000,
+    },
+  });
+  const lifecycle = await withTestTimeout(launch, "signed staging shell launch timed out");
+  assert.deepEqual(factoryOptions, {
+    app: fixture.app,
+    resourcesPath: fixture.resourcesPath,
+    credentialBrokerEnabled: false,
+  });
+  assert.equal(handoverCalls, 1);
+  assert.equal(accountlessFactoryCalls, 1);
+  assert.equal(brokerCalls, 0);
+  assert.equal(spawnCalls.length, 1);
+  assert.deepEqual(spawnCalls[0].stdio, ["ignore", "pipe", "pipe", "ipc"]);
+  const childEnvironment = spawnCalls[0].env;
+  assert.equal(childEnvironment.HOME, join(
+    fixture.userData,
+    "accountless-signed-staging-rehearsal-v1",
+    "synthetic-home",
+ ));
+  assert.equal(childEnvironment.CODEX_HOME, join(
+    fixture.userData,
+    "accountless-signed-staging-rehearsal-v1",
+    "synthetic-home",
+    ".codex",
+ ));
+  assert.equal(childEnvironment.USAGE_MONITOR_STATE_ROOT, join(
+    fixture.userData,
+    "accountless-signed-staging-rehearsal-v1",
+    "companion-state",
+ ));
+  assert.equal(childEnvironment.USAGE_MONITOR_ACCOUNTLESS_MODE, "rehearsal-v1");
+  assert.equal(childEnvironment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, fixture.metadata.origin);
+  for (const key of [
+    "NODE_OPTIONS",
+    "USAGE_MONITOR_CENTRAL_ORIGIN",
+    "USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE",
+    "USAGE_MONITOR_KEYCHAIN_BROKER_FD",
+    "USAGE_MONITOR_PREPARED_DIRECTORY",
+    "USAGE_MONITOR_TEST_LANE",
+  ]) assert.equal(childEnvironment[key], undefined, key);
+  const dispose = lifecycle.dispose();
+  child.emit("exit", 0, null);
+  await dispose;
 });
 
 test("packaged Electron composition keeps the companion in app.asar and uses physical Resources as cwd", async () => {

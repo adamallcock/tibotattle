@@ -321,6 +321,25 @@ test("verified adapter loading exposes a separate accountless factory without pr
     MACOS_KEYCHAIN_ADAPTER_STARTUP_PREFLIGHT_CAPABILITIES.length);
 });
 
+test("accountless-only loading verifies the signed adapter without reading normal broker services", async () => {
+  const f = bindingFixture();
+  const backends = await loadDesktopMacOSCredentialBackends({
+    app: { isPackaged: true, getAppPath: () => `${RESOURCES}/app.asar` },
+    resourcesPath: RESOURCES, platform: "darwin", architecture: "arm64",
+    preflightBroker: false,
+    inspectFile: async () => METADATA,
+    resolveRealPath: async (path) => path,
+    verifyApplication: async () => true,
+    requireBinding: () => f.binding,
+  });
+  assert.deepEqual(f.calls, []);
+  const accountless = backends.createAccountlessCredentialBackend({
+    legacyCredentialProbe: async () => "absent",
+  });
+  assert.equal(await accountless.createIfMissing(Buffer.alloc(32, 3)), "created");
+  assert.deepEqual(f.calls, [["createIfMissing", "accountless_installation"]]);
+});
+
 test("unsigned, replaced, linked, development and wrong-target candidates cannot load native code", async () => {
   const base = {
     app: { isPackaged: true, getAppPath: () => `${RESOURCES}/app.asar` },
@@ -388,6 +407,40 @@ test("production composition establishes credentials before touching the predece
   assert.deepEqual(await preparation, { status: "migrated" });
   bridge.attachCredentialBroker(stream).dispose();
   assert.equal(stream.destroyed, true);
+  assert.equal(bridge.createAccountlessCredentialBackend({
+    legacyCredentialProbe: async () => "absent",
+  }), accountless);
+});
+
+test("signed staging handover retains its accountless factory without an FD4 broker preflight", async () => {
+  const app = {};
+  const accountless = { read: async () => null, createIfMissing: async () => "created",
+    deleteExact: async () => "missing" };
+  let loaderOptions = null;
+  const bridge = createProductionMacCredentialHandover({
+    app,
+    resourcesPath: RESOURCES,
+    credentialBrokerEnabled: false,
+    async loadBackend(options) {
+      loaderOptions = options;
+      return {
+        broker: { get: async () => assert.fail("FD4 broker must remain dormant") },
+        createAccountlessCredentialBackend(options) {
+          assert.equal(typeof options.legacyCredentialProbe, "function");
+          return accountless;
+        },
+      };
+    },
+    async runHandover() {
+      return { status: "no_legacy_state" };
+    },
+  });
+
+  assert.deepEqual(await bridge.prepareNativeHandover({ homeDirectory: "/synthetic/home" }), {
+    status: "no_legacy_state",
+  });
+  assert.deepEqual(loaderOptions, { app, resourcesPath: RESOURCES, preflightBroker: false });
+  assert.throws(() => bridge.attachCredentialBroker({}));
   assert.equal(bridge.createAccountlessCredentialBackend({
     legacyCredentialProbe: async () => "absent",
   }), accountless);

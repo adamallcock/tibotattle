@@ -796,9 +796,13 @@ export function installWindowsSmokeControlForTest(lifecycle, {
 export function createProductionMacCredentialHandover({
   app,
   resourcesPath,
+  credentialBrokerEnabled = true,
   loadBackend = loadDesktopMacOSCredentialBackends,
   runHandover = runProductionNativeMacHandover,
 } = {}) {
+  if (credentialBrokerEnabled !== true && credentialBrokerEnabled !== false) {
+    throw new TypeError("credential broker selection is invalid");
+  }
   let brokerBackend = null;
   let createAccountlessCredentialBackend = null;
   return Object.freeze({
@@ -807,7 +811,11 @@ export function createProductionMacCredentialHandover({
       createAccountlessCredentialBackend = null;
       let selected;
       try {
-        selected = await loadBackend({ app, resourcesPath });
+        selected = await loadBackend({
+          app,
+          resourcesPath,
+          ...(credentialBrokerEnabled ? {} : { preflightBroker: false }),
+        });
       } catch (error) {
         if (MACOS_CREDENTIAL_PREFLIGHT_FAILURE_CODES.has(error?.code)) {
           return Object.freeze({ status: "credential_preflight_blocked" });
@@ -816,7 +824,7 @@ export function createProductionMacCredentialHandover({
       }
       const handover = await runHandover({ electronApp: app, resourcesPath, homeDirectory });
       if (["no_legacy_state", "migrated", "already_migrated"].includes(handover?.status)) {
-        brokerBackend = selected?.broker ?? selected;
+        brokerBackend = credentialBrokerEnabled ? selected?.broker ?? selected : null;
         createAccountlessCredentialBackend = typeof selected?.createAccountlessCredentialBackend === "function"
           ? selected.createAccountlessCredentialBackend.bind(selected)
           : null;
@@ -865,6 +873,8 @@ export async function launchElectronShell({
   resourceRoot,
   resourcesPath,
   environment = process.env,
+  platform = process.platform,
+  architecture = process.arch,
   supervisorOptions = {},
   lifecycleOptions = {},
   firstRunReceiptBackend,
@@ -873,6 +883,7 @@ export async function launchElectronShell({
   linuxQualificationContext = null,
   getuid = typeof process.getuid === "function" ? process.getuid.bind(process) : undefined,
   getUserInfo = userInfo,
+  createMacCredentialHandover = createProductionMacCredentialHandover,
   emitFailureDiagnostic = false,
   writeDiagnostic,
 } = {}) {
@@ -885,6 +896,8 @@ export async function launchElectronShell({
     const qualificationContext = await createWindowsElectronQualificationContext({
       app,
       environment,
+      platform,
+      architecture,
     });
     assertElectronQualificationLaunchOptions({
       qualificationContext,
@@ -900,9 +913,13 @@ export async function launchElectronShell({
     // Read and validate the packaged selection before constructing any
     // companion or platform service. Linux candidates require an exact stable
     // Linux/x64 selection; installed lifecycle evidence remains a separate gate.
-    const productionDistribution = await readProductionDistribution({ app });
-    const accountlessHostedRehearsal = await readAccountlessHostedRehearsal({ app });
-    const accountlessSignedStagingRehearsal = await readAccountlessSignedStagingRehearsal({ app });
+    const productionDistribution = await readProductionDistribution({ app, platform, architecture });
+    const accountlessHostedRehearsal = await readAccountlessHostedRehearsal({ app, platform, architecture });
+    const accountlessSignedStagingRehearsal = await readAccountlessSignedStagingRehearsal({
+      app,
+      platform,
+      architecture,
+    });
     if (accountlessSignedStagingRehearsal !== null
         && environment.USAGE_MONITOR_TEST_LANE !== undefined) {
       throw shellError("electron_configuration_invalid");
@@ -917,8 +934,8 @@ export async function launchElectronShell({
       getUserInfo,
     });
     assertElectronPlatformGate({
-      platform: process.platform,
-      architecture: process.arch,
+      platform,
+      architecture,
       environment,
       qualificationContext: qualificationContext ?? linuxQualificationContext,
       productionDistribution,
@@ -957,20 +974,24 @@ export async function launchElectronShell({
     // target against this process. Keep the fixed Linux handover dormant for
     // every development, rehearsal, test-lane, non-x64, and non-stable path.
     const linuxProductionCredentialHandover = accountlessProductionEnabled
-      && process.platform === "linux"
-      && process.arch === "x64"
+      && platform === "linux"
+      && architecture === "x64"
       && productionDistribution.target === "linux-x64"
       ? createLinuxProductionCredentialHandover() : null;
     const windowsNormalCandidateCredentialHandover = accountlessProductionEnabled
-      && process.platform === "win32"
-      && process.arch === "x64"
+      && platform === "win32"
+      && architecture === "x64"
       && productionDistribution.target === "win32-x64"
       ? createWindowsNormalCandidateCredentialHandover() : null;
+    // Signed staging retains the verified native handover and its main-process
+    // FD3 factory, but it never gives the companion the normal FD4 broker or
+    // reads normal broker services during startup.
     const macCredentialHandover = (productionEnabled || accountlessSignedStagingEnabled)
-      && process.platform === "darwin"
-      ? createProductionMacCredentialHandover({
+      && platform === "darwin"
+      ? createMacCredentialHandover({
         app,
         resourcesPath: packagedResourcesPath(app, packagedAppPath(app), resourcesPath),
+        credentialBrokerEnabled: productionEnabled,
       }) : null;
     const trayIconFactory = createDesktopTrayIconFactory({
       nativeImage: runtime.nativeImage,
@@ -989,7 +1010,7 @@ export async function launchElectronShell({
         preloadPath: resolve(MODULE_DIRECTORY, "preload.cjs"),
       },
       environment: {
-        ...companionEnvironment({ app, environment, qualificationContext }),
+        ...companionEnvironment({ app, environment, qualificationContext, platform }),
         USAGE_MONITOR_RESOURCE_ROOT: paths.resourceRoot,
       },
       supervisorOptions: {
@@ -1006,7 +1027,7 @@ export async function launchElectronShell({
           attachWindowsAccountObservationBroker:
             windowsNormalCandidateCredentialHandover.attachWindowsAccountObservationBroker,
         }),
-        ...(macCredentialHandover === null ? {} : {
+        ...(macCredentialHandover === null || !productionEnabled ? {} : {
           attachCredentialBroker: macCredentialHandover.attachCredentialBroker,
         }),
       },
@@ -1023,8 +1044,8 @@ export async function launchElectronShell({
       ownedDownloadsRegistry,
       notificationBackend,
       qualificationContext,
-      platform: process.platform,
-      architecture: process.arch,
+      platform,
+      architecture,
       productionDistribution: productionEnabled ? productionDistribution : undefined,
       prepareNativeHandover: macCredentialHandover?.prepareNativeHandover,
       accountlessProduction: accountlessProductionEnabled ? {
@@ -1058,6 +1079,7 @@ export async function launchElectronShell({
     });
     installWindowsSmokeControl(desktop.lifecycle, {
       environment,
+      platform,
       qualificationContext,
     });
     return desktop.lifecycle;
