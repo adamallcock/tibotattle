@@ -7,16 +7,16 @@ status: in-progress
 
 # Objective and current position
 
-Updated 2026-09-08. Deliver one primary Electron application for Apple Silicon
+Updated 2026-09-09. Deliver one primary Electron application for Apple Silicon
 Mac, Intel Mac, Windows x64 and Linux x64, with one shared product and release
 process. Provider support stays inside that app. The accepted
 [sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md) remains
 fresh-install automatic sharing, persistent opt-out, no sign-in, and three
 visible notices before activation for existing undecided installations.
 
-Current checkpoint, 2026-09-08 (supersedes the historical entries below):
+Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
-Latest continuation checkpoint (integrated source `bdfce5a3`; signed Mac source `c938a654`):
+Latest continuation checkpoint (bootstrap repair `f3bf7a53`; signed Mac source `c938a654`):
 
 - **Installed Mac launch, refresh and restart pass.** R8 completed the native
   migration; r9 launched signed `.11` from that completed profile after fresh,
@@ -34,16 +34,38 @@ Latest continuation checkpoint (integrated source `bdfce5a3`; signed Mac source 
   recalculation, then populated after refresh; all 20 continuity rows resolved,
   and all 15 auto-review rows had verified parent links. Actual tray-popup
   rendering is still open because the UI automation could not select the status
-  icon. Three health reads took 0.3–8.8 ms and one desktop-status read took
-  0.4 ms; these are spot samples, not the full responsiveness qualification.
+  icon. The exact installed `.11` then passed a 45-second active-refresh
+  responsiveness probe: 45 samples per endpoint, zero failures, health p95
+  0.68 ms (maximum 14.29 ms) and refresh-status p95 0.40 ms (maximum 0.45 ms),
+  with the original 250 ms p95 and 3,000 ms individual limits unchanged.
+  `active-status.json` retains every sample. This covers the observed active
+  phase, not every cold-start phase or a renderer latency bound. The restarted
+  app also completed its refresh in 151 seconds; its index skipped 8,659 of
+  8,666 sources, resumed seven and rescanned none. The remaining work was
+  generation-bound indexed-history accounting, not a full raw-log rescan.
 - **All four corrected private Mac archives are finalized.** Current `.11` and
   next `.12`, for arm64 and x64, are signed, notarized, stapled and independently
   hash-verified under `signed-handover-c938a654`. Their canonical source release
   remains 0.1.18. The exact signed companion starts, returns health HTTP 200 and
   exits cleanly on arm64 and on x64 under Rosetta. Rosetta is not physical Intel
   GUI qualification. No feed or public release was published; the signed
-  current-to-next update remains open.
-- **All six CI jobs pass** at `4b32c7e6` in
+  current-to-next update remains open. The isolated feed publisher is integrated
+  at `b6230274`; all five focused tests and a dry run binding the exact signed
+  archives pass. It requires exclusive operator control, journals each phase,
+  and verifies remote bytes; it does not claim atomic compare-and-swap. Approval
+  for publication and the installed update rehearsal has been requested.
+- **The latest CI is not green.** Run
+  [34306321483](https://github.com/adamallcock/tibotattle/actions/runs/34306321483)
+  at `a0cd02d0` passed Linux packaging and the Windows normal app journey, but
+  both Mac packaging jobs and Windows packaging failed; NSIS was skipped. The
+  production receipt-shape repair at `a77ddfd6` passes 40/40 focused tests. A
+  signed-staging bootstrap and injected-platform correction is committed at
+  `f3bf7a53`. Of 189 combined cases, 188 passed in the sandbox and the sole
+  loopback-listener failure passed in its full 16-case owning suite with
+  loopback access. The actual Electron product-entry ready-event probe passes
+  with explicit synthetic appData and a barrier before native handover.
+  These source regressions do not change the installed signed `c938a654`
+  app. The prior complete six-job pass was at `4b32c7e6` in
   [34303173582](https://github.com/adamallcock/tibotattle/actions/runs/34303173582):
   four development package targets, Windows normal app journey and Windows NSIS
   installed lifecycle. Linux runtime and Secret Service checks pass. These remain
@@ -57,18 +79,32 @@ Latest continuation checkpoint (integrated source `bdfce5a3`; signed Mac source 
   for a disposable OS account, not GitHub attestation. No signed fixture or
   packaged scheduler end-to-end result exists yet. The duplicate host-preflight
   CLI was excluded from integration. Automatic approval review rejected GitHub
-  receipt egress; no upload workflow or alternate transport was executed.
+  receipt egress; no upload workflow or alternate transport was executed. Before
+  signing this fixture, the actual-ready ordering issue was repaired at
+  `f3bf7a53` and verified through the real entry point; this does not qualify a
+  signed fixture or its packaged scheduler. The probe explicitly redirects
+  appData and blocks native work at the readiness promise.
 - Main advanced to `77317f9` through PR #114. A real three-way merge preserves
   branch-only Electron files but has 15 shared hosted/release conflicts; a
   separate reconciliation is underway. Both branches claim migration numbers
   0046–0048 for different schemas; deployed ledgers must determine a forward-only
-  reconciliation before any deployment. The native tray PR #112 and Electron
+  reconciliation before any deployment. Read-only ledgers confirm production
+  has canonical migrations through 0056 while staging has the earlier accountless
+  0046–0048. The legacy rebuild cannot safely be replayed on that staging schema.
+  The current plan preserves the old staging database as evidence and prepares
+  a replacement from one canonical forward sequence; no remote database or
+  binding has been changed. The native tray PR #112 and Electron
   tray PR #113 were already included. Do not claim parity with all of the new
   main revision until that reconciliation is validated.
 - Native 0.1.18 build 1026, its fresh stopped state and the completed Electron
   profile remain independently preserved. Native observations recorded after
   the earlier r8 rollback still require an explicit reconciliation check before
-  final cutover. Never restore an old journal over completed Electron state.
+  final cutover. The read-only r9 collector comparison confirms the same salt
+  but finds 11 `codex_quota_snapshot` rows missing from the current Electron
+  profile (matched by digest and multiplicity). The stopped native backup
+  retains all of them; append-only reconciliation is being rehearsed on private
+  copies. No live collector record has been changed. Never restore an old
+  journal over completed Electron state.
   The r9 rollback operator preserves newer Electron state as well as native
   state. Historical r1/r3/r4 archives retain verified bytes, metadata and tested
   `tar --fflags -p` recovery; newer backups remain.
