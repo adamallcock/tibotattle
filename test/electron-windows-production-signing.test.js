@@ -20,6 +20,10 @@ const RESOURCE_ENVIRONMENT = Object.freeze({
   TIBOTATTLE_ELECTRON_AZURE_CODE_SIGNING_ACCOUNT_NAME: "account",
   TIBOTATTLE_ELECTRON_AZURE_CERTIFICATE_PROFILE_NAME: "profile",
 });
+const WINDOWS_SIGNING_ENVIRONMENT = Object.freeze({
+  ...RESOURCE_ENVIRONMENT,
+  SystemRoot: "C:\\Windows",
+});
 
 async function withFixture(run) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-signing-"));
@@ -59,7 +63,8 @@ function successfulResult({ stdout = "" } = {}) {
   return { error: undefined, signal: null, status: 0, stdout };
 }
 
-function testDependencies({ calls = [], environment = RESOURCE_ENVIRONMENT } = {}) {
+function testDependencies({ calls = [], environment = WINDOWS_SIGNING_ENVIRONMENT,
+  azureCliResult = null } = {}) {
   return {
     architecture: "x64",
     builderCli: "C:\\reviewed\\electron-builder.cjs",
@@ -71,6 +76,9 @@ function testDependencies({ calls = [], environment = RESOURCE_ENVIRONMENT } = {
         captureOutput: options?.captureOutput === true });
       if (command === "git" && arguments_[0] === "rev-parse") {
         return successfulResult({ stdout: `${SOURCE_REVISION}\n` });
+      }
+      if (command === "C:\\Windows\\System32\\cmd.exe" && azureCliResult !== null) {
+        return azureCliResult;
       }
       return successfulResult();
     },
@@ -156,7 +164,9 @@ test("Windows signing invocation is explicit, strips ambient secrets, and keeps 
       [process.execPath, calls[0].arguments],
       ["git", ["rev-parse", "--verify", "HEAD"]],
       ["git", ["status", "--porcelain=v1", "--untracked-files=all"]],
-      ["az", ["account", "show", "--only-show-errors", "--output", "none"]],
+      ["C:\\Windows\\System32\\cmd.exe", [
+        "/d", "/s", "/c", "az account show --only-show-errors --output none",
+      ]],
       [process.execPath, [
         "C:\\reviewed\\electron-builder.cjs",
         "--config", join(root, "apps", "electron", "electron-builder.release.config.cjs"),
@@ -165,11 +175,50 @@ test("Windows signing invocation is explicit, strips ambient secrets, and keeps 
     ]);
     assert.equal(calls[1].captureOutput, true);
     assert.equal(calls[2].captureOutput, true);
+    assert.equal(calls[3].captureOutput, true);
     const builderEnvironment = calls.at(-1).environment;
     assert.equal(builderEnvironment.CSC_LINK, undefined);
     assert.equal(builderEnvironment.AZURE_CLIENT_SECRET, undefined);
     assert.equal(builderEnvironment.TIBOTATTLE_ELECTRON_TARGET, "win32-x64");
     assert.equal(builderEnvironment.TIBOTATTLE_ELECTRON_WINDOWS_SOURCE_CANDIDATE_RECEIPT, candidatePath);
+  });
+});
+
+test("Windows signing classifies the fixed Azure CLI account probe without retaining its output", async () => {
+  await withFixture(async ({ candidatePath, root }) => {
+    const calls = [];
+    const dependencies = testDependencies({
+      calls,
+      azureCliResult: {
+        error: { code: "ENOENT" }, signal: null, status: null,
+        stdout: "", stderr: "untrusted diagnostic content",
+      },
+    });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({ candidateReceiptPath: candidatePath }, dependencies),
+      { code: "ELECTRON_WINDOWS_SIGNING_AZURE_CLI_ACCOUNT_SHOW_LAUNCH_UNAVAILABLE" },
+    );
+    const invocation = calls.at(-1);
+    assert.equal(invocation.command, "C:\\Windows\\System32\\cmd.exe");
+    assert.deepEqual(invocation.arguments, [
+      "/d", "/s", "/c", "az account show --only-show-errors --output none",
+    ]);
+    assert.equal(invocation.captureOutput, true);
+  });
+
+  await withFixture(async ({ candidatePath, root }) => {
+    const dependencies = testDependencies({
+      azureCliResult: {
+        error: undefined, signal: null, status: 1, stdout: "",
+        stderr: "ERROR: Please run 'az login' to setup account.",
+      },
+    });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({ candidateReceiptPath: candidatePath }, dependencies),
+      { code: "ELECTRON_WINDOWS_SIGNING_AZURE_CLI_ACCOUNT_SHOW_AUTHENTICATION_UNAVAILABLE" },
+    );
   });
 });
 

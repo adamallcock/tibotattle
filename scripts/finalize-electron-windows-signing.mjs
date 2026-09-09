@@ -19,7 +19,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 
@@ -80,6 +80,12 @@ const SYSTEM_ENVIRONMENT_ALLOWLIST = Object.freeze([
   "USERPROFILE",
   "WINDIR",
 ]);
+
+const AZURE_CLI_ACCOUNT_SHOW_COMMAND = "az account show --only-show-errors --output none";
+const AZURE_CLI_LAUNCH_ERROR_CODES = new Set(["EACCES", "ENOENT"]);
+const AZURE_CLI_AUTHENTICATION_OUTPUT = /(?:please\s+run\s+['"]?az\s+login|not\s+logged\s+in|aadsts)/iu;
+const AZURE_CLI_COMMAND_OUTPUT = /(?:not\s+recognized\s+as\s+(?:an\s+internal\s+or\s+external\s+command|the\s+name\s+of)|command\s+not\s+found)/iu;
+const AZURE_CLI_CONFIGURATION_OUTPUT = /(?:azure_config_dir|(?:azure\s+)?config(?:uration)?\s+(?:is\s+)?(?:invalid|unavailable|not\s+found|missing))/iu;
 
 function failure(code) {
   const error = new Error(`ELECTRON_WINDOWS_SIGNING_${code}`);
@@ -247,13 +253,50 @@ function defaultRun(command, arguments_, { environment, captureOutput = false } 
     cwd: REPOSITORY_ROOT,
     env: environment,
     encoding: "utf8",
-    stdio: ["ignore", captureOutput ? "pipe" : "ignore", "ignore"],
+    maxBuffer: captureOutput ? 32 * 1024 : undefined,
+    stdio: ["ignore", captureOutput ? "pipe" : "ignore", captureOutput ? "pipe" : "ignore"],
+    windowsHide: true,
   });
 }
 
 function successful(result) {
   return result !== null && typeof result === "object"
     && result.error === undefined && result.status === 0 && result.signal === null;
+}
+
+function fixedWindowsCommandInterpreter(environment) {
+  const systemRoot = environment?.SystemRoot;
+  if (!safeString(systemRoot, 32 * 1024) || !win32.isAbsolute(systemRoot)) return null;
+  return win32.join(systemRoot, "System32", "cmd.exe");
+}
+
+function azureCliAccountShowInvocation(environment) {
+  const command = fixedWindowsCommandInterpreter(environment);
+  if (command === null) return null;
+  return Object.freeze({
+    command,
+    arguments: Object.freeze(["/d", "/s", "/c", AZURE_CLI_ACCOUNT_SHOW_COMMAND]),
+  });
+}
+
+function capturedText(result) {
+  if (result === null || typeof result !== "object") return "";
+  return [result.stdout, result.stderr]
+    .filter((value) => typeof value === "string" && value.length <= 32 * 1024)
+    .join("\n");
+}
+
+function azureCliAccountShowFailure(result) {
+  if (successful(result)) return null;
+  if (result === null || typeof result !== "object") return "AZURE_CLI_ACCOUNT_SHOW_RESULT_UNAVAILABLE";
+  const errorCode = typeof result.error?.code === "string" ? result.error.code : "";
+  if (AZURE_CLI_LAUNCH_ERROR_CODES.has(errorCode)) return "AZURE_CLI_ACCOUNT_SHOW_LAUNCH_UNAVAILABLE";
+  if (errorCode !== "") return "AZURE_CLI_ACCOUNT_SHOW_LAUNCH_FAILED";
+  const output = capturedText(result);
+  if (AZURE_CLI_COMMAND_OUTPUT.test(output)) return "AZURE_CLI_ACCOUNT_SHOW_LAUNCH_UNAVAILABLE";
+  if (AZURE_CLI_AUTHENTICATION_OUTPUT.test(output)) return "AZURE_CLI_ACCOUNT_SHOW_AUTHENTICATION_UNAVAILABLE";
+  if (AZURE_CLI_CONFIGURATION_OUTPUT.test(output)) return "AZURE_CLI_ACCOUNT_SHOW_CONFIGURATION_UNAVAILABLE";
+  return "AZURE_CLI_ACCOUNT_SHOW_FAILED";
 }
 
 function hostEligible({ platform, architecture, version }) {
@@ -389,11 +432,14 @@ export async function invokeElectronWindowsSigning({ candidateReceiptPath } = {}
     fail("SIGNING_PREREQUISITES_UNAVAILABLE");
   }
   assertCleanFrozenSource(candidate, run);
-  if (!successful(run("az", ["account", "show", "--only-show-errors", "--output", "none"], {
-    environment: builderEnvironment,
-  }))) {
-    fail("AZURE_CLI_AUTHENTICATION_UNAVAILABLE");
-  }
+  const azureCliInvocation = azureCliAccountShowInvocation(builderEnvironment);
+  if (azureCliInvocation === null) fail("AZURE_CLI_ACCOUNT_SHOW_LAUNCH_UNAVAILABLE");
+  const azureCliFailure = azureCliAccountShowFailure(run(
+    azureCliInvocation.command,
+    azureCliInvocation.arguments,
+    { environment: builderEnvironment, captureOutput: true },
+  ));
+  if (azureCliFailure !== null) fail(azureCliFailure);
   const builderCli = testOnly.builderCli ?? REQUIRE.resolve("electron-builder/cli.js");
   if (!safeString(builderCli, 32 * 1024)) fail("BUILDER_UNAVAILABLE");
   if (!successful(run(process.execPath, [
