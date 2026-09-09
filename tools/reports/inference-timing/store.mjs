@@ -42,7 +42,9 @@ export async function openStore(directory) {
         CREATE TABLE turn (key BLOB PRIMARY KEY, source INTEGER NOT NULL, offset INTEGER NOT NULL,
           at INTEGER NOT NULL, model TEXT, effort TEXT, tokens INTEGER, reasoning INTEGER,
           duration INTEGER, ttft INTEGER, responses INTEGER NOT NULL, covered INTEGER NOT NULL,
-          quality TEXT NOT NULL) WITHOUT ROWID;
+          quality TEXT NOT NULL, sample_tokens INTEGER, sample_reasoning INTEGER,
+          sample_duration INTEGER, sample_responses INTEGER NOT NULL,
+          sample_total_responses INTEGER NOT NULL, sample_method TEXT) WITHOUT ROWID;
         CREATE INDEX turn_time ON turn(at);
         PRAGMA application_id=${APPLICATION}; PRAGMA user_version=${METHOD};`);
       db.prepare('INSERT INTO metadata VALUES (?)').run(randomBytes(32));
@@ -95,9 +97,9 @@ export async function ingestFile(store, path, { maxBytes = CHUNK, signal, onRead
       if (!old) db.prepare('INSERT INTO source(digest,fingerprint,cursor,snapshot,state) VALUES (?,?,?,?,?)')
         .run(sourceKey, '', 0, JSON.stringify(before), '{}');
       const source = old?.id ?? Number(db.prepare('SELECT last_insert_rowid() AS id').get().id);
-      const insert = db.prepare('INSERT OR IGNORE INTO turn VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)');
-      const existing = db.prepare('SELECT at,model,effort,tokens,reasoning,duration,ttft,responses,covered,quality FROM turn WHERE key=?');
-      const conflict = db.prepare("UPDATE turn SET model=NULL,effort=NULL,duration=NULL,ttft=NULL,quality='conflicting_duplicate' WHERE key=?");
+      const insert = db.prepare('INSERT OR IGNORE INTO turn VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)');
+      const existing = db.prepare('SELECT at,model,effort,tokens,reasoning,duration,ttft,responses,covered,quality,sample_tokens,sample_reasoning,sample_duration,sample_responses,sample_total_responses,sample_method FROM turn WHERE key=?');
+      const conflict = db.prepare("UPDATE turn SET model=NULL,effort=NULL,duration=NULL,ttft=NULL,sample_tokens=NULL,sample_reasoning=NULL,sample_duration=NULL,sample_responses=0,sample_method=NULL,quality='conflicting_duplicate' WHERE key=?");
       const saved = old ? JSON.parse(old.state) : null;
       let discardLine = saved?.discardLine === true;
       const parser = createParser(key, saved, t => {
@@ -106,7 +108,9 @@ export async function ingestFile(store, path, { maxBytes = CHUNK, signal, onRead
         if (prior) {
           if (Object.keys(prior).some(k => prior[k] !== t[k])) conflict.run(turnKey);
         } else insert.run(turnKey, source, t.offset, t.at, t.model, t.effort, t.tokens,
-          t.reasoning, t.duration, t.ttft, t.responses, t.covered, t.quality);
+          t.reasoning, t.duration, t.ttft, t.responses, t.covered, t.quality,
+          t.sample_tokens, t.sample_reasoning, t.sample_duration, t.sample_responses,
+          t.sample_total_responses, t.sample_method);
       });
       attemptedBytes = end - cursor;
       const receipt = await forEachRolloutLine(handle, { start: cursor, end, signal,
@@ -134,7 +138,7 @@ export async function ingestFile(store, path, { maxBytes = CHUNK, signal, onRead
       db.prepare('UPDATE source SET fingerprint=?,cursor=?,snapshot=?,state=? WHERE id=?')
         .run(await fingerprint(handle, nextOffset, key), nextOffset,
           JSON.stringify(after), JSON.stringify(state), source);
-      if (state.blocked) db.prepare("UPDATE turn SET model=NULL,effort=NULL,duration=NULL,ttft=NULL,quality='blocked_source' WHERE source=?").run(source);
+      if (state.blocked) db.prepare("UPDATE turn SET model=NULL,effort=NULL,duration=NULL,ttft=NULL,sample_tokens=NULL,sample_reasoning=NULL,sample_duration=NULL,sample_responses=0,sample_method=NULL,quality='blocked_source' WHERE source=?").run(source);
       db.exec('COMMIT');
       return { bytes: end - cursor, unchanged: false, cursor: nextOffset,
         remaining: before.size - nextOffset, partial: receipt.partialDeferred };
@@ -145,7 +149,8 @@ export async function ingestFile(store, path, { maxBytes = CHUNK, signal, onRead
 
 export function report(store) {
   const rows = store.db.prepare(`SELECT at,model,effort,tokens,reasoning,duration,ttft,
-    responses,covered,quality FROM turn ORDER BY at LIMIT 100001`).all();
+    responses,covered,quality,sample_tokens,sample_reasoning,sample_duration,
+    sample_responses,sample_total_responses,sample_method FROM turn ORDER BY at LIMIT 100001`).all();
   safe(rows.length <= 100000, 'export_limit');
   const diagnostics = {};
   for (const row of store.db.prepare('SELECT state FROM source').iterate()) {

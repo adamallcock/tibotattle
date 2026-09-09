@@ -14,24 +14,32 @@ Production integration and migration remain a subsequent gate.
 
 ## Measurement contract
 
-- Estimated TPS: sum response output tokens divided by sum reconstructed response
-  seconds within a completed turn. Output already includes reasoning tokens.
-- Each response starts at its earliest completed Reasoning/AgentMessage item's
-  recorded start, and ends at the corresponding token_usage_record timestamp.
-  Associate in log order within the same turn, rejecting overlapping intervals.
-  Tool execution gaps between responses are excluded. This is a client timing
-  proxy, not first-to-last-token server decode speed.
+- Default estimated TPS: matched output tokens divided by reconstructed seconds
+  for the covered responses within each completed turn. Output already includes
+  reasoning tokens. Missing response windows exclude both their tokens and time.
+- Receipt windows start at the earliest completed Reasoning/AgentMessage item's
+  recorded start and end at the corresponding token_usage_record timestamp.
+  Legacy windows use the same explicit item starts, but end at the last correlated
+  model-output timestamp; positive cumulative output/reasoning deltas must match
+  last-response usage. Ignore repeated snapshots and exclude delayed tool waits.
+  Never use legacy mirrors if any modern usage record was observed for that turn.
+  Both are client timing proxies, not server first-to-last-token decode speed.
 - Recorded turn TTFT: task_complete.time_to_first_token_ms, once per turn.
   It is not per-request TTFT and may include provider-specific hidden reasoning
   behavior. Missing evidence stays NULL, never zero.
-- Require unique response IDs and reconciliation with final turn token totals;
-  any missing window makes full-turn TPS unavailable. Reject inherited/forked
-  histories and conflicting attribution. Keep quality/coverage counts.
+- Receipt usage requires unique response IDs and final-turn reconciliation.
+  `--tps-method strict` retains the original complete-coverage requirement;
+  `covered` (default), `receipt` and `legacy` select the compatible metrics.
+  Reject inherited/forked histories and conflicting attribution. Keep quality
+  flags for the strict metric and independent compatible sample/coverage fields.
 - Model panels show median per-turn TPS and recorded TTFT by completion date,
   with percentile bands, sample counts and effort context. Sparse bins use hollow
   points. Adjacent observed medians connect; missing bins use dashed connections
   up to seven days by default, without filling observations or bands. Longer gaps
-  break lines. The original scatter view remains available.
+  break lines. Receipt and legacy trends remain separate, with distinct markers.
+  Panel fractions count eligible/retained model turns; TPS additionally reports
+  timed responses. TTFT and TPS have independent eligibility and date coverage.
+  The original scatter view remains available.
   Exclude automatic-review/unknown models.
   Produce local PNG/SVG plus content-free scalar data; inspect the rendered plot.
 
@@ -301,9 +309,10 @@ found 27 missing-start violations and no prior-usage overlap violations. Relaxin
 timestamp tolerance would not repair those cases. Missing coverage rejects the
 whole turn because its total tokens cannot be divided by a partial duration.
 
-A distinct legacy estimator may be possible using timed item starts, final model
+A distinct legacy estimator was identified using timed item starts, final model
 message/tool-call timestamps and the passthrough turn metadata, with reconciled
-cumulative output deltas. It is not implemented or mixed into method 1. Directly
+cumulative output deltas. It was not implemented in method 1; method 2 below
+implements it with independent coverage and method labels. Directly
 substituting legacy token-count timestamps is invalid: one September 1 sample
 had 196 output tokens over 3.534 seconds to the final model event (55.5 TPS), but
 16.575 seconds to the delayed usage record (11.8 TPS), including 13.041 seconds
@@ -315,3 +324,92 @@ Validation: 20 focused Node tests and five Python tests pass. Documentation,
 tool inventory, architecture and preflight gates pass. Both final chart layouts
 were inspected after separating the date-range caption from facet titles.
 Production accounting and the installed application were not modified.
+
+## Compatibility extension plan, 2026-09-09
+
+Implement method 2 in a fresh experiment sidecar; preserve the method-1 database
+and refuse opening incompatible versions for writes. Keep the strict full-turn
+receipt metric for comparison. Add one compact covered-response aggregate per
+turn: matched output/reasoning tokens, duration, covered/observed response counts
+and explicit receipt/legacy method label. A missing window excludes its own
+numerator as well as its time. Identity, duplicate, reconciliation, mixed-model
+and invalid turn-boundary failures must still reject ambiguous measurements.
+
+For older logs, require explicit timed model starts and correlated final model
+message/tool-call endpoints; reconcile positive cumulative token deltas against
+last-response usage. Never use delayed token-count arrival as model end, infer
+missing starts from wall-clock idle gaps, or double count legacy mirrors of new
+response usage records. Unknown/oversized evidence invalidates the affected
+window; recovery needs an explicit subsequent accounting boundary. Preserve the
+existing memory/cursor/privacy bounds. Validate synthetic waits, partial windows,
+legacy mismatches/resets, replay/restart and duplicates; then rescan all history,
+compare coverage and resource cost, and inspect clearly labelled plots.
+
+## Compatibility extension results, 2026-09-09
+
+Method 2 is implemented locally. The version-1 sidecar is preserved; a version-2
+writer refuses it without modification. Six additional scalar columns persist
+covered output/reasoning tokens, duration, covered and observed response counts,
+and method. Strict fields remain available. Legacy sample quality is expressed
+by those independent fields; the original `quality` column describes the strict
+receipt metric. Legacy counts represent observed positive usage deltas, not proof
+that every response in the source was observable.
+
+The modern path recovers after an unreadable/missing timing window at the next
+valid receipt, but still requires unique response IDs and reconciliation of all
+receipt tokens with the final turn total. It rejects ambiguous identities,
+unknown model changes, duplicates and invalid boundaries. The legacy path
+requires a single active turn, correlated model endpoints and output/reasoning
+counter agreement. It rejects transient concurrency, missing baselines, unknown
+output shapes and output that arrives after a tool result within the candidate.
+Counter resets discard their affected window. Modern usage, including orphan or
+rejected records, disables legacy fallback for potentially affected turns.
+Neither method substitutes tool-result timestamps or passthrough `create_time`
+for generation completion. Missing-start windows cannot contribute any tokens.
+
+Seven bounded scan passes read 54.73 GB including resumed partial ranges and live
+appends, reporting 62.39 seconds total scan-phase time and at most 159 MiB peak
+RSS. Every pass had zero source failures. Both roots reached their scan ends;
+verification matched all 8,777 present sources to exhausted snapshots (5,055
+sessions, 3,722 archives). Ten active session files grew after their snapshots.
+The source inventory itself totalled 48.75 GB. This is a local historical rebuild,
+not an integrated accounting overhead or cold-cache benchmark.
+
+The new sidecar has 29,561 turns from May 17 through September 9 and occupies
+10,588,160 bytes (10.10 MiB), compared with 9.51 MiB in the preceding snapshot.
+The corpus changed slightly between snapshots, so this is an approximate storage
+comparison. The one-row-per-turn design and existing state/SQLite bounds remain.
+Explicit experiment JSON exports accumulate separately and are not globally
+retention-bounded; production should export on demand rather than mirror them.
+
+Within the same method-2 export, strict TPS covers 128 turns; compatible TPS
+covers 1,056: 693 receipt-based and 363 legacy. They contain 37,330 timed responses.
+The earliest compatible turn is August 21, compared with September 3 for strict
+receipt coverage. May–July sample records still lack explicit model-start timing;
+no equivalent generation-speed estimate is invented for that period.
+
+| Model | Strict TPS turns | Compatible TPS turns | Legacy turns included | Timed responses | Recorded TTFT turns |
+|---|---:|---:|---:|---:|---:|
+| Luna | 28 | 209 | 76 | 5,893 | 565 |
+| Terra | 38 | 323 | 45 | 12,795 | 1,713 |
+| Astra | 58 | 240 | 0 | 6,179 | 242 |
+| Sol | 4 | 284 | 242 | 12,463 | 1,724 |
+
+The count mismatch is expected: TPS needs a matched token numerator and timed
+response interval, while recorded turn TTFT needs one valid completion field.
+These are independent populations and can cover different dates. The plot now
+labels eligible/retained model turns, additionally counts timed responses, and
+keeps daily receipt and legacy medians separate (circles versus triangles/hatched
+bands). JSON exports include method-specific statistics and population overlap.
+Partial coverage is not a claim about the unmeasured responses' speed.
+
+Validation: 32 focused Node tests and nine Python tests pass. Regression cases
+cover delayed tool waits, partial numerators, legacy counter mismatches/resets,
+missing starts and baselines, repeated snapshots, modern mirrors/orphans,
+transient concurrency, unattributed model items/settings, old-schema refusal,
+and legacy restart equivalence. Read-only correlation and performance review
+found attribution edge cases that were fixed and tested; buffer-filter ordering
+was improved without changing admission semantics. Documentation, tool inventory,
+architecture and preflight checks pass. Revised current, earlier and strict
+comparison charts were rendered for local inspection. No installed-app or live
+accounting migration was performed.

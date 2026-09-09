@@ -30,6 +30,17 @@ function usage(ms, response, n, total) {
     turn_token_usage: { output_tokens: total, reasoning_output_tokens: total / 2 } });
 }
 const lines = rows => rows.map(r => JSON.stringify(r) + '\n').join('');
+const count = (ms, total, last) => rec(ms, 'event_msg', { type: 'token_count', info: {
+  total_token_usage: { output_tokens: total, reasoning_output_tokens: total / 2 },
+  last_token_usage: { output_tokens: last, reasoning_output_tokens: last / 2 },
+} });
+const output = (ms, type = 'function_call') => rec(ms, 'response_item', { type,
+  internal_chat_message_metadata_passthrough: { turn_id: 'synthetic-turn', create_time: (BASE - 10000) / 1000 } });
+function legacyFixture() {
+  const x = fixture();
+  return [x[0], count(0, 1000, 10), x[1], x[2], x[3], output(1000), x[5],
+    count(201000, 1100, 100), x[6], output(202000), count(202000, 1200, 100), x[8]];
+}
 function parse(rows) {
   const result = []; const parser = createParser(key, null, t => result.push(t));
   rows.forEach((r, i) => parser.line(Buffer.from(JSON.stringify(r)), i + 1, false));
@@ -55,6 +66,91 @@ test('TTFT stays independent and missing TTFT does not become zero', () => {
   const x = fixture(); x.splice(3, 1); assert.equal(parse(x).result[0].ttft, 100);
   const y = fixture(); delete y.at(-1).payload.time_to_first_token_ms;
   assert.equal(parse(y).result[0].ttft, null); assert.equal(parse(y).result[0].duration, 2000);
+});
+test('partial receipt coverage retains only the matching response numerator and duration', () => {
+  const x = fixture(); x.splice(3, 1);
+  const t = parse(x).result[0];
+  assert.equal(t.duration, null); assert.equal(t.tokens, 200);
+  assert.equal(t.sample_method, 'receipt'); assert.equal(t.sample_tokens, 100);
+  assert.equal(t.sample_duration, 1000); assert.equal(t.sample_reasoning, 50);
+  assert.equal(t.sample_responses, 1); assert.equal(t.sample_total_responses, 2);
+});
+test('unattributed model items cannot shorten a modern response window', () => {
+  for (const turn_id of [undefined, 'orphan-turn']) {
+    const x = fixture(); const orphan = structuredClone(x[3]); orphan.payload.turn_id = turn_id;
+    x.splice(3, 0, orphan);
+    const t = parse(x).result[0];
+    assert.equal(t.duration, null); assert.equal(t.sample_tokens, 100);
+    assert.equal(t.sample_duration, 1000);
+  }
+});
+test('partial windows still require unique identities, reconciliation and stable attribution', () => {
+  for (const mutate of [
+    x => x.splice(5, 0, structuredClone(x[4])),
+    x => { x[7].payload.turn_token_usage.output_tokens = 999; },
+    x => x.splice(6, 0, rec(201000, 'turn_context', { turn_id: 'synthetic-turn', model: 'gpt-5.6-luna', effort: 'high' })),
+  ]) {
+    const x = fixture(); mutate(x);
+    assert.equal(parse(x).result[0].sample_duration, null);
+  }
+});
+test('legacy endpoints exclude delayed tool waits and ignore create_time', () => {
+  const t = parse(legacyFixture()).result[0];
+  assert.equal(t.duration, null); assert.equal(t.sample_method, 'legacy');
+  assert.equal(t.sample_tokens, 200); assert.equal(t.sample_reasoning, 100);
+  assert.equal(t.sample_duration, 2000); assert.equal(t.sample_responses, 2);
+  assert.equal(t.sample_total_responses, 2); assert.equal(t.ttft, 100);
+});
+test('legacy snapshots repeat without duplicating responses and unmatched windows exclude their tokens', () => {
+  const x = legacyFixture(); x.splice(8, 0, count(201000, 1100, 100));
+  assert.equal(parse(x).result[0].sample_tokens, 200);
+  for (const mutate of [
+    x => { x[7].payload.info.last_token_usage.output_tokens = 98; },
+    x => { delete x[4].payload.started_at_ms; },
+    x => { x[5].payload.internal_chat_message_metadata_passthrough.turn_id = 'different-turn'; },
+    x => x.splice(6, 0, output(1500, 'unknown_model_output')),
+    x => x.splice(1, 1), // Missing prior cumulative baseline excludes first response.
+  ]) {
+    const y = legacyFixture(); mutate(y); const t = parse(y).result[0];
+    assert.equal(t.sample_tokens, 100); assert.equal(t.sample_duration, 1000);
+    assert.equal(t.sample_responses, 1);
+  }
+});
+test('legacy counter resets and model output after tool results cannot create false speed', () => {
+  const x = legacyFixture(); x[7] = count(201000, 900, 100); x[10] = count(202000, 1000, 100);
+  assert.equal(parse(x).result[0].sample_tokens, 100);
+  const y = legacyFixture(); y.splice(7, 0, output(201000));
+  assert.equal(parse(y).result[0].sample_tokens, 100);
+});
+test('legacy mirror never rescues rejected modern usage or double counts modern receipts', () => {
+  const x = legacyFixture(); x.splice(6, 0, usage(1000, 'response-one', 100, 100));
+  const t = parse(x).result[0];
+  assert.equal(t.sample_method, 'receipt'); assert.equal(t.sample_tokens, 100);
+  const y = legacyFixture(); const invalid = usage(1000, 'response-one', 100, 100);
+  delete invalid.payload.response_id; y.splice(6, 0, invalid);
+  assert.equal(parse(y).result[0].sample_duration, null);
+});
+test('legacy token counts with concurrent active turns stay unattributed', () => {
+  const x = legacyFixture(); x.splice(4, 0, event(0, 'task_started', { turn_id: 'parallel-turn' }));
+  assert.equal(parse(x).result[0].sample_duration, null);
+});
+test('legacy cannot absorb orphan modern usage or transient concurrent-turn windows', () => {
+  const x = legacyFixture(); const orphan = usage(1000, 'orphan-response', 100, 100);
+  orphan.payload.turn_id = 'orphan-turn'; x.splice(6, 0, orphan);
+  assert.equal(parse(x).result[0].sample_duration, null);
+  const y = legacyFixture();
+  y.splice(6, 0, event(1100, 'task_started', { turn_id: 'parallel-turn' }),
+    event(1200, 'turn_aborted', { turn_id: 'parallel-turn' }));
+  assert.equal(parse(y).result[0].sample_tokens, 100);
+});
+test('unattributed model changes invalidate pending attribution and missing baseline counts as uncovered', () => {
+  const x = legacyFixture();
+  x.splice(6, 0, rec(1100, 'turn_context', { model: 'gpt-5.6-luna', effort: 'high' }));
+  const t = parse(x).result[0];
+  assert.equal(t.sample_duration, null); assert.equal(t.model, null);
+  const y = legacyFixture(); y.splice(1, 1);
+  const partial = parse(y).result[0];
+  assert.equal(partial.sample_responses, 1); assert.equal(partial.sample_total_responses, 2);
 });
 test('oversized timing and malformed records invalidate timing; oversized tool content is ignored', () => {
   for (const type of ['timing', 'malformed', 'tool']) {
@@ -143,6 +239,7 @@ test('conflicting duplicate invalidates the measurement', async t => {
   const rows = report(store).turns;
   assert.equal(rows.length, 1); assert.equal(rows[0].quality, 'conflicting_duplicate');
   assert.equal(rows[0].duration, null); assert.equal(rows[0].ttft, null);
+  assert.equal(rows[0].sample_duration, null); assert.equal(rows[0].sample_method, null);
 });
 test('oversized lines resume across budgets and later turns remain readable', async t => {
   const { file, store } = await setup(t);
@@ -166,6 +263,28 @@ test('unknown schema, unsafe permissions and symlinks are refused', async t => {
   await assert.rejects(openStore(join(dir, 'out')), /incompatible_database/);
   await chmod(join(dir, 'out'), 0o755); await assert.rejects(openStore(join(dir, 'out')), /unsafe_directory/);
   const link = join(dir, 'link.jsonl'); await symlink(file, link); await assert.rejects(ingestFile(store, link));
+});
+test('method-1 experiment database is preserved and refused by the new writer', async t => {
+  const { dir, store } = await setup(t);
+  store.db.exec('PRAGMA user_version=1');
+  await assert.rejects(openStore(join(dir, 'out')), /incompatible_database/);
+  assert.equal(store.db.prepare('PRAGMA user_version').get().user_version, 1);
+});
+test('legacy reconstruction persists scalar windows across close and reopen', async t => {
+  const dir = await mkdtemp(join(await realpath(tmpdir()), 'timing-legacy-restart-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, 'synthetic.jsonl'), out = join(dir, 'out'), rows = legacyFixture();
+  await writeFile(file, lines(rows.slice(0, 6)), { mode: 0o600 });
+  const first = await openStore(out);
+  try { await ingestFile(first, file); } finally { first.close(); }
+  await appendFile(file, lines(rows.slice(6)));
+  const second = await openStore(out);
+  try {
+    await ingestFile(second, file);
+    const r = report(second).turns[0];
+    assert.equal(r.sample_tokens, 200); assert.equal(r.sample_duration, 2000);
+    assert.doesNotMatch(JSON.stringify(report(second)), /synthetic-turn|synthetic-session|create_time/);
+  } finally { second.close(); }
 });
 test('busy database leaves prior result and cursor intact', async t => {
   const { file, store } = await setup(t); const other = new DatabaseSync(store.file);

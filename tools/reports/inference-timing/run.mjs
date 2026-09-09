@@ -92,6 +92,8 @@ export async function run(options, signal) {
     const data = report(store);
     summary.turns = data.turns.length;
     summary.completeTps = data.turns.filter(t => t.duration !== null).length;
+    summary.sampledTps = data.turns.filter(t => t.sample_duration !== null).length;
+    summary.legacyTps = data.turns.filter(t => t.sample_method === 'legacy').length;
     summary.recordedTtft = data.turns.filter(t => t.ttft !== null).length;
     // No-clobber output artifacts; repeated runs create separate receipts.
     const name = `${options.baseline ? 'baseline' : 'measurements'}-${Date.now()}.json`;

@@ -53,6 +53,38 @@ class TimingTrendTests(unittest.TestCase):
         self.assertEqual([b['median'] for b in result], [0, 1])
         self.assertEqual(result[0]['start'], 0)
 
+    def test_covered_uses_matching_partial_numerator_not_full_turn_tokens(self):
+        row = {**self.row(tokens=1000, duration=None), 'sample_method': 'receipt',
+            'sample_tokens': 100, 'sample_duration': 1000, 'sample_responses': 1, 'sample_total_responses': 4}
+        before = row.copy()
+        samples = plot.tps_samples([row])
+        self.assertEqual(plot.trend_bins(samples, 'tps')[0]['median'], 100)
+        self.assertEqual(plot.speed_summary(samples)['response_coverage_in_eligible_turns'], .25)
+        self.assertEqual(plot.tps_samples([row], 'strict'), [])
+        self.assertEqual(row, before)
+
+    def test_null_v2_evidence_never_falls_back_and_v1_remains_supported(self):
+        self.assertEqual(plot.tps_samples([{**self.row(), 'sample_method': None}]), [])
+        samples = plot.tps_samples([self.row()])
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]['tps_method'], 'receipt')
+        self.assertIsNone(plot.speed_summary(samples)['covered_responses'])
+        self.assertEqual(plot.tps_samples([self.row()], 'legacy'), [])
+
+    def test_method_filter_preserves_independent_receipt_and_legacy_samples(self):
+        rows = [{**self.row(), 'sample_method': method, 'sample_tokens': tokens,
+                 'sample_duration': 1000, 'sample_responses': 1, 'sample_total_responses': 1}
+                for method, tokens in [('receipt', 100), ('legacy', 10)]]
+        self.assertEqual(len(plot.tps_samples(rows)), 2)
+        for method, expected in [('receipt', 100), ('legacy', 10)]:
+            samples = plot.tps_samples(rows, method)
+            self.assertEqual(len(samples), 1)
+            self.assertEqual(plot.trend_bins(samples, 'tps')[0]['median'], expected)
+
+    def test_invalid_timing_is_unavailable_not_zero_or_infinite_speed(self):
+        self.assertEqual(plot.tps_samples([self.row(duration=0), self.row(duration=-1),
+                                         self.row(tokens=float('nan')), self.row(tokens=True)]), [])
+
 
 if __name__ == '__main__':
     unittest.main()
