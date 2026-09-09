@@ -17,6 +17,8 @@ import {
 import { basename, dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+import { syncDirectory } from "./platform/index.js";
+
 // The one local index.
 //
 // Everything the product needs in order to show a figure or to upload a
@@ -1872,21 +1874,6 @@ async function syncFile(path) {
   }
 }
 
-async function syncDirectoryPath(path) {
-  let handle;
-  try {
-    handle = await open(path, constants.O_RDONLY);
-    await handle.sync();
-  } catch (error) {
-    if (error?.code === "local_unified_index_directory_sync_failed") {
-      throw error;
-    }
-    throw fixedError("local_unified_index_directory_sync_failed");
-  } finally {
-    await handle?.close();
-  }
-}
-
 /**
  * A bulk writer over one persistent connection.
  *
@@ -3081,7 +3068,7 @@ export async function publishStagedUnifiedIndex(
   if (!allowRecoveryLock) assertLocalUnifiedIndexRecoveryUnlocked(indexFile);
   await rename(stageFile, indexFile);
   try {
-    await syncDirectoryPath(dirname(resolve(indexFile)));
+    await syncDirectory(dirname(resolve(indexFile)));
     await syncFile(indexFile);
   } catch {
     // The rename has already happened. Report that exact bounded state so the
