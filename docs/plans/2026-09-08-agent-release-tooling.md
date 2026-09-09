@@ -2,7 +2,7 @@
 title: Agent release tooling implementation and follow-on plans
 date: 2026-09-08
 type: plan
-status: recommendations-1-3-implemented
+status: recommendations-4-5-in-progress
 ---
 
 # Scope
@@ -10,8 +10,9 @@ status: recommendations-1-3-implemented
 Implement recommendations 1–3 from the
 [investigation](../research/2026-09-08-agent-release-process-improvements.md):
 read-only doctor/status, shared deployment protection and resumable native
-finalization. Plan, but do not implement, recommendations 4–5. This work does
-not authorize signing, notarization, production writes or publication.
+finalization. The owner subsequently authorized pushing those commits and
+implementing recommendations 4–5. This does not authorize signing,
+notarization, production writes or release publication.
 
 ## Implementation boundary
 
@@ -38,15 +39,17 @@ not authorize signing, notarization, production writes or publication.
 - [x] Write reviewable plans for recommendations 4–5.
 - [x] Run owning checks and review the integrated diff.
 
-Recommendations 1–3 are implemented locally; no external publication occurred.
+Recommendations 1–3 are implemented and pushed through `1b0f2f04`, including
+the subsequently discovered native journal export-closure repair; no release
+publication occurred.
 The [validation record](../reviews/2026-09-08-agent-release-tooling-validation.md)
 separates passing recovery/native/Worker checks from the pre-existing R7
-receipt mismatch. Recommendations 4–5 below remain planned, retaining this
-document as their implementation boundary.
+receipt mismatch. Recommendations 4–5 below are now being implemented, retaining
+this document as their acceptance boundary.
 
 ## Follow-on 4: publication reconciliation
 
-Planned only. Build a manifest-driven, read-only-default reconciler for GitHub,
+Build a manifest-driven, read-only-default reconciler for GitHub,
 both Sparkle feeds, tap and website. Reuse the existing updater CAS publisher,
 public provenance and architecture-aware cask updater. Bind state to source,
 tag object, channel, build and final artifact digests; keep publication authority
@@ -59,7 +62,7 @@ ownership contracts implemented here; no new signing implementation.
 
 ## Follow-on 5: earlier qualification and evidence reuse
 
-Planned only. Add bounded source-format and predecessor-upgrade admission
+Add bounded source-format and predecessor-upgrade admission
 before expensive R7 and signing. Rehearse migrations from the actual deployed
 prefix using synthetic populated data with realistic cardinality/skew, remote
 syntax checks in a separately approved disposable environment, preservation
@@ -74,3 +77,18 @@ paginated reset semantics, future-parent attribution, interrupted upgrades,
 changed runtime/import/schema invalidation, tampered receipts and unchanged
 hosted/docs changes avoiding unrelated analytical work. R7 calculation resume
 and single-notarization experiments remain separately scoped later work.
+
+## Current implementation workstreams
+
+- [x] Publication reconciler with real adapters and synthetic lost-response tests.
+- [x] Early synthetic source/upgrade admission with private exact-input reuse.
+- [x] Deployed-prefix observation and populated local migration rehearsal;
+  separately gated disposable-remote syntax rehearsal.
+- [x] Conservative test-lane routing, measured reuse and invalidation tests.
+- [ ] Integrated validation, command registration and maintained runbooks.
+
+Reuse of synthetic historical-schema tests is early admission, not proof of an
+arbitrary installed predecessor. Existing R7 v0.1 receipt semantics remain
+unchanged. Narrowing their accepted fingerprint requires an independently
+qualified schema transition; advisory dependency inspection cannot promote an
+old receipt. No protected R7 regeneration or remote rehearsal will run here.

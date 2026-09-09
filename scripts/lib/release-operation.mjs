@@ -4,6 +4,8 @@ import { lstat, mkdir, open, realpath, rename } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
+const OPERATION_KINDS = new Set(["native", "production", "publication", "qualification"]);
+
 export function operationError(code) {
   return Object.assign(new Error(code), { code });
 }
@@ -69,7 +71,7 @@ export async function readOperation(directory) {
   } catch { throw operationError("RELEASE_OPERATION_INVALID"); } finally { await handle.close(); }
   if (!value || Object.keys(value).sort().join() !== "binding,createdAt,id,kind,schema,state,updatedAt"
       || value.schema !== 1 || !/^[a-f0-9]{64}$/.test(value.binding)
-      || !/^[a-f0-9-]{36}$/.test(value.id) || !["native", "production"].includes(value.kind)
+      || !/^[a-f0-9-]{36}$/.test(value.id) || !OPERATION_KINDS.has(value.kind)
       || !value.state || typeof value.state !== "object" || Array.isArray(value.state)
       || !Number.isFinite(Date.parse(value.createdAt)) || !Number.isFinite(Date.parse(value.updatedAt))) {
     throw operationError("RELEASE_OPERATION_INVALID");
@@ -81,6 +83,7 @@ export async function readOperation(directory) {
 // durable operation state is separately fsynced, never rolled back with it.
 // Do not put this directory on a network filesystem.
 export async function openOperation({ directory, kind, binding, resume = false }) {
+  if (!OPERATION_KINDS.has(kind)) throw operationError("RELEASE_OPERATION_KIND_INVALID");
   directory = resolve(directory);
   await privateDirectory(directory, !resume);
   const lockPath = join(directory, "mutex.sqlite");

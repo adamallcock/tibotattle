@@ -44,6 +44,20 @@ export function validateReleasePlan(value) {
 
 export async function releaseOperationStatus(directory) {
   const { kind, createdAt, updatedAt, state } = await readOperation(resolve(directory));
+  if (kind === "publication") {
+    if (!object(state.steps) || !["pending", "held", "released"].includes(state.lock)
+        || Object.values(state.steps).some((value) => !["intent", "submitted", "verified"].includes(value))) throw operationError("RELEASE_STATUS_INVALID");
+    return { schema: 1, kind, createdAt, updatedAt, coordination: state.lock,
+      recordedVerifiedSteps: Object.values(state.steps).filter((value) => value === "verified").length,
+      uncertainSteps: Object.values(state.steps).filter((value) => value === "intent").length,
+      pendingSteps: Object.values(state.steps).filter((value) => value === "submitted").length,
+      remoteState: "not_rechecked", nextAction: "inspect_exact_publication_plan_before_resuming" };
+  }
+  if (kind === "qualification") {
+    if (!["running", "failed", "complete"].includes(state.status)) throw operationError("RELEASE_STATUS_INVALID");
+    return { schema: 1, kind, createdAt, updatedAt, outcome: state.status,
+      currentInputs: "not_rechecked", nextAction: "inspect_exact_qualification_inputs", releaseReady: false };
+  }
   if (kind === "production") {
     if (!["not_started", "outcome_unknown", "deployed_unverified", "verified"].includes(state.outcome)
         || !["not_acquired", "uncertain", "held", "released"].includes(state.lock)) throw operationError("RELEASE_STATUS_INVALID");

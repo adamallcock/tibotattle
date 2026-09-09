@@ -15,6 +15,8 @@ async function fixture(t) {
 
 test("operation binds canonical inputs and preserves isolated durable state", async (t) => {
   const f = await fixture(t);
+  await assert.rejects(openOperation({ ...f, kind: "unreviewed-kind" }), { code: "RELEASE_OPERATION_KIND_INVALID" });
+  await assert.rejects(lstat(f.directory), { code: "ENOENT" });
   assert.equal(identityDigest({ b: 2, a: { y: 1, x: 3 } }), identityDigest({ a: { x: 3, y: 1 }, b: 2 }));
   const operation = await openOperation(f);
   try {

@@ -99,3 +99,18 @@ test("status distinguishes safe preflight retry from retained uncertain ownershi
   }
   operation.close();
 });
+
+test("publication and admission summaries omit private journal details and never imply current proof", async (t) => {
+  const root = await fixture(t);
+  const publication = await openOperation({ directory: join(root, "publication"), kind: "publication", binding: {} });
+  await publication.save({ owner: "private-canary", lock: "held", steps: { draft: "verified", tap: "submitted", website: "intent" } });
+  const status = await releaseOperationStatus(publication.directory);
+  assert.equal(status.recordedVerifiedSteps, 1); assert.equal(status.pendingSteps, 1); assert.equal(status.uncertainSteps, 1);
+  assert.equal(status.remoteState, "not_rechecked"); assert.equal(JSON.stringify(status).includes("private-canary"), false);
+  publication.close();
+  const admission = await openOperation({ directory: join(root, "qualification"), kind: "qualification", binding: {} });
+  await admission.save({ status: "complete", private: "canary" });
+  const result = await releaseOperationStatus(admission.directory);
+  assert.equal(result.currentInputs, "not_rechecked"); assert.equal(result.releaseReady, false);
+  assert.equal(JSON.stringify(result).includes("canary"), false); admission.close();
+});

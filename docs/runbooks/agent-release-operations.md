@@ -10,8 +10,11 @@ status: maintained
 This is the entrypoint for local release inspection and interrupted operation
 recovery. It does not grant signing, production or publication authority. Retain
 the [macOS release](macos-stable-release-runbook.md) and
-[production](production-operations.md) gates. Publication reconciliation and
-earlier qualification remain [planned work](../plans/2026-09-08-agent-release-tooling.md).
+[production](production-operations.md) gates. Use
+[publication reconciliation](release-publication-reconciliation.md) for exact
+cross-surface state and [early qualification](release-qualification-admission.md)
+for synthetic admission and reviewed local proof reuse. Neither grants release
+authority or substitutes for final qualification.
 
 ## Read-only discovery
 
