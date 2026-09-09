@@ -19,6 +19,22 @@ Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
 Latest continuation, 2026-09-09:
 
+- **Windows signed-installed runtime now passes.** Exact source `4d8d551b`,
+  build `2026090937`, passed signing, installation, dashboard rendering,
+  synthetic usage ingestion, retained totals/settings/opt-out across restart,
+  uninstall and cleanup in
+  [34409539722](https://github.com/adamallcock/tibotattle/actions/runs/34409539722).
+  Owner readback verified the downloaded 101,072,192-byte installer against
+  its native receipt (`c47782c3b0911477f275f8d967b0ddacec8924d74d9c6d0d6aea78a2aef5fc90`)
+  and matched both receipts to ASAR
+  `dab708b782478eae5401b0982425b3d47979ff01abe515fa8e7465fc1d5fe8d2`.
+  This clears the signed startup/data-processing blocker. Credential persistence
+  retains its earlier native qualification; this normal journey did not requalify
+  it or exercise hosted enrollment, notification delivery or updater replacement.
+  The latter desktop acceptance items remain separate from this passing gate.
+  Production migration/activation, final protected qualification and public
+  release remain open; `productionReady` is still false.
+
 - Live `main` was checked at `77317f9f` (PR #114) and is an ancestor of both
   the installed Mac source `7293828a` and current integration source. There are
   no unseen main-branch commits to port at this observation; ancestry alone
@@ -182,8 +198,9 @@ Latest continuation, 2026-09-09:
   tampered executable bytes and a malformed header. Focused loader, rebinding,
   resource, artifact and package-closure tests pass; architecture is clean,
   release trust passes 78/78 and preflight passes 20/20. Platform-dependent tests
-  remain skipped locally. Signed build 37 is running at that exact source in
-  [34409539722](https://github.com/adamallcock/tibotattle/actions/runs/34409539722).
+  remain skipped locally. Signed build 37 passed at that exact source in
+  [34409539722](https://github.com/adamallcock/tibotattle/actions/runs/34409539722),
+  including the installed normal journey described above.
   No timeout, credential or acceptance rule is relaxed. The active dependency tree still has the previously documented stale builder
   patch. The current fix and full five-test config suite pass in an isolated
   workspace using the verified frozen/offline patched runtime. No active
@@ -195,9 +212,9 @@ Latest continuation, 2026-09-09:
   included in the first signed run and is included in the `57165992` retry.
 - Windows native modules have passed Azure signing, strict Authenticode
   verification and integrity rebinding. The latest run has passed final
-  installer/evidence verification and installation. Uninstall/cleanup passed in
-  the preceding run, not the latest delegated normal journey. Normal signed app
-  startup remains open after the metadata-corrected retry reached the listener gate.
+  installer/evidence verification, installation, normal startup, data processing,
+  restart preservation, uninstall and cleanup. Earlier startup failures below
+  remain retained evidence; build 37 supersedes their open runtime status.
   Earlier failures are retained in runs
   `34373775022`, `34374830275`, `34376745223`, `34378235956`, `34379698420`
   and `34382343677`; these exposed native-path, read-only-file, PowerShell
