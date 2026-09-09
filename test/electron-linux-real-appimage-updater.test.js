@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { linuxUpdaterRehearsalVersions, linuxAppImageIdentity } from "../scripts/build-linux-updater-rehearsal.mjs";
-import { validateLinuxRealUpdaterPair, realUpdaterFeed, isLinuxUpdaterSettingsURL, prepareLinuxUpdaterDownload, isOwnedLinuxUpdaterExecutable } from "../scripts/smoke-electron-linux-real-appimage-updater.mjs";
+import { validateLinuxRealUpdaterPair, realUpdaterFeed, isLinuxUpdaterSettingsURL, prepareLinuxUpdaterDownload, isOwnedLinuxUpdaterExecutable, linuxUpdaterFixedStatus, linuxUpdaterRuntimeErrorCategories } from "../scripts/smoke-electron-linux-real-appimage-updater.mjs";
 import { readProductionDistribution } from "../apps/electron/main.js";
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 const revision = "a".repeat(40);
@@ -113,4 +113,11 @@ test("AppImage process identity is confined to the private extraction mount", ()
   for (const path of ["/usr/bin/tibotattle", "/tmp/tibotattle", "/opt/tibotattle-updater-exec/tmp/../tibotattle", "/opt/tibotattle-updater-exec/tmp/appimage/chrome_crashpad_handler", "/opt/tibotattle-updater-exec/tmp/appimage/tibotattle --type=renderer"]) {
     assert.equal(isOwnedLinuxUpdaterExecutable(path), false);
   }
+});
+
+test("install diagnostics retain only fixed updater and operating-system classifications", () => {
+  assert.deepEqual(linuxUpdaterFixedStatus({ status: "error", error: "shutdown_failed", detail: "private path" }), { status: "error", error: "shutdown_failed" });
+  assert.deepEqual(linuxUpdaterFixedStatus({ status: "secret", error: "private" }), { status: "unavailable", error: "unavailable" });
+  assert.deepEqual(linuxUpdaterRuntimeErrorCategories("Error: EACCES /private/file; EXDEV other"), ["EACCES", "EXDEV"]);
+  assert.deepEqual(linuxUpdaterRuntimeErrorCategories("ENOENTish"), []);
 });

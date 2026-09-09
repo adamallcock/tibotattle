@@ -69,6 +69,16 @@ export async function prepareLinuxUpdaterDownload({ readUpdate, click, automatic
   return { check, download };
 }
 
+export function linuxUpdaterFixedStatus(value) {
+  const statuses = new Set(["unavailable", "ready", "checking", "available", "downloading", "downloaded", "current", "installing", "error"]);
+  const errors = new Set(["none", "configuration_failed", "check_failed", "download_failed", "install_failed", "preferences_unavailable", "shutdown_failed", "unavailable"]);
+  return { status: statuses.has(value?.status) ? value.status : "unavailable",
+    error: errors.has(value?.error) ? value.error : "unavailable" };
+}
+export function linuxUpdaterRuntimeErrorCategories(text) {
+  // Synthetic app output stays in memory; only these fixed classifiers leave.
+  return ["EACCES", "ENOENT", "EXDEV", "EROFS", "ENOSPC"].filter((code) => new RegExp(`\\b${code}\\b`, "u").test(text));
+}
 function command(name, args, options = {}) {
   const result = spawnSync(name, args, { stdio: "ignore", timeout: 15000, shell: false, ...options });
   if (result.error || result.status !== 0 || result.signal) fail("LOCAL_TRUST_SETUP_FAILED");
@@ -192,7 +202,7 @@ export async function runRealLinuxAppImageUpdater() {
     if (path === "/electron/stable/linux-x64/next.AppImage") { servedImage++; response.writeHead(200, { "content-length": pair.images.next.bytes, "content-type": "application/octet-stream" }); createReadStream(join(pairRoot, pair.images.next.file)).pipe(response); return; }
     unexpectedRequests++; response.writeHead(404).end();
   });
-  let child; let dashboard; let settings; let updatedPid;
+  let child; let dashboard; let settings; let updatedPid; let runtimeErrors = "";
   const receipt = { schemaVersion: "tibotattle-linux-real-appimage-updater-v1", sourceRevision: contract.sourceRevision,
     versions: { current: pair.images.current.version, next: pair.images.next.version }, images: { current: pair.images.current.sha256, next: pair.images.next.sha256 },
     scope: "normal_product_AppImages_with_private_next_version", feed: "fixed_production_URL_simulated_inside_network_none", ca: "disposable_profile_only", publication: "not_performed" };
@@ -204,7 +214,8 @@ export async function runRealLinuxAppImageUpdater() {
       XDG_CONFIG_HOME: config, XDG_CACHE_HOME: join(fixture.home, ".cache"), XDG_DATA_HOME: join(fixture.home, ".local/share"),
       APPIMAGE_EXTRACT_AND_RUN: "1", TMPDIR: temp, NODE_EXTRA_CA_CERTS: cert };
     stage = "current_launch";
-    child = spawn(image, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", "--disable-gpu"], { env: environment, stdio: "ignore" });
+    child = spawn(image, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", "--disable-gpu"], { env: environment, stdio: ["ignore", "ignore", "pipe"] });
+    child.stderr.on("data", (chunk) => { runtimeErrors = (runtimeErrors + chunk.toString("utf8")).slice(-16384); });
     child.on("error", () => {});
     dashboard = await connectPage(port, (url) => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url));
     stage = "dashboard_ready";
@@ -231,18 +242,40 @@ export async function runRealLinuxAppImageUpdater() {
     stage = "current_process_identity";
     const oldPids = new Set(await appPids(image));
     if (!oldPids.size) { receipt.processIdentityDiagnostics = await processIdentityDiagnostics(); fail("CURRENT_PROCESS_MISSING"); }
-    const currentExecutable = await processExecutable([...oldPids][0]);
+    const currentPid = [...oldPids].sort((a, b) => a - b)[0];
+    const currentExecutable = await processExecutable(currentPid);
+    try {
+      const env = (await readFile(`/proc/${currentPid}/environ`, "utf8")).split("\0");
+      const value = env.find((item) => item.startsWith("APPIMAGE="))?.slice(9);
+      receipt.appImageEnvironment = value === image ? "original_private_image"
+        : value === undefined ? "absent_in_proc_environment"
+        : value.startsWith(`${EXEC}/tmp/`) ? "private_extracted_path" : "other_path";
+    } catch { receipt.appImageEnvironment = "proc_environment_unavailable"; }
     if (await digest(join(dirname(currentExecutable), "resources/app.asar")) !== pair.images.current.asarSha256) fail("CURRENT_ASAR_MISMATCH");
+    stage = "install_button_ready";
+    await waitFor(() => settings.evaluate("(() => { const button = document.querySelector('#settings-install-update'); return button !== null && button.disabled === false && button.hidden === false; })()"));
+    receipt.installButtonReady = true;
     stage = "update_install";
     await settings.evaluate("setTimeout(() => document.querySelector('#settings-install-update').click(), 25)");
     let checkedImageStamp;
+    let nextStatusRead = 0;
     await waitFor(async () => {
+      if (Date.now() >= nextStatusRead) {
+        nextStatusRead = Date.now() + 1000;
+        try { receipt.lastInstallStatus = linuxUpdaterFixedStatus((await settings.evaluate("globalThis.tibotattleDesktop.getSettings()")).about.update); }
+        catch { /* Expected once the current app exits. */ }
+        if (receipt.lastInstallStatus?.status === "error") fail("INSTALLER_REPORTED_ERROR");
+      }
       const stat = await lstat(image).catch(() => null);
+      receipt.originalImage = stat ? "present" : "missing";
       if (!stat || stat.size !== pair.images.next.bytes) return false;
       const stamp = `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
       if (stamp === checkedImageStamp) return false;
       checkedImageStamp = stamp;
-      return (await digest(image).catch(() => null)) === pair.images.next.sha256;
+      const hash = await digest(image).catch(() => null);
+      receipt.originalImage = hash === pair.images.next.sha256 ? "exact_next_image"
+        : hash === pair.images.current.sha256 ? "exact_current_image" : "other_bytes";
+      return hash === pair.images.next.sha256;
     }, 60000);
     stage = "automatic_restart";
     updatedPid = await waitFor(async () => {
@@ -274,7 +307,7 @@ export async function runRealLinuxAppImageUpdater() {
     return receipt;
   } catch (error) {
     const code = error.code?.startsWith("LINUX_REAL_APPIMAGE_") ? error.code : "LINUX_REAL_APPIMAGE_FAILED";
-    error.receipt = { ...receipt, status: "failed", stage, code, feedRequests: servedFeed, imageRequests: servedImage, unexpectedRequests };
+    error.receipt = { ...receipt, runtimeErrorCategories: linuxUpdaterRuntimeErrorCategories(runtimeErrors), status: "failed", stage, code, feedRequests: servedFeed, imageRequests: servedImage, unexpectedRequests };
     throw error;
   } finally {
     dashboard?.close(); settings?.close();
