@@ -25,8 +25,12 @@ Latest continuation, 2026-09-09:
   The untouched profile completed the actual native introduction, created
   default-on sharing without a seeded preference, automatically enrolled and
   uploaded, reused its installation credential after controlled restart, then
-  retained opt-out after another restart. No social sign-in was used. Server
-  readback found one new synthetic enrollment, two accepted chunks, two usage
+  retained opt-out after another restart. No social sign-in was used.
+  The scheduler, accountless client, incremental upload and credential capability
+  source files are unchanged between signed `c0c98040` and runner `990b7fc9`;
+  staging intentionally keeps its isolated origin/profile/account binding and
+  disabled updater. Accepted receipts mean durable staged records, not downstream
+  public analytics. Server readback found one new synthetic enrollment, two accepted chunks, two usage
   records and two quota records; all 23 retained staging records joined to
   consistent installation ownership, with zero duplicate occurrence groups and
   zero public daily aggregates. Staging is restored to revision 16, all four
