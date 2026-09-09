@@ -9,13 +9,15 @@ import { forEachRolloutLine } from '../../../src/rollout-line-reader.js';
 export function argumentsFor(argv) {
   const { values } = parseArgs({ args: argv, strict: true, allowPositionals: false, options: {
     root: { type: 'string' }, output: { type: 'string' }, since: { type: 'string' },
+    all: { type: 'boolean', default: false },
     'max-bytes': { type: 'string', default: '1073741824' },
     'max-files': { type: 'string', default: '50' },
     'max-seconds': { type: 'string', default: '60' }, baseline: { type: 'boolean', default: false },
   } });
-  if (!values.root || !values.output || !/^\d{4}-\d{2}-\d{2}$/.test(values.since ?? '')
-    || !Number.isFinite(Date.parse(values.since))) throw new Error('invalid_arguments');
-  for (const [name, upper] of [['max-bytes', 8 * 1024 ** 3], ['max-files', 5000], ['max-seconds', 300]]) {
+  const validDate = /^\d{4}-\d{2}-\d{2}$/.test(values.since ?? '') && Number.isFinite(Date.parse(values.since));
+  if (!values.root || !values.output || (values.all ? values.since !== undefined : !validDate))
+    throw new Error('invalid_arguments');
+  for (const [name, upper] of [['max-bytes', 8 * 1024 ** 3], ['max-files', 50000], ['max-seconds', 300]]) {
     const n = Number(values[name]);
     if (!Number.isSafeInteger(n) || n < 1 || n > upper) throw new Error('invalid_budget');
     values[name] = n;
@@ -47,11 +49,11 @@ const ERROR_CODES = new Set(['cancelled', 'source_replaced', 'source_rewritten',
   'line_exceeds_budget', 'unsafe_source', 'SQLITE_BUSY', 'SQLITE_FULL']);
 export async function run(options, signal) {
   const started = performance.now();
-  const selection = await discover(resolve(options.root), Date.parse(options.since), options['max-files']);
+  const selection = await discover(resolve(options.root), options.all ? -Infinity : Date.parse(options.since), options['max-files']);
   const output = resolve(options.output);
   await mkdir(resolve(output, '..'), { recursive: true, mode: 0o700 });
   const store = await openStore(output);
-  const summary = { baseline: options.baseline, selected: selection.files.length,
+  const summary = { baseline: options.baseline, allHistory: options.all === true, selected: selection.files.length,
     candidates: selection.candidates, scanned: 0, unchanged: 0, scanBytes: 0, failures: {}, limited: false };
   try {
     for (const file of selection.files) {

@@ -37,6 +37,17 @@ class TimingTrendTests(unittest.TestCase):
         self.assertIsNone(result[1]['median'])
         self.assertEqual(plot.trend_bins([self.row(duration=None)], 'tps'), [])
 
+    def test_sparse_medians_join_and_missing_days_are_dashed(self):
+        rows = [self.row(), self.row(at=86400000), self.row(at=3 * 86400000), self.row(at=20 * 86400000)]
+        bins = plot.trend_bins(rows, 'ttft')
+        before = [b.copy() for b in bins]
+        segments = plot.median_segments(bins)
+        self.assertEqual(len(segments), 2)
+        self.assertEqual([s['dashed'] for s in segments], [False, True])
+        self.assertEqual(bins, before)
+        self.assertIsNone(bins[2]['median'])
+        self.assertEqual(len(plot.median_segments(bins, maximum_gap_days=0)), 1)
+
     def test_zero_ttft_is_valid_and_day_boundary_is_exact(self):
         result = plot.trend_bins([self.row(at=86400000 - 1, ttft=0), self.row(at=86400000, ttft=1000)], 'ttft')
         self.assertEqual([b['median'] for b in result], [0, 1])

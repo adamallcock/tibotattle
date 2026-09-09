@@ -51,33 +51,59 @@ def trend_bins(rows, metric, hours=24):
     return result
 
 
+def median_segments(bins, hours=24, maximum_gap_days=7):
+    """Connect measured medians; never create observations or percentile bands."""
+    observed = [b for b in bins if b['n'] > 0]
+    width = hours * 3600 * 1000
+    maximum = max(width, maximum_gap_days * 86400000)
+    return [{'left': left, 'right': right,
+             'dashed': right['start'] - left['start'] > width}
+            for left, right in zip(observed, observed[1:])
+            if right['start'] - left['start'] <= maximum]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', required=True)
     parser.add_argument('--output', required=True, help='New output prefix; existing files are refused')
-    parser.add_argument('--since', required=True)
+    parser.add_argument('--since', help='Optional completion-date filter; omitted means all retained history')
+    parser.add_argument('--models', help='Comma-separated model labels; default is the four current models')
+    parser.add_argument('--connect-gap-days', type=int, default=7)
     parser.add_argument('--style', choices=['trend', 'scatter'], default='trend')
     parser.add_argument('--bin-hours', type=int, choices=[6, 12, 24, 48, 168], default=24)
     parser.add_argument('--band', choices=['iqr', 'p10-p90'], default='iqr')
     parser.add_argument('--min-bin', type=int, default=5)
     args = parser.parse_args()
+    if not 0 <= args.connect_gap_days <= 365:
+        raise ValueError('Connection gap must be 0–365 days')
     if args.min_bin < 2:
         raise ValueError('Minimum bin size must be at least two')
     low_key, high_key, band_label = ('p25', 'p75', 'P25–P75 (middle 50%)') if args.band == 'iqr' else ('p10', 'p90', 'P10–P90 (middle 80%)')
     os.umask(0o077)
-    since = dt.datetime.fromisoformat(args.since).replace(tzinfo=dt.timezone.utc)
+    since = dt.datetime.fromisoformat(args.since).replace(tzinfo=dt.timezone.utc) if args.since else None
     with open(args.input) as handle:
         data = json.load(handle)
-    rows = [r for r in data['turns'] if r['at'] >= since.timestamp() * 1000]
+    rows = [r for r in data['turns'] if since is None or r['at'] >= since.timestamp() * 1000]
     names = {'gpt-5.6-luna': 'Luna', 'gpt-5.6-terra': 'Terra', 'gpt-6-astra': 'Astra', 'gpt-5.6-sol': 'Sol'}
     colors = {'gpt-5.6-luna': '#3267a4', 'gpt-5.6-terra': '#b38324', 'gpt-6-astra': '#c66035', 'gpt-5.6-sol': '#717a40'}
+    known_names = {**names, 'gpt-5.5': 'GPT-5.5', 'gpt-5.4': 'GPT-5.4', 'gpt-5.4-mini': 'GPT-5.4 mini',
+        'gpt-5.3-codex-spark': 'Codex Spark', 'gpt-5.3-codex': 'GPT-5.3 Codex', 'gpt-5.2-codex': 'GPT-5.2 Codex', 'gpt-5.2': 'GPT-5.2'}
+    if args.models:
+        selected = args.models.split(',')
+        if not 1 <= len(selected) <= 4 or len(set(selected)) != len(selected) or any(m not in known_names for m in selected):
+            raise ValueError('Select 1–4 distinct known models')
+        names = {m: known_names[m] for m in selected}
+        colors = dict(zip(selected, ['#3267a4', '#b38324', '#c66035', '#717a40']))
     # Facets identify models even in greyscale; color is a secondary cue.
-    fig, axes = plt.subplots(2, 4, figsize=(17.5, 9), sharex='row', sharey='row')
+    fig, axes = plt.subplots(2, len(names), figsize=(4.375 * len(names), 9), sharex='row', sharey='row', squeeze=False)
     fig.patch.set_facecolor('#fafafa')
     fig.suptitle('Output speed and recorded turn TTFT over time', x=.065, ha='left', fontsize=22, fontweight='bold')
     subtitle = (f'{args.bin_hours}-hour median · shaded {band_label} of turns · bands require n ≥ {args.min_bin} · all reasoning efforts · UTC'
         if args.style == 'trend' else 'One point per completed turn · all reasoning efforts · UTC')
     fig.text(.065, .918, subtitle, fontsize=11, color='#555555')
+    if rows:
+        dates = [dt.datetime.fromtimestamp(r['at'] / 1000, dt.timezone.utc).strftime('%b %d, %Y') for r in [min(rows, key=lambda r: r['at']), max(rows, key=lambda r: r['at'])]]
+        fig.text(.065, .887, f'Retained completion history: {dates[0]} – {dates[1]} · each metric axis shows its supported period', fontsize=10, color='#555555')
     plotted_values = {'tps': [], 'ttft': []}
     summaries = []
     for col, (model, label) in enumerate(names.items()):
@@ -97,11 +123,16 @@ def main():
                 dense = [b for b in bins if b['n'] >= args.min_bin]
                 sparse = [b for b in bins if 0 < b['n'] < args.min_bin]
                 x = [dt.datetime.fromtimestamp(b['at'] / 1000, dt.timezone.utc) for b in bins]
-                y = [b['median'] if b['n'] >= args.min_bin else float('nan') for b in bins]
                 lower = [b[low_key] if b['n'] >= args.min_bin else float('nan') for b in bins]
                 upper = [b[high_key] if b['n'] >= args.min_bin else float('nan') for b in bins]
                 ax.fill_between(x, lower, upper, color=colors[model], alpha=.17, linewidth=0)
-                ax.plot(x, y, color=colors[model], marker='o', markersize=4, linewidth=1.6)
+                for segment in median_segments(bins, args.bin_hours, args.connect_gap_days):
+                    a, b = segment['left'], segment['right']
+                    ax.plot([dt.datetime.fromtimestamp(v['at'] / 1000, dt.timezone.utc) for v in [a, b]],
+                        [a['median'], b['median']], color=colors[model], linewidth=1.6,
+                        linestyle='--' if segment['dashed'] else '-')
+                ax.scatter([dt.datetime.fromtimestamp(b['at'] / 1000, dt.timezone.utc) for b in dense],
+                    [b['median'] for b in dense], color=colors[model], s=18, zorder=3)
                 # Vertical percentile bars also show isolated supported bins.
                 if dense:
                     dx = [dt.datetime.fromtimestamp(b['at'] / 1000, dt.timezone.utc) for b in dense]
@@ -149,12 +180,14 @@ def main():
     axes[1, 0].set_ylabel('Recorded turn TTFT (seconds)' + ('; symlog scale' if args.style == 'scatter' else ''), fontsize=11)
     plotted_tps = sum(s['tps_turns'] for s in summaries)
     plotted_ttft = sum(s['ttft_turns'] for s in summaries)
+    if not plotted_tps:
+        axes[0, 0].set_xticks([])
     other = sum(r['model'] not in names for r in rows)
     fig.text(.065, .105, f'{len(rows):,} completed turns in date range · {plotted_tps} supported TPS observations · {plotted_ttft} recorded TTFT observations · {other:,} other/unknown-model turns omitted', fontsize=9, color='#444444')
-    notes = (f'All values enter percentiles; values outside {band_label} are hidden only by this summary. Hollow dots: sparse bins without a band. Bands show spread, not confidence intervals.'
+    notes = (f'Solid lines join adjacent observed medians, including sparse days. Dashed lines bridge gaps ≤ {args.connect_gap_days} days; no values or bands are filled into gaps.'
         if args.style == 'trend' else 'All supported observations are shown; missing evidence stays unavailable.')
-    fig.text(.065, .045, notes + '\nTPS includes reasoning and excludes tool gaps. TTFT is Codex’s turn metric. Workload and reasoning-effort mixes differ across models.', fontsize=9, color='#555555', linespacing=1.6)
-    fig.subplots_adjust(left=.065, right=.98, top=.86, bottom=.20, hspace=.44, wspace=.16)
+    fig.text(.065, .045, notes + '\nHollow dots: sparse days without a band. All observations enter percentiles. TPS includes reasoning; TTFT is turn-level. Workload and effort mixes differ.', fontsize=9, color='#555555', linespacing=1.6)
+    fig.subplots_adjust(left=.065, right=.98, top=.83, bottom=.20, hspace=.44, wspace=.16)
     prefix = Path(args.output)
     for suffix in ['.png', '.svg', '.json']:
         if prefix.with_suffix(suffix).exists():
@@ -162,7 +195,7 @@ def main():
     fig.savefig(prefix.with_suffix('.png'), dpi=170, facecolor=fig.get_facecolor())
     fig.savefig(prefix.with_suffix('.svg'), facecolor=fig.get_facecolor())
     with open(prefix.with_suffix('.json'), 'x') as handle:
-        json.dump({'since': args.since, 'style': args.style, 'bin_hours': args.bin_hours, 'minimum_bin': args.min_bin, 'band': args.band, 'models': summaries, 'quality': dict(collections.Counter(r['quality'] for r in rows))}, handle, indent=2)
+        json.dump({'since': args.since, 'style': args.style, 'bin_hours': args.bin_hours, 'minimum_bin': args.min_bin, 'band': args.band, 'connect_gap_days': args.connect_gap_days, 'models': summaries, 'quality': dict(collections.Counter(r['quality'] for r in rows))}, handle, indent=2)
     print(json.dumps({'models': [{k: v for k, v in s.items() if k != 'bins'} for s in summaries], 'completed_in_range': len(rows), 'omitted_models': other}))
 
 

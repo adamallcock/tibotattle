@@ -29,7 +29,9 @@ Production integration and migration remain a subsequent gate.
   histories and conflicting attribution. Keep quality/coverage counts.
 - Model panels show median per-turn TPS and recorded TTFT by completion date,
   with percentile bands, sample counts and effort context. Sparse bins use hollow
-  points; missing bins break lines. The original scatter view remains available.
+  points. Adjacent observed medians connect; missing bins use dashed connections
+  up to seven days by default, without filling observations or bands. Longer gaps
+  break lines. The original scatter view remains available.
   Exclude automatic-review/unknown models.
   Produce local PNG/SVG plus content-free scalar data; inspect the rendered plot.
 
@@ -88,7 +90,8 @@ startup. These are proposed acceptance thresholds, not achieved production claim
 ## Implemented local interfaces
 
 - [Runner](../../tools/reports/inference-timing/run.mjs): explicit source root,
-  output directory, start date, file/byte/time budgets; optional reader-only baseline.
+  output directory, start date or explicit `--all`, file/byte/time budgets;
+  optional reader-only baseline.
 - [Parser](../../tools/reports/inference-timing/parser.mjs): bounded same-turn
   reconstruction, response reconciliation, model/effort allowlists and quality flags.
 - [Sidecar](../../tools/reports/inference-timing/store.mjs): atomic checkpoints,
@@ -205,16 +208,18 @@ The combined sidecar contains 20,209 completed-turn rows in 6,156,288 bytes
 1,925 have one of the four displayed model labels. Unknown/other-model turns
 remain excluded from per-model claims. The plotted data has 114 supported TPS
 observations and 1,689 recorded TTFT observations. TTFT is available back to
-August 10; supported TPS starts September 3 (September 4 for Astra). Reading older
-files cannot recover timestamps absent from their recorded evidence.
+August 10; accepted TPS starts September 3 (September 4 for Astra). This is the
+strict reconstruction's accepted cohort boundary, not a proven logging-field
+introduction date; the all-history investigation below corrects that inference.
 
 The renderer defaults to daily median plus P25–P75, the middle 50% of observations.
 `--band p10-p90` provides the middle 80%; `--style scatter` shows individual
 observations. `--bin-hours` accepts 6, 12, 24, 48 or 168. All valid observations
 enter quantile calculations, including extreme values. These are spread bands,
 not confidence intervals or an error filter. No winsorization, deletion or
-retry inference is applied. A band/line requires at least five observations;
-sparser bins appear as hollow median points. Metrics use their actual supported
+retry inference is applied. In this earlier renderer a band/line required at least
+five observations; sparser bins appeared as hollow median points. The updated
+connection rule is documented below. Metrics use their actual supported
 date ranges, labelled separately, with a shared range across models per row.
 
 The wider P10–P90 view retains a very broad Sol range on August 22. The IQR view
@@ -249,3 +254,64 @@ zero TTFT, plus a Node test for the expanded file ceiling. Run Python checks in
 the plotting environment with `python test/inference-timing-plot.test.py`.
 Nineteen Node tests and four Python tests pass; main and companion PNGs are
 visually inspected. The production accounting code and database are unchanged.
+
+## All-history scan and September boundary investigation, 2026-09-09
+
+The explicit `--all` mode removes the modification-date filter and refuses a
+simultaneous `--since`. The file ceiling is 50,000, default 50; byte, time,
+discovery and per-chunk memory bounds remain. Scan each source root with `--all
+--max-files 50000 --max-bytes 8589934592 --max-seconds 60` and repeat until
+`limited` is false. No compressed rollout files were found in this inventory.
+
+Coverage verification matched all 5,045 session and 3,722 archive JSONL paths to
+sidecar checkpoints: 8,767 currently present files, 48.72 GB. Every checkpoint
+reached its scanned snapshot end; 17 active session files had subsequently grown.
+The sidecar retains 8,805 source-path checkpoints, including 38 paths no longer
+present in that inventory. Checkpoints survive source moves or archiving;
+logical turn keys deduplicate measurements across sources.
+Both roots completed with no source failures. The four extension passes read
+25.88 GB, reusing prior checkpoints, and reported 30.2 seconds total scan time,
+98–121 MiB peak RSS. These are incremental local scan measurements, not a cold
+production overhead benchmark.
+
+The final export contains 29,494 completed turns dated May 17–September 9,
+127 complete TPS observations and 25,711 recorded TTFTs, in a 9,969,664-byte
+SQLite sidecar (9.51 MiB). Model-attributed charts show 4,239 TTFTs for the four
+current models and 5,519 for the four earlier models; unknown attribution remains
+excluded. The remaining older model panels explicitly show unavailable TPS.
+
+Chart contract: compare daily median per-turn estimates across all retained
+history using static Matplotlib facets and P25–P75 spread bands. Preserve the
+existing blue/gold/orange/olive palette, direct model labels, sample counts and
+hollow sparse markers. Connect adjacent observed medians regardless of sample
+size; dashed segments bridge up to seven days (`--connect-gap-days`), while bands
+still require five observations and never fill missing bins. Each metric row
+shows its supported date extent; the caption gives the full retained range.
+`--models` selects one to four allowlisted model panels; omitted `--since` means
+all retained dates. Sparse TPS, especially Sol, remains descriptive rather than
+proof of a stable trend. PNG/SVG plus scalar JSON artifacts are retained locally.
+
+September 3 is the earliest accepted full-turn TPS under method 1, not a hardcoded
+cutoff or proven start of upstream timing support. A bounded diagnostic of 100
+unique files found timed model items from August 27 and per-response usage
+records by September 2 at 23:13 UTC. Some raw evidence is inherited fork history,
+which this prototype excludes. In the September 2 sample, 17 completions were
+rejected for item intervals and eight for unreadable evidence. A separate probe
+found 27 missing-start violations and no prior-usage overlap violations. Relaxing
+timestamp tolerance would not repair those cases. Missing coverage rejects the
+whole turn because its total tokens cannot be divided by a partial duration.
+
+A distinct legacy estimator may be possible using timed item starts, final model
+message/tool-call timestamps and the passthrough turn metadata, with reconciled
+cumulative output deltas. It is not implemented or mixed into method 1. Directly
+substituting legacy token-count timestamps is invalid: one September 1 sample
+had 196 output tokens over 3.534 seconds to the final model event (55.5 TPS), but
+16.575 seconds to the delayed usage record (11.8 TPS), including 13.041 seconds
+of extra elapsed time after model output and a tool result. Any legacy method
+needs its own correlation, reconciliation, ambiguity tests and method identity.
+The diagnostic receipt retains only allowlisted counts, dates and numeric cases.
+
+Validation: 20 focused Node tests and five Python tests pass. Documentation,
+tool inventory, architecture and preflight gates pass. Both final chart layouts
+were inspected after separating the date-range caption from facet titles.
+Production accounting and the installed application were not modified.

@@ -183,5 +183,13 @@ test('CLI refuses unknown options and unbounded budgets', () => {
 test('expanded scan file limit remains explicitly bounded', () => {
   const base = ['--root', '.', '--output', '.', '--since', '2026-08-10'];
   assert.equal(argumentsFor([...base, '--max-files', '5000'])['max-files'], 5000);
-  assert.throws(() => argumentsFor([...base, '--max-files', '5001']));
+  assert.equal(argumentsFor([...base, '--max-files', '50000'])['max-files'], 50000);
+  assert.throws(() => argumentsFor([...base, '--max-files', '50001']));
+});
+
+test('all-history mode removes date filtering explicitly and rejects ambiguous dates', () => {
+  const base = ['--root', '.', '--output', '.', '--all'];
+  assert.equal(argumentsFor(base).all, true);
+  assert.throws(() => argumentsFor([...base, '--since', '2026-08-10']));
+  assert.throws(() => argumentsFor(['--root', '.', '--output', '.']));
 });
