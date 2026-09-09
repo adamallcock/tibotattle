@@ -3701,6 +3701,16 @@ test("desktop lifecycle owns a bounded Settings window and authorizes only its t
   );
   assert.equal(windows.length, 3);
 
+  const projectsMenuItem = applicationMenus[0].template.find((item) => item.label === "View")
+    .submenu.find((item) => item.label === "Projects & threads");
+  projectsMenuItem.click();
+  assert.equal(settings.visible, false);
+  assert.deepEqual(dashboardWindowsForTest(windows)[0].webContents.sent.at(-1), {
+    channel: "tibotattle:desktop-command:v1",
+    command: { command: "dashboardSection", section: "projects" },
+  });
+  assert.equal(lifecycle.navigateDashboardSection("#projects"), false);
+
   const aboutMenuItem = applicationMenus[0].template[0].submenu.find(
     (item) => item.label === "About TiboTattle",
   );
@@ -4629,6 +4639,9 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
   commandListener({}, { command: "dashboardSection", section: "weekly" });
   commandListener({}, { command: "dashboardSection", section: "timeline" });
   commandListener({}, { command: "dashboardSection", section: "accounting" });
+  commandListener({}, { command: "dashboardSection", section: "projects" });
+  commandListener({}, { command: "dashboardSection", section: "projects", search: "unexpected" });
+  commandListener({}, { command: "dashboardSection", section: "#projects" });
   commandListener({}, { command: "dashboardSection", section: "community" });
   commandListener({}, { command: "language", value: "es" });
   commandListener({}, { command: "sidebar", collapsed: true });
@@ -4654,6 +4667,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     { command: "dashboardSection", section: "weekly" },
     { command: "dashboardSection", section: "timeline" },
     { command: "dashboardSection", section: "accounting" },
+    { command: "dashboardSection", section: "projects" },
     { command: "dashboardSection", section: "community" },
     { command: "language", value: "es" },
     { command: "sidebar", collapsed: true },

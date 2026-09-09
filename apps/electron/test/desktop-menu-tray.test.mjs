@@ -90,6 +90,7 @@ test("application menu maps all desktop commands to the injected action interfac
   item(view, "Weekly Allowance").click();
   item(view, "Usage Timeline").click();
   item(view, "Usage and Costs").click();
+  item(view, "Projects & threads").click();
   item(view, "Toggle Sidebar").click();
   item(view, "Show TiboTattle Dev").click();
   item(view, "Focus TiboTattle Dev").click();
@@ -101,6 +102,7 @@ test("application menu maps all desktop commands to the injected action interfac
     "weekly",
     "timeline",
     "accounting",
+    "projects",
     "toggleSidebar",
     "show",
     "focus",
@@ -143,6 +145,7 @@ test("desktop menu and tray copy resolves every supported language", () => {
   const expected = {
     "en-US": {
       file: "File",
+      projects: "Projects & threads",
       refresh: "Update Local Usage",
       checkForUpdates: "Check for Updates…",
       tray: "Open TiboTattle Dev",
@@ -152,6 +155,7 @@ test("desktop menu and tray copy resolves every supported language", () => {
     },
     "zh-Hans": {
       file: "文件",
+      projects: "项目与会话",
       refresh: "更新本地使用情况",
       checkForUpdates: "检查更新…",
       tray: "打开 TiboTattle Dev",
@@ -161,6 +165,7 @@ test("desktop menu and tray copy resolves every supported language", () => {
     },
     es: {
       file: "Archivo",
+      projects: "Proyectos e hilos",
       refresh: "Actualizar uso local",
       checkForUpdates: "Buscar actualizaciones…",
       tray: "Abrir TiboTattle Dev",
@@ -181,6 +186,7 @@ test("desktop menu and tray copy resolves every supported language", () => {
     assert.equal(file[1].label, locale === "en-US" ? "Settings…" : locale === "zh-Hans" ? "设置…" : "Configuración…");
     const view = menu.find(({ label }) => label === (locale === "en-US" ? "View" : locale === "zh-Hans" ? "视图" : "Ver"));
     assert.equal(view.submenu[0].label, copy.refresh);
+    assert.equal(typeof item(view.submenu, copy.projects).click, "function");
     const tray = createDesktopTrayTemplate({
       appName: "TiboTattle Dev",
       locale,

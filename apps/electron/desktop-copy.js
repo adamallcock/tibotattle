@@ -462,6 +462,11 @@ const DESKTOP_MESSAGES = Object.freeze({
     "zh-Hans": "使用情况与成本",
     es: "Uso y costos",
   }),
+  "electron.menu.projects": Object.freeze({
+    "en-US": "Projects & threads",
+    "zh-Hans": "项目与会话",
+    es: "Proyectos e hilos",
+  }),
   "electron.menu.toggleSidebar": Object.freeze({
     "en-US": "Toggle Sidebar",
     "zh-Hans": "切换侧边栏",

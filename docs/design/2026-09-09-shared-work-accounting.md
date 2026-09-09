@@ -508,3 +508,35 @@ qualification confirmed all-history search and project expansion, followed by
 navigation away and back with the search, expanded row and as-of time preserved.
 The observed touch returned HTTP 200 in 8 ms; this is one local observation, not a
 latency guarantee. The installed app and release remain unchanged.
+
+
+## Current Electron app integration, 2026-09-09
+
+The feature is integrated on the current Electron application lineage from
+`f5115a5a`, preserving the newer accountless lifecycle, model catalog and
+auto-review task handling. The shared local companion remains the only
+accounting owner. The shared formatter preserves parent-only auto-review links;
+internal review UUIDs remain non-navigable. Collaboration ancestry remains an
+explicit worker-source graph and does not inherit guardian rollout navigation.
+
+Projects is included in the closed desktop command, preload, lifecycle and
+renderer section vocabularies, with localized View-menu access. Canonical Codex
+links reuse existing trusted-click interception and validation. Existing model
+icons and styles are reused. The pure model-visual helper is already used by
+the current public community surface; keep it shared while explicitly excluding
+the local work-usage module from public artifacts.
+
+The integration branch is isolated from existing dirty checkouts. Desktop
+qualification uses a durable development artifact and a private backup of the
+real index, collector database and matching salt through the reviewed profile
+helper. No installed database, release branch, signing or publication is changed.
+
+Integration validation: 689 web tests and 348 local companion tests passed.
+The selected domain/index suite passed 251 of 252 initially; the remaining exact
+public-export expectation was corrected for the two reviewed added exports and
+its focused suite passed. Metadata tests additionally verify multilevel worker
+ancestry and that ancestry reads no guardian rollout or names file. Electron's
+588-test suite passed 587 in the sandbox; the sole AppKit launch abort passed
+unchanged outside the outer sandbox. Public build, export, API/doc contracts,
+runtime graph, architecture and preflight checks passed after reconciling the
+current shared-helper classification and route inventory.

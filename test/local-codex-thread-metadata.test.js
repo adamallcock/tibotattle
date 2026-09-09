@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
+import fsPromises, {
   chmod, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { readCodexLocalRepositoryOrigins, readCodexLocalThreadMetadata } from "../src/platform/index.js";
+import { readCodexLocalRepositoryOrigins, readCodexLocalThreadAncestry, readCodexLocalThreadMetadata } from "../src/platform/index.js";
 
 const ROOT = "11111111-1111-4111-8111-111111111111";
 const WORKER = "22222222-2222-4222-8222-222222222222";
@@ -87,6 +88,43 @@ test("selected metadata resolves display names and explicit worker parents witho
   ]);
   assert.doesNotMatch(JSON.stringify([...result]), new RegExp(PRIVATE_PROMPT_CANARY, "u"));
   assert.deepEqual(await Promise.all([readFile(databaseFile), readFile(namesFile)]), before);
+});
+
+test("accounting ancestry follows nested workers without reading guardian rollout parents", async (t) => {
+  const { home, databaseFile, rolloutPath } = await addAutoReview(t);
+  const grandchild = "55555555-5555-4555-8555-555555555555";
+  const database = new DatabaseSync(databaseFile);
+  database.prepare(`INSERT INTO threads(
+    id, title, source, thread_source, agent_nickname, rollout_path)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(grandchild, PRIVATE_PROMPT_CANARY,
+      JSON.stringify({ subagent: { thread_spawn: { parent_thread_id: WORKER } } }),
+      "subagent", null, null);
+  database.close();
+
+  // This is a valid guardian navigation fixture, not a malformed log that
+  // would hide an accidental ancestry read behind normal rejection.
+  const displayed = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW]);
+  assert.equal(displayed.get(AUTO_REVIEW).parent.id, ROOT);
+
+  const opened = [];
+  const originalOpen = fsPromises.open;
+  const mockedOpen = t.mock.method(fsPromises, "open", async function (path, ...args) {
+    opened.push(path);
+    return originalOpen.call(this, path, ...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    // Request only the leaf, forcing both explicit ancestors to be loaded.
+    const ancestry = await readCodexLocalThreadAncestry(home, [grandchild, AUTO_REVIEW]);
+    assert.deepEqual([...ancestry], [[grandchild, ROOT], [AUTO_REVIEW, AUTO_REVIEW]]);
+    assert.equal(opened.includes(rolloutPath), false,
+      "guardian session metadata must never be opened for accounting ancestry");
+    assert.deepEqual(opened, [], "ancestry does not open display-name or rollout files");
+  } finally {
+    mockedOpen.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 test("guardian review uses only its own verified session parent and an accessible local parent record", async (t) => {

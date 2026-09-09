@@ -149,6 +149,9 @@ a task for model and contributor details. Worktrees share a repository group;
 folders with no identifiable repository appear under **Non-project tasks**.
 Missing source context remains **Unassigned**.
 
+Open **Projects & threads** in the dashboard sidebar, or choose
+**View → Projects & threads** in the Electron desktop app.
+
 Search by project or task name, including subworker names, or paste a complete
 thread ID or Codex link. Name search covers the full report before pagination.
 A matching subworker brings back its task family; a matching project includes
