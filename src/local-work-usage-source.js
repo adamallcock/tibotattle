@@ -627,13 +627,14 @@ export async function readLocalWorkUsageSnapshot({
   }
 }
 
-export async function enrichWorkUsageRows({ result, rows, codexHome }) {
+export async function enrichWorkUsageRows({ result, rows, codexHome, purpose }) {
   const ids = rows
     .filter((r) => r.kind === "thread")
     .map((r) => result.display.threads[r.id]?.uuid)
     .filter(Boolean);
   const names = await readCodexLocalThreadMetadata(codexHome, ids, {
     allowTitleFallback: true,
+    forNameSearch: purpose === "search",
   });
   const display = {};
   for (const row of rows) {

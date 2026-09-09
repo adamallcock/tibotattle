@@ -1,3 +1,4 @@
+import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import {
   formatNumber,
   formatLocal,
@@ -224,6 +225,7 @@ export function mountWorkUsageView({
         delete query.worktree;
         delete query.thread;
         delete query.findThread;
+        delete query.search;
         query.grouping = id;
         resetPage();
         load();
@@ -285,15 +287,21 @@ export function mountWorkUsageView({
   input.setAttribute("aria-label", tr("findHint"));
   const find = button(tr("find"), () => {});
   find.type = "submit";
-  form.append(input, find);
+  const clearSearch = button(tr("clearSearch"), () => {
+    input.value = "";
+    applySearch("");
+    input.focus();
+  }, "button button-quiet compact");
+  clearSearch.hidden = true;
+  form.append(input, find, clearSearch);
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    const value = input.value.trim();
-    if (
-      !/^(?:codex:\/\/threads\/)?[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
-        value,
-      )
-    ) {
+    applySearch(input.value.trim());
+  });
+  function applySearch(value) {
+    const exactThread = /^(?:codex:\/\/threads\/)?[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
+    if (value.length > 100 || /[\u0000-\u001f\u007f]/u.test(value)
+        || (/^codex:\/\//iu.test(value) && !exactThread)) {
       setStatus("invalid");
       return;
     }
@@ -302,11 +310,14 @@ export function mountWorkUsageView({
     delete query.project;
     delete query.worktree;
     delete query.thread;
-    query.findThread = value;
-    query.grouping = "thread";
+    delete query.findThread;
+    delete query.search;
+    if (exactThread) query.findThread = value;
+    else if (value) query.search = value;
+    query.grouping = exactThread ? "thread" : "project";
     resetPage();
     load();
-  });
+  }
   const message = el("p", "work-usage-status");
   message.setAttribute("role", "status");
   message.setAttribute("aria-live", "polite");
@@ -396,6 +407,14 @@ export function mountWorkUsageView({
           `${tr(row.kind === "project" ? "projects" : row.kind === "worktree" ? "worktrees" : "threads")} · ${display?.shortId ?? row.id.slice(-10)}`);
   }
   const quantity = (n) => (n === null ? "—" : formatNumber(n));
+  function appendModelIcon(target, id) {
+    const presentation = modelUsagePresentation(id);
+    const icon = modelThemeIcon(documentRef, presentation.theme);
+    if (icon) {
+      icon.classList.add("model-usage-icon", presentation.className);
+      target.prepend(icon);
+    }
+  }
   const quietButton = (text, action) =>
     button(text, action, "button button-quiet compact");
   function clearNested() {
@@ -503,6 +522,32 @@ export function mountWorkUsageView({
       summaries.append(card);
     }
     body.append(summaries);
+    const totalTokens = response.totals.tokens;
+    if (totalTokens > 0) {
+      const mix = el("section", "work-usage-mix");
+      mix.append(el("h3", null, tr("tokenMix")));
+      const strip = el("div", "work-usage-mix-strip");
+      strip.setAttribute("aria-hidden", "true");
+      const legend = el("ul", "work-usage-mix-legend");
+      for (const index of [1, 0, 2, 3, 4, 5]) {
+        const amount = response.totals.components[COMPONENTS[index]];
+        if (!(amount > 0)) continue;
+        const style = `work-usage-component-${index}`;
+        const segment = el("span", style);
+        segment.style.width = `${Math.min(100, amount / totalTokens * 100)}%`;
+        strip.append(segment);
+        const item = el("li");
+        const swatch = el("span", `work-usage-mix-swatch ${style}`);
+        swatch.setAttribute("aria-hidden", "true");
+        item.append(swatch, el("span", null, tr(COMPONENT_LABELS[index])),
+          el("strong", null, formatSharePercent(amount, totalTokens)),
+          el("span", "work-usage-mix-count", quantity(amount)));
+        legend.append(item);
+      }
+      mix.append(strip, legend);
+      body.append(mix);
+    }
+    if (query.search) body.append(el("p", "annotation work-usage-search-note", tr("searchNote")));
     if (response.totals.assumedEvents)
       body.append(el("p", "annotation", tr("assumedNote", {count: quantity(response.totals.assumedEvents)})));
     if (response.totals.incompleteEvents)
@@ -681,8 +726,10 @@ export function mountWorkUsageView({
         toggle.append(caret);
         identity.prepend(toggle);
         const primary = row.modelBreakdown[0];
-        identity.append(el("small", "work-usage-muted work-usage-primary-model",
-          tr("primaryModel", { model: formatModelName(primary.id), extra: row.modelBreakdown.length > 1 ? ` +${row.modelBreakdown.length - 1}` : "" })));
+        const primaryLabel = el("small", "work-usage-muted work-usage-primary-model",
+          tr("primaryModel", { model: formatModelName(primary.id), extra: row.modelBreakdown.length > 1 ? ` +${row.modelBreakdown.length - 1}` : "" }));
+        appendModelIcon(primaryLabel, primary.id);
+        identity.append(primaryLabel);
         control = toggle;
       }
       if (
@@ -707,7 +754,17 @@ export function mountWorkUsageView({
       );
       if (row.priceStatus === "partial")
         cost.append(el("small", "work-usage-muted", tr("partial")));
-      const share = (part, whole) => formatSharePercent(part, whole) ?? "—";
+      const shareCell = (part, whole, index) => {
+        const cell = numericCell(formatSharePercent(part, whole) ?? "—", index, "numeric-cell model-share");
+        if (part !== null && whole > 0 && Number.isFinite(part)) {
+          const bar = el("span", "work-usage-bar");
+          bar.setAttribute("aria-hidden", "true");
+          const fill = el("span");
+          fill.style.width = `${Math.max(0, Math.min(100, part / whole * 100))}%`;
+          bar.append(fill); cell.append(bar);
+        }
+        return cell;
+      };
       const costNumber =
         row.costUsdExact === null ? null : Number(row.costUsdExact);
       const totalCost =
@@ -718,17 +775,9 @@ export function mountWorkUsageView({
         identity,
         numericCell(quantity(row.events), 1),
         tokens,
-        numericCell(
-          share(row.tokens, response.totals.tokens),
-          3,
-          "numeric-cell model-share",
-        ),
+        shareCell(row.tokens, response.totals.tokens, 3),
         cost,
-        numericCell(
-          share(costNumber, totalCost),
-          5,
-          "numeric-cell model-share",
-        ),
+        shareCell(costNumber, totalCost, 5),
       );
       return trNode;
     };
@@ -756,7 +805,10 @@ export function mountWorkUsageView({
       head.append(header); detail.append(head);
       const body = el("tbody");
       for (const model of row.modelBreakdown) {
-        const line = el("tr"); line.append(el("td",null,formatModelName(model.id)));
+        const line = el("tr");
+        const modelName = el("td", "model-identity", formatModelName(model.id));
+        appendModelIcon(modelName, model.id);
+        line.append(modelName);
         for (const [key] of components) line.append(el("td","numeric-cell",quantity(model.components[key])));
         const cost = el("td","numeric-cell model-api-equivalent",formatApiMoney(model.costUsdExact));
         if (model.priceStatus === "partial") cost.append(el("small","work-usage-muted",tr("partial")));
@@ -866,7 +918,7 @@ export function mountWorkUsageView({
     body.append(panel);
     body.append(el("p", "annotation", tr("shareNote")));
     if (!response.rowCount)
-      body.append(el("p", "work-usage-empty", tr("empty")));
+      body.append(el("p", "work-usage-empty", tr(query.search ? "searchEmpty" : "empty")));
     const pagination = el("div", "table-pagination");
     const previous = quietButton(tr("previous"), () => {
       pendingFocus = "first-row";
@@ -913,6 +965,7 @@ export function mountWorkUsageView({
   }
   async function load() {
     started = true;
+    clearSearch.hidden = !query.search && !query.findThread;
     clearNested();
     const token = ++serial;
     controller?.abort();
@@ -1040,6 +1093,7 @@ export function mountWorkUsageView({
     input.placeholder = tr("findHint");
     input.setAttribute("aria-label", tr("findHint"));
     find.textContent = tr("find");
+    clearSearch.textContent = tr("clearSearch");
     cancel.textContent = tr("cancel");
     footnote.replaceChildren(
       ...["mapping", "transient", "priceNote"].map((key) =>

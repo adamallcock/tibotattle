@@ -92,6 +92,7 @@ const APP_ONLY_SOURCE_BASENAMES = Object.freeze([
   "data-client.js",
   "index.html",
   "lib.js",
+  "model-visuals.js",
   "navigation.js",
   "telemetry-envelope.js",
   "telemetry-shared.generated.js",

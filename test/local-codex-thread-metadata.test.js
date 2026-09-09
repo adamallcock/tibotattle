@@ -477,3 +477,16 @@ test("present rejected repository origins block historical attribution in either
     }
   }
 });
+
+test("name-search opt-in reads beyond one displayed page while ordinary metadata retains its small bound", async (t) => {
+  const { home, databaseFile } = await fixture(t);
+  const ids = Array.from({ length: 161 }, (_, i) => `${String(i + 1).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`);
+  const db = new DatabaseSync(databaseFile);
+  db.prepare("INSERT INTO threads(id, title, source) VALUES (?, ?, ?)").run(ids.at(-1), "Saved searchable café title", '"cli"');
+  db.close();
+  assert.equal((await readCodexLocalThreadMetadata(home, ids, { allowTitleFallback: true })).size, 0);
+  const search = await readCodexLocalThreadMetadata(home, ids, { allowTitleFallback: true, forNameSearch: true });
+  assert.equal(search.get(ids.at(-1)).name, "Saved searchable café title");
+  assert.equal((await readCodexLocalThreadMetadata(home, Array(25_001).fill(ROOT), { forNameSearch: true })).size, 0);
+  assert.equal((await readCodexLocalThreadMetadata(home, [...ids, "invalid-id"], { forNameSearch: true })).size, 0);
+});

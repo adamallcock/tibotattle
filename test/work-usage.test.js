@@ -578,3 +578,82 @@ test("assumed counts conserve across project, thread and model grouping independ
     assert.equal(result.rows.reduce((sum, row) => sum + row.assumedEvents, 0), 1);
   }
 });
+
+test("name search validates bounded Unicode input and never accepts control characters", () => {
+  const base = { schemaVersion: WORK_USAGE_SCHEMA };
+  assert.equal(validateWorkUsageQuery({ ...base, search: "  CAFÉ ＦＯＯ  " }).search, "café foo");
+  assert.equal(validateWorkUsageQuery({ ...base, search: "   " }).search, "");
+  for (const search of [null, 42, {}, "x".repeat(101), "hello\nworld", "hello\0world", "\uFDFA".repeat(10)]) {
+    assertQueryError({ ...base, search });
+  }
+});
+
+test("name search discovers off-page project and worker names before pagination and conserves matching families", async (t) => {
+  let builds = 0;
+  let nameReads = 0;
+  const source = availableResult([
+    event({ thread: "busy", project: "repo-a", tokens: { output_text_tokens: 100 }, price: { amount: "10", status: "fully_priced" } }),
+    event({ thread: "root", project: "repo-b", tokens: { output_text_tokens: 20 }, price: { amount: "2", status: "fully_priced" } }),
+    event({ thread: "worker", project: "repo-b", tokens: { output_text_tokens: 5 }, price: { amount: "0.5", status: "fully_priced" } }),
+    event({ thread: "sibling", project: "repo-b", tokens: { output_text_tokens: 3 }, price: { amount: "0.3", status: "fully_priced" } }),
+    event({ thread: "other", project: "repo-b", tokens: { output_text_tokens: 2 }, price: { amount: "0.2", status: "fully_priced" } }),
+  ], { threadFamilies: { root: "root", worker: "root", sibling: "root" } });
+  const before = JSON.stringify(source);
+  const names = {
+    "repo-a": { name: "Synthetic project Alpha" },
+    "repo-b": { name: "Synthetic project Beta" },
+    busy: { name: "Large task" },
+    root: { name: "Review café design" },
+    worker: { name: "Small task", thread: { nickname: "測試担当" } },
+    other: { name: "Unrelated task" },
+  };
+  const service = createWorkUsageService({
+    build: async () => { builds++; return source; },
+    enrich: async ({ rows, purpose }) => {
+      if (purpose === "search") {
+        nameReads++;
+        assert.ok(rows.some(row => row.id === "worker"));
+        assert.ok(rows.some(row => row.id === "repo-b"));
+      }
+      return Object.fromEntries(rows.map(row => [row.id, names[row.id] ?? {}]));
+    },
+  });
+  t.after(() => service.close());
+  const request = { schemaVersion: WORK_USAGE_SCHEMA, pageSize: 1 };
+  const initial = await waitForAvailable(service, request);
+  assert.equal(initial.rows[0].id, "repo-a");
+  assert.equal(nameReads, 0, "normal rows do not load a full name index");
+  const pinned = { ...request, snapshotId: initial.snapshotId };
+  const worker = await service.query({ ...pinned, search: "測試" });
+  assert.equal(worker.rowCount, 1);
+  assert.equal(worker.rows[0].id, "repo-b");
+  assert.equal(worker.rows[0].tokens, 28);
+  assert.equal(worker.rows[0].costUsdExact, "2.8");
+  assert.equal(worker.rows[0].share, 28 / 130);
+  assert.deepEqual(worker.totals, initial.totals);
+  const family = await service.query({ ...pinned, grouping: "thread", project: "repo-b", search: "測試" });
+  assert.equal(family.rowCount, 1);
+  assert.equal(family.rows[0].id, "root");
+  assert.equal(family.rows[0].tokens, worker.rows[0].tokens);
+  assert.equal(family.rows[0].subworkerCount, 2);
+  assert.equal(family.rows[0].modelBreakdown.reduce((sum, row) => sum + row.tokens, 0), 28);
+  const unicode = await service.query({ ...pinned, search: "  CAFE\u0301  " });
+  assert.equal(unicode.rows[0].tokens, 28);
+  const project = await service.query({ ...pinned, search: "ＢＥＴＡ" });
+  assert.equal(project.rows[0].tokens, 30);
+  const projectChildren = await service.query({ ...pinned, grouping: "thread", project: "repo-b", search: "ＢＥＴＡ", pageSize: 100 });
+  assert.equal(projectChildren.rows.reduce((sum, row) => sum + row.tokens, 0), 30);
+  const noMatch = await service.query({ ...pinned, search: "does not exist" });
+  assert.equal(noMatch.rowCount, 0);
+  assert.deepEqual(noMatch.rows, []);
+  assert.deepEqual(noMatch.totals, initial.totals);
+  const allMatches = await service.query({ ...pinned, search: "Synthetic project" });
+  assert.ok(allMatches.nextCursor);
+  await assert.rejects(service.query({ ...pinned, search: "Beta", cursor: allMatches.nextCursor }), error => error.code === "work_usage_snapshot_changed");
+  const next = await service.query({ ...pinned, search: " SYNTHETIC PROJECT ", cursor: allMatches.nextCursor });
+  assert.equal(next.rows[0].id, "repo-b");
+  assert.equal(builds, 1);
+  assert.equal(nameReads, 1, "one bounded name read per snapshot, shared across all searches");
+  assert.equal(JSON.stringify(source), before, "names are never attached to the accounting snapshot");
+  assert.equal(Object.hasOwn(worker, "search"), false, "raw query text is never echoed");
+});

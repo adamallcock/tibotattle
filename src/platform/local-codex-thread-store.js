@@ -382,11 +382,13 @@ async function readSelectedSessionIndexNames(codexHome, selectedIds) {
  * Resolve only selected usage-row UUIDs to ephemeral, local-only display
  * metadata. The local Projects & threads caller may explicitly allow bounded
  * Codex titles. No transcript/body is read; display text and ancestry must
- * never enter accounting caches, derived indexes, or exports.
+ * never enter accounting caches, derived indexes, or exports. Name search may
+ * explicitly request up to 25,000 selected IDs in one bounded, transient pass;
+ * ordinary row display remains capped at 160 IDs.
  */
-export async function readCodexLocalThreadMetadata(codexHome, threadIds, { allowTitleFallback = false } = {}) {
+export async function readCodexLocalThreadMetadata(codexHome, threadIds, { allowTitleFallback = false, forNameSearch = false } = {}) {
   if (!Array.isArray(threadIds) || threadIds.length === 0
-      || threadIds.length > MAX_LOCAL_THREAD_LOOKUPS
+      || threadIds.length > (forNameSearch === true ? 25_000 : MAX_LOCAL_THREAD_LOOKUPS)
       || !await ownerControlledCodexHome(codexHome)) return new Map();
   const ids = [...new Set(threadIds.map(threadId))];
   if (ids.includes(null)) return new Map();

@@ -1035,3 +1035,82 @@ test("assumptions stay distinct from missing data and the non-project bucket is 
   assert.match(root.textContent, /Token counts are missing or incomplete for 1 usage records/);
   view.destroy();
 });
+
+test("name search keeps the report snapshot and nested filter, and clearing restores project view", async () => {
+  const { root, windowRef } = mountedRoot(); const requests = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); requests.push(query);
+      return httpResponse(query.grouping === "thread" ? THREAD_A_RESPONSE : PROJECT_ROWS_RESPONSE);
+    } });
+  try {
+    await settleMountedView();
+    const input = findMounted(root, n => n.tagName === "INPUT")[0];
+    const form = findMounted(root, n => n.tagName === "FORM")[0];
+    input.value = "  Build café  "; form.dispatchEvent({type:"submit"});
+    await settleMountedView();
+    assert.equal(requests.at(-1).search, "Build café");
+    assert.equal(requests.at(-1).snapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+    assert.equal(requests.at(-1).grouping, "project");
+    assert.equal(requests.at(-1).findThread, undefined);
+    assert.match(root.textContent, /Rows show matching work/);
+    findMounted(root, n => n.classList.contains("work-usage-project-toggle"))[0].click();
+    await settleMountedView();
+    assert.equal(requests.at(-1).search, "Build café");
+    assert.equal(requests.at(-1).project, "project-a");
+    const clear = findMounted(root, n => n.tagName === "BUTTON" && n.textContent === "Clear search")[0];
+    clear.click(); await settleMountedView();
+    assert.equal(requests.at(-1).search, undefined);
+    assert.equal(requests.at(-1).project, undefined);
+    assert.equal(input.value, "");
+    assert.equal(clear.hidden, true);
+    input.value = "codex://threads/not-a-thread";
+    const before = requests.length; form.dispatchEvent({type:"submit"});
+    await settleMountedView(); assert.equal(requests.length, before);
+    input.value = "11111111-1111-4111-8111-111111111111";
+    form.dispatchEvent({type:"submit"}); await settleMountedView();
+    assert.equal(requests.at(-1).findThread, input.value);
+    assert.equal(requests.at(-1).search, undefined);
+  } finally { view.destroy(); }
+});
+
+test("token mix and share bars preserve amounts and omit unknown or empty visuals", async () => {
+  const report = structuredClone(PROJECT_ROWS_RESPONSE);
+  report.totals.components = completeComponents({input_cache_read_tokens:70, input_uncached_tokens:20, output_combined_tokens:10});
+  const {root,windowRef} = mountedRoot();
+  const view=mountWorkUsageView({root,windowRef,t:mountedTranslator,fetchRef:async()=>httpResponse(report)});
+  try {
+    await settleMountedView();
+    const mix=findMounted(root,n=>n.classList.contains("work-usage-mix-strip"))[0];
+    assert.equal(mix.getAttribute("aria-hidden"),"true");
+    assert.deepEqual(mix.children.map(n=>n.style.width),["70%","20%","10%"]);
+    const legends=findMounted(root,n=>n.classList.contains("work-usage-mix-legend"))[0];
+    assert.match(legends.textContent,/Combined output/);
+    assert.doesNotMatch(legends.textContent,/Reasoning output/);
+    const bars=findMounted(root,n=>n.classList.contains("work-usage-bar"));
+    assert.equal(bars[0].children[0].style.width,"60%");
+    assert.ok(bars.every(n=>n.getAttribute("aria-hidden")==="true"));
+    report.totals.tokens=null; report.totals.costUsdExact=null;
+    report.totals.components=completeComponents();
+    view.refresh(); await settleMountedView();
+    assert.equal(findMounted(root,n=>n.classList.contains("work-usage-mix-strip")).length,0);
+    assert.equal(findMounted(root,n=>n.classList.contains("work-usage-bar")).length,0);
+  } finally {view.destroy();}
+});
+
+test("primary and expanded model names reuse decorative model icons without extra requests", async () => {
+  const children=structuredClone(THREAD_A_RESPONSE);
+  children.rows[0].modelBreakdown=[mountedRow({id:"gpt-5.6-sol",kind:"model",tokens:25,cost:"2.50",events:1,share:1})];
+  const {root,windowRef}=mountedRoot();let calls=0;
+  const view=mountWorkUsageView({root,windowRef,t:mountedTranslator,fetchRef:async(_url,init)=>{calls++;return httpResponse(JSON.parse(init.body).grouping==="thread"?children:PROJECT_ROWS_RESPONSE);}});
+  try {
+    await settleMountedView(); findMounted(root,n=>n.classList.contains("work-usage-project-toggle"))[0].click(); await settleMountedView();
+    const primary=findMounted(root,n=>n.classList.contains("work-usage-primary-model"))[0];
+    assert.equal(primary.children[0].getAttribute("aria-hidden"),"true");
+    assert.ok(primary.children[0].classList.contains("allowance-model-sol"));
+    const before=calls;findMounted(root,n=>n.classList.contains("work-usage-model-toggle"))[0].click();
+    assert.equal(calls,before);
+    const detail=findMounted(root,n=>n.classList.contains("work-usage-model-detail"))[0];
+    assert.equal(findMounted(detail,n=>n.classList.contains("allowance-model-sol")).length,1);
+  } finally {view.destroy();}
+});

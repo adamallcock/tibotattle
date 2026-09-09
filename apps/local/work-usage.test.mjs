@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { request as httpRequest } from "node:http";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -258,6 +258,49 @@ test("work-usage route accepts no Origin with the local capability and keeps a s
     assert.equal(second.json.rows[0].id, "repo-b");
     assert.equal(second.json.totals.tokens, 50);
     assert.equal(second.json.generation, 1);
+    assert.equal(builds, 1);
+  } finally {
+    await closeFixture(fixture);
+  }
+});
+
+test("work-usage route searches local saved task names through the real enrichment adapter", async () => {
+  const uuid = "11111111-1111-4111-8111-111111111111";
+  let builds = 0;
+  const fixture = await serverFixture({
+    workUsageBuild: async () => {
+      builds++;
+      return {
+        ...buildResult([event({ project: "repo-a", tokens: 100 }), event({ project: "repo-b", thread: "needle", tokens: 10 })]),
+        display: {
+          projects: { "repo-a": { name: "Large project" }, "repo-b": { name: "Small project" } },
+          threads: { needle: { uuid } }, worktrees: {},
+        },
+      };
+    },
+  });
+  try {
+    await writeFile(join(fixture.root, "codex", "session_index.jsonl"), JSON.stringify({ id: uuid, thread_name: "Review café interface", updated_at: "2026-09-09T00:00:00Z" }) + "\n", { mode: 0o600 });
+    const request = overrides => jsonRequest({ port: fixture.app.port, headers: localHeaders(), body: requestBody(overrides) });
+    const invalid = await request({ search: "x".repeat(101) });
+    assert.equal(invalid.status, 400);
+    assert.equal(builds, 0);
+    const first = await request({ pageSize: 1 });
+    let result;
+    for (let attempt = 0; attempt < 20; attempt++) {
+      result = await request({ snapshotId: first.json.snapshotId, pageSize: 1, search: " CAFE\u0301 " });
+      if (result.json?.status === "available") break;
+      await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    assert.equal(result.status, 200);
+    assert.equal(result.json.status, "available");
+    assert.equal(result.json.rows[0].id, "repo-b");
+    assert.equal(result.json.rows[0].tokens, 10);
+    assert.equal(result.json.totals.tokens, 110);
+    assert.equal(Object.hasOwn(result.json, "search"), false);
+    const children = await request({ snapshotId: first.json.snapshotId, grouping: "thread", project: "repo-b", search: "CAFÉ" });
+    assert.equal(children.json.rows[0].id, "needle");
+    assert.equal(children.json.display.needle.name, "Review café interface");
     assert.equal(builds, 1);
   } finally {
     await closeFixture(fixture);

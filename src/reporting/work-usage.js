@@ -209,8 +209,18 @@ export function queryWorkUsageSnapshot(snapshot, query) {
     && (!query.worktree || cell.worktrees.includes(query.worktree))
     && (!query.thread || familyOf(cell.threads[0]) === query.thread)
     && (!query.model || cell.models.includes(query.model));
+  const matchesSearch = (cell) => !query.searchMatches
+    || query.searchMatches.projects.has(cell.projects[0])
+    || query.searchMatches.threads.has(snapshot.threadFamilies?.[cell.threads[0]] ?? cell.threads[0]);
   for (const cell of snapshot.cells) {
     if (!matches(cell)) continue;
+    merge(total, cell);
+    if (cell.tokens > 0) {
+      for (const t of cell.threads) activeThreads.add(familyOf(t));
+      for (const p of cell.projects)
+        if (p !== "unassigned") activeProjects.add(p);
+    }
+    if (!matchesSearch(cell)) continue;
     const id =
       query.grouping === "project"
         ? cell.projects[0]
@@ -220,12 +230,6 @@ export function queryWorkUsageSnapshot(snapshot, query) {
     const row = rows.get(id) ?? empty(id, query.grouping);
     merge(row, cell);
     rows.set(id, row);
-    merge(total, cell);
-    if (cell.tokens > 0) {
-      for (const t of cell.threads) activeThreads.add(familyOf(t));
-      for (const p of cell.projects)
-        if (p !== "unassigned") activeProjects.add(p);
-    }
   }
   if (total.events === 0) total.tokens = 0;
   const ordered = [...rows.values()].sort((a, b) => {
@@ -250,7 +254,7 @@ export function queryWorkUsageSnapshot(snapshot, query) {
   const contributions = new Map([...modelsByThread.keys()].map(id => [id, { primary: empty("primary", "contribution"), subworkers: empty("subworkers", "contribution") }]));
   if (modelsByThread.size) for (const cell of snapshot.cells) {
     const models = modelsByThread.get(familyOf(cell.threads[0]));
-    if (!models || !matches(cell)) continue;
+    if (!models || !matches(cell) || !matchesSearch(cell)) continue;
     const id = cell.models[0];
     const model = models.get(id) ?? empty(id, "model");
     merge(model, cell);

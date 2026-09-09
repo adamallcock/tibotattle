@@ -372,6 +372,15 @@ is written to the index, exports, diagnostics, contributions or browser storage.
 Explicit collaboration parent links are read in a bounded local metadata pass
 to group subworkers into primary-thread families. Cycles and unresolved ancestry
 remain separate; names and title policy are independent of this grouping.
+Name search is submitted only to the loopback query route in a bounded POST
+body, never a URL. It may read up to 25,000 selected task identities through the
+same approved name/title reader; ordinary visible-row enrichment remains capped
+at 160. A lazily built search lookup stores normalized names only in private
+memory, limited to 75,000 project/task entries and 16 MiB of normalized text per
+report. It expires or is evicted with the report. Search matches are applied
+before pagination and family/project summation, preserving global share
+denominators. Neither search text nor the lookup is serialized, exported or
+uploaded. Refreshing creates a new lookup when names need to be reread.
 Attribution reports are immutable and expiring. A serial local projection worker
 may reuse extracted workspace observations and quota-status offsets in private
 memory across refreshes, under a 32 MiB estimated payload budget and a 25,000-source

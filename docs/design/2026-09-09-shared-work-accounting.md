@@ -448,3 +448,34 @@ focused preview. Sidebar navigation, all-history selection and nested task
 expansion were verified. The app remains a development artifact; installed and
 release gates remain open. Cross-generation persistent incremental accounting
 has not been implemented by this delivery step.
+
+
+## Name discovery and comparative visuals, 2026-09-09
+
+Name search extends exact UUID/link lookup using bounded, transient local
+metadata. It searches all task/project candidates before pagination; matching
+subworker names include their task family. Matching project names include all
+project tasks. Matched cells produce the project/family rows while existing
+period/model/scope totals remain the share denominator. The UI labels this
+relationship so search cannot make a small task look like the entire workload.
+No new accounting, pricing or source-log scan is performed for searching, sorting
+or expanding an available report. Name lookup is lazy and reused per report.
+
+Visual changes add linear share bars and a labelled token composition strip,
+with exact numeric labels retained, no inferred output split, no fabricated
+trend, and no animation. Model names use the established shared model-visuals
+helper from the newer app source, including its reviewed aliases and unknown-
+model omission. The same helper now serves the normal accounting model table
+and Projects & threads. Closed loopback/export/native packaging inventories and
+public-site exclusions include the module.
+
+Validation passed: 523 browser-unit tests, 329 local integration tests, 67
+reporting/service/source/metadata tests, and the focused export, public-site and
+native dependency-graph checks. Architecture, documentation, preflight and
+translation-mirror checks passed. A fresh development macOS bundle contains the
+changes; its payload digest is
+`31538129a9cd5bb03614f65b297442c1b03a84be818790100ee798d2cb71812e`.
+The bundled production dashboard was checked against the isolated real-data
+copy: project-name and task-name search, preserved global totals, nested task
+families, clearing search, share bars, token mix, and Sol/Terra icons in expanded
+model rows. This remains a local development build, not an installed release.

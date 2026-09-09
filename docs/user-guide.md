@@ -149,6 +149,18 @@ a task for model and contributor details. Worktrees share a repository group;
 folders with no identifiable repository appear under **Non-project tasks**.
 Missing source context remains **Unassigned**.
 
+Search by project or task name, including subworker names, or paste a complete
+thread ID or Codex link. Name search covers the full report before pagination.
+A matching subworker brings back its task family; a matching project includes
+all its tasks. Search result rows show matching work, while summary totals,
+token mix and share denominators retain the selected period/model scope.
+**Clear search** restores the project list. Names and search terms stay local.
+
+Small bars beside token and cost shares show their relative size. The token-mix
+strip separates cached and uncached input from recorded output categories;
+combined output stays combined when no split was recorded. Numeric labels remain
+available alongside the graphics. Model rows reuse the app's decorative icons.
+
 Choose a period and model to compare token and API-equivalent shares. These are
 estimates of recorded usage, not subscription charges or quota shares. Omitted
 cache-write counts use the explicitly approved zero assumption when the remaining

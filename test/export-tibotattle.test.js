@@ -72,6 +72,8 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
       "src/platform/work-usage-projects.js",
       "src/reporting/work-usage.js",
       "apps/web/public/work-usage-view.js",
+      "apps/web/public/model-visuals.js",
+      "apps/web/test/model-display.test.mjs",
       "apps/local/work-usage.test.mjs",
       "apps/web/test/work-usage-view.test.mjs",
       "test/work-usage-source.test.js",

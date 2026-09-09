@@ -445,6 +445,7 @@ export const CLIENT_TEST_FILES = Object.freeze([
   "apps/web/test/community-refresh.test.mjs",
   "apps/web/test/lib.test.mjs",
   "apps/web/test/navigation.test.mjs",
+  "apps/web/test/model-display.test.mjs",
   "apps/web/test/i18n-browser-parity.test.mjs",
   "apps/web/test/telemetry-shared-parity.test.mjs",
   "apps/web/test/work-usage-view.test.mjs",

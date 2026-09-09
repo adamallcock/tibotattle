@@ -25,6 +25,7 @@ const KEYS = new Set([
   "worktree",
   "thread",
   "findThread",
+  "search",
   "model",
   "sort",
   "pageSize",
@@ -76,6 +77,12 @@ export function validateWorkUsageQuery(value) {
     (typeof q.model !== "string" || !/^[a-zA-Z0-9._:/-]{1,200}$/u.test(q.model))
   )
     throw workUsageError("work_usage_query_invalid");
+  if (q.search !== undefined) {
+    if (typeof q.search !== "string" || q.search.length > 100 || /[\u0000-\u001f\u007f]/u.test(q.search))
+      throw workUsageError("work_usage_query_invalid");
+    q.search = q.search.normalize("NFKC").trim().toLowerCase();
+    if (q.search.length > 100) throw workUsageError("work_usage_query_invalid");
+  }
   if (q.findThread !== undefined) {
     if (typeof q.findThread !== "string" || q.findThread.length > 100)
       throw workUsageError("work_usage_query_invalid");
@@ -90,6 +97,32 @@ export function validateWorkUsageQuery(value) {
   if (q.action === "cancel" && !q.snapshotId)
     throw workUsageError("work_usage_query_invalid");
   return q;
+}
+
+// Names remain separate from the immutable accounting snapshot and never leave
+// this process as a search index. Loading is lazy and shared across search calls.
+async function createSearchIndex(result, enrich) {
+  const rows = new Map();
+  for (const cell of result.cells) {
+    for (const [field, kind] of [["projects", "project"], ["threads", "thread"]]) {
+      for (const id of cell[field]) rows.set(`${kind}:${id}`, { id, kind });
+    }
+  }
+  for (const id of Object.values(result.threadFamilies ?? {})) rows.set(`thread:${id}`, { id, kind: "thread" });
+  if (rows.size > 75_000 || [...rows.values()].filter(row => row.kind === "thread").length > 25_000)
+    throw workUsageError("work_usage_capacity_exceeded");
+  const display = await enrich({ result, rows: [...rows.values()], purpose: "search" });
+  const index = { projects: new Map(), threads: new Map() };
+  let bytes = 0;
+  for (const row of rows.values()) {
+    const value = display[row.id];
+    const text = [value?.name, value?.thread?.name, value?.thread?.nickname, value?.thread?.parent?.name]
+      .filter(item => typeof item === "string").map(item => item.normalize("NFKC").toLowerCase()).join("\n");
+    bytes += text.length * 2;
+    if (bytes > 16 * 1024 * 1024) throw workUsageError("work_usage_capacity_exceeded");
+    if (text) index[row.kind === "project" ? "projects" : "threads"].set(row.id, text);
+  }
+  return index;
 }
 
 /** Process-local immutable reports. Jobs never block HTTP or retain source content. */
@@ -235,6 +268,13 @@ export function createWorkUsageService({
       const selected = { ...q, offset: 0 };
       if (q.findThread)
         selected.thread = result.threadLookup[q.findThread] ?? "not-found";
+      if (q.search) {
+        entry.searchIndex ??= createSearchIndex(result, enrich);
+        const index = await entry.searchIndex;
+        selected.searchMatches = { projects: new Set(), threads: new Set() };
+        for (const [id, name] of index.projects) if (name.includes(q.search)) selected.searchMatches.projects.add(id);
+        for (const [id, name] of index.threads) if (name.includes(q.search)) selected.searchMatches.threads.add(result.threadFamilies?.[id] ?? id);
+      }
       const filterKey = JSON.stringify([
         q.grouping,
         q.project,
@@ -243,6 +283,7 @@ export function createWorkUsageService({
         q.model,
         q.sort,
         q.pageSize,
+        q.search || undefined,
       ]);
       if (q.cursor) {
         const cursor = entry.cursors.get(q.cursor);

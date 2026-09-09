@@ -163,7 +163,7 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/onboarding` | Local installation and evidence-source readiness |
 | `GET` | `/api/local/overview` | Personal dashboard headline and evidence coverage |
 | `GET` | `/api/local/cache-drop-thread-links` | Optional, generation-bound local thread-name/parent lookup for the two recent cache-drop tables; requires `X-Usage-Monitor-Local: 1` and no foreign Origin |
-| `POST` | `/api/local/work-usage/query` | Read-only local project/worktree/thread reports; closed JSON, local header and Origin/Host checks; bounded cancellable snapshots and transient names |
+| `POST` | `/api/local/work-usage/query` | Read-only local project/worktree/thread reports; closed JSON, local header and Origin/Host checks; bounded cancellable snapshots, transient names and bounded project/task name search before pagination |
 | `GET` | `/api/local/gradient` | Quota-versus-cost gradient report data |
 | `GET` | `/api/local/weekly` | Weekly calibration report data |
 | `GET` | `/api/local/weekly-pace-outlook` | Privacy-safe weekly allowance pace projection bound to the current observed window |
