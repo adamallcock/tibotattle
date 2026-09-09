@@ -4,10 +4,12 @@
  * Prepare or explicitly invoke the reviewed Windows Azure signing builder.
  *
  * The default mode only validates the canonical source candidate and reports
- * whether the local Windows signing prerequisites are present.  It never
+ * whether the local Windows signing prerequisites are present. It never
  * contacts Azure, invokes electron-builder, signs a file, publishes a feed,
- * or writes a receipt.  The separate `--sign` mode is deliberately explicit
- * and always supplies electron-builder with `--publish never`.
+ * or writes a receipt. The explicit `--prepare-builder-host` mode performs
+ * only electron-builder's TrustedSigning module preparation before Azure or
+ * native signing. The separate `--sign` mode is deliberately explicit and
+ * always supplies electron-builder with `--publish never`.
  *
  * This is not a production-credential or native-module qualification
  * finalizer.  The Windows runtime remains `required` until a later reviewed
@@ -34,6 +36,7 @@ const CANDIDATE_SCHEMA = "tibotattle-electron-production-source-candidate-v1";
 const CANDIDATE_RECEIPT_LEAF = "production-source-candidate.json";
 const CONFIGURATION_RELATIVE_PATH = "apps/electron/electron-builder.release.config.cjs";
 const MAXIMUM_CANDIDATE_BYTES = 128 * 1024;
+const MAXIMUM_CAPTURED_PROCESS_OUTPUT_BYTES = 256 * 1024;
 const SOURCE_REVISION = /^[0-9a-f]{40}$/u;
 const BUILD_NUMBER = /^[1-9][0-9]{0,9}$/u;
 const VERSION = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
@@ -91,9 +94,95 @@ const AZURE_CLI_AUTHENTICATION_OUTPUT = /(?:please\s+run\s+['"]?az\s+login|not\s
 const AZURE_CLI_COMMAND_OUTPUT = /(?:not\s+recognized\s+as\s+(?:an\s+internal\s+or\s+external\s+command|the\s+name\s+of)|command\s+not\s+found)/iu;
 const AZURE_CLI_CONFIGURATION_OUTPUT = /(?:azure_config_dir|(?:azure\s+)?config(?:uration)?\s+(?:is\s+)?(?:invalid|unavailable|not\s+found|missing))/iu;
 
-function failure(code) {
+const BUILDER_DIAGNOSTIC_PREFIX = "ELECTRON_WINDOWS_SIGNING_BUILDER_DIAGNOSTIC";
+// Captured stdout and stderr have no trustworthy shared chronology. `stage`
+// is therefore a fixed diagnostic hint, never a claim about final builder state.
+const BUILDER_DIAGNOSTIC_STAGE_MARKER = /TIBOTATTLE_ELECTRON_BUILDER_STAGE=(OUTER_PWSH_LOOKUP|MODULE_INSTALL|MODULE_IMPORT)/gu;
+const BUILDER_DIAGNOSTIC_MARKERS = Object.freeze([
+  Object.freeze({
+    key: "outerPwshLookup",
+    pattern: /Get-Command\s+pwsh\.exe|identified\s+pwsh\.exe|falling\s+back\s+to\s+powershell\.exe/giu,
+    stage: "outer_pwsh_lookup",
+  }),
+  Object.freeze({
+    key: "moduleInstall",
+    pattern: /Install-PackageProvider|Install-Module\s+-Name\s+TrustedSigning|PackageProvider\s+NuGet/giu,
+    stage: "module_install",
+  }),
+  Object.freeze({
+    key: "moduleImport",
+    pattern: /Import-Module\s+-Name\s+TrustedSigning|Get-Command\s+-Name\s+Invoke-TrustedSigning|module\s+(?:was|is)\s+not\s+(?:loaded|found)/giu,
+    stage: "module_import",
+  }),
+  Object.freeze({
+    key: "commandSerialization",
+    pattern: /positional\s+parameter|parameter\s+cannot\s+be\s+found|argument\s+transformation|SwitchParameter/giu,
+    stage: "command_serialization",
+  }),
+  Object.freeze({
+    key: "packagingMetadata",
+    pattern: /electron-builder\s+configuration|package\.json|\bnsis\b|artifactName|configuration\s+(?:is\s+)?invalid/giu,
+    stage: "packaging_metadata",
+  }),
+  Object.freeze({
+    key: "signer",
+    pattern: /Invoke-TrustedSigning|Authenticode|code\s+signing|timestamp|Azure\s+(?:credential|trusted)|AADSTS/giu,
+    stage: "signer",
+  }),
+]);
+const TRUSTED_SIGNING_SWITCH_PARAMETERS = Object.freeze([
+  "ExcludeEnvironmentCredential",
+  "ExcludeWorkloadIdentityCredential",
+  "ExcludeManagedIdentityCredential",
+  "ExcludeSharedTokenCacheCredential",
+  "ExcludeVisualStudioCredential",
+  "ExcludeVisualStudioCodeCredential",
+  "ExcludeAzureCliCredential",
+  "ExcludeAzurePowerShellCredential",
+  "ExcludeAzureDeveloperCliCredential",
+  "ExcludeInteractiveBrowserCredential",
+]);
+const TRUSTED_SIGNING_SWITCH_PARAMETER_LIST = TRUSTED_SIGNING_SWITCH_PARAMETERS
+  .map((name) => `'${name}'`)
+  .join(", ");
+const BUILDER_HOST_MODULE_READY_MARKER = "TIBOTATTLE_ELECTRON_BUILDER_HOST_MODULE_READY";
+const BUILDER_HOST_MODULE_PREFLIGHT_SCRIPT = [
+  '"use strict";',
+  'const { createRequire } = require("node:module");',
+  'const electronBuilderRequire = createRequire(require.resolve("electron-builder/package.json"));',
+  'const appBuilderRequire = createRequire(electronBuilderRequire.resolve("app-builder-lib/package.json"));',
+  'const { WindowsSignAzureManager } = appBuilderRequire("./out/codeSign/windowsSignAzureManager");',
+  'const { VmManager } = appBuilderRequire("./out/vm/vm");',
+  'const config = require("./apps/electron/electron-builder.release.config.cjs");',
+  'const stage = value => process.stdout.write(`TIBOTATTLE_ELECTRON_BUILDER_STAGE=${value}\\n`);',
+  'const vm = new VmManager();',
+  'const execute = vm.exec.bind(vm);',
+  'vm.exec = async (...arguments_) => {',
+  '  const command = Array.isArray(arguments_[1]) ? arguments_[1].at(-1) : "";',
+  '  if (command === "Get-Command pwsh.exe") stage("OUTER_PWSH_LOOKUP");',
+  '  else if (command.includes("Install-PackageProvider") || command.includes("Install-Module -Name TrustedSigning")) stage("MODULE_INSTALL");',
+  '  else if (command.includes("Import-Module -Name TrustedSigning") || command.includes("Get-Command -Name Invoke-TrustedSigning")) stage("MODULE_IMPORT");',
+  '  return execute(...arguments_);',
+  '};',
+  'const manager = new WindowsSignAzureManager({',
+  '  platformSpecificBuildOptions: { azureSignOptions: config.win.azureSignOptions },',
+  '  vm: { value: Promise.resolve(vm) },',
+  '});',
+  '(async () => {',
+  '  await manager.initialize();',
+  '  const powershell = await vm.powershellCommand.value;',
+  '  await vm.exec(powershell, [',
+  '    "-NoProfile", "-NonInteractive", "-Command",',
+  `    "$ErrorActionPreference = 'Stop'; Import-Module -Name TrustedSigning -RequiredVersion 0.5.0 -Force -ErrorAction Stop; $command = Get-Command -Name Invoke-TrustedSigning -ErrorAction Stop; $expected = @(${TRUSTED_SIGNING_SWITCH_PARAMETER_LIST}); foreach ($name in $expected) { if ($null -eq $command.Parameters[$name] -or $command.Parameters[$name].ParameterType.FullName -ne 'System.Management.Automation.SwitchParameter') { throw 'TIBOTATTLE_TRUSTED_SIGNING_SWITCH_CONTRACT_INVALID' } } [Console]::Out.Write('TIBOTATTLE_ELECTRON_BUILDER_HOST_MODULE_READY')",`,
+  '  ]);',
+  `  process.stdout.write("${BUILDER_HOST_MODULE_READY_MARKER}\\n");`,
+  '})().catch(() => { process.exitCode = 1; });',
+].join("\n");
+
+function failure(code, { diagnostic = null } = {}) {
   const error = new Error(`ELECTRON_WINDOWS_SIGNING_${code}`);
   error.code = error.message;
+  if (diagnostic !== null) error.diagnostic = diagnostic;
   return error;
 }
 
@@ -271,7 +360,7 @@ function defaultRun(command, arguments_, { environment, captureOutput = false } 
     cwd: REPOSITORY_ROOT,
     env: environment,
     encoding: "utf8",
-    maxBuffer: captureOutput ? 32 * 1024 : undefined,
+    maxBuffer: captureOutput ? MAXIMUM_CAPTURED_PROCESS_OUTPUT_BYTES : undefined,
     stdio: ["ignore", captureOutput ? "pipe" : "ignore", captureOutput ? "pipe" : "ignore"],
     windowsHide: true,
   });
@@ -300,8 +389,89 @@ function azureCliAccountShowInvocation(environment) {
 function capturedText(result) {
   if (result === null || typeof result !== "object") return "";
   return [result.stdout, result.stderr]
-    .filter((value) => typeof value === "string" && value.length <= 32 * 1024)
+    .filter((value) => typeof value === "string" && value.length <= MAXIMUM_CAPTURED_PROCESS_OUTPUT_BYTES)
     .join("\n");
+}
+
+function finalMatchIndex(pattern, text) {
+  pattern.lastIndex = 0;
+  let finalIndex = -1;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    finalIndex = match.index;
+    if (match[0] === "") pattern.lastIndex += 1;
+  }
+  pattern.lastIndex = 0;
+  return finalIndex;
+}
+
+function builderDiagnosticStage(text) {
+  const markerStages = new Map([
+    ["OUTER_PWSH_LOOKUP", "outer_pwsh_lookup"],
+    ["MODULE_INSTALL", "module_install"],
+    ["MODULE_IMPORT", "module_import"],
+  ]);
+  const stages = [];
+  let marker;
+  BUILDER_DIAGNOSTIC_STAGE_MARKER.lastIndex = 0;
+  while ((marker = BUILDER_DIAGNOSTIC_STAGE_MARKER.exec(text)) !== null) {
+    stages.push({ index: marker.index, stage: markerStages.get(marker[1]) });
+  }
+  BUILDER_DIAGNOSTIC_STAGE_MARKER.lastIndex = 0;
+  for (const markerDefinition of BUILDER_DIAGNOSTIC_MARKERS) {
+    const index = finalMatchIndex(markerDefinition.pattern, text);
+    if (index >= 0) stages.push({ index, stage: markerDefinition.stage });
+  }
+  stages.sort((left, right) => left.index - right.index);
+  return stages.at(-1)?.stage ?? "unknown";
+}
+
+function builderDiagnosticExit(result) {
+  if (result === null || typeof result !== "object") return "invalid";
+  if (result.error !== undefined) return "none";
+  if (typeof result.signal === "string" && result.signal !== "") return "signal";
+  if (Number.isInteger(result.status) && result.status >= 0 && result.status <= 255) {
+    return `code_${result.status}`;
+  }
+  return "other";
+}
+
+function builderDiagnosticSpawn(result) {
+  const code = typeof result?.error?.code === "string" ? result.error.code : "";
+  if (code === "") return "none";
+  if (code === "ENOENT") return "not_found";
+  if (code === "EACCES") return "access_denied";
+  if (code === "ENOBUFS") return "buffer_overflow";
+  return "other";
+}
+
+function builderFailureDiagnostic(result) {
+  const text = capturedText(result);
+  const markers = {};
+  for (const marker of BUILDER_DIAGNOSTIC_MARKERS) {
+    markers[marker.key] = finalMatchIndex(marker.pattern, text) >= 0 ? "yes" : "no";
+  }
+  return [
+    BUILDER_DIAGNOSTIC_PREFIX,
+    `stage=${builderDiagnosticStage(text)}`,
+    `exit=${builderDiagnosticExit(result)}`,
+    `spawn=${builderDiagnosticSpawn(result)}`,
+    `outer_pwsh_lookup=${markers.outerPwshLookup}`,
+    `module_install=${markers.moduleInstall}`,
+    `module_import=${markers.moduleImport}`,
+    `command_serialization=${markers.commandSerialization}`,
+    `packaging_metadata=${markers.packagingMetadata}`,
+    `signer=${markers.signer}`,
+  ].join(";");
+}
+
+const BUILDER_DIAGNOSTIC_FORMAT = new RegExp(
+  `^${BUILDER_DIAGNOSTIC_PREFIX};stage=(?:outer_pwsh_lookup|module_install|module_import|command_serialization|packaging_metadata|signer|unknown);exit=(?:none|signal|invalid|other|code_[0-9]{1,3});spawn=(?:none|not_found|access_denied|buffer_overflow|other);outer_pwsh_lookup=(?:yes|no);module_install=(?:yes|no);module_import=(?:yes|no);command_serialization=(?:yes|no);packaging_metadata=(?:yes|no);signer=(?:yes|no)$`,
+  "u",
+);
+
+function isBuilderFailureDiagnostic(value) {
+  return typeof value === "string" && BUILDER_DIAGNOSTIC_FORMAT.test(value);
 }
 
 function azureCliAccountShowFailure(result) {
@@ -349,16 +519,20 @@ function preflightReceipt({ candidate, configurationValid, eligible }) {
   });
 }
 
-/** Parse a no-write preflight or explicit protected signing invocation. */
+/** Parse a no-write preflight, builder-host preparation, or protected signing invocation. */
 export function parseElectronWindowsSigningArguments(argv) {
   if (!Array.isArray(argv)) fail("ARGUMENT_INVALID");
   if (argv.length === 2 && argv[0] === "--candidate-receipt" && safeString(argv[1])) {
-    return Object.freeze({ candidateReceiptPath: argv[1], sign: false });
+    return Object.freeze({ candidateReceiptPath: argv[1], prepareBuilderHost: false, sign: false });
+  }
+  if (argv.length === 3 && argv[0] === "--prepare-builder-host"
+      && argv[1] === "--candidate-receipt" && safeString(argv[2])) {
+    return Object.freeze({ candidateReceiptPath: argv[2], prepareBuilderHost: true, sign: false });
   }
   if (argv.length === 4 && argv[0] === "--sign"
       && argv[1] === "--confirm-azure-trusted-signing"
       && argv[2] === "--candidate-receipt" && safeString(argv[3])) {
-    return Object.freeze({ candidateReceiptPath: argv[3], sign: true });
+    return Object.freeze({ candidateReceiptPath: argv[3], prepareBuilderHost: false, sign: true });
   }
   fail("ARGUMENT_INVALID");
 }
@@ -399,29 +573,7 @@ export async function preflightElectronWindowsSigning({ candidateReceiptPath } =
   });
 }
 
-function assertCleanFrozenSource(candidate, run) {
-  const head = run("git", ["rev-parse", "--verify", "HEAD"], {
-    environment: process.env, captureOutput: true,
-  });
-  if (!successful(head) || !safeString(head.stdout, 128)
-      || head.stdout.trim() !== candidate.sourceRevision) {
-    fail("SOURCE_REVISION_UNAVAILABLE");
-  }
-  const status = run("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
-    environment: process.env, captureOutput: true,
-  });
-  if (!successful(status) || typeof status.stdout !== "string" || status.stdout !== "") {
-    fail("SOURCE_NOT_CLEAN");
-  }
-}
-
-/**
- * Invoke only the canonical electron-builder signing/package pass.  This mode
- * is protected by two explicit flags and never publishes an updater feed.
- * Its result intentionally remains short of a final signed-candidate receipt:
- * the two unpacked native modules require later signature/rebinding evidence.
- */
-export async function invokeElectronWindowsSigning({ candidateReceiptPath } = {}, testOnly = {}) {
+async function protectedSigningContext({ candidateReceiptPath } = {}, testOnly = {}) {
   const repositoryRoot = resolve(testOnly.repositoryRoot ?? REPOSITORY_ROOT);
   const expectedCandidatePath = canonicalCandidateReceiptPath(repositoryRoot);
   const selectedCandidatePath = typeof candidateReceiptPath === "string"
@@ -452,29 +604,112 @@ export async function invokeElectronWindowsSigning({ candidateReceiptPath } = {}
   }))) {
     fail("SIGNING_PREREQUISITES_UNAVAILABLE");
   }
-  assertCleanFrozenSource(candidate, run);
-  const azureCliInvocation = azureCliAccountShowInvocation(builderEnvironment);
+  return Object.freeze({
+    builderEnvironment,
+    candidate,
+    configurationPath,
+    repositoryRoot,
+    run,
+    selectedCandidatePath,
+  });
+}
+
+function builderHostModulePreflightResult({ builderEnvironment, run, testOnly }) {
+  if (typeof testOnly.builderHostModulePreflight === "function") {
+    return testOnly.builderHostModulePreflight({
+      environment: builderEnvironment,
+      script: BUILDER_HOST_MODULE_PREFLIGHT_SCRIPT,
+    });
+  }
+  return run(process.execPath, ["-e", BUILDER_HOST_MODULE_PREFLIGHT_SCRIPT], {
+    environment: builderEnvironment,
+    captureOutput: true,
+  });
+}
+
+/**
+ * Prepare the exact electron-builder PowerShell host and TrustedSigning module
+ * that later package signing will use. This intentionally permits only the
+ * builder's module installation; it does not authenticate to Azure, sign, or
+ * package an artifact.
+ */
+export async function prepareElectronWindowsBuilderHost({ candidateReceiptPath } = {}, testOnly = {}) {
+  const context = await protectedSigningContext({ candidateReceiptPath }, testOnly);
+  const result = await builderHostModulePreflightResult({
+    builderEnvironment: context.builderEnvironment,
+    run: context.run,
+    testOnly,
+  });
+  if (!successful(result) || !capturedText(result).includes(BUILDER_HOST_MODULE_READY_MARKER)) {
+    throw failure("BUILDER_HOST_MODULE_PREFLIGHT_FAILED", {
+      diagnostic: builderFailureDiagnostic(result),
+    });
+  }
+  return Object.freeze({
+    schemaVersion: "tibotattle-electron-windows-builder-host-preflight-v1",
+    status: "builder_host_module_ready",
+    scope: "builder_dependency_initialization_only_no_azure_signing",
+    candidate: candidateSummary(context.candidate),
+    azureResourceConfiguration: "validated",
+    builderConfiguration: CONFIGURATION_RELATIVE_PATH,
+    builderHost: "electron_builder_vm_manager",
+    trustedSigningModulePreflight: "required_version_0_5_0_import_switch_contract_verified",
+    nativeModuleFinalization: "not_performed",
+    signing: "not_performed",
+    windowsRuntimeQualification: "required",
+  });
+}
+
+function assertCleanFrozenSource(candidate, run) {
+  const head = run("git", ["rev-parse", "--verify", "HEAD"], {
+    environment: process.env, captureOutput: true,
+  });
+  if (!successful(head) || !safeString(head.stdout, 128)
+      || head.stdout.trim() !== candidate.sourceRevision) {
+    fail("SOURCE_REVISION_UNAVAILABLE");
+  }
+  const status = run("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
+    environment: process.env, captureOutput: true,
+  });
+  if (!successful(status) || typeof status.stdout !== "string" || status.stdout !== "") {
+    fail("SOURCE_NOT_CLEAN");
+  }
+}
+
+/**
+ * Invoke only the canonical electron-builder signing/package pass.  This mode
+ * is protected by two explicit flags and never publishes an updater feed.
+ * Its result intentionally remains short of a final signed-candidate receipt:
+ * the two unpacked native modules require later signature/rebinding evidence.
+ */
+export async function invokeElectronWindowsSigning({ candidateReceiptPath } = {}, testOnly = {}) {
+  const context = await protectedSigningContext({ candidateReceiptPath }, testOnly);
+  assertCleanFrozenSource(context.candidate, context.run);
+  const azureCliInvocation = azureCliAccountShowInvocation(context.builderEnvironment);
   if (azureCliInvocation === null) fail("AZURE_CLI_ACCOUNT_SHOW_LAUNCH_UNAVAILABLE");
-  const azureCliFailure = azureCliAccountShowFailure(run(
+  const azureCliFailure = azureCliAccountShowFailure(context.run(
     azureCliInvocation.command,
     azureCliInvocation.arguments,
-    { environment: builderEnvironment, captureOutput: true },
+    { environment: context.builderEnvironment, captureOutput: true },
   ));
   if (azureCliFailure !== null) fail(azureCliFailure);
   const builderCli = testOnly.builderCli ?? REQUIRE.resolve("electron-builder/cli.js");
   if (!safeString(builderCli, 32 * 1024)) fail("BUILDER_UNAVAILABLE");
-  if (!successful(run(process.execPath, [
+  const builderResult = context.run(process.execPath, [
     builderCli,
-    "--config", resolve(repositoryRoot, CONFIGURATION_RELATIVE_PATH),
+    "--config", context.configurationPath,
     "--win", "nsis", "--x64", "--publish", "never",
-  ], { environment: builderEnvironment }))) {
-    fail("BUILDER_SIGNING_FAILED");
+  ], { environment: context.builderEnvironment, captureOutput: true });
+  if (!successful(builderResult)) {
+    throw failure("BUILDER_SIGNING_FAILED", {
+      diagnostic: builderFailureDiagnostic(builderResult),
+    });
   }
   return Object.freeze({
     schemaVersion: RECEIPT_SCHEMA,
     status: "builder_signing_completed_pending_native_module_finalization",
     scope: "azure_trusted_signing_builder_pass_only",
-    candidate: candidateSummary(candidate),
+    candidate: candidateSummary(context.candidate),
     nativeModuleFinalization: "required_before_signed_candidate_receipt",
     publishing: "not_performed",
     windowsRuntimeQualification: "required",
@@ -486,11 +721,16 @@ if (process.argv[1] && resolve(process.argv[1]) === SCRIPT_FILE) {
     const options = parseElectronWindowsSigningArguments(process.argv.slice(2));
     const receipt = options.sign
       ? await invokeElectronWindowsSigning(options)
-      : await preflightElectronWindowsSigning(options);
+      : options.prepareBuilderHost
+        ? await prepareElectronWindowsBuilderHost(options)
+        : await preflightElectronWindowsSigning(options);
     process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
   } catch (error) {
     process.stderr.write(`${/^ELECTRON_WINDOWS_SIGNING_[A-Z_]+$/u.test(error?.code ?? "")
       ? error.code : "ELECTRON_WINDOWS_SIGNING_FAILED"}\n`);
+    if (isBuilderFailureDiagnostic(error?.diagnostic)) {
+      process.stderr.write(`${error.diagnostic}\n`);
+    }
     process.exitCode = 1;
   }
 }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -8,9 +9,20 @@ import test from "node:test";
 import {
   invokeElectronWindowsSigning,
   parseElectronWindowsSigningArguments,
+  prepareElectronWindowsBuilderHost,
   preflightElectronWindowsSigning,
 } from "../scripts/finalize-electron-windows-signing.mjs";
 import { productionElectronCandidatePlan } from "../scripts/package-electron-production.mjs";
+
+const require = createRequire(import.meta.url);
+const electronBuilderRequire = createRequire(require.resolve("electron-builder/package.json"));
+const appBuilderRequire = createRequire(
+  electronBuilderRequire.resolve("app-builder-lib/package.json"),
+);
+const { WindowsSignAzureManager } = appBuilderRequire(
+  "./out/codeSign/windowsSignAzureManager",
+);
+const { VmManager } = appBuilderRequire("./out/vm/vm");
 
 const SOURCE_REVISION = "a".repeat(40);
 const BUILD_NUMBER = "20260909";
@@ -65,7 +77,7 @@ function successfulResult({ stdout = "" } = {}) {
 }
 
 function testDependencies({ calls = [], environment = WINDOWS_SIGNING_ENVIRONMENT,
-  azureCliResult = null } = {}) {
+  azureCliResult = null, builderHostModuleResult = null, builderResult = null } = {}) {
   return {
     architecture: "x64",
     builderCli: "C:\\reviewed\\electron-builder.cjs",
@@ -80,6 +92,15 @@ function testDependencies({ calls = [], environment = WINDOWS_SIGNING_ENVIRONMEN
       }
       if (command === "C:\\Windows\\System32\\cmd.exe" && azureCliResult !== null) {
         return azureCliResult;
+      }
+      if (command === process.execPath && arguments_[0] === "-e"
+          && arguments_[1].includes("WindowsSignAzureManager")
+          && builderHostModuleResult !== null) {
+        return builderHostModuleResult;
+      }
+      if (command === process.execPath && arguments_[0] === "C:\\reviewed\\electron-builder.cjs"
+          && builderResult !== null) {
+        return builderResult;
       }
       return successfulResult();
     },
@@ -179,6 +200,7 @@ test("Windows signing invocation is explicit, strips ambient secrets, and keeps 
     assert.equal(calls[1].captureOutput, true);
     assert.equal(calls[2].captureOutput, true);
     assert.equal(calls[3].captureOutput, true);
+    assert.equal(calls[4].captureOutput, true);
     const builderEnvironment = calls.at(-1).environment;
     assert.equal(builderEnvironment.CSC_LINK, undefined);
     assert.equal(builderEnvironment.AZURE_CLIENT_SECRET, undefined);
@@ -245,18 +267,168 @@ test("Windows signing classifies the fixed Azure CLI account probe without retai
   });
 });
 
+test("Windows builder-host preparation uses the resolved manager contract before native signing", async () => {
+  await withFixture(async ({ candidatePath, root }) => {
+    const calls = [];
+    const environment = {
+      ...WINDOWS_SIGNING_ENVIRONMENT,
+      AZURE_CLIENT_SECRET: "must-not-reach-builder",
+    };
+    const dependencies = testDependencies({
+      calls,
+      environment,
+      builderHostModuleResult: successfulResult({
+        stdout: "TIBOTATTLE_ELECTRON_BUILDER_HOST_MODULE_READY\n",
+      }),
+    });
+    dependencies.repositoryRoot = root;
+    const receipt = await prepareElectronWindowsBuilderHost(
+      { candidateReceiptPath: candidatePath },
+      dependencies,
+    );
+    assert.deepEqual(receipt, {
+      schemaVersion: "tibotattle-electron-windows-builder-host-preflight-v1",
+      status: "builder_host_module_ready",
+      scope: "builder_dependency_initialization_only_no_azure_signing",
+      candidate: {
+        buildNumber: BUILD_NUMBER,
+        sha256: createHash("sha256").update(await readFile(candidatePath)).digest("hex"),
+        sourceRevision: SOURCE_REVISION,
+        target: "win32-x64",
+        version: candidateVersion(),
+      },
+      azureResourceConfiguration: "validated",
+      builderConfiguration: "apps/electron/electron-builder.release.config.cjs",
+      builderHost: "electron_builder_vm_manager",
+      trustedSigningModulePreflight: "required_version_0_5_0_import_switch_contract_verified",
+      nativeModuleFinalization: "not_performed",
+      signing: "not_performed",
+      windowsRuntimeQualification: "required",
+    });
+    assert.equal(calls.length, 2);
+    const invocation = calls.at(-1);
+    assert.equal(invocation.command, process.execPath);
+    assert.equal(invocation.arguments[0], "-e");
+    assert.equal(invocation.captureOutput, true);
+    assert.match(invocation.arguments[1], /new WindowsSignAzureManager/u);
+    assert.match(invocation.arguments[1], /Import-Module -Name TrustedSigning -RequiredVersion 0\.5\.0/u);
+    assert.match(invocation.arguments[1], /Get-Command -Name Invoke-TrustedSigning/u);
+    assert.match(invocation.arguments[1], /System\.Management\.Automation\.SwitchParameter/u);
+    assert.doesNotMatch(invocation.arguments[1], /signFile/u);
+    assert.equal(invocation.environment.AZURE_CLIENT_SECRET, undefined);
+    assert.equal(invocation.environment.AZURE_CONFIG_DIR, "C:\\azureCli");
+  });
+});
+
+test("builder-host preflight shim satisfies the resolved VM and manager initialization contract", async () => {
+  const invocations = [];
+  const vm = new VmManager();
+  vm.exec = async (command, arguments_) => {
+    invocations.push({ arguments_, command });
+    return "";
+  };
+  const manager = new WindowsSignAzureManager({
+    platformSpecificBuildOptions: { azureSignOptions: { publisherName: "TiboTattle" } },
+    vm: { value: Promise.resolve(vm) },
+  });
+  await manager.initialize();
+  assert.deepEqual(invocations, [
+    ["powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "Get-Command pwsh.exe"]],
+    ["pwsh.exe", [
+      "-NoProfile", "-NonInteractive", "-Command",
+      "Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force -Scope CurrentUser",
+    ]],
+    ["pwsh.exe", [
+      "-NoProfile", "-NonInteractive", "-Command",
+      "Install-Module -Name TrustedSigning -RequiredVersion 0.5.0 -Force -Repository PSGallery -Scope CurrentUser",
+    ]],
+  ].map(([command, arguments_]) => ({ arguments_, command })));
+});
+
+test("Windows builder failures expose only fixed diagnostic fields", async () => {
+  await withFixture(async ({ candidatePath, root }) => {
+    const dependencies = testDependencies({
+      builderResult: {
+        error: undefined,
+        signal: null,
+        status: 1,
+        stderr: "Parameter cannot be found; arbitrary-private-builder-content",
+        stdout: "",
+      },
+    });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({ candidateReceiptPath: candidatePath }, dependencies),
+      (error) => {
+        assert.equal(error.code, "ELECTRON_WINDOWS_SIGNING_BUILDER_SIGNING_FAILED");
+        assert.equal(
+          error.diagnostic,
+          "ELECTRON_WINDOWS_SIGNING_BUILDER_DIAGNOSTIC;stage=command_serialization;exit=code_1;spawn=none;outer_pwsh_lookup=no;module_install=no;module_import=no;command_serialization=yes;packaging_metadata=no;signer=no",
+        );
+        assert.doesNotMatch(error.diagnostic, /arbitrary-private-builder-content/u);
+        return true;
+      },
+    );
+  });
+
+  await withFixture(async ({ candidatePath, root }) => {
+    const dependencies = testDependencies({
+      builderResult: {
+        error: { code: "ENOENT" }, signal: null, status: null,
+        stderr: "arbitrary-private-builder-content", stdout: "",
+      },
+    });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({ candidateReceiptPath: candidatePath }, dependencies),
+      (error) => {
+        assert.equal(error.code, "ELECTRON_WINDOWS_SIGNING_BUILDER_SIGNING_FAILED");
+        assert.equal(
+          error.diagnostic,
+          "ELECTRON_WINDOWS_SIGNING_BUILDER_DIAGNOSTIC;stage=unknown;exit=none;spawn=not_found;outer_pwsh_lookup=no;module_install=no;module_import=no;command_serialization=no;packaging_metadata=no;signer=no",
+        );
+        return true;
+      },
+    );
+  });
+
+  await withFixture(async ({ candidatePath, root }) => {
+    const dependencies = testDependencies({
+      builderResult: {
+        error: { code: "ENOBUFS" }, signal: null, status: null,
+        stderr: "arbitrary-private-builder-content", stdout: "",
+      },
+    });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({ candidateReceiptPath: candidatePath }, dependencies),
+      (error) => {
+        assert.equal(error.code, "ELECTRON_WINDOWS_SIGNING_BUILDER_SIGNING_FAILED");
+        assert.match(error.diagnostic, /;exit=none;spawn=buffer_overflow;/u);
+        return true;
+      },
+    );
+  });
+});
+
 test("Windows signing refuses ambiguous invocation and unavailable prerequisites before a signer runs", async () => {
   assert.deepEqual(
     parseElectronWindowsSigningArguments([
       "--candidate-receipt", "candidate.json",
     ]),
-    { candidateReceiptPath: "candidate.json", sign: false },
+    { candidateReceiptPath: "candidate.json", prepareBuilderHost: false, sign: false },
+  );
+  assert.deepEqual(
+    parseElectronWindowsSigningArguments([
+      "--prepare-builder-host", "--candidate-receipt", "candidate.json",
+    ]),
+    { candidateReceiptPath: "candidate.json", prepareBuilderHost: true, sign: false },
   );
   assert.deepEqual(
     parseElectronWindowsSigningArguments([
       "--sign", "--confirm-azure-trusted-signing", "--candidate-receipt", "candidate.json",
     ]),
-    { candidateReceiptPath: "candidate.json", sign: true },
+    { candidateReceiptPath: "candidate.json", prepareBuilderHost: false, sign: true },
   );
   assert.throws(
     () => parseElectronWindowsSigningArguments(["--sign", "--candidate-receipt", "candidate.json"]),

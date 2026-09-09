@@ -129,6 +129,12 @@ jobs:
           $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
           node scripts/finalize-electron-windows-signing.mjs --candidate-receipt $candidateReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_SIGNING_PREFLIGHT_FAILED' }
+      - name: Prepare the electron-builder signing host and module
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
+          node scripts/finalize-electron-windows-signing.mjs --prepare-builder-host --candidate-receipt $candidateReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_BUILDER_HOST_MODULE_PREFLIGHT_FAILED' }
       - name: Inspect and journal native module bytes before signing
         run: |
           $ErrorActionPreference = 'Stop'

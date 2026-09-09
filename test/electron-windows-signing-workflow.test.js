@@ -37,8 +37,11 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   assert.match(workflow, /--sign --confirm-azure-trusted-signing/u);
   assert.doesNotMatch(workflow, /--publish\s+(?!never)/u);
   assert.match(workflow, /WINDOWS_SIGNED_INSTALLER_VERIFIED/u);
+  assert.match(workflow, /--prepare-builder-host --candidate-receipt \$candidateReceipt/u);
+  assert.match(workflow, /WINDOWS_BUILDER_HOST_MODULE_PREFLIGHT_FAILED/u);
 
   const preflight = workflow.indexOf("Preflight the exact protected Azure resource selection");
+  const builderHostPreflight = workflow.indexOf("Prepare the electron-builder signing host and module");
   const journal = workflow.indexOf("Inspect and journal native module bytes before signing");
   const probePreSign = workflow.indexOf("Execute the native Authenticode verifier before signing");
   const makeWritable = workflow.indexOf("Make the fixed signed native modules writable");
@@ -51,7 +54,7 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   const verification = workflow.indexOf("Verify the signed final installer and retained signing evidence");
   const signedInstalled = workflow.indexOf("Qualify the signed installed Windows journey");
   const retention = workflow.indexOf("Retain the signed installer and content-free evidence");
-  assert.ok(preflight >= 0 && preflight < journal);
+  assert.ok(preflight >= 0 && preflight < builderHostPreflight && builderHostPreflight < journal);
   assert.ok(journal < probePreSign && probePreSign < makeWritable && makeWritable < azureLogin && azureLogin < nativeSigning);
   assert.ok(nativeSigning < makeRebindMetadataWritable && makeRebindMetadataWritable < rebind);
   assert.ok(rebind < restoreReadOnly && restoreReadOnly < installerSigning && installerSigning < verification
