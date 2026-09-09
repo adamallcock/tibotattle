@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createDecipheriv, createHash, generateKeyPairSync, privateDecrypt } from "node:crypto";
-import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync, lstatSync } from "node:fs";
+import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -212,6 +213,17 @@ test("Windows signing invocation is explicit, strips ambient secrets, and keeps 
     };
     const dependencies = testDependencies({ calls, environment });
     dependencies.repositoryRoot = root;
+    const run = dependencies.run;
+    dependencies.run = (command, arguments_, options) => {
+      if (command === process.execPath && arguments_[0] === "C:\\reviewed\\electron-builder.cjs") {
+        const evidenceRoot = join(root, ".release-build", "electron-production", "win32-x64", "evidence");
+        assert.equal(existsSync(evidenceRoot), true);
+        const metadata = lstatSync(evidenceRoot);
+        assert.equal(metadata.isDirectory(), true);
+        assert.equal(metadata.isSymbolicLink(), false);
+      }
+      return run(command, arguments_, options);
+    };
     const receipt = await invokeElectronWindowsSigning({ candidateReceiptPath: candidatePath }, dependencies);
     assert.equal(receipt.status, "builder_signing_completed_pending_native_module_finalization");
     assert.equal(receipt.publishing, "not_performed");
@@ -241,6 +253,46 @@ test("Windows signing invocation is explicit, strips ambient secrets, and keeps 
     assert.equal(builderEnvironment.AZURE_CONFIG_DIR, "C:\\azureCli");
     assert.equal(builderEnvironment.TIBOTATTLE_ELECTRON_TARGET, "win32-x64");
     assert.equal(builderEnvironment.TIBOTATTLE_ELECTRON_WINDOWS_SOURCE_CANDIDATE_RECEIPT, candidatePath);
+    const evidenceRoot = join(root, ".release-build", "electron-production", "win32-x64", "evidence");
+    const evidenceMetadata = await lstat(evidenceRoot);
+    assert.equal(evidenceMetadata.isDirectory(), true);
+    assert.equal(evidenceMetadata.isSymbolicLink(), false);
+    await assert.rejects(lstat(join(evidenceRoot, "windows-signing-operation-ledger.json")), { code: "ENOENT" });
+  });
+});
+
+test("Windows signing prepares only the exact new ledger root before builder access", async () => {
+  await withFixture(async ({ candidatePath, root }) => {
+    const evidenceRoot = join(root, ".release-build", "electron-production", "win32-x64", "evidence");
+    const ledgerPath = join(evidenceRoot, "windows-signing-operation-ledger.json");
+    await mkdir(evidenceRoot, { mode: 0o700 });
+    await writeFile(ledgerPath, "stale-ledger\n", { flag: "wx", mode: 0o600 });
+    const calls = [];
+    const dependencies = testDependencies({ calls });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({ candidateReceiptPath: candidatePath }, dependencies),
+      { code: "ELECTRON_WINDOWS_SIGNING_SIGNING_OPERATION_LEDGER_PREEXISTS" },
+    );
+    assert.equal(calls.some(({ command }) => command === "C:\\Windows\\System32\\cmd.exe"), false);
+    assert.equal(calls.some(({ arguments: args }) => args[0] === "C:\\reviewed\\electron-builder.cjs"), false);
+    assert.deepEqual(await readFile(ledgerPath, "utf8"), "stale-ledger\n");
+  });
+
+  await withFixture(async ({ candidatePath, root }) => {
+    const evidenceRoot = join(root, ".release-build", "electron-production", "win32-x64", "evidence");
+    const alternateRoot = join(root, "alternate-evidence");
+    await mkdir(alternateRoot, { mode: 0o700 });
+    await symlink(alternateRoot, evidenceRoot, "dir");
+    const calls = [];
+    const dependencies = testDependencies({ calls });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({ candidateReceiptPath: candidatePath }, dependencies),
+      { code: "ELECTRON_WINDOWS_SIGNING_SIGNING_OPERATION_EVIDENCE_ROOT_UNAVAILABLE" },
+    );
+    assert.equal(calls.some(({ command }) => command === "C:\\Windows\\System32\\cmd.exe"), false);
+    assert.equal(calls.some(({ arguments: args }) => args[0] === "C:\\reviewed\\electron-builder.cjs"), false);
   });
 });
 

@@ -34,6 +34,8 @@ const REQUIRE = createRequire(import.meta.url);
 const RECEIPT_SCHEMA = "tibotattle-electron-windows-signing-preflight-v1";
 const CANDIDATE_SCHEMA = "tibotattle-electron-production-source-candidate-v1";
 const CANDIDATE_RECEIPT_LEAF = "production-source-candidate.json";
+const WINDOWS_SIGNING_OPERATION_EVIDENCE_DIRECTORY = "evidence";
+const WINDOWS_SIGNING_OPERATION_LEDGER_LEAF = "windows-signing-operation-ledger.json";
 const CONFIGURATION_RELATIVE_PATH = "apps/electron/electron-builder.release.config.cjs";
 const MAXIMUM_CANDIDATE_BYTES = 128 * 1024;
 const MAXIMUM_CAPTURED_PROCESS_OUTPUT_BYTES = 256 * 1024;
@@ -268,6 +270,14 @@ function canonicalCandidateReceiptPath(repositoryRoot) {
   );
 }
 
+function windowsSigningOperationEvidencePaths(candidateReceiptPath) {
+  const evidenceRoot = join(dirname(candidateReceiptPath), WINDOWS_SIGNING_OPERATION_EVIDENCE_DIRECTORY);
+  return Object.freeze({
+    evidenceRoot,
+    ledgerPath: join(evidenceRoot, WINDOWS_SIGNING_OPERATION_LEDGER_LEAF),
+  });
+}
+
 function relativeRepositoryPath(repositoryRoot, value) {
   const selected = relative(repositoryRoot, value);
   if (selected === "" || selected === ".." || selected.startsWith(`..${sep}`)
@@ -299,6 +309,34 @@ async function assertNoSymbolicLinkPathComponents(repositoryRoot, value) {
     }
     if (metadata.isSymbolicLink()) fail("CANDIDATE_PATH_INVALID");
   }
+}
+
+async function prepareWindowsSigningOperationEvidenceRoot({ candidateReceiptPath, repositoryRoot }) {
+  const { evidenceRoot, ledgerPath } = windowsSigningOperationEvidencePaths(candidateReceiptPath);
+  try {
+    await mkdir(evidenceRoot, { mode: 0o700 });
+  } catch (error) {
+    if (error?.code !== "EEXIST") fail("SIGNING_OPERATION_EVIDENCE_ROOT_UNAVAILABLE");
+  }
+  try {
+    await assertNoSymbolicLinkPathComponents(repositoryRoot, evidenceRoot);
+    const metadata = await lstat(evidenceRoot);
+    if (!metadata.isDirectory() || metadata.isSymbolicLink()) {
+      fail("SIGNING_OPERATION_EVIDENCE_ROOT_UNAVAILABLE");
+    }
+  } catch (error) {
+    if (error?.code === "ELECTRON_WINDOWS_SIGNING_SIGNING_OPERATION_EVIDENCE_ROOT_UNAVAILABLE") {
+      throw error;
+    }
+    fail("SIGNING_OPERATION_EVIDENCE_ROOT_UNAVAILABLE");
+  }
+  try {
+    await lstat(ledgerPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return Object.freeze({ evidenceRoot, ledgerPath });
+    fail("SIGNING_OPERATION_EVIDENCE_ROOT_UNAVAILABLE");
+  }
+  fail("SIGNING_OPERATION_LEDGER_PREEXISTS");
 }
 
 async function readBoundedCandidate(repositoryRoot, path) {
@@ -515,8 +553,7 @@ function sealEncryptedBuilderDiagnostic(context, result) {
 
 async function writeEncryptedBuilderDiagnostic({ candidateReceiptPath, diagnosticContext,
   repositoryRoot, result }) {
-  const candidateRoot = dirname(candidateReceiptPath);
-  const evidenceRoot = join(candidateRoot, "evidence");
+  const { evidenceRoot } = windowsSigningOperationEvidencePaths(candidateReceiptPath);
   const envelopePath = join(evidenceRoot, ENCRYPTED_BUILDER_DIAGNOSTIC_LEAF);
   try {
     await mkdir(evidenceRoot, { mode: 0o700, recursive: true });
@@ -885,6 +922,10 @@ export async function invokeElectronWindowsSigning({ candidateReceiptPath,
     captureEncryptedBuilderDiagnostic,
   }, testOnly);
   assertCleanFrozenSource(context.candidate, context.run);
+  await prepareWindowsSigningOperationEvidenceRoot({
+    candidateReceiptPath: context.selectedCandidatePath,
+    repositoryRoot: context.repositoryRoot,
+  });
   const azureCliInvocation = azureCliAccountShowInvocation(context.builderEnvironment);
   if (azureCliInvocation === null) fail("AZURE_CLI_ACCOUNT_SHOW_LAUNCH_UNAVAILABLE");
   const azureCliFailure = azureCliAccountShowFailure(context.run(
