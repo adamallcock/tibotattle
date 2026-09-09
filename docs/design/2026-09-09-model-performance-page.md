@@ -84,6 +84,16 @@ method/model/bin for a band. Sparse medians use hollow markers. Solid segments
 connect adjacent measured bins; dashed segments bridge limited gaps, with the
 maximum gap explained in the measurement details. Never bridge between methods.
 
+Y axes begin at zero and use rounded 1/2/5 increments, with enough decimal
+precision for subsecond data. X ticks follow UTC days, Monday weeks, first/15th
+month boundaries, or regular months/years according to the visible span.
+Inspect any position in the plot by sweeping horizontally: the cursor snaps to
+the calendar bin and both charts show that exact interval. Missing bins explicitly
+report no measurements. Larger highlighted points and compact floating tooltips
+replace point-only hover text. Keyboard users enter each chart once, move through
+observed dates with arrows/Home/End, and dismiss inspection with Escape.
+
+
 Newer-log and older-log TPS estimates remain separate series within each model:
 circles versus triangles, with a short visible legend “Newer logs / Older logs.”
 If a summary includes both methods, show two labelled median values rather

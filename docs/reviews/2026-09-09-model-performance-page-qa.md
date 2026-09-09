@@ -106,3 +106,43 @@ claimed. The preview uses a separate copy of the sidecar; the installed accounti
 database was not modified. Cold historical scanning is deliberately incremental
 and can take hours for tens of gigabytes; coverage remains marked as updating.
 No release, installation or publication occurred.
+
+
+## Chart refinement verification, 2026-09-09
+
+Follow-up to the user's axis and hover feedback, based on local commit
+`eaa1069a`. The same approved visual reference was compared in one input with
+`refined.jpg` at 1230 × 1280 CSS pixels; `refined-charts.jpg` and
+`refined-hover.jpg` retain focused, viewport-only chart evidence. The browser
+export downscales images; a full-page capture showed a stitching artifact after
+the footer, so direct scrolled viewport inspection and DOM visibility checks
+were used to verify that no duplicate chart exists in the actual page.
+
+Changes and observed results:
+
+- Rounded y ticks: Sol speed 0/20/40/60 and TTFT 0/10/20/30/40.
+- Calendar ticks: July 15, August 1, August 15, September 1 in All time;
+  individual September dates in the seven-day selection.
+- Full plot-area sweep: moving vertically between y=548 and y=690 at the same
+  horizontal position retained the identical September 4 observation.
+- A sweep to August 11 correctly reported no speed measurements and the
+  independent TTFT median 6.3 seconds. Leaving the plot hid both tooltips.
+- Keyboard Home then ArrowRight traversed August 22 to August 23 across the
+  chronologically ordered series. One point per chart participates in Tab order.
+- Larger highlight rings and structured floating tooltips display method, median,
+  units, spread and each metric's own count; no values are interpolated.
+- More prominent sans chart headings, real colored legend symbols, vertical
+  date guides and a raised coverage strip follow the approved mock more closely.
+- Spanish seven-day layout at 760 CSS pixels remained readable with no document
+  overflow. Final inspected browser console contained no warnings/errors.
+
+The P2 arbitrary ticks and point-only hover findings are resolved. Typography,
+spacing, colors, chart asset fidelity and coverage copy were rechecked against
+the selected mock. Real data and existing app chrome remain intentional
+differences. No remaining actionable P0/P1/P2 findings in inspected states.
+Final result: passed.
+
+Validation: 13 focused chart tests, 604 full UI tests, generated-i18n consistency
+and architecture checks passed. The added regressions exercise nice scales,
+calendar boundaries, missing-bin hover, vertical independence, pointer exit and
+chronological keyboard navigation using the mounted chart event handlers.

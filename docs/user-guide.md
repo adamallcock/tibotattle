@@ -104,7 +104,11 @@ these changes before the page is available there.
 **First-token latency** uses independently available turn timing, so its sample
 count can be much larger. The plots show median trends and middle-50% bands
 where enough observations exist. Newer and older timing methods stay separate;
-missing timing is unavailable, never zero. Expand **About these measurements**
+missing timing is unavailable, never zero.
+
+Sweep horizontally anywhere in a chart to inspect the same date in both metrics.
+Use arrow keys after focusing a chart point, or Escape to dismiss the tooltip.
+Empty dates explicitly show no measurements. Expand **About these measurements**
 for interpretation and coverage.
 
 These diagnostics cover Codex files on this device across accounts. Tool waits

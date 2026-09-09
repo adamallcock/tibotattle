@@ -82,6 +82,54 @@ export function performanceDomain(payload, model) {
   return { start: start ?? payload.end, end: payload.end };
 }
 
+/** Zero-based 1/2/5 scales keep ticks legible without clipping the spread. */
+export function performanceYScale(values) {
+  const peak = Math.max(0, ...values.filter(value => Number.isFinite(value) && value >= 0));
+  const rough = (peak || 1) / 4;
+  const power = 10 ** Math.floor(Math.log10(rough));
+  const step = ([1, 2, 5, 10].find(n => n * power >= rough) ?? 10) * power;
+  const maximum = Math.ceil((peak || 1) / step) * step;
+  const ticks = Array.from({ length: Math.round(maximum / step) + 1 }, (_, i) => Number((i * step).toPrecision(12)));
+  return { maximum, ticks, digits: Math.max(0, -Math.floor(Math.log10(step))) };
+}
+
+/** UTC calendar ticks, never fractional positions formatted as random dates. */
+export function performanceDateTicks({ start, end }) {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) return [];
+  const days = (end - start) / DAY, ticks = [];
+  if (days <= 40) {
+    const step = days <= 8 ? DAY : days <= 16 ? 2 * DAY : 7 * DAY;
+    const anchor = step === 7 * DAY ? 4 * DAY : 0; // Mondays.
+    for (let at = Math.ceil((start - anchor) / step) * step + anchor; at <= end; at += step) ticks.push(at);
+  } else {
+    const date = new Date(start);
+    let year = date.getUTCFullYear(), month = date.getUTCMonth();
+    const monthStep = days <= 100 ? 0 : days <= 240 ? 1 : days <= 730 ? 3 : 12 * Math.ceil(days / (365 * 6));
+    if (monthStep >= 12) { year = Math.floor(year / (monthStep / 12)) * (monthStep / 12); month = 0; }
+    else if (monthStep) month = Math.floor(month / monthStep) * monthStep;
+    for (let i = 0; i < 32; i++) {
+      const at = Date.UTC(year, month, 1);
+      if (at > end) break;
+      if (at >= start) ticks.push(at);
+      if (!monthStep) {
+        const mid = Date.UTC(year, month, 15);
+        if (mid >= start && mid <= end) ticks.push(mid);
+      }
+      month += monthStep || 1;
+    }
+  }
+  return ticks;
+}
+
+/** Snap to the calendar bin, including missing bins; never borrow a distant point. */
+export function performanceHoverBin(fraction, { start, end }, interval) {
+  const step = interval === 'week' ? 7 * DAY : DAY;
+  const anchor = interval === 'week' ? 4 * DAY : 0;
+  const at = start + Math.max(0, Math.min(1, fraction)) * (end - start);
+  const first = Math.floor((start - anchor) / step), last = Math.floor((end - anchor) / step);
+  return Math.max(first, Math.min(last, Math.round((at - anchor) / step))) * step + anchor;
+}
+
 export function mountModelPerformance({ root, client, t, locale = () => "en-US", windowRef = globalThis.window }) {
   if (!root) return { render() {}, refresh() {} };
   const documentRef = root.ownerDocument;
@@ -92,7 +140,8 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
   let modelId = Object.hasOwn(MODEL_NAMES, saved.model) ? saved.model : null;
   let payload = null, loading = false, failed = false, request = 0, abort = null, timer = null;
   let tableOpen = false, aboutOpen = false, chartCursors = [];
-  const showInterval = (at) => { for (const update of chartCursors) update(at); };
+  let selectedInterval = null;
+  const showInterval = (at) => { if (at === selectedInterval) return; selectedInterval = at; for (const update of chartCursors) update(at); };
   const translate = (key, values) => t(`performance.${key}`, values);
   let formatterLocale, numberFormat, dateFormat, fullDateFormat;
   function formatters() {
@@ -124,59 +173,108 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     const holder = element("div", "performance-plot");
     const points = series.flatMap((item) => item.points);
     if (!points.length) { holder.append(element("p", "performance-empty", translate(metric === "speed" ? "speedEmpty" : "ttftEmpty"))); return holder; }
-    const svg = svgElement("svg", { viewBox: "0 0 800 228", role: "group", "aria-label": translate(metric === "speed" ? "speed" : "latency") });
+    const svg = svgElement("svg", { viewBox: "0 0 800 256", role: "group", "aria-label": translate(metric === "speed" ? "speed" : "latency") });
+    formatters();
     const { start, end } = domain;
-    const maximum = Math.max(1, ...points.map((point) => point.p75 ?? point.median)) * 1.12;
-    const x = (value) => 52 + Math.max(0, Math.min(1, (value - start) / Math.max(1, end - start))) * 730;
-    const y = (value) => 191 - value / maximum * 170;
-    for (let tick = 0; tick < 5; tick++) {
-      const value = maximum * tick / 4;
+    const scale = performanceYScale(points.map(point => point.p75 ?? point.median));
+    const axisNumber = new Intl.NumberFormat(locale(), { maximumFractionDigits: Math.min(20, scale.digits) });
+    const x = value => 52 + Math.max(0, Math.min(1, (value - start) / Math.max(1, end - start))) * 730;
+    const y = value => 214 - value / scale.maximum * 190;
+    for (const value of scale.ticks) {
       svg.append(svgElement("line", { x1: 52, x2: 782, y1: y(value), y2: y(value), class: "performance-grid" }),
-        svgElement("text", { x: 43, y: y(value) + 4, "text-anchor": "end", class: "performance-axis" }, number(value)));
+        svgElement("text", { x: 42, y: y(value) + 4, "text-anchor": "end", class: "performance-axis" }, axisNumber.format(value)));
     }
-    for (let tick = 0; tick < 4; tick++) {
-      const at = start + (end - start) * tick / 3;
-      svg.append(svgElement("text", { x: x(at), y: 218, "text-anchor": tick === 0 ? "start" : tick === 3 ? "end" : "middle", class: "performance-axis" }, date(at)));
+    const dateTicks = performanceDateTicks(domain);
+    const tickDate = new Intl.DateTimeFormat(locale(), { month: "short", ...(end - start > 730 * DAY ? { year: "numeric" } : { day: "numeric" }), timeZone: "UTC" });
+    for (const at of dateTicks) {
+      const px = x(at);
+      svg.append(svgElement("line", { x1: px, x2: px, y1: 24, y2: 214, class: "performance-grid performance-date-grid" }),
+        svgElement("text", { x: px, y: 244, "text-anchor": px < 80 ? "start" : px > 750 ? "end" : "middle", class: "performance-axis" }, tickDate.format(at)));
     }
-    const readout = element("p", "performance-readout", "\u00a0");
+    svg.append(svgElement("path", { d: "M52 24V214H782", class: "performance-axis-line", fill: "none" }));
+    const readout = element("p", "sr-only performance-readout", "");
     readout.setAttribute("aria-live", "polite");
-    const formatPoint = (point, method) => translate("point", { date: date(point.at), method: method === "ttft" ? translate("latencyUnit") : `${translate(method)} · ${translate("speedUnit")}`, median: number(point.median), spread: point.p25 === null ? "—" : `${number(point.p25)}–${number(point.p75)}`, count: number(point.n) });
-    const cursor = svgElement("line", { x1: 0, x2: 0, y1: 18, y2: 191, class: "performance-cursor", visibility: "hidden" });
-    svg.append(cursor);
-    chartCursors.push((at) => {
-      cursor.setAttribute("x1", x(at)); cursor.setAttribute("x2", x(at)); cursor.setAttribute("visibility", "visible");
-      readout.textContent = series.flatMap((item) => item.points.filter((point) => point.at === at).map((point) => formatPoint(point, item.method))).join(" · ") || `${date(at)} · —`;
-    });
+    const tooltip = element("div", "performance-tooltip"); tooltip.hidden = true;
+    tooltip.setAttribute("aria-hidden", "true");
+    const formatPoint = (point, method) => translate("point", { date: fullDateFormat.format(point.at), method: method === "ttft" ? translate("latencyUnit") : `${translate(method)} · ${translate("speedUnit")}`, median: number(point.median), spread: point.p25 === null ? "—" : `${number(point.p25)}–${number(point.p75)}`, count: number(point.n) });
+    const cursor = svgElement("line", { x1: 0, x2: 0, y1: 24, y2: 214, class: "performance-cursor", visibility: "hidden" });
+    const markers = [];
     for (const item of series) {
       for (const segment of performanceSegments(item.points, payload.interval)) {
         const a = segment.from, b = segment.to;
         if (!segment.dashed && a.p25 !== null && b.p25 !== null) {
-          svg.append(svgElement("polygon", { points: `${x(a.at)},${y(a.p25)} ${x(b.at)},${y(b.p25)} ${x(b.at)},${y(b.p75)} ${x(a.at)},${y(a.p75)}`, fill: color, opacity: item.method === "legacy" ? .1 : .16 }));
+          svg.append(svgElement("polygon", { points: `${x(a.at)},${y(a.p25)} ${x(b.at)},${y(b.p25)} ${x(b.at)},${y(b.p75)} ${x(a.at)},${y(a.p75)}`, fill: color, opacity: item.method === "legacy" ? .14 : .18 }));
         }
-        svg.append(svgElement("line", { x1: x(a.at), y1: y(a.median), x2: x(b.at), y2: y(b.median), stroke: color, "stroke-width": 2, ...(segment.dashed ? { "stroke-dasharray": "5 5" } : {}) }));
+        svg.append(svgElement("line", { x1: x(a.at), y1: y(a.median), x2: x(b.at), y2: y(b.median), stroke: color, "stroke-width": 2.3, ...(segment.dashed ? { "stroke-dasharray": "5 5" } : {}) }));
       }
       for (const point of item.points) {
         const cx = x(point.at), cy = y(point.median);
-        const marker = svgElement(item.method === "legacy" ? "polygon" : "circle", {
-          ...(item.method === "legacy" ? { points: `${cx},${cy - 4.5} ${cx - 4.5},${cy + 4} ${cx + 4.5},${cy + 4}` } : { cx, cy, r: 3.5 }),
-          fill: point.n < 5 ? "var(--white)" : color, stroke: color, "stroke-width": 1.8,
-          tabindex: 0, role: "img", "aria-label": formatPoint(point, item.method), class: "performance-point",
-        });
+        const marker = svgElement("g", { tabindex: -1, role: "img", "aria-label": formatPoint(point, item.method), class: "performance-point" });
         marker.dataset.performanceFocus = `point-${metric}-${item.method}-${point.at}`;
+        // Pointer targets are independent of visible marker size; the whole plot
+        // also accepts a horizontal sweep, including dates without evidence.
+        marker.append(svgElement("circle", { cx, cy, r: 14, fill: "transparent", class: "performance-hit-target" }));
+        marker.append(svgElement(item.method === "legacy" ? "polygon" : "circle", {
+          ...(item.method === "legacy" ? { points: `${cx},${cy - 5} ${cx - 5},${cy + 4.5} ${cx + 5},${cy + 4.5}` } : { cx, cy, r: 4 }),
+          fill: point.n < 5 ? "var(--white)" : color, stroke: color, "stroke-width": 1.8,
+        }));
         if (point.p25 !== null) svg.append(svgElement("line", { x1: cx, x2: cx, y1: y(point.p25), y2: y(point.p75), stroke: color, "stroke-width": 5, opacity: .18 }));
-        marker.append(svgElement("title", {}, formatPoint(point, item.method)));
-        marker.addEventListener("focus", () => { showInterval(point.at); });
-        marker.addEventListener("pointerenter", () => { showInterval(point.at); });
-        marker.addEventListener("keydown", (event) => {
-          if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-          const markers = [...svg.querySelectorAll(".performance-point")], index = markers.indexOf(marker);
-          const next = event.key === "Home" ? 0 : event.key === "End" ? markers.length - 1 : Math.max(0, Math.min(markers.length - 1, index + (event.key === "ArrowRight" ? 1 : -1)));
-          event.preventDefault(); markers[next]?.focus();
+        marker.addEventListener("focus", () => {
+          for (const entry of markers) entry.node.setAttribute("tabindex", entry.node === marker ? "0" : "-1");
+          showInterval(point.at);
         });
-        svg.append(marker);
+        marker.addEventListener("keydown", event => {
+          if (event.key === "Escape") { showInterval(null); return; }
+          if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+          const index = markers.findIndex(entry => entry.node === marker);
+          const next = event.key === "Home" ? 0 : event.key === "End" ? markers.length - 1 : Math.max(0, Math.min(markers.length - 1, index + (event.key === "ArrowRight" ? 1 : -1)));
+          event.preventDefault(); markers[next]?.node.focus();
+        });
+        markers.push({ node: marker, at: point.at }); svg.append(marker);
       }
     }
-    holder.append(svg, readout);
+    markers.sort((a, b) => a.at - b.at);
+    markers[0]?.node.setAttribute("tabindex", "0");
+    const highlights = series.map(() => svgElement("circle", { r: 8, fill: "none", stroke: color, "stroke-width": 2.5, visibility: "hidden", class: "performance-highlight" }));
+    svg.append(cursor, ...highlights);
+    const byDate = series.map(item => new Map(item.points.map(point => [point.at, point])));
+    chartCursors.push(at => {
+      tooltip.hidden = at === null;
+      cursor.setAttribute("visibility", at === null ? "hidden" : "visible");
+      for (const highlight of highlights) highlight.setAttribute("visibility", "hidden");
+      if (at === null) { readout.textContent = ""; return; }
+      cursor.setAttribute("x1", x(at)); cursor.setAttribute("x2", x(at));
+      const matches = series.flatMap((item, i) => {
+        const point = byDate[i].get(at);
+        if (!point) return [];
+        highlights[i].setAttribute("cx", x(at)); highlights[i].setAttribute("cy", y(point.median)); highlights[i].setAttribute("visibility", "visible");
+        return [{ point, method: item.method }];
+      });
+      tooltip.replaceChildren(element("strong", "performance-tooltip-date", fullDateFormat.format(at)));
+      readout.textContent = matches.map(({ point, method }) => formatPoint(point, method)).join(" · ") || `${fullDateFormat.format(at)} · ${translate("noBin")}`;
+      if (!matches.length) tooltip.append(element("p", "", translate("noBin")));
+      for (const { point, method } of matches) {
+        const row = element("div", "performance-tooltip-row");
+        row.append(element("span", "performance-tooltip-method", method === "ttft" ? translate("latency") : translate(method)),
+          element("strong", "performance-tooltip-value", `${number(point.median)} ${translate(metric === "speed" ? "speedShortUnit" : "latencyShortUnit")}`),
+          element("span", "performance-tooltip-detail", `${translate("spread")}: ${point.p25 === null ? "—" : `${number(point.p25)}–${number(point.p75)}`} · ${translate("turns")}: ${number(point.n)}`));
+        tooltip.append(row);
+      }
+      tooltip.style.setProperty("left", `clamp(0px, ${x(at) / 8 + 2}%, max(0px, 100% - 280px))`);
+    });
+    const sweep = event => {
+      const bounds = svg.getBoundingClientRect();
+      if (!bounds.width || !bounds.height) return;
+      const px = (event.clientX - bounds.left) * 800 / bounds.width;
+      const py = (event.clientY - bounds.top) * 256 / bounds.height;
+      if (px < 52 || px > 782 || py < 24 || py > 214) { showInterval(null); return; }
+      showInterval(performanceHoverBin((px - 52) / 730, domain, payload.interval));
+    };
+    svg.addEventListener("pointermove", sweep);
+    svg.addEventListener("pointerdown", sweep);
+    svg.addEventListener("pointerleave", () => { showInterval(null); });
+    svg.addEventListener("focusout", event => { if (!svg.contains(event.relatedTarget)) showInterval(null); });
+    holder.append(svg, tooltip, readout);
     return holder;
   }
   function render() {
@@ -185,7 +283,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
       if (activeFocus) [...root.querySelectorAll("[data-performance-focus]")]
         .find((node) => node.dataset.performanceFocus === activeFocus)?.focus({ preventScroll: true });
     };
-    chartCursors = [];
+    chartCursors = []; selectedInterval = null;
     root.replaceChildren();
     const heading = element("div", "performance-heading");
     const title = element("div");
@@ -235,8 +333,17 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     for (const metric of ["speed", "latency"]) {
       const card = element("article", "performance-card"); card.append(element("h4", "", translate(metric)), element("p", "performance-unit", translate(`${metric}Unit`)));
       card.append(plot(metric === "speed" ? selected.speed : [{ method: "ttft", points: selected.ttft }], metric, COLORS[modelId] ?? "var(--green)", domain));
-      const legend = element("p", "performance-legend");
-      legend.textContent = metric === "speed" ? `● ${translate("receipt")}   △ ${translate("legacy")}   ▰ ${translate("band")}` : `▰ ${translate("band")}`;
+      const legend = element("div", "performance-legend");
+      for (const method of metric === "speed" ? ["receipt", "legacy", "band"] : ["band"]) {
+        const entry = element("span", "performance-legend-item");
+        const swatch = svgElement("svg", { width: 18, height: 16, viewBox: "0 0 18 16", "aria-hidden": "true" });
+        const color = COLORS[modelId] ?? "var(--green)";
+        swatch.append(svgElement(method === "band" ? "rect" : method === "legacy" ? "polygon" : "circle", {
+          ...(method === "band" ? { x: 1, y: 3, width: 16, height: 10, rx: 2, opacity: .22 } : method === "legacy" ? { points: "9,3 4,12 14,12" } : { cx: 9, cy: 8, r: 4 }),
+          fill: method === "band" ? color : "var(--white)", stroke: color, "stroke-width": method === "band" ? 0 : 2,
+        }));
+        entry.append(swatch, element("span", "", translate(method))); legend.append(entry);
+      }
       card.append(legend); panel.append(card);
     }
     const coverage = element("div", "performance-coverage");

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeModelPerformance, performanceSegments, performanceDomain, mountModelPerformance } from '../public/model-performance.js';
+import { normalizeModelPerformance, performanceSegments, performanceDomain, performanceYScale, performanceDateTicks, performanceHoverBin, mountModelPerformance } from '../public/model-performance.js';
 import { LocalCompanionClient } from '../public/data-client.js';
 import { translate, SUPPORTED_LOCALES } from '../public/localization.js';
 const DAY = 86400000;
@@ -119,11 +119,14 @@ function focusHarness() {
       assert.equal(selector, '[data-performance-focus]');
       return this.all().filter(node => node.dataset.performanceFocus);
     }
-    setAttribute(key, value) { this.attributes[key] = value; }
+    setAttribute(key, value) { this.attributes[key] = value; if (key === "class") this.className = value; }
+    getBoundingClientRect() { return { left: 0, top: 0, width: 800, height: 256 }; }
+    contains(node) { return node === this || this.all().includes(node); }
     addEventListener(type, listener) { this.listeners[type] = listener; }
-    focus(options) { documentRef.activeElement = this; this.focusOptions = options; }
+    focus(options) { documentRef.activeElement = this; this.focusOptions = options; this.listeners.focus?.(); }
   }
   documentRef.createElement = tag => new Node(tag);
+  documentRef.createElementNS = (namespace, tag) => new Node(tag);
   const root = new Node('section');
   const windowRef = { localStorage: { getItem: () => null, setItem() {} },
     setTimeout: () => 1, clearTimeout() {},
@@ -161,5 +164,59 @@ test('loading and background renders retain heading and disclosure keyboard focu
   assert.notEqual(dom.documentRef.activeElement, previousTable);
   assert.equal(dom.documentRef.activeElement, dom.find('table'), 'new background data retains table disclosure focus');
   assert.deepEqual(dom.documentRef.activeElement.focusOptions, { preventScroll: true });
+  controller.destroy();
+});
+
+
+test('y axes use readable round steps, include the spread, and retain subsecond resolution', () => {
+  assert.deepEqual(performanceYScale([53.9, 54.5, 30]), { maximum: 60, ticks: [0,20,40,60], digits: 0 });
+  assert.deepEqual(performanceYScale([36.3]), { maximum: 40, ticks: [0,10,20,30,40], digits: 0 });
+  assert.deepEqual(performanceYScale([.008]), { maximum: .008, ticks: [0,.002,.004,.006,.008], digits: 3 });
+  assert.equal(performanceYScale([0, null, NaN]).maximum, 1);
+  for (const peak of [.1, .9, 1, 12, 72, 100, 1e9]) {
+    const scale = performanceYScale([peak]);
+    assert.ok(scale.maximum >= peak); assert.ok(scale.ticks.length >= 3 && scale.ticks.length <= 6);
+  }
+});
+test('calendar ticks use first/fifteenth, Monday weeks and bounded year intervals', () => {
+  const stamp = value => Date.parse(`${value}T00:00:00Z`);
+  const dates = (start,end) => performanceDateTicks({ start: stamp(start), end: stamp(end) }).map(at => new Date(at).toISOString().slice(0,10));
+  assert.deepEqual(dates('2026-07-09','2026-09-09'), ['2026-07-15','2026-08-01','2026-08-15','2026-09-01']);
+  assert.deepEqual(dates('2026-08-11','2026-09-09'), ['2026-08-17','2026-08-24','2026-08-31','2026-09-07']);
+  assert.deepEqual(dates('2026-09-03','2026-09-09'), ['2026-09-03','2026-09-04','2026-09-05','2026-09-06','2026-09-07','2026-09-08','2026-09-09']);
+  assert.ok(dates('2001-06-01','2049-09-09').length <= 7);
+  assert.deepEqual(performanceDateTicks({ start: 2, end: 1 }), []);
+});
+test('horizontal hover bins are calendar-aligned including unobserved days and edges', () => {
+  const domain = { start: 2*DAY, end: 9.5*DAY };
+  assert.equal(performanceHoverBin(0, domain, 'day'), 2*DAY);
+  assert.equal(performanceHoverBin(1, domain, 'day'), 9*DAY);
+  assert.equal(performanceHoverBin(.5, domain, 'day'), 6*DAY);
+  assert.equal((performanceHoverBin(.5, domain, 'week') - 4*DAY) % (7*DAY), 0);
+});
+test('plot-area sweep works away from points, clears on exit, and keyboard order follows dates', async () => {
+  const dom = focusHarness();
+  const controller = mountModelPerformance({ ...dom, client: { modelPerformance: async () => payload() },
+    t: (key, values) => translate(key, values, 'en-US') });
+  dom.show(); await controller.refresh();
+  const svgs = dom.root.all().filter(node => node.tagName === 'svg' && node.listeners.pointermove);
+  assert.equal(svgs.length, 2);
+  const readouts = () => dom.root.all().filter(node => node.className === 'sr-only performance-readout');
+  // Jan3 = first measured day. Pointer near the top, far from its actual point.
+  svgs[0].listeners.pointermove({ clientX: 52, clientY: 30 });
+  assert.ok(readouts().every(node => node.textContent.includes('Median 50')));
+  svgs[0].listeners.pointermove({ clientX: 52, clientY: 200 });
+  assert.ok(readouts().every(node => node.textContent.includes('Median 50')), 'vertical position never changes selected date');
+  svgs[0].listeners.pointermove({ clientX: 52 + 730 * 4/7, clientY: 100 });
+  assert.ok(readouts().every(node => node.textContent.includes('No measurements')), 'missing day never borrows a nearby observation');
+  svgs[0].listeners.pointerleave();
+  assert.ok(readouts().every(node => node.textContent === ''));
+  const targets = svgs[0].all().filter(node => node.className === 'performance-point');
+  assert.equal(targets.filter(node => node.attributes.tabindex === '0').length, 1);
+  targets[0].focus(); targets[0].listeners.keydown({ key: 'ArrowRight', preventDefault() {} });
+  assert.equal(dom.documentRef.activeElement, targets[1]);
+  assert.ok(readouts().every(node => node.textContent.includes('Jan 4')));
+  targets[1].listeners.keydown({ key: 'Escape' });
+  assert.ok(readouts().every(node => node.textContent === ''));
   controller.destroy();
 });
