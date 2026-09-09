@@ -16,7 +16,35 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
-Latest continuation checkpoint (source fixes through `204269c6`; installed signed Mac source `c938a654`):
+Latest continuation checkpoint (frozen candidate source `9be7da8d`; installed signed Mac source `c938a654`):
+
+- **The frozen source now passes all six development CI jobs.** Run
+  [34328830735](https://github.com/adamallcock/tibotattle/actions/runs/34328830735)
+  passed both Mac package targets, Linux packaging/runtime, Windows packaging,
+  the Windows normal dashboard/refresh/Settings/opt-out journey, and the Windows
+  NSIS installed restart/uninstall lifecycle. Exact content-free receipts are
+  retained privately under `windows-normal-9be7da8d`, `linux-normal-9be7da8d`
+  and `windows-nsis-9be7da8d`. These receipts explicitly remain candidate-only;
+  Windows signing, persistent application-credential continuity and full owned
+  descendant cleanup are not established by the NSIS receipt.
+- **The complete local Worker gate passes on the same source.** All 77 test
+  files / 989 tests passed, followed by production and staging dry deploys.
+  A missing generated catalog was resolved through the prescribed public-site
+  builder. Root compared all 17 public source-file hashes against the frozen
+  commit and verified identical source/staged manifests. The local build used
+  unavailable-installer assets; it makes no live site or installer claim. No
+  remote migration, deployment, binding or admission-control change occurred.
+- Corrected private Mac `.13` / `.14` candidates are staged from the clean
+  frozen source, and authorized signing/notarization is underway. Their
+  immutable artifacts, installed behavior and actual updater completion still
+  need verification; `.11` remains the installed application.
+- The rehearsal publisher now supports the exact corrected source and `.13` /
+  `.14` pair while preserving the historical `.11` / `.12` rollback path.
+  Corrected initial publication binds a completed historical receipt and exact
+  predecessor bytes; a mixed-target retry accepts already-verified `.13` without
+  rewriting it. Eight focused tests, the real historical rollback dry run and
+  20 preflight tests pass. No corrected artifact or feed has been published.
+
 
 - **Installed Mac launch, refresh and restart pass.** R8 completed the native
   migration; r9 launched signed `.11` from that completed profile after fresh,
@@ -115,8 +143,9 @@ Latest continuation checkpoint (source fixes through `204269c6`; installed signe
   could no longer see the deleted owner. Repair `51a61dd2` preserves social
   graph invalidation/progress cleanup and accountless exclusion. All 989 tests
   in 77 Worker files, the 95-case focused regression suite and 54 readiness
-  tests pass. The final dry packaging stages require the committed clean tree
-  and remain to be run. Accountless public aggregate inclusion stays disabled.
+  tests pass. The final production and staging dry packaging stages also pass
+  on clean `9be7da8d` after prescribed local asset generation. Accountless public
+  aggregate inclusion stays disabled.
 - **The 11 missing native quota observations are recovered.** Private-copy
   reconciliation passed, then the normally stopped live Electron database was
   proven identical to the baseline before the guarded append-only replacement.
@@ -141,6 +170,12 @@ was regenerated or relabelled. A private proposal binds pinned Node 24.14.0 and
 26.2.0, the existing frozen 31-day interval and a 45–60 minute local regeneration.
 
 Latest CI receipt SHA-256 values (private files, not public artifacts):
+
+- `windows-normal-9be7da8d`: `6d82a1b0dcb4ae41d2d464229fc8e0618cde9ec46b6986fcd000eb5c69d45e6e`.
+- `linux-normal-9be7da8d`: `6d1eeca8b46474fe8abc6510ff9f76ce5307a68f0451a5e3e06dcb335667e014`.
+- `windows-nsis-9be7da8d`: `4a1fda20c3df046c5399a7189357529752fadfeea846d96f96bba653b613e2c9`.
+
+Prior source receipts retained:
 
 - `windows-nsis-9d07534d`: `b08189e64b1f0eb24d4ed7e7a8e6bfccb8c54c580f94427f5232d1f28cc3c8fc`.
 - `linux-normal-9d07534d`: `26e8f58c619b0393645a56de4c0e9221c0a7021b594ba6373c98ddba655777f3`.

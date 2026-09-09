@@ -22,7 +22,27 @@ export const HANDOVER_CHANNEL = "native-to-electron-handover-rehearsal-v1";
 export const TARGETS = Object.freeze(["darwin-arm64", "darwin-x64"]);
 export const CURRENT_VERSION = "0.1.19-native-to-electron-handover.11";
 export const NEXT_VERSION = "0.1.19-native-to-electron-handover.12";
+export const CORRECTED_HANDOVER_SOURCE_REVISION = "9be7da8d2b84f41693b65d982b61ffa71507201c";
+export const CORRECTED_CURRENT_VERSION = "0.1.19-native-to-electron-handover.13";
+export const CORRECTED_NEXT_VERSION = "0.1.19-native-to-electron-handover.14";
 const PROPOSAL_SCHEMA = "tibotattle-private-updater-publication-proposal-v1";
+const CORRECTED_PROPOSAL_SCHEMA = "tibotattle-private-updater-publication-proposal-v2";
+const LEGACY_FAMILY = Object.freeze({
+  id: "c938a654-11-12",
+  sourceRevision: HANDOVER_SOURCE_REVISION,
+  schema: PROPOSAL_SCHEMA,
+  currentVersion: CURRENT_VERSION,
+  nextVersion: NEXT_VERSION,
+  requiresPredecessor: false,
+});
+const CORRECTED_FAMILY = Object.freeze({
+  id: "9be7da8d-13-14",
+  sourceRevision: CORRECTED_HANDOVER_SOURCE_REVISION,
+  schema: CORRECTED_PROPOSAL_SCHEMA,
+  currentVersion: CORRECTED_CURRENT_VERSION,
+  nextVersion: CORRECTED_NEXT_VERSION,
+  requiresPredecessor: true,
+});
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024;
 const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
@@ -86,8 +106,8 @@ function parseManifest(bytes, version, expectedObjects) {
 function expectedName(version, target, extension) {
   return `TiboTattle-${version}-mac-${target.slice("darwin-".length)}.${extension}`;
 }
-function parseReceipt(receipt, { kind, objects, target, version }) {
-  if (!plain(receipt) || receipt.sourceRevision !== HANDOVER_SOURCE_REVISION || receipt.version !== version
+function parseReceipt(receipt, { family, kind, objects, target, version }) {
+  if (!plain(receipt) || receipt.sourceRevision !== family.sourceRevision || receipt.version !== version
       || receipt.target !== target || receipt.candidate !== kind
       || !plain(receipt.checks) || Object.values(receipt.checks).length === 0 || !Object.values(receipt.checks).every((value) => value === true)
       || !exactKeys(receipt.artifacts, ["dmg", "zip"])) {
@@ -104,8 +124,8 @@ function parseReceipt(receipt, { kind, objects, target, version }) {
     }
   }
 }
-async function candidate(root, input, target, kind) {
-  if (!exactKeys(input, ["version", "finalizationReceipt", "finalizationChecksAllTrue", "manifest", "objects"]) || input.version !== (kind === "current" ? CURRENT_VERSION : NEXT_VERSION)
+async function candidate(root, input, target, kind, family) {
+  if (!exactKeys(input, ["version", "finalizationReceipt", "finalizationChecksAllTrue", "manifest", "objects"]) || input.version !== (kind === "current" ? family.currentVersion : family.nextVersion)
       || input.finalizationChecksAllTrue !== true || !Array.isArray(input.objects) || input.objects.length !== 2) fail(`${target} ${kind} proposal shape is invalid`);
   const receiptBytes = await bytesAt(root, input.finalizationReceipt, MAX_MANIFEST_BYTES, `${target} receipt`);
   let receipt; try { receipt = JSON.parse(receiptBytes.bytes.toString("utf8")); } catch { fail(`${target} receipt is invalid`); }
@@ -124,9 +144,89 @@ async function candidate(root, input, target, kind) {
     objects.push(Object.freeze({ ...inputObject, path: read.path, sha512: sha512(read.bytes) }));
   }
   if (new Set(objects.map((object) => object.objectKey)).size !== objects.length || objects.filter((object) => object.primaryForUpdater).length !== 1) fail(`${target} artifact set is invalid`);
-  parseReceipt(receipt, { kind, objects, target, version: input.version });
+  parseReceipt(receipt, { family, kind, objects, target, version: input.version });
   parseManifest(manifest.bytes, input.version, objects);
   return Object.freeze({ version: input.version, receipt: receiptBytes, manifest: Object.freeze({ ...input.manifest, ...manifest }), objects: Object.freeze(objects) });
+}
+
+function proposalFamily(proposal) {
+  if (proposal?.schema === LEGACY_FAMILY.schema && proposal?.sourceRevision === LEGACY_FAMILY.sourceRevision) return LEGACY_FAMILY;
+  if (proposal?.schema === CORRECTED_FAMILY.schema && proposal?.sourceRevision === CORRECTED_FAMILY.sourceRevision) return CORRECTED_FAMILY;
+  fail("proposal is not an accepted closed candidate family");
+}
+
+async function predecessorForCorrectedFamily(root, predecessor) {
+  if (!exactKeys(predecessor, ["state", "proposal", "publicationReceipt"])
+      || !["rollback", "advance"].includes(predecessor.state)
+      || !exactKeys(predecessor.proposal, ["localPath", "sha256"])
+      || !exactKeys(predecessor.publicationReceipt, ["localPath", "sha256"])
+      || !safeHash(predecessor.proposal.sha256) || !safeHash(predecessor.publicationReceipt.sha256)) {
+    fail("corrected predecessor proof is invalid", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID");
+  }
+  const proposalBytes = await bytesAt(root, predecessor.proposal.localPath, MAX_MANIFEST_BYTES, "predecessor proposal");
+  if (proposalBytes.sha256 !== predecessor.proposal.sha256) fail("predecessor proposal changed after binding", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID");
+  let legacyProposal;
+  try { legacyProposal = JSON.parse(proposalBytes.bytes.toString("utf8")); } catch { fail("predecessor proposal is invalid", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID"); }
+  let legacy;
+  try {
+    legacy = await validateProposal(root, legacyProposal, LEGACY_FAMILY);
+  } catch {
+    fail("predecessor proposal is outside the closed history", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID");
+  }
+  const receiptBytes = await bytesAt(root, predecessor.publicationReceipt.localPath, MAX_MANIFEST_BYTES, "predecessor publication receipt");
+  if (receiptBytes.sha256 !== predecessor.publicationReceipt.sha256) fail("predecessor publication receipt changed after binding", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID");
+  let receipt;
+  try { receipt = JSON.parse(receiptBytes.bytes.toString("utf8")); } catch { fail("predecessor publication receipt is invalid", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID"); }
+  const expected = predecessor.state === "rollback"
+    ? Object.fromEntries(TARGETS.map((target) => [target, legacy.targets[target].current.manifest]))
+    : Object.fromEntries(TARGETS.map((target) => [target, legacy.targets[target].next.manifest]));
+  const expectedImmutableKeys = Object.fromEntries(TARGETS.map((target) => [target,
+    (predecessor.state === "rollback" ? legacy.targets[target].current.objects : legacy.targets[target].next.objects)
+      .map((object) => object.objectKey),
+  ]));
+  if (!exactKeys(receipt, ["schema", "sourceRevision", "stage", "bucket", "status", "mutation", "targets"])
+      || receipt.schema !== "tibotattle-electron-handover-feed-publication-receipt-v1"
+      || receipt.sourceRevision !== LEGACY_FAMILY.sourceRevision || receipt.stage !== predecessor.state
+      || receipt.status !== "completed" || receipt.bucket !== DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket
+      || receipt.mutation !== "wrangler-unconditional-put-with-exclusive-control-pre-post-readback"
+      || !plain(receipt.targets) || Reflect.ownKeys(receipt.targets).length !== TARGETS.length) {
+    fail("predecessor publication receipt is outside the closed history", "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID");
+  }
+  for (const target of TARGETS) {
+    const item = receipt.targets[target];
+    if (!exactKeys(item, ["feedKey", "feedSha256", "immutableKeys", "phase"])
+        || !Array.isArray(item.immutableKeys) || item.immutableKeys.length !== expectedImmutableKeys[target].length
+        || item.immutableKeys.some((key, index) => key !== expectedImmutableKeys[target][index])
+        || item.feedKey !== expected[target].objectKey || item.feedSha256 !== expected[target].sha256
+        || item.phase !== "feed_readback_passed") fail(`${target} predecessor receipt does not bind the selected state`, "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID");
+  }
+  return Object.freeze({ state: predecessor.state, targets: Object.freeze(expected) });
+}
+
+async function validateProposal(root, proposal, family = proposalFamily(proposal)) {
+  const expectedKeys = family.requiresPredecessor
+    ? ["schema", "disposition", "sourceRevision", "r2Bucket", "publicOrigin", "feedPrefix", "channel", "privacy", "predecessor", "initialPublication", "feedAdvance", "rollback", "stableMustRemainUntouched"]
+    : ["schema", "disposition", "sourceRevision", "r2Bucket", "publicOrigin", "feedPrefix", "channel", "privacy", "initialPublication", "feedAdvance", "rollback", "stableMustRemainUntouched"];
+  if (!exactKeys(proposal, expectedKeys) || proposal.schema !== family.schema || proposal.disposition !== "proposal-only-no-network-write"
+      || proposal.sourceRevision !== family.sourceRevision || proposal.r2Bucket !== DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket
+      || proposal.publicOrigin !== "https://updates.tibotattle.com" || proposal.feedPrefix !== HANDOVER_PREFIX || proposal.channel !== HANDOVER_CHANNEL
+      || !Array.isArray(proposal.stableMustRemainUntouched) || proposal.stableMustRemainUntouched.join("|") !== "electron/stable/**|appcast.xml|intel/appcast.xml|preview/**") fail("proposal is outside the closed rehearsal policy");
+  const predecessor = family.requiresPredecessor ? await predecessorForCorrectedFamily(root, proposal.predecessor) : null;
+  const resolved = {};
+  for (const target of TARGETS) {
+    const current = await candidate(root, proposal.initialPublication?.[target], target, "current", family);
+    const advance = proposal.feedAdvance?.[target];
+    const rollback = proposal.rollback?.[target];
+    if (!exactKeys(advance, ["prepositionImmutableObjects", "replaceOnlyManifest", "expectedPreviousManifestSha256"])
+        || !Array.isArray(advance.prepositionImmutableObjects) || advance.expectedPreviousManifestSha256 !== current.manifest.sha256) fail(`${target} advance policy is invalid`);
+    const next = await candidate(root, { ...proposal.initialPublication[target], version: family.nextVersion, finalizationReceipt: `${dirname(advance.replaceOnlyManifest.localPath)}/production-finalization-receipt.json`, finalizationChecksAllTrue: true, manifest: advance.replaceOnlyManifest, objects: advance.prepositionImmutableObjects }, target, "next", family);
+    if (!exactKeys(rollback, ["restoreOnlyManifest", "expectedCurrentManifestSha256", "retainImmutableObjects"]) || rollback.expectedCurrentManifestSha256 !== next.manifest.sha256 || rollback.retainImmutableObjects !== true) fail(`${target} rollback policy is invalid`);
+    const rollbackBytes = await bytesAt(root, rollback.restoreOnlyManifest.localPath, MAX_MANIFEST_BYTES, `${target} rollback manifest`);
+    if (rollback.restoreOnlyManifest.objectKey !== current.manifest.objectKey || rollbackBytes.sha256 !== current.manifest.sha256 || rollbackBytes.bytesLength !== current.manifest.bytesLength) fail(`${target} rollback bytes do not match current manifest`);
+    resolved[target] = Object.freeze({ current, next, rollback: Object.freeze({ ...rollback.restoreOnlyManifest, ...rollbackBytes }), predecessor: predecessor?.targets[target] ?? null });
+  }
+  if (Reflect.ownKeys(proposal.initialPublication).length !== TARGETS.length || Reflect.ownKeys(proposal.feedAdvance).length !== TARGETS.length || Reflect.ownKeys(proposal.rollback).length !== TARGETS.length) fail("proposal target set is not closed");
+  return Object.freeze({ family, bucket: proposal.r2Bucket, targets: Object.freeze(resolved) });
 }
 
 export async function validateHandoverFeedProposal({ artifactRoot, proposalPath } = {}) {
@@ -136,26 +236,8 @@ export async function validateHandoverFeedProposal({ artifactRoot, proposalPath 
   await regularFile(proposalFile, MAX_MANIFEST_BYTES, "proposal");
   const proposalReal = await realpath(proposalFile).catch(() => fail("proposal cannot be resolved"));
   let proposal; try { proposal = JSON.parse(await readFile(proposalReal, "utf8")); } catch { fail("proposal JSON is invalid"); }
-  const expectedKeys = ["schema", "disposition", "sourceRevision", "r2Bucket", "publicOrigin", "feedPrefix", "channel", "privacy", "initialPublication", "feedAdvance", "rollback", "stableMustRemainUntouched"];
-  if (!exactKeys(proposal, expectedKeys) || proposal.schema !== PROPOSAL_SCHEMA || proposal.disposition !== "proposal-only-no-network-write"
-      || proposal.sourceRevision !== HANDOVER_SOURCE_REVISION || proposal.r2Bucket !== DEPLOYMENT_ENDPOINTS.sparkle.r2Bucket
-      || proposal.publicOrigin !== "https://updates.tibotattle.com" || proposal.feedPrefix !== HANDOVER_PREFIX || proposal.channel !== HANDOVER_CHANNEL
-      || !Array.isArray(proposal.stableMustRemainUntouched) || proposal.stableMustRemainUntouched.join("|") !== "electron/stable/**|appcast.xml|intel/appcast.xml|preview/**") fail("proposal is outside the closed rehearsal policy");
-  const resolved = {};
-  for (const target of TARGETS) {
-    const current = await candidate(root, proposal.initialPublication?.[target], target, "current");
-    const advance = proposal.feedAdvance?.[target];
-    const rollback = proposal.rollback?.[target];
-    if (!exactKeys(advance, ["prepositionImmutableObjects", "replaceOnlyManifest", "expectedPreviousManifestSha256"])
-        || !Array.isArray(advance.prepositionImmutableObjects) || advance.expectedPreviousManifestSha256 !== current.manifest.sha256) fail(`${target} advance policy is invalid`);
-    const next = await candidate(root, { ...proposal.initialPublication[target], version: NEXT_VERSION, finalizationReceipt: `${dirname(advance.replaceOnlyManifest.localPath)}/production-finalization-receipt.json`, finalizationChecksAllTrue: true, manifest: advance.replaceOnlyManifest, objects: advance.prepositionImmutableObjects }, target, "next");
-    if (!exactKeys(rollback, ["restoreOnlyManifest", "expectedCurrentManifestSha256", "retainImmutableObjects"]) || rollback.expectedCurrentManifestSha256 !== next.manifest.sha256 || rollback.retainImmutableObjects !== true) fail(`${target} rollback policy is invalid`);
-    const rollbackBytes = await bytesAt(root, rollback.restoreOnlyManifest.localPath, MAX_MANIFEST_BYTES, `${target} rollback manifest`);
-    if (rollback.restoreOnlyManifest.objectKey !== current.manifest.objectKey || rollbackBytes.sha256 !== current.manifest.sha256 || rollbackBytes.bytesLength !== current.manifest.bytesLength) fail(`${target} rollback bytes do not match current manifest`);
-    resolved[target] = Object.freeze({ current, next, rollback: Object.freeze({ ...rollback.restoreOnlyManifest, ...rollbackBytes }) });
-  }
-  if (Reflect.ownKeys(proposal.initialPublication).length !== TARGETS.length || Reflect.ownKeys(proposal.feedAdvance).length !== TARGETS.length || Reflect.ownKeys(proposal.rollback).length !== TARGETS.length) fail("proposal target set is not closed");
-  return Object.freeze({ artifactRoot: root, proposalPath: proposalReal, bucket: proposal.r2Bucket, targets: Object.freeze(resolved) });
+  const validated = await validateProposal(root, proposal);
+  return Object.freeze({ artifactRoot: root, proposalPath: proposalReal, ...validated });
 }
 
 function defaultRunWrangler(arguments_) {
@@ -241,7 +323,7 @@ export async function publishElectronHandoverRehearsalFeed({ artifactRoot, propo
   // read/write. It records only object keys, hashes, and closed phases.
   const journal = {
     schema: "tibotattle-electron-handover-feed-publication-receipt-v1",
-    sourceRevision: HANDOVER_SOURCE_REVISION,
+    sourceRevision: validated.family.sourceRevision,
     stage,
     bucket: validated.bucket,
     status: "prepared",
@@ -255,13 +337,24 @@ export async function publishElectronHandoverRehearsalFeed({ artifactRoot, propo
       const item = validated.targets[target];
       const currentFeed = await remoteObject({ bucket: validated.bucket, key: item.current.manifest.objectKey, maximumBytes: MAX_MANIFEST_BYTES, runWrangler, temporaryRoot });
       if (stage === "initial") {
-        if (currentFeed !== null && !sameBytes(currentFeed.bytes, item.current.manifest.bytes)) fail(`existing feed is not the known current candidate: ${target}`, "ELECTRON_HANDOVER_FEED_FEED_CONFLICT");
+        let initialAlreadyCurrent = false;
+        const initialExpected = validated.family.requiresPredecessor
+          ? item.predecessor
+          : currentFeed === null ? null : item.current.manifest;
+        if (validated.family.requiresPredecessor) {
+          const predecessorMatches = sameBytes(currentFeed?.bytes ?? null, initialExpected.bytes);
+          const currentMatches = sameBytes(currentFeed?.bytes ?? null, item.current.manifest.bytes);
+          if (!predecessorMatches && !currentMatches) fail(`existing feed is not the bound predecessor or corrected current candidate: ${target}`, "ELECTRON_HANDOVER_FEED_FEED_CONFLICT");
+          initialAlreadyCurrent = currentMatches;
+        } else if (currentFeed !== null && !sameBytes(currentFeed.bytes, initialExpected.bytes)) {
+          fail(`existing feed is not the known current candidate: ${target}`, "ELECTRON_HANDOVER_FEED_FEED_CONFLICT");
+        }
         journal.targets[target].phase = "feed_preflight_passed";
         await persistReceiptJournal(journalPath, journal);
         for (const object of item.current.objects) await ensureImmutable({ bucket: validated.bucket, object, runWrangler, temporaryRoot });
         journal.targets[target].phase = "assets_readback_passed";
         await persistReceiptJournal(journalPath, journal);
-        if (currentFeed === null) await writeFeed({ bucket: validated.bucket, expected: null, next: item.current.manifest, runWrangler, temporaryRoot });
+        if ((validated.family.requiresPredecessor && !initialAlreadyCurrent) || currentFeed === null) await writeFeed({ bucket: validated.bucket, expected: initialExpected?.bytes ?? null, next: item.current.manifest, runWrangler, temporaryRoot });
         const verified = await remoteObject({ bucket: validated.bucket, key: item.current.manifest.objectKey, maximumBytes: MAX_MANIFEST_BYTES, runWrangler, temporaryRoot });
         if (!sameBytes(verified?.bytes ?? null, item.current.manifest.bytes)) fail(`existing initial feed differs after asset work: ${target}`, "ELECTRON_HANDOVER_FEED_READBACK_FAILED");
       } else if (stage === "advance") {
@@ -273,7 +366,7 @@ export async function publishElectronHandoverRehearsalFeed({ artifactRoot, propo
         await persistReceiptJournal(journalPath, journal);
         await writeFeed({ bucket: validated.bucket, expected: item.current.manifest.bytes, next: item.next.manifest, runWrangler, temporaryRoot });
       } else {
-        // A prior advance can stop between targets. The known .11 state is a
+        // A prior advance can stop between targets. The known family current state is a
         // safe no-op during recovery; any other state remains a hard refusal.
         if (sameBytes(currentFeed?.bytes ?? null, item.current.manifest.bytes)) {
           journal.targets[target].phase = "already_rolled_back";
