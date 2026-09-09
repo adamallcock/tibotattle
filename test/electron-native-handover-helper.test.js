@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -35,6 +35,59 @@ test("native-to-Electron handover helper compiles and exposes only its no-side-e
     runNativeElectronHandoverHelperContractSmoke({ executable }),
     { status: "contract_ok" },
   );
+});
+
+test("same-identity Foundation bundles cannot use their own identifier as a defaults suite", {
+  skip: SKIP,
+  timeout: 120_000,
+}, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-native-handover-defaults-domain-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const contents = join(root, "TiboTattle.app", "Contents");
+  const executable = join(contents, "MacOS", "TiboTattleDefaultsFixture");
+  await mkdir(join(contents, "MacOS"), { recursive: true });
+  await writeFile(join(root, "main.swift"), `import Foundation
+let identifier = "com.usagemonitor.local"
+let result: [String: Any] = [
+  "bundleMatches": Bundle.main.bundleIdentifier == identifier,
+  "sameIdentitySuiteAvailable": UserDefaults(suiteName: identifier) != nil,
+]
+let data = try JSONSerialization.data(withJSONObject: result, options: [.sortedKeys])
+print(String(data: data, encoding: .utf8)!)
+`);
+  await writeFile(join(contents, "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.usagemonitor.local</string>
+<key>CFBundleExecutable</key><string>TiboTattleDefaultsFixture</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+</dict></plist>
+`);
+  const compile = spawnSync("/usr/bin/swiftc", [
+    "-module-cache-path", join(root, "swift-module-cache"),
+    join(root, "main.swift"), "-o", executable,
+  ], {
+    encoding: "utf8", timeout: 30_000, maxBuffer: 8 * 1024,
+  });
+  assert.equal(compile.status, 0, compile.stderr);
+  const result = spawnSync(executable, [], {
+    encoding: "utf8", timeout: 10_000, maxBuffer: 8 * 1024,
+    env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    bundleMatches: true,
+    sameIdentitySuiteAvailable: false,
+  });
+});
+
+test("native handover helper reads legacy preferences through the native default domain", async () => {
+  const source = await readFile("apps/macos/Helpers/NativeElectronHandoverHelper.swift", "utf8");
+  const start = source.indexOf("private static func readPreferences");
+  const end = source.indexOf("private static func failureResponse", start);
+  assert.ok(start >= 0 && end > start, "preference bridge functions must remain present");
+  const reader = source.slice(start, end);
+  assert.match(reader, /let defaults = UserDefaults\.standard/u);
+  assert.doesNotMatch(reader, /UserDefaults\(suiteName:/u);
 });
 
 test("native handover helper classifies selected, unrelated, and other same-identity process fixtures", { skip: SKIP }, async (t) => {

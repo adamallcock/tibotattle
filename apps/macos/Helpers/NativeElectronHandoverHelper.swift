@@ -117,9 +117,9 @@ enum NativeElectronHandoverHelper {
         let service = SMAppService.mainApp
         let startAtLogin = service.status == .enabled
         try validatePreparationLoginItemStatus(service)
-        // Preferences are read and validated before the helper terminates the
-        // old writer or withdraws its login item. A malformed legacy value
-        // therefore cannot leave the predecessor partially transitioned.
+        // Preferences are validated before the helper terminates the old writer
+        // or withdraws its login item. The standard reader binds to the same
+        // app-defaults domain used by the released native predecessor.
         let preferences = try readPreferences(startAtLogin: startAtLogin)
         try assertNoOtherSameIdentityApplications(nativeApplicationPath)
         try stopNativeApplications(nativeApplicationPath)
@@ -335,10 +335,11 @@ enum NativeElectronHandoverHelper {
         throw BridgeFailure.nativeWriter
     }
 
+    /// Read the same app-defaults domain as the released native predecessor.
+    /// A same-identity `suiteName` is deliberately invalid on macOS; using it
+    /// makes a signed helper reject every setting before handover begins.
     private static func readPreferences(startAtLogin: Bool) throws -> [String: Any] {
-        guard let defaults = UserDefaults(suiteName: productIdentifier) else {
-            throw BridgeFailure.preferences
-        }
+        let defaults = UserDefaults.standard
         let rawLanguage = defaults.string(forKey: nativeLanguageKey) ?? "system"
         let language: String
         switch rawLanguage {
