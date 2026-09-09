@@ -50,6 +50,9 @@ export {
   isWindowsFilesystemIdentity,
 } from "./windows-filesystem.js";
 export {
+  windowsNativeUnsignedContentDigest,
+} from "./windows-native-unsigned-content.js";
+export {
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_CAPABILITY,
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_INTEGRATION_STATUS,
   WINDOWS_ACCOUNT_OBSERVATION_BROKER_IPC_ENV,

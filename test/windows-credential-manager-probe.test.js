@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import test from "node:test";
 
 import {
@@ -6,6 +9,48 @@ import {
   loadAuditedWindowsCredentialBinding,
   runWindowsCredentialManagerProbe,
 } from "../src/platform/windows-credential-manager-probe.js";
+import {
+  windowsNativeUnsignedContentDigest,
+} from "../src/platform/index.js";
+
+const require = createRequire(import.meta.url);
+const WINDOWS_KEYTAR_PATH = require.resolve(
+  "@github/keytar/prebuilds/win32-x64/keytar.node",
+);
+
+function nativeBinding() {
+  return {
+    getPassword() {},
+    setPassword() {},
+    deletePassword() {},
+  };
+}
+
+function signedAuthenticodeCopy(bytes) {
+  const pe = bytes.readUInt32LE(0x3c);
+  const optional = pe + 24;
+  const security = optional + 112 + 32;
+  assert.equal(bytes.length % 8, 0);
+  assert.equal(bytes.readUInt32LE(security), 0);
+  assert.equal(bytes.readUInt32LE(security + 4), 0);
+  const signed = Buffer.alloc(bytes.length + 8);
+  bytes.copy(signed);
+  signed.writeUInt32LE(7, optional + 64);
+  signed.writeUInt32LE(bytes.length, security);
+  signed.writeUInt32LE(8, security + 4);
+  signed.fill(1, bytes.length);
+  return signed;
+}
+
+function loadFixtureBinding(bytes, requireBinding = nativeBinding) {
+  return loadAuditedWindowsCredentialBinding({
+    platform: "win32",
+    architecture: "x64",
+    resolveBinding: () => WINDOWS_KEYTAR_PATH,
+    readBinding: () => bytes,
+    requireBinding,
+  });
+}
 
 function memoryBinding() {
   const values = new Map();
@@ -22,7 +67,7 @@ function memoryBinding() {
   };
 }
 
-test("Credential Manager probe reports only status, binding identity, and cleanup", async () => {
+test("Credential Manager probe reports only status, binding content identity, and cleanup", async () => {
   const secret = Buffer.alloc(32, 7).toString("base64url");
   const receipt = await runWindowsCredentialManagerProbe({
     binding: memoryBinding(),
@@ -33,10 +78,41 @@ test("Credential Manager probe reports only status, binding identity, and cleanu
     status: "passed",
     platform: "win32",
     architecture: "x64",
-    bindingSha256: KEYTAR_WIN32_X64_SHA256,
+    bindingUnsignedContentSha256: KEYTAR_WIN32_X64_SHA256,
     cleanup: "confirmed",
   });
   assert.equal(JSON.stringify(receipt).includes(secret), false);
+});
+
+test("Credential Manager binding accepts only vendor-pinned PE content after Authenticode changes", () => {
+  const vendor = readFileSync(WINDOWS_KEYTAR_PATH);
+  assert.equal(createHash("sha256").update(vendor).digest("hex"), KEYTAR_WIN32_X64_SHA256);
+  assert.equal(windowsNativeUnsignedContentDigest(vendor), KEYTAR_WIN32_X64_SHA256);
+
+  const signed = signedAuthenticodeCopy(vendor);
+  assert.notEqual(createHash("sha256").update(signed).digest("hex"), KEYTAR_WIN32_X64_SHA256);
+  assert.equal(windowsNativeUnsignedContentDigest(signed), KEYTAR_WIN32_X64_SHA256);
+  const expectedBinding = nativeBinding();
+  assert.equal(loadFixtureBinding(signed, () => expectedBinding), expectedBinding);
+
+  const altered = Buffer.from(signed);
+  altered[512] ^= 1;
+  let required = false;
+  assert.throws(
+    () => loadFixtureBinding(altered, () => {
+      required = true;
+      return nativeBinding();
+    }),
+    { code: "WINDOWS_CREDENTIAL_MANAGER_BINDING_INTEGRITY" },
+  );
+  assert.equal(required, false);
+
+  const malformed = Buffer.from(signed);
+  malformed.writeUInt32LE(32, 0x3c);
+  assert.throws(
+    () => loadFixtureBinding(malformed),
+    { code: "WINDOWS_CREDENTIAL_MANAGER_BINDING_INTEGRITY" },
+  );
 });
 
 test("Credential Manager probe confirms cleanup after a failed readback", async () => {

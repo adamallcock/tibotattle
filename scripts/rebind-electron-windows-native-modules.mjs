@@ -11,6 +11,7 @@ import { verifyStagedElectronRuntime } from "./build-electron-runtime.mjs";
 import { buildWindowsFilesystemBindingManifest } from "./build-windows-filesystem-manifest.mjs";
 import { preflightElectronWindowsSigning } from "./finalize-electron-windows-signing.mjs";
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
+import { windowsNativeUnsignedContentDigest as nativeUnsignedContentDigest } from "../src/platform/index.js";
 
 const SCRIPT = fileURLToPath(import.meta.url);
 const ROOT = resolve(dirname(SCRIPT), "..");
@@ -204,32 +205,12 @@ function assertOriginalBinding(manifest, sidecarBytes) {
 }
 
 /** Compare PE content while excluding only fields changed by Authenticode. */
-export function windowsNativeUnsignedContentDigest(bytes) {
-  if (!Buffer.isBuffer(bytes) || bytes.length < 256 || bytes.length > MAX_FILE
-      || bytes.readUInt16LE(0) !== 0x5a4d) fail("PE_INVALID");
-  const pe = bytes.readUInt32LE(0x3c);
-  if (pe < 64 || pe + 24 > bytes.length || bytes.readUInt32LE(pe) !== 0x4550
-      || bytes.readUInt16LE(pe + 4) !== 0x8664) fail("PE_INVALID");
-  const optional = pe + 24;
-  const optionalSize = bytes.readUInt16LE(pe + 20);
-  const directory = optional + 112;
-  if (optionalSize < 152 || optional + optionalSize > bytes.length
-      || bytes.readUInt16LE(optional) !== 0x20b
-      || bytes.readUInt32LE(optional + 108) < 5) fail("PE_INVALID");
-  const security = directory + 32;
-  const certificateOffset = bytes.readUInt32LE(security);
-  const certificateSize = bytes.readUInt32LE(security + 4);
-  let end = bytes.length;
-  if (certificateOffset !== 0 || certificateSize !== 0) {
-    if (certificateOffset < optional + optionalSize || certificateOffset % 8 !== 0
-        || certificateSize < 8 || certificateSize % 8 !== 0
-        || certificateOffset + certificateSize !== bytes.length) fail("PE_INVALID");
-    end = certificateOffset;
+function windowsNativeUnsignedContentDigest(bytes) {
+  try {
+    return nativeUnsignedContentDigest(bytes);
+  } catch {
+    fail("PE_INVALID");
   }
-  const unsigned = Buffer.from(bytes.subarray(0, end));
-  unsigned.fill(0, optional + 64, optional + 68);
-  unsigned.fill(0, security, security + 8);
-  return hash(unsigned);
 }
 
 async function selected(options, dependencies) {

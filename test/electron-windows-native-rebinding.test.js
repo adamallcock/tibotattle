@@ -7,6 +7,10 @@ import test from "node:test";
 import { productionElectronCandidatePlan } from "../scripts/package-electron-production.mjs";
 import { createWindowsFilesystemBindingManifest } from "../scripts/build-windows-filesystem-manifest.mjs";
 import { WINDOWS_FILESYSTEM_BINDING_REQUIRED_METHODS } from "../src/platform/windows-filesystem.js";
+import { windowsNativeUnsignedContentDigest } from "../src/platform/index.js";
+import {
+  MAXIMUM_WINDOWS_NATIVE_UNSIGNED_CONTENT_BYTES,
+} from "../src/platform/windows-native-unsigned-content.js";
 import { verifyStagedElectronRuntime } from "../scripts/build-electron-runtime.mjs";
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import {
@@ -17,7 +21,6 @@ import {
   inspectWindowsNativeRebinding, parseWindowsNativeRebindingArguments,
   prepareWindowsNativeRebinding, rebindWindowsNativeModules, rebindWindowsNativeModulesForTest,
   probeWindowsAuthenticodePreSignForTest,
-  windowsNativeUnsignedContentDigest,
 } from "../scripts/rebind-electron-windows-native-modules.mjs";
 const FS = "native/windows-filesystem/build/Release/windows_filesystem.node";
 const SIDECAR = `${FS}.manifest.json`;
@@ -99,8 +102,14 @@ test("native content digest permits Authenticode fields only and rejects malform
   const altered = pe(true); altered[400] = 55;
   assert.notEqual(windowsNativeUnsignedContentDigest(altered), windowsNativeUnsignedContentDigest(pe()));
   const truncated = pe(true); truncated.writeUInt32LE(32, 236);
-  assert.throws(() => windowsNativeUnsignedContentDigest(truncated), { code: "WINDOWS_NATIVE_REBIND_PE_INVALID" });
-  assert.throws(() => windowsNativeUnsignedContentDigest(Buffer.alloc(512)), { code: "WINDOWS_NATIVE_REBIND_PE_INVALID" });
+  assert.throws(() => windowsNativeUnsignedContentDigest(truncated), { code: "WINDOWS_NATIVE_UNSIGNED_CONTENT_INVALID" });
+  assert.throws(() => windowsNativeUnsignedContentDigest(Buffer.alloc(512)), { code: "WINDOWS_NATIVE_UNSIGNED_CONTENT_INVALID" });
+  assert.throws(
+    () => windowsNativeUnsignedContentDigest(
+      Buffer.allocUnsafe(MAXIMUM_WINDOWS_NATIVE_UNSIGNED_CONTENT_BYTES + 1),
+    ),
+    { code: "WINDOWS_NATIVE_UNSIGNED_CONTENT_INVALID" },
+  );
 });
 test("Authenticode diagnostics remain closed while distinguishing trust failures", () => {
   assert.deepEqual(

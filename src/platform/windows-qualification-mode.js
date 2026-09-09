@@ -165,6 +165,7 @@ export const WINDOWS_QUALIFICATION_REQUIRED_RESOURCE_PATHS = Object.freeze([
   "src/desktop-shell-status.js",
   "src/platform/windows-accountless-installation-credential.js",
   "src/platform/windows-credential-manager-probe.js",
+  "src/platform/windows-native-unsigned-content.js",
   "apps/local/server.js",
   "apps/web/public/index.html",
 ]);
@@ -223,6 +224,7 @@ const REQUIRED_RESOURCE_KINDS = Object.freeze({
   "src/desktop-shell-status.js": "electron_shell",
   "src/platform/windows-accountless-installation-credential.js": "electron_shell",
   "src/platform/windows-credential-manager-probe.js": "electron_shell",
+  "src/platform/windows-native-unsigned-content.js": "electron_shell",
   "apps/local/server.js": "companion_source",
   "apps/web/public/index.html": "dashboard_asset",
 });

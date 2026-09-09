@@ -83,6 +83,7 @@ test("Electron app staging includes the shell and keeps the companion manifest v
     assert.ok(shellClosure.includes("apps/electron/desktop-linux-accountless-credential.js"));
     assert.ok(shellClosure.includes("src/platform/linux-accountless-installation-credential.js"));
     assert.ok(shellClosure.includes("src/platform/windows-credential-manager-probe.js"));
+    assert.ok(shellClosure.includes("src/platform/windows-native-unsigned-content.js"));
     await access(join(result.output, "apps/local/server.js"));
     await access(join(result.output, "apps/web/public/index.html"));
     assert.ok(paths.every((path) => !/(^|\/)(?:docs?|tests?)(?:\/|$)/iu.test(path)));
@@ -397,6 +398,7 @@ test("Windows Electron staging includes the exact binding pair and shell", async
     }
     const shellClosure = await assertStagedElectronShellModuleLinkage(result.output);
     assert.ok(shellClosure.includes("src/platform/windows-credential-manager-probe.js"));
+    assert.ok(shellClosure.includes("src/platform/windows-native-unsigned-content.js"));
     assert.ok(!paths.some((path) => path.includes("windows_filesystem_qualification")));
     assert.ok(!paths.some((path) => /(^|\/)(?:docs?|tests?)(?:\/|$)/iu.test(path)));
   });

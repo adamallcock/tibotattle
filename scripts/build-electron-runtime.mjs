@@ -252,6 +252,7 @@ export const ELECTRON_SHELL_RUNTIME_FILES = Object.freeze([
   "src/platform/linux-secret-service.js",
   "src/platform/windows-accountless-installation-credential.js",
   "src/platform/windows-credential-manager-probe.js",
+  "src/platform/windows-native-unsigned-content.js",
   "src/platform/windows-account-observation-broker.js",
   "src/platform/account-observation-broker-ipc.js",
   "src/platform/windows-account-observation-credential.js",

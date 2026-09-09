@@ -302,6 +302,8 @@ test("qualification authority refuses a self-consistent manifest missing any obs
       "apps/electron/windows-account-observation-qualification-smoke-child.mjs",
       "apps/electron/windows-account-observation-qualification-smoke.js",
       "src/platform/windows-account-observation-credential.js",
+      "src/platform/windows-credential-manager-probe.js",
+      "src/platform/windows-native-unsigned-content.js",
       "src/platform/windows-account-observation-broker.js",
       "src/platform/account-observation-broker-ipc.js",
       "src/platform/windows-credential-manager.js",

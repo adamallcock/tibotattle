@@ -155,6 +155,7 @@ const PLATFORM_PUBLIC_EXPORTS = Object.freeze([
   "supportsCompressedRollouts",
   "syncDirectory",
   "windowsAccountObservationBrokerConfiguration",
+  "windowsNativeUnsignedContentDigest",
   "withParticipantSecretLease",
 ]);
 
