@@ -157,8 +157,33 @@ Latest continuation, 2026-09-09:
   normal-candidate smoke lane in `02cefa16`, preserving the entry-marker state
   when dashboard discovery fails. The final diff passed independent review,
   43 normal-candidate tests, 78 shell-core tests and 78 release-trust tests.
-  Signed build 36 is running in
-  [34406692094](https://github.com/adamallcock/tibotattle/actions/runs/34406692094).
+  Signed build 36 in
+  [34406692094](https://github.com/adamallcock/tibotattle/actions/runs/34406692094)
+  passed signing, final-installer verification and installed signed-closure checks,
+  then failed at `dashboard_target`. Its new receipt shows the GUI child alive,
+  CDP version available, no entry-failure marker, and the companion exiting during
+  `starting` with `signal_kill`. Source inspection shows this can be supervisor
+  cleanup after either broker attachment refusal or a readiness timeout; it does
+  not establish a child crash. No dashboard-load failure was captured. The runner
+  removed its owned profile and firewall rule; Windows normal runtime remains open.
+  Independent source review then found a signed-only credential-loader defect:
+  it still compares Keytar's full bytes against the unsigned vendor hash after
+  production Authenticode signing. The exact build-36 packaged loader rejects
+  the extracted signed library with `WINDOWS_CREDENTIAL_MANAGER_BINDING_INTEGRITY`
+  before native loading, although its size/hash match the sealed runtime manifest.
+  The existing PE content verifier also confirms unchanged vendor executable
+  content after removing only signing metadata. These are local artifact proofs;
+  a corrected loader still needs the signed Windows installed journey.
+  Reviewed repair `4d8d551b` now shares that bounded PE verifier between the
+  loader and signer, retaining the vendor content pin and rejecting executable
+  changes or malformed input before native loading. All explicit runtime and
+  qualification inventories include the helper. The patched loader accepts the
+  exact signed build-36 library in a local injected-load check and rejects both
+  tampered executable bytes and a malformed header. Focused loader, rebinding,
+  resource, artifact and package-closure tests pass; architecture is clean,
+  release trust passes 78/78 and preflight passes 20/20. Platform-dependent tests
+  remain skipped locally. Signed build 37 is running at that exact source in
+  [34409539722](https://github.com/adamallcock/tibotattle/actions/runs/34409539722).
   No timeout, credential or acceptance rule is relaxed. The active dependency tree still has the previously documented stale builder
   patch. The current fix and full five-test config suite pass in an isolated
   workspace using the verified frozen/offline patched runtime. No active
