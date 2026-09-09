@@ -579,3 +579,23 @@ test("default environment uses real process.env without rejecting its native pro
   });
   assert.deepEqual(JSON.parse(output), { reached: true });
 });
+
+
+test("untouched staging preparation leaves classification and introduction to the app", async (t) => {
+  const { home } = await homeFixture(t);
+  const forbidden = () => { assert.fail("untouched preparation must not instantiate a persistence backend"); };
+  const inputs = { ...preseedInputs({ home, metadata: signedMetadata() }), initialSharing: "untouched" };
+  const seed = await prepareSignedStagingDisposableProfile(inputs, {
+    createFirstRunBackend: forbidden, createSharingBackend: forbidden, createSharingCoordinator: forbidden,
+  });
+  const { readdir } = await import("node:fs/promises");
+  assert.deepEqual(await readdir(seed.settingsRoot), []);
+  assert.equal(seed.firstRunBackend, undefined);
+  assert.equal(seed.shareBackend, undefined);
+  const { classifyDesktopSharingInstallation } = await import("../apps/electron/desktop-sharing-installation.js");
+  assert.equal(await classifyDesktopSharingInstallation({ profileRoot: seed.runtimeProfileRoot,
+    stateRoot: join(seed.runtimeProfileRoot, "companion-state"), legacyStateRoots: [] }), "fresh");
+  await assert.rejects(prepareSignedStagingDisposableProfile(inputs), {
+    code: "ELECTRON_SIGNED_STAGING_CONSUMER_PROFILE_NOT_FRESH",
+  });
+});

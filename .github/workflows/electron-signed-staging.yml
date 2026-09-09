@@ -7,7 +7,7 @@ on:
       mode:
         description: Probe the disposable account or execute a verified signed staging app
         type: choice
-        options: [probe, native-ui-probe, execute]
+        options: [probe, native-ui-probe, execute, fresh-install]
         default: probe
         required: true
       source_revision:
@@ -71,14 +71,14 @@ jobs:
           raise SystemExit(0 if available else 1)
           PYPROBE
       - name: Install locked verification dependencies
-        if: inputs.mode == 'execute'
+        if: inputs.mode == 'execute' || inputs.mode == 'fresh-install'
         run: |
           npm install --global corepack@0.34.0 --force --ignore-scripts
           corepack enable
           corepack prepare pnpm@11.9.0 --activate
           pnpm install --frozen-lockfile --ignore-scripts
       - name: Verify and extract the exact signed test artifact
-        if: inputs.mode == 'execute'
+        if: inputs.mode == 'execute' || inputs.mode == 'fresh-install'
         run: |
           python3 - <<'PY'
           import os,re,hashlib,json,pathlib,zipfile,subprocess
@@ -111,9 +111,11 @@ jobs:
             'asarSha256':asar,'archiveVerified':True})+'\n')
           PY
       - name: Run real signed scheduler, credential restart and opt-out rehearsal
-        if: inputs.mode == 'execute'
+        if: inputs.mode == 'execute' || inputs.mode == 'fresh-install'
         run: |
-          node scripts/run-signed-electron-staging.mjs --execute-staging \
+          command=--execute-staging
+          if [[ "$SELECTED_MODE" == fresh-install ]]; then command=--execute-fresh-install; fi
+          node scripts/run-signed-electron-staging.mjs "$command" \
             --app "$RUNNER_TEMP/signed-staging-intake/verified/TiboTattle.app" \
             --source-revision "$SELECTED_SOURCE" --asar-sha256 "$SELECTED_ASAR" \
             > staging-receipts/execution.json

@@ -633,9 +633,10 @@ async function readDisabledProjection(shareBackend, createCoordinator, destinati
 }
 
 /**
- * Create only a new signed-staging profile and write the two reviewed records
- * that prevent both the first-run dialog and accountless transport before the
- * first Electron process is started. An existing profile is always refused.
+ * Create only a new signed-staging profile. The default writes the reviewed
+ * acknowledgement and persistent opt-out; fresh seeds the policy default.
+ * Untouched creates directories only, leaving classification and the native
+ * introduction to the signed application. An existing profile is always refused.
  * If a write fails after directory creation, the partial profile is preserved
  * and later calls fail closed; this helper never deletes or repairs it.
  */
@@ -654,7 +655,7 @@ export async function prepareSignedStagingDisposableProfile({
   createSharingCoordinator = createDesktopSharingCoordinator,
 } = {}) {
   assertTarget(platform, architecture);
-  if (!["off", "fresh"].includes(initialSharing)) fail(ERROR_CODES.inputInvalid);
+  if (!["off", "fresh", "untouched"].includes(initialSharing)) fail(ERROR_CODES.inputInvalid);
   if (typeof getuid !== "function" || typeof getUserInfo !== "function") {
     fail(ERROR_CODES.accountContextInvalid);
   }
@@ -692,6 +693,11 @@ export async function prepareSignedStagingDisposableProfile({
   const settingsRoot = signedStagingRuntimeSettingsPathForProfile(profileRoot);
   await assertAbsent(settingsRoot, ERROR_CODES.profileNotFresh);
   await createNewPrivateDirectory(settingsRoot, account.uid, ERROR_CODES.profileNotFresh);
+
+  if (initialSharing === "untouched") {
+    return Object.freeze({ profileRoot, runtimeProfileRoot, settingsRoot,
+      destinationOrigin: validatedMetadata.origin });
+  }
 
   let firstRunBackend;
   let shareBackend;

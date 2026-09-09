@@ -109,3 +109,32 @@ such; this does not qualify native menu Quit, operating-system notification
 presentation, locked Keychain behavior, or interruption recovery for an
 ordinary user's installation. The source tests and prepared workflow do not
 establish an actual signed scheduler pass. Execution evidence remains required.
+
+
+## Untouched first-launch confidence check
+
+The manual `native-ui-probe` mode reads only whether the disposable Mac permits
+native UI automation. It does not enumerate applications or inspect their data.
+A successful probe is an environment prerequisite, not proof that the app's
+introduction was completed.
+
+The separate `fresh-install` workflow mode uses the same immutable signed app
+inputs and intake checks, then runs `--execute-fresh-install`. Its `untouched`
+preparation creates only isolated directories and synthetic source input. It
+writes no first-run receipt, settings, sharing preference, index or credential.
+The runner verifies that classification markers are absent before launch.
+
+After verifying the exact launched executable and process group, the runner
+inspects only that process's native introduction. It requires the expected
+message, Continue/Quit buttons and login checkbox, clears Start at login, and
+clicks Continue. No injected dialog response or acknowledgement bypass is used.
+Missing Accessibility permission, unexpected controls or a timeout fail with an
+explicit stage; the runner never approves unrelated prompts.
+
+The app must create its own acknowledgement and report enabled sharing with
+`default_on` through the normal Settings bridge. The runner then stops its owned
+processes. The receipt separately records untouched preparation, native intro
+completion and the observed policy result. It does not claim an accepted upload,
+credential restart or migration notice delivery. This check can run while staging
+collection and enrollment remain disabled: it qualifies local first-launch
+classification only and does not require a new deployment or a seven-day wait.

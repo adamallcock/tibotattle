@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseSignedStagingExecutionArguments, signedStagingChildEnvironment, signedStagingFixture } from '../scripts/run-signed-electron-staging.mjs';
+import { parseSignedStagingExecutionArguments, signedStagingChildEnvironment, signedStagingFixture, signedStagingNativeIntroScript, interpretSignedStagingNativeIntroResult, assertSignedStagingFreshProjection } from '../scripts/run-signed-electron-staging.mjs';
 const identity = ['--app', '/tmp/reviewed/TiboTattle.app', '--source-revision', 'a'.repeat(40), '--asar-sha256', 'b'.repeat(64)];
 test('execution requires an explicit staging mutation mode and exact artifact inputs', () => {
   assert.throws(() => parseSignedStagingExecutionArguments(identity));
@@ -37,4 +37,65 @@ test('signed intake binds reviewed runner separately and ignores ambient downloa
   assert.ok(workflow.includes("'runnerRevision':runner,'sourceRevision':revision"));
   assert.ok(workflow.includes('--source-revision "$SELECTED_SOURCE" --asar-sha256 "$SELECTED_ASAR"'));
   assert.equal(workflow.includes("'--location'"), false);
+});
+
+
+test('fresh-install is a separate explicit execution mode with the same immutable artifact contract', () => {
+  assert.equal(parseSignedStagingExecutionArguments(['--execute-fresh-install', ...identity]).executionMode, 'fresh_install');
+  assert.equal(parseSignedStagingExecutionArguments(['--execute-staging', ...identity]).executionMode, 'seeded_upload');
+  assert.throws(() => parseSignedStagingExecutionArguments(['--execute-fresh-install', ...identity, '--skip-intro']));
+});
+
+test('native introduction targets one owned PID and only accepts the matching real controls', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const { desktopFirstRunDialogCopy } = await import('../apps/electron/desktop-first-run.js');
+  const copy = desktopFirstRunDialogCopy({ production: true, locale: 'en-US' });
+  const clicks = [];
+  let checked = 1;
+  let message = copy.message;
+  const elements = [
+    { role: () => 'AXStaticText', value: () => message },
+    ...copy.buttons.map((name) => ({ role: () => 'AXButton', name: () => name, click: () => clicks.push(name) })),
+    { role: () => 'AXCheckBox', name: () => copy.checkboxLabel, value: () => checked,
+      click: () => { clicks.push('clear_login'); checked = 0; } },
+  ];
+  const app = { uiElementsEnabled: () => true, applicationProcesses: { whose(query) {
+    assert.equal(query.unixId, 12345);
+    assert.deepEqual(Object.keys(query), ['unixId']);
+    return () => [{ windows: () => [{ entireContents: () => elements }] }];
+  } } };
+  const execute = () => runInNewContext(signedStagingNativeIntroScript(12345) + '; run();', { Application(name) {
+    assert.equal(name, 'System Events'); return app;
+  } });
+  assert.equal(execute(), 'continued');
+  assert.deepEqual(clicks, ['clear_login', copy.buttons[0]]);
+  clicks.length = 0; message = 'A different application dialog';
+  assert.equal(execute(), 'waiting');
+  assert.deepEqual(clicks, []);
+  app.uiElementsEnabled = () => false;
+  assert.equal(execute(), 'unavailable');
+  assert.deepEqual(clicks, []);
+  for (const pid of [0, -1, 1.5, '12345', '1; bad()']) assert.throws(() => signedStagingNativeIntroScript(pid));
+});
+
+test('fresh proof cannot substitute a saved user choice or a forged native result', () => {
+  const receipt = { schemaVersion: 'tibotattle-desktop-first-run-v1', acknowledged: true };
+  assert.equal(assertSignedStagingFreshProjection({ enabled: true, basis: 'default_on' }, receipt), true);
+  assert.throws(() => assertSignedStagingFreshProjection({ enabled: true, basis: 'user_choice' }, receipt));
+  assert.throws(() => assertSignedStagingFreshProjection({ enabled: false, basis: 'default_on' }, receipt));
+  assert.throws(() => assertSignedStagingFreshProjection({ enabled: true, basis: 'default_on' }, null));
+  assert.equal(interpretSignedStagingNativeIntroResult('continued'), true);
+  assert.equal(interpretSignedStagingNativeIntroResult('waiting'), false);
+  assert.throws(() => interpretSignedStagingNativeIntroResult('unavailable'), { stage: 'native_intro_automation_unavailable' });
+  assert.throws(() => interpretSignedStagingNativeIntroResult('ok'), { stage: 'native_intro_unexpected' });
+});
+
+
+test('fresh-only receipt does not claim the seeded restart or upload journey', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const source = await readFile(new URL('../scripts/run-signed-electron-staging.mjs', import.meta.url), 'utf8');
+  assert.match(source, /durableOptOut: false, controlledRestart: false/u);
+  assert.equal((source.match(/proof\.controlledRestart = true/gu) ?? []).length, 1);
+  assert.ok(source.indexOf("stage = 'credential_restart'") < source.indexOf('proof.controlledRestart = true'));
+  assert.ok(source.indexOf('return proof;', source.indexOf('if (untouched) {')) < source.indexOf('proof.controlledRestart = true'));
 });

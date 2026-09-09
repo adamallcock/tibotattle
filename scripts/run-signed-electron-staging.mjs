@@ -9,6 +9,8 @@ import { join, resolve } from 'node:path';
 import { userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { connectCdp, selectMacDashboardTarget, selectMacSettingsTarget, waitFor } from './smoke-electron-macos.mjs';
+import { desktopFirstRunDialogCopy, validateDesktopFirstRunReceipt } from '../apps/electron/desktop-first-run.js';
+import { classifyDesktopSharingInstallation } from '../apps/electron/desktop-sharing-installation.js';
 import { verifySignedStagingLaunchInputs, prepareSignedStagingDisposableProfile, parseSignedStagingConsumerArguments } from './consume-signed-electron-staging.mjs';
 
 export const SIGNED_STAGING_EXECUTION_SCHEMA = 'tibotattle-signed-staging-execution-v1';
@@ -19,8 +21,9 @@ function fail(stage) { throw Object.assign(new Error('SIGNED_STAGING_EXECUTION_F
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
 
 export function parseSignedStagingExecutionArguments(argv) {
-  if (!Array.isArray(argv) || argv[0] !== '--execute-staging') fail('arguments');
-  return parseSignedStagingConsumerArguments(argv.slice(1));
+  if (!Array.isArray(argv) || !['--execute-staging', '--execute-fresh-install'].includes(argv[0])) fail('arguments');
+  return { ...parseSignedStagingConsumerArguments(argv.slice(1)),
+    executionMode: argv[0] === '--execute-fresh-install' ? 'fresh_install' : 'seeded_upload' };
 }
 
 export function signedStagingChildEnvironment(parent, home, temporaryDirectory) {
@@ -81,7 +84,77 @@ function listenerOwned(pid, port) {
   } catch { return false; }
 }
 
-async function launch(verified, environment) {
+// UI automation is confined to the PID whose executable and process group the
+// launcher verified. No global keystrokes, injected dialog response or receipt.
+export function signedStagingNativeIntroScript(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) fail('native_intro_identity');
+  const copies = ['en-US', 'zh-Hans', 'es'].map((locale) => {
+    const copy = desktopFirstRunDialogCopy({ production: true, locale });
+    return { message: copy.message, buttons: copy.buttons, checkbox: copy.checkboxLabel };
+  });
+  return `function run() {
+    var events = Application('System Events');
+    if (!events.uiElementsEnabled()) return 'unavailable';
+    var matches = events.applicationProcesses.whose({ unixId: ${pid} })();
+    if (matches.length !== 1) return 'waiting';
+    var windows = matches[0].windows();
+    if (windows.length > 3) return 'unexpected';
+    var copies = ${JSON.stringify(copies)};
+    var found = [];
+    for (var w = 0; w < windows.length; w++) {
+      var elements = windows[w].entireContents();
+      if (elements.length > 500) return 'unexpected';
+      var texts = elements.filter(function(e) { return e.role() === 'AXStaticText'; });
+      var buttons = elements.filter(function(e) { return e.role() === 'AXButton'; });
+      var checks = elements.filter(function(e) { return e.role() === 'AXCheckBox'; });
+      for (var c = 0; c < copies.length; c++) {
+        var copy = copies[c];
+        if (!texts.some(function(e) { return e.value() === copy.message; })) continue;
+        var next = buttons.filter(function(e) { return e.name() === copy.buttons[0]; });
+        var quit = buttons.filter(function(e) { return e.name() === copy.buttons[1]; });
+        var box = checks.filter(function(e) { return e.name() === copy.checkbox; });
+        if (next.length !== 1 || quit.length !== 1 || box.length !== 1) return 'unexpected';
+        found.push({ next: next[0], box: box[0] });
+      }
+    }
+    if (found.length === 0) return 'waiting';
+    if (found.length !== 1) return 'unexpected';
+    var selected = found[0];
+    if (selected.box.value() === 1) selected.box.click();
+    if (selected.box.value() !== 0) return 'unexpected';
+    selected.next.click();
+    return 'continued';
+  }`;
+}
+
+export function interpretSignedStagingNativeIntroResult(value) {
+  if (value === 'continued') return true;
+  if (value === 'waiting') return false;
+  fail(value === 'unavailable' ? 'native_intro_automation_unavailable' : 'native_intro_unexpected');
+}
+
+async function continueNativeIntro(state, verified) {
+  await waitFor(() => {
+    if (state.stopped()) fail('native_intro_closed');
+    const row = processTable().find((entry) => entry.pid === state.pid);
+    if (row?.group !== state.pid || row.command !== verified.executable) fail('native_intro_identity');
+    let result;
+    try {
+      result = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', signedStagingNativeIntroScript(state.pid)],
+        { encoding: 'utf8', timeout: OPERATION, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    } catch { fail('native_intro_automation_unavailable'); }
+    return interpretSignedStagingNativeIntroResult(result);
+  }, STARTUP, 'native introduction');
+  state.nativeIntroContinued = true;
+}
+
+export function assertSignedStagingFreshProjection(sharing, receipt) {
+  validateDesktopFirstRunReceipt(receipt);
+  if (sharing?.enabled !== true || sharing.basis !== 'default_on') fail('fresh_classification');
+  return true;
+}
+
+async function launch(verified, environment, { untouched = false } = {}) {
   // Same-identity handover/SingleInstanceLock must never attach to a pre-existing app.
   if (processTable().some((row) => /\/TiboTattle(?: Dev)?\.app\/Contents\/MacOS\/TiboTattle(?: Dev)?$/u.test(row.command))) fail('preexisting_app');
   const port = await freePort();
@@ -100,6 +173,7 @@ async function launch(verified, environment) {
       return row?.group === child.pid && row.command === verified.executable;
     }, OPERATION, 'process group');
     state.groupVerified = true;
+    if (untouched) await continueNativeIntro(state, verified);
     await waitFor(() => listenerOwned(child.pid, port), STARTUP, 'owned debugger');
     const target = await waitFor(async () => selectMacDashboardTarget(await json(`http://127.0.0.1:${port}/json/list`), port), STARTUP, 'dashboard target');
     const dashboard = await connectCdp(target);
@@ -152,8 +226,10 @@ async function bindingDigest(root) {
 export async function runSignedStagingExecution(options) {
   const proof = { schemaVersion: SIGNED_STAGING_EXECUTION_SCHEMA, status: 'failed',
     sourceRevision: options.sourceRevision, asarSha256: options.asarSha256,
+    executionMode: options.executionMode ?? 'seeded_upload', untouchedProfile: false,
+    nativeIntroContinued: false, freshDefaultOnObserved: false,
     signedArtifactVerified: false, seededDefaultOn: false, automaticAcceptedUpload: false,
-    credentialReuseAfterRestart: false, durableOptOut: false, controlledRestart: true,
+    credentialReuseAfterRestart: false, durableOptOut: false, controlledRestart: false,
     nativeCleanQuitQualified: false, ownedProcessesStopped: false, failureStage: null, failureCode: null };
   let active;
   let stage = 'artifact';
@@ -161,14 +237,37 @@ export async function runSignedStagingExecution(options) {
     const verified = await verifySignedStagingLaunchInputs(options);
     proof.signedArtifactVerified = true;
     stage = 'profile';
-    const seed = await prepareSignedStagingDisposableProfile({ metadata: verified.metadata, initialSharing: 'fresh' });
+    if (!['seeded_upload', 'fresh_install'].includes(proof.executionMode)) fail('arguments');
+    const untouched = proof.executionMode === 'fresh_install';
+    const seed = await prepareSignedStagingDisposableProfile({ metadata: verified.metadata,
+      initialSharing: untouched ? 'untouched' : 'fresh' });
     const temporary = join(seed.profileRoot, 'temporary');
     const sessions = join(seed.runtimeProfileRoot, 'synthetic-home', '.codex', 'sessions');
     await mkdir(temporary, { mode: 0o700 });
     await mkdir(sessions, { recursive: true, mode: 0o700 });
     await writeFile(join(sessions, 'rollout-signed-staging-synthetic.jsonl'), signedStagingFixture(), { mode: 0o600, flag: 'wx' });
     const environment = signedStagingChildEnvironment(process.env, userInfo().homedir, temporary);
-    proof.seededDefaultOn = true;
+    proof.seededDefaultOn = !untouched;
+    if (untouched) {
+      stage = 'fresh_profile';
+      if (await classifyDesktopSharingInstallation({ profileRoot: seed.runtimeProfileRoot,
+        stateRoot: join(seed.runtimeProfileRoot, 'companion-state'), legacyStateRoots: [] }) !== 'fresh') fail('fresh_profile');
+      proof.untouchedProfile = true;
+      stage = 'native_intro';
+      active = await launch(verified, environment, { untouched: true });
+      proof.nativeIntroContinued = active.nativeIntroContinued === true;
+      stage = 'fresh_classification';
+      const receiptPath = join(seed.settingsRoot, 'desktop-first-run-v1.json');
+      const metadata = await lstat(receiptPath);
+      if (!metadata.isFile() || metadata.isSymbolicLink() || metadata.uid !== process.getuid()
+        || metadata.size > 4096 || metadata.nlink !== 1) fail('fresh_classification');
+      const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
+      proof.freshDefaultOnObserved = assertSignedStagingFreshProjection(await active.readSharing(), receipt);
+      await stop(active); active = null;
+      proof.ownedProcessesStopped = true;
+      proof.status = 'passed';
+      return proof;
+    }
     stage = 'automatic_upload';
     active = await launch(verified, environment);
     const accepted = await waitFor(async () => {
@@ -181,6 +280,7 @@ export async function runSignedStagingExecution(options) {
     await stop(active); active = null;
     stage = 'credential_restart';
     active = await launch(verified, environment);
+    proof.controlledRestart = true;
     await waitFor(async () => (await active.readSharing())?.transportStatus === 'up_to_date', SYNC, 'authenticated restart');
     if (await bindingDigest(seed.runtimeProfileRoot) !== identity) fail('binding_changed');
     proof.credentialReuseAfterRestart = true;
@@ -203,7 +303,7 @@ export async function runSignedStagingExecution(options) {
     const knownCodes = ['ACCOUNT_CONTEXT_INVALID', 'APP_INVALID', 'ARCHIVE_INVALID', 'ARTIFACT_DIGEST_INVALID', 'ARTIFACT_INVALID', 'INPUT_INVALID', 'METADATA_INVALID', 'OPT_OUT_INVALID', 'PROFILE_NOT_FRESH', 'PROFILE_UNSAFE', 'SIGNATURE_INVALID', 'TARGET_INVALID'];
     const prefix = 'ELECTRON_SIGNED_STAGING_CONSUMER_';
     proof.failureCode = knownCodes.map((code) => prefix + code).includes(error?.code) ? error.code : null;
-    proof.failureStage = ['arguments', 'account', 'process_inventory', 'preexisting_app', 'binding', 'binding_changed', 'opt_out_restart'].includes(error?.stage) ? error.stage : stage;
+    proof.failureStage = ['arguments', 'account', 'process_inventory', 'preexisting_app', 'binding', 'binding_changed', 'opt_out_restart', 'native_intro_identity', 'native_intro_closed', 'native_intro_unexpected', 'native_intro_automation_unavailable', 'fresh_profile', 'fresh_classification'].includes(error?.stage) ? error.stage : stage;
   } finally {
     if (active) { try { proof.ownedProcessesStopped = await stop(active); } catch { proof.ownedProcessesStopped = false; proof.status = 'failed'; } }
   }
