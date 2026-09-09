@@ -39,6 +39,19 @@ SQLite size 151,183,360 bytes, and deletion SQLite size 749,568 bytes. Node was
 process termination. These are synthetic local resource observations, not
 production-size or Cloudflare execution guarantees.
 
+A subsequent maintained D1 metadata observation at
+`2026-09-09T18:46:56Z` reports a **5,328,384,000-byte primary database** and
+49,152-byte deletion ledger. The primary is about 35.2 times the local
+151,183,360-byte fixture database. The owner-only `database-size-metadata.json`
+receipt contains sizes only, without database IDs or records. Exact record
+counts were not queried: scanning the live database was unnecessary for this
+bounded intake. Since 0058 snapshots and rebuilds many populated tables, the
+current 100,000-records-per-table test does **not** establish production-scale
+time or temporary-storage admission. Prepare a representative larger local
+scale/peak-storage rehearsal and assess the provider migration/storage limits
+before approving that live rebuild; do not infer row count, execution time or
+available headroom from total byte size alone.
+
 Private owner-only evidence is retained under
 `production-activation-preparation-20260909/` in the qualification artifact
 root: `production-prefix.json`, `migration-admission.json`, and
@@ -49,6 +62,236 @@ migration-inventory digest
 It explicitly records `freshness: supplied-snapshot-not-live`,
 `remoteSyntax: not-exercised`, and `productionReadiness: false`. No production
 migration, remote syntax write or deployment was performed.
+
+# Migration 0058 admission and simpler alternatives
+
+Source review found 52 ordinary main-database snapshot tables created with
+`CREATE TABLE ... AS SELECT`, not SQLite temporary tables. The snapshots coexist
+with the original rows before the participant/device roots are dropped. Their
+foreign-key cascades clear descendants; explicit deletes clear non-cascading
+sources. All 52 snapshots are restored while the copies remain present, then
+removed. Root indexes are recreated, and retained descendant indexes must be
+updated during replay. One interrupted transaction must preserve the original
+schema, authority and every retained row.
+
+Capacity is a risk, not a demonstrated overflow. The metadata size includes an
+unknown mixture of table/index allocation and free pages; the read-only intake
+did not establish their proportions. Snapshot tables do not copy source indexes
+or constraints, and reusable free pages can reduce file growth. A simple
+`2 × 5.33 GB` calculation is therefore not a measured peak. Conversely, assume
+neither spare pages nor a particular index/data ratio when approving the rebuild.
+SQLite documents the distinct CTAS layout and its free-page accounting in
+[CREATE TABLE](https://www.sqlite.org/lang_createtable.html#the_create_table_command)
+and [PRAGMA freelist_count](https://www.sqlite.org/pragma.html#pragma_freelist_count).
+
+The local receipt went from 109,506,560 bytes after 0057 to 151,183,360 bytes
+after 0058, about 1.38× for that synthetic distribution. This is a file-size
+observation, not a universal peak factor or a journal/WAL allowance. Its 5,535 ms
+0058 step includes interruption/rollback, forward execution and preservation
+checks; it is **not** a pure migration duration. The maintained harness currently
+caps each database at 1 GiB and one million events per telemetry table, so it
+cannot claim a 5.33 GB qualification unchanged.
+
+Cloudflare specifies a 10 GB per-database maximum, which cannot be raised, and
+30 seconds for a SQL query/API batch. Its guidance recommends batching large
+data modifications. The pinned Wrangler `migrations apply` implementation sends
+each entire migration plus ledger append to the `/query` path; it does not use
+the asynchronous file-import path. Both capacity and total-call duration require
+admission. The 5 GB file-import limit concerns the uploaded SQL file, not this
+existing database's size. These are current provider limits, not timings inferred
+from the local Mac. See [D1 limits](https://developers.cloudflare.com/d1/platform/limits/)
+and [import behavior](https://developers.cloudflare.com/d1/best-practices/import-export-data/).
+
+A simpler schema operation now exists in upstream SQLite:
+`ALTER TABLE ... ALTER COLUMN ... DROP NOT NULL` was introduced in 3.53.0 on
+April 9, 2026. It passed a tiny synthetic local check with our Node SQLite3.53.1.
+That does not prove deployed D1 support. Production's constant-only
+`SELECT sqlite_version()` and a strictly prefixed `EXPLAIN ALTER TABLE ...`
+were refused by the authorizer; neither executed DDL. The local pinned
+Miniflare feature probe stalled without evidence and its owned processes were
+terminated. D1 release notes do not establish this feature. The private
+`d1-alter-capability-intake.json` and `d1-alter-explain.json` keep those limits
+explicit. See [SQLite ALTER COLUMN](https://www.sqlite.org/lang_altertable.html#altertabaltercol)
+and [EXPLAIN semantics](https://www.sqlite.org/lang_explain.html).
+
+The subsequently authorized one-row probe in the existing isolated staging D1
+verified the configured/live staging identity, created a fresh uniquely owned
+table and attempted the actual `ALTER COLUMN ... DROP NOT NULL`. D1 refused it
+with `not authorized` / `SQLITE_ERROR`. The probe dropped only its new table and
+verified absence; production and existing staging tables were untouched. The
+owner-only `staging-alter-not-null-feature.json` records the capability failure
+and successful cleanup at `2026-09-09T19:00:14Z`. This is not a production or
+full-migration rehearsal. It establishes that the desired operation is not
+usable through the current hosted D1 route; it does not identify the engine
+version or justify bypassing the authorizer.
+
+The bounded options and current recommendation are:
+
+1. **In-place changes: currently unavailable.** The tiny hosted check above
+   refused the necessary operation. If Cloudflare subsequently exposes it,
+   prepare an equivalent candidate using additive owner columns, nullable social
+   fields, unique indexes and only necessary trigger/view changes. Compare full
+   final schema semantics and populated preservation against existing 0058,
+   then qualify the hosted transaction. Do not start that rewrite on the
+   strength of the newer local SQLite alone.
+2. **Next assess the unchanged migration's asynchronous file path.**
+   Wrangler's maintained `d1 execute --file` uses an import job with polling;
+   that may avoid the ordinary API batch's total-call limit, but does not prove
+   exemption from individual-statement/resource limits. This is the smallest
+   next qualification option, not approval to run the rebuild. Retain the exact SQL
+   and ledger append together and qualify atomic failure recovery on a
+   disposable database. Admit production only with measured temporary-storage
+   headroom and hosted evidence for the largest snapshot/cascade/restore. Do
+   not assume this route makes a multi-gigabyte statement safe.
+3. **Use resumable bounded maintenance only if the above fail.** Reuse existing
+   collection pause/revision, ownership fences, migration admission and recovery
+   boundaries. A reviewed phase journal must bind predecessor/source hashes,
+   immutable batch cursors, preservation evidence and cleanup; restart must
+   resume the exact phase. The root drop/cascade itself must be bounded, so
+   merely chunking snapshots leaves the original risk. This is more engineering
+   than an in-place alteration and requires a source plan before implementation.
+   A new production database is not the default response.
+
+Do not silently replace 0058's provenance: it is pending in production but has
+already run in isolated staging. Scoped Worker guidance requires forward-only,
+reviewed migrations, and the source inventory/receipts bind their hashes. Keep
+the current canonical file until an equivalent candidate, staging lineage and
+explicit admission approach have been reviewed. Do not skip/relabel ledger
+entries or edit `sqlite_schema` to make the gate pass.
+
+No multi-gigabyte run was started. If a larger local rehearsal remains useful
+after assessing the asynchronous route, extend the existing contained runner narrowly:
+record actual migration execution time separately from preservation, observe
+snapshot/restore page and journal peaks, retain the watchdog/RSS/page ceilings,
+and require explicit scratch-disk headroom. At intake the local volume had
+about 112 GB available; this is an observation, not a reservation. Propose a
+single owned scratch directory with a 20 GiB total footprint ceiling, 2 GiB RSS
+and ten-minute external deadline, stopping at the ceiling rather than hiding
+it. A larger local pass can reject an unsafe plan but cannot replace the
+hosted 30-second/transaction qualification.
+
+# Asynchronous import assessment and tiny hosted proof
+
+The installed Wrangler's `executeRemotely` uses `/import` for `--file`, with
+an MD5-checked upload followed by ingest and bookmark polling. Its user-facing
+contract warns that the database cannot serve queries while processing and
+states that a failed import restores the original database state. This supports
+investigating the unchanged SQL. The tiny hosted proof below exercises those
+semantics; it does not establish the behavior of all 0058 statements or its
+production-scale resource needs. The [import guide](https://developers.cloudflare.com/d1/best-practices/import-export-data/)
+requires omitting explicit transaction wrappers and supports deferred foreign
+keys. Preserve the migration text and the same ledger append generated by
+Wrangler in one file; do not split either around the import or add `BEGIN`.
+
+The [import API](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/import/)
+documents init, ingest and poll, an in-progress bookmark and a final bookmark.
+It reports duration and size **after** completion. It does not document a
+whole-import duration ceiling, an exemption from individual-statement limits,
+a cancellation action or peak storage. The pinned polling implementation has
+no overall deadline or cancellation request. Stopping a local client therefore
+does not prove that the remote operation stopped or rolled back. Resume status
+observation for the same operation before any retry or cleanup; a locally
+interrupted poll is an unknown outcome until the provider result and exact
+schema/ledger readback agree. Do not infer import cancellation from the separate
+export API's behavior.
+
+No documented cheap live-data/free-page split was found: the
+[D1 statement reference](https://developers.cloudflare.com/d1/sql-api/sql-statements/)
+does not list `page_count` or `freelist_count`, and the maintained metadata
+surface supplies file size rather than those counts. No additional production
+PRAGMA, table scan or export was attempted. The current 5.33 GB allocation and
+unknown import peak remain an admission gap, not proof of insufficient space.
+
+**Recommended next experiment:** qualify semantics first, at tiny synthetic
+scale. On a specifically approved isolated target, use unique owned parent,
+child and private marker tables, with a synthetic baseline committed before
+import. The file should defer foreign keys, snapshot, cascade/rebuild and
+restore, then append the private marker. Run one late intentional failure and
+prove that the original schema/rows remain and the marker/copies do not; run
+one successful variant and prove restoration, foreign-key integrity and exactly
+one marker. Retain exact input hashes, terminal import status and closed
+readbacks. Clean up only these owned tables after a known terminal outcome.
+This proves route semantics, not production-scale timing or storage.
+
+Even a tiny file can temporarily block the entire target database. Existing
+session authorization for isolated staging synthetic work may cover this bounded
+operation; the coordinator must assess the concrete scope and availability effect
+against that authorization, rather than infer a new approval requirement from
+the provider warning alone. The coordinator reviewed and authorized the exact
+owned-table experiment below under that existing scope. A full exact 0058
+rehearsal requires a fresh disposable database selected through the
+maintained rehearsal admission boundary: existing staging already has 0058,
+so do not reapply it there, rewrite its ledger or relax target checks. Prepare
+0056 plus a synthetic fixture and 0057, then run exact 0058 plus its ledger
+append through the file route. Creating a disposable target, if needed, is an
+explicit operation in that proposal. Proceed to larger representative data only
+if the tiny rollback/cascade test passes and the provider's statement/storage
+limits can be admitted. This keeps the existing migration architecture and
+avoids a new batching framework before it is shown to be necessary.
+
+The concrete private preparation now exists at
+`production-activation-preparation-20260909/import-semantics-plan/`: six immutable
+SQL inputs, per-file SHA-256/size manifest, prior verified staging identity,
+exact sequential commands, readback expectations and cleanup/interruption rules.
+Its largest input is 1,849 bytes; the only baseline is one parent and two children
+plus an empty private ledger analogue. A local synthetic transaction test passed
+late-failure rollback, successful cascade/restore and exact-object cleanup.
+The exact experiment subsequently ran on the existing isolated staging target.
+Fresh configured/live identity separation passed; all four collection flags were
+off at revision 14, and no relevant active hosted/local rehearsal was observed.
+The final `execution-reconciled.json` receipt passed at
+`2026-09-09T19:19:00Z`: the deliberate final UNIQUE failure restored the original
+schema and all three synthetic rows with no marker or snapshots; the successful
+import restored children before their parent under deferred foreign keys,
+committed the expected schema and exactly one private marker, and passed the
+foreign-key check. Its provider duration was 3.7459 ms. Exact cleanup verified
+all five owned object names absent. No production, existing product table or
+canonical migration ledger was changed, and no remote resource was created.
+
+The first read-only metadata check returned an unclassified nonzero result;
+its read-only retry succeeded without renewal. During the success import,
+Wrangler emitted leading status text before its JSON suffix. The initial
+parser failure is preserved in `execution.json`; dependent operations stopped.
+The pinned terminal result (`success`, final bookmark and metadata) was then
+validated from the unique complete JSON suffix and reconciled with exact
+read-only schema/data checks before cleanup. Neither import was rerun. This
+qualifies tiny hosted atomic failure/cascade/restore semantics only; it does
+not close the 5.33 GB storage or largest-statement duration admission gap.
+
+# Prepared exact-migration disposable experiment
+
+The maintained remote rehearsal now has a narrow explicit
+`--import-migration 0058_accountless_upload_ownership.sql` option, accepted only
+for the reviewed primary 0056 / ledger 0002 predecessor. Its existing distinct,
+forbidden-target and empty-pair checks remain mandatory. It uses the established
+two-account/20-record fixture, applies 0057 normally, imports exact 0058 and its
+ledger append together, then applies 0059 normally. It verifies original-column
+synthetic row hashes, counts, foreign keys and final ordered ledgers. Completion
+parsing accepts only known pinned upload progress plus a complete successful
+terminal result. Uncertain mutations preserve the private generated inputs for
+reconciliation and never authorize retry or remote deletion.
+
+The source-focused suite passed 26 tests, including actual in-memory SQLite
+routing/preservation, same-count row corruption, forbidden admission and malformed
+terminal output. An independent read-only source review found no blocker. This
+is source/local evidence; the new disposable resources do not exist yet.
+
+The concrete owner-only inputs are in
+`production-activation-preparation-20260909/disposable-import58-plan/`:
+`OPERATION.md`, source/seed hashes, exact predecessor SQL, import SQL and target/
+configuration templates. The proposed new database names are
+`tibotattle-rehearsal-import58-primary-20260909-a6e8e3ce` and
+`tibotattle-rehearsal-import58-ledger-20260909-a6e8e3ce`.
+UUID placeholders intentionally refuse execution until exact new creation
+receipts are bound. The complete import-file SHA-256 is
+`e0795f0a1823d79d89522ba317f7462079c70c06e43c96a12568476c91f126d4`.
+
+The requested approval covers creating those two resources, the small exact
+migration rehearsal/readbacks and deleting only the newly created UUIDs after
+known terminal results and ownership verification. Production, existing staging,
+real records, deployment, collection activation and multi-gigabyte fixtures are
+excluded. Unknown creation/import/deletion stops for reconciliation. No new
+remote resource or exact-migration hosted run has been performed.
 
 # Live configuration and recovery preparation
 
@@ -188,9 +431,12 @@ key are uploaded. The owner privately decrypts the exact operation/source/ASAR-
 bound device target, resolves its participant, performs the maintained targeted
 erasure and verifies completion. Any timeout, missing target, unfinished fence
 or partial enrollment stays unresolved. The controlled process restart is not a
-native menu-quit qualification. The workflow has not yet executed; hosted
-intake, production acceptance, duplicate-count readback, public exclusion and
-owner erasure are not claimed by the local plan or unit tests.
+native menu-quit qualification. The hosted **plan-only** run
+[34391083322](https://github.com/adamallcock/tibotattle/actions/runs/34391083322)
+at runner `a76c11ff` passed exact archive/signature/source/ASAR verification and
+reported the actual .18 handover channel. Its receipt says `prepared`, with
+launch/upload/restart/opt-out evidence false. Production acceptance,
+duplicate-count readback, public exclusion and owner erasure remain unexecuted.
 
 # Proposed operation sequence
 

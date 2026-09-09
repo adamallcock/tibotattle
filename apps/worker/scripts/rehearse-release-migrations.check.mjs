@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
+import { readFileSync, readdirSync, rmSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { cp, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -27,6 +29,7 @@ const target = { schemaVersion: 1, purpose: "release-migration-rehearsal", datab
 } };
 const confirm = "APPLY_SYNTHETIC_MIGRATIONS_TO_DISPOSABLE_D1";
 const response = results => ({ status: 0, stdout: JSON.stringify([{ success: true, results }]) });
+const importResponse = () => ({ status: 0, stdout: JSON.stringify([{ success: true, results: [], finalBookmark: "synthetic-bookmark", meta: { duration: 1 } }]) });
 
 test("exact supplied prefix admits pending hashes but never claims live lineage or production readiness", async () => {
   const result = await inspectMigrationPrefix({ prefix: await prefix() });
@@ -164,7 +167,7 @@ test("remote syntax uses only isolated config and generated synthetic SQL, valid
     if (sql?.includes("COUNT(*)")) return response([args[2] === "USAGE_MONITOR_DB"
       ? { participants: 2, device_credentials: 2, telemetry_v1_device_consents: 2, telemetry_v1_records: 20, telemetry_records: 20, identity_reenrollment_cooldowns: 2 }
       : { deletion_tombstones: 2, identity_reenrollment_cooldowns: 2 }]);
-    assert.ok(args.includes("--file")); return response([]);
+    assert.ok(args.includes("--file")); return importResponse();
   } });
   assert.equal(result.ok, true); assert.equal(result.productionReadiness, false);
   assert.equal(calls.filter(args => args[1] === "migrations").length, 4);
@@ -242,4 +245,86 @@ test("unconfirmed termination preserves the owned temporary database instead of 
     }), /REHEARSAL_TERMINATION_UNCONFIRMED/);
     assert.deepEqual(await readdir(directory), []);
   } finally { if (directory) await rm(directory, { recursive: true }); }
+});
+
+
+test("only exact pending 0058 at the observed 0056/two-ledger predecessor admits import", async () => {
+  for (const [name, p] of [["0057_accountless_enrollment_ledger.sql", await prefix(56, 2)],
+    ["0058_accountless_upload_ownership.sql", await prefix(55, 2)], ["0058_accountless_upload_ownership.sql", await prefix(58, 2)]]) {
+    await assert.rejects(rehearseRemoteSyntax({ prefix: p, target, confirmation: confirm, importMigration: name,
+      spawn: () => assert.fail("must refuse before any subprocess") }), /IMPORT_INVALID/);
+  }
+});
+
+function syntheticRemote({ corrupt = false, badOutput = null } = {}) {
+  const databases = Object.fromEntries(Object.keys(target.databases).map(binding => [binding, new DatabaseSync(":memory:")]));
+  for (const db of Object.values(databases)) db.exec("PRAGMA foreign_keys=ON;");
+  const imported = [], applied = [], directories = new Set();
+  return { imported, applied, close: () => { Object.values(databases).forEach(db => db.close()); for (const dir of directories) rmSync(dir, { recursive: true, force: true }); },
+    spawn: (_cmd, args) => {
+      const db = databases[args[2] === "apply" ? args[3] : args[2]];
+      const configPath = args[args.indexOf("--config") + 1]; directories.add(dirname(configPath));
+      const config = JSON.parse(readFileSync(configPath, "utf8"));
+      if (args[1] === "migrations") {
+        const binding = args[3], dir = config.d1_databases.find(row => row.binding === binding).migrations_dir;
+        db.exec("CREATE TABLE IF NOT EXISTS d1_migrations (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, applied_at TEXT DEFAULT CURRENT_TIMESTAMP);");
+        for (const name of readdirSync(dir).filter(name => name.endsWith(".sql")).sort()) {
+          if (db.prepare("SELECT 1 FROM d1_migrations WHERE name=?").get(name)) continue;
+          db.exec(`BEGIN;${readFileSync(join(dir, name), "utf8")}\nINSERT INTO d1_migrations(name) VALUES ('${name}');COMMIT;`); applied.push(name);
+        }
+        return { status: 0, stdout: "applied" };
+      }
+      if (args.includes("--file")) {
+        const path = args[args.indexOf("--file") + 1], sql = readFileSync(path, "utf8");
+        db.exec(`BEGIN;${sql}COMMIT;`); imported.push({ path, sql });
+        if (corrupt && path.endsWith("ownership-migration-import.sql")) db.exec("UPDATE telemetry_records SET input_uncached_tokens=input_uncached_tokens+1 WHERE id=(SELECT min(id) FROM telemetry_records);");
+        return badOutput === null ? { status: 0, stdout: "├ Checking if file needs uploading\n│\n├ 🌀 Uploading aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.0123456789abcdef.sql\n│ 🌀 Uploading complete.\n\n" + importResponse().stdout } : { status: 0, stdout: badOutput };
+      }
+      const sql = args[args.indexOf("--command") + 1];
+      const values = sql.split(";").filter(part => part.trim()).map(part => ({ success: true, results: db.prepare(part).all() }));
+      return { status: 0, stdout: JSON.stringify(values) };
+    } };
+}
+
+test("exact 0058 file import preserves populated synthetic predecessors and appends ledger once", async () => {
+  const fake = syntheticRemote();
+  try {
+    const result = await rehearseRemoteSyntax({ prefix: await prefix(56, 2), target, confirmation: confirm,
+      importMigration: "0058_accountless_upload_ownership.sql", spawn: fake.spawn });
+    assert.equal(result.preservedRowsVerified, true); assert.equal(result.productionReadiness, false);
+    assert.equal(result.importReceipts.length, 1);
+    const sql = await readFile(join(workerRoot, "migrations/0058_accountless_upload_ownership.sql"), "utf8");
+    const entry = fake.imported.find(row => row.path.endsWith("ownership-migration-import.sql"));
+    assert.equal(entry.sql, `${sql}\nINSERT INTO d1_migrations (name) values ('0058_accountless_upload_ownership.sql');`);
+    assert.equal(result.importReceipts[0].importSha256, sha(entry.sql));
+    assert.ok(fake.applied.includes("0057_accountless_enrollment_ledger.sql"));
+    assert.ok(fake.applied.includes("0059_accountless_upload_renewal.sql"));
+    assert.ok(!fake.applied.includes("0058_accountless_upload_ownership.sql"));
+  } finally { fake.close(); }
+});
+
+test("synthetic retained-row corruption fails even when all remote counts remain correct", async () => {
+  const fake = syntheticRemote({ corrupt: true });
+  try { await assert.rejects(rehearseRemoteSyntax({ prefix: await prefix(56, 2), target, confirmation: confirm,
+    importMigration: "0058_accountless_upload_ownership.sql", spawn: fake.spawn }), /OUTCOME_UNCERTAIN/); }
+  finally { fake.close(); }
+});
+
+test("file import refuses malformed, partial, false and arbitrary progress results without retry", async () => {
+  for (const badOutput of [importResponse().stdout + "junk", importResponse().stdout.slice(0, -2),
+    importResponse().stdout.replace('"success":true', '"success":false'), "private-output\n" + importResponse().stdout,
+    response([]).stdout]) {
+    const fake = syntheticRemote({ badOutput });
+    try {
+      await assert.rejects(rehearseRemoteSyntax({ prefix: await prefix(56, 2), target, confirmation: confirm,
+        importMigration: "0058_accountless_upload_ownership.sql", spawn: fake.spawn }), error => {
+          assert.match(error.code, /OUTCOME_UNCERTAIN/);
+          assert.ok(readFileSync(join(error.recoveryDirectory, "wrangler.json"), "utf8").includes("tibotattle-rehearsal"));
+          assert.ok(readFileSync(join(error.recoveryDirectory, "USAGE_MONITOR_DB-seed.sql"), "utf8").includes("synthetic-rehearsal"));
+          return true;
+        });
+      assert.equal(fake.imported.length, 1);
+      assert.ok(!fake.applied.includes("0057_accountless_enrollment_ledger.sql"));
+    } finally { fake.close(); }
+  }
 });

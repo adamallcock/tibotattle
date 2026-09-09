@@ -12,6 +12,7 @@ const WORKER_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const STREAMS = Object.freeze({ USAGE_MONITOR_DB: "migrations", DELETION_LEDGER: "deletion-ledger-migrations" });
 const SCHEMA = "release-migration-rehearsal-v1";
 const PREFIX_SCHEMA = "release-migration-prefix-v1";
+const IMPORT_OWNERSHIP_MIGRATION = "0058_accountless_upload_ownership.sql";
 const LEDGER_SQL = "SELECT name FROM d1_migrations ORDER BY id;";
 const sha = value => createHash("sha256").update(value).digest("hex");
 const fail = code => { throw Object.assign(new Error(code), { code }); };
@@ -68,6 +69,23 @@ export async function inspectMigrationPrefix({ workerRoot = WORKER_ROOT, prefix 
   return admissionForSources(await bundles(workerRoot), prefix);
 }
 
+function decodeImportResult(stdout) {
+  // Pinned Wrangler can emit upload progress before its terminal JSON value.
+  // Accept only those complete progress lines, never arbitrary or partial output.
+  const start = stdout.indexOf("[");
+  if (start < 0 || start > 4096) fail("REHEARSAL_WRANGLER_RESULT_INVALID");
+  const progress = stdout.slice(0, start).split("\n").filter(line => line.trim());
+  if (progress.some(line => !/^(?:├ Checking if file needs uploading|│|├ 🌀 Uploading [a-f0-9-]+\.[a-f0-9]+\.sql|│ 🌀 Uploading complete\.)$/.test(line))) fail("REHEARSAL_WRANGLER_RESULT_INVALID");
+  let value;
+  try { value = JSON.parse(stdout.slice(start)); } catch { fail("REHEARSAL_WRANGLER_RESULT_INVALID"); }
+  const row = value?.[0];
+  if (!Array.isArray(value) || value.length !== 1 || !exact(row, ["results", "success", "finalBookmark", "meta"])
+      || row.success !== true || !Array.isArray(row.results) || typeof row.finalBookmark !== "string"
+      || row.finalBookmark.length === 0 || row.finalBookmark.length > 256 || !object(row.meta)
+      || !Number.isFinite(row.meta.duration) || row.meta.duration < 0) fail("REHEARSAL_WRANGLER_RESULT_INVALID");
+  return value;
+}
+
 function wranglerRun(workerRoot, args, spawn = spawnSync) {
   let result;
   try {
@@ -76,6 +94,7 @@ function wranglerRun(workerRoot, args, spawn = spawnSync) {
       env: { ...process.env, CI: "true", WRANGLER_SEND_METRICS: "false" } });
   } catch { fail("REHEARSAL_WRANGLER_FAILED"); }
   if (result.error || result.status !== 0) fail("REHEARSAL_WRANGLER_FAILED");
+  if (args.includes("--file")) return decodeImportResult(result.stdout);
   try { return JSON.parse(result.stdout); } catch { fail("REHEARSAL_WRANGLER_RESULT_INVALID"); }
 }
 
@@ -360,9 +379,12 @@ async function privateJson(path) {
 
 /** Remote writes are possible only through this explicit separately approved mode.
  * A fresh, existing disposable pair is required. No resource creation or deletion. */
-export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, target, confirmation, spawn = spawnSync }) {
+export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, target, confirmation, importMigration = null, spawn = spawnSync }) {
   if (confirmation !== "APPLY_SYNTHETIC_MIGRATIONS_TO_DISPOSABLE_D1") fail("REMOTE_REHEARSAL_CONFIRMATION_REQUIRED");
   const sources = await bundles(workerRoot), admission = admissionForSources(sources, prefix);
+  if (importMigration !== null && (importMigration !== IMPORT_OWNERSHIP_MIGRATION
+      || prefix.migrations.USAGE_MONITOR_DB.length !== 56 || prefix.migrations.DELETION_LEDGER.length !== 2
+      || !admission.migrations.USAGE_MONITOR_DB.pending.some(row => row.name === importMigration))) fail("REMOTE_REHEARSAL_IMPORT_INVALID");
   const errors = [], config = parse(await readFile(join(workerRoot, "wrangler.jsonc"), "utf8"), errors);
   if (errors.length || !object(config)) fail("REMOTE_REHEARSAL_CONFIG_INVALID");
   const forbidden = [];
@@ -382,12 +404,27 @@ export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, t
     ids.add(db.database_id);
   }
   const directory = await mkdtemp(join(tmpdir(), "tibotattle-remote-syntax-")); await chmod(directory, 0o700);
-  let attempted = false;
+  let attempted = false, retainDirectory = false;
   try {
     const configPath = join(directory, "wrangler.json");
     await writeFile(configPath, JSON.stringify({ name: "tibotattle-rehearsal", compatibility_date: config.compatibility_date,
       d1_databases: Object.entries(target.databases).map(([binding, db]) => ({ binding, ...db, migrations_dir: join(directory, binding) })) }), { mode: 0o600 });
     const args = ["--config", configPath];
+    const importReceipts = [];
+    // Only the admitted fresh pair is queried; these are tiny generated fixtures.
+    const capture = (binding, previous = null) => {
+      const infos = wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--command",
+        PRESERVED_TABLES.map(table => `PRAGMA table_info(${quote(table)});`).join("\n"), "--json"], spawn);
+      if (!Array.isArray(infos) || infos.length !== PRESERVED_TABLES.length || infos.some(row => row.success !== true || !Array.isArray(row.results))) fail("REMOTE_REHEARSAL_PRESERVATION_FAILED");
+      const shape = previous ?? Object.fromEntries(infos.flatMap((row, i) => row.results.length ? [[PRESERVED_TABLES[i], {
+        columns: row.results.map(column => column.name), order: row.results.filter(column => column.pk > 0).sort((a, b) => a.pk - b.pk).map(column => column.name),
+      }]] : []));
+      const tables = Object.keys(shape);
+      const rows = wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--command",
+        tables.map(table => `SELECT ${shape[table].columns.map(quote).join(",")} FROM ${quote(table)} ORDER BY ${(shape[table].order.length ? shape[table].order : shape[table].columns).map(quote).join(",")} LIMIT 257;`).join("\n"), "--json"], spawn);
+      if (!Array.isArray(rows) || rows.length !== tables.length || rows.some(row => row.success !== true || !Array.isArray(row.results) || row.results.length > 256)) fail("REMOTE_REHEARSAL_PRESERVATION_FAILED");
+      return { shape, digests: Object.fromEntries(tables.map((table, i) => [table, { count: rows[i].results.length, sha256: sha(JSON.stringify(rows[i].results)) }])) };
+    };
     // Query both before any mutation; an occupied or unknown target never receives SQL.
     for (const binding of Object.keys(STREAMS)) {
       const rows = resultRows(wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--command",
@@ -410,8 +447,25 @@ export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, t
       const seed = join(directory, `${binding}-seed.sql`);
       await writeFile(seed, [...seedStatements(binding, 2, 20, binding === "USAGE_MONITOR_DB" || start >= 2)].join("\n"), { mode: 0o600 });
       wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--file", seed, "--yes", "--json"], spawn);
-      for (const migration of sources[binding].slice(start)) await writeFile(join(directory, binding, migration.name), migration.sql, { mode: 0o600 });
-      apply();
+      const before = importMigration ? capture(binding) : null;
+      if (importMigration && binding === "USAGE_MONITOR_DB") {
+        for (const migration of sources[binding].slice(start)) {
+          await writeFile(join(directory, binding, migration.name), migration.sql, { mode: 0o600 });
+          if (migration.name !== importMigration) { apply(); continue; }
+          const sql = `${migration.sql}\nINSERT INTO d1_migrations (name) values ('${migration.name}');`;
+          const path = join(directory, "ownership-migration-import.sql");
+          await writeFile(path, sql, { mode: 0o600 });
+          const [result] = wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--file", path, "--yes", "--json"], spawn);
+          importReceipts.push({ name: migration.name, sha256: migration.sha256, importSha256: sha(sql), durationMs: result.meta.duration, terminalResultVerified: true });
+        }
+      } else {
+        for (const migration of sources[binding].slice(start)) await writeFile(join(directory, binding, migration.name), migration.sql, { mode: 0o600 });
+        apply();
+      }
+      if (before) {
+        if (JSON.stringify(capture(binding, before.shape).digests) !== JSON.stringify(before.digests)) fail("REMOTE_REHEARSAL_PRESERVATION_FAILED");
+        if (resultRows(wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--command", "PRAGMA foreign_key_check;", "--json"], spawn)).length) fail("REMOTE_REHEARSAL_PRESERVATION_FAILED");
+      }
       const names = resultRows(wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--command", LEDGER_SQL, "--json"], spawn)).map(row => row.name);
       if (JSON.stringify(names) !== JSON.stringify(sources[binding].map(row => row.name))) fail("REMOTE_REHEARSAL_LEDGER_DRIFT");
       const expected = binding === "USAGE_MONITOR_DB" ? { participants: 2, device_credentials: 2,
@@ -423,9 +477,18 @@ export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, t
           || Object.entries(expected).some(([key, count]) => rows[0][key] !== count)) fail("REMOTE_REHEARSAL_PRESERVATION_FAILED");
     }
     return { schemaVersion: SCHEMA, ok: true, mode: "remote-syntax", targetDigest: sha(JSON.stringify(target)),
-      ...admission, fixture: { accounts: 2, events: 20 }, productionReadiness: false };
-  } catch (error) { if (attempted) fail("REMOTE_REHEARSAL_OUTCOME_UNCERTAIN"); throw error;
-  } finally { await rm(directory, { recursive: true }); }
+      ...admission, fixture: { accounts: 2, events: 20 }, ...(importMigration ? { importReceipts, preservedRowsVerified: true } : {}), productionReadiness: false };
+  } catch (error) {
+    if (attempted) {
+      // Preserve this exact private target/config/SQL after an uncertain import.
+      // It is evidence for reconciliation, never permission to rerun occupied targets.
+      retainDirectory = importMigration !== null;
+      throw Object.assign(new Error("REMOTE_REHEARSAL_OUTCOME_UNCERTAIN"), {
+        code: "REMOTE_REHEARSAL_OUTCOME_UNCERTAIN", ...(retainDirectory ? { recoveryDirectory: directory } : {}),
+      });
+    }
+    throw error;
+  } finally { if (!retainDirectory) await rm(directory, { recursive: true }); }
 }
 
 export async function main(args = process.argv.slice(2)) {
@@ -433,11 +496,11 @@ export async function main(args = process.argv.slice(2)) {
   if (!["observe-prefix", "local", "remote-syntax"].includes(mode)) fail("REHEARSAL_USAGE_INVALID");
   for (let i = 0; i < flags.length; i += 2) {
     const key = flags[i], value = flags[i + 1];
-    if (!["--prefix", "--environment", "--accounts", "--events", "--target", "--confirm"].includes(key)
+    if (!["--prefix", "--environment", "--accounts", "--events", "--target", "--confirm", "--import-migration"].includes(key)
         || key in options || !value || value.startsWith("--")) fail("REHEARSAL_USAGE_INVALID");
     options[key] = value;
   }
-  const allowed = { "observe-prefix": ["--environment"], local: ["--prefix", "--accounts", "--events"], "remote-syntax": ["--prefix", "--target", "--confirm"] }[mode];
+  const allowed = { "observe-prefix": ["--environment"], local: ["--prefix", "--accounts", "--events"], "remote-syntax": ["--prefix", "--target", "--confirm", "--import-migration"] }[mode];
   if (Object.keys(options).some(key => !allowed.includes(key))) fail("REHEARSAL_USAGE_INVALID");
   if (mode === "observe-prefix") return observeMigrationPrefix({ environment: options["--environment"] });
   if (!options["--prefix"]) fail("REHEARSAL_USAGE_INVALID");
@@ -445,12 +508,12 @@ export async function main(args = process.argv.slice(2)) {
   if (mode === "local") return runMigrationRehearsalProcess({ prefix, accounts: options["--accounts"] ? Number(options["--accounts"]) : undefined,
     events: options["--events"] ? Number(options["--events"]) : undefined });
   if (!options["--target"]) fail("REHEARSAL_USAGE_INVALID");
-  return rehearseRemoteSyntax({ prefix, target: await privateJson(options["--target"]), confirmation: options["--confirm"] });
+  return rehearseRemoteSyntax({ prefix, target: await privateJson(options["--target"]), confirmation: options["--confirm"], importMigration: options["--import-migration"] ?? null });
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   (process.argv.length === 3 && process.argv[2] === "--rehearsal-worker" ? workerMain() : main()).then(result => process.stdout.write(`${JSON.stringify(result)}\n`), error => {
     const code = typeof error?.code === "string" && /^(?:MIGRATION|REHEARSAL|REMOTE_REHEARSAL|LOCAL_MIGRATION)_[A-Z_]+$/.test(error.code) ? error.code : "REHEARSAL_FAILED";
-    process.stderr.write(`${JSON.stringify({ ok: false, code })}\n`); process.exitCode = 1;
+    process.stderr.write(`${JSON.stringify({ ok: false, code, ...(typeof error?.recoveryDirectory === "string" ? { recoveryDirectory: error.recoveryDirectory } : {}) })}\n`); process.exitCode = 1;
   });
 }

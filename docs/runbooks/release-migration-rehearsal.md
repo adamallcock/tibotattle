@@ -159,6 +159,43 @@ The targets remain for owner inspection, including on success. Do not blindly
 retry: a rerun refuses occupied targets, and the owner must reconcile the exact
 remote ledger before choosing separately approved fresh disposable resources.
 
+### Exact 0058 asynchronous-import qualification
+
+For the reviewed primary 0056 / deletion-ledger 0002 predecessor only, the same
+fresh-pair admission supports one explicit transport variation:
+
+```sh
+node apps/worker/scripts/rehearse-release-migrations.mjs remote-syntax \
+  --prefix /private/tmp/reviewed-migration-prefix.json \
+  --target /private/tmp/approved-disposable-d1.json \
+  --confirm APPLY_SYNTHETIC_MIGRATIONS_TO_DISPOSABLE_D1 \
+  --import-migration 0058_accountless_upload_ownership.sql
+```
+
+No other migration name or predecessor is accepted by this option. The tool
+applies the exact predecessor, seeds the existing two-account/20-record fixture,
+applies 0057 normally, imports unchanged 0058 and its ledger append in **one**
+file, then applies remaining migrations normally. It does not create or delete
+remote resources. File imports may make the selected disposable database
+unavailable while processing. They never target normal staging or production.
+
+Import completion accepts only the pinned CLI's known upload progress followed
+by one complete successful terminal result with a final bookmark. Partial,
+malformed or unexplained output refuses qualification. Before/after hashes cover
+original columns of retained synthetic rows, with 256-row per-table readback
+ceilings; foreign keys and final ordered ledgers must pass. The receipt binds
+0058's source and complete import-file hashes, provider duration and terminal
+completion. This is small-fixture hosted proof, not production-size admission.
+
+Any uncertain mutation stops. In this optional mode the tool retains its
+owner-only temporary target configuration, SQL and fixture and reports its
+`recoveryDirectory` in the closed error receipt. Keep that receipt private.
+Reconcile provider terminal status and exact remote ledgers/schema before
+choosing any retry or deletion. A client timeout is not cancellation; rerunning
+the command refuses occupied targets. Do not delete the new databases while an
+import outcome is unknown. Resource creation and eventual exact-ID deletion
+must be included in the separately approved disposable operation.
+
 Command syntax is based on the current [Cloudflare D1 Wrangler reference](https://developers.cloudflare.com/d1/wrangler-commands/).
 The owning regression suite is:
 
