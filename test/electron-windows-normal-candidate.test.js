@@ -32,11 +32,13 @@ import {
   inspectWindowsNormalCandidateStartupRefreshCompletion,
   normalizeStartupCompletionDiagnostic,
   normalizeStartupFailureDiagnostic,
+  normalizeStartupPhase,
   removeOutboundFirewallBlock,
   parseWindowsNormalCandidateSmokeArguments,
   prepareWindowsNormalCandidateProfile,
   runWindowsNormalCandidateSmoke,
   releaseWindowsNormalCandidateStartupRefreshGate,
+  stopOwnedCandidate,
   classifyWindowsNormalCandidatePreloadContext,
   classifyWindowsNormalCandidateStartupRefreshGateFailure,
   inspectWindowsNormalCandidateStartupRefreshGate,
@@ -68,6 +70,14 @@ test("startup failure diagnostics retain only fixed categories and booleans", ()
     { ...value, refreshStatus: "private" }, { ...value, sourceReadable: "private" },
     { ...value, requests: 42 }, { ...value, launch: "private" }]) {
     assert.equal(normalizeStartupFailureDiagnostic(changed), null);
+  }
+});
+
+test("normal candidate startup phase keeps only fixed lifecycle categories", () => {
+  assert.equal(normalizeStartupPhase("settings_target"), "settings_target");
+  assert.equal(normalizeStartupPhase("dashboard_target"), "dashboard_target");
+  for (const value of [null, "private", "settings_target/private", 42, {}]) {
+    assert.equal(normalizeStartupPhase(value), null);
   }
 });
 
@@ -1360,6 +1370,59 @@ test("normal candidate quit protocol accepts only the fixed lifecycle acknowledg
   assert.deepEqual(sent, [{ type: "tibotattle-electron-smoke-quit-v1" }]);
 });
 
+test("normal candidate process stop waits for exact PID-tree killer completion", async () => {
+  const child = new EventEmitter();
+  child.pid = 1234;
+  child.exitCode = null;
+  child.signalCode = null;
+  const killer = new EventEmitter();
+  killer.exitCode = null;
+  killer.signalCode = null;
+  let killerFinished = false;
+  const stopped = await stopOwnedCandidate(child, {
+    environment: { SystemRoot: String.raw`C:\Windows` },
+    spawnProgram: (command, args) => {
+      assert.equal(command, String.raw`C:\Windows\System32\taskkill.exe`);
+      assert.deepEqual(args, ["/PID", "1234", "/T", "/F"]);
+      setTimeout(() => {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+      }, 0);
+      setTimeout(() => {
+        killer.exitCode = 0;
+        killerFinished = true;
+        killer.emit("exit", 0, null);
+      }, 25);
+      return killer;
+    },
+  });
+  assert.equal(stopped, true);
+  assert.equal(killerFinished, true);
+});
+
+test("normal candidate process stop fails closed on unsuccessful PID-tree killer", async () => {
+  const child = new EventEmitter();
+  child.pid = 1234;
+  child.exitCode = null;
+  child.signalCode = null;
+  const killer = new EventEmitter();
+  killer.exitCode = null;
+  killer.signalCode = null;
+  const stopped = await stopOwnedCandidate(child, {
+    environment: { SystemRoot: String.raw`C:\Windows` },
+    spawnProgram: () => {
+      setImmediate(() => {
+        killer.exitCode = 1;
+        killer.emit("exit", 1, null);
+      });
+      return killer;
+    },
+  });
+  assert.equal(stopped, false);
+  assert.equal(child.exitCode, null);
+  assert.equal(child.signalCode, null);
+});
+
 test("normal candidate runner orders firewall coverage around both ordinary launches and writes a content-free receipt", async () => {
   const events = [];
   let receipt = null;
@@ -1506,6 +1569,7 @@ test("normal candidate runner retains the outbound block and profile when proces
     installFirewall: async () => FIREWALL_RULE,
     launchJourney: async ({ candidateState }) => {
       candidateState.quiescent = false;
+      candidateState.startupPhase = "settings_target";
       throw Object.assign(new Error("dashboard"), {
         code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_DASHBOARD_UNAVAILABLE",
         startupDiagnostic,
@@ -1524,6 +1588,8 @@ test("normal candidate runner retains the outbound block and profile when proces
   assert.equal(receipt.outboundFirewallRuleRemoved, false);
   assert.equal(receipt.ownedProfileRemoved, false);
   assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_OWNED_PROCESS_REMAINS");
+  assert.equal(receipt.startupFailureCode, "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_DASHBOARD_UNAVAILABLE");
+  assert.equal(receipt.startupPhase, "settings_target");
   assert.deepEqual(receipt.startupDiagnostic, startupDiagnostic);
   assert.deepEqual(receipt.startupCompletionDiagnostic, startupCompletionDiagnostic);
 });

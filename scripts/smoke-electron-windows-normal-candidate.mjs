@@ -130,6 +130,28 @@ const POWERSHELL_TIMEOUT_MS = 20_000;
 // candidate remains ineligible to launch until this command verifies its rule.
 export const WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS = 60_000;
 const CLEANUP_TIMEOUT_MS = 10_000;
+const NORMAL_CANDIDATE_STARTUP_PHASES = new Set([
+  "port_allocation",
+  "process_spawn",
+  "cdp_version",
+  "dashboard_target",
+  "cdp_connection",
+  "dashboard_gate",
+  "dashboard_ready",
+  "dashboard_health",
+  "startup_refresh_acceptance",
+  "startup_refresh_completion",
+  "explicit_refresh_acceptance",
+  "explicit_refresh_completion",
+  "sharing_opt_out",
+  "process_proof",
+  "settings_target",
+  "settings_ready",
+  "settings_panel",
+  "settings_persist",
+  "clean_quit",
+  "process_absence",
+]);
 const PROTECTED_OPT_OUT_STAGES = new Set([
   "PROTECTED_OPT_OUT_ADAPTER_UNAVAILABLE",
   "PROTECTED_OPT_OUT_STORE_UNAVAILABLE",
@@ -1668,16 +1690,22 @@ export function createWindowsNormalCandidateQuitProtocol(child, {
 function waitForChildExit(child, timeoutMs = PROCESS_EXIT_TIMEOUT_MS) {
   if (child?.exitCode !== null || child?.signalCode !== null) return Promise.resolve(true);
   return new Promise((resolveExit) => {
-    const onExit = () => { clearTimeout(timer); resolveExit(true); };
-    const timer = setTimeout(() => {
+    let timer;
+    const finish = (value) => {
+      clearTimeout(timer);
       child?.off?.("exit", onExit);
-      resolveExit(false);
-    }, timeoutMs);
+      child?.off?.("error", onError);
+      resolveExit(value);
+    };
+    const onExit = () => finish(true);
+    const onError = () => finish(false);
+    timer = setTimeout(() => finish(false), timeoutMs);
     child?.once?.("exit", onExit);
+    child?.once?.("error", onError);
   });
 }
 
-async function stopOwnedCandidate(child, {
+export async function stopOwnedCandidate(child, {
   environment,
   spawnProgram = spawn,
 } = {}) {
@@ -1695,29 +1723,44 @@ async function stopOwnedCandidate(child, {
       windowsHide: true,
       stdio: "ignore",
     });
+    if (!killer || typeof killer !== "object") return false;
     killer.once?.("error", () => {});
+    if (!await waitForChildExit(killer, CLEANUP_TIMEOUT_MS)
+        || killer.signalCode !== null || killer.exitCode !== 0) return false;
   } catch {
     return false;
   }
   return waitForChildExit(child, CLEANUP_TIMEOUT_MS);
 }
 
-async function connectDashboard({ port, fetchImpl, WebSocketConstructor }) {
+async function connectDashboard({ port, fetchImpl, WebSocketConstructor, onPhase = () => {} }) {
   const endpoint = `http://127.0.0.1:${port}`;
+  onPhase("cdp_version");
   const version = await waitFor(
     () => jsonFetch(`${endpoint}/json/version`, { fetchImpl }),
     STARTUP_TIMEOUT_MS,
   );
   if (!exactObject(version)) fail("CDP_UNAVAILABLE");
+  onPhase("dashboard_target");
   const target = await waitFor(async () => {
     const targets = await jsonFetch(`${endpoint}/json`, { fetchImpl });
     return selectWindowsNormalCandidateDashboardTarget(targets, port);
   }, STARTUP_TIMEOUT_MS);
   if (!target) fail("DASHBOARD_UNAVAILABLE");
+  onPhase("cdp_connection");
   let cdp;
   try { cdp = await connectCdp(target, { WebSocketConstructor }); }
   catch { fail("CDP_UNAVAILABLE"); }
   return Object.freeze({ cdp, endpoint, target });
+}
+
+export function normalizeStartupPhase(value) {
+  return NORMAL_CANDIDATE_STARTUP_PHASES.has(value) ? value : null;
+}
+
+function normalizeStartupFailureCode(value) {
+  if (typeof value !== "string" || !value.startsWith(PREFIX)) return null;
+  return FAILURE_CODES.has(value.slice(PREFIX.length)) ? value : null;
 }
 
 export function normalizeStartupFailureDiagnostic(value) {
@@ -2071,7 +2114,7 @@ export async function waitForWindowsNormalCandidateStartupRefreshCompletion({
   return terminal.decision;
 }
 
-async function assertDashboard({ cdp, target, fetchImpl, launch }) {
+async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () => {} }) {
   const dashboard = exactLoopbackRootPage(target.url);
   if (dashboard === null) fail("DASHBOARD_INVALID");
   const observer = localNetworkObserver(cdp, dashboard.origin);
@@ -2083,11 +2126,13 @@ async function assertDashboard({ cdp, target, fetchImpl, launch }) {
     // The exact normal-candidate preload is now holding automatic refresh at
     // its existing smoke gate. Releasing only after Network.enable closes the
     // fast-renderer race without accepting an unobserved startup POST.
+    onPhase("dashboard_gate");
     const startupGate = await waitForWindowsNormalCandidateStartupRefreshGate(cdp);
     if (startupGate.released !== true) {
       const contexts = await preloadContexts?.inspect?.() ?? [];
       fail(classifyWindowsNormalCandidateStartupRefreshGateFailure(startupGate, contexts));
     }
+    onPhase("dashboard_ready");
     const ready = await waitFor(async () => {
       const value = await cdp.evaluate(`(() => ({
         ready: document.documentElement?.dataset?.localDashboardReady === "true",
@@ -2099,6 +2144,7 @@ async function assertDashboard({ cdp, target, fetchImpl, launch }) {
         && value.heading.length > 0 && value.location === dashboard.href ? value : null;
     }, STARTUP_TIMEOUT_MS);
     if (ready === null) fail("DASHBOARD_UNAVAILABLE");
+    onPhase("dashboard_health");
     const health = await jsonFetch(new URL("/api/local/health", dashboard), { fetchImpl });
     if (health?.status !== "ready") fail("DASHBOARD_UNAVAILABLE");
     const refreshEndpoint = new URL("/api/local/refresh", dashboard);
@@ -2106,6 +2152,7 @@ async function assertDashboard({ cdp, target, fetchImpl, launch }) {
     // disabled while it is active. The observer is attached before dashboard
     // readiness, so require its exact one local POST instead of clicking a
     // second operation into that intentional busy state.
+    onPhase("startup_refresh_acceptance");
     const accepted = await waitFor(async () => {
       if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
       const decision = classifyAutomaticStartupRefreshReceipt({
@@ -2143,6 +2190,7 @@ async function assertDashboard({ cdp, target, fetchImpl, launch }) {
         code: `${PREFIX}LOCAL_STARTUP_REFRESH_UNAVAILABLE`, startupDiagnostic: diagnostic,
       });
     }
+    onPhase("startup_refresh_completion");
     const terminal = await waitForWindowsNormalCandidateStartupRefreshCompletion({
       refreshCount: () => observer.refreshCount(),
       readRefresh: async () => (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
@@ -2163,6 +2211,7 @@ async function assertDashboard({ cdp, target, fetchImpl, launch }) {
     if (await waitFor(() => observer.refreshObserved(), OPERATION_TIMEOUT_MS) !== true) {
       fail("LOCAL_EXPLICIT_REFRESH_REQUEST_UNOBSERVED");
     }
+    onPhase("explicit_refresh_acceptance");
     const explicitAccepted = await waitFor(async () => {
       if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
       const decision = classifyAutomaticStartupRefreshReceipt({
@@ -2174,6 +2223,7 @@ async function assertDashboard({ cdp, target, fetchImpl, launch }) {
       return decision.status === "accepted" ? decision : null;
     }, STARTUP_TIMEOUT_MS);
     if (explicitAccepted === null) fail("LOCAL_EXPLICIT_REFRESH_ACCEPTANCE_UNAVAILABLE");
+    onPhase("explicit_refresh_completion");
     const explicitTerminal = await waitFor(async () => {
       if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
       const decision = classifyAutomaticStartupRefreshReceipt({
@@ -2222,7 +2272,7 @@ async function findSettingsTarget(endpoint, dashboardOrigin, port, fetchImpl) {
   ), STARTUP_TIMEOUT_MS);
 }
 
-async function openSettings({ dashboardCdp, endpoint, dashboardOrigin, port, fetchImpl, WebSocketConstructor }) {
+async function openSettings({ dashboardCdp, endpoint, dashboardOrigin, port, fetchImpl, WebSocketConstructor, onPhase = () => {} }) {
   const opened = await dashboardCdp.evaluate(`(() => {
     const button = document.querySelector("#electron-settings-button");
     if (!button || button.disabled) return false;
@@ -2230,6 +2280,7 @@ async function openSettings({ dashboardCdp, endpoint, dashboardOrigin, port, fet
     return true;
   })()`);
   if (opened !== true) fail("SETTINGS_UNAVAILABLE");
+  onPhase("settings_target");
   const target = await findSettingsTarget(endpoint, dashboardOrigin, port, fetchImpl);
   if (!target) fail("SETTINGS_UNAVAILABLE");
   try {
@@ -2306,9 +2357,12 @@ async function setSettingsRefreshInterval(cdp, seconds) {
 async function assertFirstSettingsPersistence(input) {
   const settings = await openSettings(input);
   try {
+    input.onPhase?.("settings_ready");
     await waitForSettingsReady(settings);
+    input.onPhase?.("settings_panel");
     await activateSettingsDataPanel(settings);
     if (await readSettingsRefreshInterval(settings) !== 300) fail("SETTINGS_PERSISTENCE_INVALID");
+    input.onPhase?.("settings_persist");
     await setSettingsRefreshInterval(settings, 900);
     return true;
   } finally {
@@ -2319,7 +2373,9 @@ async function assertFirstSettingsPersistence(input) {
 async function assertSecondSettingsPersistence(input) {
   const settings = await openSettings(input);
   try {
+    input.onPhase?.("settings_ready");
     await waitForSettingsReady(settings);
+    input.onPhase?.("settings_panel");
     await activateSettingsDataPanel(settings);
     if (await readSettingsRefreshInterval(settings) !== 900) fail("SETTINGS_PERSISTENCE_INVALID");
     return true;
@@ -2353,6 +2409,15 @@ async function launchAndRenderCandidate({
   processRunProgram = runWindowsNsisLifecycleProgram,
   createQuitProtocol = createWindowsNormalCandidateQuitProtocol,
 } = {}) {
+  if (candidateState !== null && (typeof candidateState !== "object" || Array.isArray(candidateState))) {
+    fail("PROCESS_PROOF_UNAVAILABLE");
+  }
+  const onPhase = (phase) => {
+    if (candidateState !== null && NORMAL_CANDIDATE_STARTUP_PHASES.has(phase)) {
+      candidateState.startupPhase = phase;
+    }
+  };
+  onPhase("port_allocation");
   const port = await freePort();
   const spec = buildWindowsNormalCandidateLaunchSpec({
     appPath,
@@ -2366,11 +2431,9 @@ async function launchAndRenderCandidate({
   let quitProtocol = null;
   let clean = false;
   let tracked = null;
-  if (candidateState !== null && (typeof candidateState !== "object" || Array.isArray(candidateState))) {
-    fail("PROCESS_PROOF_UNAVAILABLE");
-  }
   try {
     try {
+      onPhase("process_spawn");
       child = spawnApplication(spec.command, spec.args, {
         ...spec.options,
         stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -2382,10 +2445,10 @@ async function launchAndRenderCandidate({
     if (!Number.isSafeInteger(child?.pid) || child.pid < 1) fail("APPLICATION_LAUNCH_UNAVAILABLE");
     if (candidateState !== null) candidateState.quiescent = false;
     quitProtocol = createQuitProtocol(child);
-    const connected = await connectDashboard({ port, fetchImpl, WebSocketConstructor });
+    const connected = await connectDashboard({ port, fetchImpl, WebSocketConstructor, onPhase });
     cdp = connected.cdp;
     const dashboard = await assertDashboard({ cdp, target: connected.target, fetchImpl,
-      launch: changeSettings ? "first" : "restart" });
+      launch: changeSettings ? "first" : "restart", onPhase });
     observer = dashboard.observer;
     // Preserve only completed, closed dashboard proof before the separate
     // Settings journey. A later Settings failure must not erase evidence that
@@ -2395,7 +2458,9 @@ async function launchAndRenderCandidate({
       candidateState.localRefreshObserved = true;
       candidateState.localRefreshTerminal = dashboard.refreshTerminalStatus;
     }
+    onPhase("sharing_opt_out");
     const sharingOptOutRetained = await assertRenderedSharingOptOut(cdp);
+    onPhase("process_proof");
     tracked = await processProof({
       appPath,
       rootPid: child.pid,
@@ -2410,11 +2475,14 @@ async function launchAndRenderCandidate({
       port,
       fetchImpl,
       WebSocketConstructor,
+      onPhase,
     };
     if (changeSettings) await assertFirstSettingsPersistence(input);
     else await assertSecondSettingsPersistence(input);
     if (!observer.valid()) fail("DASHBOARD_INVALID");
+    onPhase("clean_quit");
     await closeCandidate(child, quitProtocol);
+    onPhase("process_absence");
     await processAbsence({
       appPath,
       environment,
@@ -2520,12 +2588,16 @@ function candidateReceipt({
   cleanup = {},
   startupDiagnostic = null,
   startupCompletionDiagnostic = null,
+  startupFailureCode = null,
+  startupPhase = null,
 } = {}) {
   const terminal = ["succeeded", "degraded"].includes(journey?.localRefreshTerminal)
     ? journey.localRefreshTerminal
     : ["succeeded", "degraded"].includes(progress?.localRefreshTerminal)
       ? progress.localRefreshTerminal
       : null;
+  const selectedStartupFailureCode = normalizeStartupFailureCode(startupFailureCode);
+  const selectedStartupPhase = normalizeStartupPhase(startupPhase);
   return Object.freeze({
     schemaVersion: RECEIPT_SCHEMA,
     status: errorCode === null ? "passed" : "failed",
@@ -2546,6 +2618,10 @@ function candidateReceipt({
     outboundFirewallRuleRemoved: cleanup.firewallRemoved === true,
     ownedProfileRemoved: cleanup.profileRemoved === true,
     errorCode,
+    ...(selectedStartupFailureCode !== null && selectedStartupFailureCode !== errorCode ? {
+      startupFailureCode: selectedStartupFailureCode,
+    } : {}),
+    ...(selectedStartupPhase === null ? {} : { startupPhase: selectedStartupPhase }),
     ...(normalizeStartupFailureDiagnostic(startupDiagnostic) === null ? {} : {
       startupDiagnostic: normalizeStartupFailureDiagnostic(startupDiagnostic),
     }),
@@ -2602,12 +2678,14 @@ export async function runWindowsNormalCandidateSmoke(options, {
   let firewallName = null;
   let journey = null;
   let errorCode = null;
+  let startupFailureCode = null;
   let startupDiagnostic = null;
   let startupCompletionDiagnostic = null;
   const cleanup = { firewallInstalled: false, firewallRemoved: false, profileRemoved: false };
   const candidateState = {
     quiescent: false,
     tracked: null,
+    startupPhase: null,
     dashboardRendered: false,
     localRefreshObserved: false,
     localRefreshTerminal: null,
@@ -2657,6 +2735,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
     });
   } catch (error) {
     errorCode = fixedCode(error);
+    startupFailureCode = normalizeStartupFailureCode(errorCode);
     startupDiagnostic = normalizeStartupFailureDiagnostic(error?.startupDiagnostic);
     startupCompletionDiagnostic = normalizeStartupCompletionDiagnostic(
       error?.startupCompletionDiagnostic,
@@ -2690,6 +2769,8 @@ export async function runWindowsNormalCandidateSmoke(options, {
       cleanup,
       startupDiagnostic,
       startupCompletionDiagnostic,
+      startupFailureCode,
+      startupPhase: candidateState.startupPhase,
     });
     try {
       await receiptHandle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`);
