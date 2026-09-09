@@ -19,6 +19,35 @@ Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
 Latest test-feed and platform continuation:
 
+- Follow-up `.15`/`.16` candidates from frozen runtime `dcf2d6ca` are now
+  signed, notarized, stapled and finalized for both Mac architectures. All 24
+  retained files and four ZIP-contained ASARs were independently checked;
+  `signed-handover-dcf2d6ca/retention-verification.json` has SHA-256
+  `3c4a39e9a98e02a060fcadbc04f48a28a2d37ffe4e1ece5036a896ec08255f6b`.
+- R12 preserved a fresh stopped `.14` app/profile snapshot and the moved original,
+  installed signed `.15`, and verified exact archived ASAR, signature, unchanged
+  installation salt and scheduler preference. The ordinary app launched, About
+  shows `.15` / `content-2d027b25648a`, General settings persist, and Data & privacy
+  explicitly shows sharing off with the previous choice preserved. No unexpected
+  credential prompt was observed. **The one-click `.15` to `.16` update passed:**
+  normal About discovery/download and Install and Restart replaced the app and
+  relaunched it without a manual Quit or launch. Installed `.16` ASAR matches
+  the signed ZIP, native signature/Gatekeeper checks pass, all observed old
+  process IDs are absent and the exact new main binary is running. Installation
+  salt, scheduler opt-out and settings remain unchanged; About identifies `.16`
+  / `content-10b0c4144ac8` and the dashboard returns FRESH. Process/trust and GUI
+  receipts are retained under `mac-native-event-installed-rehearsal-dcf2d6ca-r12`.
+- Both `.15` initial and `.16` advance feed publications completed with R2
+  readbacks. Independent public HTTPS verification matched all eight archives
+  and both `.16` manifests by size, MIME type and SHA-256. Exact proposal
+  `b28cbdd870744f0701d364b9b46db1b48cdaca8e462e70137710501b8ff9e587`
+  and new receipts are retained under `mac-updater-publication-proposal-dcf2d6ca`.
+  Stable feed paths and historical immutable archives were not modified.
+- Reviewed tooling and platform evidence `a6bff54e` passed all six jobs in
+  [34339617379](https://github.com/adamallcock/tibotattle/actions/runs/34339617379),
+  along with contract, documentation, release-trust and dependency workflows.
+  Windows/Linux automated candidate qualification is complete; production trust,
+  upgrades and desktop integration remain unqualified.
 - Approved corrected publication completed: all eight `.13`/`.14` Mac ZIP/DMGs
   and both `.14` test manifests were verified in R2, then independently streamed
   through public HTTPS and matched against expected size, MIME type and SHA-256.
@@ -33,12 +62,12 @@ Latest test-feed and platform continuation:
   `content-6c9e5f12ea46`, and refresh completed FRESH. Both failure and manual-Quit
   recovery receipts are retained under `mac-updater-installed-rehearsal-9be7da8d-r11`.
   This closes archive replacement and relaunch, not the one-click update gate.
-- The remaining update blocker is native event ordering: Electron emits
+- The R11 update failure was native event ordering: Electron emits
   `autoUpdater.before-quit-for-update` before window closes, and `app.before-quit`
   afterward. Source now forwards the earlier native signal into prepared
   lifecycle shutdown. Recovery/dashboard/Settings and production-composition
-  regression coverage passes; 73 focused tests pass. A new signed sender must
-  still prove the corrected one-click path; installed `.14` predates this fix.
+  regression coverage passes; 73 focused tests pass. A new signed sender had to
+  prove the corrected one-click path; R12 above now supplies that proof for Apple Silicon.
 - All six CI jobs for `fb19164f` passed in run
   [34335037428](https://github.com/adamallcock/tibotattle/actions/runs/34335037428).
   Linux includes disposable Secret Service and normal packaged runtime checks;
