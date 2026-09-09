@@ -14,11 +14,19 @@ has no update feed or publishing configuration.
 
 The source package requires two finalizer inputs: the disposable consumer
 account's numeric UID and login name. They are written into the signed package
-marker. At launch, the marker is accepted only on a GitHub-hosted macOS arm64
-profile when `process.getuid()` and `os.userInfo()` both match those values.
-The check occurs before the native handover or credential adapter is created;
-`HOME`, `USER`, and other launcher environment values do not select the
-profile or satisfy the account check.
+marker. At launch, `process.getuid()` and `os.userInfo()` must match those
+values, and the fixed runner-profile environment must be present. These are
+accidental-launch constraints for the dedicated disposable OS account, not an
+attestation that the process runs on a GitHub host. `HOME`, `USER`, and other
+launcher environment values do not select the profile or satisfy the account
+check. The check occurs before the native handover or credential adapter is
+created.
+
+Before readiness, the package redirects both Electron `userData` and
+`sessionData` to the fixed `TiboTattle Signed Staging Rehearsal` sibling under
+the operating system's `appData` directory. This keeps Chromium cookies,
+caches, and other session state out of the normal TiboTattle profile; the
+synthetic companion roots remain nested under that isolated profile.
 
 The child process receives the existing synthetic rehearsal roots and the
 fixed `rehearsal-v1` accountless mode. It cannot inherit a production

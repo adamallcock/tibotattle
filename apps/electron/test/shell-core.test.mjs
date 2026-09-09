@@ -580,7 +580,12 @@ async function createSignedStagingShellFixture(t) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-signed-staging-shell-"));
   const resourcesPath = join(root, "TiboTattle.app", "Contents", "Resources");
   const appPath = join(resourcesPath, "app.asar");
-  const userData = join(root, "user-data");
+  const appData = join(root, "app-data");
+  const userData = join(appData, "TiboTattle");
+  const signedStagingUserData = join(
+    appData,
+    "TiboTattle Signed Staging Rehearsal",
+  );
   const metadata = createAccountlessSignedStagingRehearsalMetadata({
     expectedTestUID: 501,
     expectedTestUsername: "ci-runner",
@@ -602,8 +607,33 @@ async function createSignedStagingShellFixture(t) {
   app.getAppPath = () => appPath;
   app.getName = () => "TiboTattle";
   app.getVersion = () => "0.1.19";
-  app.getPath = (name) => name === "userData" ? userData : join(root, name);
-  return { app, metadata, resourcesPath, root, userData };
+  const paths = new Map([
+    ["appData", appData],
+    ["sessionData", userData],
+    ["userData", userData],
+  ]);
+  const events = [];
+  const whenReady = app.whenReady.bind(app);
+  app.whenReady = async () => {
+    events.push("whenReady");
+    return whenReady();
+  };
+  app.getPath = (name) => paths.get(name) ?? join(root, name);
+  app.setPath = (name, value) => {
+    events.push(`setPath:${name}`);
+    paths.set(name, value);
+  };
+  return {
+    app,
+    appData,
+    events,
+    metadata,
+    paths,
+    resourcesPath,
+    root,
+    signedStagingUserData,
+    userData,
+  };
 }
 
 function signedStagingElectronRuntime(app) {
@@ -4021,6 +4051,66 @@ test("signed staging rejects a wrong operating account and hostile test lane bef
     }), errorCode("electron_configuration_invalid"), name);
     assert.equal(nativeFactoryCalls, 0, name);
     assert.equal(fixture.app.readyCalls, 0, name);
+    assert.deepEqual(fixture.events, [], name);
+  }
+});
+
+test("stable and Dev packages leave Electron profile paths unchanged", async (t) => {
+  const stableDistribution = createProductionDistributionMetadata({
+    target: "darwin-arm64",
+    sourceRevision: "e".repeat(40),
+    buildNumber: "20260908",
+  });
+  for (const [name, appName, manifest, createMacCredentialHandover] of [
+    ["stable", "TiboTattle", { tibotattleDistribution: stableDistribution }, () => ({
+      async prepareNativeHandover() { return { status: "no_legacy_state" }; },
+      attachCredentialBroker() {},
+      createAccountlessCredentialBackend() {
+        return { read: async () => null, createIfMissing: async () => "created", deleteExact: async () => "missing" };
+      },
+    })],
+    ["Dev", "TiboTattle Dev", {}, undefined],
+  ]) {
+    const root = await mkdtemp(join(tmpdir(), "tibotattle-ordinary-shell-"));
+    const appPath = join(root, "TiboTattle.app", "Contents", "Resources", "app.asar");
+    const appData = join(root, "app-data");
+    const userData = join(appData, "TiboTattle");
+    await Promise.all([
+      mkdir(appPath, { recursive: true }),
+      mkdir(userData, { recursive: true }),
+    ]);
+    await writeFile(join(appPath, "package.json"), `${JSON.stringify({
+      name: "tibotattle",
+      version: "0.1.19",
+      ...manifest,
+    })}\n`, "utf8");
+    t.after(() => rm(root, { recursive: true, force: true }));
+
+    const paths = new Map([["appData", appData], ["sessionData", userData], ["userData", userData]]);
+    const setPathCalls = [];
+    const app = new RuntimeApp();
+    app.isPackaged = true;
+    app.getAppPath = () => appPath;
+    app.getName = () => appName;
+    app.getVersion = () => "0.1.19";
+    app.getPath = (key) => paths.get(key) ?? join(root, key);
+    app.setPath = (key, value) => {
+      setPathCalls.push([key, value]);
+      paths.set(key, value);
+    };
+    app.whenReady = async () => { throw new Error(`${name} readiness sentinel`); };
+
+    await assert.rejects(launchElectronShell({
+      electron: signedStagingElectronRuntime(app),
+      environment: {},
+      platform: "darwin",
+      architecture: "arm64",
+      resourcesPath: join(root, "TiboTattle.app", "Contents", "Resources"),
+      ...(createMacCredentialHandover === undefined ? {} : { createMacCredentialHandover }),
+    }), new RegExp(`${name} readiness sentinel`, "u"));
+    assert.deepEqual(setPathCalls, [], name);
+    assert.equal(paths.get("userData"), userData, name);
+    assert.equal(paths.get("sessionData"), userData, name);
   }
 });
 
@@ -4049,6 +4139,7 @@ test("signed staging composes only the accountless native adapter and scrubs hos
     USAGE_MONITOR_PREPARED_DIRECTORY: "/host/prepared",
     USERPROFILE: "/host/profile",
   });
+  let nativeFactoryEvent = null;
   const launch = launchElectronShell({
     electron: signedStagingElectronRuntime(fixture.app),
     environment,
@@ -4058,12 +4149,14 @@ test("signed staging composes only the accountless native adapter and scrubs hos
     getUserInfo: () => ({ uid: 501, username: "ci-runner" }),
     resourcesPath: fixture.resourcesPath,
     createMacCredentialHandover(options) {
+      fixture.events.push("nativeFactory");
+      nativeFactoryEvent = fixture.events.length - 1;
       factoryOptions = options;
       return {
         async prepareNativeHandover({ homeDirectory }) {
           handoverCalls += 1;
           assert.equal(homeDirectory, join(
-            fixture.userData,
+            fixture.signedStagingUserData,
             "accountless-signed-staging-rehearsal-v1",
             "synthetic-home",
           ));
@@ -4102,21 +4195,32 @@ test("signed staging composes only the accountless native adapter and scrubs hos
   assert.equal(accountlessFactoryCalls, 1);
   assert.equal(brokerCalls, 0);
   assert.equal(spawnCalls.length, 1);
+  assert.deepEqual(fixture.events.slice(0, 2), [
+    "setPath:userData",
+    "setPath:sessionData",
+  ]);
+  assert.equal(fixture.paths.get("userData"), fixture.signedStagingUserData);
+  assert.equal(fixture.paths.get("sessionData"), fixture.signedStagingUserData);
+  assert.ok(nativeFactoryEvent !== null);
+  assert.ok(fixture.events.indexOf("setPath:userData") < nativeFactoryEvent);
+  assert.ok(fixture.events.indexOf("setPath:sessionData") < nativeFactoryEvent);
+  assert.ok(fixture.events.indexOf("setPath:userData") < fixture.events.indexOf("whenReady"));
+  assert.ok(fixture.events.indexOf("setPath:sessionData") < fixture.events.indexOf("whenReady"));
   assert.deepEqual(spawnCalls[0].stdio, ["ignore", "pipe", "pipe", "ipc"]);
   const childEnvironment = spawnCalls[0].env;
   assert.equal(childEnvironment.HOME, join(
-    fixture.userData,
+    fixture.signedStagingUserData,
     "accountless-signed-staging-rehearsal-v1",
     "synthetic-home",
  ));
   assert.equal(childEnvironment.CODEX_HOME, join(
-    fixture.userData,
+    fixture.signedStagingUserData,
     "accountless-signed-staging-rehearsal-v1",
     "synthetic-home",
     ".codex",
  ));
   assert.equal(childEnvironment.USAGE_MONITOR_STATE_ROOT, join(
-    fixture.userData,
+    fixture.signedStagingUserData,
     "accountless-signed-staging-rehearsal-v1",
     "companion-state",
  ));

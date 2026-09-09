@@ -1,4 +1,4 @@
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { readFile } from "node:fs/promises";
 import { userInfo } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -66,6 +66,8 @@ const WINDOWS_ELECTRON_SMOKE_QUIT_MESSAGE = "quit-v1";
 const WINDOWS_ELECTRON_SMOKE_ACCEPTED_STATUS = "accepted-v1";
 const WINDOWS_ELECTRON_SMOKE_PASSED_STATUS = "passed-v1";
 const WINDOWS_ELECTRON_SMOKE_FAILED_STATUS = "failed-v1";
+const ACCOUNTLESS_SIGNED_STAGING_PROFILE_DIRECTORY =
+  "TiboTattle Signed Staging Rehearsal";
 const WINDOWS_ELECTRON_SMOKE_COMMANDS = new Set([
   "status-v1",
   "tray-show-v1",
@@ -209,6 +211,29 @@ export async function readAccountlessSignedStagingRehearsal({
   } catch {
     throw shellError("electron_configuration_invalid");
   }
+}
+
+/**
+ * Keep Chromium's own state outside the normal production profile. The
+ * package marker is the sole selector; inherited environment values never
+ * choose this path. Both Electron path names are set before `whenReady`,
+ * since Chromium otherwise binds session data to the normal userData root.
+ */
+function configureAccountlessSignedStagingProfile(app, metadata) {
+  if (metadata === null) return null;
+  if (typeof app?.getPath !== "function" || typeof app?.setPath !== "function") {
+    throw shellError("electron_configuration_invalid");
+  }
+  const rawAppData = app.getPath("appData");
+  if (typeof rawAppData !== "string" || rawAppData.length === 0) {
+    throw shellError("electron_configuration_invalid");
+  }
+  const appData = resolve(rawAppData);
+  const profile = join(appData, ACCOUNTLESS_SIGNED_STAGING_PROFILE_DIRECTORY);
+  if (dirname(profile) !== appData) throw shellError("electron_configuration_invalid");
+  app.setPath("userData", profile);
+  app.setPath("sessionData", profile);
+  return profile;
 }
 
 function packagedResourcesPath(app, appPath, resourcesPath) {
@@ -933,6 +958,11 @@ export async function launchElectronShell({
       getuid,
       getUserInfo,
     });
+    // The account guard above fails before either normal-profile path can be
+    // redirected. A valid signed rehearsal uses a fixed sibling of appData
+    // for both userData and Chromium session data before any native factory
+    // or readiness work can observe the normal production profile.
+    configureAccountlessSignedStagingProfile(app, accountlessSignedStagingRehearsal);
     assertElectronPlatformGate({
       platform,
       architecture,
