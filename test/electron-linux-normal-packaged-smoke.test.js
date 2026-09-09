@@ -19,6 +19,7 @@ import {
   readLinuxNormalStartupFailure,
   runLinuxNormalPackagedSmoke,
   runLinuxNormalPackagedSmokeInside,
+  runOneNormalApp,
   runExactAsarSnapshot,
   runExactAsarSnapshotInside,
   parseLinuxNormalPackagedSmokeArguments,
@@ -225,6 +226,22 @@ test("normal packaged Linux restart preference actions use only the ordinary bri
     verifyLinuxNormalPackagedRestartPreferences({ cdp: null }),
     { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SETTINGS_PERSISTENCE_INVALID" },
   );
+});
+
+test("normal packaged Linux runner preserves its fixed persistence failure over the preceding renderer stage", async () => {
+  const error = Object.assign(new Error("fixed"), {
+    code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SETTINGS_PERSISTENCE_INVALID",
+  });
+  await assert.rejects(runOneNormalApp({
+    sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256,
+  }, {
+    appPath: APP_PATH,
+    environment: {},
+    service: "available",
+    run: async () => { throw error; },
+  }), {
+    code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SETTINGS_PERSISTENCE_INVALID",
+  });
 });
 
 test("Linux session retains only fixed automatic refresh failure classifiers", async () => {

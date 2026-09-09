@@ -641,13 +641,14 @@ async function readCheckpoint(path) {
   return module.readLocalCollectorCheckpoint({ stateFile: path });
 }
 
-async function runOneNormalApp(identity, {
+export async function runOneNormalApp(identity, {
   appPath,
   beforeQuit = null,
   environment,
   fixture = null,
   preserveFixtureAfterCleanQuit = false,
   readState = readCheckpoint,
+  run = runSmoke,
   service,
 } = {}) {
   let observed = "invalid";
@@ -661,7 +662,7 @@ async function runOneNormalApp(identity, {
   let result;
   let ownedFixture = null;
   try {
-    result = await runSmoke({
+    result = await run({
       binary: appPath,
       fixtureFactory: async () => {
         ownedFixture = fixture ?? await createLinuxNormalPackagedSmokeFixture();
@@ -701,6 +702,9 @@ async function runOneNormalApp(identity, {
     });
   } catch (error) {
     if (observationFailure !== null) fail(observationFailure);
+    if (error?.code === "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SETTINGS_PERSISTENCE_INVALID") {
+      throw error;
+    }
     if (smokeFailureStage === "initial_refresh" || smokeFailureStage === "reload_refresh") {
       automaticRefreshFailure = validateAutomaticRefreshFailure(error?.code);
       automaticRefreshTimeoutDiagnostic = validateStartupRefreshTimeoutDiagnostic(
