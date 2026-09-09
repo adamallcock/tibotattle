@@ -39,6 +39,8 @@ import {
   launchElectronShell,
   createLinuxSmokeCompanionProcessObserver,
   createLinuxSmokeDashboardFailureObserver,
+  createWindowsNormalCandidateCompanionProcessObserver,
+  createWindowsNormalCandidateDashboardFailureObserver,
   readAccountlessHostedRehearsal,
   readAccountlessSignedStagingRehearsal,
   readProductionDistribution,
@@ -1772,6 +1774,50 @@ test("Linux dashboard failure diagnostic is scoped to the normal quit smoke mark
     assert.equal(blocked, undefined);
   }
   assert.equal(writes.length, 3, "ordinary and non-Linux launches remain quiet");
+});
+
+test("Windows normal candidate diagnostics exclude qualification and test lanes", () => {
+  const writes = [];
+  const options = {
+    environment: { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1" },
+    platform: "win32",
+    architecture: "x64",
+    writeDiagnostic(value) { writes.push(value); },
+  };
+  const companion = createWindowsNormalCandidateCompanionProcessObserver(options);
+  const dashboard = createWindowsNormalCandidateDashboardFailureObserver(options);
+  assert.equal(typeof companion, "function");
+  assert.equal(typeof dashboard, "function");
+  companion({ event: "started", phase: "starting", outcome: null });
+  companion({ event: "exited", phase: "ready", outcome: "exit_nonzero" });
+  dashboard({ stage: "did_fail_load", reason: -2 });
+  dashboard({ stage: "render_process_gone", reason: "private renderer detail" });
+  assert.deepEqual(writes, [
+    `${ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX}{"event":"started","phase":"starting","outcome":null}\n`,
+    `${ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX}{"event":"exited","phase":"ready","outcome":"exit_nonzero"}\n`,
+    `${ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX}{"stage":"did_fail_load","reason":-2}\n`,
+  ]);
+
+  for (const environment of [
+    {},
+    { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "other-v1" },
+    { USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1", USAGE_MONITOR_TEST_LANE: undefined },
+    {
+      USAGE_MONITOR_ELECTRON_SMOKE_CONTROL: "quit-v1",
+      USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION: "windows-electron-qualification-v1",
+    },
+  ]) {
+    for (const factory of [
+      createWindowsNormalCandidateCompanionProcessObserver,
+      createWindowsNormalCandidateDashboardFailureObserver,
+    ]) {
+      assert.equal(factory({ ...options, environment }), undefined);
+    }
+  }
+  for (const platform of ["linux", "darwin"]) {
+    assert.equal(createWindowsNormalCandidateDashboardFailureObserver({ ...options, platform }), undefined);
+  }
+  assert.equal(createWindowsNormalCandidateCompanionProcessObserver({ ...options, architecture: "arm64" }), undefined);
 });
 
 test("platform gate leaves macOS/Linux available and refuses unqualified Windows readiness", () => {

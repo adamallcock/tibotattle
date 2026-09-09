@@ -11,6 +11,10 @@ import { createProductionDistributionMetadata } from "../apps/electron/desktop-u
 import { DesktopSettingsBackendError } from "../apps/electron/desktop-settings-backends.js";
 import { createDesktopSharingCoordinator } from "../apps/electron/desktop-sharing.js";
 import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC } from "../apps/electron/errors.js";
+import {
+  ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX,
+  ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX,
+} from "../apps/electron/main.js";
 import { normalizeLocalOnboarding } from "../apps/web/public/data-client.js";
 import {
   inspectLocalOnboarding,
@@ -28,6 +32,7 @@ import {
   buildWindowsNormalCandidateFirewallRemoveArguments,
   buildWindowsNormalCandidateStartupNativeProbeArguments,
   createWindowsNormalCandidateQuitProtocol,
+  createWindowsNormalCandidateProductFailureDiagnostics,
   createWindowsNormalCandidateStartupStderrObserver,
   classifyWindowsNormalCandidateStartupCdpChild,
   installOutboundFirewallBlock,
@@ -323,6 +328,38 @@ test("CDP startup marker observer retains no stream content across chunk boundar
   assert.equal(createWindowsNormalCandidateStartupStderrObserver(null).state(), "stream_unavailable");
 });
 
+test("dashboard-target diagnostic retains only existing closed product markers", () => {
+  const stream = new EventEmitter();
+  const observer = createWindowsNormalCandidateProductFailureDiagnostics(stream);
+  const companion = `${ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX}${JSON.stringify({
+    event: "exited", phase: "ready", outcome: "exit_nonzero",
+  })}\n`;
+  const dashboard = `${ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX}${JSON.stringify({
+    stage: "did_fail_load", reason: -2,
+  })}\n`;
+  stream.emit("data", Buffer.from(`${ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX}${JSON.stringify({
+    stage: "load_url", reason: null, private: "discard" })}\nprivate stderr\n`));
+  for (let index = 0; index < companion.length; index += 7) {
+    stream.emit("data", Buffer.from(companion.slice(index, index + 7)));
+  }
+  for (let index = 0; index < dashboard.length; index += 5) {
+    stream.emit("data", Buffer.from(dashboard.slice(index, index + 5)));
+  }
+  assert.deepEqual(observer.snapshot(), {
+    companionProcessDiagnostics: {
+      lastEvent: { event: "exited", phase: "ready", outcome: "exit_nonzero" },
+      firstUnexpectedExit: { event: "exited", phase: "ready", outcome: "exit_nonzero" },
+    },
+    dashboardLoadFailure: { stage: "did_fail_load", reason: -2 },
+  });
+  assert.equal(JSON.stringify(observer.snapshot()).includes("discard"), false);
+  observer.dispose();
+  stream.emit("data", Buffer.from(`${ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX}${JSON.stringify({
+    stage: "render_process_gone", reason: "crashed",
+  })}\n`));
+  assert.deepEqual(observer.snapshot().dashboardLoadFailure, { stage: "did_fail_load", reason: -2 });
+});
+
 test("normal candidate snapshots the closed CDP diagnostic before owned cleanup", async () => {
   const root = await mkdtemp(join(process.cwd(), ".tibotattle-cdp-diagnostic-"));
   const appPath = join(root, "TiboTattle.exe");
@@ -392,6 +429,74 @@ test("normal candidate snapshots the closed CDP diagnostic before owned cleanup"
     assert.deepEqual(nativeSnapshot, { exitCode: null, signalCode: null });
     assert.deepEqual(cleanupSnapshot, { exitCode: null, signalCode: null });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("normal candidate retains dashboard-target product diagnostics before cleanup", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".tibotattle-dashboard-target-diagnostic-"));
+  const appPath = join(root, "TiboTattle.exe");
+  const profile = await prepareWindowsDevelopmentProfile({ appPath, profilePath: join(root, "profile") });
+  const child = new EventEmitter();
+  child.pid = 8124;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.connected = true;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.send = (_message, callback) => callback?.();
+  let cleanupSnapshot = null;
+  const originalNow = Date.now;
+  let now = 0;
+  Date.now = () => now;
+  try {
+    await assert.rejects(launchAndRenderCandidate({
+      appPath,
+      profile,
+      environment: { PATH: "/safe/bin" },
+      freePort: async () => 9223,
+      spawnApplication: () => {
+        queueMicrotask(() => {
+          child.stderr.emit("data", Buffer.from(`${ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX}${JSON.stringify({
+            event: "exited", phase: "ready", outcome: "exit_nonzero",
+          })}\n${ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX}${JSON.stringify({
+            stage: "did_fail_load", reason: -2,
+          })}\n`));
+        });
+        return child;
+      },
+      fetchImpl: async (url) => {
+        if (url.endsWith("/json/version")) {
+          return { ok: true, redirected: false, json: async () => ({ Browser: "Electron" }) };
+        }
+        now = 30_000;
+        return { ok: true, redirected: false, json: async () => [] };
+      },
+      processProof: async () => [],
+      processAbsence: async () => true,
+      stopChild: async (ownedChild) => {
+        cleanupSnapshot = { exitCode: ownedChild.exitCode, signalCode: ownedChild.signalCode };
+        ownedChild.exitCode = 0;
+        return true;
+      },
+      candidateState: { quiescent: false },
+    }), (error) => {
+      assert.equal(error.code, "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_DASHBOARD_UNAVAILABLE");
+      assert.deepEqual(error.startupCdpDiagnostic, {
+        child: "alive",
+        endpoint: "version_available",
+        entryMarker: "marker_absent",
+      });
+      assert.deepEqual(error.startupCompanionProcessDiagnostics, {
+        lastEvent: { event: "exited", phase: "ready", outcome: "exit_nonzero" },
+        firstUnexpectedExit: { event: "exited", phase: "ready", outcome: "exit_nonzero" },
+      });
+      assert.deepEqual(error.startupDashboardLoadFailure, { stage: "did_fail_load", reason: -2 });
+      return true;
+    });
+    assert.deepEqual(cleanupSnapshot, { exitCode: null, signalCode: null });
+  } finally {
+    Date.now = originalNow;
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -1986,6 +2091,11 @@ test("normal candidate runner retains the outbound block and profile when proces
     dialog: "other_owned_window",
     dialogCause: "none",
   };
+  const startupCompanionProcessDiagnostics = {
+    lastEvent: { event: "exited", phase: "ready", outcome: "exit_nonzero" },
+    firstUnexpectedExit: { event: "exited", phase: "ready", outcome: "exit_nonzero" },
+  };
+  const startupDashboardLoadFailure = { stage: "did_fail_load", reason: -2 };
   let removedFirewall = false;
   let removedProfile = false;
   await assert.rejects(() => runWindowsNormalCandidateSmoke(smokeOptions(), {
@@ -2012,6 +2122,8 @@ test("normal candidate runner retains the outbound block and profile when proces
         code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_DASHBOARD_UNAVAILABLE",
         startupDiagnostic,
         startupCdpNativeDiagnostic,
+        startupCompanionProcessDiagnostics,
+        startupDashboardLoadFailure,
         startupCompletionDiagnostic,
       });
     },
@@ -2031,6 +2143,8 @@ test("normal candidate runner retains the outbound block and profile when proces
   assert.equal(receipt.startupPhase, "settings_target");
   assert.deepEqual(receipt.startupDiagnostic, startupDiagnostic);
   assert.deepEqual(receipt.startupCdpNativeDiagnostic, startupCdpNativeDiagnostic);
+  assert.deepEqual(receipt.startupCompanionProcessDiagnostics, startupCompanionProcessDiagnostics);
+  assert.deepEqual(receipt.startupDashboardLoadFailure, startupDashboardLoadFailure);
   assert.deepEqual(receipt.startupCompletionDiagnostic, startupCompletionDiagnostic);
 });
 

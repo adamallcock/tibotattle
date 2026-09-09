@@ -47,7 +47,11 @@ import {
 } from "./launch-electron-windows-development.mjs";
 import {
   classifyAutomaticStartupRefreshReceipt,
+  createLinuxCompanionProcessDiagnostics,
+  createLinuxDashboardFailureDiagnostics,
   ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES,
+  validateLinuxCompanionProcessDiagnostics,
+  validateLinuxDashboardFailureDiagnostic,
 } from "./smoke-electron-linux.mjs";
 import {
   assertWindowsProcessTreeExited,
@@ -1756,6 +1760,40 @@ export function createWindowsNormalCandidateStartupStderrObserver(stream) {
   });
 }
 
+/**
+ * Consume only the existing closed main-process dashboard and companion
+ * markers. Every other child stderr byte is discarded by the shared bounded
+ * readers; this observer has no lifecycle or renderer effect.
+ */
+export function createWindowsNormalCandidateProductFailureDiagnostics(stream) {
+  const companion = createLinuxCompanionProcessDiagnostics();
+  const dashboard = createLinuxDashboardFailureDiagnostics();
+  if (stream === null || typeof stream !== "object" || typeof stream.on !== "function") {
+    return Object.freeze({
+      snapshot: () => Object.freeze({ companionProcessDiagnostics: null, dashboardLoadFailure: null }),
+      dispose: () => {},
+    });
+  }
+  const onData = (chunk) => {
+    try {
+      companion.feed(chunk);
+      dashboard.feed(chunk);
+    } catch {
+      // Child stderr must never affect lifecycle cleanup or the original failure.
+    }
+  };
+  stream.on("data", onData);
+  return Object.freeze({
+    snapshot: () => Object.freeze({
+      companionProcessDiagnostics: validateLinuxCompanionProcessDiagnostics(companion.snapshot()),
+      dashboardLoadFailure: validateLinuxDashboardFailureDiagnostic(dashboard.snapshot()),
+    }),
+    dispose: () => {
+      try { stream.off?.("data", onData) ?? stream.removeListener?.("data", onData); } catch {}
+    },
+  });
+}
+
 async function readWindowsNormalCandidateCdpVersion(endpoint, {
   fetchImpl = fetch,
   timeoutMs = OPERATION_TIMEOUT_MS,
@@ -3042,6 +3080,7 @@ export async function launchAndRenderCandidate({
   let observer = null;
   let stdoutObserver = null;
   let stderrObserver = null;
+  let productFailureDiagnostics = null;
   let quitProtocol = null;
   let clean = false;
   let tracked = null;
@@ -3059,22 +3098,38 @@ export async function launchAndRenderCandidate({
     if (!Number.isSafeInteger(child?.pid) || child.pid < 1) fail("APPLICATION_LAUNCH_UNAVAILABLE");
     stdoutObserver = createWindowsNormalCandidateStartupStderrObserver(child.stdout);
     stderrObserver = createWindowsNormalCandidateStartupStderrObserver(child.stderr);
+    productFailureDiagnostics = createWindowsNormalCandidateProductFailureDiagnostics(child.stderr);
     if (candidateState !== null) candidateState.quiescent = false;
     quitProtocol = createQuitProtocol(child);
     let connected;
     try {
       connected = await connectDashboard({ port, fetchImpl, WebSocketConstructor, onPhase });
     } catch (error) {
-      if (error?.code === `${PREFIX}CDP_UNAVAILABLE`) {
+      const entryMarker = stdoutObserver.state() === "entry_failure_marked"
+        || stderrObserver.state() === "entry_failure_marked"
+        ? "entry_failure_marked"
+        : stdoutObserver.state() === "stream_unavailable" && stderrObserver.state() === "stream_unavailable"
+          ? "stream_unavailable" : "marker_absent";
+      if (error?.code === `${PREFIX}CDP_UNAVAILABLE`
+          || error?.code === `${PREFIX}DASHBOARD_UNAVAILABLE`) {
         error.startupCdpDiagnostic = startupCdpDiagnostic({
           child,
-          endpoint: error.startupCdpEndpoint,
-          entryMarker: stdoutObserver.state() === "entry_failure_marked"
-            || stderrObserver.state() === "entry_failure_marked"
-            ? "entry_failure_marked"
-            : stdoutObserver.state() === "stream_unavailable" && stderrObserver.state() === "stream_unavailable"
-              ? "stream_unavailable" : "marker_absent",
+          endpoint: error?.code === `${PREFIX}DASHBOARD_UNAVAILABLE`
+            ? "version_available" : error.startupCdpEndpoint,
+          entryMarker,
         });
+      }
+      if (error?.code === `${PREFIX}DASHBOARD_UNAVAILABLE`) {
+        const diagnostics = productFailureDiagnostics?.snapshot?.()
+          ?? { companionProcessDiagnostics: null, dashboardLoadFailure: null };
+        error.startupCompanionProcessDiagnostics = validateLinuxCompanionProcessDiagnostics(
+          diagnostics.companionProcessDiagnostics,
+        );
+        error.startupDashboardLoadFailure = validateLinuxDashboardFailureDiagnostic(
+          diagnostics.dashboardLoadFailure,
+        );
+      }
+      if (error?.code === `${PREFIX}CDP_UNAVAILABLE`) {
         try {
           error.startupCdpNativeDiagnostic = await inspectStartupNativeDiagnostic({
             appPath,
@@ -3149,6 +3204,7 @@ export async function launchAndRenderCandidate({
   } finally {
     stdoutObserver?.dispose?.();
     stderrObserver?.dispose?.();
+    productFailureDiagnostics?.dispose?.();
     observer?.dispose?.();
     cdp?.close?.();
     quitProtocol?.close?.();
@@ -3238,6 +3294,8 @@ function candidateReceipt({
   startupDiagnostic = null,
   startupCdpDiagnostic = null,
   startupCdpNativeDiagnostic = null,
+  startupCompanionProcessDiagnostics = null,
+  startupDashboardLoadFailure = null,
   startupCompletionDiagnostic = null,
   startupFailureCode = null,
   startupPhase = null,
@@ -3284,6 +3342,14 @@ function candidateReceipt({
     }),
     ...(normalizeStartupCdpNativeDiagnostic(startupCdpNativeDiagnostic) === null ? {} : {
       startupCdpNativeDiagnostic: normalizeStartupCdpNativeDiagnostic(startupCdpNativeDiagnostic),
+    }),
+    ...(validateLinuxCompanionProcessDiagnostics(startupCompanionProcessDiagnostics) === null ? {} : {
+      startupCompanionProcessDiagnostics:
+        validateLinuxCompanionProcessDiagnostics(startupCompanionProcessDiagnostics),
+    }),
+    ...(validateLinuxDashboardFailureDiagnostic(startupDashboardLoadFailure) === null ? {} : {
+      startupDashboardLoadFailure:
+        validateLinuxDashboardFailureDiagnostic(startupDashboardLoadFailure),
     }),
     ...(normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic) === null ? {} : {
       startupCompletionDiagnostic: normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic),
@@ -3342,6 +3408,8 @@ export async function runWindowsNormalCandidateSmoke(options, {
   let startupDiagnostic = null;
   let startupCdpDetail = null;
   let startupCdpNativeDetail = null;
+  let startupCompanionProcessDiagnostics = null;
+  let startupDashboardLoadFailure = null;
   let startupCompletionDiagnostic = null;
   const cleanup = { firewallInstalled: false, firewallRemoved: false, profileRemoved: false };
   const candidateState = {
@@ -3409,6 +3477,12 @@ export async function runWindowsNormalCandidateSmoke(options, {
     startupCdpNativeDetail = normalizeStartupCdpNativeDiagnostic(
       error?.startupCdpNativeDiagnostic,
     );
+    startupCompanionProcessDiagnostics = validateLinuxCompanionProcessDiagnostics(
+      error?.startupCompanionProcessDiagnostics,
+    );
+    startupDashboardLoadFailure = validateLinuxDashboardFailureDiagnostic(
+      error?.startupDashboardLoadFailure,
+    );
     startupCompletionDiagnostic = normalizeStartupCompletionDiagnostic(
       error?.startupCompletionDiagnostic,
     );
@@ -3442,6 +3516,8 @@ export async function runWindowsNormalCandidateSmoke(options, {
       startupDiagnostic,
       startupCdpDiagnostic: startupCdpDetail,
       startupCdpNativeDiagnostic: startupCdpNativeDetail,
+      startupCompanionProcessDiagnostics,
+      startupDashboardLoadFailure,
       startupCompletionDiagnostic,
       startupFailureCode,
       startupPhase: candidateState.startupPhase,

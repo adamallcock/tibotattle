@@ -486,6 +486,71 @@ export function createLinuxSmokeDashboardFailureObserver({
   };
 }
 
+/**
+ * Emit only fixed companion lifecycle facts for the exact Windows normal
+ * candidate. This is not the Windows qualification lane and is unavailable
+ * whenever either qualification or test-lane marker is present.
+ */
+export function createWindowsNormalCandidateCompanionProcessObserver({
+  environment = process.env,
+  platform = process.platform,
+  architecture = process.arch,
+  writeDiagnostic = process.stderr?.write?.bind(process.stderr),
+} = {}) {
+  if (environment === null || typeof environment !== "object"
+      || platform !== "win32"
+      || architecture !== "x64"
+      || environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL !== ELECTRON_SMOKE_CONTROL
+      || Object.hasOwn(environment, "USAGE_MONITOR_TEST_LANE")
+      || Object.hasOwn(environment, "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION")
+      || typeof writeDiagnostic !== "function") {
+    return undefined;
+  }
+  return (event) => {
+    if (!isCompanionProcessLifecycleEvent(event)) return;
+    const value = {
+      event: event.event,
+      phase: event.phase,
+      outcome: event.outcome,
+    };
+    try {
+      writeDiagnostic(`${ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX}${JSON.stringify(value)}\n`);
+    } catch {
+      // Diagnostic delivery must never affect the normal desktop lifecycle.
+    }
+  };
+}
+
+/** Emit closed dashboard failures only for the exact Windows normal candidate. */
+export function createWindowsNormalCandidateDashboardFailureObserver({
+  environment = process.env,
+  platform = process.platform,
+  architecture = process.arch,
+  writeDiagnostic = process.stderr?.write?.bind(process.stderr),
+} = {}) {
+  if (environment === null || typeof environment !== "object"
+      || platform !== "win32"
+      || architecture !== "x64"
+      || environment.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL !== ELECTRON_SMOKE_CONTROL
+      || Object.hasOwn(environment, "USAGE_MONITOR_TEST_LANE")
+      || Object.hasOwn(environment, "USAGE_MONITOR_WINDOWS_ELECTRON_QUALIFICATION")
+      || typeof writeDiagnostic !== "function") {
+    return undefined;
+  }
+  return (event) => {
+    if (!isDashboardFailureEvent(event)) return;
+    const value = {
+      stage: event.stage,
+      reason: event.reason,
+    };
+    try {
+      writeDiagnostic(`${ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX}${JSON.stringify(value)}\n`);
+    } catch {
+      // Diagnostic delivery must never affect the normal desktop lifecycle.
+    }
+  };
+}
+
 export function assertElectronQualificationLaunchOptions({
   qualificationContext,
   companionScript,
@@ -1118,6 +1183,24 @@ export async function launchElectronShell({
       architecture: process.arch,
       writeDiagnostic,
     });
+    const windowsNormalCandidateCompanionProcessObserver =
+      createWindowsNormalCandidateCompanionProcessObserver({
+        environment,
+        platform: process.platform,
+        architecture: process.arch,
+        writeDiagnostic,
+      });
+    const windowsNormalCandidateDashboardFailureObserver =
+      createWindowsNormalCandidateDashboardFailureObserver({
+        environment,
+        platform: process.platform,
+        architecture: process.arch,
+        writeDiagnostic,
+      });
+    const normalCandidateCompanionProcessObserver = linuxSmokeCompanionProcessObserver
+      ?? windowsNormalCandidateCompanionProcessObserver;
+    const normalCandidateDashboardFailureObserver = linuxSmokeDashboardFailureObserver
+      ?? windowsNormalCandidateDashboardFailureObserver;
     // readProductionDistribution has already validated the package-local
     // target against this process. Keep the fixed Linux handover dormant for
     // every development, rehearsal, test-lane, non-x64, and non-stable path.
@@ -1164,8 +1247,8 @@ export async function launchElectronShell({
       supervisorOptions: {
         ...supervisorOptions,
         ...linuxQualificationSupervisorOptions,
-        ...(linuxSmokeCompanionProcessObserver === undefined ? {} : {
-          onChildLifecycleEvent: linuxSmokeCompanionProcessObserver,
+        ...(normalCandidateCompanionProcessObserver === undefined ? {} : {
+          onChildLifecycleEvent: normalCandidateCompanionProcessObserver,
         }),
         ...(linuxProductionCredentialHandover === null ? {} : {
           attachLinuxAccountObservationBroker:
@@ -1184,8 +1267,8 @@ export async function launchElectronShell({
           || !isPackagedElectronApp(app)
           ? "TiboTattle" : "TiboTattle Dev",
         ...lifecycleOptions,
-        ...(linuxSmokeDashboardFailureObserver === undefined ? {} : {
-          onDashboardLoadFailure: linuxSmokeDashboardFailureObserver,
+        ...(normalCandidateDashboardFailureObserver === undefined ? {} : {
+          onDashboardLoadFailure: normalCandidateDashboardFailureObserver,
         }),
       },
       firstRunReceiptBackend,
