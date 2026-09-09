@@ -13,6 +13,7 @@ import {
   classifyWindowsAuthenticodeForTest,
   createWindowsAuthenticodeProbeForTest,
   createWindowsAuthenticodePowerShellArgumentsForTest,
+  createWindowsAuthenticodePowerShellInvocationForTest,
   inspectWindowsNativeRebinding, parseWindowsNativeRebindingArguments,
   prepareWindowsNativeRebinding, rebindWindowsNativeModules, rebindWindowsNativeModulesForTest,
   probeWindowsAuthenticodePreSignForTest,
@@ -142,12 +143,24 @@ test("the native Authenticode probe uses a fixed, content-free status branch set
   const invocation = createWindowsAuthenticodePowerShellArgumentsForTest();
   assert.deepEqual(invocation.slice(0, 3), ["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
   assert.equal(Buffer.from(invocation[3], "base64").toString("utf16le"), probe);
+  const fixed = createWindowsAuthenticodePowerShellInvocationForTest({
+    SystemRoot: String.raw`C:\Windows`, PATH: String.raw`C:\Windows\System32`,
+    PSModulePath: "ambient-module-path-must-not-pass", HOME: "ambient-home-must-not-pass",
+    TIBOTATTLE_NATIVE_VERIFY_PATH: String.raw`C:\stage\native.node`,
+  });
+  assert.equal(fixed.command, String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`);
+  assert.equal(fixed.environment.PSModulePath, String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\Modules`);
+  assert.equal(fixed.environment.TIBOTATTLE_NATIVE_VERIFY_PATH, String.raw`C:\stage\native.node`);
+  assert.equal(Object.hasOwn(fixed.environment, "HOME"), false);
+  assert.notEqual(fixed.environment.PSModulePath, "ambient-module-path-must-not-pass");
   assert.doesNotMatch(probe, /switch\s*\(/iu);
+  assert.match(probe, /Import-Module Microsoft\.PowerShell\.Security -ErrorAction Stop/u);
   assert.match(probe, /Get-AuthenticodeSignature -LiteralPath \$env:TIBOTATTLE_NATIVE_VERIFY_PATH/u);
   for (const status of ["Valid", "NotSigned", "HashMismatch", "NotTrusted", "NotSupported", "Incompatible", "NotAllowed"]) {
     assert.match(probe, new RegExp(`Status -ceq '${status}'`, "u"));
   }
   assert.match(probe, /status=\$status;signer=\$signer;timestamp=\$timestamp;publisher=\$publisher/u);
+  assert.match(probe, /failure=\$kind;exception=\$exception;id=\$identifier/u);
   assert.doesNotMatch(probe, /Format-List|ConvertTo-Json|Subject|IssuedTo/u);
 });
 test("inspect uses the exact Windows keytar prebuild selected for packaging, then prepare is no-clobber", async () => {
@@ -221,6 +234,22 @@ test("the pre-sign Authenticode probe executes the exact verifier on both fixed 
       { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE_INVALID" },
     );
   });
+  for (const [code, exception] of [
+    ["command_unavailable", "command_not_found"], ["access_denied", "unauthorized"],
+    ["path_unavailable", "runtime"], ["parameter_invalid", "parameter_binding"],
+    ["projection_failed", "method"], ["module_load_failed", "file_load"],
+    ["execution_failed", "other"],
+  ]) {
+    await fixture(async ({ options, dependencies }) => {
+      await assert.rejects(
+        probeWindowsAuthenticodePreSignForTest(options, {
+          ...dependencies,
+          runAuthenticodeProbe: () => ({ status: 0, signal: null, stderr: "", stdout: `failure=${code};exception=${exception};id=synthetic_failure` }),
+        }),
+        { code: `WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE_${code.toUpperCase()}` },
+      );
+    });
+  }
 });
 test("rebinding changes only native rows, sidecar and payload; policy and replay remain stable", async () => {
   await fixture(async ({ options, dependencies, stage, manifest, sign }) => {

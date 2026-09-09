@@ -49,16 +49,22 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   const restoreReadOnly = workflow.indexOf("Restore the fixed native modules and rebinding metadata read-only state");
   const installerSigning = workflow.indexOf("Sign the reviewed installer without publishing");
   const verification = workflow.indexOf("Verify the signed final installer and retained signing evidence");
+  const signedInstalled = workflow.indexOf("Qualify the signed installed Windows journey");
+  const retention = workflow.indexOf("Retain the signed installer and content-free evidence");
   assert.ok(preflight >= 0 && preflight < journal);
   assert.ok(journal < probePreSign && probePreSign < makeWritable && makeWritable < azureLogin && azureLogin < nativeSigning);
   assert.ok(nativeSigning < makeRebindMetadataWritable && makeRebindMetadataWritable < rebind);
-  assert.ok(rebind < restoreReadOnly && restoreReadOnly < installerSigning && installerSigning < verification);
+  assert.ok(rebind < restoreReadOnly && restoreReadOnly < installerSigning && installerSigning < verification
+    && verification < signedInstalled && signedInstalled < retention);
   assert.match(workflow, /WINDOWS_NATIVE_SIGNING_INPUT_READONLY_EXPECTED/u);
   assert.match(workflow, /--probe-authenticode-pre-sign/u);
   assert.match(workflow, /WINDOWS_NATIVE_SIGNING_INPUT_WRITABLE_UNAVAILABLE/u);
   assert.match(workflow, /WINDOWS_REBIND_METADATA_READONLY_EXPECTED/u);
   assert.match(workflow, /WINDOWS_REBIND_METADATA_WRITABLE_UNAVAILABLE/u);
   assert.match(workflow, /WINDOWS_NATIVE_SIGNING_INPUT_READONLY_RESTORE_FAILED/u);
+  assert.match(workflow, /scripts\/smoke-electron-windows-signed-installed\.mjs --execute/u);
+  assert.match(workflow, /WINDOWS_SIGNED_INSTALLED_QUALIFIED/u);
+  assert.match(workflow, /WINDOWS_SIGNED_INSTALLED_QUALIFICATION_FAILED/u);
   assert.match(workflow, /\[System\.IO\.File\]::SetAttributes\(\$path, \$writableAttributes\)/u);
   assert.doesNotMatch(workflow, /(?:\battrib(?:\.exe)?\b|\bicacls(?:\.exe)?\b|\bchmod\b|\bSet-Acl\b)/iu);
 
@@ -70,4 +76,12 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   assert.equal((restoredInputs.match(/Join-Path \$env:GITHUB_WORKSPACE/g) ?? []).length, 4);
   assert.match(rebindInputs, /windows_filesystem\.node\.manifest\.json/u);
   assert.match(rebindInputs, /electron-runtime-manifest\.json/u);
+  const signedInstalledInputs = workflow.slice(signedInstalled, retention);
+  const retained = workflow.slice(retention);
+  assert.match(signedInstalledInputs, /--installer \$installerPath --installer-sha256 \$installerSha256/u);
+  assert.match(signedInstalledInputs, /--staged-app \$stagedAppPath --source-candidate \$sourceCandidatePath/u);
+  assert.match(signedInstalledInputs, /--source-revision \$env:SOURCE_REVISION --receipt \$signedInstalledReceipt/u);
+  assert.match(retained, /^        if: \$\{\{ always\(\) \}\}/mu);
+  assert.match(retained, /evidence\/windows-signed-installed\.json/u);
+  assert.match(retained, /electron-windows-normal-candidate\/normal-candidate-smoke\.json/u);
 });

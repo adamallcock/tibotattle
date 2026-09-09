@@ -4,7 +4,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, open, readFile, readdir, rename } from "node:fs/promises";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { dirname, join, relative, resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
 import { verifyStagedElectronRuntime } from "./build-electron-runtime.mjs";
@@ -28,6 +28,12 @@ const MAX_FILE = 128 * 1024 * 1024;
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const jsonBytes = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
 const AUTHENTICODE_DIAGNOSTIC = /^status=(valid|not_signed|hash_mismatch|not_trusted|not_supported|incompatible|not_allowed|other);signer=(present|absent);timestamp=(present|absent);publisher=(match|mismatch|not_checked)$/u;
+const AUTHENTICODE_PROBE_FAILURE = /^failure=(command_unavailable|access_denied|path_unavailable|parameter_invalid|projection_failed|module_load_failed|execution_failed);exception=(command_not_found|unauthorized|file_not_found|file_load|parameter_binding|method|property_not_found|runtime|other);id=([a-z][a-z0-9_.-]{0,127}|other)$/u;
+const POWERSHELL_ENVIRONMENT_KEYS = Object.freeze([
+  "PATH", "PATHEXT", "SystemRoot", "WINDIR", "COMSPEC", "OS",
+  "PROCESSOR_ARCHITECTURE", "PROCESSOR_ARCHITEW6432", "NUMBER_OF_PROCESSORS",
+  "ProgramData", "ProgramFiles", "ProgramW6432", "CommonProgramFiles", "CommonProgramW6432",
+]);
 function fail(code) {
   const error = new Error(`WINDOWS_NATIVE_REBIND_${code}`);
   error.code = error.message;
@@ -59,7 +65,7 @@ function authenticodeProbeFailureCode(result) {
   if (result?.signal) return "SIGNATURE_PROBE_INTERRUPTED";
   const standardError = typeof result?.stderr === "string" ? result.stderr : "";
   if (/ParserError|Unexpected token|Missing .*[\]}]/iu.test(standardError)) return "SIGNATURE_PROBE_PARSE_FAILED";
-  if (/Get-AuthenticodeSignature.*(?:not recognized|not found)|CommandNotFoundException/iu.test(standardError)) {
+  if (/Get-AuthenticodeSignature[\s\S]{0,512}(?:not recognized|not found)|CommandNotFoundException/iu.test(standardError)) {
     return "SIGNATURE_PROBE_COMMAND_UNAVAILABLE";
   }
   if (/Access is denied|UnauthorizedAccessException|PermissionDenied/iu.test(standardError)) {
@@ -68,16 +74,41 @@ function authenticodeProbeFailureCode(result) {
   return "SIGNATURE_PROBE_EXECUTION_FAILED";
 }
 function createAuthenticodeProbeScript() {
-  return "$ErrorActionPreference='Stop'; $s=Get-AuthenticodeSignature -LiteralPath $env:TIBOTATTLE_NATIVE_VERIFY_PATH; "
+  return "$ErrorActionPreference='Stop'; try { Import-Module Microsoft.PowerShell.Security -ErrorAction Stop; $s=Get-AuthenticodeSignature -LiteralPath $env:TIBOTATTLE_NATIVE_VERIFY_PATH; "
     + "$status='other'; "
-    + "if([string]$s.Status -ceq 'Valid'){$status='valid'}elseif([string]$s.Status -ceq 'NotSigned'){$status='not_signed'}elseif([string]$s.Status -ceq 'HashMismatch'){$status='hash_mismatch'}elseif([string]$s.Status -ceq 'NotTrusted'){$status='not_trusted'}elseif([string]$s.Status -ceq 'NotSupported'){$status='not_supported'}elseif([string]$s.Status -ceq 'Incompatible'){$status='incompatible'}elseif([string]$s.Status -ceq 'NotAllowed'){$status='not_allowed'}; "
+    + "if ([string]$s.Status -ceq 'Valid') { $status='valid' } elseif ([string]$s.Status -ceq 'NotSigned') { $status='not_signed' } elseif ([string]$s.Status -ceq 'HashMismatch') { $status='hash_mismatch' } elseif ([string]$s.Status -ceq 'NotTrusted') { $status='not_trusted' } elseif ([string]$s.Status -ceq 'NotSupported') { $status='not_supported' } elseif ([string]$s.Status -ceq 'Incompatible') { $status='incompatible' } elseif ([string]$s.Status -ceq 'NotAllowed') { $status='not_allowed' }; "
     + "$signer=if($null -eq $s.SignerCertificate){'absent'}else{'present'}; "
     + "$timestamp=if($null -eq $s.TimeStamperCertificate){'absent'}else{'present'}; "
     + "$publisher=if($signer -eq 'absent'){'not_checked'}elseif($s.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,$false) -ceq 'Adam Allcock'){'match'}else{'mismatch'}; "
-    + "[Console]::Out.Write(\"status=$status;signer=$signer;timestamp=$timestamp;publisher=$publisher\"); exit 0";
+    + "[Console]::Out.Write(\"status=$status;signer=$signer;timestamp=$timestamp;publisher=$publisher\"); exit 0 } catch { "
+    + "$kind='execution_failed'; $exception='other'; $type=$_.Exception.GetType().FullName; $category=[string]$_.CategoryInfo.Category; $identifier='other'; $rawIdentifier=[string]$_.FullyQualifiedErrorId; "
+    + "if ($rawIdentifier -match '^([A-Za-z][A-Za-z0-9_.-]{0,127})') { $identifier=$Matches[1].ToLowerInvariant() }; "
+    + "if ($type -ceq 'System.Management.Automation.CommandNotFoundException') { $kind='command_unavailable'; $exception='command_not_found' } elseif ($type -ceq 'System.UnauthorizedAccessException' -or $category -ceq 'PermissionDenied') { $kind='access_denied'; $exception='unauthorized' } elseif ($type -ceq 'System.IO.FileNotFoundException') { $kind='module_load_failed'; $exception='file_not_found' } elseif ($type -ceq 'System.IO.FileLoadException') { $kind='module_load_failed'; $exception='file_load' } elseif ($type -ceq 'System.Management.Automation.ParameterBindingException') { $kind='parameter_invalid'; $exception='parameter_binding' } elseif ($type -ceq 'System.Management.Automation.MethodException') { $kind='projection_failed'; $exception='method' } elseif ($type -ceq 'System.Management.Automation.PropertyNotFoundException') { $kind='projection_failed'; $exception='property_not_found' } elseif ($type -ceq 'System.Management.Automation.RuntimeException') { $exception='runtime' } elseif ($category -ceq 'ObjectNotFound') { $kind='path_unavailable' } elseif ($category -ceq 'ResourceUnavailable') { $kind='module_load_failed' }; "
+    + "[Console]::Out.Write(\"failure=$kind;exception=$exception;id=$identifier\"); exit 0 }";
 }
 function createAuthenticodePowerShellArguments(script) {
   return ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")];
+}
+function absoluteWindowsPath(value) {
+  return typeof value === "string" && /^[A-Za-z]:\\/u.test(value) && !/[\0\r\n]/u.test(value)
+    && win32.resolve(value) === value && !value.split("\\").some((part) => part === "." || part === "..");
+}
+function createAuthenticodePowerShellInvocation(script, environment) {
+  const systemRoot = environment?.SystemRoot;
+  const verificationPath = environment?.TIBOTATTLE_NATIVE_VERIFY_PATH;
+  if (!absoluteWindowsPath(systemRoot) || !absoluteWindowsPath(verificationPath)) {
+    fail("SIGNATURE_PROBE_ENVIRONMENT_INVALID");
+  }
+  const selected = {};
+  for (const key of POWERSHELL_ENVIRONMENT_KEYS) {
+    const value = environment?.[key];
+    if (typeof value === "string" && value.length > 0 && !value.includes("\0")) selected[key] = value;
+  }
+  if (selected.SystemRoot !== systemRoot) fail("SIGNATURE_PROBE_ENVIRONMENT_INVALID");
+  selected.PSModulePath = win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "Modules");
+  selected.TIBOTATTLE_NATIVE_VERIFY_PATH = verificationPath;
+  const command = win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  return Object.freeze({ command, arguments: createAuthenticodePowerShellArguments(script), environment: selected });
 }
 /** Synthetic-only test seam; the probe never prints certificate fields. */
 export function createWindowsAuthenticodeProbeForTest() {
@@ -87,9 +118,15 @@ export function createWindowsAuthenticodeProbeForTest() {
 export function createWindowsAuthenticodePowerShellArgumentsForTest() {
   return createAuthenticodePowerShellArguments(createAuthenticodeProbeScript());
 }
+/** Synthetic-only test seam for the fixed system PowerShell environment. */
+export function createWindowsAuthenticodePowerShellInvocationForTest(environment) {
+  return createAuthenticodePowerShellInvocation(createAuthenticodeProbeScript(), environment);
+}
 function runAuthenticodePowerShell(script, environment) {
-  return spawnSync("powershell.exe", createAuthenticodePowerShellArguments(script), {
-    env: environment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000,
+  const invocation = createAuthenticodePowerShellInvocation(script, environment);
+  return spawnSync(invocation.command, invocation.arguments, {
+    cwd: win32.dirname(invocation.command), env: invocation.environment,
+    encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000,
     windowsHide: true,
   });
 }
@@ -266,6 +303,11 @@ function probeAuthenticode(path, run = runAuthenticodePowerShell) {
   });
   assertAuthenticodeProbeSucceeded(result);
   const diagnostic = parseAuthenticodeDiagnostic(result.stdout);
+  const emittedFailure = typeof result.stdout === "string" ? AUTHENTICODE_PROBE_FAILURE.exec(result.stdout.trim()) : null;
+  if (emittedFailure) {
+    console.error(`WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE failure=${emittedFailure[1]};exception=${emittedFailure[2]};id=${emittedFailure[3]}`);
+    fail(`SIGNATURE_PROBE_${emittedFailure[1].toUpperCase()}`);
+  }
   if (!diagnostic) fail("SIGNATURE_PROBE_INVALID");
   return diagnostic;
 }

@@ -272,7 +272,26 @@ jobs:
           }
           $null = Get-FileHash -LiteralPath $installerPath -Algorithm SHA256
           Write-Host 'WINDOWS_SIGNED_INSTALLER_VERIFIED'
+      - name: Qualify the signed installed Windows journey
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64'
+          $artifactRoot = Join-Path $candidateRoot 'artifacts'
+          $packagePath = Join-Path $candidateRoot 'app/package.json'
+          $package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
+          if ($package.version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+            throw 'WINDOWS_SIGNED_INSTALLED_PACKAGE_VERSION_INVALID'
+          }
+          $installerPath = Join-Path $artifactRoot ("TiboTattle-{0}-Windows-x64.exe" -f $package.version)
+          $installerSha256 = (Get-FileHash -LiteralPath $installerPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $stagedAppPath = Join-Path $candidateRoot 'app'
+          $sourceCandidatePath = Join-Path $candidateRoot 'production-source-candidate.json'
+          $signedInstalledReceipt = Join-Path $candidateRoot 'evidence/windows-signed-installed.json'
+          node scripts/smoke-electron-windows-signed-installed.mjs --execute --installer $installerPath --installer-sha256 $installerSha256 --staged-app $stagedAppPath --source-candidate $sourceCandidatePath --source-revision $env:SOURCE_REVISION --receipt $signedInstalledReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_SIGNED_INSTALLED_QUALIFICATION_FAILED' }
+          Write-Host 'WINDOWS_SIGNED_INSTALLED_QUALIFIED'
       - name: Retain the signed installer and content-free evidence
+        if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: electron-windows-signed-${{ github.run_id }}
@@ -282,5 +301,7 @@ jobs:
             .release-build/electron-production/win32-x64/artifacts/latest.yml
             .release-build/electron-production/win32-x64/evidence/windows-signing-operation-ledger.json
             .release-build/electron-production/win32-x64/windows-native-rebinding/rebound.json
+            .release-build/electron-production/win32-x64/evidence/windows-signed-installed.json
+            .release-build/electron-windows-normal-candidate/normal-candidate-smoke.json
           if-no-files-found: error
           retention-days: 14
