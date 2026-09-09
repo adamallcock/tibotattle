@@ -134,15 +134,19 @@ The bounded options and current recommendation are:
    final schema semantics and populated preservation against existing 0058,
    then qualify the hosted transaction. Do not start that rewrite on the
    strength of the newer local SQLite alone.
-2. **Next assess the unchanged migration's asynchronous file path.**
-   Wrangler's maintained `d1 execute --file` uses an import job with polling;
-   that may avoid the ordinary API batch's total-call limit, but does not prove
-   exemption from individual-statement/resource limits. This is the smallest
-   next qualification option, not approval to run the rebuild. Retain the exact SQL
-   and ledger append together and qualify atomic failure recovery on a
-   disposable database. Admit production only with measured temporary-storage
-   headroom and hosted evidence for the largest snapshot/cascade/restore. Do
-   not assume this route makes a multi-gigabyte statement safe.
+2. **Unchanged SQL through a supported transaction route: not yet admitted.**
+   The tiny asynchronous rollback probe passed, but exact 0058 subsequently
+   failed with a foreign-key constraint on the small populated disposable
+   fixture. Treat this async route as unsuitable until its cause is established;
+   do not retry the same canonical import or infer safety from the earlier tiny
+   pass. The ordinary `/query` migration route retains the 30-second API-batch
+   limit, so a local pass cannot admit the 5.33 GB live rebuild. A prepared tiny
+   statement-boundary diagnostic below may explain the file-route difference.
+   The final controlled hosted diagnostic reproduced a deferral-gap-sensitive
+   failure, as recorded below; this excludes the unchanged async route from
+   current production admission. The normal transactional query route still
+   needs timing/storage qualification, or a reviewed phased maintenance design
+   must bound the work without weakening foreign keys.
 3. **Use resumable bounded maintenance only if the above fail.** Reuse existing
    collection pause/revision, ownership fences, migration admission and recovery
    boundaries. A reviewed phase journal must bind predecessor/source hashes,
@@ -313,6 +317,49 @@ The maintained optional mode now retains bounded owner-private failed-call
 phase/status/output alongside its generated SQL/config to prevent another opaque
 failure. Nine focused remote/import tests passed for that diagnostic addition.
 No production or existing staging resource was changed by this experiment.
+
+After the provider confirmed no current import, both first-attempt UUIDs were
+removed and absence verified at `19:41:17Z`. The same approved names were
+recreated with new ownership receipts and the instrumented harness ran once.
+At `19:43:02Z`, it captured a concrete 0058 failure:
+`FOREIGN KEY constraint failed: SQLITE_CONSTRAINT`
+(`SQLITE_CONSTRAINT_FOREIGNKEY`). It was an exit-1 SQL failure, with no process
+signal or buffer error, not a JSON-progress parsing failure. Readback again
+proved intact 0057 state, both participants and 20/20 records, no snapshots and
+no foreign-key violations. A documented poll again confirmed no current import.
+Both second-attempt UUIDs were deleted with exact absence verified at
+`2026-09-09T19:45:21Z`. All attempts/ownership/cleanup receipts remain private;
+no disposable database from this experiment remains. Exact-migration async
+qualification **failed**; cleanup **passed**.
+
+SQLite statement-completeness parsing counts 476 statements in canonical 0058;
+its largest statement is 5,230 bytes, below the documented statement-text limit. A possible
+explanation is an internal import transaction boundary during deferred-FK
+restoration; this remains a hypothesis. `import-boundary-plan/` contains an exact
+three-row control and a variant inserting 450 `SELECT 1` statements between
+restoring children and their parent. Both passed locally as single transactions. The reviewed final padded pair
+uses 500 added SELECT statements: 513 total statements and 130,155 bytes per
+file, exceeding canonical 0058 in both count and size, with no statement above
+301 bytes. The control restores the parent before the added statements; the
+gap restores it afterward. Both passed the same local three-row fixture.
+
+The final hosted comparison completed at `2026-09-09T19:52:23Z` on the existing
+isolated staging target after fresh identity/containment checks (all controls
+off, revision 14, no active relevant rehearsal). The padded control passed in
+10.794 ms with exact restoration; the padded gap returned a foreign-key failure
+and exact baseline rollback. Both known-terminal runs removed only their five
+uniquely owned objects and verified absence. No import was retried, no existing
+product table changed, and no new remote resource was created. The owner-only
+`import-boundary-plan/execution.json` binds the closed outcomes and input hashes.
+
+This reproduces a failure sensitive to how long deferred foreign keys remain
+unresolved while controlling statement count, file size and data. It supports
+an import transaction/batch-boundary explanation, but does not establish the
+provider's exact batch size or uniquely explain every 0058 interaction. The
+unchanged async import route remains unsuitable. Do not weaken foreign-key
+enforcement or edit applied migration provenance to bypass the result. Assess
+the normal query transaction against its 30-second/storage limits before
+choosing a more complex, explicitly reviewed phased maintenance design.
 
 # Live configuration and recovery preparation
 
