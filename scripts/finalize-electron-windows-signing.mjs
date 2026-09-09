@@ -242,12 +242,12 @@ function createBuilderEnvironment({ candidatePath, candidate, environment }) {
   return Object.freeze(selected);
 }
 
-function defaultRun(command, arguments_, { environment } = {}) {
+function defaultRun(command, arguments_, { environment, captureOutput = false } = {}) {
   return spawnSync(command, arguments_, {
     cwd: REPOSITORY_ROOT,
     env: environment,
     encoding: "utf8",
-    stdio: ["ignore", "ignore", "ignore"],
+    stdio: ["ignore", captureOutput ? "pipe" : "ignore", "ignore"],
   });
 }
 
@@ -339,13 +339,15 @@ export async function preflightElectronWindowsSigning({ candidateReceiptPath } =
 }
 
 function assertCleanFrozenSource(candidate, run) {
-  const head = run("git", ["rev-parse", "--verify", "HEAD"], { environment: process.env });
+  const head = run("git", ["rev-parse", "--verify", "HEAD"], {
+    environment: process.env, captureOutput: true,
+  });
   if (!successful(head) || !safeString(head.stdout, 128)
       || head.stdout.trim() !== candidate.sourceRevision) {
     fail("SOURCE_REVISION_UNAVAILABLE");
   }
   const status = run("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
-    environment: process.env,
+    environment: process.env, captureOutput: true,
   });
   if (!successful(status) || typeof status.stdout !== "string" || status.stdout !== "") {
     fail("SOURCE_NOT_CLEAN");

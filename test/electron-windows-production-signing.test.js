@@ -67,7 +67,8 @@ function testDependencies({ calls = [], environment = RESOURCE_ENVIRONMENT } = {
     platform: "win32",
     repositoryRoot: undefined,
     run(command, arguments_, options) {
-      calls.push({ arguments: arguments_, command, environment: options?.environment });
+      calls.push({ arguments: arguments_, command, environment: options?.environment,
+        captureOutput: options?.captureOutput === true });
       if (command === "git" && arguments_[0] === "rev-parse") {
         return successfulResult({ stdout: `${SOURCE_REVISION}\n` });
       }
@@ -162,6 +163,8 @@ test("Windows signing invocation is explicit, strips ambient secrets, and keeps 
         "--win", "nsis", "--x64", "--publish", "never",
       ]],
     ]);
+    assert.equal(calls[1].captureOutput, true);
+    assert.equal(calls[2].captureOutput, true);
     const builderEnvironment = calls.at(-1).environment;
     assert.equal(builderEnvironment.CSC_LINK, undefined);
     assert.equal(builderEnvironment.AZURE_CLIENT_SECRET, undefined);
