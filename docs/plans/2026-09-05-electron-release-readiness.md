@@ -16,7 +16,7 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
-Latest continuation checkpoint (bootstrap repair `f3bf7a53`; signed Mac source `c938a654`):
+Latest continuation checkpoint (source fixes through `204269c6`; installed signed Mac source `c938a654`):
 
 - **Installed Mac launch, refresh and restart pass.** R8 completed the native
   migration; r9 launched signed `.11` from that completed profile after fresh,
@@ -48,29 +48,50 @@ Latest continuation checkpoint (bootstrap repair `f3bf7a53`; signed Mac source `
   hash-verified under `signed-handover-c938a654`. Their canonical source release
   remains 0.1.18. The exact signed companion starts, returns health HTTP 200 and
   exits cleanly on arm64 and on x64 under Rosetta. Rosetta is not physical Intel
-  GUI qualification. No feed or public release was published; the signed
-  current-to-next update remains open. The isolated feed publisher is integrated
-  at `b6230274`; all five focused tests and a dry run binding the exact signed
-  archives pass. It requires exclusive operator control, journals each phase,
-  and verifies remote bytes; it does not claim atomic compare-and-swap. Approval
-  for publication and the installed update rehearsal has been requested.
-- **The latest CI is not green.** Run
-  [34306321483](https://github.com/adamallcock/tibotattle/actions/runs/34306321483)
-  at `a0cd02d0` passed Linux packaging and the Windows normal app journey, but
-  both Mac packaging jobs and Windows packaging failed; NSIS was skipped. The
-  production receipt-shape repair at `a77ddfd6` passes 40/40 focused tests. A
-  signed-staging bootstrap and injected-platform correction is committed at
-  `f3bf7a53`. Of 189 combined cases, 188 passed in the sandbox and the sole
-  loopback-listener failure passed in its full 16-case owning suite with
-  loopback access. The actual Electron product-entry ready-event probe passes
-  with explicit synthetic appData and a barrier before native handover.
-  These source regressions do not change the installed signed `c938a654`
-  app. The prior complete six-job pass was at `4b32c7e6` in
-  [34303173582](https://github.com/adamallcock/tibotattle/actions/runs/34303173582):
-  four development package targets, Windows normal app journey and Windows NSIS
-  installed lifecycle. Linux runtime and Secret Service checks pass. These remain
-  development receipts with `productionReady=false`; NSIS still lacks signed
-  output, persistent-credential proof and full descendant-cleanup proof.
+  GUI qualification. The isolated rehearsal feeds and all eight signed ZIP/DMG
+  objects are now published; independent HTTP downloads match the recorded
+  hashes, sizes and content types. Installed `.11` correctly showed current,
+  detected the `.12` advance, and returned to current with its download button
+  removed after exact feed rollback. No update was installed during that
+  rollback proof. Initial, advance and rollback receipts are complete for both
+  architectures. The subsequent installed update **failed**: close-to-tray
+  handlers blocked native exit. Native-menu Quit released the handoff, but
+  ShipIt then refused quarantine removal from the read-only packaged keytar
+  module (POSIX error 13). After its bounded retries, `.11` relaunched unchanged.
+  Its ASAR, installation salt and sharing-choice hashes match the snapshot;
+  refresh reached FRESH and sharing remained off. The lifecycle correction
+  `c8a6d4bc` passes 102/102 shell/updater/recovery tests. Packaging correction
+  `204269c6` preserves exact native bytes and sets Darwin native modules to
+  owner-writable 0755 before signing; all 13 package-layout tests pass. Windows
+  and Linux retain their prior mode policy. Both archived .12 ZIPs have only
+  one owner-read-only regular member, Keytar, and a synthetic quarantine test
+  reproduces the 0555 refusal and 0755 success. A fresh signed .13/.14 pair is
+  required; no successful installed-version update is claimed.
+  Automatic approval review rejected the second rollback request and requires
+  exact destination/file confirmation. The test feed still offers `.12` pending
+  that response, with automatic downloads disabled in these test builds.
+  The publisher requires exclusive operator control and before/after byte
+  checks; it does not claim atomic compare-and-swap. This namespace is publicly
+  readable but isolated from stable routing. Public stable release remains
+  outside the user's 2026-09-09 rehearsal approval.
+- **All six CI jobs pass at `9d07534d`.** Run
+  [34326477259](https://github.com/adamallcock/tibotattle/actions/runs/34326477259)
+  **passed all six jobs**: all four package targets, the Windows normal app
+  journey and the Windows NSIS installed lifecycle. The retained
+  Windows receipt proves packaged dashboard rendering, successful refresh,
+  Settings persistence through restart, durable opt-out, outbound block and
+  cleanup; its terminal phase is process absence. Receipt SHA-256 is
+  `819962b0c1ac697743468ad4c4fedc242444a6b4f145378c7d334e83974b51b9`.
+  This is development evidence with `productionReady=false`, not signed Windows
+  installer or production qualification. The previous `d70e99ed` run passed
+  Mac/Linux but failed Windows: one simulated Darwin storage expectation and
+  a Settings target timeout whose original error was hidden by cleanup.
+  `590a99dc` asserts the real Windows storage refusal; `9d07534d` awaits the
+  PID-tree terminator and retains the primary error/phase. Their owning local
+  suites pass 77/77 and 32/32 respectively. The prior complete six-job pass
+  remains `4b32c7e6` in
+  [34303173582](https://github.com/adamallcock/tibotattle/actions/runs/34303173582).
+  Source changes do not update the installed `c938a654` app.
 - **Signed contribution staging source is integrated** at `bdfce5a3` with
   163/163 focused tests passing. The private profile uses the native accountless
   backend through FD3, omits the production FD4 broker, fixes the staging origin,
@@ -84,32 +105,46 @@ Latest continuation checkpoint (bootstrap repair `f3bf7a53`; signed Mac source `
   `f3bf7a53` and verified through the real entry point; this does not qualify a
   signed fixture or its packaged scheduler. The probe explicitly redirects
   appData and blocks native work at the readiness promise.
-- Main advanced to `77317f9` through PR #114. A real three-way merge preserves
-  branch-only Electron files but has 15 shared hosted/release conflicts; a
-  separate reconciliation is underway. Both branches claim migration numbers
-  0046–0048 for different schemas; deployed ledgers must determine a forward-only
-  reconciliation before any deployment. Read-only ledgers confirm production
-  has canonical migrations through 0056 while staging has the earlier accountless
-  0046–0048. The legacy rebuild cannot safely be replayed on that staging schema.
-  The current plan preserves the old staging database as evidence and prepares
-  a replacement from one canonical forward sequence; no remote database or
-  binding has been changed. The native tray PR #112 and Electron
-  tray PR #113 were already included. Do not claim parity with all of the new
-  main revision until that reconciliation is validated.
-- Native 0.1.18 build 1026, its fresh stopped state and the completed Electron
-  profile remain independently preserved. Native observations recorded after
-  the earlier r8 rollback still require an explicit reconciliation check before
-  final cutover. The read-only r9 collector comparison confirms the same salt
-  but finds 11 `codex_quota_snapshot` rows missing from the current Electron
-  profile (matched by digest and multiplicity). The stopped native backup
-  retains all of them; append-only reconciliation is being rehearsed on private
-  copies. No live collector record has been changed. Never restore an old
-  journal over completed Electron state.
+- **PR #114 reconciliation is merged locally** through `2f77628`, preserving
+  branch-only Electron work and canonical production migrations 0046–0056.
+  Accountless migrations append at 0057–0059. Legacy staging 0046–0048 is
+  explicitly replacement-required; its database remains preserved and no
+  remote migration, binding or deployment has changed. Focused migration,
+  readiness, ownership and social-only public/scheduler checks pass. Integrated
+  full Worker testing found a real parent-delete cascade defect: child triggers
+  could no longer see the deleted owner. Repair `51a61dd2` preserves social
+  graph invalidation/progress cleanup and accountless exclusion. All 989 tests
+  in 77 Worker files, the 95-case focused regression suite and 54 readiness
+  tests pass. The final dry packaging stages require the committed clean tree
+  and remain to be run. Accountless public aggregate inclusion stays disabled.
+- **The 11 missing native quota observations are recovered.** Private-copy
+  reconciliation passed, then the normally stopped live Electron database was
+  proven identical to the baseline before the guarded append-only replacement.
+  The collector grew from 649,071 to 649,082 observations. Full-field comparison
+  found zero changes to pre-existing records and zero metadata differences.
+  The previous database remains available for rollback. Signed `.11` reopened,
+  its automatic refresh reached the rendered FRESH state, and the existing
+  contribution opt-out remained off. Private r9 receipts bind the replacement,
+  rollback copy and installed ASAR. Do not repeat the no-clobber operator or
+  restore an old migration journal over completed Electron state.
   The r9 rollback operator preserves newer Electron state as well as native
   state. Historical r1/r3/r4 archives retain verified bytes, metadata and tested
   `tar --fflags -p` recovery; newer backups remain.
 
+Broader integrated source regression result: 4,814 cases, 4,763 passed,
+45 skipped and six failures. The two missing public API declarations and one
+missing tool caller entry are corrected (44/44 boundary tests and 6/6 inventory
+tests pass). R7 workload coverage now includes deployment endpoint policy in
+both digests (`82da1373`; focused checks pass). The two remaining generated R7
+receipt validations correctly reject old workload evidence. No protected receipt
+was regenerated or relabelled. A private proposal binds pinned Node 24.14.0 and
+26.2.0, the existing frozen 31-day interval and a 45–60 minute local regeneration.
+
 Latest CI receipt SHA-256 values (private files, not public artifacts):
+
+- `windows-nsis-9d07534d`: `b08189e64b1f0eb24d4ed7e7a8e6bfccb8c54c580f94427f5232d1f28cc3c8fc`.
+- `linux-normal-9d07534d`: `26e8f58c619b0393645a56de4c0e9221c0a7021b594ba6373c98ddba655777f3`.
+
 
 - `windows-normal-4b32c7e6`: `08b110a7a03c3c1bcb814a6962bb853938b4a06117c3560e0f2d87fb1c1acf4f`.
 - `linux-normal-4b32c7e6`: `7391b9fbd6e43ffa8df4deaf8dd050004dd00a4d97223f2d334865bd6e84d916`.
