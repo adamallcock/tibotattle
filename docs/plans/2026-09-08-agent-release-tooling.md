@@ -48,6 +48,9 @@ receipt mismatch. Recommendations 4–5 are implemented locally in `c44f41f9`.
 The [follow-on validation record](../reviews/2026-09-08-publication-admission-validation.md)
 records the export correction, measured reuse, populated migration rehearsal,
 calendar-safe test fixture follow-up and remaining R7 release-gate failures.
+The [main-branch integration review](../reviews/2026-09-08-release-tooling-integration.md)
+records PR 114, preservation of newer desktop work, dependency-scan repairs,
+the combined regression run and source-merge versus release boundaries.
 
 ## Follow-on 4: publication reconciliation
 
