@@ -361,7 +361,7 @@ enforcement or edit applied migration provenance to bypass the result. Assess
 local storage, rollback and whole-transaction costs to inform a supported hosted
 upgrade design. The explicit local `production-scale-5gib` profile is implemented
 with fixed 20 GiB scratch / 2 GiB combined sampled RSS / 600-second admission;
-its actual large workload has not yet run. It pads the existing valid synthetic
+its actual large workload failed as recorded below. It pads the existing valid synthetic
 legacy/v1 fixture before preservation hashing and leaves migration transactions
 unchanged. Per-statement and index/free-page breakdowns are not collected.
 
@@ -371,6 +371,60 @@ Even a local transaction below 30 seconds would not qualify a production query.
 into smaller batches. The normal migration CLI sends unchanged 0058 plus its
 ledger append in one API query batch. Local stress evidence is therefore design
 input, not a workaround for either hosted failure or execution limits.
+
+# Local scale failure and bounded phased feasibility
+
+The fixed profile from source `565364a7` was executed locally. Attempt01 stopped
+because the sandbox prevented resident-memory observation; its confirmed
+cleanup is retained. Attempt02 used the same source and limits with authorized
+process observation. It stopped during0058's interrupted pass with the closed
+child code `REHEARSAL_RESOURCE_CEILING_EXCEEDED`: sampled scratch peak
+9,970,833,041 bytes, combined parent/child RSS287,047,680 bytes, and last phase
+elapsed37,491 ms. The wrapper confirmed termination and absence of its scratch
+directory. This failure is not specifically labelled `SQLITE_FULL`: the child
+code covers multiple resource conditions. It does not prove the production
+storage distribution or hosted failure mode. The owner-only
+`local-scale-20260909-02/failure.json` preserves the result. No ceiling was raised
+and no further large run was attempted.
+
+A subsequent small local-only prototype demonstrates a narrower alternative:
+evacuate the preserved rows in bounded transactions, execute unchanged0058 on
+the empty source tables, then restore in bounded transactions. SQLite schema
+inspection at0056 found51 tables in the participant/device foreign-key closure,
+all covered by0058's52 snapshots, with no cycles. The extra preserved table is
+`community_aggregate_exclusions`; external parents are `admin_action_audit` and
+`community_publication_generation`. Therefore children-first evacuation and
+parents-first restore can retain valid foreign keys at every durable boundary.
+
+`phased-small-proof-03/receipt.json` records a successful two-account fixture
+with20 rows in each telemetry table. It used52 committed batches of at most
+three rows, reopened the database and checked foreign keys after every commit,
+and injected a close-before-commit interruption in each movement direction.
+Both interruptions rolled back the row movement and journal cursor. Canonical
+0058 and its ledger append executed exactly once. Original-column hashes for
+all52 preserved tables matched, and final data for every table plus the entire
+index/trigger/view schema matched an ordinary canonical-migration control.
+Repeating restoration after its staging table was empty performed no writes.
+The prototype completed in478 ms with75,857,920-byte peak RSS. This is topology,
+small-fixture preservation and restart feasibility, not scale or hosted proof.
+
+The private prototype uses declared primary-key tuples for source movement
+because some tables are `WITHOUT ROWID`; staging records have an owned sequence.
+Earlier failed prototype receipts remain: the first exposed that rowid
+assumption; the second compared independently generated fixtures with different
+random/time defaults. The passing control and candidate share one cloned small
+synthetic baseline. No production records were copied.
+
+The minimal implementation still needs an exclusive durable maintenance fence,
+a source-bound phase journal, exact bounded copy/verify/delete/cursor commits,
+phase-specific historical-trigger handling, per-batch timeout/byte admission,
+and restore completion checks. Existing collection revision controls may carry
+the maintenance marker, but ordinary four-control containment alone does not
+stop all lifecycle or privileged mutations. Fence coverage, in-flight draining,
+operator/restart ownership and deletion-ledger reconciliation must be completed
+before remote execution. The prototype changes no canonical migration and
+implements no application maintenance fence. A new production database remains
+a broader fallback rather than the default path.
 
 # Live configuration and recovery preparation
 
