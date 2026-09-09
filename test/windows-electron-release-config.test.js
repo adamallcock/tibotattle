@@ -186,6 +186,7 @@ function loadReleaseConfig(environment) {
     "  nsisGuid: config.nsis.guid,",
     "  publish: config.publish,",
     "  signExts: config.win.signExts,",
+    "  icon: config.win.icon,",
     "  ledgerLeaf: config.win.windowsSigningOperationLedgerLeaf,",
     "  ledgerRoot: config.win.windowsSigningOperationEvidenceRoot,",
     "  azureSignOptions: config.win.azureSignOptions,",
@@ -240,6 +241,7 @@ test("Windows release config requires the patched signing runtime contract", asy
     assert.equal(config.nsisGuid, POLICY.PRODUCTION_ELECTRON_WINDOWS_TOAST_ACTIVATOR_CLSID);
     assert.equal(config.extraMetadata.tibotattleDistribution.target, "win32-x64");
     assert.equal(config.forceCodeSigning, true);
+    assert.equal(config.icon, resolve("apps/electron/assets/tibotattle.ico"));
     assert.deepEqual(config.signExts, [".dll", "!.node"]);
     assert.equal(config.ledgerLeaf, "windows-signing-operation-ledger.json");
     assert.equal(basename(config.ledgerRoot), "evidence");
@@ -468,4 +470,30 @@ test("patched platform finalizer waits for Windows targets and remains inert els
   }], nonWindowsTasks);
   await nonWindowsTasks.awaitTasks();
   assert.deepEqual(nonWindowsEvents, ["target"]);
+});
+
+
+test("Windows branding contains all taskbar and installer icon sizes", async () => {
+  const bytes = await fsPromises.readFile(resolve("apps/electron/assets/tibotattle.ico"));
+  assert.equal(bytes.readUInt16LE(0), 0);
+  assert.equal(bytes.readUInt16LE(2), 1);
+  const sizes = [16, 24, 32, 48, 64, 128, 256];
+  assert.equal(bytes.readUInt16LE(4), sizes.length);
+  let expectedOffset = 6 + sizes.length * 16;
+  for (const [index, size] of sizes.entries()) {
+    const offset = 6 + index * 16;
+    assert.equal(bytes[offset] || 256, size);
+    assert.equal(bytes[offset + 1] || 256, size);
+    assert.equal(bytes.readUInt16LE(offset + 6), 32);
+    const length = bytes.readUInt32LE(offset + 8);
+    const imageOffset = bytes.readUInt32LE(offset + 12);
+    assert.equal(imageOffset, expectedOffset);
+    assert.ok(length > 24 && imageOffset + length <= bytes.length);
+    const png = bytes.subarray(imageOffset, imageOffset + length);
+    assert.deepEqual([...png.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10]);
+    assert.equal(png.readUInt32BE(16), size);
+    assert.equal(png.readUInt32BE(20), size);
+    expectedOffset += length;
+  }
+  assert.equal(expectedOffset, bytes.length);
 });

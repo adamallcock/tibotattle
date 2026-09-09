@@ -531,6 +531,7 @@ module.exports = {
   // app-update.yml selected by the source candidate.
   publish: [{ provider: "generic", url: RELEASE_INPUTS.candidate.updateFeed }],
   win: {
+    icon: path.join(__dirname, "assets/tibotattle.ico"),
     target: [{ target: "nsis", arch: ["x64"] }],
     signAndEditExecutable: true,
     signExecutable: true,
