@@ -80,11 +80,18 @@ test("startup completion diagnostics retain fixed classifier and controller cate
     classifierReason: "failed",
     failedStep: "accounting",
     controllerError: "refresh_resource_limited",
+    failureCode: "none",
+    indexStatus: "missing",
+    degradedContractUnmet: [],
   };
   assert.deepEqual(normalizeStartupCompletionDiagnostic(value), value);
   for (const changed of [
     null,
     { ...value, failureCode: "private" },
+    { ...value, indexStatus: "private" },
+    { ...value, degradedContractUnmet: ["private"] },
+    { ...value, degradedContractUnmet: ["unified_index_step", "refresh_degraded"] },
+    { ...value, refreshStatus: "degraded", classifierReason: "degraded_invalid" },
     { ...value, failedStep: "private" },
     { ...value, controllerError: "private" },
     { ...value, classifierReason: "private" },
@@ -114,6 +121,9 @@ test("startup completion diagnostics retain fixed classifier and controller cate
     classifierReason: "failed",
     failedStep: "other",
     controllerError: "other",
+    failureCode: "other",
+    indexStatus: "missing",
+    degradedContractUnmet: [],
   });
   assert.doesNotMatch(JSON.stringify(unknownController.diagnostic), /private/u);
 
@@ -138,7 +148,168 @@ test("startup completion diagnostics retain fixed classifier and controller cate
     classifierReason: "none",
     failedStep: "none",
     controllerError: "none",
+    failureCode: "none",
+    indexStatus: "missing",
+    degradedContractUnmet: [],
   });
+
+  const coherentQuarantine = {
+    status: "degraded",
+    refreshId: "startup-refresh-id",
+    errorCode: "refresh_degraded",
+    failedStep: "unified_index",
+    failureCode: "codex_rollout_content_invalid",
+    result: {
+      unifiedIndex: {
+        status: "ingested",
+        generation: {
+          status: "partial",
+          blockReason: "codex_rollout_sources_quarantined",
+          skippedSourceCount: 1,
+          skippedThreadCount: 1,
+          reasonCounts: { codex_rollout_content_invalid: 1 },
+          discoveryComplete: true,
+          diagnosticsComplete: true,
+          usageProvenanceComplete: true,
+          sourceOrderComplete: true,
+          quotaProvenanceComplete: true,
+        },
+      },
+      accounting: {
+        status: "replay_safe",
+        sourceMode: "unified",
+        coverageStatus: "partial",
+        generationMatched: true,
+        fallbackCount: 0,
+        diagnosticsAvailable: true,
+      },
+    },
+  };
+  const coherent = inspectWindowsNormalCandidateStartupRefreshCompletion({
+    requestCount: 1,
+    refresh: coherentQuarantine,
+    expectedRefreshId: "startup-refresh-id",
+  });
+  assert.equal(coherent.decision.status, "completed");
+  assert.deepEqual(coherent.diagnostic.degradedContractUnmet, []);
+  assert.equal(coherent.diagnostic.failureCode, "codex_rollout_content_invalid");
+  assert.equal(coherent.diagnostic.indexStatus, "ingested");
+
+  const failedIndex = inspectWindowsNormalCandidateStartupRefreshCompletion({
+    requestCount: 1,
+    refresh: {
+      ...coherentQuarantine,
+      failureCode: "local_unified_index_file_invalid",
+      result: { unifiedIndex: { status: "failed" } },
+    },
+    expectedRefreshId: "startup-refresh-id",
+  });
+  assert.equal(failedIndex.decision.status, "failed");
+  assert.deepEqual(failedIndex.diagnostic, {
+    phase: "completion",
+    requestCount: "one",
+    refreshStatus: "degraded",
+    classifierStatus: "failed",
+    classifierReason: "degraded_invalid",
+    failedStep: "unified_index",
+    controllerError: "refresh_degraded",
+    failureCode: "local_unified_index_file_invalid",
+    indexStatus: "failed",
+    degradedContractUnmet: [
+      "quarantine_failure_code",
+      "unified_index_ingested",
+      "generation_partial",
+      "quarantine_block_reason",
+      "skipped_sources_positive",
+      "skipped_threads_positive",
+      "failure_reason_count_positive",
+      "discovery_complete",
+      "diagnostics_complete",
+      "usage_provenance_complete",
+      "source_order_complete",
+      "quota_provenance_complete",
+      "accounting_replay_safe",
+      "accounting_unified",
+      "accounting_partial_coverage",
+      "accounting_generation_matched",
+      "accounting_zero_fallback",
+      "accounting_diagnostics_available",
+    ],
+  });
+
+  const violations = [
+    ["refresh_degraded", (refresh) => { refresh.errorCode = "refresh_failed"; }],
+    ["unified_index_step", (refresh) => { refresh.failedStep = "accounting"; }],
+    ["quarantine_failure_code", (refresh) => {
+      refresh.failureCode = "local_unified_index_file_invalid";
+    }, ["quarantine_failure_code", "failure_reason_count_positive"]],
+    ["unified_index_ingested", (refresh) => { refresh.result.unifiedIndex.status = "failed"; }],
+    ["generation_partial", (refresh) => { refresh.result.unifiedIndex.generation.status = "complete"; }],
+    ["quarantine_block_reason", (refresh) => {
+      refresh.result.unifiedIndex.generation.blockReason = "tool_provenance_incomplete";
+    }],
+    ["skipped_sources_positive", (refresh) => {
+      refresh.result.unifiedIndex.generation.skippedSourceCount = 0;
+    }],
+    ["skipped_threads_positive", (refresh) => {
+      refresh.result.unifiedIndex.generation.skippedThreadCount = 0;
+    }],
+    ["failure_reason_count_positive", (refresh) => {
+      refresh.result.unifiedIndex.generation.reasonCounts.codex_rollout_content_invalid = 0;
+    }],
+    ["discovery_complete", (refresh) => {
+      refresh.result.unifiedIndex.generation.discoveryComplete = false;
+    }],
+    ["diagnostics_complete", (refresh) => {
+      refresh.result.unifiedIndex.generation.diagnosticsComplete = false;
+    }],
+    ["usage_provenance_complete", (refresh) => {
+      refresh.result.unifiedIndex.generation.usageProvenanceComplete = false;
+    }],
+    ["source_order_complete", (refresh) => {
+      refresh.result.unifiedIndex.generation.sourceOrderComplete = false;
+    }],
+    ["quota_provenance_complete", (refresh) => {
+      refresh.result.unifiedIndex.generation.quotaProvenanceComplete = false;
+    }],
+    ["accounting_replay_safe", (refresh) => {
+      refresh.result.accounting.status = "unavailable";
+    }],
+    ["accounting_unified", (refresh) => { refresh.result.accounting.sourceMode = "legacy"; }],
+    ["accounting_partial_coverage", (refresh) => {
+      refresh.result.accounting.coverageStatus = "complete";
+    }],
+    ["accounting_generation_matched", (refresh) => {
+      refresh.result.accounting.generationMatched = false;
+    }],
+    ["accounting_zero_fallback", (refresh) => { refresh.result.accounting.fallbackCount = 1; }],
+    ["accounting_diagnostics_available", (refresh) => {
+      refresh.result.accounting.diagnosticsAvailable = false;
+    }],
+  ];
+  for (const [check, mutate, expected = [check]] of violations) {
+    const refresh = structuredClone(coherentQuarantine);
+    mutate(refresh);
+    const observed = inspectWindowsNormalCandidateStartupRefreshCompletion({
+      requestCount: 1,
+      refresh,
+      expectedRefreshId: "startup-refresh-id",
+    });
+    assert.equal(observed.decision.status, "failed", check);
+    assert.equal(observed.diagnostic.classifierReason, "degraded_invalid", check);
+    assert.deepEqual(observed.diagnostic.degradedContractUnmet, expected, check);
+  }
+
+  const defaultFailure = inspectWindowsNormalCandidateStartupRefreshCompletion({
+    requestCount: 1,
+    refresh: {
+      status: "failed",
+      refreshId: "startup-refresh-id",
+      failureCode: "local_unified_index_refresh_failed",
+    },
+    expectedRefreshId: "startup-refresh-id",
+  });
+  assert.equal(defaultFailure.diagnostic.failureCode, "local_unified_index_refresh_failed");
 });
 
 test("normal candidate startup completion returns a failed classifier without waiting for a timeout", async () => {
@@ -167,6 +338,9 @@ test("normal candidate startup completion returns a failed classifier without wa
       classifierReason: "failed",
       failedStep: "accounting",
       controllerError: "refresh_resource_limited",
+      failureCode: "other",
+      indexStatus: "missing",
+      degradedContractUnmet: [],
     });
     assert.doesNotMatch(JSON.stringify(error?.startupCompletionDiagnostic), /private/u);
     return true;
@@ -1257,6 +1431,9 @@ test("normal candidate runner retains the outbound block and profile when proces
     classifierReason: "failed",
     failedStep: "accounting",
     controllerError: "refresh_resource_limited",
+    failureCode: "none",
+    indexStatus: "missing",
+    degradedContractUnmet: [],
   };
   let removedFirewall = false;
   let removedProfile = false;

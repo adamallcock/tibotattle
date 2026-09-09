@@ -1749,6 +1749,73 @@ const STARTUP_COMPLETION_CONTROLLER_ERRORS = new Set([
   "none", "refresh_failed", "refresh_resource_limited", "refresh_timed_out", "refresh_cancelled",
   "refresh_degraded", "other",
 ]);
+// This is the reviewed public unified-index vocabulary from
+// src/local-companion-refresh.js, plus its fail-closed default.  The receipt
+// must never preserve an arbitrary controller failure string.
+const STARTUP_COMPLETION_UNIFIED_INDEX_FAILURE_CODES = new Set([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+  "local_unified_index_aborted",
+  "local_unified_index_directory_sync_failed",
+  "local_unified_index_file_changed",
+  "local_unified_index_file_invalid",
+  "local_unified_index_generation_invalid",
+  "local_unified_index_generation_mismatch",
+  "local_unified_index_integrity_failed",
+  "local_unified_index_journal_mode_refused",
+  "local_unified_index_meta_invalid",
+  "local_unified_index_missing",
+  "local_unified_index_publication_durability_uncertain",
+  "local_unified_index_refresh_failed",
+  "local_unified_index_schema_invalid",
+  "local_unified_index_schema_newer",
+  "local_unified_index_secondary_indexes_failed",
+  "local_unified_index_secondary_indexes_missing",
+  "local_unified_index_secret_invalid",
+  "local_unified_index_secret_unavailable",
+  "local_unified_index_unavailable",
+  "local_unified_index_worker_failed",
+]);
+const STARTUP_COMPLETION_DEGRADED_FAILURE_CODES = new Set([
+  "codex_rollout_compression_unsupported",
+  "codex_rollout_filename_identity_mismatch",
+  "codex_rollout_generation_ambiguous",
+  "codex_rollout_lineage_invalid",
+  "codex_rollout_content_invalid",
+  "codex_rollout_tail_incomplete",
+]);
+const STARTUP_COMPLETION_FAILURE_CODES = new Set([
+  "none", "other", ...STARTUP_COMPLETION_UNIFIED_INDEX_FAILURE_CODES,
+]);
+const STARTUP_COMPLETION_INDEX_STATUSES = new Set([
+  "failed", "ingested", "missing", "other",
+]);
+const STARTUP_COMPLETION_DEGRADED_CONTRACT_CHECKS = Object.freeze([
+  "refresh_degraded",
+  "unified_index_step",
+  "quarantine_failure_code",
+  "unified_index_ingested",
+  "generation_partial",
+  "quarantine_block_reason",
+  "skipped_sources_positive",
+  "skipped_threads_positive",
+  "failure_reason_count_positive",
+  "discovery_complete",
+  "diagnostics_complete",
+  "usage_provenance_complete",
+  "source_order_complete",
+  "quota_provenance_complete",
+  "accounting_replay_safe",
+  "accounting_unified",
+  "accounting_partial_coverage",
+  "accounting_generation_matched",
+  "accounting_zero_fallback",
+  "accounting_diagnostics_available",
+]);
 const STARTUP_COMPLETION_CLASSIFIER_REASON_BY_ERROR_CODE = new Map([
   [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.duplicate, "duplicate"],
   [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.invalidReceipt, "invalid_receipt"],
@@ -1783,17 +1850,97 @@ function startupCompletionFailedStep(refresh) {
   return STARTUP_COMPLETION_FAILED_STEPS.has(refresh.failedStep) ? refresh.failedStep : "other";
 }
 
+function startupCompletionFailureCode(refresh) {
+  if (refresh?.failureCode === null || refresh?.failureCode === undefined) return "none";
+  return STARTUP_COMPLETION_UNIFIED_INDEX_FAILURE_CODES.has(refresh.failureCode)
+    ? refresh.failureCode
+    : "other";
+}
+
+function startupCompletionIndexStatus(refresh) {
+  const status = refresh?.result?.unifiedIndex?.status;
+  if (status === null || status === undefined) return "missing";
+  return STARTUP_COMPLETION_INDEX_STATUSES.has(status) && status !== "missing" && status !== "other"
+    ? status
+    : "other";
+}
+
+function startupCompletionDegradedContractUnmet(refresh) {
+  if (refresh?.status !== "degraded") return Object.freeze([]);
+  const unifiedIndex = refresh?.result?.unifiedIndex;
+  const generation = unifiedIndex?.generation;
+  const accounting = refresh?.result?.accounting;
+  const failureCode = refresh?.failureCode;
+  const unmet = [];
+  if (refresh?.errorCode !== "refresh_degraded") unmet.push("refresh_degraded");
+  if (refresh?.failedStep !== "unified_index") unmet.push("unified_index_step");
+  if (!STARTUP_COMPLETION_DEGRADED_FAILURE_CODES.has(failureCode)) {
+    unmet.push("quarantine_failure_code");
+  }
+  if (unifiedIndex?.status !== "ingested") unmet.push("unified_index_ingested");
+  if (generation?.status !== "partial") unmet.push("generation_partial");
+  if (generation?.blockReason !== "codex_rollout_sources_quarantined") {
+    unmet.push("quarantine_block_reason");
+  }
+  if (!Number.isSafeInteger(generation?.skippedSourceCount)
+      || generation.skippedSourceCount <= 0) {
+    unmet.push("skipped_sources_positive");
+  }
+  if (!Number.isSafeInteger(generation?.skippedThreadCount)
+      || generation.skippedThreadCount <= 0) {
+    unmet.push("skipped_threads_positive");
+  }
+  if (!STARTUP_COMPLETION_DEGRADED_FAILURE_CODES.has(failureCode)
+      || !Number.isSafeInteger(generation?.reasonCounts?.[failureCode])
+      || generation.reasonCounts[failureCode] <= 0) {
+    unmet.push("failure_reason_count_positive");
+  }
+  if (generation?.discoveryComplete !== true) unmet.push("discovery_complete");
+  if (generation?.diagnosticsComplete !== true) unmet.push("diagnostics_complete");
+  if (generation?.usageProvenanceComplete !== true) {
+    unmet.push("usage_provenance_complete");
+  }
+  if (generation?.sourceOrderComplete !== true) unmet.push("source_order_complete");
+  if (generation?.quotaProvenanceComplete !== true) {
+    unmet.push("quota_provenance_complete");
+  }
+  if (accounting?.status !== "replay_safe") unmet.push("accounting_replay_safe");
+  if (accounting?.sourceMode !== "unified") unmet.push("accounting_unified");
+  if (accounting?.coverageStatus !== "partial") {
+    unmet.push("accounting_partial_coverage");
+  }
+  if (accounting?.generationMatched !== true) {
+    unmet.push("accounting_generation_matched");
+  }
+  if (accounting?.fallbackCount !== 0) unmet.push("accounting_zero_fallback");
+  if (accounting?.diagnosticsAvailable !== true) {
+    unmet.push("accounting_diagnostics_available");
+  }
+  return Object.freeze(unmet);
+}
+
 function startupCompletionClassifierReason(decision) {
   if (decision?.status !== "failed") return "none";
   return STARTUP_COMPLETION_CLASSIFIER_REASON_BY_ERROR_CODE.get(decision.errorCode) ?? "other";
 }
 
 /**
- * Retain the completion boundary as fixed categories only. This deliberately
- * excludes failureCode and all provider/controller text from the receipt.
+ * Retain the completion boundary as fixed categories only.  The unified-index
+ * failure and degraded-contract fields use reviewed enums and booleans only;
+ * provider/controller text cannot cross into the receipt.
  */
 export function normalizeStartupCompletionDiagnostic(value) {
-  if (!exactObject(value) || Object.keys(value).length !== 7
+  const unmet = value?.degradedContractUnmet;
+  const selectedChecks = Array.isArray(unmet)
+    ? STARTUP_COMPLETION_DEGRADED_CONTRACT_CHECKS
+      .filter((check) => unmet.includes(check))
+    : null;
+  const canonicalUnmet = Array.isArray(unmet)
+    && unmet.length === new Set(unmet).size
+    && unmet.every((check) => STARTUP_COMPLETION_DEGRADED_CONTRACT_CHECKS.includes(check))
+    && selectedChecks.length === unmet.length
+    && selectedChecks.every((check, index) => check === unmet[index]);
+  if (!exactObject(value) || Object.keys(value).length !== 10
       || value.phase !== "completion"
       || !STARTUP_COMPLETION_REQUEST_COUNTS.has(value.requestCount)
       || !STARTUP_COMPLETION_REFRESH_STATUSES.has(value.refreshStatus)
@@ -1801,10 +1948,15 @@ export function normalizeStartupCompletionDiagnostic(value) {
       || !STARTUP_COMPLETION_CLASSIFIER_REASONS.has(value.classifierReason)
       || !STARTUP_COMPLETION_FAILED_STEPS.has(value.failedStep)
       || !STARTUP_COMPLETION_CONTROLLER_ERRORS.has(value.controllerError)
+      || !STARTUP_COMPLETION_FAILURE_CODES.has(value.failureCode)
+      || !STARTUP_COMPLETION_INDEX_STATUSES.has(value.indexStatus)
+      || !canonicalUnmet
       || value.requestCount === "zero" && value.refreshStatus !== "not_observed"
       || value.requestCount !== "zero" && value.refreshStatus === "not_observed"
       || value.classifierStatus === "failed" && value.classifierReason === "none"
-      || value.classifierStatus !== "failed" && value.classifierReason !== "none") return null;
+      || value.classifierStatus !== "failed" && value.classifierReason !== "none"
+      || value.classifierReason === "degraded_invalid" && unmet.length === 0
+      || value.refreshStatus !== "degraded" && unmet.length !== 0) return null;
   return Object.freeze({
     phase: value.phase,
     requestCount: value.requestCount,
@@ -1813,6 +1965,9 @@ export function normalizeStartupCompletionDiagnostic(value) {
     classifierReason: value.classifierReason,
     failedStep: value.failedStep,
     controllerError: value.controllerError,
+    failureCode: value.failureCode,
+    indexStatus: value.indexStatus,
+    degradedContractUnmet: Object.freeze([...unmet]),
   });
 }
 
@@ -1845,6 +2000,9 @@ export function inspectWindowsNormalCandidateStartupRefreshCompletion({
     classifierReason: startupCompletionClassifierReason(decision),
     failedStep: startupCompletionFailedStep(refresh),
     controllerError: startupCompletionControllerError(refresh),
+    failureCode: startupCompletionFailureCode(refresh),
+    indexStatus: startupCompletionIndexStatus(refresh),
+    degradedContractUnmet: startupCompletionDegradedContractUnmet(refresh),
   });
   return Object.freeze({ decision, diagnostic });
 }
@@ -1875,6 +2033,9 @@ export async function waitForWindowsNormalCandidateStartupRefreshCompletion({
     classifierReason: "none",
     failedStep: "none",
     controllerError: "none",
+    failureCode: "none",
+    indexStatus: "missing",
+    degradedContractUnmet: [],
   });
   const terminal = await waitForPoll(async () => {
     const requestCount = refreshCount();
