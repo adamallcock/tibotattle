@@ -134,8 +134,24 @@ Latest continuation, 2026-09-09:
   build `2026090933`, has passed signing and final installer verification and
   failed its installed journey at the same CDP gate. Its closed diagnostic shows
   the child alive, loopback transport unavailable, and the entry-failure marker
-  absent. A bounded owned-PID native-dialog probe is being prepared to distinguish
-  pre-entry loader failure from a listener stall; no cause is yet proven.
+  absent. A bounded owned-PID native-dialog probe was reviewed and committed
+  as `10bbe518`, with 41 focused tests passing. Its diagnostic-only run
+  [34403396128](https://github.com/adamallcock/tibotattle/actions/runs/34403396128)
+  was cancelled before signing after direct artifact inspection found the missing
+  dependency: Windows omits `native/macos-keychain/contract.js`, which its main
+  module imports unconditionally through the credential facade. The exact signed
+  installer hash was checked before extracting its 701 JavaScript/JSON files.
+  Loading the extracted main module in Node 26 failed with `ERR_MODULE_NOT_FOUND`;
+  adding only that contract from the pinned source made the complete module graph
+  load successfully. This establishes the packaging defect, not a Windows runtime
+  pass. Linux already includes the contract. The scoped Windows package-filter fix is committed as `196ec95e`; its
+  source-derived regression and 78 release-trust tests pass, with independent
+  review. The corrected signed run is
+  [34403971764](https://github.com/adamallcock/tibotattle/actions/runs/34403971764),
+  build `2026090935`; it is in progress. The full local config suite still sees
+  the previously documented stale installed builder patch; the unchanged ledger
+  correction passed its separate fresh frozen/offline five-test qualification.
+  No dependency purge or test weakening was performed.
   The broader lifecycle correction is
   committed separately as `72f357e2`. Five tests against a fresh isolated
   installation of the patched builder pass, including once-only emission after
@@ -221,7 +237,15 @@ rows and final all-table data/schema matching the canonical control. It took
 and trustworthy in-flight drain are not implemented. Existing controls do not
 cover every write, and an old ingest error handler can perform R2 cleanup after
 reading a temporarily empty table, so a database write barrier alone is
-insufficient. No production operation occurred.
+insufficient. The simpler next proposal is a single invocation of the normal
+atomic migration path, with unchanged 0057–0059, revision-checked containment,
+fresh bookmarks and explicit success/failure/unknown readback. It avoids exposing
+empty tables between batches. Each migration has its own transaction; this is not
+one all-or-nothing transaction across the three migrations. The proposal adds no
+index wrapper or phased coordinator. Compatibility of the exact deployed Worker
+with each possible completed prefix is being checked before requesting production
+approval. See the [prepared operation](../runbooks/release-migration-rehearsal.md#single-attempt-production-migration-proposal).
+No production operation occurred.
 Updated public privacy,
 Docs and translated homepage copy are prepared and locally verified, not deployed.
 Production accountless modes remain disabled in source.
