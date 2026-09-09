@@ -7,6 +7,12 @@ status: complete-with-baseline-failures
 
 # Scope and result boundary
 
+Follow-up: the [publication/admission validation record](2026-09-08-publication-admission-validation.md)
+corrects this report's incomplete broad-suite failure accounting: a native
+helper export-closure omission from recommendations 1–3 was subsequently found
+and fixed in `1b0f2f04`. The original observations below are retained as a
+point-in-time record, not the latest qualification status.
+
 Validates recommendations 1–3 of the
 [release investigation](../research/2026-09-08-agent-release-process-improvements.md),
 implemented in `a624d521dd6ce49d8466927d91652124af09234b` on

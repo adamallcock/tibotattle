@@ -16,6 +16,15 @@ publication; those remain explicit owner operations.
 The Sparkle artifact/publication sequence is separate and remains governed by
 the [macOS stable release runbook](./macos-stable-release-runbook.md).
 
+For a release containing schema changes, use
+[release migration admission and rehearsal](./release-migration-rehearsal.md)
+before expensive candidate qualification: observe the deployed prefix and test
+the pending migrations on populated synthetic data. Its local receipt neither
+authorizes remote writes nor replaces the live schema and recovery checks below.
+For release-site coordination with GitHub, architecture feeds and Homebrew, use
+[publication reconciliation](./release-publication-reconciliation.md); it delegates
+website writes to this runbook's existing guarded deployment path.
+
 ## Production topology
 
 | Surface | Authority and boundary |

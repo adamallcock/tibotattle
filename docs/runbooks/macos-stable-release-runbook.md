@@ -123,6 +123,17 @@ access signing keys, test Apple authentication, sign, build or publish. A
 configured credential reference is not verified usability; unexercised/manual
 checks remain outstanding.
 
+Run [early synthetic admission](release-qualification-admission.md) before
+expensive R7 or native finalization. It can reuse an exact reviewed local proof,
+but cannot replace R7, predecessor, installed-app or hardware qualification.
+If hosted migrations are included, perform the populated
+[migration rehearsal](release-migration-rehearsal.md) early too. Once both final
+installers and the website are qualified, use
+[publication reconciliation](release-publication-reconciliation.md) to inspect
+GitHub, both feeds, Homebrew and the website together, then resume only the
+separately authorized pending publication steps. Its read-only default is not
+publication permission and its stable dual-macOS scope does not cover dogfood.
+
 The release CLI uses a private journal at `<output>.operation` by default.
 An interrupted authorized finalization resumes with the original arguments plus
 `--resume`, never `--prepare-candidate` or `--replace`. Keep the exact candidate,

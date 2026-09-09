@@ -2,7 +2,7 @@
 title: Agent release tooling implementation and follow-on plans
 date: 2026-09-08
 type: plan
-status: recommendations-4-5-in-progress
+status: implemented-with-validation-limitations
 ---
 
 # Scope
@@ -44,8 +44,10 @@ the subsequently discovered native journal export-closure repair; no release
 publication occurred.
 The [validation record](../reviews/2026-09-08-agent-release-tooling-validation.md)
 separates passing recovery/native/Worker checks from the pre-existing R7
-receipt mismatch. Recommendations 4–5 below are now being implemented, retaining
-this document as their acceptance boundary.
+receipt mismatch. Recommendations 4–5 are implemented locally in `c44f41f9`.
+The [follow-on validation record](../reviews/2026-09-08-publication-admission-validation.md)
+records the export correction, measured reuse, populated migration rehearsal,
+calendar-safe test fixture follow-up and remaining R7 release-gate failures.
 
 ## Follow-on 4: publication reconciliation
 
@@ -85,7 +87,9 @@ and single-notarization experiments remain separately scoped later work.
 - [x] Deployed-prefix observation and populated local migration rehearsal;
   separately gated disposable-remote syntax rehearsal.
 - [x] Conservative test-lane routing, measured reuse and invalidation tests.
-- [ ] Integrated validation, command registration and maintained runbooks.
+- [x] Integrated validation, command registration and maintained runbooks;
+  the R7 mismatch is recorded, not waived; the date-dependent Worker fixture
+  failure is diagnosed and repaired without changing production request limits.
 
 Reuse of synthetic historical-schema tests is early admission, not proof of an
 arbitrary installed predecessor. Existing R7 v0.1 receipt semantics remain
