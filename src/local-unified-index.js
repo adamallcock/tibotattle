@@ -131,7 +131,11 @@ export const LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION =
 // v15 (2026-09-07): parent model declarations at/before the event and fork
 // boundary recover missing paginated-fork models. Explicit child selections
 // supersede the default. Counters, effort, tier and replay remain independent.
-export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v15";
+// v16 (2026-09-09): missing cache-write counts use the explicit product
+// assumption of zero when input/cache-read counters are valid and consistent.
+// A per-event suffix retains the assumption; raw delta/replay counters do not
+// change. The base cursor stamp forces historical sources to be reparsed.
+export const LOCAL_UNIFIED_INDEX_PARSER_VERSION = "unified-rollout-typed-v16";
 export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
   "codex-immutable-rollout-v1";
 
@@ -142,14 +146,14 @@ export const LOCAL_UNIFIED_INDEX_SOURCE_IDENTITY_VERSION =
 // degraded row is recorded. Kept in lockstep with the main constant: salvaged
 // rows run the same delta derivation.
 export const LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v15-partial";
+  "unified-rollout-typed-v16-partial";
 
 // Per-row provenance variants retain the inherited-model assumption without
-// changing the physical schema. Ingest cursors keep the base v15 stamp.
+// changing the physical schema. Ingest cursors keep the base v16 stamp.
 export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION =
-  "unified-rollout-typed-v15-parent-model";
+  "unified-rollout-typed-v16-parent-model";
 export const LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION =
-  "unified-rollout-typed-v15-parent-model-partial";
+  "unified-rollout-typed-v16-parent-model-partial";
 
 export const LOCAL_UNIFIED_INDEX_APPLICATION_ID = 0x554d5549;
 const INDEX_APPLICATION_ID = LOCAL_UNIFIED_INDEX_APPLICATION_ID;
@@ -2499,18 +2503,21 @@ export function createUnifiedIndexWriter(database, {
 
     writeUsageEvent(event) {
       begin();
+      const provenanceVersion = event.modelInherited
+        ? event.partial
+          ? LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION
+          : LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION
+        : event.partial ? LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION : parserVersion;
+      const eventParserVersionId = event.cacheWriteAssumedZero === true
+        ? internParserVersion(`${provenanceVersion}-cache-write-zero`)
+        : event.modelInherited || event.partial
+          ? internParserVersion(provenanceVersion) : defaultParserVersionId;
       const changes = statements.usage.run(
         event.eventKey,
         event.observedAtMs,
         event.generationId ?? generationId,
         ingestRunId,
-        event.modelInherited
-          ? internParserVersion(event.partial
-            ? LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION
-            : LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION)
-          : event.partial
-            ? internParserVersion(LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION)
-            : defaultParserVersionId,
+        eventParserVersionId,
         event.sourceId ?? null,
         event.sourceOffset ?? null,
         event.sessionLocal,

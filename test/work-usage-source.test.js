@@ -1033,3 +1033,133 @@ test("oversized cache candidates fall back to streaming without changing account
     assert.deepEqual(query(bounded, "project"), query(independent, "project"));
   } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });
+
+test("non-repository and unavailable locations share one project while retaining location detail", async () => {
+  const { createWorkUsageProjectResolver } = await import("../src/platform/index.js");
+  const root = await mkdtemp(join(tmpdir(), "work-usage-nonproject-"));
+  const resolveProject = createWorkUsageProjectResolver({ digest: (kind, value) => `${kind}:${value}` });
+  try {
+    const first = join(root, "first", "scratch");
+    const second = join(root, "second", "scratch");
+    const removed = join(root, "removed", "scratch");
+    await mkdir(first, { recursive: true });
+    await mkdir(second, { recursive: true });
+    const locations = await Promise.all([first, second, removed].map(resolveProject));
+    for (const location of locations) {
+      assert.equal(location.project, "non-project");
+      assert.equal(location.projectName, "Non-project tasks");
+      assert.equal(location.method, "non_project");
+      assert.equal(location.worktreeName, "scratch");
+    }
+    assert.equal(new Set(locations.map(location => location.worktree)).size, 3);
+    assert.equal(await resolveProject(first), locations[0], "per-location resolution remains cached");
+    for (const invalid of [null, undefined, "", "relative/path", `${root}\0bad`, `${root}\nbad`, `${root}\tbad`, `${root}\x7fbad`]) {
+      assert.equal(await resolveProject(invalid), null, "missing or malformed location remains Unassigned");
+    }
+    const file = join(root, "file");
+    await writeFile(file, "fixture");
+    assert.equal(await resolveProject(file), null, "a regular file is not a workspace");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("repository grouping joins linked worktrees but keeps distinct clones separate", async () => {
+  const { createWorkUsageProjectResolver } = await import("../src/platform/index.js");
+  const fixture = await makeFixture({ events: [] });
+  const resolveProject = createWorkUsageProjectResolver({ digest: (kind, value) => `${kind}:${value}` });
+  try {
+    const clone = join(fixture.root, "clone");
+    await git(["clone", "-q", fixture.repository, clone], fixture.root);
+    const [main, linked, separate] = await Promise.all(
+      [fixture.repository, fixture.worktree, clone].map(resolveProject),
+    );
+    assert.equal(main.method, "git_observation");
+    assert.equal(linked.project, main.project);
+    assert.notEqual(linked.worktree, main.worktree);
+    assert.notEqual(separate.project, main.project);
+    assert.notEqual(separate.project, "non-project");
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("canonical source groups unavailable non-project folders and conserves usage", async () => {
+  const absentRoot = await mkdtemp(join(tmpdir(), "work-usage-absent-"));
+  const fixture = await makeFixture({ events: [
+    { timestamp: "2026-08-24T00:01:00Z", total: 100, last: 100, cwd: join(absentRoot, "first") },
+    { timestamp: "2026-08-24T00:02:00Z", total: 400, last: 300, cwd: join(absentRoot, "second") },
+  ] });
+  try {
+    const result = await readLocalWorkUsageSnapshot({
+      ...fixture,
+      ...interval("2026-08-24T00:00:00Z", "2026-08-25T00:00:00Z"),
+    });
+    assert.equal(result.status, "available");
+    const projects = query(result, "project");
+    assert.equal(projects.rows.length, 1);
+    assert.equal(projects.rows[0].id, "non-project");
+    assert.equal(projects.rows[0].tokens, 400);
+    assert.equal(projects.totals.tokens, 400);
+    assert.equal(result.display.projects["non-project"].name, "Non-project tasks");
+    assert.equal(result.display.projects["non-project"].method, "non_project");
+    assert.deepEqual(query(result, "worktree").rows.map(row => row.tokens).sort((a, b) => a - b), [100, 300]);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+    await rm(absentRoot, { recursive: true, force: true });
+  }
+});
+
+test("verified repository origins recover deleted workspaces and group transport variants", async () => {
+  const { createWorkUsageProjectResolver } = await import("../src/platform/index.js");
+  const fixture = await makeFixture({ events: [] });
+  try {
+    await git(["remote", "add", "origin", "https://fixture-token@example.invalid/team/project.git"], fixture.repository);
+    const clone = join(fixture.root, "clone");
+    await git(["clone", "-q", fixture.repository, clone], fixture.root);
+    await git(["remote", "set-url", "origin", "git@example.invalid:team/project.git"], clone);
+    const removed = join(fixture.root, "removed");
+    const replaced = join(fixture.root, "replaced");
+    const malformed = join(fixture.root, "malformed");
+    await mkdir(replaced);
+    const resolveProject = createWorkUsageProjectResolver({
+      digest: (kind, value) => `${kind}:${value}`,
+      repositoryOrigins: new Map([
+        [removed, "ssh://git@example.invalid:22/team/project.git?ignored=yes#fragment"],
+        [replaced, "https://example.invalid/team/project"],
+        [malformed, "file:///local/repository"],
+      ]),
+    });
+    const [main, linked, copy, historical, currentFolder, invalid] = await Promise.all(
+      [fixture.repository, fixture.worktree, clone, removed, replaced, malformed].map(resolveProject),
+    );
+    assert.equal(main.project, linked.project);
+    assert.equal(main.project, copy.project);
+    assert.equal(main.project, historical.project);
+    assert.equal(main.projectName, "project");
+    assert.equal(historical.method, "retained_git_origin");
+    assert.equal(await resolveProject(`${removed}/`), historical, "trailing slash recovers and reuses the same retained workspace");
+    assert.equal(await resolveProject(`${removed}//`), historical, "repeated trailing separators do not split workspace identity");
+    assert.equal(new Set([main.worktree, linked.worktree, copy.worktree, historical.worktree]).size, 4);
+    assert.equal(currentFolder.project, "non-project", "current non-Git directory overrides a stale saved origin");
+    assert.equal(invalid.project, "non-project");
+    assert.ok(!JSON.stringify([main, linked, copy, historical]).includes("fixture-token"));
+    await git(["remote", "set-url", "origin", "https://example.invalid/other/project.git"], clone);
+    const fresh = createWorkUsageProjectResolver({ digest: (kind, value) => `${kind}:${value}` });
+    assert.notEqual((await fresh(clone)).project, (await fresh(fixture.repository)).project);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+test("repository origin normalization rejects unsupported and malformed identities", async () => {
+  const { normalizeWorkUsageRepositoryOrigin } = await import("../src/platform/index.js");
+  const expected = "https://example.invalid/team/project";
+  for (const value of [
+    "https://user:password@EXAMPLE.invalid/team/project.git/?query=yes#fragment",
+    "ssh://git@example.invalid:22/team/project.git",
+    "git://example.invalid:9418/team/project.git",
+    "git@example.invalid:team/project.git",
+    expected,
+  ]) assert.equal(normalizeWorkUsageRepositoryOrigin(value), expected);
+  for (const value of [null, "", "/local/project", "file:///local/project", "http://example.invalid/team/project",
+    "https://example.invalid", "https://example.invalid/.git", "https://example.invalid/team/%2fproject",
+    "https://example.invalid/team/%00project", "not a URL", "https://example.invalid/team/\\project"])
+    assert.equal(normalizeWorkUsageRepositoryOrigin(value), null);
+  assert.equal(normalizeWorkUsageRepositoryOrigin("ssh://git@example.invalid:2222/team/project.git"),
+    "https://example.invalid:2222/team/project");
+});

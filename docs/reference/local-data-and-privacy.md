@@ -357,7 +357,16 @@ to 512 characters inside SQLite before reaching JavaScript; whitespace is
 normalized and control-containing values are rejected. Titles can include opening
 message text, but are never exported, uploaded or persisted by this feature.
 No transcript or response bodies are read. The cache-drop tables and ancestry
-reader retain their title-free contract. A bounded local Git lookup groups worktrees; display labels and
+reader retain their title-free contract. A bounded local Git lookup groups worktrees
+and clones with the same normalized origin. An owner-controlled, read-only SQLite
+snapshot may read up to 25,000 rows of `cwd` and `git_origin_url`, each bounded to
+4,096 characters and UTF-8 bytes. Credentials, query strings and fragments are
+removed from recognized network origins. Unambiguous retained origins recover
+repository identity only for missing folders; existing non-Git folders override
+stale hints. Conflicting hints stay unresolved. Raw origins remain transient and
+never reach the browser, index, export or telemetry. Folders without identifiable
+repositories share Non-project tasks; missing source context stays Unassigned.
+Display labels and
 basenames are transient display decoration. No raw path, name or project handle
 is written to the index, exports, diagnostics, contributions or browser storage.
 Explicit collaboration parent links are read in a bounded local metadata pass
@@ -371,8 +380,8 @@ index/home/secret configuration and disappears on abort, worker failure, shutdow
 five minutes of worker inactivity. Changed indexed prefixes are reread; absent
 or rejected sources are evicted. Each hit still verifies the retained source,
 and Git mappings and ancestry are resolved afresh. This cache is not serialized,
-exported or returned to the browser. Retained-source loss yields Unassigned;
-it cannot reconstruct historical repository ownership. This is independent of token-count
+exported or returned to the browser. Retained-source loss yields Unassigned because there is no usage-bound directory
+to associate with a current or retained repository identity. This is independent of token-count
 and event-time API-price coverage. See the
 [implementation plan](../plans/2026-09-08-thread-project-usage-implementation.md)
 for the preview's bounds and qualification status.

@@ -463,6 +463,16 @@ export async function extractRolloutUsage(path, {
   // continuity lens compares positive-input requests, so only the next one is
   // a meaningful boundary.
   function emitUsage(event, rawUsage) {
+    // Product-approved assumption: historical Codex counters can omit cache
+    // writes. Apply it only after choosing the charged usage, keeping raw
+    // cumulative counters unchanged for replay and delta decisions.
+    if (rawUsage != null && rawUsage.cache_write_input_tokens == null
+        && Number.isSafeInteger(rawUsage.input_tokens) && rawUsage.input_tokens >= 0
+        && Number.isSafeInteger(rawUsage.cached_input_tokens) && rawUsage.cached_input_tokens >= 0
+        && rawUsage.cached_input_tokens <= rawUsage.input_tokens) {
+      event.components = canonicalComponents({ ...rawUsage, cache_write_input_tokens: 0 });
+      event.cacheWriteAssumedZero = true;
+    }
     if (event.model === null && parentModelAt !== null) {
       event.model = parentModelAt(event.observedAtMs);
       event.modelInherited = event.model !== null;

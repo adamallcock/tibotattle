@@ -2020,7 +2020,7 @@ for (const history of ["reset", "anchored-null"]) {
             FROM usage_event u JOIN parser_version p ON p.id = u.parser_version_id
             WHERE u.observed_at_ms = ?`).get(Date.parse("2026-07-25T01:00:01.000Z"));
           assert.equal(stamp.parser_version, history === "reset"
-            ? "unified-rollout-typed-v15-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
+            ? "unified-rollout-typed-v16-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
         } finally { provenance.close(); }
 
         if (pipeline !== "incremental") return;
@@ -2065,7 +2065,7 @@ for (const history of ["reset", "anchored-null"]) {
         const raw = openLocalUnifiedIndex(indexFile, { readOnly: false });
         try {
           raw.prepare(
-            "UPDATE parser_version SET parser_version = replace(parser_version, 'v15', 'v13')",
+            "UPDATE parser_version SET parser_version = replace(parser_version, 'v16', 'v13')",
           ).run();
         } finally {
           raw.close();

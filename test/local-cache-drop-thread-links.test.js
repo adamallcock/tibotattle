@@ -595,10 +595,12 @@ test("switch rows preserve exact prior Max/Ultra labels rather than adopting con
 });
 
 
-test("inherited-model provenance retains exact cache-drop thread links", async (t) => {
+test("current inherited-model and assumed-cache-write provenance retain exact cache-drop thread links", async (t) => {
   const f = await fixture(t);
-  for (const version of [LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
-    LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION]) {
+  for (const version of [LOCAL_UNIFIED_INDEX_PARSER_VERSION,
+    LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
+    LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION]
+    .flatMap((value) => [value, `${value}-cache-write-zero`])) {
     f.database.prepare("UPDATE parser_version SET parser_version = ? WHERE id = 1").run(version);
     const result = await f.run();
     assert.equal(result.status, "available");

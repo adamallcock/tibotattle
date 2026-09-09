@@ -6,7 +6,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { readCodexLocalThreadMetadata } from "../src/platform/index.js";
+import { readCodexLocalRepositoryOrigins, readCodexLocalThreadMetadata } from "../src/platform/index.js";
 
 const ROOT = "11111111-1111-4111-8111-111111111111";
 const WORKER = "22222222-2222-4222-8222-222222222222";
@@ -410,5 +410,70 @@ test("title fallback rejects nontext and control-containing values", async (t) =
   for (const title of ['bad\u0000title','bad\u0007title','   ',null]) {
     const db=new DatabaseSync(databaseFile);db.prepare('UPDATE threads SET title=? WHERE id=?').run(title,ROOT);db.close();
     assert.equal((await readCodexLocalThreadMetadata(home,[ROOT],{allowTitleFallback:true})).get(ROOT).name,null);
+  }
+});
+
+
+test("repository hints read bounded local metadata, normalize origins and preserve ambiguity", async (t) => {
+  const { home, databaseFile } = await fixture(t);
+  const db = new DatabaseSync(databaseFile);
+  db.exec("ALTER TABLE threads ADD COLUMN cwd TEXT; ALTER TABLE threads ADD COLUMN git_origin_url TEXT;");
+  db.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?").run("/gone/repo", "git@example.test:owner/repo.git", ROOT);
+  db.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?").run("/gone/repo/", "https://user:private@example.test/owner/repo.git?secret=hidden", WORKER);
+  db.close();
+  const before = await readFile(databaseFile);
+  assert.deepEqual([...await readCodexLocalRepositoryOrigins(home)], [["/gone/repo", "https://example.test/owner/repo"]]);
+  assert.deepEqual(await readFile(databaseFile), before);
+  const update = new DatabaseSync(databaseFile);
+  update.prepare("UPDATE threads SET git_origin_url = ? WHERE id = ?").run("https://example.test/other/repo", WORKER);
+  update.close();
+  assert.deepEqual([...await readCodexLocalRepositoryOrigins(home)], [["/gone/repo", null]]);
+  await chmod(databaseFile, 0o666);
+  assert.equal((await readCodexLocalRepositoryOrigins(home)).size, 0);
+});
+
+test("repository hints fail closed for absent columns and invalid locations", async (t) => {
+  const { home, databaseFile } = await fixture(t);
+  assert.equal((await readCodexLocalRepositoryOrigins(home)).size, 0);
+  const db = new DatabaseSync(databaseFile);
+  db.exec("ALTER TABLE threads ADD COLUMN cwd TEXT; ALTER TABLE threads ADD COLUMN git_origin_url TEXT;");
+  db.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?").run("relative/repo", "https://example.test/owner/repo", ROOT);
+  db.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?").run("/valid/repo", "file:///private/repo", WORKER);
+  db.close();
+  assert.deepEqual([...await readCodexLocalRepositoryOrigins(home)], [["/valid/repo", null]]);
+});
+
+
+test("repository hints reject oversized values and fail closed above the row bound", async (t) => {
+  const { home, databaseFile } = await fixture(t);
+  const db = new DatabaseSync(databaseFile);
+  db.exec("ALTER TABLE threads ADD COLUMN cwd TEXT; ALTER TABLE threads ADD COLUMN git_origin_url TEXT;");
+  const update = db.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?");
+  update.run("/gone/repo", "https://example.test/owner/" + "x".repeat(4096), ROOT);
+  update.run("/" + "x".repeat(4096), "https://example.test/owner/repo", WORKER);
+  db.close();
+  assert.deepEqual([...await readCodexLocalRepositoryOrigins(home)], [["/gone/repo", null]]);
+  const fill = new DatabaseSync(databaseFile);
+  fill.exec(`WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<24999)
+    INSERT INTO threads(id,cwd,git_origin_url) SELECT 'bounded-' || n, '/gone/repo', 'https://example.test/owner/repo' FROM rows;`);
+  fill.close();
+  assert.equal((await readCodexLocalRepositoryOrigins(home)).size, 0);
+});
+
+
+test("present rejected repository origins block historical attribution in either row order", async (t) => {
+  const { home, databaseFile } = await fixture(t);
+  const db = new DatabaseSync(databaseFile);
+  db.exec("ALTER TABLE threads ADD COLUMN cwd TEXT; ALTER TABLE threads ADD COLUMN git_origin_url TEXT;");
+  db.close();
+  for (const invalid of ["file:///different/repo", "https://example.test/" + "x".repeat(4096)]) {
+    for (const origins of [[invalid, "https://example.test/owner/repo"], ["https://example.test/owner/repo", invalid]]) {
+      const update = new DatabaseSync(databaseFile);
+      const row = update.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?");
+      row.run("/gone/repo", origins[0], ROOT);
+      row.run("/gone/repo", origins[1], WORKER);
+      update.close();
+      assert.deepEqual([...await readCodexLocalRepositoryOrigins(home)], [["/gone/repo", null]]);
+    }
   }
 });

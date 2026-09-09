@@ -18,6 +18,7 @@ import {
   createWorkUsageProjectResolver,
   readCodexLocalThreadMetadata,
   readCodexLocalThreadAncestry,
+  readCodexLocalRepositoryOrigins,
 } from "./platform/index.js";
 import {
   createWorkUsageAccumulator,
@@ -160,7 +161,9 @@ export async function prepareWorkUsageCollector({
       secretFile ?? defaultLocalUnifiedIndexSecretPath(indexFile),
     );
     deviceSalt = salt;
+    const repositoryOrigins = await readCodexLocalRepositoryOrigins(codexHome);
     const resolveProject = createWorkUsageProjectResolver({
+      repositoryOrigins,
       digest: (kind, value) =>
         localDigest(salt, `work-usage-${kind}`, value).toString("hex"),
     });
@@ -360,6 +363,7 @@ export async function prepareWorkUsageCollector({
         model: row.model_id,
         at: row.observed_at_ms,
         components: rowComponents,
+        cacheWriteAssumedZero: row.parser_version.includes("cache-write-zero"),
         partial:
           row.parser_version.includes("partial") ||
           !generation.usageProvenanceComplete,
@@ -444,7 +448,7 @@ export async function prepareWorkUsageCollector({
       metadata: {
         method: "last_observed_location",
         usageClassification: "verified-quota-status-v2",
-        resolverVersion: "work-location-v2",
+        resolverVersion: "work-location-v3",
         discoveryFingerprint,
         observationDigest: createHash("sha256")
           .update(

@@ -1,7 +1,8 @@
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
-import { basename, isAbsolute, join, relative, sep } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { normalizeWorkUsageRepositoryOrigin } from "./work-usage-projects.js";
 import { readBoundedUtf8LineEntries } from "./bounded-jsonl-reader.js";
 
 const CODEX_THREAD_ID =
@@ -440,4 +441,39 @@ export async function readCodexLocalThreadAncestry(codexHome, threadIds) {
     roots.set(id, current);
   }
   return roots;
+}
+
+
+/** Local-only repository hints for vanished working folders. Never reads titles. */
+export async function readCodexLocalRepositoryOrigins(codexHome) {
+  if (!await ownerControlledCodexHome(codexHome)) return new Map();
+  const databaseFile = join(codexHome, "state_5.sqlite");
+  let database;
+  try {
+    const before = await lstat(databaseFile);
+    if (!ownerControlledRegularFile(before) || !await safeSqliteSidecars(databaseFile)) return new Map();
+    database = new DatabaseSync(databaseFile, { readOnly: true, timeout: 500 });
+    if (!sameOwnerControlledFile(before, await lstat(databaseFile))) return new Map();
+    database.exec("BEGIN");
+    if (database.prepare("SELECT type FROM sqlite_master WHERE name = 'threads'").get()?.type !== "table") return new Map();
+    const columns = new Set(database.prepare("PRAGMA table_info(threads)").all().map(row => row.name));
+    if (!columns.has("cwd") || !columns.has("git_origin_url")) return new Map();
+    const selected = [boundedTextColumn(columns, "cwd", 4096),
+      boundedTextColumn(columns, "git_origin_url", 4096),
+      "CASE WHEN git_origin_url IS NULL OR (typeof(git_origin_url) = 'text' AND length(CAST(git_origin_url AS BLOB)) = 0) THEN 0 ELSE 1 END AS origin_present"].join(", ");
+    const result = new Map();
+    let count = 0;
+    for (const row of database.prepare(`SELECT ${selected} FROM threads LIMIT 25001`).iterate()) {
+      if (++count > 25_000) return new Map();
+      if (typeof row.cwd !== "string" || !isAbsolute(row.cwd) || /[\u0000-\u001f\u007f]/u.test(row.cwd)) continue;
+      if (!row.origin_present) continue;
+      const origin = normalizeWorkUsageRepositoryOrigin(row.git_origin_url);
+      const cwd = resolve(row.cwd);
+      if (!result.has(cwd)) result.set(cwd, origin);
+      else if (result.get(cwd) !== origin) result.set(cwd, null);
+    }
+    return sameOwnerControlledFile(before, await lstat(databaseFile)) && await safeSqliteSidecars(databaseFile)
+      ? result : new Map();
+  } catch { return new Map(); }
+  finally { if (database?.isOpen) database.close(); }
 }

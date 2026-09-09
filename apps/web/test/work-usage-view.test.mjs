@@ -1013,3 +1013,25 @@ test("period switches reuse the available report anchor, polling drops it, and r
     assert.equal(calls.at(-1).sourceSnapshotId, undefined);
   } finally { view.destroy(); }
 });
+
+
+test("assumptions stay distinct from missing data and the non-project bucket is localized", async () => {
+  const response = structuredClone(PROJECT_ROWS_RESPONSE);
+  response.rows[0].id = "non-project";
+  response.rows[0].assumedEvents = 1;
+  response.totals.assumedEvents = 1;
+  response.totals.incompleteEvents = 1;
+  assert.equal(validateWorkUsageResponse(response), response);
+  const malformed = structuredClone(response);
+  malformed.rows[0].assumedEvents = -1;
+  assertInvalid(malformed, "negative assumption count");
+  const { root, windowRef } = mountedRoot();
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async () => httpResponse(response) });
+  await settleMountedView();
+  assert.match(root.textContent, /Non-project tasks/);
+  assert.match(root.textContent, /Includes assumed counts/);
+  assert.match(root.textContent, /Missing cache-write counts are assumed to be 0 for 1 usage records/);
+  assert.match(root.textContent, /Token counts are missing or incomplete for 1 usage records/);
+  view.destroy();
+});

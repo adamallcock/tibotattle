@@ -562,3 +562,19 @@ test("complete zero usage needs no model price while uncertain zero stays unpric
   assert.equal(mixed.totals.costUsdExact, "0.0001");
   assert.equal(mixed.rows[0].priceStatus, "complete");
 });
+
+
+test("assumed counts conserve across project, thread and model grouping independently of missingness", () => {
+  const complete = Object.fromEntries(COMPONENT_NAMES.map(name => [name, 0]));
+  const report = reportFrom([
+    { ...event({ tokens: { ...complete, input_uncached_tokens: 10 }, price: { amount: "1", status: "fully_priced" } }), cacheWriteAssumedZero: true },
+    event({ tokens: { input_uncached_tokens: 5 } }),
+  ]);
+  for (const grouping of ["project", "thread", "model"]) {
+    const result = query(report, { grouping });
+    assert.equal(result.totals.assumedEvents, 1);
+    assert.equal(result.totals.incompleteEvents, 1);
+    assert.equal(result.totals.tokens, 15);
+    assert.equal(result.rows.reduce((sum, row) => sum + row.assumedEvents, 0), 1);
+  }
+});

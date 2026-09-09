@@ -26,7 +26,7 @@ const CURRENT_PARSERS = new Set([
   LOCAL_UNIFIED_INDEX_PARSER_VERSION, LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
-]);
+].flatMap((version) => [version, `${version}-cache-write-zero`]));
 const EFFORTS = new Set(REASONING_EFFORTS.filter((value) => value !== "unknown"));
 const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const POSITIVE_INPUT = `COALESCE(tokens_in_uncached, 0)

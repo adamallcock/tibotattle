@@ -112,6 +112,7 @@ export function validateWorkUsageResponse(value) {
       !["total", "project", "worktree", "thread", "model", "contribution"].includes(row.kind) ||
       (row.lastAt !== null && !timestamp(row.lastAt)) ||
       !count(row.incompleteEvents) ||
+      (row.assumedEvents !== undefined && !count(row.assumedEvents)) ||
       !count(row.events) ||
       !["complete", "partial", "unpriced"].includes(row.priceStatus) ||
       (row.share !== null &&
@@ -390,6 +391,7 @@ export function mountWorkUsageView({
     const display = report?.display[row.id];
     return row.id === "unassigned"
       ? tr("unassigned")
+      : row.id === "non-project" ? tr("nonProject")
       : (display?.name ??
           `${tr(row.kind === "project" ? "projects" : row.kind === "worktree" ? "worktrees" : "threads")} · ${display?.shortId ?? row.id.slice(-10)}`);
   }
@@ -501,6 +503,8 @@ export function mountWorkUsageView({
       summaries.append(card);
     }
     body.append(summaries);
+    if (response.totals.assumedEvents)
+      body.append(el("p", "annotation", tr("assumedNote", {count: quantity(response.totals.assumedEvents)})));
     if (response.totals.incompleteEvents)
       body.append(
         el(
@@ -694,6 +698,8 @@ export function mountWorkUsageView({
       const tokens = numericCell(quantity(row.tokens), 2);
       if (row.incompleteEvents)
         tokens.append(el("small", "work-usage-muted", tr("partial")));
+      if (row.assumedEvents)
+        tokens.append(el("small", "work-usage-muted", tr("assumed")));
       const cost = numericCell(
         formatApiMoney(row.costUsdExact),
         4,
@@ -771,6 +777,7 @@ export function mountWorkUsageView({
         totals.append(rows); region.prepend(totals);
       }
       region.append(el("p","annotation",tr("modelBreakdownNote")));
+      if (row.assumedEvents) region.append(el("p","annotation",tr("assumedNote", {count:quantity(row.assumedEvents)})));
       if (row.incompleteEvents) region.append(el("p","annotation",tr("unknownNote", {count:quantity(row.incompleteEvents)})));
       cell.append(region); detailRow.append(cell); group.append(detailRow);
     };

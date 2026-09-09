@@ -368,3 +368,50 @@ new generations and oversized-cache fallback. Native source packaging passed
 98 tests with three artifact-only skips. Export/owner-boundary checks,
 architecture, documentation and preflight passed. No installed-app or release
 qualification is inferred from the loopback preview.
+
+
+## Approved cache-write assumption and repository recovery, 2026-09-09
+
+The owner explicitly chose zero for omitted historical cache-write counters.
+Canonical parser v16 applies this only when selected input and cache-read counts
+are valid and compatible. It preserves raw replay counters and appends per-event
+assumption provenance. Shared accounting exposes `assumedEvents` through all
+rollups; the UI labels these separately from records with missing counts. This
+is an explicit assumption, not recovered provider evidence. The previously
+identified 48 cumulative-difference cases and repeat/reset uncertainty remain
+outside this correction.
+
+The many identically named project rows were not separate worktree labels.
+Opaque suffixes disambiguated path-based fallback IDs. Inspection found 72
+missing historical folders alongside one live repository group. Saved local
+repository origins can recover most historical ownership without inferring from
+folder names. Valid normalized origins now group live worktrees, clones and
+unambiguous missing-folder hints. Distinct origins remain distinct. Existing
+non-Git folders and other unidentifiable folders share Non-project tasks, while
+missing usage-bound source context remains Unassigned. Location detail remains
+available within repository groups.
+
+The private preview index was reparsed to v16: 8,752 sources, 862,639 canonical
+usage facts, about 183 seconds. This replaces the prior parser generation; it is
+not a claim that re-emitted facts are newly incurred usage. Installed state and
+public releases are unchanged.
+
+
+Real-data qualification after this correction: all history grouped into 34
+projects instead of 526 path-derived groups. The view marked exactly 1,005
+assumed cache-write records and 209 remaining incomplete records. Browser checks
+confirmed Non-project tasks expands into named, linked thread families with
+inline contributor and model breakdowns. The normalized repository basename may
+differ from the checkout folder name. Different retained origin names remain
+separate unless identity evidence connects them; repository renames are not
+inferred from similar names.
+
+The new generation passed 11,612 token/component/cost conservation and direct
+canonical-pricing checks on first build. First-build time was 72.3 seconds and
+warm refresh 33.6 seconds under concurrent validation load, about 54% less.
+These are local measurements, not a latency guarantee. Focused reporting/UI/
+source/lifecycle tests, local integration, index/recovery/export tests, metadata
+bounds/ambiguity tests, architecture, documentation and preflight passed.
+A final origin review additionally rejects a present malformed/unsupported origin
+as ambiguous when another record claims the same directory, independent of row
+order. Its SQL presence flag preserves this safeguard even for oversized values.

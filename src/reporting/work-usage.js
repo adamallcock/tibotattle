@@ -68,6 +68,7 @@ function empty(id, kind) {
     events: 0,
     incompleteEvents: 0,
     unknownEvents: 0,
+    assumedEvents: 0,
     lastAt: null,
     costUsdExact: null,
     unpricedEvents: 0,
@@ -86,10 +87,11 @@ function merge(target, source) {
   for (const field of [
     "incompleteEvents",
     "unknownEvents",
+    "assumedEvents",
     "unpricedEvents",
     "partialPriceEvents",
   ])
-    target[field] = add(target[field], source[field]);
+    target[field] = add(target[field], source[field] ?? 0);
   if (source.tokens !== null)
     target.tokens = add(target.tokens ?? 0, source.tokens);
   if (source.costUsdExact !== null)
@@ -162,6 +164,7 @@ export function createWorkUsageAccumulator({ maximumCells = 50_000 } = {}) {
         events: 1,
         incompleteEvents: tokens.totalComplete && !event.partial ? 0 : 1,
         unknownEvents: tokens.totalTokens === null ? 1 : 0,
+        assumedEvents: event.cacheWriteAssumedZero === true ? 1 : 0,
         lastAt: event.at,
         costUsdExact: priced ? price.amount : knownZero ? "0" : null,
         unpricedEvents: priced || knownZero ? 0 : 1,
