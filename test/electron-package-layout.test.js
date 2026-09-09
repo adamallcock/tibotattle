@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
   chmod,
+  lstat,
   mkdtemp,
   mkdir,
   readFile,
@@ -23,6 +24,7 @@ import {
   electronRuntimeStatOptionsForTest,
   parseElectronRuntimeArguments,
   ELECTRON_KEYTAR_PACKAGE_PIN,
+  ELECTRON_KEYTAR_PREBUILD_SHA256,
   ELECTRON_TARGETS,
   normalizeElectronTarget,
   pinnedElectronKeytarPackage,
@@ -200,6 +202,32 @@ test("Electron runtime stages the same reviewed closure for every development ta
       ), target);
       assert.ok(filePaths(result.manifest).every((path) =>
         !path.includes("windows_filesystem_qualification")), target);
+      const keytar = await lstat(join(
+        result.output,
+        "node_modules/@github/keytar/prebuilds",
+        spec.keytarArchitecture,
+        "keytar.node",
+      ));
+      if (process.platform === "win32") {
+        // Windows exposes the owner-write/read-only file attribute, rather
+        // than POSIX execute and group/other permission bits. The staged
+        // Darwin module must remain writable for ShipIt's quarantine removal;
+        // every other target keeps the captured module read-only.
+        assert.equal(
+          (keytar.mode & 0o200) !== 0,
+          spec.platform === "darwin",
+          target,
+        );
+      } else {
+        assert.equal(keytar.mode & 0o777, spec.platform === "darwin" ? 0o755 : 0o555, target);
+        assert.equal(keytar.mode & 0o022, 0, target);
+      }
+      assert.equal(
+        result.manifest.files.find((file) => file.path
+          === `node_modules/@github/keytar/prebuilds/${spec.keytarArchitecture}/keytar.node`)?.sha256,
+        ELECTRON_KEYTAR_PREBUILD_SHA256[spec.keytarArchitecture],
+        target,
+      );
     }
   });
 });

@@ -952,6 +952,7 @@ async function stagePackageFiles({
   packageRoot,
   include,
   packageJsonOptions,
+  targetSpec,
 }) {
   const sourceRoot = await realpath(packageRoot);
   const files = await walkFiles(sourceRoot, sourceRoot, {
@@ -974,7 +975,12 @@ async function stagePackageFiles({
         captured.bytes,
         packageJsonOptions,
       ),
-      /\.node$/u.test(relativeFile) ? 0o555 : 0o444,
+      /\.node$/u.test(relativeFile)
+        // ShipIt must remove quarantine from the extracted, signed macOS app.
+        // Its update account owns this closed native-module set, so retain no
+        // group/other write while allowing that installation-time operation.
+        ? (targetSpec.platform === "darwin" ? 0o755 : 0o555)
+        : 0o444,
     );
     staged.push({ kind: THIRD_PARTY_KIND, path: relativePath });
   }
@@ -1125,13 +1131,14 @@ async function resolveThirdPartyPackages(
   });
 }
 
-async function stageThirdPartyPackages({ stagingRoot, packages, packageJsonOptions }) {
+async function stageThirdPartyPackages({ stagingRoot, packages, packageJsonOptions, targetSpec }) {
   const staged = [];
   staged.push(...await stagePackageFiles({
     stagingRoot,
     name: packages.ajv.name,
     packageRoot: packages.ajv.root,
     packageJsonOptions,
+    targetSpec,
     include: (path) => path === "package.json"
       || path === "LICENSE"
       || (path.startsWith("dist/") && (path.endsWith(".js") || path.endsWith(".json"))),
@@ -1142,6 +1149,7 @@ async function stageThirdPartyPackages({ stagingRoot, packages, packageJsonOptio
       name: packageInfo.name,
       packageRoot: packageInfo.root,
       packageJsonOptions,
+      targetSpec,
       include: packageRuntimeFile,
     }));
   }
@@ -1150,6 +1158,7 @@ async function stageThirdPartyPackages({ stagingRoot, packages, packageJsonOptio
     name: packages.runcost.name,
     packageRoot: packages.runcost.root,
     packageJsonOptions,
+    targetSpec,
     include: (path) => path === "browser.js" || path === "package.json",
   }));
   const keytarArchitecture = packages.keytar.keytarArchitecture;
@@ -1158,6 +1167,7 @@ async function stageThirdPartyPackages({ stagingRoot, packages, packageJsonOptio
     name: packages.keytar.name,
     packageRoot: packages.keytar.root,
     packageJsonOptions,
+    targetSpec,
     include: (path) => path === "package.json"
       || path === "LICENSE.md"
       || path === `prebuilds/${keytarArchitecture}/keytar.node`,
@@ -1182,6 +1192,7 @@ async function stageThirdPartyPackages({ stagingRoot, packages, packageJsonOptio
       name: packageInfo.name,
       packageRoot: packageInfo.root,
       packageJsonOptions,
+      targetSpec,
       include: packageRuntimeFile,
     }));
   }
@@ -1778,6 +1789,7 @@ export async function buildElectronRuntime({
       stagingRoot: temporaryRoot,
       packages,
       packageJsonOptions,
+      targetSpec: selectedTargetSpec,
     }));
 
     const rootPackageBytes = Buffer.from(stableJson({
