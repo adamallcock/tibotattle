@@ -159,6 +159,190 @@ import route. Local evidence informs storage/recovery design and cannot replace
 a supported, qualified hosted migration path. See
 [Cloudflare D1 limits](https://developers.cloudflare.com/d1/platform/limits/).
 
+## Single-attempt production migration proposal
+
+This is a prepared operation, **not authorization to execute it**. It uses the
+normal atomic migration route, with no index wrapper, asynchronous import,
+phased evacuation, table overlays or invocation registry. A failure is a possible
+outcome, not evidence that the actual production distribution matches the local
+padding-heavy stress fixture. Cloudflare documents rollback of a failed
+migration while earlier successful migrations remain applied; client transport
+failure is not proof of rollback. See [Wrangler migrations](https://developers.cloudflare.com/d1/wrangler-commands/).
+
+The approval must explicitly cover: the existing **production primary** D1;
+one attempt at the exact reviewed primary 0057, 0058 and 0059 migrations; temporary
+revision-checked pause of all four collection stages; read-only bookmarks,
+ledger/schema/health reconciliation; and conditional restoration of the captured
+controls after an operator-reviewed known outcome, within the same eventual
+user authorization. No second user approval is required when those approved
+conditions are met. The deletion ledger receives
+**no migration or write**. Its bookmark is read for recovery context. This scope
+excludes deployment, accountless-mode activation, key changes, canary uploads,
+index changes, retry, restore, deletion, new resources and release publication.
+Approving containment alone does not authorize restoring collection.
+
+### Prepare and admit, without mutations
+
+Run commands sequentially from `apps/worker` in the exact reviewed checkout.
+Create a new owner-only evidence directory; `OP_DIR` below means that actual
+absolute directory, not a reused receipt directory. Enable shell no-clobber
+output and retain all output privately. Record the checkout commit, pinned
+Wrangler version and SQL hashes. Do not use a freshly downloaded CLI.
+
+```sh
+umask 077
+set -C
+OP_DIR=$(mktemp -d /private/tmp/tibotattle-production-atomic-XXXXXX)
+git rev-parse HEAD > "$OP_DIR/source-commit.txt"
+./node_modules/.bin/wrangler --version > "$OP_DIR/wrangler-version.txt"
+shasum -a 256 migrations/0057_accountless_enrollment_ledger.sql migrations/0058_accountless_upload_ownership.sql migrations/0059_accountless_upload_renewal.sql > "$OP_DIR/pending-sha256.txt"
+node scripts/rehearse-release-migrations.mjs observe-prefix --environment production > "$OP_DIR/prefix-before.json"
+./node_modules/.bin/wrangler d1 info USAGE_MONITOR_DB --env production --json > "$OP_DIR/primary-info.json"
+./node_modules/.bin/wrangler d1 info DELETION_LEDGER --env production --json > "$OP_DIR/ledger-info.json"
+./node_modules/.bin/wrangler d1 execute USAGE_MONITOR_DB --env production --remote --command "SELECT schema_version,control_state,revision,enrollment_enabled,upload_registration_enabled,processing_enabled,publication_enabled,reason_code FROM collection_controls WHERE singleton=1; SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name;" --json > "$OP_DIR/preflight-schema-controls.json"
+```
+
+Require configured/live production UUID agreement and separation from staging;
+primary prefix 0001–0056 and deletion prefix 0001–0002; the three hashes in the
+[activation proposal](../plans/2026-09-09-production-accountless-activation-proposal.md#observed-migration-admission-and-local-result);
+no additional pending migration, pre-existing 0058 save table, unknown schema,
+active owner erasure/restore fence or competing operator migration. Retain the
+current healthy service/storage/lifecycle readback. No live telemetry rows or
+full-database export are needed for this admission. The following prepared SQL
+admits only the already observed revision 1/all-enabled/initial state. Any drift
+stops preparation for a revised exact operation; do not substitute a new
+revision silently.
+
+**Outstanding pre-approval admission:** qualify the exact still-running
+production Worker source/configuration against primary prefixes 0056, 0057,
+0058 and 0059 with the deletion ledger at 0002. The observed production source
+is `32cd6317622c9aef9b7bf015b376b4cdb93c91fc`; refresh that identity before using
+it. Existing local migration preservation tests do not prove this old runtime's
+behavior at every possible stopped prefix. Require its ordinary health/storage,
+authenticated contribution and lifecycle paths to pass against small synthetic
+fixtures without enabling accountless modes. Until that matrix is verified,
+this document is prepared but not ready for a production approval request.
+
+### Approved pause, then fresh recovery bookmarks
+
+The production runbook permits owner-run revision-checked D1 controls. Do not
+repurpose the local-only `collection-control.mjs`. Prepare the following exact
+SQL in the new private `pause.sql` file, then invoke it only after approval:
+
+```sql
+UPDATE collection_controls
+SET enrollment_enabled=0, upload_registration_enabled=0,
+    processing_enabled=0, publication_enabled=0,
+    control_state='contained', reason_code='maintenance', revision=2,
+    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+WHERE singleton=1 AND revision=1 AND control_state='operational'
+  AND reason_code='initial' AND enrollment_enabled=1
+  AND upload_registration_enabled=1 AND processing_enabled=1
+  AND publication_enabled=1;
+SELECT changes() AS changed, control_state,reason_code,revision,
+       enrollment_enabled,upload_registration_enabled,processing_enabled,publication_enabled
+FROM collection_controls WHERE singleton=1;
+```
+
+```sh
+./node_modules/.bin/wrangler d1 execute USAGE_MONITOR_DB --env production --remote --command "$(cat "$OP_DIR/pause.sql")" --json > "$OP_DIR/pause-result.json" 2> "$OP_DIR/pause-stderr-private.txt"
+./node_modules/.bin/wrangler d1 time-travel info USAGE_MONITOR_DB --env production --json > "$OP_DIR/primary-paused-bookmark.json"
+./node_modules/.bin/wrangler d1 time-travel info DELETION_LEDGER --env production --json > "$OP_DIR/ledger-bookmark.json"
+```
+
+Require a successful terminal pause result, `changed=1`, revision 2, maintenance
+reason, contained state and all four flags0 before reading bookmarks or doing
+anything dependent. Ambiguous pause outcome requires read-only reconciliation.
+These controls reduce new contribution work; they **do not prove old HTTP,
+OAuth or lifecycle invocations drained**. Atomic migration keeps partial table
+states uncommitted, which is the reason this proposal avoids the phased-read
+hazard. A bookmark is not an atomic lease across databases and does not protect
+against unrelated later legitimate writes. It is not permission to rewind them.
+
+### Exactly one normal migration invocation
+
+Recheck the admitted source and pending set immediately before executing. The
+pinned normal migration command sends each unchanged migration and its ledger
+append in one `/query` batch. It applies 0057, then 0058, then 0059 sequentially;
+these are **three transactions**, not one transaction across the set.
+
+```sh
+./node_modules/.bin/wrangler d1 migrations apply USAGE_MONITOR_DB --env production --remote > "$OP_DIR/migrations-stdout-private.txt" 2> "$OP_DIR/migrations-stderr-private.txt"
+MIGRATION_EXIT_STATUS=$?
+printf '%s\n' "$MIGRATION_EXIT_STATUS" > "$OP_DIR/migrations-exit-status.txt"
+```
+
+Record the actual process exit status separately, including on failure. Do not
+chain deployment/restoration commands to its exit code. Never use `--file` for
+this operation: that selects the different asynchronous import route. Do not
+retry the invocation, add indexes around it, or insert ledger rows separately.
+Expect temporarily unavailable requests; D1's 30-second API limit covers the
+whole batch, and large work can cause database resets. These limits make failure
+plausible, not a reason to conceal or automatically retry it.
+
+### Reconcile the outcome before proceeding
+
+Use separate maintained read-only calls after the process settles:
+
+```sh
+node scripts/rehearse-release-migrations.mjs observe-prefix --environment production > "$OP_DIR/prefix-after.json"
+./node_modules/.bin/wrangler d1 execute USAGE_MONITOR_DB --env production --remote --command "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name; SELECT control_state,reason_code,revision,enrollment_enabled,upload_registration_enabled,processing_enabled,publication_enabled FROM collection_controls WHERE singleton=1;" --json > "$OP_DIR/schema-controls-after.json"
+./node_modules/.bin/wrangler d1 info USAGE_MONITOR_DB --env production --json > "$OP_DIR/primary-info-after.json"
+```
+
+- **Known complete success:** primary ledger ends at 0059, deletion ledger remains
+  exactly 0002, schema matches the rehearsed final schema, no 0058 save tables
+  remain, controls stay at the owned paused revision, and service/storage checks
+  pass. Only then consider control restoration under the same approved scope. No
+  accountless deployment or client canary is implied.
+- **Known server-side migration failure:** reconcile to the last successful
+  whole migration: 0056 if 0057 failed, 0057 if 0058 failed, or 0058 if 0059 failed.
+  Require the corresponding exact schema and no partial 0058 save tables. Retain
+  the error and halted prefix; do not call this whole-operation rollback. Check
+  compatibility of the still-running code before deciding whether collection
+  can resume. Full row hashes/integrity checks are not claimed by schema-only
+  readback; additional validation must remain bounded and separately identified.
+- **Unknown transport outcome or unavailable database:** keep collection paused,
+  retain every receipt, and use only bounded read-only reconciliation. A client
+  timeout/reset, nonzero CLI exit, or stale ledger read alone is not termination
+  or rollback proof. If final prefix/schema cannot be established, stop and seek
+  provider reconciliation. There is no normal-query import bookmark to poll.
+- **Unexpected prefix/schema/control drift:** stop. Do not repair ledgers, drop
+  temporary tables, rerun migrations or restore a bookmark to manufacture the
+  expected result.
+
+A destructive Time Travel restore needs a separate concrete approval and must
+preserve/replay the newest independent deletion ledger. Never restore that
+ledger or recover R2 objects implicitly. See [Time Travel recovery](https://developers.cloudflare.com/d1/reference/time-travel/).
+
+Conditional collection restoration is a separate operator decision after the
+known-outcome checks above, included in the same eventual approval for this
+operation. It does not require a second user approval when its conditions hold. Prepare this
+exact `restore-controls.sql`:
+
+```sql
+UPDATE collection_controls
+SET enrollment_enabled=1, upload_registration_enabled=1,
+    processing_enabled=1, publication_enabled=1,
+    control_state='operational', reason_code='initial', revision=3,
+    updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+WHERE singleton=1 AND revision=2 AND control_state='contained'
+  AND reason_code='maintenance' AND enrollment_enabled=0
+  AND upload_registration_enabled=0 AND processing_enabled=0
+  AND publication_enabled=0;
+SELECT changes() AS changed, control_state,reason_code,revision,
+       enrollment_enabled,upload_registration_enabled,processing_enabled,publication_enabled
+FROM collection_controls WHERE singleton=1;
+```
+
+```sh
+./node_modules/.bin/wrangler d1 execute USAGE_MONITOR_DB --env production --remote --command "$(cat "$OP_DIR/restore-controls.sql")" --json > "$OP_DIR/restore-controls-result.json" 2> "$OP_DIR/restore-controls-stderr-private.txt"
+```
+
+Require `changed=1` plus exact revision 3/all-enabled/operational readback.
+If revision or state changed, do not overwrite it. No automatic restoration on
+error, timeout or successful CLI exit is authorized by this runbook.
+
 ## Separately approved disposable remote syntax check
 
 This mode **writes remote D1** and requires separate approval for the exact two

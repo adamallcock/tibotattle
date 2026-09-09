@@ -374,13 +374,13 @@ input, not a workaround for either hosted failure or execution limits.
 
 # Local scale failure and bounded phased feasibility
 
-The fixed profile from source `565364a7` was executed locally. Attempt01 stopped
+The fixed profile from source `565364a7` was executed locally. Attempt 01 stopped
 because the sandbox prevented resident-memory observation; its confirmed
-cleanup is retained. Attempt02 used the same source and limits with authorized
-process observation. It stopped during0058's interrupted pass with the closed
+cleanup is retained. Attempt 02 used the same source and limits with authorized
+process observation. It stopped during 0058's interrupted pass with the closed
 child code `REHEARSAL_RESOURCE_CEILING_EXCEEDED`: sampled scratch peak
-9,970,833,041 bytes, combined parent/child RSS287,047,680 bytes, and last phase
-elapsed37,491 ms. The wrapper confirmed termination and absence of its scratch
+9,970,833,041 bytes, combined parent/child RSS 287,047,680 bytes, and last phase
+elapsed 37,491 ms. The wrapper confirmed termination and absence of its scratch
 directory. This failure is not specifically labelled `SQLITE_FULL`: the child
 code covers multiple resource conditions. It does not prove the production
 storage distribution or hosted failure mode. The owner-only
@@ -388,24 +388,24 @@ storage distribution or hosted failure mode. The owner-only
 and no further large run was attempted.
 
 A subsequent small local-only prototype demonstrates a narrower alternative:
-evacuate the preserved rows in bounded transactions, execute unchanged0058 on
+evacuate the preserved rows in bounded transactions, execute unchanged 0058 on
 the empty source tables, then restore in bounded transactions. SQLite schema
-inspection at0056 found51 tables in the participant/device foreign-key closure,
-all covered by0058's52 snapshots, with no cycles. The extra preserved table is
+inspection at 0056 found 51 tables in the participant/device foreign-key closure,
+all covered by 0058's 52 snapshots, with no cycles. The extra preserved table is
 `community_aggregate_exclusions`; external parents are `admin_action_audit` and
 `community_publication_generation`. Therefore children-first evacuation and
 parents-first restore can retain valid foreign keys at every durable boundary.
 
 `phased-small-proof-03/receipt.json` records a successful two-account fixture
-with20 rows in each telemetry table. It used52 committed batches of at most
+with 20 rows in each telemetry table. It used 52 committed batches of at most
 three rows, reopened the database and checked foreign keys after every commit,
 and injected a close-before-commit interruption in each movement direction.
 Both interruptions rolled back the row movement and journal cursor. Canonical
 0058 and its ledger append executed exactly once. Original-column hashes for
-all52 preserved tables matched, and final data for every table plus the entire
+all 52 preserved tables matched, and final data for every table plus the entire
 index/trigger/view schema matched an ordinary canonical-migration control.
 Repeating restoration after its staging table was empty performed no writes.
-The prototype completed in478 ms with75,857,920-byte peak RSS. This is topology,
+The prototype completed in 478 ms with 75,857,920-byte peak RSS. This is topology,
 small-fixture preservation and restart feasibility, not scale or hosted proof.
 
 The private prototype uses declared primary-key tuples for source movement
@@ -425,6 +425,40 @@ operator/restart ownership and deletion-ledger reconciliation must be completed
 before remote execution. The prototype changes no canonical migration and
 implements no application maintenance fence. A new production database remains
 a broader fallback rather than the default path.
+
+# Recommended next operation — normal atomic attempt
+
+Prefer the prepared [single-attempt normal migration operation](../runbooks/release-migration-rehearsal.md#single-attempt-production-migration-proposal)
+over implementing the phased coordinator, registry or read-through overlays.
+This is a source-bound maintenance-window proposal, not a prediction of success
+or authorization to run it. The exact proposed primary set is 0057–0059 above;
+no deletion-ledger migration is included. Each migration and its ledger append
+is one ordinary query transaction. 0057 may remain applied if 0058 fails, and 0058
+may remain applied if 0059 fails. The existing code/configuration stays in place.
+
+The proposed approval includes a revision-checked temporary pause, fresh private
+bookmarks, exactly one canonical migration invocation, bounded ledger/schema/
+health reconciliation, and conditional restoration of the captured controls
+only after an operator-reviewed known outcome, within the same eventual user
+authorization. This does not require a second approval when those conditions
+are met. It excludes deployment, accountless flags,
+client canary, index changes, retries, restores and new resources. Current
+prepared controls admit only the observed revision 1/all-enabled state; drift
+requires a revised concrete operation. This pause reduces new traffic but is
+not an old-invocation drain claim. Atomicity avoids exposing evacuated records.
+
+Cloudflare documents failed-migration rollback. Known server-side errors must
+be reconciled to the last fully applied migration; network/client failures
+remain unknown until authoritative readback establishes a complete state.
+No automatic retry, cleanup or Time Travel restore is permitted. A failed
+local 5 GiB padding-heavy fixture does not prove the real 5.33 GB allocation has
+the same copy pressure, but hosted execution/storage failure remains plausible.
+The runbook specifies exact source/prefix admission, commands, readback criteria
+and stop conditions. Prior failed imports and local stress evidence remain
+unchanged. This operation has not run in production. The exact deployed Worker still needs a small-fixture
+compatibility matrix at prefixes 0056/0057/0058/0059 before the migration
+approval request; preservation tests alone do not establish old-runtime
+compatibility or safe conditional reopening.
 
 # Live configuration and recovery preparation
 
