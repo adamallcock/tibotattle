@@ -137,6 +137,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_INSPECTION_FAILED' }
           node scripts/rebind-electron-windows-native-modules.mjs --prepare --candidate-receipt $candidateReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_PREPARATION_FAILED' }
+      - name: Make the fixed signed native modules writable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $readOnly = [System.IO.FileAttributes]::ReadOnly
+          $nativeModules = @(
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/native/windows-filesystem/build/Release/windows_filesystem.node'),
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/node_modules/@github/keytar/prebuilds/win32-x64/keytar.node')
+          )
+          foreach ($path in $nativeModules) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($null -eq $item -or $item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw 'WINDOWS_NATIVE_SIGNING_INPUT_UNSAFE'
+            }
+            $attributes = [System.IO.FileAttributes]$item.Attributes
+            if (($attributes -band $readOnly) -eq 0) { throw 'WINDOWS_NATIVE_SIGNING_INPUT_READONLY_EXPECTED' }
+            $writableAttributes = [System.IO.FileAttributes](([int]$attributes) -band (-bnot ([int]$readOnly)))
+            [System.IO.File]::SetAttributes($path, $writableAttributes)
+            if (([System.IO.File]::GetAttributes($path) -band $readOnly) -ne 0) {
+              throw 'WINDOWS_NATIVE_SIGNING_INPUT_WRITABLE_UNAVAILABLE'
+            }
+          }
       - name: Authenticate to Azure with protected OIDC inputs
         uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
         with:
@@ -172,6 +193,25 @@ jobs:
           $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
           node scripts/rebind-electron-windows-native-modules.mjs --rebind --candidate-receipt $candidateReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_FAILED' }
+      - name: Restore the fixed native modules' read-only state
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $readOnly = [System.IO.FileAttributes]::ReadOnly
+          $nativeModules = @(
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/native/windows-filesystem/build/Release/windows_filesystem.node'),
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/node_modules/@github/keytar/prebuilds/win32-x64/keytar.node')
+          )
+          foreach ($path in $nativeModules) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($null -eq $item -or $item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw 'WINDOWS_NATIVE_SIGNING_INPUT_UNSAFE'
+            }
+            $attributes = [System.IO.FileAttributes]$item.Attributes
+            [System.IO.File]::SetAttributes($path, [System.IO.FileAttributes](([int]$attributes) -bor ([int]$readOnly)))
+            if (([System.IO.File]::GetAttributes($path) -band $readOnly) -eq 0) {
+              throw 'WINDOWS_NATIVE_SIGNING_INPUT_READONLY_RESTORE_FAILED'
+            }
+          }
       - name: Sign the reviewed installer without publishing
         run: |
           $ErrorActionPreference = 'Stop'

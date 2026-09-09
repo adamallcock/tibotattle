@@ -59,6 +59,13 @@ async function capture(root, path, maximum = MAX_FILE) {
   }
   return bytes;
 }
+async function nativeAccess(root, path) {
+  await safePath(root, path);
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.nlink !== 1) fail("FILE_UNSAFE");
+  const mode = metadata.mode & 0o777;
+  return { mode, readOnly: (mode & 0o222) === 0 };
+}
 async function exclusive(path, bytes) {
   const handle = await open(path, "wx", 0o600);
   try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); }
@@ -145,12 +152,19 @@ async function snapshot(context) {
   if (manifest.windowsBinding?.included !== true || manifest.windowsBinding?.verified !== false
       || manifest.windowsBinding?.status !== "included_unverified") fail("POLICY_INVALID");
   const nativeContent = {};
-  for (const path of NATIVES) nativeContent[path] = windowsNativeUnsignedContentDigest(await capture(root, join(stage, path)));
+  const nativeModes = {};
+  const nativeReadOnly = {};
+  for (const path of NATIVES) {
+    nativeContent[path] = windowsNativeUnsignedContentDigest(await capture(root, join(stage, path)));
+    const access = await nativeAccess(root, join(stage, path));
+    nativeModes[path] = access.mode;
+    nativeReadOnly[path] = access.readOnly;
+  }
   const manifestBytes = await capture(root, join(stage, MANIFEST), 8 * 1024 * 1024);
   const sidecarBytes = await capture(root, join(stage, SIDECAR), 128 * 1024);
   assertOriginalBinding(manifest, sidecarBytes);
   return { schemaVersion: SCHEMA, candidate, manifestBase64: manifestBytes.toString("base64"),
-    sidecarBase64: sidecarBytes.toString("base64"), nativeContent };
+    sidecarBase64: sidecarBytes.toString("base64"), nativeContent, nativeModes, nativeReadOnly };
 }
 
 export async function inspectWindowsNativeRebinding(options = {}, dependencies = {}) {
@@ -222,10 +236,16 @@ async function rebind(options, dependencies) {
   assertHost(dependencies);
   const context = await selected(options, dependencies);
   const journal = parse(await capture(context.root, context.journalPath, 16 * 1024 * 1024));
-  if (!exactKeys(journal, ["schemaVersion", "candidate", "manifestBase64", "sidecarBase64", "nativeContent"])
+  if (!exactKeys(journal, ["schemaVersion", "candidate", "manifestBase64", "sidecarBase64", "nativeContent", "nativeModes", "nativeReadOnly"])
       || journal.schemaVersion !== SCHEMA || !isDeepStrictEqual(journal.candidate, context.candidate)
       || !exactKeys(journal.nativeContent, NATIVES)
+      || !exactKeys(journal.nativeModes, NATIVES) || !exactKeys(journal.nativeReadOnly, NATIVES)
       || typeof journal.manifestBase64 !== "string" || typeof journal.sidecarBase64 !== "string") fail("JOURNAL_INVALID");
+  for (const path of NATIVES) {
+    if (!Number.isInteger(journal.nativeModes[path]) || journal.nativeModes[path] < 0 || journal.nativeModes[path] > 0o777
+        || typeof journal.nativeReadOnly[path] !== "boolean"
+        || journal.nativeReadOnly[path] !== ((journal.nativeModes[path] & 0o222) === 0)) fail("JOURNAL_INVALID");
+  }
   const originalManifestBytes = Buffer.from(journal.manifestBase64, "base64");
   const originalSidecarBytes = Buffer.from(journal.sidecarBase64, "base64");
   const manifest = parse(originalManifestBytes);
