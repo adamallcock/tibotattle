@@ -98,6 +98,7 @@ const BUILDER_DIAGNOSTIC_PREFIX = "ELECTRON_WINDOWS_SIGNING_BUILDER_DIAGNOSTIC";
 // Captured stdout and stderr have no trustworthy shared chronology. `stage`
 // is therefore a fixed diagnostic hint, never a claim about final builder state.
 const BUILDER_DIAGNOSTIC_STAGE_MARKER = /TIBOTATTLE_ELECTRON_BUILDER_STAGE=(OUTER_PWSH_LOOKUP|MODULE_INSTALL|MODULE_IMPORT)/gu;
+const BUILDER_DIAGNOSTIC_VENDOR_CODE_PATTERN = /\b(ENOENT|EACCES|EPERM|ENOSPC|ETIMEDOUT)\b/giu;
 const BUILDER_DIAGNOSTIC_MARKERS = Object.freeze([
   Object.freeze({
     key: "outerPwshLookup",
@@ -445,6 +446,17 @@ function builderDiagnosticSpawn(result) {
   return "other";
 }
 
+function builderDiagnosticVendorCode(text) {
+  let selected = "unknown";
+  let match;
+  BUILDER_DIAGNOSTIC_VENDOR_CODE_PATTERN.lastIndex = 0;
+  while ((match = BUILDER_DIAGNOSTIC_VENDOR_CODE_PATTERN.exec(text)) !== null) {
+    selected = match[1];
+  }
+  BUILDER_DIAGNOSTIC_VENDOR_CODE_PATTERN.lastIndex = 0;
+  return selected;
+}
+
 function builderFailureDiagnostic(result) {
   const text = capturedText(result);
   const markers = {};
@@ -456,6 +468,7 @@ function builderFailureDiagnostic(result) {
     `stage=${builderDiagnosticStage(text)}`,
     `exit=${builderDiagnosticExit(result)}`,
     `spawn=${builderDiagnosticSpawn(result)}`,
+    `vendor_code=${builderDiagnosticVendorCode(text)}`,
     `outer_pwsh_lookup=${markers.outerPwshLookup}`,
     `module_install=${markers.moduleInstall}`,
     `module_import=${markers.moduleImport}`,
@@ -466,7 +479,7 @@ function builderFailureDiagnostic(result) {
 }
 
 const BUILDER_DIAGNOSTIC_FORMAT = new RegExp(
-  `^${BUILDER_DIAGNOSTIC_PREFIX};stage=(?:outer_pwsh_lookup|module_install|module_import|command_serialization|packaging_metadata|signer|unknown);exit=(?:none|signal|invalid|other|code_[0-9]{1,3});spawn=(?:none|not_found|access_denied|buffer_overflow|other);outer_pwsh_lookup=(?:yes|no);module_install=(?:yes|no);module_import=(?:yes|no);command_serialization=(?:yes|no);packaging_metadata=(?:yes|no);signer=(?:yes|no)$`,
+  `^${BUILDER_DIAGNOSTIC_PREFIX};stage=(?:outer_pwsh_lookup|module_install|module_import|command_serialization|packaging_metadata|signer|unknown);exit=(?:none|signal|invalid|other|code_[0-9]{1,3});spawn=(?:none|not_found|access_denied|buffer_overflow|other);vendor_code=(?:ENOENT|EACCES|EPERM|ENOSPC|ETIMEDOUT|unknown);outer_pwsh_lookup=(?:yes|no);module_install=(?:yes|no);module_import=(?:yes|no);command_serialization=(?:yes|no);packaging_metadata=(?:yes|no);signer=(?:yes|no)$`,
   "u",
 );
 

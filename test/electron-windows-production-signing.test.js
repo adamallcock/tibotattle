@@ -352,7 +352,7 @@ test("Windows builder failures expose only fixed diagnostic fields", async () =>
         error: undefined,
         signal: null,
         status: 1,
-        stderr: "Parameter cannot be found; arbitrary-private-builder-content",
+        stderr: "Parameter cannot be found; EPERM; arbitrary-private-builder-content",
         stdout: "",
       },
     });
@@ -363,7 +363,7 @@ test("Windows builder failures expose only fixed diagnostic fields", async () =>
         assert.equal(error.code, "ELECTRON_WINDOWS_SIGNING_BUILDER_SIGNING_FAILED");
         assert.equal(
           error.diagnostic,
-          "ELECTRON_WINDOWS_SIGNING_BUILDER_DIAGNOSTIC;stage=command_serialization;exit=code_1;spawn=none;outer_pwsh_lookup=no;module_install=no;module_import=no;command_serialization=yes;packaging_metadata=no;signer=no",
+          "ELECTRON_WINDOWS_SIGNING_BUILDER_DIAGNOSTIC;stage=command_serialization;exit=code_1;spawn=none;vendor_code=EPERM;outer_pwsh_lookup=no;module_install=no;module_import=no;command_serialization=yes;packaging_metadata=no;signer=no",
         );
         assert.doesNotMatch(error.diagnostic, /arbitrary-private-builder-content/u);
         return true;
@@ -385,7 +385,7 @@ test("Windows builder failures expose only fixed diagnostic fields", async () =>
         assert.equal(error.code, "ELECTRON_WINDOWS_SIGNING_BUILDER_SIGNING_FAILED");
         assert.equal(
           error.diagnostic,
-          "ELECTRON_WINDOWS_SIGNING_BUILDER_DIAGNOSTIC;stage=unknown;exit=none;spawn=not_found;outer_pwsh_lookup=no;module_install=no;module_import=no;command_serialization=no;packaging_metadata=no;signer=no",
+          "ELECTRON_WINDOWS_SIGNING_BUILDER_DIAGNOSTIC;stage=unknown;exit=none;spawn=not_found;vendor_code=unknown;outer_pwsh_lookup=no;module_install=no;module_import=no;command_serialization=no;packaging_metadata=no;signer=no",
         );
         return true;
       },
