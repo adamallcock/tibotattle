@@ -1942,8 +1942,6 @@ export const LEGACY_TEXT_CATALOG = Object.freeze({
   "Open TiboTattle and let it calculate your Codex usage locally.": ["打开 TiboTattle，让它在本地计算你的 Codex 使用情况。", "Abre TiboTattle y deja que calcule tu uso de Codex de forma local."],
   "See your week": ["查看你的一周", "Consulta tu semana"],
   "View your allowance estimate and history in the app.": ["在应用中查看额度估计和历史记录。", "Consulta en la app la estimación de tu límite y su historial."],
-  "Share only if you choose": ["仅在你选择时分享", "Comparte solo si quieres"],
-  "Review a content-free summary before any optional community contribution.": ["在选择向社区贡献之前，先查看不含内容的摘要。", "Revisa un resumen sin contenido antes de cualquier contribución opcional a la comunidad."],
   "When available, this leads with one combined Pro 20x-equivalent allowance from delayed, anonymous personal-plan contributions. The daily activity series sits below. A late contribution never edits history: it publishes a replacement revision for its day.": ["如有可用数据，这里会首先展示一个合并后的 Pro 20x 等值额度，数据来自延迟的匿名个人方案贡献。每日活动序列位于下方。迟到的贡献绝不会改写历史：它会为对应日期发布替代修订。", "Cuando está disponible, aquí se muestra primero una única asignación combinada equivalente a Pro 20x a partir de contribuciones anónimas y diferidas de planes personales. La serie de actividad diaria está debajo. Una contribución tardía nunca edita el historial: publica una revisión de reemplazo para su día."],
   "What the Codex allowance is really worth": ["Codex 额度到底值多少", "Cuánto vale realmente la asignación de Codex"],
   "Community view": ["社区视图", "Vista de la comunidad"],

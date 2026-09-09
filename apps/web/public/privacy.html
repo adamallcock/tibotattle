@@ -42,7 +42,7 @@
     <main class="resource-main" id="main" tabindex="-1">
       <header class="resource-heading">
         <p class="eyebrow">Privacy overview</p>
-        <h1>Your dashboard belongs on your Mac.</h1>
+        <h1>Your dashboard belongs on your device.</h1>
         <p class="resource-lede">
           TiboTattle separates personal analysis from public community evidence.
           Local usage remains useful without an account or contribution.
@@ -96,36 +96,68 @@
         <article class="resource-card" id="contribution">
           <h2>Optional contribution</h2>
           <p>
-            Nothing is contributed unless you review and opt in. The public
-            website has no enrollment or upload control. Any contribution
-            starts from an explicit app flow and contains bounded, content-free
-            observations rather than prompts, responses, file contents, or
-            personal dashboard history.
+            In the Electron app, fresh installations enable sharing
+            automatically. No social sign-in is required. You can turn sharing
+            off in Settings or Community; that choice persists across restarts
+            and upgrades that preserve your app profile. Local analysis keeps
+            working with sharing off.
+          </p>
+          <ul>
+            <li>Saved sharing choices are preserved. Known off, paused, or
+              disconnected installations stay off.</li>
+            <li>An existing installation with no prior choice receives three
+              visible notices while sharing stays off. Activation requires all
+              three notices, at least seven days from the transition's start,
+              and at least one day after the final notice.</li>
+            <li>Choosing Share now or Keep sharing off cancels the remaining
+              reminders. Unreadable or uncertain preference state does not
+              enable sharing.</li>
+          </ul>
+          <p>
+            Shared measurements can include token counts, model labels, quota
+            observations, and pseudonymous continuity identifiers. They exclude
+            prompts, responses, credentials, private paths, and raw account
+            identifiers. The public website has no enrollment or upload control.
+            Older native Mac releases retain their review-and-approve flow.
           </p>
         </article>
         <article class="resource-card" id="hosted-identity">
           <h2>Hosted identity and data</h2>
           <p>
-            Google or Apple sign-in establishes a one-person account boundary.
-            The service stores an irreversible identity hash, never the
-            provider's name or email. Accepted contributions are closed,
+            Accountless sharing uses an installation credential to authenticate
+            one contribution source. It does not prove a unique person, a
+            unique provider account, or the truth of a measurement. A separate
+            device or reinstall without retained state can become another
+            source. Retries within one retained installation are deduplicated;
+            independently created installations can submit overlapping history.
+          </p>
+          <p>
+            The older Google or Apple sign-in flow proves control of that login,
+            not one unique person. It stores a keyed identity hash rather than
+            the provider's name or email. Accepted contributions are closed,
             content-free telemetry. Validated closed metadata is stored in
             Cloudflare D1, while R2 holds only bounded encrypted quarantine
             objects. Admin operations are exposed only on the Access-protected
             admin host.
           </p>
           <p>
-            A separately reviewed attribution format can include opaque account
-            and plan-era pseudonyms, evidence categories, and plan labels. It is
-            not enabled by an app update or existing consent. If offered, it
-            requires explicit new consent and can link observations within the
-            same enrollment and destination. It does not include raw provider
-            account identifiers or claim that uncertain history is verified.
-            These pseudonyms are not published in community figures.
+            Shared measurements can include opaque account and plan-era
+            pseudonyms, evidence categories, and plan labels. These can link
+            observations within the same enrollment and destination. Accountless
+            sharing uses the installation's current sharing policy; older
+            review-and-approve flows retain their consent requirements. The
+            measurements exclude raw provider account identifiers and do not
+            make uncertain history verified. These pseudonyms are not published
+            in community figures.
           </p>
         </article>
         <article class="resource-card" id="publication">
           <h2>Community publication</h2>
+          <p>
+            Accountless contributions are currently excluded from public
+            community figures. Receiving an upload does not publish it. Public
+            inclusion requires a separate eligibility decision.
+          </p>
           <p>
             The daily view publishes activity totals and API-price-equivalent
             allowance estimates, including comparisons by plan and model.
@@ -149,9 +181,12 @@
             The local display window is not a retention limit: accumulated
             owner-only evidence remains until you run an explicit local erase.
             Local erase and Keychain identity reset have separate consequences.
-            Disconnect this Mac stops that device's uploads without deleting
-            hosted history or local analysis. Signing out only ends the hosted
-            session; it does not disconnect the upload device.
+            Turning sharing off stops future automatic delivery; a request
+            already sent may have reached the service. It does not delete
+            previously accepted hosted history or local analysis. In the older
+            sign-in flow, Disconnect this Mac stops that device's uploads;
+            signing out only ends the hosted session and does not disconnect
+            the upload device.
           </p>
           <p>
             Accepted hosted contributions and aggregates have no blanket short

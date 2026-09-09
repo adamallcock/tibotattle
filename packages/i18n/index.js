@@ -20,6 +20,8 @@ export const LANGUAGE_OPTIONS = Object.freeze([
 ]);
 
 export const EN_US_CATALOG = Object.freeze({
+  "electron.sharing.publicFeatureTitle": "Control your sharing",
+  "electron.sharing.publicFeatureCopy": "Fresh Electron installations share content-free measurements automatically. You can keep sharing off in Settings.",
   "accounting.cacheImpact.bulletSample": "Showing the {shown} most recent of {total} drops. Summary amounts use all covered drops in the selected period.",
   "accounting.cacheImpact.bulletPartial": "Partial estimate · {priced} priced drops",
   "accounting.cacheImpact.bulletPriced": "{priced} priced drops",
@@ -387,6 +389,8 @@ export const EN_US_CATALOG = Object.freeze({
 });
 
 export const ZH_HANS_CATALOG = Object.freeze({
+  "electron.sharing.publicFeatureTitle": "掌控共享设置",
+  "electron.sharing.publicFeatureCopy": "全新安装的 Electron 应用会自动共享不含对话内容的测量数据。你可以在设置中关闭共享，并保留这一选择。",
   "accounting.cacheImpact.bulletSample": "显示 {total} 次下降中最近的 {shown} 次。汇总金额使用所选期间内所有已覆盖的下降。",
   "accounting.cacheImpact.bulletPartial": "部分估算 · {priced} 次已定价下降",
   "accounting.cacheImpact.bulletPriced": "{priced} 次已定价下降",
@@ -754,6 +758,8 @@ export const ZH_HANS_CATALOG = Object.freeze({
 });
 
 export const ES_CATALOG = Object.freeze({
+  "electron.sharing.publicFeatureTitle": "Controla lo que compartes",
+  "electron.sharing.publicFeatureCopy": "Las instalaciones nuevas de Electron comparten automáticamente mediciones sin contenido de conversaciones. Puedes mantener desactivado el envío en Ajustes.",
   "accounting.cacheImpact.bulletSample": "Se muestran las {shown} caídas más recientes de {total}. Los importes resumen todas las caídas con cobertura del período seleccionado.",
   "accounting.cacheImpact.bulletPartial": "Estimación parcial · {priced} caídas con precio",
   "accounting.cacheImpact.bulletPriced": "{priced} caídas con precio",
