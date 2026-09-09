@@ -2115,7 +2115,7 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 .cache-reuse-summary {
   display: grid;
-  grid-template-columns: minmax(250px, .9fr) minmax(500px, 1.55fr);
+  grid-template-columns: minmax(0, .9fr) minmax(0, 1.55fr);
   align-items: start;
   gap: var(--space-7);
   padding-bottom: var(--space-5);
@@ -2164,7 +2164,7 @@ tbody tr:last-child td { border-bottom: 0; }
   font-weight: var(--weight-display);
   line-height: 1.1;
   letter-spacing: -.02em;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
 }
 .cache-reuse-metrics span {
   color: var(--muted);
@@ -2321,7 +2321,8 @@ tbody tr:last-child td { border-bottom: 0; }
 }
 @media (max-width: 700px) {
   .cache-reuse-outcome { padding: var(--space-4); }
-  .cache-reuse-metrics { gap: 6px; }
+  .cache-reuse-metrics { gap: 6px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cache-reuse-metric-overhead { grid-column: 1 / -1; }
   .cache-reuse-metrics > div {
     min-height: 88px;
     padding: 8px 5px;
@@ -4879,3 +4880,11 @@ html[data-theme="dark"] .noscript {
   accent-color: var(--green);
   flex: 0 0 auto;
 }
+
+/* Compact evidence cards keep the qualifiers beside the amount. */
+.cache-impact-card { min-width: 0; }
+.cache-impact-card .metric-value { overflow-wrap: anywhere; font-size: clamp(1.6rem, 3vw, 2rem); line-height: 1.1; }
+.cache-impact-bullets { padding-inline-start: 1.1rem; margin: var(--space-2) 0 0; color: var(--muted); font-size: .78rem; line-height: 1.5; }
+.cache-impact-bullets li + li { margin-top: var(--space-1); }
+.model-identity .model-usage-icon { width: 1.25rem; height: 1.25rem; display: inline-block; vertical-align: middle; margin-inline-end: .45rem; }
+.allowance-model-spark { --allowance-color: #996315; }

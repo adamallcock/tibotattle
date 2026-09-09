@@ -276,6 +276,20 @@ export function mountDesktopShell({
   };
   const onSettings = () => openSettings(windowRef);
   const bridge = windowRef?.tibotattleDesktop;
+  const communityLink = documentRef.querySelector?.(".community-public-evidence a");
+  const onCommunity = (event) => {
+    // Electron denies new windows. Send the existing fixed website action;
+    // never forward renderer markup or an arbitrary href to the OS shell.
+    event?.preventDefault?.();
+    if (bridge?.version !== ELECTRON_API_VERSION
+        || typeof bridge.openExternal !== "function") return;
+    try {
+      void Promise.resolve(bridge.openExternal("website")).catch(() => {});
+    } catch {
+      // Shell shutdown must not produce an unhandled renderer exception.
+    }
+  };
+  communityLink?.addEventListener?.("click", onCommunity);
   const picker = documentRef.querySelector?.("[data-language-picker]");
   const applySidebar = (collapsed) => applySidebarState(documentRef, collapsed);
   let applyingLanguage = false;
@@ -312,6 +326,7 @@ export function mountDesktopShell({
   const mounted = Object.freeze({
     teardown() {
       shareButton?.removeEventListener?.("click", onShare);
+      communityLink?.removeEventListener?.("click", onCommunity);
       settingsButton.removeEventListener?.("click", onSettings);
       picker?.removeEventListener?.("change", onLanguageChange);
       unsubscribeCommand();

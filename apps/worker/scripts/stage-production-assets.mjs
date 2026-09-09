@@ -49,6 +49,7 @@ const PUBLIC_RELEASE_ASSET_BASENAMES = Object.freeze([
   "community-data.js",
   "community-refresh.js",
   "community-view.js",
+  "model-visuals.js",
   "community.js",
   "community.html",
   "docs.html",

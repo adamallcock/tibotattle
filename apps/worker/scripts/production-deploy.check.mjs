@@ -157,6 +157,7 @@ async function immutableSnapshotFixture() {
     "i18n.generated.js": "export const catalog = {};\n",
     "model-catalog.generated.js": "export const REVIEWED_MODEL_CATALOG = [];\n",
     "community-data.js": "export const data = true;\n",
+    "model-visuals.js": "export const modelVisuals = true;\n",
     "community-view.js": "export const view = true;\n",
     "community.js": "console.log('snapshot community');\n",
     "index.html": '<script type="module" src="./community.js"></script>\n',

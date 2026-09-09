@@ -78,7 +78,8 @@ test("short accounting headings retain Standard-rate context in every locale", a
 
 test("cache continuity rows and empty states retain five correctly aligned cells", () => {
   const element = (tagName, className = "", textContent = "") => ({ tagName, className, textContent, children: [], append(...items) { this.children.push(...items); } });
-  const disclosure = { hidden: true, open: false };
+  const sampleNote = {};
+  const disclosure = { hidden: true, open: false, querySelector: () => sampleNote };
   const rows = element("tbody");
   const linkedItems = [];
   const render = appFunction("renderAccountingCacheContinuityDetails", "sideChatConfigurationDescription", {
@@ -101,10 +102,13 @@ test("cache continuity rows and empty states retain five correctly aligned cells
     formatLocal: (value) => value,
     formatCacheContinuityGap: (value) => `${value}s`,
     cacheContinuityConfigurationDescription: () => "GPT-5.6 Sol · High",
+    setLocalizedText: (target, key, values) => { target.textContent = translate(key, values, "en-US"); },
     ...localizedDependencies(),
   });
   const recent = { observedAt: "synthetic time", gapSeconds: 60, previousCacheReadTokens: 100, currentCacheReadTokens: 20, lostCacheTokens: 80, estimatedPremiumUsd: 0.25 };
-  render({ status: "available", recent: [recent] });
+  render({ status: "available", recent: [recent], cacheReadDrops: 100 });
+  assert.equal(sampleNote.hidden, false);
+  assert.match(sampleNote.textContent, /1 most recent of 100/u);
   assert.equal(disclosure.hidden, false);
   assert.deepEqual(linkedItems, [{ kind: "continuity", item: recent }]);
   assert.deepEqual(rows.children[0].children.map((cell) => cell.textContent),

@@ -15,8 +15,8 @@ function fakeButton() {
     removeEventListener(type, listener) {
       if (listeners.get(type) === listener) listeners.delete(type);
     },
-    click() {
-      listeners.get("click")?.();
+    click(event) {
+      listeners.get("click")?.(event);
     },
   };
 }
@@ -56,6 +56,7 @@ function fakeDocument({
   settingsButton = fakeButton(),
   shareButton = null,
   sharePanel = null,
+  communityLink = null,
 } = {}) {
   const classList = { contains: (value) => value === "electron-dashboard" };
   return {
@@ -64,6 +65,7 @@ function fakeDocument({
       if (selector === "#electron-settings-button") return settingsButton;
       if (selector === "#electron-share-button") return shareButton;
       if (selector === "#share-panel") return sharePanel;
+      if (selector === ".community-public-evidence a") return communityLink;
       if (selector === "[data-language-picker]") return null;
       return null;
     },
@@ -153,5 +155,38 @@ test("Electron Share selects Allowance and focuses the existing results card", (
   assert.equal(windowRef.location.hash, "#weekly");
   assert.equal(focused, true);
   assert.equal(scrolled, true);
+  mounted.teardown();
+});
+
+
+test("community link opens the fixed website through Electron and tears down cleanly", async () => {
+  const { windowRef } = fakeWindow();
+  const calls = [];
+  windowRef.tibotattleDesktop.openExternal = async (...args) => { calls.push(args); };
+  const communityLink = fakeButton();
+  communityLink.href = "https://untrusted.example/renderer-mutation";
+  const documentRef = fakeDocument({ communityLink });
+  const mounted = mountDesktopShell({ documentRef, windowRef });
+  let prevented = 0;
+  communityLink.click({ preventDefault() { prevented += 1; } });
+  await Promise.resolve();
+  assert.equal(prevented, 1);
+  assert.deepEqual(calls, [["website"]]);
+  mounted.teardown();
+  communityLink.click({ preventDefault() { prevented += 1; } });
+  assert.equal(prevented, 1);
+  assert.equal(calls.length, 1);
+});
+
+test("community bridge failures do not leave an unhandled rejection", async () => {
+  const { windowRef } = fakeWindow();
+  const communityLink = fakeButton();
+  const documentRef = fakeDocument({ communityLink });
+  windowRef.tibotattleDesktop.openExternal = () => Promise.reject(new Error("closed"));
+  const mounted = mountDesktopShell({ documentRef, windowRef });
+  communityLink.click({ preventDefault() {} });
+  await new Promise((resolve) => setImmediate(resolve));
+  windowRef.tibotattleDesktop.openExternal = () => { throw new Error("closed"); };
+  assert.doesNotThrow(() => communityLink.click({ preventDefault() {} }));
   mounted.teardown();
 });

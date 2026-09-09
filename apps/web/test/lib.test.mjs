@@ -6313,6 +6313,7 @@ test("allowance history draws visible evidence dots while the dense usage timeli
         label: { key: "series.wellObserved" },
         connect: false,
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
+        pointFilter: (point) => point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
       },
       {
@@ -6321,6 +6322,7 @@ test("allowance history draws visible evidence dots while the dense usage timeli
         label: { key: "series.shortObservation" },
         connect: false,
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
+        pointFilter: (point) => !point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
       },
     ],
@@ -6330,6 +6332,8 @@ test("allowance history draws visible evidence dots while the dense usage timeli
   });
   const mature = sparse.querySelectorAll("circle.chart-point-weekly-mature");
   const partial = sparse.querySelectorAll("circle.chart-point-weekly-partial");
+  assert.equal(mature.length, 3, "well-observed points have no short-series hit target");
+  assert.equal(partial.length, 1, "only the short observation can show its tooltip");
   const drawn = [...mature, ...partial].filter(
     (circle) => Number(circle.getAttribute("r")) > 0
       && !circle.getAttribute("class").includes("chart-point-hit-target"),

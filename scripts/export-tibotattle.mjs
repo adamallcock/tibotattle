@@ -304,6 +304,7 @@ export const CLIENT_WEB_FILES = Object.freeze([
   "apps/web/public/community-data.js",
   "apps/web/public/community-refresh.js",
   "apps/web/public/community-view.js",
+  "apps/web/public/model-visuals.js",
   "apps/web/public/community.html",
   "apps/web/public/community.js",
   "apps/web/public/data-client.js",

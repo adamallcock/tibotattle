@@ -857,37 +857,21 @@
               <span class="table-pagination-status" id="accounting-model-page-status" role="status"></span>
               <button class="button button-quiet compact" id="accounting-model-page-next" type="button" aria-controls="accounting-models" data-i18n="table.pagination.next">Next</button>
             </div>
-            <p class="annotation" data-i18n="accounting.model.shareOfPeriod">
-              Both share columns are a share of the whole period, so components
-              add up to their model and models add up to the total.
-            </p>
             <p class="annotation" id="accounting-price-coverage" hidden></p>
             <!--
               The expansion of the marker each separately metered row carries.
               The asterisk itself is drawn by the stylesheet so this stays one
               translated sentence rather than a sentence plus a glyph.
             -->
-            <!--
-              The component rows' two withheld cells, explained where they can
-              be read rather than only in a hover title: a title is unreachable
-              on touch and easy to miss with a keyboard, and this table already
-              settles such things in a standing sentence under the rows.
-            -->
-            <p class="annotation" data-i18n="accounting.model.componentFootnote">
-              A component row shows no usage-change count, because one usage
-              change carries every component at once and cannot be divided
-              between them. Where a model states no API equivalent, its
-              components state none either.
-            </p>
             <p class="annotation model-allowance-footnote">
               A model on a separate allowance is listed on its own row and
               carries no API equivalent, because that figure cannot be compared
-              with the main allowance. Nothing unavailable is replaced with an
-              invented cost.
+              with the main allowance.
             </p>
         </article>
         <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details" id="cache-switch-details" hidden>
           <summary data-i18n="accounting.cacheSwitch.detailsSummary">See possible switch overhead</summary>
+          <p class="annotation cache-impact-sample" hidden></p>
           <p class="annotation" data-i18n="accounting.cacheSwitch.detailsExplanation">
             These recent rows pair an adjacent model or reasoning change with
             an observed material cache-read drop within five minutes. The
@@ -967,6 +951,7 @@
         </section>
         <details class="panel advanced-diagnostics evidence-disclosure cache-switch-details cache-continuity-details" id="cache-continuity-details" hidden>
           <summary data-i18n="accounting.cacheContinuity.detailsSummary">See recent large cache drops</summary>
+          <p class="annotation cache-impact-sample" hidden></p>
           <div class="table-wrap">
             <table class="cache-continuity-recent-table">
               <caption class="sr-only" data-i18n="accounting.cacheContinuity.tableCaption">Recent covered cache-continuity comparisons at Standard API rates; not a period total</caption>

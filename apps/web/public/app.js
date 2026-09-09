@@ -1,3 +1,4 @@
+import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import {
   CommunityClient,
   isPrimaryCodexQuotaWindow,
@@ -2093,6 +2094,7 @@ function renderEvidenceWarnings(data) {
   ]);
   for (const message of Array.isArray(data?.warnings) ? data.warnings : []) {
     if (typeof message !== "string" || message === "") continue;
+    if (/^Quota tracking started fresh on this Mac, so its retained records begin /u.test(message)) continue;
     grouped.get(evidenceWarningTarget(message)).push(message);
   }
   for (const [selector, messages] of grouped) {
@@ -7032,6 +7034,10 @@ function lineChart({
     {
       const format = item.format ?? formatMoney;
       points.forEach((point, index) => {
+        // A classified series must not leave an invisible hover target over
+        // a point belonging to another series. Marker visibility alone is
+        // separate: dense timelines intentionally retain hover-only points.
+        if (typeof item.pointFilter === "function" && !item.pointFilter(point)) return;
         const value = finite(point[item.key]);
         if (value === null) return;
         // Both coordinates are used three times each — the attribute, the
@@ -7143,6 +7149,10 @@ function lineChart({
     {
       const format = item.format ?? ((value) => formatPercent(value, 1));
       points.forEach((point, index) => {
+        // A classified series must not leave an invisible hover target over
+        // a point belonging to another series. Marker visibility alone is
+        // separate: dense timelines intentionally retain hover-only points.
+        if (typeof item.pointFilter === "function" && !item.pointFilter(point)) return;
         const value = finite(point[item.key]);
         if (value === null) return;
         const markerX = x(index, point);
@@ -7457,6 +7467,7 @@ function renderAllowanceHistoryChart(history) {
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
         detail: weeklyPointDetail,
+        pointFilter: (point) => point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 4 : 0,
       },
       {
@@ -7467,6 +7478,7 @@ function renderAllowanceHistoryChart(history) {
         pointStyle: CHART_POINT_STYLE.EVIDENCE_DOTS,
         format: (value) => formatMoney(value),
         detail: weeklyPointDetail,
+        pointFilter: (point) => !point.wellObserved,
         markerRadius: (point) => point.wellObserved ? 0 : 4,
       },
     ],
@@ -8441,9 +8453,7 @@ function cacheSwitchMetricValue(impact) {
   const cost = cacheImpactCostView(impact);
   if (cost === null) return "—";
   const weighting = cost.allowanceWeighting;
-  const display = (value) => cost.isSubtotal
-    ? t("accounting.cacheImpact.subtotalValue", { amount: value })
-    : value;
+  const display = (value) => value;
   if (weighting?.status === "complete") {
     const premium = finite(weighting.selectedPremiumUsd, null);
     return premium === null ? "—" : display(formatApiMoney(premium));
@@ -8465,9 +8475,7 @@ function cacheContinuityStandardMetricValue(impact) {
   const cost = cacheImpactCostView(impact);
   if (cost === null || cost.standardApiPremiumUsd === null) return "—";
   const amount = formatApiMoney(cost.standardApiPremiumUsd);
-  return cost.isSubtotal
-    ? t("accounting.cacheImpact.subtotalValue", { amount })
-    : amount;
+  return amount;
 }
 
 function cacheContinuityMetricValue(impact) {
@@ -8534,6 +8542,38 @@ function appendCacheImpactSubtotalNote(container, impact) {
     );
   }
   return true;
+}
+
+function cacheImpactMetricBullets(impact, appendDetails) {
+  const details = node("span");
+  appendDetails(details, impact);
+  const list = node("ul", "cache-impact-bullets");
+  // Keep the full evidence explanation reachable without crowding the card.
+  list.title = details.textContent;
+  const cost = cacheImpactCostView(impact);
+  if (cost === null) {
+    list.append(node("li", "", details.textContent));
+    return list;
+  }
+  list.append(localizedNode("li", "", cost.isSubtotal
+    ? "accounting.cacheImpact.bulletPartial" : "accounting.cacheImpact.bulletPriced", {
+    priced: formatCount(cost.pricedDrops ?? impact.pricedDrops),
+  }));
+  if (cost.standardApiPremiumUsd !== null) {
+    list.append(localizedNode("li", "", "accounting.cacheImpact.bulletStandard", {
+      amount: formatApiMoney(cost.standardApiPremiumUsd),
+    }));
+  }
+  const excluded = [];
+  for (const [count, key] of [
+    [impact.orderingCoverageGaps, "accounting.cacheImpact.bulletOrdering"],
+    [impact.unpricedDrops, "accounting.cacheImpact.bulletUnpriced"],
+    [impact.uncoveredConfigurationChanges ?? impact.uncoveredReturns, "accounting.cacheImpact.bulletUncovered"],
+  ]) {
+    if (finite(count, 0) > 0) excluded.push(t(key, { count: formatCount(count) }));
+  }
+  if (excluded.length) list.append(node("li", "", excluded.join(" · ")));
+  return list;
 }
 
 function formatCacheSwitchPercentagePoints(value) {
@@ -8973,6 +9013,13 @@ function renderAccountingCacheSwitchDetails(impact) {
     return;
   }
   const recent = Array.isArray(impact.recent) ? impact.recent : [];
+  const sampleNote = disclosure.querySelector(".cache-impact-sample");
+  if (sampleNote) {
+    sampleNote.hidden = impact.cacheReadDrops <= recent.length;
+    setLocalizedText(sampleNote, "accounting.cacheImpact.bulletSample", {
+      shown: formatCount(recent.length), total: formatCount(impact.cacheReadDrops),
+    });
+  }
   const page = paginateCacheImpactRows(
     recent,
     cacheSwitchTablePagination,
@@ -9932,6 +9979,13 @@ function renderAccountingCacheContinuityDetails(impact) {
     return;
   }
   const recent = Array.isArray(impact.recent) ? impact.recent : [];
+  const sampleNote = disclosure.querySelector(".cache-impact-sample");
+  if (sampleNote) {
+    sampleNote.hidden = impact.cacheReadDrops <= recent.length;
+    setLocalizedText(sampleNote, "accounting.cacheImpact.bulletSample", {
+      shown: formatCount(recent.length), total: formatCount(impact.cacheReadDrops),
+    });
+  }
   const page = paginateCacheImpactRows(
     recent,
     cacheContinuityTablePagination,
@@ -10704,14 +10758,13 @@ function renderAccounting(data) {
     summary.append(attributionNote);
   }
   const cacheSwitchImpact = accounting.cacheSwitchImpact;
-  const cacheSwitchCard = node("article", "metric-card compact-metric");
+  const cacheSwitchCard = node("article", "metric-card compact-metric cache-impact-card");
   const cacheSwitchLabel = node("span", "metric-name");
   cacheSwitchLabel.append(informationLabel(
     t("accounting.cacheSwitch.metricLabel"),
     t("accounting.cacheSwitch.metricExplanation"),
   ));
-  const cacheSwitchNote = node("p");
-  appendCacheSwitchMetricNote(cacheSwitchNote, cacheSwitchImpact);
+  const cacheSwitchNote = cacheImpactMetricBullets(cacheSwitchImpact, appendCacheSwitchMetricNote);
   cacheSwitchCard.append(
     cacheSwitchLabel,
     rawNode("strong", "metric-value", cacheSwitchMetricValue(cacheSwitchImpact)),
@@ -10720,17 +10773,13 @@ function renderAccounting(data) {
   summary.append(cacheSwitchCard);
 
   const cacheContinuityImpact = accounting.cacheContinuityImpact;
-  const cacheContinuityCard = node("article", "metric-card compact-metric");
+  const cacheContinuityCard = node("article", "metric-card compact-metric cache-impact-card");
   const cacheContinuityLabel = node("span", "metric-name");
   cacheContinuityLabel.append(informationLabel(
     t("accounting.cacheContinuity.metricLabel"),
     t("accounting.cacheContinuity.metricExplanation"),
   ));
-  const cacheContinuityNote = node("p");
-  appendCacheContinuityMetricNote(
-    cacheContinuityNote,
-    cacheContinuityImpact,
-  );
+  const cacheContinuityNote = cacheImpactMetricBullets(cacheContinuityImpact, appendCacheContinuityMetricNote);
   cacheContinuityCard.append(
     cacheContinuityLabel,
     rawNode(
@@ -10917,7 +10966,7 @@ function pricingCoverageNote(accounting) {
   const events = finite(accounting?.events, 0);
   if (events <= 0) return null;
   if (finite(accounting?.pricingCoverage?.unpricedEvents, 0) <= 0) {
-    return t("accounting.pricing.coverageReviewed");
+    return null;
   }
   const priced = finite(accounting?.pricingCoverage?.fullyPricedEvents, 0)
     + finite(accounting?.pricingCoverage?.partiallyPricedEvents, 0);
@@ -11085,6 +11134,12 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
       const name = formatModelName(model.model);
       const label = rawNode("span", "", name);
       if (name !== model.model) label.title = model.model;
+      const presentation = modelUsagePresentation(model.model);
+      const icon = modelThemeIcon(document, presentation.theme);
+      if (icon) {
+        icon.classList.add("model-usage-icon", presentation.className);
+        identity.append(icon);
+      }
       identity.append(label);
     }
     if (modelRowIsSeparateAllowance(model)) {
