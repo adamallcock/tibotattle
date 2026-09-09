@@ -1908,6 +1908,7 @@
         "scripts/verify-electron-development-artifact.mjs",
         "test/electron-builder-package-json.test.js",
         "apps/electron/test/shell-core.test.mjs",
+        "apps/electron/test/electron-profile-ready.test.mjs",
         "scripts/package-electron-development.mjs",
         "scripts/package-electron-production.mjs",
         "test/electron-development-artifact-verifier.test.js"
