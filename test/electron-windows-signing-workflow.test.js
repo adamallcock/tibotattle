@@ -7,13 +7,15 @@ const workflowPath = new URL(
   import.meta.url,
 );
 
-test("Windows signing workflow is manual, source-bound, protected, and signs native modules before the installer", async () => {
+test("Windows signing workflow registers safely, while signing stays manual and source-bound", async () => {
   const workflow = await readFile(workflowPath, "utf8");
 
-  assert.match(workflow, /^on:\n  workflow_dispatch:/mu);
-  assert.doesNotMatch(workflow, /^  (?:push|pull_request|schedule):/mu);
+  assert.match(workflow, /^on:\n  # GitHub registers[\s\S]*?\n  push:\n    branches: \[codex\/unified-desktop-accountless\]\n  workflow_dispatch:/mu);
+  assert.doesNotMatch(workflow, /^  (?:pull_request|schedule):/mu);
   assert.doesNotMatch(workflow, /secrets\./u);
   assert.doesNotMatch(workflow, /AZURE_CLIENT_SECRET|AZURE_CREDENTIALS|CSC_LINK/u);
+  assert.match(workflow, /registration:\n    if: github\.event_name == 'push'[\s\S]*?runs-on: ubuntu-24\.04[\s\S]*?WINDOWS_SIGNING_WORKFLOW_REGISTERED/u);
+  assert.match(workflow, /sign:\n    if: github\.event_name == 'workflow_dispatch'/u);
   assert.match(workflow, /environment:\n      name: windows-production-signing/u);
   assert.match(workflow, /permissions:\n      contents: read\n      id-token: write/u);
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/u);

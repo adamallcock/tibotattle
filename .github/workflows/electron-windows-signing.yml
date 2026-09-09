@@ -2,6 +2,10 @@ name: Electron Windows production signing
 run-name: Windows signing (${{ inputs.source-revision }})
 
 on:
+  # GitHub registers this manual signer after the integration branch observes
+  # this harmless job. The protected signing job below remains dispatch-only.
+  push:
+    branches: [codex/unified-desktop-accountless]
   workflow_dispatch:
     inputs:
       source-revision:
@@ -21,7 +25,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  registration:
+    if: github.event_name == 'push'
+    name: Register manual Windows signer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Record registration only
+        run: printf '%s\n' 'WINDOWS_SIGNING_WORKFLOW_REGISTERED'
   sign:
+    if: github.event_name == 'workflow_dispatch'
     name: Sign exact Windows x64 candidate
     runs-on: windows-2025
     timeout-minutes: 60
