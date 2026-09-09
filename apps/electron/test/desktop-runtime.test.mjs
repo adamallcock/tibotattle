@@ -10,7 +10,10 @@ import { fileURLToPath } from "node:url";
 
 import { DESKTOP_DEFAULT_SETTINGS } from "../desktop-contract.js";
 import { DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION } from "../desktop-first-run.js";
-import { launchDesktopRuntime } from "../desktop-runtime.js";
+import {
+  assertAccountlessSignedStagingOperatingAccount,
+  launchDesktopRuntime,
+} from "../desktop-runtime.js";
 import { createProductionDistributionMetadata } from "../desktop-updater.js";
 import distribution from "../../../config/electron-production-distribution.cjs";
 import { DEPLOYMENT_ENDPOINTS } from "../../../config/deployment-endpoints.js";
@@ -276,6 +279,53 @@ function hostedRehearsalMetadata(sourceRevision = "a".repeat(40)) {
   });
 }
 
+function signedStagingRehearsalMetadata({
+  expectedTestUID = 501,
+  expectedTestUsername = "ci-runner",
+  sourceRevision = "a".repeat(40),
+} = {}) {
+  const selection = distribution.accountlessSignedStagingRehearsalForTarget({
+    target: "darwin-arm64",
+    expectedTestUID,
+    expectedTestUsername,
+  });
+  assert.notEqual(selection, null);
+  return Object.freeze({
+    appId: selection.appId,
+    channel: selection.channel,
+    contributionPolicy: selection.contributionPolicy,
+    credentialStorage: selection.credentialStorage,
+    executionProfile: selection.executionProfile,
+    expectedTestUID: selection.expectedTestUID,
+    expectedTestUsername: selection.expectedTestUsername,
+    origin: DEPLOYMENT_ENDPOINTS.staging.origin,
+    schemaVersion: selection.schemaVersion,
+    sourceRevision,
+    target: selection.target,
+    updater: "disabled",
+  });
+}
+
+function githubHostedMacOSArm64Environment() {
+  return Object.freeze({
+    GITHUB_ACTIONS: "true",
+    RUNNER_ARCH: "ARM64",
+    RUNNER_ENVIRONMENT: "github-hosted",
+    RUNNER_OS: "macOS",
+  });
+}
+
+function signedStagingRuntimeComposition(metadata, createMacOSCredentialBackend) {
+  return Object.freeze({
+    createMacOSCredentialBackend,
+    executionProfile: metadata.executionProfile,
+    expectedTestUID: metadata.expectedTestUID,
+    expectedTestUsername: metadata.expectedTestUsername,
+    origin: metadata.origin,
+    policyVersion: metadata.contributionPolicy,
+  });
+}
+
 function shellStatus({ usedPercent, observedAt }) {
   const notificationEvidence = {
     schemaVersion: "tibotattle-notification-evidence-v2",
@@ -345,8 +395,11 @@ async function launchFixture({
   accountlessLaboratory,
   accountlessProduction,
   accountlessHostedRehearsal,
+  accountlessSignedStagingRehearsal,
   productionDistribution,
   prepareNativeHandover,
+  getuid,
+  getUserInfo,
   loadProductionUpdater,
   sharingBackend,
   sharingInstallationState,
@@ -362,6 +415,8 @@ async function launchFixture({
   FakeWindow.instances = [];
   const app = suppliedApp ?? new FakeApp();
   const hostedRehearsal = accountlessHostedRehearsal !== undefined;
+  const signedStagingRehearsal = accountlessSignedStagingRehearsal !== undefined;
+  const isolatedRehearsal = hostedRehearsal || signedStagingRehearsal;
   const children = [];
   const spawnCalls = [];
   const backend = { load, save };
@@ -375,25 +430,28 @@ async function launchFixture({
       preloadPath: "/repo/apps/electron/preload.cjs",
     },
     environment,
-    platformServices: suppliedPlatformServices ?? (productionDistribution || hostedRehearsal
+    platformServices: suppliedPlatformServices ?? (productionDistribution || isolatedRehearsal
       ? undefined : platformServices()),
-    ...(hostedRehearsal ? {} : {
+    ...(isolatedRehearsal ? {} : {
       notificationBackend,
       firstRunReceiptBackend,
     }),
     platform,
     architecture,
-    ...(hostedRehearsal ? {} : { argv }),
+    ...(isolatedRehearsal ? {} : { argv }),
     lifecycleOptions,
     accountlessLaboratory,
     accountlessProduction,
     accountlessHostedRehearsal,
+    accountlessSignedStagingRehearsal,
     productionDistribution,
     prepareNativeHandover,
+    getuid,
+    getUserInfo,
     loadProductionUpdater,
     sharingBackend,
     sharingInstallationState,
-    ...(hostedRehearsal ? {} : { settingsBackend: backend }),
+    ...(isolatedRehearsal ? {} : { settingsBackend: backend }),
     supervisorOptions: {
       spawnChild(_command, args, options) {
         spawnCalls.push({ args: [...args], options });
@@ -526,6 +584,190 @@ test("compiled hosted rehearsal refuses test and settings injection before Elect
     childFactory: () => new FakeIpcChild(),
   }), { code: "electron_shell_electron_configuration_invalid" });
   assert.equal(app.readyCalls, 0);
+});
+
+test("signed staging requires its package-bound OS identity and GitHub-hosted arm64 profile", () => {
+  const metadata = signedStagingRehearsalMetadata();
+  const environment = {
+    ...githubHostedMacOSArm64Environment(),
+    HOME: "/Users/adam",
+    USER: "adam",
+  };
+  assert.deepEqual(assertAccountlessSignedStagingOperatingAccount({
+    metadata,
+    environment,
+    getuid: () => 501,
+    getUserInfo: () => ({ uid: 501, username: "ci-runner" }),
+    platform: "darwin",
+    architecture: "arm64",
+  }), {
+    executionProfile: distribution.ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_EXECUTION_PROFILE,
+    expectedTestUID: 501,
+    expectedTestUsername: "ci-runner",
+  });
+  for (const [name, options] of [
+    ["ambient GitHub flag without hosted profile", {
+      environment: { ...environment, RUNNER_ENVIRONMENT: "self-hosted" },
+    }],
+    ["wrong runner architecture", {
+      environment: { ...environment, RUNNER_ARCH: "X64" },
+    }],
+    ["wrong OS login despite matching uid", {
+      getUserInfo: () => ({ uid: 501, username: "adam" }),
+    }],
+    ["uid mismatch", {
+      getuid: () => 502,
+      getUserInfo: () => ({ uid: 502, username: "ci-runner" }),
+    }],
+    ["incoherent OS account uid", {
+      getUserInfo: () => ({ uid: 502, username: "ci-runner" }),
+    }],
+  ]) {
+    assert.throws(() => assertAccountlessSignedStagingOperatingAccount({
+      metadata,
+      environment,
+      getuid: () => 501,
+      getUserInfo: () => ({ uid: 501, username: "ci-runner" }),
+      platform: "darwin",
+      architecture: "arm64",
+      ...options,
+    }), { code: "electron_shell_electron_configuration_invalid" }, name);
+  }
+});
+
+test("signed staging rejects an unbound account before native handover or adapter access", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  const metadata = signedStagingRehearsalMetadata();
+  let adapterCalls = 0;
+  let handoverCalls = 0;
+  await assert.rejects(launchFixture({
+    app,
+    platform: "darwin",
+    architecture: "arm64",
+    accountlessSignedStagingRehearsal: signedStagingRuntimeComposition(
+      metadata,
+      () => { adapterCalls += 1; return {}; },
+    ),
+    environment: githubHostedMacOSArm64Environment(),
+    getuid: () => 501,
+    getUserInfo: () => ({ uid: 501, username: "adam" }),
+    prepareNativeHandover: async () => {
+      handoverCalls += 1;
+      return { status: "no_legacy_state" };
+    },
+    childFactory: () => new FakeIpcChild(),
+  }), { code: "electron_shell_electron_configuration_invalid" });
+  assert.equal(app.readyCalls, 0);
+  assert.equal(adapterCalls, 0);
+  assert.equal(handoverCalls, 0);
+});
+
+test("signed staging uses its native credential route only after the bound account guard", async (t) => {
+  const profile = await mkdtemp(join(tmpdir(), "signed-staging-runtime-"));
+  let fixture;
+  t.after(async () => {
+    await fixture?.desktop.lifecycle.requestQuit();
+    await rm(profile, { recursive: true, force: true });
+  });
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  app.getVersion = () => "0.1.19";
+  app.getPath = () => profile;
+  const metadata = signedStagingRehearsalMetadata();
+  let adapterCalls = 0;
+  let handoverCalls = 0;
+  let updaterLoads = 0;
+  let safeStorageAccesses = 0;
+  const nativeBackend = Object.freeze({
+    read: async () => null,
+    createIfMissing: async () => ({ status: "created" }),
+    deleteExact: async () => ({ status: "deleted" }),
+  });
+  fixture = await launchFixture({
+    app,
+    platform: "darwin",
+    architecture: "arm64",
+    accountlessSignedStagingRehearsal: signedStagingRuntimeComposition(
+      metadata,
+      () => {
+        adapterCalls += 1;
+        return nativeBackend;
+      },
+    ),
+    environment: {
+      ...githubHostedMacOSArm64Environment(),
+      HOME: "/Users/adam",
+      USER: "adam",
+      USAGE_MONITOR_CENTRAL_ORIGIN: DEPLOYMENT_ENDPOINTS.public.origin,
+      USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE: "/ambient/queue",
+      USAGE_MONITOR_PREPARED_DIRECTORY: "/ambient/prepared",
+    },
+    getuid: () => 501,
+    getUserInfo: () => ({ uid: 501, username: "ci-runner" }),
+    prepareNativeHandover: async () => {
+      handoverCalls += 1;
+      return { status: "no_legacy_state" };
+    },
+    loadProductionUpdater: async () => {
+      updaterLoads += 1;
+      return { autoUpdater: null };
+    },
+    runtimeOverrides: {
+      safeStorage: new Proxy({}, {
+        get() {
+          safeStorageAccesses += 1;
+          throw new Error("signed staging must not access Electron safeStorage");
+        },
+      }),
+    },
+    childFactory: () => new FakeIpcChild(),
+  });
+  const root = join(profile, "accountless-signed-staging-rehearsal-v1");
+  const environment = fixture.spawnCalls[0].options.env;
+  assert.equal(adapterCalls, 1);
+  assert.equal(handoverCalls, 1);
+  assert.equal(updaterLoads, 0);
+  assert.equal(safeStorageAccesses, 0);
+  assert.equal(environment.HOME, join(root, "synthetic-home"));
+  assert.equal(environment.CODEX_HOME, join(root, "synthetic-home", ".codex"));
+  assert.equal(environment.USAGE_MONITOR_STATE_ROOT, join(root, "companion-state"));
+  assert.equal(environment.USAGE_MONITOR_ACCOUNTLESS_MODE, "rehearsal-v1");
+  assert.equal(environment.USAGE_MONITOR_ACCOUNTLESS_ORIGIN, DEPLOYMENT_ENDPOINTS.staging.origin);
+  assert.equal(environment.USAGE_MONITOR_CENTRAL_ORIGIN, undefined);
+  assert.equal(environment.USAGE_MONITOR_CONTRIBUTION_QUEUE_FILE, undefined);
+  assert.equal(environment.USAGE_MONITOR_PREPARED_DIRECTORY, undefined);
+});
+
+test("signed staging rejects caller-selected roots before native credentials", async () => {
+  const app = new FakeApp();
+  app.isPackaged = true;
+  app.getName = () => "TiboTattle";
+  let adapterCalls = 0;
+  let handoverCalls = 0;
+  await assert.rejects(launchFixture({
+    app,
+    platform: "darwin",
+    architecture: "arm64",
+    accountlessSignedStagingRehearsal: signedStagingRuntimeComposition(
+      signedStagingRehearsalMetadata(),
+      () => { adapterCalls += 1; return {}; },
+    ),
+    environment: githubHostedMacOSArm64Environment(),
+    getuid: () => 501,
+    getUserInfo: () => ({ uid: 501, username: "ci-runner" }),
+    platformServices: platformServices(),
+    prepareNativeHandover: async () => {
+      handoverCalls += 1;
+      return { status: "no_legacy_state" };
+    },
+    childFactory: () => new FakeIpcChild(),
+  }), { code: "electron_shell_electron_configuration_invalid" });
+  assert.equal(app.readyCalls, 0);
+  assert.equal(adapterCalls, 0);
+  assert.equal(handoverCalls, 0);
 });
 
 test("macOS production runtime connects updater controls to protected preferences and owned-child shutdown", {

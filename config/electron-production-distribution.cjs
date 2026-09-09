@@ -26,6 +26,28 @@ const ACCOUNTLESS_HOSTED_REHEARSAL_CREDENTIAL_STORAGE =
 const ACCOUNTLESS_HOSTED_REHEARSAL_SCHEMA_VERSION =
   "tibotattle-accountless-hosted-rehearsal-v1";
 const ACCOUNTLESS_HOSTED_REHEARSAL_TARGET = "darwin-arm64";
+// The signed staging rehearsal preserves the production bundle and native
+// credential authority while keeping its scheduler isolated from production.
+// It is intentionally a separate package marker instead of a distribution
+// channel: it has no updater feed and is allowed only in an explicitly bound
+// disposable macOS account.
+const ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_CHANNEL =
+  "accountless-signed-staging-rehearsal-v1";
+const ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_CREDENTIAL_STORAGE =
+  "native-macos-keychain-accountless-installation-v1";
+const ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_SCHEMA_VERSION =
+  "tibotattle-accountless-signed-staging-rehearsal-v1";
+const ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_TARGET = "darwin-arm64";
+const ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_ID =
+  "accountless-signed-staging-rehearsal-v1";
+// The package is deliberately consumable only by the reviewed hosted macOS
+// arm64 profile. The runtime checks the complete GitHub-provided tuple in
+// addition to the OS-provided account identity; environment values never
+// select this package path.
+const ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_EXECUTION_PROFILE =
+  "github-hosted-macos-arm64-v1";
+const MACOS_UID_MAXIMUM = 4_294_967_295;
+const MACOS_LOGIN_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u;
 // The native-to-Electron handover accepts one explicit, ordered prerelease
 // pair. It shares a private target-scoped feed so an installed current
 // candidate can discover the later candidate, while remaining isolated from
@@ -207,6 +229,54 @@ function productionElectronStagingPathSegments(options = {}) {
   ]);
 }
 
+function validMacOSUID(value) {
+  return Number.isSafeInteger(value) && value >= 1 && value <= MACOS_UID_MAXIMUM;
+}
+
+function validMacOSLoginName(value) {
+  return typeof value === "string" && MACOS_LOGIN_NAME_PATTERN.test(value);
+}
+
+/**
+ * The signed staging package is bound to one disposable OS user. Both parts
+ * of that account identity are supplied by the finalizer; the source tree
+ * never guesses a local account UID or login name. A hosted runner may reuse
+ * the builder's numeric UID, so the operating-system login name and closed
+ * execution profile are also part of the package contract.
+ */
+function accountlessSignedStagingRehearsalForTarget({
+  target,
+  expectedTestUID,
+  expectedTestUsername,
+} = {}) {
+  if (target !== ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_TARGET
+      || !validMacOSUID(expectedTestUID)
+      || !validMacOSLoginName(expectedTestUsername)) {
+    return null;
+  }
+  return Object.freeze({
+    appId: PRODUCTION_ELECTRON_APP_ID,
+    channel: ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_CHANNEL,
+    contributionPolicy: PRODUCTION_ELECTRON_CONTRIBUTION_POLICY,
+    credentialStorage: ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_CREDENTIAL_STORAGE,
+    executionProfile: ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_EXECUTION_PROFILE,
+    expectedTestUID,
+    expectedTestUsername,
+    schemaVersion: ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_SCHEMA_VERSION,
+    target: ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_TARGET,
+  });
+}
+
+function accountlessSignedStagingRehearsalStagingPathSegments(options = {}) {
+  const selection = accountlessSignedStagingRehearsalForTarget(options);
+  return selection === null ? null : Object.freeze([
+    "electron-production",
+    "rehearsal",
+    ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_ID,
+    selection.target,
+  ]);
+}
+
 function assertProductionBuildNumber(buildNumber) {
   if (typeof buildNumber !== "string" || !PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN.test(buildNumber)) {
     throw new TypeError("buildNumber must be a bounded positive decimal string");
@@ -279,6 +349,12 @@ module.exports = Object.freeze({
   ACCOUNTLESS_HOSTED_REHEARSAL_CREDENTIAL_STORAGE,
   ACCOUNTLESS_HOSTED_REHEARSAL_SCHEMA_VERSION,
   ACCOUNTLESS_HOSTED_REHEARSAL_TARGET,
+  ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_CHANNEL,
+  ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_CREDENTIAL_STORAGE,
+  ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_EXECUTION_PROFILE,
+  ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_ID,
+  ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_SCHEMA_VERSION,
+  ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_TARGET,
   PRODUCTION_ELECTRON_APP_ID,
   PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN,
   PRODUCTION_ELECTRON_CHANNEL,
@@ -296,6 +372,8 @@ module.exports = Object.freeze({
   PRODUCTION_ELECTRON_TARGETS,
   PRODUCTION_ELECTRON_UPDATE_ORIGIN,
   WINDOWS_FILE_VERSION_COMPONENT_LIMIT,
+  accountlessSignedStagingRehearsalForTarget,
+  accountlessSignedStagingRehearsalStagingPathSegments,
   productionElectronBuildVersionForTarget,
   productionElectronDistributionForTarget,
   productionElectronFeedForTarget,

@@ -37,13 +37,17 @@ import {
   createLinuxSmokeCompanionProcessObserver,
   createLinuxSmokeDashboardFailureObserver,
   readAccountlessHostedRehearsal,
+  readAccountlessSignedStagingRehearsal,
   readProductionDistribution,
   ELECTRON_COMPANION_PROCESS_DIAGNOSTIC_PREFIX,
   ELECTRON_DASHBOARD_FAILURE_DIAGNOSTIC_PREFIX,
   MACOS_ELECTRON_LOCAL_QA_TEST_LANE,
 } from "../main.js";
 import { createProductionDistributionMetadata } from "../desktop-updater.js";
-import { createAccountlessHostedRehearsalMetadata } from "../../../scripts/lib/electron-builder-package-json.mjs";
+import {
+  createAccountlessHostedRehearsalMetadata,
+  createAccountlessSignedStagingRehearsalMetadata,
+} from "../../../scripts/lib/electron-builder-package-json.mjs";
 import {
   ELECTRON_ENTRY_FAILURE_DIAGNOSTIC,
   ElectronShellError,
@@ -1334,6 +1338,60 @@ test("hosted rehearsal policy reads only its exact packaged Dev manifest", async
     assert.equal(await readAccountlessHostedRehearsal({
       app: candidate,
       readManifest: () => { throw new Error("ordinary app must not read rehearsal metadata"); },
+    }), null);
+  }
+});
+
+test("signed staging policy reads only its exact packaged TiboTattle manifest", async () => {
+  const metadata = createAccountlessSignedStagingRehearsalMetadata({
+    expectedTestUID: 501,
+    expectedTestUsername: "ci-runner",
+    sourceRevision: "d".repeat(40),
+  });
+  const packagedAppPath = join(tmpdir(), "tibotattle-signed-staging-fixture", "app.asar");
+  const paths = [];
+  const app = {
+    isPackaged: true,
+    getName: () => "TiboTattle",
+    getAppPath: () => packagedAppPath,
+  };
+  const readManifest = async (path) => {
+    paths.push(path);
+    return Buffer.from(JSON.stringify({
+      tibotattleAccountlessSignedStagingRehearsal: metadata,
+    }));
+  };
+  assert.deepEqual(await readAccountlessSignedStagingRehearsal({
+    app, platform: "darwin", architecture: "arm64", readManifest,
+  }), metadata);
+  assert.deepEqual(paths, [join(packagedAppPath, "package.json")]);
+  assert.equal(await readAccountlessSignedStagingRehearsal({
+    app, platform: "darwin", architecture: "arm64",
+    readManifest: async () => Buffer.from("{}"),
+  }), null);
+  for (const manifest of [
+    { tibotattleAccountlessSignedStagingRehearsal: {
+      ...metadata, executionProfile: "self-hosted-macos-v1",
+    } },
+    { tibotattleAccountlessSignedStagingRehearsal: metadata, tibotattleDistribution: {} },
+    { tibotattleAccountlessSignedStagingRehearsal: metadata,
+      tibotattleAccountlessHostedRehearsal: {} },
+  ]) {
+    await assert.rejects(readAccountlessSignedStagingRehearsal({
+      app, platform: "darwin", architecture: "arm64",
+      readManifest: async () => Buffer.from(JSON.stringify(manifest)),
+    }), errorCode("electron_configuration_invalid"));
+  }
+  await assert.rejects(readAccountlessSignedStagingRehearsal({
+    app, platform: "darwin", architecture: "x64", readManifest,
+  }), errorCode("electron_configuration_invalid"));
+  for (const candidate of [
+    { ...app, isPackaged: false },
+    { ...app, getName: () => "TiboTattle Dev" },
+  ]) {
+    assert.equal(await readAccountlessSignedStagingRehearsal({
+      app: candidate,
+      readManifest: () => { throw new Error("wrong app must not read staging marker"); },
     }), null);
   }
 });

@@ -19,6 +19,7 @@ import {
   parseProductionCandidateArguments,
   productionElectronCandidatePlan,
 } from "../scripts/package-electron-production.mjs";
+import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
 
 const require = createRequire(import.meta.url);
@@ -197,6 +198,31 @@ function loadProductionBuilderConfig(target, {
         TIBOTATTLE_ELECTRON_REHEARSAL_CURRENT_VERSION: rehearsalCurrentVersion,
         TIBOTATTLE_ELECTRON_REHEARSAL_NEXT_VERSION: rehearsalNextVersion,
       }),
+    },
+  }));
+}
+
+function loadSignedStagingBuilderConfig({
+  expectedTestUID = "501",
+  expectedTestUsername = "ci-runner",
+} = {}) {
+  const source = [
+    `const config = require(${JSON.stringify(BUILDER_CONFIG_PATH)});`,
+    "process.stdout.write(JSON.stringify(config));",
+  ].join("\n");
+  return JSON.parse(execFileSync(process.execPath, ["-e", source], {
+    cwd: resolve("."),
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      TIBOTATTLE_ELECTRON_ACCOUNTLESS_SIGNED_STAGING_REHEARSAL: "rehearsal-v1",
+      TIBOTATTLE_ELECTRON_BUILD_NUMBER: BUILD_NUMBER,
+      TIBOTATTLE_ELECTRON_SIGNED_STAGING_EXPECTED_TEST_UID: expectedTestUID,
+      TIBOTATTLE_ELECTRON_SIGNED_STAGING_EXPECTED_TEST_USERNAME: expectedTestUsername,
+      TIBOTATTLE_ELECTRON_SOURCE_REVISION: SOURCE_REVISION,
+      TIBOTATTLE_ELECTRON_TARGET: "darwin-arm64",
+      TIBOTATTLE_ELECTRON_VERSION: RELEASE_VERSION,
     },
   }));
 }
@@ -577,6 +603,67 @@ test("production source candidate requires an explicit numeric build number and 
     "--target", "darwin-arm64", "--source-revision", SOURCE_REVISION,
     "--build-number", "10000000000",
   ]), (error) => error?.code === "ELECTRON_PRODUCTION_ARGUMENT_INVALID");
+});
+
+test("signed staging source binds the hosted macOS account and disables the updater", () => {
+  const options = parseProductionCandidateArguments([
+    "--target", "darwin-arm64",
+    "--source-revision", SOURCE_REVISION,
+    "--build-number", BUILD_NUMBER,
+    "--accountless-signed-staging-rehearsal",
+    "--signed-staging-expected-test-uid", "501",
+    "--signed-staging-expected-test-username", "ci-runner",
+  ]);
+  const plan = productionElectronCandidatePlan(options);
+  assert.equal(plan.packagingProfile, "accountless-signed-staging-rehearsal");
+  assert.equal(plan.updateFeed, undefined);
+  assert.equal(plan.updaterEnabled, false);
+  assert.equal(plan.signingRequired, true);
+  assert.equal(plan.stagingDirectory,
+    ".release-build/electron-production/rehearsal/accountless-signed-staging-rehearsal-v1/darwin-arm64/app");
+  assert.deepEqual(plan.accountlessSignedStagingRehearsal, {
+    executionProfile: "github-hosted-macos-arm64-v1",
+    expectedTestUID: 501,
+    expectedTestUsername: "ci-runner",
+    id: "accountless-signed-staging-rehearsal-v1",
+    origin: DEPLOYMENT_ENDPOINTS.staging.origin,
+    updater: "disabled",
+  });
+  assert.deepEqual(plan.builderEnvironment, {
+    TIBOTATTLE_ELECTRON_ACCOUNTLESS_SIGNED_STAGING_REHEARSAL: "rehearsal-v1",
+    TIBOTATTLE_ELECTRON_BUILD_NUMBER: BUILD_NUMBER,
+    TIBOTATTLE_ELECTRON_SIGNED_STAGING_EXPECTED_TEST_UID: "501",
+    TIBOTATTLE_ELECTRON_SIGNED_STAGING_EXPECTED_TEST_USERNAME: "ci-runner",
+    TIBOTATTLE_ELECTRON_SOURCE_REVISION: SOURCE_REVISION,
+    TIBOTATTLE_ELECTRON_TARGET: "darwin-arm64",
+    TIBOTATTLE_ELECTRON_VERSION: RELEASE_VERSION,
+  });
+  const config = loadSignedStagingBuilderConfig();
+  assert.equal(config.appId, POLICY.PRODUCTION_ELECTRON_APP_ID);
+  assert.equal(config.forceCodeSigning, true);
+  assert.equal(config.publish, undefined);
+  assert.equal(Object.hasOwn(config.extraMetadata, "tibotattleDistribution"), false);
+  assert.match(config.directories.app,
+    /electron-production\/rehearsal\/accountless-signed-staging-rehearsal-v1\/darwin-arm64\/app$/u);
+  assert.throws(() => loadSignedStagingBuilderConfig({ expectedTestUsername: "ci runner" }));
+  for (const argv of [
+    ["--target", "darwin-arm64", "--source-revision", SOURCE_REVISION,
+      "--build-number", BUILD_NUMBER, "--accountless-signed-staging-rehearsal",
+      "--signed-staging-expected-test-uid", "501"],
+    ["--target", "darwin-arm64", "--source-revision", SOURCE_REVISION,
+      "--build-number", BUILD_NUMBER, "--accountless-signed-staging-rehearsal",
+      "--signed-staging-expected-test-username", "ci-runner"],
+    ["--target", "darwin-x64", "--source-revision", SOURCE_REVISION,
+      "--build-number", BUILD_NUMBER, "--accountless-signed-staging-rehearsal",
+      "--signed-staging-expected-test-uid", "501",
+      "--signed-staging-expected-test-username", "ci-runner"],
+    ["--target", "darwin-arm64", "--source-revision", SOURCE_REVISION,
+      "--build-number", BUILD_NUMBER,
+      "--signed-staging-expected-test-uid", "501"],
+  ]) {
+    assert.throws(() => parseProductionCandidateArguments(argv),
+      (error) => error?.code === "ELECTRON_PRODUCTION_ARGUMENT_INVALID");
+  }
 });
 
 test("rehearsal plans prepare two isolated source candidates without allocating a stable release", () => {

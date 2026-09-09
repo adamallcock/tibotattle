@@ -60,6 +60,7 @@ import {
   canonicalElectronBuilderPackageJsonBytes,
   ELECTRON_BUILDER_PACKAGE_PROFILES,
   validateAccountlessHostedRehearsalMetadata,
+  validateAccountlessSignedStagingRehearsalMetadata,
   validateProductionDistributionMetadata,
 } from "./lib/electron-builder-package-json.mjs";
 import { extractEsmImports } from "./lib/esm-imports.mjs";
@@ -1591,6 +1592,7 @@ export async function buildElectronRuntime({
   packageVersion = RELEASE_VERSION,
   distributionMetadata,
   hostedRehearsalMetadata,
+  signedStagingRehearsalMetadata,
 } = {}) {
   if (typeof includeElectronShell !== "boolean") {
     fail("INVALID_SHELL_MODE", "includeElectronShell must be a boolean");
@@ -1609,6 +1611,7 @@ export async function buildElectronRuntime({
   }
   let selectedDistributionMetadata;
   let selectedHostedRehearsalMetadata;
+  let selectedSignedStagingRehearsalMetadata;
   if (selectedPackagingProfile === "production") {
     if (!includeElectronShell) {
       fail(
@@ -1648,6 +1651,29 @@ export async function buildElectronRuntime({
   } else if (hostedRehearsalMetadata !== undefined) {
     fail("HOSTED_REHEARSAL_METADATA", "Hosted rehearsal metadata requires its selected profile");
   }
+  if (selectedPackagingProfile === "accountless-signed-staging-rehearsal") {
+    if (!includeElectronShell || selectedTarget !== DARWIN_ARM64_TARGET) {
+      fail(
+        "PACKAGING_PROFILE_TARGET",
+        "The signed accountless staging rehearsal requires a Darwin arm64 Electron shell build",
+      );
+    }
+    try {
+      selectedSignedStagingRehearsalMetadata = validateAccountlessSignedStagingRehearsalMetadata(
+        signedStagingRehearsalMetadata,
+      );
+    } catch {
+      fail("SIGNED_STAGING_REHEARSAL_METADATA", "Signed staging rehearsal metadata is invalid");
+    }
+    if (selectedSignedStagingRehearsalMetadata.target !== selectedTarget) {
+      fail("SIGNED_STAGING_REHEARSAL_METADATA", "Signed staging rehearsal target does not match staging");
+    }
+  } else if (signedStagingRehearsalMetadata !== undefined) {
+    fail(
+      "SIGNED_STAGING_REHEARSAL_METADATA",
+      "Signed staging rehearsal metadata requires its selected profile",
+    );
+  }
   const selectedPackageVersion = normalizePackageVersion(
     packageVersion,
     selectedDistributionMetadata,
@@ -1662,6 +1688,9 @@ export async function buildElectronRuntime({
         : {}),
       ...(selectedHostedRehearsalMetadata
         ? { hostedRehearsalMetadata: selectedHostedRehearsalMetadata }
+        : {}),
+      ...(selectedSignedStagingRehearsalMetadata
+        ? { signedStagingRehearsalMetadata: selectedSignedStagingRehearsalMetadata }
         : {}),
       packageVersion: selectedPackageVersion,
       profile: selectedPackagingProfile,

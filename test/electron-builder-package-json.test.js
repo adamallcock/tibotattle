@@ -13,9 +13,11 @@ import test from "node:test";
 import {
   canonicalElectronBuilderPackageJsonBytes,
   createAccountlessHostedRehearsalMetadata,
+  createAccountlessSignedStagingRehearsalMetadata,
   createProductionDistributionMetadata,
   transformElectronBuilderPackageJsonBytes,
   validateAccountlessHostedRehearsalMetadata,
+  validateAccountlessSignedStagingRehearsalMetadata,
 } from "../scripts/lib/electron-builder-package-json.mjs";
 import { DEPLOYMENT_ENDPOINTS } from "../config/deployment-endpoints.js";
 
@@ -97,6 +99,57 @@ test("hosted rehearsal metadata has one destination and cannot select production
   }));
   assert.throws(() => canonicalElectronBuilderPackageJsonBytes("package.json", markedSource, {
     packageVersion: VERSION, profile: "development",
+  }), TypeError);
+});
+
+test("signed staging metadata binds one hosted macOS account without distribution or updater authority", () => {
+  const metadata = createAccountlessSignedStagingRehearsalMetadata({
+    expectedTestUID: 501,
+    expectedTestUsername: "ci-runner",
+    sourceRevision: SOURCE_REVISION,
+  });
+  assert.equal(metadata.appId, "com.usagemonitor.local");
+  assert.equal(metadata.origin, DEPLOYMENT_ENDPOINTS.staging.origin);
+  assert.equal(metadata.credentialStorage, "native-macos-keychain-accountless-installation-v1");
+  assert.equal(metadata.executionProfile, "github-hosted-macos-arm64-v1");
+  assert.equal(metadata.updater, "disabled");
+  const options = {
+    packageVersion: VERSION,
+    profile: "accountless-signed-staging-rehearsal",
+    signedStagingRehearsalMetadata: metadata,
+  };
+  const bytes = canonicalElectronBuilderPackageJsonBytes("package.json", rootSource(), options);
+  const value = JSON.parse(bytes);
+  assert.equal(value.productName, "TiboTattle");
+  assert.deepEqual(value.tibotattleAccountlessSignedStagingRehearsal, metadata);
+  assert.equal(Object.hasOwn(value, "tibotattleDistribution"), false);
+  assert.equal(Object.hasOwn(value, "tibotattleAccountlessHostedRehearsal"), false);
+  assert.deepEqual(canonicalElectronBuilderPackageJsonBytes("package.json", bytes, options), bytes);
+  for (const mutation of [
+    { origin: DEPLOYMENT_ENDPOINTS.public.origin },
+    { expectedTestUsername: "ci runner" },
+    { executionProfile: "self-hosted-macos-v1" },
+    { target: "darwin-x64" },
+    { updater: "enabled" },
+  ]) {
+    assert.throws(() => validateAccountlessSignedStagingRehearsalMetadata({
+      ...metadata,
+      ...mutation,
+    }), /invalid/u);
+  }
+  assert.throws(() => canonicalElectronBuilderPackageJsonBytes("package.json", rootSource(), {
+    ...options,
+    profile: "development",
+  }), /not allowed/u);
+  const markedSource = Buffer.from(JSON.stringify({
+    ...JSON.parse(rootSource()), tibotattleAccountlessSignedStagingRehearsal: metadata,
+  }));
+  assert.throws(() => canonicalElectronBuilderPackageJsonBytes("package.json", markedSource, {
+    packageVersion: VERSION,
+    profile: "production",
+    distributionMetadata: createProductionDistributionMetadata({
+      target: "darwin-arm64", sourceRevision: SOURCE_REVISION, buildNumber: "20260906",
+    }),
   }), TypeError);
 });
 

@@ -33,6 +33,10 @@ import {
   PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN,
   PRODUCTION_ELECTRON_TARGETS,
 } from "../apps/electron/desktop-updater.js";
+import {
+  createAccountlessSignedStagingRehearsalMetadata,
+  validateAccountlessSignedStagingRehearsalMetadata,
+} from "./lib/electron-builder-package-json.mjs";
 import distribution from "../config/electron-production-distribution.cjs";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
 
@@ -63,6 +67,7 @@ const MACH_O_CPU_TYPES = Object.freeze({
   arm64: 0x0100000c,
   x64: 0x01000007,
 });
+const UID_ARGUMENT_PATTERN = /^(?:[1-9][0-9]{0,9})$/u;
 
 function failure(code) {
   const error = new Error(`ELECTRON_PRODUCTION_${code}`);
@@ -91,9 +96,18 @@ function requireArgumentValue(argv, index) {
   return value;
 }
 
+function parseUIDArgument(value) {
+  if (typeof value !== "string" || !UID_ARGUMENT_PATTERN.test(value)) {
+    fail("ARGUMENT_INVALID");
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) fail("ARGUMENT_INVALID");
+  return parsed;
+}
+
 export function parseProductionCandidateArguments(argv) {
   if (!Array.isArray(argv)) fail("ARGUMENT_INVALID");
-  const result = { replaceStaging: false };
+  const result = { replaceStaging: false, accountlessSignedStagingRehearsal: false };
   const seen = new Set();
   for (let index = 0; index < argv.length; index += 1) {
     const flag = argv[index];
@@ -103,6 +117,10 @@ export function parseProductionCandidateArguments(argv) {
       result.replaceStaging = true;
       continue;
     }
+    if (flag === "--accountless-signed-staging-rehearsal") {
+      result.accountlessSignedStagingRehearsal = true;
+      continue;
+    }
     const property = {
       "--target": "target",
       "--source-revision": "sourceRevision",
@@ -110,6 +128,8 @@ export function parseProductionCandidateArguments(argv) {
       "--rehearsal-candidate": "rehearsal",
       "--rehearsal-current-version": "rehearsalCurrentVersion",
       "--rehearsal-next-version": "rehearsalNextVersion",
+      "--signed-staging-expected-test-uid": "expectedTestUID",
+      "--signed-staging-expected-test-username": "expectedTestUsername",
       "--windows-binding": "windowsBindingPath",
       "--windows-manifest": "windowsManifestPath",
     }[flag];
@@ -117,8 +137,20 @@ export function parseProductionCandidateArguments(argv) {
     result[property] = requireArgumentValue(argv, index);
     index += 1;
   }
+  if (result.expectedTestUID !== undefined) {
+    result.expectedTestUID = parseUIDArgument(result.expectedTestUID);
+  }
   const rehearsal = result.rehearsal ?? null;
-  const distributionSelection = distribution.productionElectronDistributionForTarget({
+  const signedStagingSelection = result.accountlessSignedStagingRehearsal
+    ? distribution.accountlessSignedStagingRehearsalForTarget({
+      target: result.target,
+      expectedTestUID: result.expectedTestUID,
+      expectedTestUsername: result.expectedTestUsername,
+    })
+    : null;
+  const distributionSelection = result.accountlessSignedStagingRehearsal
+    ? null
+    : distribution.productionElectronDistributionForTarget({
     target: result.target,
     rehearsal,
     rehearsalCurrentVersion: result.rehearsalCurrentVersion,
@@ -128,9 +160,13 @@ export function parseProductionCandidateArguments(argv) {
   if (!TARGETS.includes(result.target)
       || !validSourceRevision(result.sourceRevision)
       || !validBuildNumber(result.buildNumber)
-      || distributionSelection === null
+      || (result.accountlessSignedStagingRehearsal
+        ? signedStagingSelection === null || rehearsal !== null
+        : distributionSelection === null
+          || result.expectedTestUID !== undefined || result.expectedTestUsername !== undefined)
       || Boolean(result.windowsBindingPath) !== Boolean(result.windowsManifestPath)
-      || (result.target !== "win32-x64" && result.windowsBindingPath)) {
+      || (result.target !== "win32-x64" && result.windowsBindingPath)
+      || (result.accountlessSignedStagingRehearsal && result.windowsBindingPath)) {
     fail("ARGUMENT_INVALID");
   }
   return Object.freeze(result);
@@ -148,43 +184,71 @@ export function productionElectronCandidatePlan({
   rehearsal = null,
   rehearsalCurrentVersion,
   rehearsalNextVersion,
+  accountlessSignedStagingRehearsal = false,
+  expectedTestUID,
+  expectedTestUsername,
   hostPlatform = process.platform,
   hostArchitecture = process.arch,
 } = {}) {
   const targetSpec = PRODUCTION_ELECTRON_TARGETS[target];
   const runtimeTarget = ELECTRON_TARGETS[target];
-  const distributionSelection = distribution.productionElectronDistributionForTarget({
+  const signedStagingSelection = accountlessSignedStagingRehearsal === true
+    ? distribution.accountlessSignedStagingRehearsalForTarget({
+      target,
+      expectedTestUID,
+      expectedTestUsername,
+    })
+    : null;
+  const distributionSelection = accountlessSignedStagingRehearsal === true
+    ? null
+    : distribution.productionElectronDistributionForTarget({
     target,
     rehearsal,
     rehearsalCurrentVersion,
     rehearsalNextVersion,
     ...(rehearsal === null ? {} : { minimumRehearsalVersion: RELEASE_VERSION }),
   });
-  if (!targetSpec || !runtimeTarget || distributionSelection === null
+  if (!targetSpec || !runtimeTarget
+      || typeof accountlessSignedStagingRehearsal !== "boolean"
+      || (accountlessSignedStagingRehearsal
+    ? signedStagingSelection === null || rehearsal !== null
+    : distributionSelection === null || expectedTestUID !== undefined || expectedTestUsername !== undefined)
       || targetSpec.platform !== runtimeTarget.platform
       || targetSpec.architecture !== runtimeTarget.architecture
       || !validSourceRevision(sourceRevision)
       || !validBuildNumber(buildNumber)) {
     fail("PLAN_INVALID");
   }
-  const metadata = createProductionDistributionMetadata({
-    buildNumber,
-    rehearsal,
-    rehearsalCurrentVersion,
-    rehearsalNextVersion,
-    sourceRevision,
-    target,
-  });
-  const stagingPathSegments = distribution.productionElectronStagingPathSegments({
-    target,
-    rehearsal,
-    rehearsalCurrentVersion,
-    rehearsalNextVersion,
-    ...(rehearsal === null ? {} : { minimumRehearsalVersion: RELEASE_VERSION }),
-  });
+  const metadata = accountlessSignedStagingRehearsal
+    ? createAccountlessSignedStagingRehearsalMetadata({
+      expectedTestUID,
+      expectedTestUsername,
+      sourceRevision,
+    })
+    : createProductionDistributionMetadata({
+      buildNumber,
+      rehearsal,
+      rehearsalCurrentVersion,
+      rehearsalNextVersion,
+      sourceRevision,
+      target,
+    });
+  const stagingPathSegments = accountlessSignedStagingRehearsal
+    ? distribution.accountlessSignedStagingRehearsalStagingPathSegments({
+      target,
+      expectedTestUID,
+      expectedTestUsername,
+    })
+    : distribution.productionElectronStagingPathSegments({
+      target,
+      rehearsal,
+      rehearsalCurrentVersion,
+      rehearsalNextVersion,
+      ...(rehearsal === null ? {} : { minimumRehearsalVersion: RELEASE_VERSION }),
+    });
   if (stagingPathSegments === null) fail("PLAN_INVALID");
   const stagingRoot = `.release-build/${stagingPathSegments.join("/")}`;
-  const version = distributionSelection.semanticVersion ?? RELEASE_VERSION;
+  const version = distributionSelection?.semanticVersion ?? RELEASE_VERSION;
   const nativeHandoverHelper = targetSpec.platform === "darwin"
     ? Object.freeze({
       architecture: targetSpec.architecture,
@@ -206,10 +270,13 @@ export function productionElectronCandidatePlan({
   return Object.freeze({
     schemaVersion: SCHEMA_VERSION,
     buildNumber,
+    packagingProfile: accountlessSignedStagingRehearsal
+      ? "accountless-signed-staging-rehearsal"
+      : "production",
     sourceRevision,
     version,
     target,
-    updateFeed: metadata.updateFeed,
+    ...(accountlessSignedStagingRehearsal ? {} : { updateFeed: metadata.updateFeed }),
     host: Object.freeze({ platform: hostPlatform, architecture: hostArchitecture }),
     stagingDirectory: `${stagingRoot}/app`,
     artifactDirectory: `${stagingRoot}/artifacts`,
@@ -226,19 +293,32 @@ export function productionElectronCandidatePlan({
       TIBOTATTLE_ELECTRON_SOURCE_REVISION: sourceRevision,
       TIBOTATTLE_ELECTRON_TARGET: target,
       TIBOTATTLE_ELECTRON_VERSION: version,
-      ...(rehearsal === null ? {} : {
+      ...(accountlessSignedStagingRehearsal ? {
+        TIBOTATTLE_ELECTRON_ACCOUNTLESS_SIGNED_STAGING_REHEARSAL: "rehearsal-v1",
+        TIBOTATTLE_ELECTRON_SIGNED_STAGING_EXPECTED_TEST_UID: String(expectedTestUID),
+        TIBOTATTLE_ELECTRON_SIGNED_STAGING_EXPECTED_TEST_USERNAME: expectedTestUsername,
+      } : rehearsal === null ? {} : {
         TIBOTATTLE_ELECTRON_REHEARSAL_CANDIDATE: rehearsal,
         TIBOTATTLE_ELECTRON_REHEARSAL_CURRENT_VERSION: rehearsalCurrentVersion,
         TIBOTATTLE_ELECTRON_REHEARSAL_NEXT_VERSION: rehearsalNextVersion,
       }),
     }),
-    updaterEnabled: true,
+    updaterEnabled: !accountlessSignedStagingRehearsal,
     signingRequired: targetSpec.platform !== "linux",
     signingPerformed: false,
     publishingPerformed: false,
     nativeHandoverHelper,
     nativeMacOSKeychainAdapter,
-    ...(rehearsal === null ? {} : {
+    ...(accountlessSignedStagingRehearsal ? {
+      accountlessSignedStagingRehearsal: Object.freeze({
+        executionProfile: metadata.executionProfile,
+        expectedTestUID,
+        expectedTestUsername,
+        id: distribution.ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_ID,
+        origin: metadata.origin,
+        updater: "disabled",
+      }),
+    } : rehearsal === null ? {} : {
       rehearsal: Object.freeze({
         candidate: rehearsal,
         currentVersion: rehearsalCurrentVersion,
@@ -451,9 +531,9 @@ async function prepareNativeMacOSKeychainAdapter({ plan, replaceStaging }) {
 }
 
 /**
- * Stage the app whose package.json carries the exact source, target, feed and
- * build number. No installer is built here; the config named in the receipt
- * is the later explicit signing/finalization boundary.
+ * Stage the app whose package.json carries the exact source, target, and
+ * selected package authority. No installer is built here; the config named in
+ * the receipt is the later explicit signing/finalization boundary.
  */
 export async function prepareProductionElectronCandidate(options = {}) {
   if (process.version !== "v26.2.0") fail("NODE_VERSION_REQUIRED");
@@ -461,21 +541,30 @@ export async function prepareProductionElectronCandidate(options = {}) {
   const actualRevision = await cleanSourceRevision();
   if (actualRevision !== plan.sourceRevision) fail("SOURCE_REVISION_MISMATCH");
   const targetSpec = PRODUCTION_ELECTRON_TARGETS[plan.target];
-  const metadata = createProductionDistributionMetadata({
-    buildNumber: plan.buildNumber,
-    rehearsal: plan.rehearsal?.candidate ?? null,
-    rehearsalCurrentVersion: plan.rehearsal?.currentVersion,
-    rehearsalNextVersion: plan.rehearsal?.nextVersion,
-    sourceRevision: plan.sourceRevision,
-    target: plan.target,
-  });
+  const signedStaging = plan.accountlessSignedStagingRehearsal !== undefined;
+  const metadata = signedStaging
+    ? createAccountlessSignedStagingRehearsalMetadata({
+      expectedTestUID: plan.accountlessSignedStagingRehearsal.expectedTestUID,
+      expectedTestUsername: plan.accountlessSignedStagingRehearsal.expectedTestUsername,
+      sourceRevision: plan.sourceRevision,
+    })
+    : createProductionDistributionMetadata({
+      buildNumber: plan.buildNumber,
+      rehearsal: plan.rehearsal?.candidate ?? null,
+      rehearsalCurrentVersion: plan.rehearsal?.currentVersion,
+      rehearsalNextVersion: plan.rehearsal?.nextVersion,
+      sourceRevision: plan.sourceRevision,
+      target: plan.target,
+    });
   const staged = await buildElectronApp({
     output: targetOutput(plan),
     target: plan.target,
     replace: options.replaceStaging === true,
-    packagingProfile: "production",
+    packagingProfile: plan.packagingProfile,
     packageVersion: plan.version,
-    distributionMetadata: metadata,
+    ...(signedStaging
+      ? { signedStagingRehearsalMetadata: metadata }
+      : { distributionMetadata: metadata }),
     ...(plan.target === "win32-x64" ? {
       windowsBindingPath: options.windowsBindingPath,
       windowsManifestPath: options.windowsManifestPath,
@@ -497,10 +586,14 @@ export async function prepareProductionElectronCandidate(options = {}) {
   }
   let stagedMetadata;
   try {
-    stagedMetadata = validateProductionDistributionMetadata(stagedManifest.tibotattleDistribution, {
-      platform: targetSpec.platform,
-      architecture: targetSpec.architecture,
-    });
+    stagedMetadata = signedStaging
+      ? validateAccountlessSignedStagingRehearsalMetadata(
+        stagedManifest.tibotattleAccountlessSignedStagingRehearsal,
+      )
+      : validateProductionDistributionMetadata(stagedManifest.tibotattleDistribution, {
+        platform: targetSpec.platform,
+        architecture: targetSpec.architecture,
+      });
   } catch {
     fail("STAGED_MANIFEST_INVALID");
   }
@@ -510,9 +603,11 @@ export async function prepareProductionElectronCandidate(options = {}) {
     ...plan,
     ...(nativeHandoverHelper === null ? {} : { nativeHandoverHelper }),
     ...(nativeMacOSKeychainAdapter === null ? {} : { nativeMacOSKeychainAdapter }),
-    status: plan.rehearsal === undefined
-      ? "production_source_staged"
-      : "native_to_electron_handover_rehearsal_source_staged",
+    status: signedStaging
+      ? "accountless_signed_staging_rehearsal_source_staged"
+      : plan.rehearsal === undefined
+        ? "production_source_staged"
+        : "native_to_electron_handover_rehearsal_source_staged",
     stagedManifest: "app/package.json",
     runtimeManifest: "app/electron-runtime-manifest.json",
   });

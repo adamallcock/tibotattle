@@ -23,8 +23,12 @@ const BUILD_NUMBER_ENV = "TIBOTATTLE_ELECTRON_BUILD_NUMBER";
 const REHEARSAL_CANDIDATE_ENV = "TIBOTATTLE_ELECTRON_REHEARSAL_CANDIDATE";
 const REHEARSAL_CURRENT_VERSION_ENV = "TIBOTATTLE_ELECTRON_REHEARSAL_CURRENT_VERSION";
 const REHEARSAL_NEXT_VERSION_ENV = "TIBOTATTLE_ELECTRON_REHEARSAL_NEXT_VERSION";
+const SIGNED_STAGING_REHEARSAL_ENV = "TIBOTATTLE_ELECTRON_ACCOUNTLESS_SIGNED_STAGING_REHEARSAL";
+const SIGNED_STAGING_EXPECTED_TEST_UID_ENV = "TIBOTATTLE_ELECTRON_SIGNED_STAGING_EXPECTED_TEST_UID";
+const SIGNED_STAGING_EXPECTED_TEST_USERNAME_ENV = "TIBOTATTLE_ELECTRON_SIGNED_STAGING_EXPECTED_TEST_USERNAME";
 const SOURCE_REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const VERSION_PATTERN = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
+const UID_PATTERN = /^(?:[1-9][0-9]{0,9})$/u;
 
 class ProductionElectronBuilderConfigError extends Error {
   constructor() {
@@ -53,6 +57,14 @@ function optionalExactEnvironment(name) {
   return exactEnvironment(name);
 }
 
+function requiredUIDEnvironment(name) {
+  const value = exactEnvironment(name);
+  if (!UID_PATTERN.test(value)) fail();
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) fail();
+  return parsed;
+}
+
 function readSourceReleaseVersion() {
   try {
     const manifest = JSON.parse(readFileSync(path.join(REPOSITORY_ROOT, "package.json"), "utf8"));
@@ -71,11 +83,29 @@ function readSourceReleaseVersion() {
 function readInputs() {
   const target = exactEnvironment(TARGET_ENV);
   const targetSpec = distribution.PRODUCTION_ELECTRON_TARGETS[target];
+  const signedStagingMarker = optionalExactEnvironment(SIGNED_STAGING_REHEARSAL_ENV);
+  const signedStaging = signedStagingMarker !== undefined;
+  if (signedStaging && signedStagingMarker !== "rehearsal-v1") fail();
   const rehearsal = optionalExactEnvironment(REHEARSAL_CANDIDATE_ENV) ?? null;
   const rehearsalCurrentVersion = optionalExactEnvironment(REHEARSAL_CURRENT_VERSION_ENV);
   const rehearsalNextVersion = optionalExactEnvironment(REHEARSAL_NEXT_VERSION_ENV);
+  const expectedTestUID = signedStaging
+    ? requiredUIDEnvironment(SIGNED_STAGING_EXPECTED_TEST_UID_ENV)
+    : optionalExactEnvironment(SIGNED_STAGING_EXPECTED_TEST_UID_ENV);
+  const expectedTestUsername = signedStaging
+    ? exactEnvironment(SIGNED_STAGING_EXPECTED_TEST_USERNAME_ENV)
+    : optionalExactEnvironment(SIGNED_STAGING_EXPECTED_TEST_USERNAME_ENV);
+  const signedStagingSelection = signedStaging
+    ? distribution.accountlessSignedStagingRehearsalForTarget({
+      target,
+      expectedTestUID,
+      expectedTestUsername,
+    })
+    : null;
   const sourceReleaseVersion = readSourceReleaseVersion();
-  const distributionSelection = distribution.productionElectronDistributionForTarget({
+  const distributionSelection = signedStaging
+    ? null
+    : distribution.productionElectronDistributionForTarget({
     target,
     rehearsal,
     rehearsalCurrentVersion,
@@ -85,7 +115,10 @@ function readInputs() {
   const sourceRevision = exactEnvironment(SOURCE_REVISION_ENV);
   const buildNumber = exactEnvironment(BUILD_NUMBER_ENV);
   const version = distributionSelection?.semanticVersion ?? sourceReleaseVersion;
-  if (!targetSpec || distributionSelection === null
+  if (!targetSpec || (signedStaging
+    ? signedStagingSelection === null || rehearsal !== null
+      || expectedTestUID === undefined || expectedTestUsername === undefined
+    : distributionSelection === null || expectedTestUID !== undefined || expectedTestUsername !== undefined)
       || !SOURCE_REVISION_PATTERN.test(sourceRevision)
       || !distribution.PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN.test(buildNumber)
       || exactEnvironment(VERSION_ENV) !== version) {
@@ -94,9 +127,13 @@ function readInputs() {
   return Object.freeze({
     buildNumber,
     distributionSelection,
+    expectedTestUID,
+    expectedTestUsername,
     rehearsal,
     rehearsalCurrentVersion,
     rehearsalNextVersion,
+    signedStaging,
+    signedStagingSelection,
     sourceReleaseVersion,
     sourceRevision,
     target,
@@ -122,6 +159,22 @@ function distributionMetadata({ buildNumber, distributionSelection, sourceRevisi
     metadata.rehearsalNextVersion = distributionSelection.rehearsalNextVersion;
   }
   return Object.freeze(metadata);
+}
+
+function signedStagingManifestFields({ signedStagingSelection, sourceRevision }) {
+  return Object.freeze({
+    appId: signedStagingSelection.appId,
+    channel: signedStagingSelection.channel,
+    contributionPolicy: signedStagingSelection.contributionPolicy,
+    credentialStorage: signedStagingSelection.credentialStorage,
+    executionProfile: signedStagingSelection.executionProfile,
+    expectedTestUID: signedStagingSelection.expectedTestUID,
+    expectedTestUsername: signedStagingSelection.expectedTestUsername,
+    schemaVersion: signedStagingSelection.schemaVersion,
+    sourceRevision,
+    target: signedStagingSelection.target,
+    updater: "disabled",
+  });
 }
 
 function stagingClosure() {
@@ -173,17 +226,27 @@ function asarUnpackFor(target) {
 }
 
 const INPUTS = readInputs();
-const metadata = distributionMetadata(INPUTS);
-const packagedSourceReleaseVersion = INPUTS.version === INPUTS.sourceReleaseVersion
+const metadata = INPUTS.signedStaging ? null : distributionMetadata(INPUTS);
+const packagedSourceReleaseVersion = INPUTS.signedStaging
+  || INPUTS.version === INPUTS.sourceReleaseVersion
   ? null
   : INPUTS.sourceReleaseVersion;
-const stagingPathSegments = distribution.productionElectronStagingPathSegments({
-  target: INPUTS.target,
-  rehearsal: INPUTS.rehearsal,
-  rehearsalCurrentVersion: INPUTS.rehearsalCurrentVersion,
-  rehearsalNextVersion: INPUTS.rehearsalNextVersion,
-  minimumRehearsalVersion: INPUTS.rehearsal === null ? undefined : readSourceReleaseVersion(),
-});
+const signedStagingFields = INPUTS.signedStaging
+  ? signedStagingManifestFields(INPUTS)
+  : null;
+const stagingPathSegments = INPUTS.signedStaging
+  ? distribution.accountlessSignedStagingRehearsalStagingPathSegments({
+    target: INPUTS.target,
+    expectedTestUID: INPUTS.expectedTestUID,
+    expectedTestUsername: INPUTS.expectedTestUsername,
+  })
+  : distribution.productionElectronStagingPathSegments({
+    target: INPUTS.target,
+    rehearsal: INPUTS.rehearsal,
+    rehearsalCurrentVersion: INPUTS.rehearsalCurrentVersion,
+    rehearsalNextVersion: INPUTS.rehearsalNextVersion,
+    minimumRehearsalVersion: INPUTS.rehearsal === null ? undefined : readSourceReleaseVersion(),
+  });
 if (stagingPathSegments === null) fail();
 const targetDirectory = path.join(
   REPOSITORY_ROOT,
@@ -226,8 +289,24 @@ function assertExactStagedManifest() {
   if (staged?.version !== INPUTS.version
       || (packagedSourceReleaseVersion === null
         ? Object.hasOwn(staged, "tibotattleSourceReleaseVersion")
-        : staged.tibotattleSourceReleaseVersion !== packagedSourceReleaseVersion)
-      || JSON.stringify(staged.tibotattleDistribution) !== JSON.stringify(metadata)) {
+        : staged.tibotattleSourceReleaseVersion !== packagedSourceReleaseVersion)) {
+    fail();
+  }
+  if (!INPUTS.signedStaging) {
+    if (JSON.stringify(staged.tibotattleDistribution) !== JSON.stringify(metadata)) fail();
+    return;
+  }
+  const marker = staged.tibotattleAccountlessSignedStagingRehearsal;
+  const exactKeys = [
+    ...Object.keys(signedStagingFields),
+    "origin",
+  ].sort();
+  if (marker === null || typeof marker !== "object" || Array.isArray(marker)
+      || Object.keys(marker).sort().join("\n") !== exactKeys.join("\n")
+      || typeof marker.origin !== "string" || marker.origin.length === 0
+      || Object.entries(signedStagingFields).some(([key, value]) => marker[key] !== value)
+      || Object.hasOwn(staged, "tibotattleDistribution")
+      || Object.hasOwn(staged, "tibotattleAccountlessHostedRehearsal")) {
     fail();
   }
 }
@@ -256,7 +335,7 @@ const configuration = {
     version: INPUTS.version,
     ...(packagedSourceReleaseVersion === null
       ? {} : { tibotattleSourceReleaseVersion: packagedSourceReleaseVersion }),
-    tibotattleDistribution: metadata,
+    ...(metadata === null ? {} : { tibotattleDistribution: metadata }),
     // app-builder-lib uses these fields for Windows executable and NSIS
     // ProductVersion values. Keep them in the same valid four-component form
     // as buildVersion instead of allowing its default decimal build number to
@@ -284,9 +363,12 @@ const configuration = {
   npmRebuild: true,
   buildDependenciesFromSource: false,
   nodeGypRebuild: false,
-  // The URL is fixed per target. The CLI publish policy remains `never` in
-  // the source-candidate path, so generic hosting is a later explicit gate.
-  publish: [{ provider: "generic", url: INPUTS.distributionSelection.feedURL }],
+  // The updater remains a stable/handover distribution capability. The signed
+  // staging marker deliberately omits it, and `--publish never` still applies
+  // to all source-candidate invocations.
+  ...(INPUTS.signedStaging ? {} : {
+    publish: [{ provider: "generic", url: INPUTS.distributionSelection.feedURL }],
+  }),
 };
 
 if (INPUTS.targetSpec.platform === "darwin") {

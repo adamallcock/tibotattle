@@ -25,6 +25,11 @@ export const ELECTRON_BUILDER_PACKAGE_PROFILES = Object.freeze({
     productName: "TiboTattle Dev",
     desktopName: "com.adamallcock.tibotattle.electron.dev.desktop",
   }),
+  "accountless-signed-staging-rehearsal": Object.freeze({
+    main: "apps/electron/main.js",
+    name: "app-usagemonitor",
+    productName: "TiboTattle",
+  }),
   "windows-production": Object.freeze({
     main: "apps/electron/main.js",
     name: "app-usagemonitor",
@@ -61,6 +66,20 @@ const ACCOUNTLESS_HOSTED_REHEARSAL_METADATA_KEYS = Object.freeze([
   "schemaVersion",
   "sourceRevision",
   "target",
+]);
+const ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_METADATA_KEYS = Object.freeze([
+  "appId",
+  "channel",
+  "contributionPolicy",
+  "credentialStorage",
+  "executionProfile",
+  "expectedTestUID",
+  "expectedTestUsername",
+  "origin",
+  "schemaVersion",
+  "sourceRevision",
+  "target",
+  "updater",
 ]);
 const STABLE_PRODUCTION_DISTRIBUTION_KEYS = Object.freeze([
   "appId",
@@ -139,6 +158,75 @@ export function createAccountlessHostedRehearsalMetadata({ sourceRevision } = {}
     schemaVersion: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_SCHEMA_VERSION,
     sourceRevision,
     target: distribution.ACCOUNTLESS_HOSTED_REHEARSAL_TARGET,
+  });
+}
+
+/**
+ * Validate the one signed staging selection. It keeps the production bundle
+ * identity and native credential backend, but its exact marker carries no
+ * production destination or update authority and is bound to one disposable
+ * macOS OS user before the adapter can load.
+ */
+export function validateAccountlessSignedStagingRehearsalMetadata(value) {
+  const selection = distribution.accountlessSignedStagingRehearsalForTarget({
+    target: value?.target,
+    expectedTestUID: value?.expectedTestUID,
+    expectedTestUsername: value?.expectedTestUsername,
+  });
+  if (!hasExactKeys(value, ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_METADATA_KEYS)
+      || selection === null
+      || value.appId !== selection.appId
+      || value.channel !== selection.channel
+      || value.contributionPolicy !== selection.contributionPolicy
+      || value.credentialStorage !== selection.credentialStorage
+      || value.executionProfile !== selection.executionProfile
+      || value.origin !== DEPLOYMENT_ENDPOINTS.staging.origin
+      || value.schemaVersion !== selection.schemaVersion
+      || typeof value.sourceRevision !== "string"
+      || !SOURCE_REVISION_PATTERN.test(value.sourceRevision)
+      || value.target !== selection.target
+      || value.updater !== "disabled") {
+    throw new TypeError("accountless signed staging rehearsal metadata is invalid");
+  }
+  return Object.freeze({
+    appId: selection.appId,
+    channel: selection.channel,
+    contributionPolicy: selection.contributionPolicy,
+    credentialStorage: selection.credentialStorage,
+    executionProfile: selection.executionProfile,
+    expectedTestUID: selection.expectedTestUID,
+    expectedTestUsername: selection.expectedTestUsername,
+    origin: DEPLOYMENT_ENDPOINTS.staging.origin,
+    schemaVersion: selection.schemaVersion,
+    sourceRevision: value.sourceRevision,
+    target: selection.target,
+    updater: "disabled",
+  });
+}
+
+export function createAccountlessSignedStagingRehearsalMetadata({
+  expectedTestUID,
+  expectedTestUsername,
+  sourceRevision,
+} = {}) {
+  const selection = distribution.accountlessSignedStagingRehearsalForTarget({
+    target: distribution.ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_TARGET,
+    expectedTestUID,
+    expectedTestUsername,
+  });
+  return validateAccountlessSignedStagingRehearsalMetadata({
+    appId: selection?.appId,
+    channel: selection?.channel,
+    contributionPolicy: selection?.contributionPolicy,
+    credentialStorage: selection?.credentialStorage,
+    executionProfile: selection?.executionProfile,
+    expectedTestUID,
+    expectedTestUsername,
+    origin: DEPLOYMENT_ENDPOINTS.staging.origin,
+    schemaVersion: selection?.schemaVersion,
+    sourceRevision,
+    target: selection?.target,
+    updater: "disabled",
   });
 }
 
@@ -267,6 +355,7 @@ export function transformElectronBuilderPackageJsonBytes(
     distributionMetadata,
     sourceReleaseVersion,
     hostedRehearsalMetadata,
+    signedStagingRehearsalMetadata,
   } = {},
 ) {
   if (!isPackageJsonPath(relativePath)
@@ -293,6 +382,9 @@ export function transformElectronBuilderPackageJsonBytes(
   const rehearsalMetadata = profile === "accountless-hosted-rehearsal"
     ? validateAccountlessHostedRehearsalMetadata(hostedRehearsalMetadata)
     : null;
+  const signedStagingMetadata = profile === "accountless-signed-staging-rehearsal"
+    ? validateAccountlessSignedStagingRehearsalMetadata(signedStagingRehearsalMetadata)
+    : null;
   const packageVersionMatchesDistribution = typeof packageVersion === "string"
     && (productionMetadata?.semanticVersion === undefined
       ? RELEASE_VERSION_PATTERN.test(packageVersion)
@@ -313,11 +405,19 @@ export function transformElectronBuilderPackageJsonBytes(
       && hostedRehearsalMetadata !== undefined) {
     throw new TypeError("hosted rehearsal metadata is not allowed for this profile");
   }
+  if (profile !== "accountless-signed-staging-rehearsal"
+      && signedStagingRehearsalMetadata !== undefined) {
+    throw new TypeError("signed staging rehearsal metadata is not allowed for this profile");
+  }
   if (isMain) {
     const hasDistributionMetadata = Object.hasOwn(data, "tibotattleDistribution");
     const hasHostedRehearsalMetadata = Object.hasOwn(
       data,
       "tibotattleAccountlessHostedRehearsal",
+    );
+    const hasSignedStagingRehearsalMetadata = Object.hasOwn(
+      data,
+      "tibotattleAccountlessSignedStagingRehearsal",
     );
     const hasSourceReleaseVersion = Object.hasOwn(data, "tibotattleSourceReleaseVersion");
     // The input package is shared by every unsigned development build. An
@@ -325,14 +425,20 @@ export function transformElectronBuilderPackageJsonBytes(
     // staged rehearsal or distribution build. The selected profile below is
     // the only authority that can add its compatible marker.
     if ((profile === "development" || profile === "windows-production")
-        && (hasDistributionMetadata || hasHostedRehearsalMetadata)) {
+        && (hasDistributionMetadata || hasHostedRehearsalMetadata
+          || hasSignedStagingRehearsalMetadata)) {
       throw new TypeError("package profile metadata is not allowed for this profile");
     }
-    if (profile === "production" && hasHostedRehearsalMetadata) {
+    if (profile === "production" && (hasHostedRehearsalMetadata || hasSignedStagingRehearsalMetadata)) {
       throw new TypeError("hosted rehearsal metadata is not allowed for this profile");
     }
-    if (profile === "accountless-hosted-rehearsal" && hasDistributionMetadata) {
+    if (profile === "accountless-hosted-rehearsal"
+        && (hasDistributionMetadata || hasSignedStagingRehearsalMetadata)) {
       throw new TypeError("production distribution metadata is not allowed for this profile");
+    }
+    if (profile === "accountless-signed-staging-rehearsal"
+        && (hasDistributionMetadata || hasHostedRehearsalMetadata)) {
+      throw new TypeError("incompatible package profile metadata is not allowed");
     }
     if (handoverSourceReleaseVersion === null && hasSourceReleaseVersion) {
       throw new TypeError("native handover source release metadata is not allowed");
@@ -359,6 +465,9 @@ export function transformElectronBuilderPackageJsonBytes(
       ...(productionMetadata ? { tibotattleDistribution: productionMetadata } : {}),
       ...(rehearsalMetadata
         ? { tibotattleAccountlessHostedRehearsal: rehearsalMetadata }
+        : {}),
+      ...(signedStagingMetadata
+        ? { tibotattleAccountlessSignedStagingRehearsal: signedStagingMetadata }
         : {}),
     })) {
       data[property] = value;

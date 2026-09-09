@@ -1,11 +1,14 @@
 import { dirname, resolve } from "node:path";
 import { readFile } from "node:fs/promises";
+import { userInfo } from "node:os";
 import { fileURLToPath } from "node:url";
 
 import { DEPLOYMENT_ENDPOINTS } from "../../config/deployment-endpoints.js";
 import {
+  assertAccountlessSignedStagingOperatingAccount,
   launchDesktopRuntime,
   validateAccountlessHostedRehearsalMetadata,
+  validateAccountlessSignedStagingRehearsalMetadata,
 } from "./desktop-runtime.js";
 import { createDesktopTrayIconFactory } from "./desktop-tray.js";
 import {
@@ -115,6 +118,18 @@ export async function readProductionDistribution({
       throw new Error("Invalid packaged manifest");
     }
     const manifest = JSON.parse(bytes.toString("utf8"));
+    const hasSignedStagingRehearsal = Object.hasOwn(
+      manifest,
+      "tibotattleAccountlessSignedStagingRehearsal",
+    );
+    if (!Object.hasOwn(manifest, "tibotattleDistribution")) {
+      if (hasSignedStagingRehearsal) return null;
+      throw new Error("Missing production distribution metadata");
+    }
+    if (hasSignedStagingRehearsal
+        || Object.hasOwn(manifest, "tibotattleAccountlessHostedRehearsal")) {
+      throw new Error("Mixed packaged authority markers");
+    }
     const distribution = validateProductionDistributionMetadata(manifest.tibotattleDistribution, {
       platform,
       architecture,
@@ -150,11 +165,45 @@ export async function readAccountlessHostedRehearsal({
     }
     const manifest = JSON.parse(bytes.toString("utf8"));
     if (!Object.hasOwn(manifest, "tibotattleAccountlessHostedRehearsal")) return null;
-    if (Object.hasOwn(manifest, "tibotattleDistribution")) {
+    if (Object.hasOwn(manifest, "tibotattleDistribution")
+        || Object.hasOwn(manifest, "tibotattleAccountlessSignedStagingRehearsal")) {
       throw new Error("Hosted rehearsal manifest carries production metadata");
     }
     return validateAccountlessHostedRehearsalMetadata(
       manifest.tibotattleAccountlessHostedRehearsal,
+      { platform, architecture },
+    );
+  } catch {
+    throw shellError("electron_configuration_invalid");
+  }
+}
+
+/**
+ * Read the one signed, native-credential staging rehearsal marker. It has the
+ * normal app identity but cannot carry a distribution/updater or Dev marker.
+ */
+export async function readAccountlessSignedStagingRehearsal({
+  app,
+  platform = process.platform,
+  architecture = process.arch,
+  readManifest = readFile,
+} = {}) {
+  if (!isPackagedElectronApp(app) || app.getName?.() !== "TiboTattle") return null;
+  const appPath = packagedAppPath(app);
+  if (appPath === null) throw shellError("electron_configuration_invalid");
+  try {
+    const bytes = await readManifest(resolve(appPath, "package.json"));
+    if (!Buffer.isBuffer(bytes) || bytes.length > 1_048_576) {
+      throw new Error("Invalid packaged manifest");
+    }
+    const manifest = JSON.parse(bytes.toString("utf8"));
+    if (!Object.hasOwn(manifest, "tibotattleAccountlessSignedStagingRehearsal")) return null;
+    if (Object.hasOwn(manifest, "tibotattleDistribution")
+        || Object.hasOwn(manifest, "tibotattleAccountlessHostedRehearsal")) {
+      throw new Error("Signed staging manifest carries incompatible metadata");
+    }
+    return validateAccountlessSignedStagingRehearsalMetadata(
+      manifest.tibotattleAccountlessSignedStagingRehearsal,
       { platform, architecture },
     );
   } catch {
@@ -822,6 +871,8 @@ export async function launchElectronShell({
   ownedDownloadsRegistry,
   notificationBackend,
   linuxQualificationContext = null,
+  getuid = typeof process.getuid === "function" ? process.getuid.bind(process) : undefined,
+  getUserInfo = userInfo,
   emitFailureDiagnostic = false,
   writeDiagnostic,
 } = {}) {
@@ -851,6 +902,20 @@ export async function launchElectronShell({
     // Linux/x64 selection; installed lifecycle evidence remains a separate gate.
     const productionDistribution = await readProductionDistribution({ app });
     const accountlessHostedRehearsal = await readAccountlessHostedRehearsal({ app });
+    const accountlessSignedStagingRehearsal = await readAccountlessSignedStagingRehearsal({ app });
+    if (accountlessSignedStagingRehearsal !== null
+        && environment.USAGE_MONITOR_TEST_LANE !== undefined) {
+      throw shellError("electron_configuration_invalid");
+    }
+    // This guard intentionally precedes the macOS handover and native adapter
+    // factory. An artifact outside its package-bound OS account and hosted
+    // runner profile cannot read, create, or migrate credential material.
+    assertAccountlessSignedStagingOperatingAccount({
+      metadata: accountlessSignedStagingRehearsal,
+      environment,
+      getuid,
+      getUserInfo,
+    });
     assertElectronPlatformGate({
       platform: process.platform,
       architecture: process.arch,
@@ -867,6 +932,7 @@ export async function launchElectronShell({
     // A local-QA launch must never inherit production sending or updating.
     const productionEnabled = productionDistribution !== null
       && environment.USAGE_MONITOR_TEST_LANE === undefined;
+    const accountlessSignedStagingEnabled = accountlessSignedStagingRehearsal !== null;
     // Native-to-Electron handover fixtures retain the signed migration/FD4
     // path without enabling accountless FD3 uploads. Exact stable candidates
     // select their fixed native adapters; installed lifecycle and release
@@ -900,7 +966,8 @@ export async function launchElectronShell({
       && process.arch === "x64"
       && productionDistribution.target === "win32-x64"
       ? createWindowsNormalCandidateCredentialHandover() : null;
-    const macCredentialHandover = productionEnabled && process.platform === "darwin"
+    const macCredentialHandover = (productionEnabled || accountlessSignedStagingEnabled)
+      && process.platform === "darwin"
       ? createProductionMacCredentialHandover({
         app,
         resourcesPath: packagedResourcesPath(app, packagedAppPath(app), resourcesPath),
@@ -944,7 +1011,8 @@ export async function launchElectronShell({
         }),
       },
       lifecycleOptions: {
-        appName: productionDistribution !== null || !isPackagedElectronApp(app)
+        appName: productionDistribution !== null || accountlessSignedStagingRehearsal !== null
+          || !isPackagedElectronApp(app)
           ? "TiboTattle" : "TiboTattle Dev",
         ...lifecycleOptions,
         ...(linuxSmokeDashboardFailureObserver === undefined ? {} : {
@@ -976,6 +1044,17 @@ export async function launchElectronShell({
         }),
       } : undefined,
       accountlessHostedRehearsal: accountlessHostedRehearsal ?? undefined,
+      accountlessSignedStagingRehearsal: accountlessSignedStagingEnabled ? {
+        executionProfile: accountlessSignedStagingRehearsal.executionProfile,
+        expectedTestUID: accountlessSignedStagingRehearsal.expectedTestUID,
+        expectedTestUsername: accountlessSignedStagingRehearsal.expectedTestUsername,
+        origin: accountlessSignedStagingRehearsal.origin,
+        policyVersion: accountlessSignedStagingRehearsal.contributionPolicy,
+        createMacOSCredentialBackend:
+          macCredentialHandover?.createAccountlessCredentialBackend,
+      } : undefined,
+      getuid,
+      getUserInfo,
     });
     installWindowsSmokeControl(desktop.lifecycle, {
       environment,
