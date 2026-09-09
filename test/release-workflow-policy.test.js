@@ -37,7 +37,7 @@ test("Codex drift monitoring is read-only, immutable, and cannot rewrite the led
   );
   assert.match(
     workflow,
-    /actions\/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02/u,
+    /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/u,
   );
   assert.match(workflow, /persist-credentials: false/u);
   assert.match(workflow, /package-manager-cache: false/u);

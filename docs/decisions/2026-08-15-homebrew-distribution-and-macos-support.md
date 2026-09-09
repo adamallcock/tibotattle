@@ -9,6 +9,9 @@ status: maintained
 
 ## Decision
 
+Updated on 2026-09-07 for the qualified dual-architecture cask; the original
+Apple-silicon-only decision is retained in Git history.
+
 Publish TiboTattle through the first-party
 [`adamallcock/homebrew-tap`](https://github.com/adamallcock/homebrew-tap) tap.
 The supported one-command install is:
@@ -17,17 +20,17 @@ The supported one-command install is:
 brew install --cask adamallcock/tap/tibotattle
 ```
 
-The cask selects the same signed, notarized ARM or Intel DMG as the website and
-GitHub Release for the host architecture. It declares `auto_updates true`, preserving the existing signed
+The cask selects the same signed, notarized architecture-specific DMG as the
+website and GitHub Release: `arm64` for Apple silicon and `x64` for Intel,
+with independent SHA-256 values. It declares `auto_updates true`, preserving the existing signed
 Sparkle feed as the installed app's update authority. Homebrew is an additional
 install and uninstall route, not a replacement release channel.
 
 The public support floor is macOS 14 (Sonoma) on Apple silicon and Intel. The app bundle,
 Swift compiler target, public release-site metadata, release runbook, and cask
-must all carry that same floor. The already-published v0.1.11 binary is more
-permissive at the bundle level; the cask and public support contract still
-require Sonoma, and the next signed release will carry 14.0 in the bundle and
-Sparkle appcast.
+must all carry that same floor. The packaged runtime means end users do not
+need Node.js, pnpm or Xcode. The separate Apple silicon build-host requirement
+does not restrict which published installer they can use.
 
 ## Uninstall and data boundary
 
@@ -53,12 +56,20 @@ credential reset.
 ## Tap automation
 
 The tap owns an hourly and manually dispatchable GitHub Actions workflow. It
-reads the latest non-draft `adamallcock/tibotattle` release, requires the exact
-`TiboTattle-X.Y.Z-macOS-arm64.dmg` asset, downloads and hashes it, validates the
-mounted app's signature and stapled notarization ticket, updates only the cask
-version and SHA-256, and runs Homebrew style, audit, install, and uninstall
-checks before committing. This avoids a long-lived cross-repository write
-credential in the application repository.
+reads the latest immutable, non-draft, non-prerelease `adamallcock/tibotattle`
+release and requires both exact `TiboTattle-X.Y.Z-macOS-arm64.dmg` and
+`TiboTattle-X.Y.Z-macOS-x64.dmg` assets. Independent native Apple silicon and
+Intel jobs verify each HTTPS download's size, SHA-256, architecture, signature
+and stapled notarization ticket, then run Homebrew style, online audit,
+installation and uninstall checks. Both jobs must pass before the main-branch
+publication job may update only the cask version and architecture checksums.
+
+Checks detect architecture or checksum drift even when the version is unchanged
+and reject downgrades. A manual `force_verify` run rechecks a matching release;
+the publication job makes no commit if the cask already matches. Normal pushes
+require the same clean source base used for qualification. This preserves the
+existing automatic publication behavior without a long-lived cross-repository
+write credential in the application repository.
 
 ## Official Homebrew cask gate
 

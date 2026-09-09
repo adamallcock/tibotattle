@@ -1404,6 +1404,41 @@ function cacheSwitchImpactProjection(
   };
 }
 
+/** A bounded display projection of the dashboard's existing reuse denominator.
+ * Its parent accounting projection owns generation, scope and retained authority.
+ * Opening or configuring a tray must never trigger a separate cache analysis.
+ */
+export function projectTrayCacheSummary(impact) {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0;
+  return {
+    schemaVersion: 1,
+    periods: ["7d", "30d"].map((periodId) => {
+      const unavailable = {
+        periodId, status: "unavailable", comparableReturns: null,
+        reusedMoreThanHalfReturns: null, reusePercent: null,
+        coverageStatus: "unavailable",
+      };
+      if (impact?.status !== "available" || !Array.isArray(impact.periods)
+          || impact.periods.length > 8) return unavailable;
+      const matches = impact.periods.filter((row) => row?.periodId === periodId);
+      if (matches.length !== 1) return unavailable;
+      const row = matches[0];
+      if (![row.comparableReturns, row.reusedMoreThanHalfReturns,
+        row.reusedHalfOrLessReturns].every(count)
+          || row.reusedMoreThanHalfReturns + row.reusedHalfOrLessReturns
+            !== row.comparableReturns
+          || !["complete", "incomplete"].includes(row.coverageStatus)) return unavailable;
+      return {
+        periodId, status: "available", comparableReturns: row.comparableReturns,
+        reusedMoreThanHalfReturns: row.reusedMoreThanHalfReturns,
+        reusePercent: row.comparableReturns === 0 ? null
+          : row.reusedMoreThanHalfReturns / row.comparableReturns * 100,
+        coverageStatus: row.coverageStatus,
+      };
+    }),
+  };
+}
+
 function cacheContinuityImpactProjection(
   impact,
   selectedPeriodId,
@@ -3392,6 +3427,7 @@ export async function buildLocalCompanionSnapshot({
         replayExclusionDiagnostics: replaySafeCache?.diagnostics ?? null,
         cacheSwitchImpact,
         cacheContinuityImpact,
+        trayCacheSummary: projectTrayCacheSummary(cacheContinuityImpact),
         ...(includeDevelopmentSideChatEstimates
           ? { sideChatEstimates }
           : {}),
@@ -3770,6 +3806,23 @@ const PROJECTION_SURFACES = Object.freeze([
     path: Object.freeze(["overview", "timeline", "allowanceCapacity"]),
     rows: availableStatusRows,
   },
+  {
+    path: Object.freeze(["overview", "timeline", "planScoped"]),
+    rows: availableStatusRows,
+    // Selected-plan Trends needs the scoped numerator and quota intervals as
+    // well as the fitted capacity. Retain them only with the exact matching
+    // capacity scope, after the capacity's own retention step above.
+    canRetain: (incoming, previous) => {
+      const scope = previous.planScoped?.planScope;
+      const capacity = incoming.allowanceCapacity;
+      return capacity?.status === "available"
+        && scope?.methodVersion === PLAN_SCOPED_ATTRIBUTION_METHOD_VERSION
+        && scope.methodVersion === capacity.planScope?.methodVersion
+        && ["planType", "basisFamilyId", "cohortId", "sourceGeneration",
+          "sourceGenerationFingerprint"].every((key) => scope[key] != null
+            && scope[key] === capacity.planScope?.[key]);
+    },
+  },
 ]);
 
 // Resolve a registered path, or null if any segment is absent. Absence is not
@@ -4021,13 +4074,14 @@ export class LocalCompanionDataStore {
     const retained = this.#snapshot;
     if (retained === null) return next;
     let usageEvidenceRetained = false;
-    for (const { path, rows, preserveIncomingKeys = [], retainSiblingKeys = [] }
+    for (const { path, rows, preserveIncomingKeys = [], retainSiblingKeys = [], canRetain = null }
       of PROJECTION_SURFACES) {
       const key = path[path.length - 1];
       const nextParent = surfaceParent(next, path);
       const retainedParent = surfaceParent(retained, path);
       if (nextParent === null || retainedParent === null) continue;
-      if (rows(nextParent[key]) === 0 && rows(retainedParent[key]) > 0) {
+      if (rows(nextParent[key]) === 0 && rows(retainedParent[key]) > 0
+          && (canRetain === null || canRetain(nextParent, retainedParent))) {
         const incoming = nextParent[key];
         const replacement = structuredClone(retainedParent[key]);
         for (const incomingKey of preserveIncomingKeys) {

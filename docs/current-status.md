@@ -34,6 +34,14 @@ normally; the release tag and public artifacts must not be rewritten.
 | Website | [Both macOS tabs](https://tibotattle.com/#download) show 0.1.18 and their own correct public installer URL, minimum OS and architecture |
 | Installed ARM application | Final stable 1026 passes installed-artifact validation, ordinary launch, detailed replay-safe accounting refresh and restart, with matching generation and zero fallback |
 
+Homebrew update verified on **2026-09-07**: the
+[dual-architecture cask](https://github.com/adamallcock/homebrew-tap/pull/2)
+adds Intel with its independent published checksum. Both native Mac
+[audit/install/uninstall lanes](https://github.com/adamallcock/homebrew-tap/actions/runs/34141158444)
+passed. This supersedes the Apple-silicon-only Homebrew row in the dated
+2026-09-05 release snapshot above; it does not change the desktop artifacts or
+claim completion of the waived manual tests.
+
 The manifest honestly leaves optional SBOM, source-to-binary provenance and
 store fields unset. GitHub's immutable release/asset attestations are not
 substitutes for SLSA build provenance. Follow
@@ -254,6 +262,7 @@ and `deletionSafeRestoreReplay: true`; these flags do not prove every route.
 - The live first-party Homebrew cask was rechecked on 2026-09-08: version 0.1.18
   selects Apple silicon or Intel with each release's exact checksum. Both use
   `brew install --cask adamallcock/tap/tibotattle`.
+  Both DMGs also remain available through the website and GitHub release.
 
 The owner explicitly accepted the unavailable disposable-profile/manual Login
 Item matrix and formal physical Intel install/runtime/update/upload evidence

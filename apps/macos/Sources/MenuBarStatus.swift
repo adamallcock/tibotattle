@@ -1402,6 +1402,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         /// the menu reaches a terminal idle state. The app uses it only to
         /// evaluate the just-finished receipt; it creates no new refresh.
         var refreshFinished: ((String?) -> Void)? = nil
+        var openUsageAndCosts: (() -> Void)? = nil
     }
 
     /// Background cadence while the companion is idle. A minute is cheap on
@@ -1473,6 +1474,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
     private var outsideMouseMonitor: Any?
     private var appDeactivationObserver: NSObjectProtocol?
     private var stopped = false
+    private var trayPreferenceObserver: NSObjectProtocol?
+    private var lowAllowanceState = TrayLowAllowanceState()
 
     init(productName: String, actions: Actions) {
         self.productName = productName
@@ -1496,11 +1499,21 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
                 refresh: { [weak self] in self?.analyzeLocalUsage() },
                 showMore: { [weak self] anchor in
                     self?.showActionMenu(from: anchor)
+                },
+                openUsageAndCosts: { [weak self] in
+                    self?.dismissSurfaces()
+                    (self?.actions.openUsageAndCosts ?? self?.actions.openTiboTattle)?()
                 }
             )
         )
         popover.contentViewController = popoverController
         installInteractionMonitoring()
+        trayPreferenceObserver = NotificationCenter.default.addObserver(
+            forName: TrayPreferenceStore.changed, object: nil, queue: .main
+        ) { [weak self] _ in self?.render() }
+        let customizeItem = NSMenuItem(title: trayText("customize"), action: #selector(customizeTray), keyEquivalent: "")
+        customizeItem.target = self
+        menu.addItem(customizeItem)
 
         // Explicit enablement: information rows must stay unclickable, and
         // actions must reflect the companion's real state, not AppKit's guess.
@@ -1657,6 +1670,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         // before they can consider starting another companion refresh.
         stopped = true
         dismissSurfaces()
+        if let trayPreferenceObserver { NotificationCenter.default.removeObserver(trayPreferenceObserver) }
+        trayPreferenceObserver = nil
         companionGeneration &+= 1
         cancelPoll()
         reader.invalidate()
@@ -2034,6 +2049,8 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         actions.quit()
     }
 
+    @objc private func customizeTray() { TrayCustomizationController.shared.open() }
+
     @objc private func showSettings() {
         dismissSurfaces()
         actions.showSettings()
@@ -2235,16 +2252,26 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         quitItem.isEnabled = true
         popoverController.update(snapshot: snapshot)
         guard let button = statusItem.button else { return }
-        button.image = Self.statusGlyph(
-            productName: productName,
-            state: Self.glyphState(for: snapshot),
-            brandBirdTemplate: brandBirdTemplate
-        )
-        button.title = snapshot.title
+        let preferences = TrayPreferenceStore.shared.value
+        let now = Date()
+        let title = TrayPresentation.title(preferences, snapshot: snapshot, now: now)
+        let lowWindows = lowAllowanceState.update(preferences, snapshot: snapshot, now: now)
+        button.image = Self.trayImage(preferences, snapshot: snapshot, now: now, brand: brandBirdTemplate, lowMarker: !lowWindows.isEmpty)
+        let attributed = NSMutableAttributedString(string: title, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular), .foregroundColor: NSColor.labelColor])
+        for window in lowWindows {
+            let label = window == "five-hour" ? "5h" : "7d"
+            if let range = title.range(of: label) {
+                attributed.addAttributes([.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .bold), .underlineStyle: NSUnderlineStyle.single.rawValue], range: NSRange(range, in: title))
+            }
+        }
+        button.attributedTitle = attributed
         button.toolTip =
-            "\(snapshot.allowanceSummary)\n\(snapshot.evidenceSummary)"
+            "\(snapshot.allowanceSummary)\n\(snapshot.evidenceSummary)\n\(title) · \(trayText(preferences.iconMode))"
+            + (lowWindows.isEmpty ? "" : "\n" + trayText("low"))
         button.setAccessibilityLabel(
-            snapshot.accessibilityLabel(productName: productName)
+            snapshot.accessibilityLabel(productName: productName) + ", " + title
+                + ", " + trayText(preferences.iconMode)
+                + (lowWindows.isEmpty ? "" : ", " + trayText("low"))
         )
     }
 
@@ -2374,13 +2401,28 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         structuralRebuildPending = false
     }
 
+    static func trayImage(_ preferences: TrayPreferences, snapshot: MenuBarStatusSnapshot, now: Date, brand: NSImage? = nil, lowMarker: Bool = false) -> NSImage? {
+        let meterWindow = TrayPresentation.meterWindow(preferences, snapshot: snapshot, now: now)
+        let meterLane = TrayPresentation.lane(meterWindow, snapshot: snapshot, now: now)
+        let state: StatusGlyphState = meterLane.map { .live(remainingPercent: $0.remainingPercent) }
+            ?? (snapshot.phase == .analyzing ? .analyzing : snapshot.evidence == .stale ? .stale : .unavailable)
+        return statusGlyph(productName: "TiboTattle", state: state, brandBirdTemplate: brand,
+            iconMode: preferences.iconMode,
+            dualStates: ["five-hour", "weekly"].map { window in
+                TrayPresentation.lane(window, snapshot: snapshot, now: now).map { .live(remainingPercent: $0.remainingPercent) } ?? .unavailable
+            }, lowMarker: lowMarker)
+    }
+
     /// Keep the bird mark and quota meter in the same monochrome language as
     /// native menu-bar symbols. A real percentage gets a filled track; every
     /// other state gets an intentionally non-numeric treatment.
     private static func statusGlyph(
         productName: String,
         state: StatusGlyphState,
-        brandBirdTemplate: NSImage?
+        brandBirdTemplate: NSImage?,
+        iconMode: String = "meter",
+        dualStates: [StatusGlyphState] = [],
+        lowMarker: Bool = false
     ) -> NSImage? {
         let base = brandBirdTemplate ?? nativeBirdTemplate()
         guard let base else { return nil }
@@ -2388,7 +2430,7 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
         let glyphSize = NSSize(width: 16, height: 16)
         let glyph = NSImage(size: glyphSize)
         glyph.lockFocus()
-        let birdRect = NSRect(x: 0.5, y: 2.5, width: 15, height: 12.5)
+        let birdRect = NSRect(x: 0.5, y: iconMode == "dual-meter" ? 6 : 2.5, width: 15, height: iconMode == "dual-meter" ? 9 : 12.5)
         let birdFraction: CGFloat = switch state {
         case .live, .analyzing:
             1
@@ -2403,7 +2445,20 @@ final class MenuBarStatusController: NSObject, NSMenuDelegate, NSPopoverDelegate
             operation: .sourceOver,
             fraction: birdFraction
         )
-        drawMeter(for: state, in: NSRect(x: 1.5, y: 0.25, width: 13, height: 1.75))
+        if iconMode == "dual-meter", dualStates.count == 2 {
+            // Fixed top 5-hour / bottom 7-day lanes; outlined means unknown.
+            drawMeter(for: dualStates[0], in: NSRect(x: 1.5, y: 3.5, width: 13, height: 2))
+            drawMeter(for: dualStates[1], in: NSRect(x: 1.5, y: 0.25, width: 13, height: 2))
+        } else if iconMode != "app" {
+            drawMeter(for: state, in: NSRect(x: 1.5, y: 0.25, width: 13, height: 1.75))
+        }
+        if lowMarker {
+            // A stable outline cue works without color or flashing, including
+            // icon-only mode. Tooltip and spoken label name low allowance.
+            NSColor.black.setStroke()
+            let badge = NSBezierPath(ovalIn: NSRect(x: 11, y: 11, width: 4, height: 4))
+            badge.lineWidth = 1.2; badge.stroke()
+        }
         glyph.unlockFocus()
         glyph.size = glyphSize
         glyph.isTemplate = true

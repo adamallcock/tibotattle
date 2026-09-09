@@ -4836,6 +4836,14 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         createWindow()
         // Installed before any early return below so a launch that fails still
         // leaves a visible, quittable presence in the menu bar.
+        if let root = try? ownerOnlyStateRoot() {
+            TrayPreferenceStore.shared.configure(
+                directory: root,
+                existingInstall: (try? hasCompletedFirstRun(stateRoot: root)) ?? true,
+                legacy: UserDefaults.standard.string(forKey: "tibotattle.menu-bar-allowance.v1")
+                    ?? UserDefaults.standard.string(forKey: "menuBarDisplayMode")
+            )
+        }
         installMenuBarStatus()
         do {
             centralService = try CentralServiceConfiguration.bundled()
@@ -6738,6 +6746,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
                     self?.evaluateQuotaNotificationsAfterRefresh(
                         expectedRefreshID: refreshID
                     )
+                },
+                openUsageAndCosts: { [weak self] in
+                    self?.openTiboTattle()
+                    self?.navigateNativeDashboard(to: .method)
                 }
             )
         )
@@ -7607,6 +7619,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
         updateQuotaNotificationSettingsControls()
     }
 
+    @objc private func customizeTray() { TrayCustomizationController.shared.open() }
+
     @objc private func showSettingsWindow() {
         showSettings(selecting: 0)
     }
@@ -8134,6 +8148,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate,
             views: [
                 migrationSection,
                 appearanceSection,
+                settingsGroup(title: trayText("menuBar"), symbolName: "menubar.rectangle", views: [
+                    NSButton(title: trayText("customize"), target: self, action: #selector(customizeTray))
+                ]),
                 languageSection,
                 sourceSection,
                 refreshIntervalSection,
@@ -13991,6 +14008,20 @@ private struct UsageMonitorMain {
             exit(NativeWeeklyPaceProjectionContractSmokeTest.run(
                 fixturePath: arguments[paceIndex + 1]
             ))
+        }
+        if let index = arguments.firstIndex(of: "--tray-customization-render-smoke-test"), index + 1 < arguments.count {
+            guard BundledProduct.buildChannel == "development" else { exit(2) }
+            exit(MainActor.assumeIsolated {
+                let application = NSApplication.shared
+                application.setActivationPolicy(.regular)
+                do {
+                    try TrayCustomizationController.shared.renderExample(to: URL(fileURLWithPath: arguments[index + 1], isDirectory: true))
+                    return Int32(0)
+                } catch { return Int32(1) }
+            })
+        }
+        if arguments.contains("--tray-customization-smoke-test") {
+            exit(MainActor.assumeIsolated { TrayCustomizationSmoke.run() })
         }
         if arguments.contains("--menu-bar-contract-smoke-test") {
             exit(MainActor.assumeIsolated {

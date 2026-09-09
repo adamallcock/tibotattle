@@ -398,6 +398,7 @@ export async function extractRolloutUsage(path, {
   highWaterMark = 1024 * 1024,
   signal = null,
   onEvent,
+  parentModelAt = null,
   onBoundary = null,
   onTool = null,
 } = {}) {
@@ -409,6 +410,9 @@ export async function extractRolloutUsage(path, {
   }
   if (onTool !== null && typeof onTool !== "function") {
     throw new TypeError("onTool must be a function or null");
+  }
+  if (parentModelAt !== null && typeof parentModelAt !== "function") {
+    throw new TypeError("parentModelAt must be a function or null");
   }
   let currentModel = seedModel;
   let currentEffort = seedEffort;
@@ -457,6 +461,11 @@ export async function extractRolloutUsage(path, {
   // continuity lens compares positive-input requests, so only the next one is
   // a meaningful boundary.
   function emitUsage(event, rawUsage) {
+    if (event.model === null && parentModelAt !== null) {
+      event.model = parentModelAt(event.observedAtMs);
+      event.modelInherited = event.model !== null;
+    }
+    if (event.model === null) diagnostics.modelMissing += 1;
     const finish = () => {
       if ((compactionPending === null && !turnContextPending)
           || !positiveInput(rawUsage)) return;
@@ -701,6 +710,9 @@ export async function extractRolloutUsage(path, {
           diagnostics.malformedAccountingRecords += 1;
           return;
         }
+        // An explicit UI selection supersedes the inherited default. A later
+        // turn_context remains authoritative for its own turn.
+        if (typeof settings.model === "string") currentModel = settings.model;
         if (Object.hasOwn(settings, "service_tier")) {
           const raw = settings.service_tier;
           if (raw !== null && typeof raw !== "string") {
@@ -834,7 +846,6 @@ export async function extractRolloutUsage(path, {
       }
       if ((!usage || !(usage.input_tokens > 0 || usage.output_tokens > 0))
           && quota.length === 0) return;
-      if (currentModel === null) diagnostics.modelMissing += 1;
       return emitUsage({
         observedAtMs,
         sourceOffset: lineEndOffset,

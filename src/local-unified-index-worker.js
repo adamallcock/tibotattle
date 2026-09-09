@@ -10,6 +10,7 @@ import {
 } from "./local-unified-index-extract.js";
 import {
   createHistoryBaseSeedResolver,
+  createParentModelResolver,
   selectRolloutUsageSeed,
 } from "./local-unified-index-history.js";
 import { withStableRolloutSource } from "./rollout-source-snapshot.js";
@@ -139,6 +140,7 @@ async function run() {
     const snapshots = createLineageSnapshots(shaped);
     const logicalHeads = resolveLogicalRolloutHeads(shaped);
     const finalBySessionId = new Map();
+    const parentModels = createParentModelResolver(shaped, { maximumLineBytes });
     const historySeeds = createHistoryBaseSeedResolver(shaped, {
       maximumLineBytes,
     });
@@ -239,8 +241,11 @@ async function run() {
         while (snapshotSeedKeys.length > batchEvents) {
           flush(source.rolloutKey, false, null);
         }
+        const parentModelAt = selectedSeed.seedModel === null
+          ? await parentModels.forSource(source) : null;
         const outcome = await withStableRolloutSource(source, (stableSource) => (
           extractRolloutUsage(stableSource, {
+          parentModelAt,
           size: source.size,
           isFork: source.isInlineFork === true,
           inheritedSnapshots: source.isInlineFork === true

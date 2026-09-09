@@ -1909,6 +1909,10 @@ for (const history of ["reset", "anchored-null"]) {
           tokenCount("2026-07-25T01:00:01.000Z", usage(50, 5), usage(50, 5)),
         ],
       });
+      // A reset now inherits the parent's historical model only. The exact
+      // all-null base still remains unknown; later Astra never rewrites either.
+      const seedRow = { ...UNKNOWN_PAGINATED_SEED_ROW,
+        model: history === "reset" ? "gpt-5.6-sol" : "unknown" };
       const indexFile = join(root, "index.sqlite");
       const ingest = () => ingestLocalUnifiedIndexIncrement({
         codexHome: root,
@@ -1924,7 +1928,15 @@ for (const history of ["reset", "anchored-null"]) {
         if (pipeline !== "incremental") {
           assert.equal(initial.modelSeededFromLineage, 0);
         }
-        assert.deepEqual(paginatedSeedRows(indexFile), [UNKNOWN_PAGINATED_SEED_ROW]);
+        assert.deepEqual(paginatedSeedRows(indexFile), [seedRow]);
+        const provenance = openLocalUnifiedIndex(indexFile, { readOnly: true });
+        try {
+          const stamp = provenance.prepare(`SELECT p.parser_version
+            FROM usage_event u JOIN parser_version p ON p.id = u.parser_version_id
+            WHERE u.observed_at_ms = ?`).get(Date.parse("2026-07-25T01:00:01.000Z"));
+          assert.equal(stamp.parser_version, history === "reset"
+            ? "unified-rollout-typed-v15-parent-model" : LOCAL_UNIFIED_INDEX_PARSER_VERSION);
+        } finally { provenance.close(); }
 
         if (pipeline !== "incremental") return;
 
@@ -1938,8 +1950,8 @@ for (const history of ["reset", "anchored-null"]) {
         assert.equal(resumed.sourcesResumed, 2);
         assert.equal(resumed.insertedUsageEvents, 2);
         const unknownRows = [
-          UNKNOWN_PAGINATED_SEED_ROW,
-          { ...UNKNOWN_PAGINATED_SEED_ROW, input: 30, output: 3 },
+          seedRow,
+          { ...seedRow, input: 30, output: 3 },
         ];
         assert.deepEqual(paginatedSeedRows(indexFile), unknownRows);
 
@@ -1968,7 +1980,7 @@ for (const history of ["reset", "anchored-null"]) {
         const raw = openLocalUnifiedIndex(indexFile, { readOnly: false });
         try {
           raw.prepare(
-            "UPDATE parser_version SET parser_version = 'unified-rollout-typed-v13'",
+            "UPDATE parser_version SET parser_version = replace(parser_version, 'v15', 'v13')",
           ).run();
         } finally {
           raw.close();

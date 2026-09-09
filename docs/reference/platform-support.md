@@ -1,6 +1,6 @@
 ---
 title: Platform support and qualification
-date: 2026-09-05
+date: 2026-09-07
 type: reference
 status: maintained
 ---
@@ -80,10 +80,13 @@ does not authorize relabeling those candidates as stable, fabricating a v2
 manual receipt, ignoring data-loss or integrity failures, weakening native
 signing/updater checks, or approving unexpected automatic Keychain prompts.
 Future releases must apply their normal gates unless separately decided.
-The published [first-party cask](https://github.com/adamallcock/homebrew-tap/blob/main/Casks/tibotattle.rb)
-selects the stable Apple silicon or Intel installer and its own checksum with
-the same `brew install --cask adamallcock/tap/tibotattle` command. This does not
-replace either artifact's independent native-trust or update-feed requirements.
+
+From 2026-09-07, the first-party Homebrew cask selects the matching Apple silicon
+or Intel DMG with independent checksums. Both native hosted Mac lanes passed
+[cask audit, installation, trust checks and uninstall](https://github.com/adamallcock/homebrew-tap/actions/runs/34141158444).
+These distribution checks do not replace the waived 0.1.18 interactive runtime,
+physical Intel, update or upload observations. See the
+[Homebrew distribution contract](../decisions/2026-08-15-homebrew-distribution-and-macos-support.md).
 
 ## Windows
 

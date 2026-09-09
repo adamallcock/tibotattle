@@ -29,6 +29,7 @@ import {
 } from "./local-unified-index-build.js";
 import {
   createHistoryBaseSeedResolver,
+  createParentModelResolver,
   selectRolloutUsageSeed,
 } from "./local-unified-index-history.js";
 import { withStableRolloutSource } from "./rollout-source-snapshot.js";
@@ -1339,6 +1340,7 @@ export async function ingestLocalUnifiedIndexIncrement({
       }
       return chain;
     }
+    const parentModels = createParentModelResolver(infos, { maximumLineBytes, signal });
     const historySeeds = createHistoryBaseSeedResolver(infos, {
       maximumLineBytes,
       signal,
@@ -1569,6 +1571,8 @@ export async function ingestLocalUnifiedIndexIncrement({
               );
             }
           }
+          const parentModelAt = selectedSeed.seedModel === null
+            ? await parentModels.forSource(info) : null;
           const outcome = await withStableRolloutSource(info, (source) => (
             extractRolloutUsage(source, {
             size: Number(info.size ?? 0),
@@ -1584,6 +1588,7 @@ export async function ingestLocalUnifiedIndexIncrement({
               state.sessionLocal,
             ),
             ...selectedSeed,
+            parentModelAt,
             seedCompactionPending: resuming ? carriedCompaction(cursor) : null,
             seedTurnContextPending: resuming
               && carriedTurnContextPending(cursor),
