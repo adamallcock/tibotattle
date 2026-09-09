@@ -1309,7 +1309,7 @@ test("normal candidate firewall setup and cleanup use their dedicated bounded bu
   }
 });
 
-test("normal candidate CDP selection accepts the real trailing-slash root and rejects other origins", () => {
+test("normal candidate CDP selection accepts only the fixed Settings general fragment", () => {
   const targets = [
     {
       type: "page",
@@ -1328,11 +1328,20 @@ test("normal candidate CDP selection accepts the real trailing-slash root and re
   ], 9222), undefined);
   const settings = {
     type: "page",
-    url: "http://127.0.0.1:43123/electron-settings.html",
+    url: "http://127.0.0.1:43123/electron-settings.html#general",
     webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/settings",
   };
   assert.equal(selectWindowsNormalCandidateSettingsTarget([settings], "http://127.0.0.1:43123", 9222), settings);
   assert.equal(selectWindowsNormalCandidateSettingsTarget([settings], "http://127.0.0.1:43124", 9222), undefined);
+  for (const url of [
+    "http://127.0.0.1:43123/electron-settings.html",
+    "http://127.0.0.1:43123/electron-settings.html#data",
+    "http://127.0.0.1:43123/electron-settings.html?section=general#general",
+  ]) {
+    assert.equal(selectWindowsNormalCandidateSettingsTarget([
+      { ...settings, url },
+    ], "http://127.0.0.1:43123", 9222), undefined);
+  }
 });
 
 test("normal candidate quit protocol accepts only the fixed lifecycle acknowledgement", async () => {
@@ -1416,6 +1425,47 @@ test("normal candidate runner orders firewall coverage around both ordinary laun
     errorCode: null,
     productionReady: false,
   });
+});
+
+test("normal candidate receipt retains completed dashboard proof when Settings fails", async () => {
+  let receipt = null;
+  const errorCode = "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_SETTINGS_UNAVAILABLE";
+  await assert.rejects(() => runWindowsNormalCandidateSmoke(smokeOptions(), {
+    platform: "win32",
+    architecture: "x64",
+    environment: { GITHUB_ACTIONS: "true", RUNNER_TEMP: String.raw`C:\\runner\\temp` },
+    ensureReceiptParent: async () => {},
+    reserveReceipt: async () => ({
+      writeFile: async (value) => { receipt = JSON.parse(value); },
+      sync: async () => {},
+      close: async () => {},
+    }),
+    verifyPackage: async () => ({ sourceRevision: SOURCE_REVISION, artifactSha256: "a".repeat(64), executableSha256: "b".repeat(64) }),
+    createRoot: async () => String.raw`C:\\runner\\temp\\owned`,
+    prepareProfile: async () => ({ root: String.raw`C:\\runner\\temp\\owned\\profile` }),
+    seedCodexFixture: async () => {},
+    seedProfile: async () => ({ shareBackend: {} }),
+    assertProcessAbsence: async () => true,
+    installFirewall: async () => FIREWALL_RULE,
+    launchJourney: async ({ candidateState }) => {
+      candidateState.dashboardRendered = true;
+      candidateState.localRefreshObserved = true;
+      candidateState.localRefreshTerminal = "succeeded";
+      candidateState.quiescent = true;
+      throw Object.assign(new Error("settings unavailable"), { code: errorCode });
+    },
+    verifyOptOut: async () => true,
+    removeFirewall: async () => true,
+    removeProfile: async () => {},
+  }), { code: errorCode });
+  assert.equal(receipt.packagedElectronExecutionVerified, false);
+  assert.equal(receipt.dashboardRendered, true);
+  assert.equal(receipt.localRefreshObserved, true);
+  assert.equal(receipt.localRefreshTerminal, "succeeded");
+  assert.equal(receipt.settingsPersistedAcrossRestart, false);
+  assert.equal(receipt.durableContributionOptOutRetained, false);
+  assert.equal(receipt.loopbackJourneyVerified, false);
+  assert.equal(receipt.errorCode, errorCode);
 });
 
 test("normal candidate runner retains the outbound block and profile when process cleanup is uncertain", async () => {

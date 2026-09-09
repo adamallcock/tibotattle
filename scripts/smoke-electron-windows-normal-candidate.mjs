@@ -1325,7 +1325,11 @@ export function selectWindowsNormalCandidateSettingsTarget(targets, dashboardOri
       const page = new URL(target.url);
       return page.protocol === "http:" && page.hostname === "127.0.0.1"
         && page.origin === dashboard.origin && page.pathname === "/electron-settings.html"
-        && page.search === "" && page.hash === "" && page.username === "" && page.password === ""
+        // The fixed dashboard action always asks the lifecycle for its
+        // general Settings section. The lifecycle encodes that fixed section
+        // in the fragment, so require it rather than accepting another
+        // Settings destination or waiting forever for a fragment-free page.
+        && page.search === "" && page.hash === "#general" && page.username === "" && page.password === ""
         && exactDebuggerWebSocket(target.webSocketDebuggerUrl, debugPort);
     } catch {
       return false;
@@ -2383,6 +2387,14 @@ async function launchAndRenderCandidate({
     const dashboard = await assertDashboard({ cdp, target: connected.target, fetchImpl,
       launch: changeSettings ? "first" : "restart" });
     observer = dashboard.observer;
+    // Preserve only completed, closed dashboard proof before the separate
+    // Settings journey. A later Settings failure must not erase evidence that
+    // its ordinary refresh and rendered dashboard already passed.
+    if (candidateState !== null) {
+      candidateState.dashboardRendered = true;
+      candidateState.localRefreshObserved = true;
+      candidateState.localRefreshTerminal = dashboard.refreshTerminalStatus;
+    }
     const sharingOptOutRetained = await assertRenderedSharingOptOut(cdp);
     tracked = await processProof({
       appPath,
@@ -2503,11 +2515,17 @@ function candidateReceipt({
   sourceRevision,
   identity = null,
   journey = null,
+  progress = null,
   errorCode = null,
   cleanup = {},
   startupDiagnostic = null,
   startupCompletionDiagnostic = null,
 } = {}) {
+  const terminal = ["succeeded", "degraded"].includes(journey?.localRefreshTerminal)
+    ? journey.localRefreshTerminal
+    : ["succeeded", "degraded"].includes(progress?.localRefreshTerminal)
+      ? progress.localRefreshTerminal
+      : null;
   return Object.freeze({
     schemaVersion: RECEIPT_SCHEMA,
     status: errorCode === null ? "passed" : "failed",
@@ -2518,11 +2536,9 @@ function candidateReceipt({
     executableSha256: identity?.executableSha256 ?? null,
     packageArtifactVerified: identity !== null,
     packagedElectronExecutionVerified: journey !== null,
-    dashboardRendered: journey?.dashboardRendered === true,
-    localRefreshObserved: journey?.localRefreshObserved === true,
-    localRefreshTerminal: ["succeeded", "degraded"].includes(journey?.localRefreshTerminal)
-      ? journey.localRefreshTerminal
-      : null,
+    dashboardRendered: journey?.dashboardRendered === true || progress?.dashboardRendered === true,
+    localRefreshObserved: journey?.localRefreshObserved === true || progress?.localRefreshObserved === true,
+    localRefreshTerminal: terminal,
     settingsPersistedAcrossRestart: journey?.settingsPersisted === true,
     durableContributionOptOutRetained: journey?.optOutRetained === true,
     loopbackJourneyVerified: journey?.loopbackJourneyVerified === true,
@@ -2589,7 +2605,13 @@ export async function runWindowsNormalCandidateSmoke(options, {
   let startupDiagnostic = null;
   let startupCompletionDiagnostic = null;
   const cleanup = { firewallInstalled: false, firewallRemoved: false, profileRemoved: false };
-  const candidateState = { quiescent: false, tracked: null };
+  const candidateState = {
+    quiescent: false,
+    tracked: null,
+    dashboardRendered: false,
+    localRefreshObserved: false,
+    localRefreshTerminal: null,
+  };
   try {
     identity = await verifyPackage(options);
     root = await createRoot(environment.RUNNER_TEMP);
@@ -2663,6 +2685,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
       sourceRevision: options?.sourceRevision ?? null,
       identity,
       journey,
+      progress: candidateState,
       errorCode,
       cleanup,
       startupDiagnostic,
