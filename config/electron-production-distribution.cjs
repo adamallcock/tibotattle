@@ -9,6 +9,11 @@
 const PRODUCTION_ELECTRON_DISTRIBUTION_SCHEMA_VERSION =
   "tibotattle-electron-distribution-v1";
 const PRODUCTION_ELECTRON_APP_ID = "com.usagemonitor.local";
+// Windows uses the same fixed product identity for its NSIS installation and
+// Electron toast registration. Keeping this value in the distribution policy
+// prevents separately-reviewed packaging and runtime paths from drifting.
+const PRODUCTION_ELECTRON_WINDOWS_TOAST_ACTIVATOR_CLSID =
+  "FDA705D7-5644-50E8-8CD2-3005D51B98C5";
 const PRODUCTION_ELECTRON_CHANNEL = "stable";
 const PRODUCTION_ELECTRON_CONTRIBUTION_POLICY = "accountless-opt-out-v1";
 const PRODUCTION_ELECTRON_UPDATE_ORIGIN = "https://updates.tibotattle.com";
@@ -356,6 +361,7 @@ module.exports = Object.freeze({
   ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_SCHEMA_VERSION,
   ACCOUNTLESS_SIGNED_STAGING_REHEARSAL_TARGET,
   PRODUCTION_ELECTRON_APP_ID,
+  PRODUCTION_ELECTRON_WINDOWS_TOAST_ACTIVATOR_CLSID,
   PRODUCTION_ELECTRON_BUILD_NUMBER_PATTERN,
   PRODUCTION_ELECTRON_CHANNEL,
   PRODUCTION_ELECTRON_CONTRIBUTION_POLICY,

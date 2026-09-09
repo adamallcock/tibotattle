@@ -1,6 +1,8 @@
 const { readFileSync } = require("node:fs");
 const path = require("node:path");
 
+const distribution = require("../../config/electron-production-distribution.cjs");
+
 const REPOSITORY_ROOT = path.resolve(__dirname, "../..");
 const INVALID_CONFIG_CODE = "windows_release_builder_config_invalid";
 const INVALID_CONFIG_MESSAGE = "Windows release builder configuration is invalid";
@@ -336,7 +338,7 @@ module.exports = {
     },
   },
   nsis: {
-    guid: "FDA705D7-5644-50E8-8CD2-3005D51B98C5",
+    guid: distribution.PRODUCTION_ELECTRON_WINDOWS_TOAST_ACTIVATOR_CLSID,
     artifactName: "TiboTattle-${version}-Windows-x64.${ext}",
     // electron-builder's `protocols` metadata is macOS/AppX-oriented and is
     // not consumed by its NSIS target. This supported include hook adds one

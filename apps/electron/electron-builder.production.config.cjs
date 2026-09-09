@@ -416,7 +416,7 @@ if (INPUTS.targetSpec.platform === "win32") {
     verifyUpdateCodeSignature: true,
   };
   configuration.nsis = {
-    guid: "FDA705D7-5644-50E8-8CD2-3005D51B98C5",
+    guid: distribution.PRODUCTION_ELECTRON_WINDOWS_TOAST_ACTIVATOR_CLSID,
     oneClick: true,
     perMachine: false,
     allowElevation: false,
