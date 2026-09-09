@@ -1,0 +1,31 @@
+{
+  "schemaVersion": "admin-reconstruction-progress-v0.1",
+  "status": "available",
+  "observedAt": "2026-09-06T12:00:00.000Z",
+  "mode": "resumable",
+  "lookup": { "complete": true, "lastRecordId": 1200, "throughRecordId": 1200 },
+  "calculations": {
+    "trackedAccounts": 8,
+    "completedAccounts": 3,
+    "preparingAccounts": 1,
+    "scanningAccounts": 2,
+    "finalizingAccounts": 1,
+    "sourceChangedAccounts": 1,
+    "checkpointsWritten": 42,
+    "bounded": false,
+    "newestResultAt": "2026-09-06T11:58:00.000Z"
+  },
+  "maintenance": {
+    "running": true,
+    "lastRunAt": "2026-09-06T11:59:00.000Z",
+    "leaseExpiresAt": "2026-09-06T12:04:00.000Z"
+  },
+  "publication": {
+    "state": "updating",
+    "pendingDays": 5,
+    "pendingDaysBounded": false,
+    "publishedDays": 10,
+    "pricedDays": 7,
+    "latestPublishedAt": "2026-09-06T11:55:00.000Z"
+  }
+}

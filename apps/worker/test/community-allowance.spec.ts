@@ -35,7 +35,14 @@ import {
   V1_USAGE_PAGE_AFTER_TIME_SQL,
   readV1UsagePage,
   priceChunkUsageRecord,
+  finishAccountScopedQuotaAnalysisV1,
+  finishAccountScopedModelCompositionV1,
+  v1QuotaFinishQueryReserve,
+  V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+  type V1AcquiredQuotaEvidence,
 } from "../src/quota-analysis-v1";
+import { advanceV1QuotaAcquisition, type V1QuotaAcquisitionCheckpoint } from "../src/quota-analysis-v1-reader";
+import { backfillV1QuotaFitProjection, createV1QuotaPageReader } from "../src/quota-fit-projection";
 import { loadV1SourcePin } from "../src/telemetry-v1-source-selection";
 import { createV11DeviceFixture } from "./helpers/telemetry-v11";
 import { grantTelemetryV11Consent, telemetryTransportCapabilities } from "../src/telemetry-transport-policy";
@@ -1105,6 +1112,122 @@ async function seedThreeV1Resets(
 }
 
 describe("community allowance from the v1.0 chunk corpus", () => {
+  it("finishes acquired quota with exact scalar/composition parity and one shared query reserve", async () => {
+    const participantId = await seedV1Participant("acquired-finish");
+    await seedV1Session(participantId, "v1-session-acquired");
+    await seedV1Device(participantId, "v1-device-acquired", "v1-session-acquired");
+    await seedThreeV1Resets(participantId, "v1-device-acquired", 5, "acquired");
+    const nowMs = SCALE_NOW;
+    const observedAtCutoff = new Date(nowMs - V1_ANALYSIS_WINDOW_DAYS * DAY_MS).toISOString().slice(0, 10) + "T00:00:00.000Z";
+    const sourcePin = await loadV1SourcePin(db(), { participantId, fromDay: observedAtCutoff.slice(0, 10) });
+    const identity = { participantId, inputFingerprint: sourcePin.fingerprint,
+      sourceMethodVersion: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION, observedAtCutoff,
+      resetsAtCutoff: new Date(Date.parse(observedAtCutoff) + 7 * DAY_MS).toISOString(),
+      windowMinutes: 10_080, maxQuotaRows: MAX_DOWNSAMPLED_QUOTA_ROWS };
+    expect((await backfillV1QuotaFitProjection(db())).status).toBe("complete");
+    const reader = await createV1QuotaPageReader(db(), participantId);
+    const winners = new Map(sourcePin.winners.map(winner => [winner.observed_day, winner.device_id]));
+    const readBudget = { remainingQueries: 30, deadlineMs: Date.now() + 60_000 };
+    let checkpoint: V1QuotaAcquisitionCheckpoint | undefined;
+    let evidence: V1AcquiredQuotaEvidence | undefined;
+    for (let step = 0; step < 8; step++) {
+      const result = await advanceV1QuotaAcquisition(reader, identity, winners, readBudget, checkpoint);
+      if (result.status === "complete") {
+        evidence = { identity, acquisition: { planAnchors: result.planAnchors, quotaRows: result.quotaRows } };
+        break;
+      }
+      expect(result.status).toBe("deferred");
+      if (result.status === "deferred") checkpoint = result.checkpoint;
+    }
+    expect(evidence).toBeDefined();
+    const scalarReference = await accountScopedQuotaAnalysisV1FullReferenceForTest(db(), participantId);
+    const compositionReference = await accountScopedModelCompositionV1(db(), participantId, { nowMs, sourcePin });
+    expect(compositionReference.status).toBe("ready");
+    if (compositionReference.status === "ready") expect(compositionReference.usageEventCount).toBeGreaterThan(0);
+    const sql: string[] = [];
+    const monitored = new Proxy(db(), {
+      get(target, key) {
+        if (key === "prepare") return (query: string) => {
+          sql.push(query);
+          expect(query).not.toBe(QUOTA_DOWNSAMPLE_SQL);
+          expect(query).not.toContain("WITH plan_times AS MATERIALIZED");
+          return target.prepare(query);
+        };
+        const value: unknown = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const budget = { remainingQueries: 1000, deadlineMs: Date.now() + 60_000 };
+    for (const finish of [finishAccountScopedQuotaAnalysisV1, finishAccountScopedModelCompositionV1]) {
+      for (const missing of [undefined, null, false, {}, { identity, acquisition: undefined }]) {
+        const before = sql.length;
+        await expect(Reflect.apply(finish, undefined, [monitored, participantId, missing,
+          budget, { nowMs, sourcePin }])).rejects.toThrow("evidence required");
+        expect(sql.length).toBe(before);
+        expect(budget.remainingQueries).toBe(1000);
+      }
+      for (const maxDownsampledQuotaRows of [0, -1, 60_001, Infinity, 1.5, NaN]) {
+        const before = sql.length;
+        await expect(Reflect.apply(finish, undefined, [monitored, participantId, evidence,
+          budget, { nowMs, sourcePin, maxDownsampledQuotaRows }])).rejects.toThrow("quota bound invalid");
+        expect(sql.length).toBe(before);
+        expect(budget.remainingQueries).toBe(1000);
+      }
+      const before = sql.length;
+      await expect(Reflect.apply(finish, undefined, [monitored, participantId, evidence,
+        { ...budget, now: () => NaN }, { nowMs, sourcePin }])).rejects.toThrow("budget clock invalid");
+      expect(sql.length).toBe(before);
+    }
+    expect(v1QuotaFinishQueryReserve()).toBe(407);
+    const scalar = await finishAccountScopedQuotaAnalysisV1(monitored, participantId, evidence!, budget, { nowMs, sourcePin });
+    expect(scalar.status).toBe("complete");
+    if (scalar.status !== "complete") throw new Error("scalar unexpectedly deferred");
+    expect(bandResets(scalar.analysis as AnalysisLike)).toEqual(bandResets(scalarReference as AnalysisLike));
+    expect(bandResets(scalar.analysis as AnalysisLike).length).toBeGreaterThanOrEqual(3);
+    expect(scalar.analysis).toMatchObject({ attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+      inputFingerprint: sourcePin.fingerprint });
+    expect(budget.remainingQueries).toBe(593);
+    const composition = await finishAccountScopedModelCompositionV1(monitored, participantId, evidence!, budget, { nowMs, sourcePin });
+    expect(composition.status).toBe("complete");
+    if (composition.status !== "complete") throw new Error("composition unexpectedly deferred");
+    expect(composition.analysis).toEqual(compositionReference.status === "ready"
+      ? { ...compositionReference, attributionMethod: V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION } : compositionReference);
+    expect(budget.remainingQueries).toBe(186);
+    const before = sql.length;
+    expect(await finishAccountScopedQuotaAnalysisV1(monitored, participantId, evidence!, budget, { nowMs, sourcePin }))
+      .toEqual({ status: "deferred" });
+    expect(sql.length).toBe(before);
+    expect(budget.remainingQueries).toBe(186);
+    const mismatch = { ...evidence!, identity: { ...identity, inputFingerprint: "0".repeat(64) } };
+    await expect(finishAccountScopedQuotaAnalysisV1(monitored, participantId, mismatch,
+      { remainingQueries: 407, deadlineMs: Date.now() + 60_000 }, { nowMs, sourcePin })).rejects.toThrow("evidence mismatch");
+    // A source revision can change after the initial pin check even when the
+    // analysis exits early as not_testable. Such a refusal is not cache-ready.
+    for (const finish of [finishAccountScopedQuotaAnalysisV1, finishAccountScopedModelCompositionV1]) {
+      const freshPin = await loadV1SourcePin(db(), { participantId, fromDay: observedAtCutoff.slice(0, 10) });
+      const freshEvidence = { ...evidence!, identity: { ...identity, inputFingerprint: freshPin.fingerprint } };
+      let batchReads = 0;
+      const changing = new Proxy(monitored, {
+        get(target, key) {
+          if (key === "batch") return async (statements: D1PreparedStatement[]) => {
+            const result = await target.batch(statements);
+            if (++batchReads === 1) {
+              await db().prepare("UPDATE community_analytical_input_versions SET revision = revision + 1 WHERE participant_id = ?")
+                .bind(participantId).run();
+            }
+            return result;
+          };
+          const value: unknown = Reflect.get(target, key);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      await expect(Reflect.apply(finish, undefined, [changing, participantId, freshEvidence,
+        { remainingQueries: 7, deadlineMs: Date.now() + 60_000 },
+        { nowMs, sourcePin: freshPin, maxWindowedUsageRows: 0 }])).rejects.toThrow("source changed during analysis");
+      expect(batchReads).toBe(2);
+    }
+  });
+
   it("collects fits from a v1-only participant and draws the day band", async () => {
     const participantId = await seedV1Participant("solo");
     await seedV1Session(participantId, "v1-session-solo");
@@ -1739,7 +1862,7 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
       QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp, 1).all()).results).toEqual([]);
   });
 
-  it("reduces dense quota before materializing and preserves exact run endpoints and fits", async () => {
+  it("preserves exact dense quota run endpoints and fits after the query rollback", async () => {
     const participantId = await newV1Participant("quota-working-set");
     const device = "v1-device-quota-working-set";
     const baseMs = SCALE_NOW - 2 * DAY_MS;
@@ -1750,40 +1873,9 @@ describe("v1 analyzer scale fix — fit-preserving reduction", () => {
       usageOffsetMs: 500, gridExactLevels: [3, 8] });
     await seedChunkedRecords(participantId, device, "quota", day, dense.quota);
     await seedChunkedRecords(participantId, device, "usage", day, dense.usage);
-    const pin = await loadV1SourcePin(db(), { participantId, fromDay: day });
-    const markers = JSON.stringify([["openai_codex", "codex", "pro", "unknown", "synthetic-era", "", null, 1]]);
-    const cutoff = new Date(SCALE_NOW - V1_ANALYSIS_WINDOW_DAYS * DAY_MS)
-      .toISOString().slice(0, 10) + "T00:00:00.000Z";
-    const plan = await db().prepare("EXPLAIN QUERY PLAN " + QUOTA_DOWNSAMPLE_SQL)
-      .bind(markers, pin.winnersJson, participantId, cutoff,
-        new Date(Date.parse(cutoff) + 7 * DAY_MS).toISOString(), 10_080,
-        QUOTA_CALIBRATION_POLICY.minimumBoundaries,
-        QUOTA_CALIBRATION_POLICY.minimumDisplayedSpanPp,
-        MAX_DOWNSAMPLED_QUOTA_ROWS + 1)
-      .all<{ id: number; parent: number; detail: string }>();
-    const materialized = plan.results.map((row) => row.detail)
-      .filter((detail) => detail.startsWith("MATERIALIZE "));
-    // No wide raw/assigned/survivor table may be retained before the dense
-    // stream is reduced. The bounded era vector and endpoint table may be.
-    expect(materialized).not.toEqual([]);
-    expect(materialized.every((detail) => ["MATERIALIZE era_markers", "MATERIALIZE endpoints", "MATERIALIZE fitable"]
-      .includes(detail)), materialized.join("\n")).toBe(true);
-    expect(plan.results.some(({ detail }) => detail.includes("telemetry_v1_records_participant_stream_observed")
-      && detail.includes("participant_id=? AND stream=? AND observed_at>? AND observed_at<?"))).toBe(true);
-    expect(plan.results.some(({ detail }) => detail.includes("SEARCH r USING INTEGER PRIMARY KEY (rowid=?)"))).toBe(true);
-    const endpointNode = plan.results.find(({ detail }) => detail === "MATERIALIZE endpoints");
-    expect(endpointNode).toBeDefined();
-    const endpointDescendants = new Set([endpointNode!.id]);
-    for (const row of plan.results) {
-      if (endpointDescendants.has(row.parent)) endpointDescendants.add(row.id);
-    }
-    expect(plan.results.filter((row) => endpointDescendants.has(row.id))
-      .some(({ detail }) => /TEMP B-TREE/u.test(detail))).toBe(false);
-    const neighborSeeks = plan.results.filter(({ detail }) => detail.includes("SEARCH n USING INDEX telemetry_v1_records_participant_stream_observed"));
-    expect(neighborSeeks).toHaveLength(4);
-    for (const predicate of ["observed_at=? AND rowid<?", "observed_at=? AND rowid>?", "observed_at>? AND observed_at<?"]) {
-      expect(neighborSeeks.some(({ detail }) => detail.includes(predicate)), predicate).toBe(true);
-    }
+    // The predecessor/successor plan was rolled back after production CPU
+    // resets on sparse partitions. Retain its exact-result regressions, but
+    // do not require the rejected query shape or claim a memory bound here.
     const reducedRows = await downsampleQuotaForTest(db(), participantId, SCALE_NOW);
     expect(reducedRows.map((row) => row.occurrence_id)).toEqual(
       Array.from({ length: 17 }, (_, level) => [

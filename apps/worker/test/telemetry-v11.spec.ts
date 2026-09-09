@@ -25,7 +25,7 @@ let publicJwk: JsonWebKey;
 let publicJwkJson = "";
 let privateJwkJson = "";
 const keyId = "key:synthetic-v11";
-const day = "2026-08-28";
+let day: string;
 
 beforeAll(async () => {
   const pair = await crypto.subtle.generateKey({ name: "RSA-OAEP", modulusLength: 2048,
@@ -38,6 +38,9 @@ beforeAll(async () => {
   privateJwkJson = JSON.stringify({ ...await crypto.subtle.exportKey("jwk", pair.privateKey), kid: keyId });
 });
 beforeEach(async () => {
+  // The domain extends through today. Keep its synthetic history bounded as
+  // calendar time advances, without changing the real request-limit bindings.
+  day = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
   await reset();
   await applyD1Migrations(db(), bindings().TEST_MIGRATIONS);
   await applyD1Migrations(bindings().DELETION_LEDGER, bindings().TEST_DELETION_LEDGER_MIGRATIONS);
@@ -399,7 +402,8 @@ describe("staged attribution transport and enrollment floor", () => {
     const fixture = await createV11DeviceFixture(db(), { grant: true });
     const quota: TelemetryV11QuotaObservation = { schemaVersion: "quota-observation-v1.1", observationId: `quota-occurrence:v1:${"b".repeat(64)}`,
       observedTime: `${day}T12:05:00.000Z`, provider: "openai_codex", planType: "plus", planVariant: "unknown",
-      limitId: "codex", slot: "secondary", usedPercent: 12, windowDurationMinutes: 10080, resetsAt: "2026-08-31T12:00:00.000Z",
+      limitId: "codex", slot: "secondary", usedPercent: 12, windowDurationMinutes: 10080,
+      resetsAt: new Date(Date.parse(`${day}T12:00:00.000Z`) + 3 * 86_400_000).toISOString(),
       accountPlanAttribution: { accountBasis: "unavailable", accountTrackId: null,
         planBasis: "same_source_occurrence", planType: "plus", planEraId: null } };
     const candidate = await stageV11Day(db(), fixture, await makeV11Day(day, { quota: [quota] }));

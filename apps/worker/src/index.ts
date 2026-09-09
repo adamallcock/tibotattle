@@ -1,3 +1,8 @@
+import { allowanceReconstructionMode } from "./allowance-reconstruction";
+import { createD1InvocationBudget, D1InvocationBudgetExceededError } from "./d1-invocation-budget";
+import { warmCommunityAnalysisCaches } from "./community-analysis-warmer";
+import { COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES, warmCommunityModelHistory } from "./community-model-history";
+import { backfillV1QuotaFitProjection } from "./quota-fit-projection";
 import {
   assertAdmissionBindings,
   assertAttemptAllowed,
@@ -71,6 +76,9 @@ import {
   type CollectionControlReason,
 } from "./admin-operations";
 import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
+import { readAdminReconstructionProgress } from "./admin-reconstruction-progress";
+import { readAdminGraphRefreshProgress } from "./admin-graph-refresh-progress";
+import { retireV1PreparedEvidence } from "./prepared-v1-evidence";
 import { readDistributionAnalytics } from "./distribution-analytics";
 import {
   githubUnavailable,
@@ -296,6 +304,8 @@ import {
   isCurrentCommunityAllowancePublication,
   rebuildPendingCommunityDailyAggregates,
 } from "./community-daily-aggregates";
+import { isCurrentCommunityDailySpend } from "./community-daily-spend";
+import { projectPublicAllowanceGraph } from "./public-allowance-breakdowns";
 import {
   COMMUNITY_ALLOWANCE_BASIS,
   COMMUNITY_ATTRIBUTION_METHOD_VERSION,
@@ -3096,6 +3106,24 @@ async function handleAdminCommunityAllowancePreview(
   });
 }
 
+async function handleAdminReconstructionProgress(
+  request: Request, env: Env, access?: { readonly identityKey: string },
+): Promise<Response> {
+  if (request.method !== "GET") methodNotAllowed(["GET"]);
+  if (access === undefined) {
+    if (!adminIdentityKeyConfigured(Reflect.get(env, "ADMIN_IDENTITY_LINK_KEY"))) {
+      throw new ApiError(503, "ADMIN_NOT_CONFIGURED");
+    }
+    await adminSession(request, env);
+  }
+  const params = [...new URL(request.url).searchParams];
+  const includePreparation = params.length === 1 && params[0]?.[0] === "detail" && params[0]?.[1] === "preparation";
+  if (params.length !== 0 && !includePreparation) throw new ApiError(400, "BODY_INVALID");
+  const progress = await readAdminGraphRefreshProgress(env.USAGE_MONITOR_DB, Date.now(), allowanceReconstructionMode(env),
+    { includePreparation });
+  return jsonResponse(progress, 200, { "cache-control": "no-store", vary: "Cookie" });
+}
+
 async function handleAdminOverview(
   request: Request,
   env: Env,
@@ -3118,7 +3146,7 @@ async function handleAdminOverview(
   }
   const nowEpoch = Date.now();
   const distributionEnabled = env.ENVIRONMENT === "production";
-  const [overview, ingress, githubSnapshot] = await Promise.all([
+  const [overview, ingress, githubSnapshot, reconstruction] = await Promise.all([
     readAdminOverview(env.USAGE_MONITOR_DB, env.DELETION_LEDGER, {
       environment: env.ENVIRONMENT,
       enrollmentMode: env.ENROLLMENT_MODE,
@@ -3131,6 +3159,8 @@ async function handleAdminOverview(
       ? readGithubDistributionSnapshot(env.USAGE_MONITOR_DB, nowEpoch)
         .catch(() => githubUnavailable("unavailable", "GITHUB_SNAPSHOT_UNAVAILABLE"))
       : Promise.resolve(undefined),
+    readAdminReconstructionProgress(env.USAGE_MONITOR_DB, nowEpoch,
+      allowanceReconstructionMode(env)),
   ]);
   const distribution = await readDistributionAnalytics({
     enabled: distributionEnabled,
@@ -3143,7 +3173,7 @@ async function handleAdminOverview(
     githubSnapshot,
   }, nowEpoch);
   return jsonResponse(
-    { ...overview, ingress, distribution },
+    { ...overview, ingress, distribution, reconstruction },
     200,
     { "cache-control": "no-store", vary: "Cookie" },
   );
@@ -3388,24 +3418,32 @@ async function handleCommunityDaily(
   if (rangeDays < 1 || rangeDays > COMMUNITY_DAILY_MAX_RANGE_DAYS) {
     throw new ApiError(400, "BODY_INVALID");
   }
-  // The one public data SELECT reads only this requested precomputed range and
-  // joins the scheduled allowance-publication singleton. Interactive requests
-  // never rescan global history or write readiness state.
+  // Two SELECTs in one snapshot read this precomputed range/readiness plus one
+  // bounded published cache. Interactive requests never analyze history,
+  // duplicate the preview JSON across daily rows, or write readiness state.
+  const nowMs = Date.now();
   const read = await readPublishedCommunityDailyAggregatesWithAllowanceState(
     env.USAGE_MONITOR_DB,
     from,
     to,
   );
-  const today = new Date().toISOString().slice(0, 10);
+  const today = new Date(nowMs).toISOString().slice(0, 10);
   const todayStartMs = Date.parse(`${today}T00:00:00.000Z`);
   const mergedHistoryFrom = new Date(
     todayStartMs
       - (COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS - 1)
         * MILLISECONDS_PER_DAY,
   ).toISOString().slice(0, 10);
-  const allowanceState = isCurrentCommunityAllowancePublication(read.allowancePublicationState, todayStartMs)
+  // The read has already fenced the snapshot against hard invalidation. New
+  // append-only inputs can leave it visible while the next calculation runs.
+  const graph = projectPublicAllowanceGraph(read.allowanceBreakdownsCache, {
+    publishedDays: read.rows.map((row) => row.day), nowMs,
+  });
+  const dailyAllowanceReady = isCurrentCommunityAllowancePublication(read.allowancePublicationState, todayStartMs);
+  const allowanceState = graph !== null || dailyAllowanceReady
     ? "ready"
     : "updating";
+  const allowanceBreakdowns = graph?.breakdowns ?? null;
   const days = read.rows.map((row) => {
     let payload: unknown;
     try {
@@ -3427,16 +3465,23 @@ async function handleCommunityDaily(
         || day.payload === null
         || Array.isArray(day.payload)) continue;
     const publicPayload = { ...day.payload as Record<string, unknown> };
-    // Historical revisions carried a per-plan diagnostic object. It remains
-    // private admin evidence and is never part of the public combined system.
+    // The old diagnostic shape remains private. Only the separate validated,
+    // owner-approved public allowanceBreakdowns contract exposes plan/model
+    // dollar estimates and counts; it never serializes these historical fields.
     delete publicPayload.capacityByPlanType;
+    const spend = publicPayload.apiEquivalentSpend;
+    const totals = publicPayload.totals;
+    if (!isCurrentCommunityDailySpend(spend) || !totals || typeof totals !== "object"
+        || Array.isArray(totals) || (totals as Record<string, unknown>).usageEvents !== spend.usageEvents) {
+      delete publicPayload.apiEquivalentSpend;
+    }
     const allowance = publicPayload.allowance;
     const allowanceBasis = typeof allowance === "object"
         && allowance !== null
         && !Array.isArray(allowance)
       ? (allowance as Record<string, unknown>).basis
       : null;
-    if (allowanceState !== "ready"
+    if (!dailyAllowanceReady
         || allowanceBasis !== COMMUNITY_ALLOWANCE_BASIS) {
       delete publicPayload.allowance;
     }
@@ -3448,13 +3493,16 @@ async function handleCommunityDaily(
       from,
       to,
       allowanceState,
+      allowanceReadState: read.allowanceReadState,
+      ...(allowanceBreakdowns === null ? {} : { allowanceBreakdowns }),
       days,
     },
     200,
     // Every returned revision is immutable, but the latest-revision selection
     // is not: withdrawal and late-data recomputation both move it. A modest
     // shared lifetime keeps the read cheap without pinning a stale revision.
-    { "cache-control": "public, max-age=300" },
+    { "cache-control": read.allowanceReadState === "temporarily_unavailable"
+      ? "no-store" : "public, max-age=300" },
   );
 }
 
@@ -3612,6 +3660,8 @@ async function routeApi(
       return handleAdminMetricsHistory(request, env);
     case "admin_community_allowance_preview":
       return handleAdminCommunityAllowancePreview(request, env);
+    case "admin_reconstruction_progress":
+      return handleAdminReconstructionProgress(request, env);
     case "admin_action":
       return handleAdminAction(request, env);
     case "security_reset":
@@ -3712,11 +3762,16 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
           assertWorkerRouteMethod(request, route);
           return noStore(await handleAdminAction(request, env, { identityKey }));
         }
+        if (route.kind === "exact" && route.id === "admin_reconstruction_progress") {
+          assertWorkerRouteMethod(request, route);
+          return noStore(await handleAdminReconstructionProgress(request, env, { identityKey }));
+        }
       } else if (isAdminSurfacePath(url.pathname)
         || (route.kind === "exact"
           && (route.id === "admin_overview"
             || route.id === "admin_metrics_history"
             || route.id === "admin_community_allowance_preview"
+            || route.id === "admin_reconstruction_progress"
             || route.id === "admin_action"))) {
         throw new ApiError(404, "NOT_FOUND");
       }
@@ -3866,6 +3921,9 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if ([
       "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE",
       "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE",
+      "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE",
+      "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE",
+      "ADMIN_RECONSTRUCTION_PROGRESS_UNAVAILABLE",
     ].includes(apiError.code)) {
       // Expected fail-closed state for read-only admin aggregates. Scheduled
       // maintenance warms each cache; an interactive request never writes a
@@ -4004,6 +4062,51 @@ export async function runScheduledMaintenance(
   env: Env,
   scheduledTime: number,
 ): Promise<ScheduledMaintenanceLog> {
+  const reconstructionMode = allowanceReconstructionMode(env);
+  const queryMeter = createD1InvocationBudget();
+  queryMeter.reserveQueries = 1;
+  const originalEnv = env;
+  env = new Proxy(originalEnv, { get(target, property) {
+    if (property === "USAGE_MONITOR_DB") return queryMeter.wrap(target.USAGE_MONITOR_DB);
+    if (property === "DELETION_LEDGER") return queryMeter.wrap(target.DELETION_LEDGER);
+    return Reflect.get(target, property);
+  } });
+  const maintenanceStartedMs = Date.now();
+  const optionalDeadlineMs = maintenanceStartedMs + 40_000;
+  const phaseTiming = () => {
+    const nowMs = Date.now();
+    return { queriesUsed: queryMeter.queriesUsed,
+      elapsedMs: Math.max(0, nowMs - maintenanceStartedMs),
+      deadlineRemainingMs: Math.max(0, optionalDeadlineMs - nowMs) };
+  };
+  const attemptedMetricCaches = new Set<string>();
+  const warmOwnerMetricCaches = async (phase: "before_analysis" | "after_analysis") => {
+    // These scheduled-only helpers retain their 55-minute self-throttle. A
+    // browser never rebuilds them; at most one attempt per cache per invocation.
+    for (const task of [
+      { event: "admin_metrics_snapshot", current: "SNAPSHOT_CURRENT", unavailable: "SNAPSHOT_UNAVAILABLE", run: captureAdminMetricSnapshot },
+      { event: "admin_metrics_history_cache", current: "HISTORY_CACHE_CURRENT", unavailable: "HISTORY_CACHE_UNAVAILABLE", run: warmAdminMetricsHistoryCache },
+    ]) {
+      if (attemptedMetricCaches.has(task.event)) continue;
+      if (queryMeter.remainingQueries < 40 || Date.now() >= optionalDeadlineMs) {
+        console.log(JSON.stringify({level:"info",event:task.event,phase,outcome:"deferred",
+          code:"OWNER_METRICS_BUDGET_DEFERRED",...phaseTiming()}));
+        continue;
+      }
+      attemptedMetricCaches.add(task.event);
+      const startedQueries = queryMeter.queriesUsed;
+      let code = task.unavailable;
+      try { code = (await task.run(env.USAGE_MONITOR_DB, Date.now())).code; }
+      catch { /* Keep prior cache; diagnostics cannot undo required work. */ }
+      if (code === task.current) continue;
+      const unavailable = code === task.unavailable;
+      const log = {level:unavailable ? "warn" : "info",event:task.event,phase,
+        outcome:unavailable ? "failure" : "success",code,
+        phaseQueries:queryMeter.queriesUsed-startedQueries,...phaseTiming()};
+      if (unavailable) console.warn(JSON.stringify(log));
+      else console.log(JSON.stringify(log));
+    }
+  };
   let lifecycleComplete = false;
   let quarantineRetentionComplete = false;
   let restoreReplayComplete = false;
@@ -4064,94 +4167,9 @@ export async function runScheduledMaintenance(
     const ownedMaintenanceLease = maintenanceLease;
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     await pruneDiagnosticErrors(env.USAGE_MONITOR_DB);
-    // Distribution snapshots are independent owner diagnostics. A transient
-    // GitHub failure must be recorded for the admin view but must never block
-    // deletion retention, object reconciliation, or community publication.
-    try {
-      const distributionSync = await syncGithubDistributionSnapshots(
-        env.USAGE_MONITOR_DB,
-        {
-          enabled: env.ENVIRONMENT === "production",
-          githubApiToken: Reflect.get(env, "DISTRIBUTION_GITHUB_API_TOKEN"),
-        },
-        Date.now(),
-      );
-      if (distributionSync.code === "GITHUB_SYNC_FAILED") {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "github_distribution_sync",
-          outcome: "failure",
-          code: distributionSync.failureCode,
-        }));
-      }
-    } catch {
-      // The regular maintenance work below remains authoritative. The next
-      // overview will surface a snapshot-storage failure as source-unavailable.
-    }
-    // Hourly gauge snapshots for the owner metrics history. Same isolation
-    // contract as the distribution sync: an unavailable snapshot store (or an
-    // unapplied migration 0038) must never block retention, reconciliation,
-    // or publication. The capture self-throttles to hourly and never throws.
-    try {
-      const snapshot = await captureAdminMetricSnapshot(
-        env.USAGE_MONITOR_DB,
-        Date.now(),
-      );
-      if (snapshot.code === "SNAPSHOT_UNAVAILABLE") {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "admin_metric_snapshot",
-          outcome: "failure",
-          code: snapshot.code,
-        }));
-      }
-    } catch {
-      // captureAdminMetricSnapshot reports rather than throws; this guard
-      // exists so no future edit can turn a metrics failure into a
-      // maintenance failure.
-    }
-    // The authenticated browser endpoint reads exactly one singleton cache
-    // row. Rebuilding that row is scheduled work only: it self-throttles to
-    // roughly hourly and any failure remains isolated from retention,
-    // reconciliation, and publication.
-    try {
-      const historyCache = await warmAdminMetricsHistoryCache(
-        env.USAGE_MONITOR_DB,
-        Date.now(),
-      );
-      if (historyCache.code === "HISTORY_CACHE_UNAVAILABLE") {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "admin_metrics_history_cache",
-          outcome: "failure",
-          code: historyCache.code,
-        }));
-      }
-    } catch {
-      // warmAdminMetricsHistoryCache reports rather than throws; preserve this
-      // belt-and-suspenders boundary against future cache implementation edits.
-    }
-    // The merged allowance preview follows the same browser contract: exactly
-    // one singleton aggregate read after authentication. Source-cache scanning
-    // and preview construction happen only here, at a bounded cadence, and a
-    // preview failure cannot impede the service's required maintenance work.
-    try {
-      const allowanceCache = await warmAdminCommunityAllowancePreviewCache(
-        env.USAGE_MONITOR_DB,
-        Date.now(),
-      );
-      if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
-        console.warn(JSON.stringify({
-          level: "warn",
-          event: "admin_allowance_preview_cache",
-          outcome: "failure",
-          code: allowanceCache.code,
-        }));
-      }
-    } catch {
-      // The warmer reports rather than throws. Retain an explicit isolation
-      // guard so future cache changes cannot widen its operational blast radius.
-    }
+    // Required lifecycle work runs before optional analytics and diagnostics.
+    // Catching a memory/time failure after the fact cannot protect work that
+    // never got a chance to execute.
     const handoffPurge = await purgeExpiredIdentityHandoffs(
       env.USAGE_MONITOR_DB,
       // A delayed Cron invocation must still clear handoffs that have expired
@@ -4214,6 +4232,18 @@ export async function runScheduledMaintenance(
     lifecycleComplete = quarantineRetentionComplete
       && restoreReplayComplete;
 
+    // Raw retention revokes derived days immediately via triggers. Drain their
+    // private projections independently of publication/reconstruction switches,
+    // with the same actual-statement meter and lease-release headroom.
+    if (queryMeter.remainingQueries >= 14 && await env.USAGE_MONITOR_DB.prepare(
+      "SELECT 1 AS present FROM sqlite_schema WHERE type='table' AND name='community_prepared_source_days'",
+    ).first<{ present: number }>()) {
+      const retirement = await retireV1PreparedEvidence(env.USAGE_MONITOR_DB,
+        { maxPages: 2, deadlineMs: Date.now() + 5_000 });
+      if (retirement.pagesRun > 0) console.log(JSON.stringify({ level: "info", event: "prepared_evidence_retirement",
+        outcome: retirement.status, pages: retirement.pagesRun, queries: retirement.queriesUsed }));
+    }
+
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     const reconciliation = await reconcilePendingQuarantineObjects(
       env.USAGE_MONITOR_DB,
@@ -4246,17 +4276,147 @@ export async function runScheduledMaintenance(
         env.USAGE_MONITOR_DB,
         scheduledTime,
       );
-      await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
-      const dailyRebuild = await rebuildPendingCommunityDailyAggregates(
-        env.USAGE_MONITOR_DB,
-        scheduledTime,
-      );
-      rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+      if (reconstructionMode !== "paused") {
+        queryMeter.reserveQueries = 12;
+        try {
+          await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
+          if (reconstructionMode === "resumable") {
+            // Budget admissions refresh from actual queries used. Helpers share
+            // their conservative allocation within each phase, while this one
+            // meter enforces the sum across both bindings and ALL phases.
+            const phaseBudget = () => ({ remainingQueries: Math.max(0, queryMeter.remainingQueries), deadlineMs: optionalDeadlineMs });
+            const rebuildModelHistory = async (phase: "before_analysis" | "after_publication") => {
+              const startedQueries = queryMeter.queriesUsed, startedMs = Date.now();
+              const timing = () => ({phaseQueries:queryMeter.queriesUsed-startedQueries,
+                phaseElapsedMs:Math.max(0,Date.now()-startedMs),...phaseTiming()});
+              const deadlineReached = Date.now() >= optionalDeadlineMs;
+              if (deadlineReached || queryMeter.remainingQueries < 64) {
+                console.log(JSON.stringify({level:"info",event:"scheduled_model_history",phase,outcome:"deferred",
+                  code:deadlineReached ? "MODEL_HISTORY_DEADLINE_DEFERRED" : "MODEL_HISTORY_BUDGET_DEFERRED",
+                  ...timing()}));
+                return;
+              }
+              try {
+                const history = await warmCommunityModelHistory(env.USAGE_MONITOR_DB, scheduledTime,
+                  {meter:queryMeter,deadlineMs:optionalDeadlineMs,maintenanceLease:ownedMaintenanceLease});
+                console.log(JSON.stringify({level:"info",event:"scheduled_model_history",phase,outcome:history.status,
+                  code:"BOUNDED_MODEL_HISTORY_PROGRESS",day:history.day,
+                  resolvedAccounts:history.resolvedAccounts,requiredAccounts:history.requiredAccounts,
+                  publishedDays:history.publishedDays,...timing()}));
+              } catch (error) {
+                console.warn(JSON.stringify({level:"warn",event:"scheduled_model_history",phase,outcome:"deferred",
+                  code:error instanceof D1InvocationBudgetExceededError ? error.code : "MODEL_HISTORY_UNAVAILABLE",
+                  ...timing()}));
+              }
+            };
+            const publishPreview = async (phase: "before_analysis" | "after_analysis") => {
+              const startedQueries = queryMeter.queriesUsed;
+              const result = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime,
+                {mode:"cache-only",budget:phaseBudget()});
+              if (result.code !== "ALLOWANCE_PREVIEW_CACHE_CURRENT") {
+                const unavailable = result.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE";
+                const log = {level:unavailable ? "warn" : "info",event:"admin_allowance_preview_cache",phase,
+                  outcome:unavailable ? phase === "before_analysis" ? "deferred" : "failure" : "success",
+                  code:result.code,phaseQueries:queryMeter.queriesUsed-startedQueries,...phaseTiming()};
+                if (unavailable) console.warn(JSON.stringify(log));
+                else console.log(JSON.stringify(log));
+              }
+              return result;
+            };
+            // Rotate first use of the same optional budget across previews,
+            // current accounts and historical models. History must sometimes
+            // precede the current probes/daily publisher so its non-resumable
+            // finish can be admitted. Required lifecycle work stays above every
+            // slot; no lane gains a separate deadline or runs in parallel.
+            const optionalPriority = Math.floor(scheduledTime / 60_000) % COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES;
+            const historyFirst = optionalPriority === COMMUNITY_MODEL_HISTORY_PRIORITY_CYCLE_MINUTES - 1;
+            if (historyFirst) await rebuildModelHistory("before_analysis");
+            const priorPreview = optionalPriority === 0
+              ? await publishPreview("before_analysis")
+              : null;
+            // The independent growth-history cache has the same expiry risk.
+            // Give it an early chance only on preview-first passes, retaining
+            // the current/history-first budgets and the late fallback.
+            if (priorPreview !== null) await warmOwnerMetricCaches("before_analysis");
+            try {
+              if (queryMeter.remainingQueries >= 249 && Date.now() < optionalDeadlineMs) {
+              let backfill = await backfillV1QuotaFitProjection(env.USAGE_MONITOR_DB);
+              // Fill the cheap lookup progressively without spending one minute
+              // per tiny batch. Every helper call remains <=49 statements and
+              // <=4096 physical rows/page; the actual shared meter bounds the sum.
+              for (let pass=1;pass<8 && backfill.status!=="complete"
+                && queryMeter.remainingQueries>=249 && Date.now()<optionalDeadlineMs;pass++) {
+                backfill=await backfillV1QuotaFitProjection(env.USAGE_MONITOR_DB);
+              }
+              if (backfill.status === "complete" && queryMeter.remainingQueries >= 50) {
+                const warming = await warmCommunityAnalysisCaches(env.USAGE_MONITOR_DB, scheduledTime,
+                  {meter:queryMeter,deadlineMs:optionalDeadlineMs,maintenanceLease});
+                console.log(JSON.stringify({level:"info",event:"scheduled_allowance_reconstruction",outcome:warming.status,
+                  code:"BOUNDED_ANALYSIS_PROGRESS",visited:warming.visited,published:warming.published,
+                  resumed:warming.resumed,...phaseTiming()}));
+              }
+              }
+            } catch (error) {
+              // A stale/corrupt account or unavailable lookup must not prevent
+              // publishing other already-complete evidence or new activity.
+              console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
+                stage:"analysis",code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
+                ...phaseTiming()}));
+            }
+            if (priorPreview === null || priorPreview.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
+              await publishPreview("after_analysis");
+            }
+            const dailyStartedQueries = queryMeter.queriesUsed;
+            const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
+              24, undefined, {mode:"cache-only",budget:phaseBudget()});
+            console.log(JSON.stringify({level:"info",event:"scheduled_daily_publication",
+              outcome:dailyRebuild.deferred ? "deferred" : "complete",code:"BOUNDED_DAILY_PUBLICATION_PROGRESS",
+              processed:dailyRebuild.processed,remaining:dailyRebuild.remaining,
+              phaseQueries:queryMeter.queriesUsed-dailyStartedQueries,...phaseTiming()}));
+            if (dailyRebuild.deferred && queryMeter.remainingQueries >= 100 && Date.now() < optionalDeadlineMs) {
+              await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
+                4, undefined, {mode:"activity-only",budget:phaseBudget()});
+            }
+            rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+            // Use spare resources in the other slots, but never retry an early
+            // history attempt in this invocation, including after a failure.
+            if (!historyFirst) await rebuildModelHistory("after_publication");
+          } else {
+            const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime);
+            rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+            const allowanceCache = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime);
+            if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
+              console.warn(JSON.stringify({level:"warn",event:"admin_allowance_preview_cache",outcome:"failure",code:allowanceCache.code}));
+            }
+          }
+        } catch (error) {
+          // Optional reconstruction cannot undo successful essential maintenance.
+          // All incomplete work/cache/publication writes are independently fenced.
+          console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
+            code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
+            queriesUsed:queryMeter.queriesUsed}));
+        }
+      } else {
+        console.log(JSON.stringify({level:"info",event:"scheduled_allowance_reconstruction",outcome:"paused",
+          code:"ALLOWANCE_RECONSTRUCTION_PAUSED"}));
+      }
     } else {
-      rebuildComplete = await aggregateRebuildComplete(
+      rebuildComplete = reconstructionMode !== "paused" && await aggregateRebuildComplete(
         env.USAGE_MONITOR_DB,
       );
     }
+
+    // Independent owner diagnostics retain their cadence and failure isolation,
+    // but no longer precede deletion, retention, or source reconciliation.
+    queryMeter.reserveQueries = 1;
+    if (queryMeter.remainingQueries >= 40 && Date.now() < optionalDeadlineMs) {
+      try {
+        const sync = await syncGithubDistributionSnapshots(env.USAGE_MONITOR_DB,
+          {enabled:env.ENVIRONMENT === "production",githubApiToken:Reflect.get(env,"DISTRIBUTION_GITHUB_API_TOKEN")}, Date.now());
+        if (sync.code === "GITHUB_SYNC_FAILED") console.warn(JSON.stringify({level:"warn",event:"github_distribution_sync",outcome:"failure",code:sync.failureCode}));
+      } catch { /* Optional diagnostics never block maintenance. */ }
+    }
+    await warmOwnerMetricCaches("after_analysis");
 
     const complete = lifecycleComplete
       && quarantineReconciliationComplete
@@ -4326,6 +4486,7 @@ export async function runScheduledMaintenance(
     console.error(JSON.stringify(log));
     throw error;
   } finally {
+    queryMeter.reserveQueries = 0;
     if (maintenanceLease !== null) {
       try {
         // A successor may have acquired an expired lease while this pass was

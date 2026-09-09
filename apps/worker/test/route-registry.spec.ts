@@ -123,6 +123,12 @@ const EXACT_ROUTES = [
     authority: "admin",
   },
   {
+    pathname: "/api/v1/admin/reconstruction-progress",
+    id: "admin_reconstruction_progress",
+    methods: ["GET"],
+    authority: "admin",
+  },
+  {
     pathname: "/api/v1/admin/action",
     id: "admin_action",
     methods: ["POST"],
@@ -246,7 +252,7 @@ const EXACT_ROUTES = [
 
 describe("Worker route registry", () => {
   it("recognizes every exact route and preserves stable log classifications", () => {
-    expect(EXACT_ROUTES).toHaveLength(39);
+    expect(EXACT_ROUTES).toHaveLength(40);
     expect(WORKER_ROUTE_POLICY).toEqual(EXACT_ROUTES);
     expect(Object.isFrozen(WORKER_ROUTE_POLICY)).toBe(true);
     for (const definition of WORKER_ROUTE_POLICY) {

@@ -80,7 +80,11 @@ async function importAdminModule() {
   try {
     const moduleUrl = new URL("../public/admin.js", import.meta.url);
     moduleUrl.search = `?admin-growth-test=${process.hrtime.bigint()}`;
-    return await import(moduleUrl.href);
+    const module = await import(moduleUrl.href);
+    // The bounded request lane deliberately separates read completion from
+    // publication. Drain initialization before restoring this fake page.
+    await new Promise(resolve => setImmediate(resolve));
+    return module;
   } finally {
     globalThis.document = previous.document;
     globalThis.fetch = previous.fetch;
@@ -303,23 +307,23 @@ test("the growth loader wiring stays pinned to the metrics-history contract", as
   );
   // The loader fetches the registered route, validates the schema version,
   // and stays gated off outside the admin page.
-  assert.match(source, /request\("\/api\/v1\/admin\/metrics\/history"\)/u);
+  assert.match(source, /request\("\/api\/v1\/admin\/metrics\/history", \{ signal \}\)/u);
   assert.match(
     source,
     /GROWTH_SCHEMA_VERSION = "admin-metrics-history-v0\.2"/u,
   );
   assert.match(
     source,
-    /async function loadGrowthHistory\(loadGeneration\) \{\n  if \(!isAdminPage\) return;/u,
+    /async function loadGrowthHistory\(\) \{\n  if \(!isAdminPage\) return;/u,
   );
   assert.match(
     source,
-    /isCurrentLoadGeneration\(loadGeneration, state\.loadGeneration\)/u,
+    /history: createAdminReadLane\(/u,
   );
-  assert.match(
+  assert.doesNotMatch(
     source,
     /state\.metricsHistory = undefined;\n    render\(overview\);/u,
-    "a new overview cannot temporarily reuse the prior refresh's history",
+    "an ordinary overview refresh must not erase independently dated history",
   );
   assert.match(
     source,

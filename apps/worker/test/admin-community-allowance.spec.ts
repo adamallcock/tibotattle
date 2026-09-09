@@ -7,6 +7,7 @@ import {
   ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_BASIS,
   ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS,
   ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_SCHEMA_VERSION,
+  COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL,
   buildAdminCommunityAllowancePreview,
   buildAdminCommunityAllowancePreviewFromSource,
   readCachedAdminCommunityAllowancePreview,
@@ -156,11 +157,11 @@ function previewWarmDatabase(
       const handle = {
         async first() {
           if (statement === ACTIVE_V11_SOURCE_QUERY) return null;
+          if (statement.includes("admin_community_allowance_preview_cache")) {
+            return stored === null ? null : { ...stored, source_mutation_epoch: 1, mutation_epoch: 1 };
+          }
           if (statement.includes("community_snapshot_mutation_control")) {
             return { mutation_epoch: 1, input_revision: 1 };
-          }
-          if (statement.includes("admin_community_allowance_preview_cache")) {
-            return stored;
           }
           if (statement.includes("community_model_composition_cache")) {
             return null;
@@ -609,10 +610,9 @@ describe("admin community allowance preview", () => {
     );
     expect(cached).toEqual(preview);
     expect(statements).toHaveLength(1);
-    expect(statements[0]).toMatch(
-      /^\s*SELECT generated_at, payload_json\s+FROM admin_community_allowance_preview_cache/u,
-    );
-    expect(statements[0]).toContain("WHERE singleton = 1");
+    expect(statements[0]).toBe(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL);
+    expect(statements[0]).toContain("WHERE cache.singleton = 1");
+    expect(statements[0]).toContain("cache.source_mutation_epoch >= source.graph_invalidation_epoch");
     expect(statements[0]).toContain("LIMIT 1");
     expect(statements[0]).not.toMatch(
       /\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER|PRAGMA|VACUUM)\b/iu,
@@ -621,7 +621,26 @@ describe("admin community allowance preview", () => {
     expect(JSON.stringify(cached)).not.toContain("participant-1");
   });
 
-  it("fails closed for missing, stale, oversized, corrupt, or non-exact rows", async () => {
+  it("uses reviewed current labels without invalidating analytically identical cached models", async () => {
+    const now=Date.parse("2026-09-07T12:00:00.000Z");
+    const preview=buildAdminCommunityAllowancePreview([fit()],now);
+    const renamed={...preview,models:{...preview.models,
+      modelConfig:preview.models.modelConfig.map(model=>({...model,label:"Previous display label"}))}};
+    const cached=previewCacheDatabase(previewRow(renamed));
+    expect(await readCachedAdminCommunityAllowancePreview(cached.database,now)).toEqual(preview);
+    expect(cached.statements).toHaveLength(1);
+    for(const mutation of [
+      {modelId:"unrecognized-model"}, {allowanceTrack:"unrecognized-track"},
+      {pricingStatus:"unrecognized-pricing"}, {label:""}, {label:"x".repeat(81)},
+    ]) {
+      const invalid=structuredClone(renamed);
+      Object.assign(invalid.models.modelConfig[0]!,mutation);
+      await expect(readCachedAdminCommunityAllowancePreview(previewCacheDatabase(previewRow(invalid)).database,now))
+        .rejects.toMatchObject({status:503,code:"ADMIN_ALLOWANCE_CACHE_UNAVAILABLE"});
+    }
+  });
+
+  it("preserves old evidence dates but fails closed for missing, oversized, corrupt, or non-exact rows", async () => {
     const nowEpoch = Date.parse("2026-08-23T10:30:00.000Z");
     const preview = buildAdminCommunityAllowancePreview([], nowEpoch);
     const withIdentifier = JSON.parse(JSON.stringify(preview)) as Record<
@@ -631,14 +650,13 @@ describe("admin community allowance preview", () => {
     withIdentifier.participantId = "must-not-cross-the-cache-boundary";
     const cases = [
       null,
-      previewRow(buildAdminCommunityAllowancePreview(
-        [],
-        nowEpoch - 3 * 60 * 60 * 1_000,
-      )),
       { generated_at: preview.generatedAt, payload_json: "x".repeat(256 * 1_024 + 1) },
       { generated_at: preview.generatedAt, payload_json: "{" },
       { generated_at: preview.generatedAt, payload_json: JSON.stringify(withIdentifier) },
     ];
+    const previous = buildAdminCommunityAllowancePreview([], nowEpoch - 3 * 86_400_000);
+    await expect(readCachedAdminCommunityAllowancePreview(previewCacheDatabase(previewRow(previous)).database, nowEpoch))
+      .resolves.toEqual(previous);
     for (const row of cases) {
       const { database, statements } = previewCacheDatabase(row);
       await expect(readCachedAdminCommunityAllowancePreview(database, nowEpoch))
@@ -654,11 +672,11 @@ describe("admin community allowance preview", () => {
       nowEpoch,
     )).rejects.toMatchObject({
       status: 503,
-      code: "ADMIN_ALLOWANCE_CACHE_UNAVAILABLE",
+      code: "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE",
     });
   });
 
-  it("scheduled refresh stores the actual bounded aggregate and self-throttles", async () => {
+  it("scheduled refresh stores the actual bounded aggregate and reuses an unchanged source", async () => {
     const nowEpoch = Date.parse("2026-08-23T10:30:00.000Z");
     const source = previewWarmDatabase([cacheRow()]);
     await expect(warmAdminCommunityAllowancePreviewCache(
@@ -681,9 +699,7 @@ describe("admin community allowance preview", () => {
     expect(warmWrites[2]!.trimStart()).toMatch(
       /^INSERT INTO admin_community_allowance_preview_cache\b/u,
     );
-    expect(source.statements[0]).toMatch(
-      /^\s*SELECT generated_at, payload_json\s+FROM admin_community_allowance_preview_cache/u,
-    );
+    expect(source.statements[0]).toBe(COMMUNITY_ALLOWANCE_PREVIEW_CACHE_SQL);
     expect(source.statements[1]).toContain("community_snapshot_mutation_control");
     expect(source.statements[2]).toContain("community_snapshot_mutation_control");
     expect(source.statements[3]!.trimStart()).toMatch(/^WITH\b/u);
@@ -712,7 +728,12 @@ describe("admin community allowance preview", () => {
       current.database,
       nowEpoch + 10 * 60 * 1_000,
     )).resolves.toEqual({ code: "ALLOWANCE_PREVIEW_CACHE_CURRENT" });
-    expect(current.statements).toHaveLength(1);
+    expect(current.statements).toHaveLength(2);
+    expect(current.statements[1]).toMatch(/^SELECT day FROM community_model_composition_days\b/u);
+    expect(current.statements[1]).not.toMatch(/payload_json|telemetry_|\b(?:INSERT|UPDATE|DELETE)\b/u);
+    expect(current.statements[1]).toContain("ORDER BY day DESC LIMIT ?4");
+    expect(current.bindings[1]).toEqual(["2026-06-15", "2026-08-23",
+      COMMUNITY_ATTRIBUTION_METHOD_VERSION, ADMIN_COMMUNITY_ALLOWANCE_PREVIEW_DAYS]);
   });
 
   it("reports scheduled source and write failures without throwing", async () => {

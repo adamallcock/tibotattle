@@ -25,6 +25,7 @@ const COMPOSITION_EXPORTS = Object.freeze([
   "MODEL_COMPOSITION_POLICY",
   "blendedCompositionCapacityUsd",
   "buildCompositionObservations",
+  "buildCompositionObservationsFromOrderedUsage",
   "calibrateCompositionCapacities",
   "compositionExpectedPp",
 ]);
@@ -100,7 +101,11 @@ const SOURCE_HASHES = Object.freeze({
     // suppressing the whole per-model fit. The executable kernel changed in
     // b8f43f0 (#45) while this byte-identity receipt stayed on the
     // pre-correction digest.
-    "a948dbf22e813e7bb3042cd7715c8573ebe26934a17dfda54500df53d894b035",
+    // Re-pinned 2026-09-06 for the additive ordered-usage entrypoint and
+    // interval-union storage. Both entrypoints retain the existing fit and
+    // refusal semantics; package parity tests and the independent bounded
+    // legacy-Set oracle cover ordering, invalid rows, and gap boundaries.
+    "9f33f8f128ffda704cbf2ea587e11b0b801470bde229275f43890e8b166e86fd",
 });
 
 test("quota analysis exposes one exact runtime-neutral package root", async () => {

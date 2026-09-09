@@ -1,9 +1,10 @@
 import { APP_PRICE_REGISTRY_MANIFEST } from "@app-usagemonitor/accounting";
-import { PLAN_ATTRIBUTION_POLICY, SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
+import { MODEL_COMPOSITION_POLICY, PLAN_ATTRIBUTION_POLICY, SEVEN_DAY_WINDOW_MINUTES } from "@app-usagemonitor/quota-analysis";
 import { accountScopedQuotaAnalysis } from "./quota-analysis";
 import {
   V1_ANALYSIS_WINDOW_DAYS,
   V1_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+  V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
   accountScopedModelCompositionV1,
   accountScopedQuotaAnalysisV1,
 } from "./quota-analysis-v1";
@@ -24,6 +25,7 @@ import { accountScopedModelCompositionV11, accountScopedQuotaAnalysisV11,
   V11_PLAN_ATTRIBUTION_ADAPTER_VERSION } from "./quota-analysis-v11";
 import { assertV11SourcePinCurrent, loadV11SourcePin, V11_DOMAIN_METHOD_VERSION,
   type V11SourcePin } from "./telemetry-v11-domain";
+import { currentAnalysisPublicationStatements, type CurrentAnalysisQueueClaim } from "./community-analysis-queue";
 
 /**
  * The community allowance series: for a UTC day, the fitted seven-day Codex
@@ -49,8 +51,9 @@ import { assertV11SourcePinCurrent, loadV11SourcePin, V11_DOMAIN_METHOD_VERSION,
  * they are combined. This is the same deliberately narrow merge trial shown
  * in the private admin dashboard: Pro stays unchanged, Pro 5x is multiplied
  * by four, and Plus by twenty. Unsupported or unknown plan labels do not enter
- * the estimate. The public wire carries only the resulting combined summary;
- * plan-specific diagnostics remain private admin evidence.
+ * the estimate. The daily payload carries the resulting combined summary;
+ * the optional public breakdown adds reviewed plan/model summaries, while
+ * identifiers and operational diagnostics remain private admin evidence.
  */
 
 export const COMMUNITY_ALLOWANCE_BASIS =
@@ -87,13 +90,19 @@ const NANOUSD_PER_USD = 1_000_000_000;
 const FIT_ADAPTER_VERSION = "v1-fit-7";
 export const COMMUNITY_ATTRIBUTION_METHOD_VERSION =
   [PLAN_ATTRIBUTION_POLICY.methodVersion, V1_SOURCE_SELECTION_METHOD_VERSION,
-    V1_PLAN_ATTRIBUTION_ADAPTER_VERSION, V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
-    V11_DOMAIN_METHOD_VERSION].join(":");
+    // Invalidate all prior caches when the resumable calculator is installed.
+    // Legacy direct adapters remain supported for their explicit callers; the
+    // recovery scheduler only writes the acquired-input adapter's results.
+    V1_PLAN_ATTRIBUTION_ADAPTER_VERSION, V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+    V11_PLAN_ATTRIBUTION_ADAPTER_VERSION,
+    // Public readiness and derived admin output must invalidate alongside the
+    // fit caches when the dollar-equivalent pricing semantics change.
+    V11_DOMAIN_METHOD_VERSION, SERVER_PRICING_METHOD_VERSION].join(":");
 // The tail of every v1 fit-cache key beyond the participant's chunk epoch.
 // One constant serves the writer and both readers so they can never diverge
 // (a 2026-08-30 regression had the corpus reader expecting one fewer segment,
 // which starved the admin allowance preview).
-const V1_FIT_CACHE_KEY_SUFFIX =
+export const V1_FIT_CACHE_KEY_SUFFIX =
   `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${FIT_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}:${COMMUNITY_ATTRIBUTION_METHOD_VERSION}`;
 
 function analysisFromDay(nowMs: number): string {
@@ -121,13 +130,14 @@ function sourceCacheKey(pin: CommunitySourcePin, fromDay: string, suffix: string
   return `${source}:${pin.inputRevision}:${fromDay}:${suffix}`;
 }
 
-async function loadCommunitySourcePin(db: D1Database, participantId: string, fromDay: string, source: LegacySource) {
+export async function loadCommunitySourcePin(db: D1Database, participantId: string, fromDay: string, source: LegacySource,
+  options?: { includeDayDependencies?: boolean }) {
   if (source === "v1.1") {
     const sourcePin = await loadV11SourcePin(db, participantId, {fromDay});
     if (!sourcePin) throw new Error("activated attribution source unavailable");
     return {sourcePin, fingerprint: sourcePin.fingerprint};
   }
-  const sourcePin = await loadV1SourcePin(db, { participantId, fromDay });
+  const sourcePin = await loadV1SourcePin(db, { participantId, fromDay }, options);
   const legacy = await db.prepare(`SELECT id, plaintext_digest, envelope_digest, dataset_id,
       range_start, range_end, created_at FROM telemetry_contributions
     WHERE participant_id = ? AND status = 'accepted'
@@ -142,13 +152,20 @@ async function loadCommunitySourcePin(db: D1Database, participantId: string, fro
   return { sourcePin, fingerprint };
 }
 
-function parsedCachedFits(json: string, participantId: string): CommunityAllowanceFit[] | null {
+/** All analytical versions used by either current cache, excluding display copy. */
+export function communityAnalysisCacheVersion(): string {
+  return `${V1_FIT_CACHE_KEY_SUFFIX}:${COMPOSITION_CACHE_KEY_SUFFIX}`;
+}
+
+export function parsedCachedFits(json: string, participantId: string): CommunityAllowanceFit[] | null {
   let values: unknown;
   try { values = JSON.parse(json); } catch { return null; }
   if (!Array.isArray(values) || values.length > 50_000) return null;
   const fits: CommunityAllowanceFit[] = [];
   for (const value of values) {
     if (!value || typeof value !== "object" || Array.isArray(value)
+        || Object.keys(value).length !== 4
+        || Object.keys(value).some(key => !["participantId","planType","capacityNanousd","lastObservedAt"].includes(key))
         || value.participantId !== participantId
         || typeof value.planType !== "string" || !/^[a-z][a-z0-9_-]{0,31}$/u.test(value.planType)
         || typeof value.capacityNanousd !== "number" || !Number.isFinite(value.capacityNanousd)
@@ -496,7 +513,9 @@ export interface CachedCommunityAllowanceCorpus {
 export async function readCachedCommunityAllowanceCorpus(
   db: D1Database,
   nowMs: number = Date.now(),
+  options?: CommunityCacheReadOptions,
 ): Promise<CachedCommunityAllowanceCorpus | null> {
+  if (options) return readBoundedCommunityAllowanceCorpus(db, nowMs, options);
   let rows: CachedCommunityAllowanceFitRow[];
   try {
     const result = await db.prepare(
@@ -574,8 +593,9 @@ export async function readCachedCommunityAllowanceCorpus(
 export async function readCachedCommunityAllowanceFits(
   db: D1Database,
   nowMs: number = Date.now(),
+  options?: CommunityCacheReadOptions,
 ): Promise<CommunityAllowanceFit[] | null> {
-  const corpus = await readCachedCommunityAllowanceCorpus(db, nowMs);
+  const corpus = await readCachedCommunityAllowanceCorpus(db, nowMs, options);
   return corpus === null ? null : [...corpus.fits];
 }
 
@@ -686,7 +706,7 @@ export function summarizeCommunityCapacityByPlanType(
 // refusals so a refusing participant stops re-running the raw corpus scan
 // every warm pass.
 const COMPOSITION_ADAPTER_VERSION = "v1-composition-3";
-const COMPOSITION_CACHE_KEY_SUFFIX =
+export const COMPOSITION_CACHE_KEY_SUFFIX =
   `${APP_PRICE_REGISTRY_MANIFEST.sha256}:${COMPOSITION_ADAPTER_VERSION}:${SERVER_PRICING_METHOD_VERSION}:${COMMUNITY_ATTRIBUTION_METHOD_VERSION}`;
 // The composition JSON is a per-model vector plus diagnostics — a few hundred
 // bytes. The storage CHECK allows 32 KiB; enforcing half that here keeps a
@@ -696,6 +716,606 @@ const COMPOSITION_CACHE_JSON_LIMIT_BYTES = 16 * 1024;
 export interface CommunityModelComposition {
   readonly participantId: string;
   readonly composition: V1ModelComposition;
+}
+
+export interface CachedCommunityModelCompositions {
+  compositions: CommunityModelComposition[];
+  v1ParticipantCount: number;
+  unsupportedSourceParticipantCount: number;
+  refusedParticipantCount: number;
+  storeAvailable: true;
+}
+
+export const COMMUNITY_MODEL_CACHE_PAGE_SIZE = 64;
+export const COMMUNITY_MODEL_CACHE_MAX_PAGES = 16;
+export const COMMUNITY_MODEL_CACHE_MAX_BYTES = 16 * 1024 * 1024;
+export const COMMUNITY_MODEL_CACHE_MAX_QUERIES = COMMUNITY_MODEL_CACHE_MAX_PAGES + 2;
+
+export interface CommunityModelCacheReadBudget {
+  remainingQueries: number;
+  deadlineMs: number;
+  now?: () => number;
+  reserveQueries?: number;
+}
+
+export interface CommunityCacheReadOptions {
+  budget: CommunityModelCacheReadBudget;
+  pageSize?: number;
+  maxPages?: number;
+  maxBytes?: number;
+}
+
+// Materialize only eligible contributing IDs before the bounded source lookups.
+// The lookahead row is not evidence admission: it proves whether another page
+// exists. Never group or materialize the complete analytical corpus here.
+export const COMMUNITY_PARTICIPANT_PAGE_CTE = `
+WITH participant_page AS MATERIALIZED (
+  SELECT p.id, p.state FROM community_current_analysis_queue q
+  JOIN participants p ON p.id = q.participant_id
+  WHERE q.participant_id > ?1 AND p.state != 'deleting' AND p.owner_kind = 'social' AND (
+    EXISTS (SELECT 1 FROM telemetry_v1_chunks c INDEXED BY telemetry_v1_chunks_current_identity
+      WHERE c.participant_id = p.id AND c.superseded_at IS NULL)
+    OR EXISTS (SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id = p.id)
+    OR EXISTS (SELECT 1 FROM telemetry_contributions c WHERE c.participant_id = p.id
+      AND c.status = 'accepted' AND c.transport_schema_version = 'telemetry-contribution-v0.2'))
+  ORDER BY q.participant_id LIMIT ?2
+), sources AS MATERIALIZED (
+  SELECT p.id, p.state,
+    CASE WHEN p.state = 'active' THEN EXISTS (
+      SELECT 1 FROM telemetry_contributions c
+      WHERE c.participant_id = p.id AND c.status = 'accepted'
+        AND c.transport_schema_version = 'telemetry-contribution-v0.2'
+    ) ELSE 0 END AS has_legacy,
+    CASE WHEN p.state = 'active' THEN EXISTS (
+      SELECT 1 FROM telemetry_v1_chunks c INDEXED BY telemetry_v1_chunks_current_identity
+      WHERE c.participant_id = p.id AND c.superseded_at IS NULL
+    ) ELSE 0 END AS has_v1,
+    CASE WHEN p.state = 'active' THEN EXISTS (
+      SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id = p.id
+    ) ELSE 0 END AS has_v11
+  FROM participant_page p
+)`;
+
+export const CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL = `${COMMUNITY_PARTICIPANT_PAGE_CTE}
+SELECT s.id AS participant_id, s.state, s.has_legacy, s.has_v1, s.has_v11,
+  CASE WHEN s.has_v11 = 0 AND s.has_v1 = 1 AND s.has_legacy = 1 THEN EXISTS (
+    SELECT 1 FROM telemetry_records r INDEXED BY telemetry_records_participant_time
+    WHERE r.participant_id = s.id AND r.observed_at >= ?3 AND r.record_kind = 'quota'
+      AND r.provider = 'openai_codex' AND r.limit_id = 'codex'
+      AND EXISTS (
+        SELECT 1 FROM telemetry_contribution_occurrences o INDEXED BY telemetry_contribution_occurrences_record
+        JOIN telemetry_contributions c ON c.id = o.contribution_id
+        WHERE o.participant_id = r.participant_id AND o.record_kind = r.record_kind
+          AND o.occurrence_id = r.occurrence_id AND c.status = 'accepted'
+          AND c.transport_schema_version = 'telemetry-contribution-v0.2'
+      )
+  ) ELSE 0 END AS legacy_overlap,
+  versions.revision AS input_revision,
+  CASE WHEN length(CAST(cache.cache_key AS BLOB)) <= 512 THEN cache.cache_key ELSE NULL END AS cache_key,
+  CASE WHEN length(CAST(cache.input_fingerprint AS BLOB)) = 64 THEN cache.input_fingerprint ELSE NULL END AS input_fingerprint,
+  CASE WHEN length(CAST(cache.source_method_version AS BLOB)) <= 2048 THEN cache.source_method_version ELSE NULL END AS source_method_version,
+  CASE WHEN length(CAST(cache.composition_json AS BLOB)) <= ?4
+    THEN cache.composition_json ELSE NULL END AS composition_json
+FROM sources s
+LEFT JOIN community_analytical_input_versions versions ON versions.participant_id = s.id
+LEFT JOIN community_model_composition_cache cache ON cache.participant_id = s.id
+ORDER BY s.id`;
+
+/** Page small source/cache metadata first; never return many large fit blobs in
+ * one D1 response. The following per-participant reads share a byte/query budget.
+ */
+export const CACHED_COMMUNITY_ALLOWANCE_PAGE_SQL = `${COMMUNITY_PARTICIPANT_PAGE_CTE}
+SELECT s.id AS participant_id, s.state, s.has_legacy, s.has_v1, s.has_v11,
+  versions.revision AS input_revision,
+  CASE WHEN length(CAST(cache.cache_key AS BLOB)) <= 512 THEN cache.cache_key ELSE NULL END AS cache_key,
+  CASE WHEN length(CAST(cache.input_fingerprint AS BLOB)) = 64 THEN cache.input_fingerprint ELSE NULL END AS input_fingerprint,
+  CASE WHEN length(CAST(cache.source_method_version AS BLOB)) <= 2048 THEN cache.source_method_version ELSE NULL END AS source_method_version,
+  length(CAST(cache.fits_json AS BLOB)) AS fits_bytes
+FROM sources s
+LEFT JOIN community_analytical_input_versions versions ON versions.participant_id = s.id
+LEFT JOIN community_allowance_fit_cache cache ON cache.participant_id = s.id
+ORDER BY s.id`;
+
+export const CACHED_COMMUNITY_ALLOWANCE_PAYLOADS_SQL = `WITH expected AS MATERIALIZED (
+  SELECT json_extract(value,'$.participant') AS participant_id,json_extract(value,'$.key') AS cache_key,
+    json_extract(value,'$.fingerprint') AS fingerprint,json_extract(value,'$.bytes') AS bytes FROM json_each(?1))
+SELECT e.participant_id,CASE WHEN length(CAST(c.fits_json AS BLOB))=e.bytes THEN c.fits_json ELSE NULL END AS fits_json
+FROM expected e LEFT JOIN community_allowance_fit_cache c ON c.participant_id=e.participant_id
+  AND c.cache_key=e.cache_key AND c.input_fingerprint=e.fingerprint AND c.source_method_version=?2
+ORDER BY e.participant_id`;
+
+function spendCommunityCacheQuery(budget: CommunityModelCacheReadBudget): boolean {
+  const reserve = budget.reserveQueries ?? 0, now = (budget.now ?? Date.now)();
+  if (!cacheCount(budget.remainingQueries) || !cacheCount(reserve)
+      || !Number.isFinite(budget.deadlineMs) || !Number.isFinite(now)
+      || now >= budget.deadlineMs || budget.remainingQueries - reserve < 1) return false;
+  budget.remainingQueries -= 1;
+  return true;
+}
+
+async function readBoundedCommunityAllowanceCorpus(db: D1Database, nowMs: number,
+  options: CommunityCacheReadOptions): Promise<CachedCommunityAllowanceCorpus | null> {
+  const { budget } = options;
+  const pageSize = options.pageSize ?? COMMUNITY_MODEL_CACHE_PAGE_SIZE;
+  const maxPages = options.maxPages ?? COMMUNITY_MODEL_CACHE_MAX_PAGES;
+  const maxBytes = options.maxBytes ?? COMMUNITY_MODEL_CACHE_MAX_BYTES;
+  if (!Number.isFinite(nowMs) || !cacheCount(pageSize) || pageSize < 1 || pageSize > COMMUNITY_MODEL_CACHE_PAGE_SIZE
+      || !cacheCount(maxPages) || maxPages < 1 || maxPages > COMMUNITY_MODEL_CACHE_MAX_PAGES
+      || !cacheCount(maxBytes) || maxBytes > COMMUNITY_MODEL_CACHE_MAX_BYTES) return null;
+  const epoch = async (): Promise<number | null> => {
+    if (!spendCommunityCacheQuery(budget)) return null;
+    const row = await db.prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1")
+      .first<{ mutation_epoch: number }>();
+    return cacheCount(row?.mutation_epoch) ? row!.mutation_epoch : null;
+  };
+  try {
+    const firstEpoch = await epoch();
+    if (firstEpoch === null) return null;
+    const fromDay = analysisFromDay(nowMs), participantIds: string[] = [], fits: CommunityAllowanceFit[] = [];
+    let cursor = "", bytes = 0;
+    for (let page = 0; page < maxPages; page++) {
+      if (!spendCommunityCacheQuery(budget)) return null;
+      const { results: rows } = await db.prepare(CACHED_COMMUNITY_ALLOWANCE_PAGE_SQL)
+        .bind(cursor, pageSize + 1).all<Omit<CachedModelPageRow, "legacy_overlap" | "composition_json"> & { fits_bytes: number | null }>();
+      if (!Array.isArray(rows) || rows.length > pageSize + 1) return null;
+      let previous = cursor;
+      for (const row of rows) {
+        if (typeof row.participant_id !== "string" || row.participant_id.length < 1 || row.participant_id.length > 128
+            || row.participant_id <= previous || !["active", "deleting"].includes(row.state)) return null;
+        previous = row.participant_id;
+      }
+      const selected: {participant:string;key:string;fingerprint:string;bytes:number}[] = [];
+      for (const row of rows.slice(0, pageSize)) {
+        cursor = row.participant_id;
+        if (row.state !== "active") continue;
+        if (![row.has_legacy, row.has_v1, row.has_v11].every(flag => flag === 0 || flag === 1)) return null;
+        if (!row.has_legacy && !row.has_v1 && !row.has_v11) continue;
+        const source: LegacySource = row.has_v11 ? "v1.1" : row.has_v1 ? row.has_legacy ? "mixed" : "v1" : "v0.2";
+        if (!cacheCount(row.input_revision) || row.cache_key !== `${source}:${row.input_revision}:${fromDay}:${V1_FIT_CACHE_KEY_SUFFIX}`
+            || row.source_method_version !== COMMUNITY_ATTRIBUTION_METHOD_VERSION
+            || typeof row.input_fingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(row.input_fingerprint)
+            || !cacheCount(row.fits_bytes) || row.fits_bytes! > maxBytes - bytes) return null;
+        selected.push({participant:row.participant_id,key:row.cache_key,fingerprint:row.input_fingerprint,bytes:row.fits_bytes});
+      }
+      // Pack up to64 small caches in a query, with a strict2MiB response bound.
+      // Metadata is already validated; exact keys/fingerprints and lengths are
+      // rechecked in the payload statement before the final source-epoch fence.
+      for (let offset=0;offset<selected.length;) {
+        const batch: typeof selected = []; let batchBytes=0;
+        while (offset<selected.length && batchBytes+selected[offset]!.bytes<=2*1024*1024) {
+          const row=selected[offset++]!; batch.push(row); batchBytes+=row.bytes;
+        }
+        // Preserve the established per-account contract: one larger cache may
+        // consume the remaining corpus allocation, but never shares a response
+        // with other accounts. The total16MiB fence remains unchanged.
+        if (batch.length===0 && selected[offset] && selected[offset]!.bytes<=maxBytes-bytes) {
+          const row=selected[offset++]!;batch.push(row);batchBytes=row.bytes;
+        }
+        if (batch.length===0 || bytes+batchBytes>maxBytes || !spendCommunityCacheQuery(budget)) return null;
+        const payloads=(await db.prepare(CACHED_COMMUNITY_ALLOWANCE_PAYLOADS_SQL)
+          .bind(JSON.stringify(batch),COMMUNITY_ATTRIBUTION_METHOD_VERSION)
+          .all<{participant_id:string;fits_json:string|null}>()).results;
+        if (!Array.isArray(payloads) || payloads.length!==batch.length) return null;
+        for (let index=0;index<payloads.length;index++) {
+          const payload=payloads[index]!,expected=batch[index]!;
+          if (payload.participant_id!==expected.participant || typeof payload.fits_json!=="string"
+              || new TextEncoder().encode(payload.fits_json).byteLength!==expected.bytes) return null;
+          const parsed=parsedCachedFits(payload.fits_json,payload.participant_id);
+          if (!parsed) return null;
+          participantIds.push(payload.participant_id);
+          // Avoid argument-count limits for a valid50,000-fit participant.
+          for (const fit of parsed) fits.push(fit);
+        }
+        bytes+=batchBytes;
+      }
+      if (rows.length <= pageSize) {
+        if (await epoch() !== firstEpoch) return null;
+        fits.sort((left, right) => left.lastObservedAt.localeCompare(right.lastObservedAt)
+          || left.capacityNanousd - right.capacityNanousd || left.participantId.localeCompare(right.participantId));
+        return Object.freeze({ participantIds: Object.freeze(participantIds), fits: Object.freeze(fits) });
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+interface CachedModelPageRow {
+  participant_id: string; state: string;
+  has_legacy: number; has_v1: number; has_v11: number; legacy_overlap: number;
+  input_revision: number | null; cache_key: string | null;
+  input_fingerprint: string | null; source_method_version: string | null;
+  composition_json: string | null;
+}
+
+function cacheObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function cacheKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return Object.keys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
+}
+function cacheCount(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+function cacheFinite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+function cacheNullableFinite(value: unknown): boolean { return value === null || cacheFinite(value); }
+function cacheInstant(value: unknown): value is string {
+  return typeof value === "string" && value.length === 24 && Number.isFinite(Date.parse(value))
+    && new Date(value).toISOString() === value;
+}
+function cacheModelMap(value: unknown, capacity = false): value is Record<string, number | null> {
+  return cacheObject(value) && Object.entries(value).every(([key, number]) =>
+    /^[a-zA-Z0-9][a-zA-Z0-9._:/+-]{0,255}$/u.test(key)
+    && (capacity && number === null || cacheFinite(number) && number >= 0 && (capacity || number <= 1)));
+}
+
+// This vocabulary is the completed v1/v1.1 composition adapters' analytical
+// refusals, not transport errors, transient failures, or unfinished work.
+const COMPOSITION_CACHE_REFUSALS = new Set([
+  "supported_quota_track_unavailable", "plan_attribution_limit_exceeded",
+  "multi_plan_window_unsupported", "multi_provider_window_unsupported",
+  "downsampled_quota_limit_exceeded", "windowed_usage_limit_exceeded",
+  "usage_cost_limit_exceeded", "multi_account_window_unsupported",
+  "multi_era_window_unsupported", "continuity_track_limit_exceeded",
+  "usage_day_limit_exceeded", "invalid_attribution_record",
+  "session_interval_scope_limit_exceeded", "reduced_usage_limit_exceeded",
+  "usage_attribution_unresolved",
+]);
+
+const SCALAR_CACHE_REFUSALS: Record<"v0.2" | "v1" | "v1.1", ReadonlySet<string>> = {
+  "v0.2": new Set(["analysis_record_limit_exceeded", "account_scoped_dataset_unavailable",
+    "plan_attribution_limit_exceeded", "supported_quota_track_unavailable", "continuity_track_limit_exceeded"]),
+  v1: new Set(["supported_quota_track_unavailable", "continuity_track_limit_exceeded", "plan_attribution_limit_exceeded",
+    "downsampled_quota_limit_exceeded", "windowed_usage_limit_exceeded", "session_interval_scope_limit_exceeded", "usage_cost_limit_exceeded"]),
+  "v1.1": new Set(["plan_attribution_limit_exceeded", "downsampled_quota_limit_exceeded", "continuity_track_limit_exceeded",
+    "usage_day_limit_exceeded", "windowed_usage_limit_exceeded", "invalid_attribution_record",
+    "session_interval_scope_limit_exceeded", "supported_quota_track_unavailable", "attribution_hazard_limit_exceeded",
+    "usage_cost_limit_exceeded", "reduced_usage_limit_exceeded"]),
+};
+
+function validCompleteScalarAnalysis(value: unknown, source: "v0.2" | "v1" | "v1.1", fingerprint: string): boolean {
+  if (!cacheObject(value)) return false;
+  const method = source === "v1.1" ? V11_PLAN_ATTRIBUTION_ADAPTER_VERSION : V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION;
+  if (Object.hasOwn(value, "attributionMethod") && value.attributionMethod !== method
+      || Object.hasOwn(value, "inputFingerprint") && value.inputFingerprint !== fingerprint) return false;
+  if (value.status === "not_testable") {
+    // Acquisition returns the bare form; completed adapters also carry their
+    // schema/attribution metadata and an explicitly empty track collection.
+    return Object.keys(value).every(key => ["status", "reason", "schemaVersion", "tracks", "attributionMethod", "inputFingerprint"].includes(key))
+      && typeof value.reason === "string" && SCALAR_CACHE_REFUSALS[source].has(value.reason)
+      && (!Object.hasOwn(value, "schemaVersion") || value.schemaVersion === "account-scoped-quota-analysis-v0.1")
+      && (!Object.hasOwn(value, "tracks") || Array.isArray(value.tracks) && value.tracks.length === 0);
+  }
+  if (value.status !== "ready" || value.schemaVersion !== "account-scoped-quota-analysis-v0.1"
+      || value.fragmentSelection !== "unselected_diagnostics" || !Array.isArray(value.tracks)
+      || !Object.keys(value).every(key => ["status", "schemaVersion", "fragmentSelection", "tracks", "attributionMethod", "inputFingerprint"].includes(key))) return false;
+  // Filtering a malformed track into an empty fit set would turn an internal
+  // error into authoritative evidence. Validate the shared-kernel envelope
+  // before applying the existing statistical population/fit selection gates.
+  return value.tracks.every(track => {
+    if (!cacheObject(track) || !cacheObject(track.continuity) || !cacheObject(track.calibration)) return false;
+    const continuity = track.continuity, calibration = track.calibration;
+    if (!["planType", "planVariant", "accountTrackId", "provider", "policyEpoch", "planEraKey"]
+      .every(key => typeof continuity[key] === "string" && (continuity[key] as string).length > 0)
+      || !/^[a-z][a-z0-9_-]{0,31}$/u.test(String(continuity.planType))
+      || calibration.schemaVersion !== "quota-calibration-v0.1" || !Array.isArray(calibration.tracks)
+      || calibration.trackCount !== calibration.tracks.length) return false;
+    return calibration.tracks.every(calibrationTrack => cacheObject(calibrationTrack) && Array.isArray(calibrationTrack.resets)
+      && calibrationTrack.resets.every(reset => cacheObject(reset)
+        && reset.schemaVersion === "quota-reset-calibration-v0.1"
+        && ["conditional_estimate", "not_testable"].includes(String(reset.status))
+        && typeof reset.limitId === "string" && cacheCount(reset.windowDurationMinutes)
+        && cacheCount(reset.boundaryCount) && cacheFinite(reset.displayedSpanPp)
+        && cacheInstant(reset.firstObservedAt) && cacheInstant(reset.lastObservedAt) && cacheInstant(reset.resetsAt)
+        && (reset.status === "not_testable" ? reset.capacityNanousd === null
+          : cacheFinite(reset.capacityNanousd) && reset.capacityNanousd > 0)));
+  });
+}
+
+function validCompositionFit(value: unknown): boolean {
+  if (!cacheObject(value)) return false;
+  const baseKeys = ["status", "observationCount", "totalCostUsd", "modelCostShares",
+    "capacityUsdByModel", "singleConstantUsd", "r2", "singleConstantR2", "solverConverged"];
+  const insufficient = value.status === "insufficient_observations";
+  if (!cacheKeys(value, insufficient ? baseKeys : [...baseKeys, "identification"])
+      || !["fitted", "fallback_blended", "insufficient_observations"].includes(String(value.status))
+      || !cacheCount(value.observationCount) || !cacheNullableFinite(value.totalCostUsd)
+      || value.totalCostUsd !== null && (value.totalCostUsd as number) < 0
+      || !cacheModelMap(value.modelCostShares)
+      || !cacheNullableFinite(value.singleConstantUsd)
+      || value.singleConstantUsd !== null && (value.singleConstantUsd as number) < 0
+      || !cacheNullableFinite(value.r2) || value.r2 !== null && (value.r2 as number) > 1
+      || !cacheNullableFinite(value.singleConstantR2) || value.singleConstantR2 !== null && (value.singleConstantR2 as number) > 1) return false;
+  if (insufficient) return value.capacityUsdByModel === null && value.r2 === null && value.solverConverged === null;
+  const identification = value.identification;
+  if (value.observationCount < MODEL_COMPOSITION_POLICY.minimumObservations
+      || typeof value.solverConverged !== "boolean" || !cacheObject(identification)
+      || !cacheKeys(identification, ["adjustedR2", "singleConstantAdjustedR2", "splitHalfIdentified", "splitHalfMaxCapacityDriftFraction"])
+      || !cacheNullableFinite(identification.adjustedR2)
+      || identification.adjustedR2 !== null && (identification.adjustedR2 as number) > 1
+      || !cacheNullableFinite(identification.singleConstantAdjustedR2)
+      || identification.singleConstantAdjustedR2 !== null && (identification.singleConstantAdjustedR2 as number) > 1
+      || typeof identification.splitHalfIdentified !== "boolean"
+      || !cacheFinite(identification.splitHalfMaxCapacityDriftFraction)
+      || identification.splitHalfMaxCapacityDriftFraction < 0) return false;
+  if (value.status === "fallback_blended") return value.capacityUsdByModel === null;
+  return value.solverConverged === true && identification.splitHalfIdentified === true
+    && identification.splitHalfMaxCapacityDriftFraction <= MODEL_COMPOSITION_POLICY.maxSplitHalfCapacityDriftFraction
+    && cacheFinite(value.r2) && cacheModelMap(value.capacityUsdByModel, true)
+    && Object.values(value.capacityUsdByModel).some(number => number !== null && number > 0);
+}
+
+export function validCompleteCachedComposition(value: unknown, fingerprint: string, method: string): value is V1ModelCompositionResult {
+  if (!cacheObject(value)) return false;
+  if (value.status === "not_testable") {
+    return (cacheKeys(value, ["status", "reason"])
+      || cacheKeys(value, ["status", "reason", "tracks"]) && Array.isArray(value.tracks) && value.tracks.length === 0)
+      && typeof value.reason === "string"
+      && COMPOSITION_CACHE_REFUSALS.has(value.reason);
+  }
+  return cacheKeys(value, ["status", "planType", "fit", "voidedBinCount", "poolCount", "quotaRowCount",
+    "usageEventCount", "unpricedUsageEventCount", "poisonedBinCount", "latestQuotaObservedAt",
+    "attributionStatus", "attributionMethod", "inputFingerprint"])
+    && value.status === "ready" && typeof value.planType === "string" && /^[a-z][a-z0-9_-]{0,31}$/u.test(value.planType)
+    && [value.voidedBinCount, value.poolCount, value.quotaRowCount, value.usageEventCount,
+      value.unpricedUsageEventCount, value.poisonedBinCount].every(cacheCount)
+    && (value.quotaRowCount as number) <= 60_000 && (value.usageEventCount as number) + (value.unpricedUsageEventCount as number) <= 1_000_000
+    && cacheInstant(value.latestQuotaObservedAt) && value.attributionStatus === "legacy_conditional"
+    && (value.attributionMethod === method || method === V1_PLAN_ATTRIBUTION_ADAPTER_VERSION
+      && value.attributionMethod === V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION)
+    && value.inputFingerprint === fingerprint && validCompositionFit(value.fit);
+}
+
+export interface CommunityAnalysisCacheIdentity {
+  participantId: string;
+  source: LegacySource;
+  sourcePin: CommunitySourcePin;
+  fitFingerprint: string;
+  fromDay: string;
+  compositionSupported: boolean;
+}
+
+/** Reuse a completed v1 calculation without re-reading its chunk vector.
+ * The durable acquisition head already pins that vector to the journal revision.
+ * Both payloads and their fingerprints are still checked, so corrupt caches are
+ * repaired instead of being hidden behind matching metadata. Other source kinds
+ * keep their existing exact-pin path; this does not invent a successor adapter.
+ */
+export async function completedCommunityAnalysisCachesCurrent(db: D1Database,
+  participantId: string, inputRevision: number, fromDay: string): Promise<boolean> {
+  if (!Number.isSafeInteger(inputRevision) || inputRevision < 0) return false;
+  const row = await db.prepare(`SELECT
+      CASE WHEN length(CAST(f.fits_json AS BLOB)) <= ?7 THEN f.fits_json END AS fits_json,
+      CASE WHEN length(CAST(c.composition_json AS BLOB)) <= ?8 THEN c.composition_json END AS composition_json,
+      CASE WHEN length(f.input_fingerprint) = 64 THEN f.input_fingerprint END AS fit_fingerprint,
+      CASE WHEN length(w.input_fingerprint) = 64 THEN w.input_fingerprint END AS input_fingerprint
+    FROM community_analysis_work w
+    JOIN participants p ON p.id = w.participant_id AND p.state = 'active' AND p.owner_kind = 'social'
+    JOIN community_analytical_input_versions v ON v.participant_id = w.participant_id AND v.revision = ?2
+    JOIN community_allowance_fit_cache f ON f.participant_id = w.participant_id
+      AND f.cache_key = ?3 AND f.source_method_version = ?5
+    JOIN community_model_composition_cache c ON c.participant_id = w.participant_id
+      AND c.cache_key = ?4 AND c.source_method_version = ?5 AND c.input_fingerprint = w.input_fingerprint
+    WHERE w.participant_id = ?1 AND w.input_revision = ?2 AND w.phase = 'complete'
+      AND w.source_kind = 'v1' AND w.source_method_version = ?6 AND w.observed_at_cutoff = ?9
+      AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads WHERE participant_id = ?1)
+      AND NOT EXISTS (SELECT 1 FROM telemetry_contributions
+        WHERE participant_id = ?1 AND status = 'accepted' AND transport_schema_version = 'telemetry-contribution-v0.2')
+    LIMIT 1`).bind(participantId, inputRevision,
+      `v1:${inputRevision}:${fromDay}:${V1_FIT_CACHE_KEY_SUFFIX}`,
+      `v1:${inputRevision}:${fromDay}:${COMPOSITION_CACHE_KEY_SUFFIX}`,
+      COMMUNITY_ATTRIBUTION_METHOD_VERSION, V1_RESUMABLE_ATTRIBUTION_ADAPTER_VERSION,
+      COMMUNITY_MODEL_CACHE_MAX_BYTES, COMPOSITION_CACHE_JSON_LIMIT_BYTES, `${fromDay}T00:00:00.000Z`)
+    .first<{ fits_json: string | null; composition_json: string | null;
+      fit_fingerprint: string | null; input_fingerprint: string | null }>();
+  if (typeof row?.input_fingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(row.input_fingerprint)
+      || typeof row.fits_json !== "string" || typeof row.composition_json !== "string") return false;
+  const expectedFitFingerprint = await sha256Hex(canonicalJson({
+    methodVersion: COMMUNITY_ATTRIBUTION_METHOD_VERSION, v1: row.input_fingerprint, legacy: [],
+  }));
+  if (row.fit_fingerprint !== expectedFitFingerprint || parsedCachedFits(row.fits_json, participantId) === null) return false;
+  try {
+    return validCompleteCachedComposition(JSON.parse(row.composition_json), row.input_fingerprint,
+      V1_PLAN_ATTRIBUTION_ADAPTER_VERSION);
+  } catch { return false; }
+}
+
+/** Small exact cache probe for one scheduled participant. A matching revision
+ * alone does not hide malformed cached output; the warmer can repair it.
+ */
+export async function communityAnalysisCachesCurrent(db: D1Database,
+  identity: CommunityAnalysisCacheIdentity): Promise<boolean> {
+  const { participantId, source, sourcePin, fitFingerprint, fromDay } = identity;
+  const fitKey = sourceCacheKey(sourcePin, fromDay, V1_FIT_CACHE_KEY_SUFFIX, source);
+  const fit = await db.prepare(`SELECT CASE WHEN length(CAST(fits_json AS BLOB)) <= ?5 THEN fits_json ELSE NULL END AS fits_json
+    FROM community_allowance_fit_cache WHERE participant_id=?1 AND cache_key=?2 AND input_fingerprint=?3 AND source_method_version=?4`)
+    .bind(participantId, fitKey, fitFingerprint, COMMUNITY_ATTRIBUTION_METHOD_VERSION, COMMUNITY_MODEL_CACHE_MAX_BYTES)
+    .first<{ fits_json: string | null }>();
+  if (typeof fit?.fits_json !== "string" || parsedCachedFits(fit.fits_json, participantId) === null) return false;
+  if (!identity.compositionSupported) return true;
+  const method = isV11Pin(sourcePin) ? V11_PLAN_ATTRIBUTION_ADAPTER_VERSION : V1_PLAN_ATTRIBUTION_ADAPTER_VERSION;
+  const composition = await db.prepare(`SELECT CASE WHEN length(CAST(composition_json AS BLOB)) <= ?5
+      THEN composition_json ELSE NULL END AS composition_json FROM community_model_composition_cache
+    WHERE participant_id=?1 AND cache_key=?2 AND input_fingerprint=?3 AND source_method_version=?4`)
+    .bind(participantId, sourceCacheKey(sourcePin, fromDay, COMPOSITION_CACHE_KEY_SUFFIX, isV11Pin(sourcePin) ? "v1.1" : "v1"),
+      sourcePin.fingerprint, COMMUNITY_ATTRIBUTION_METHOD_VERSION, COMPOSITION_CACHE_JSON_LIMIT_BYTES)
+    .first<{ composition_json: string | null }>();
+  if (typeof composition?.composition_json !== "string") return false;
+  try { return validCompleteCachedComposition(JSON.parse(composition.composition_json), sourcePin.fingerprint, method); }
+  catch { return false; }
+}
+
+/** Both derived caches promote atomically under the same active-participant,
+ * source-revision, successor-precedence and owned-maintenance-lease fence.
+ * Neither a transient failure nor incomplete acquisition may call this API.
+ */
+export async function publishCommunityAnalysisCaches(db: D1Database,
+  identity: CommunityAnalysisCacheIdentity, analyses: readonly { source: "v0.2" | "v1" | "v1.1"; analysis: object }[],
+  composition: V1ModelCompositionResult | null, maintenanceLease: string,
+  queueClaim?: CurrentAnalysisQueueClaim): Promise<boolean> {
+  const { participantId, sourcePin, source, fromDay, fitFingerprint } = identity;
+  const scopeMatches = isV11Pin(sourcePin) ? sourcePin.participantId === participantId
+    : "participantId" in sourcePin.scope && sourcePin.scope.participantId === participantId && sourcePin.scope.fromDay === fromDay;
+  if (!maintenanceLease || !scopeMatches
+      || !Number.isSafeInteger(sourcePin.inputRevision) || sourcePin.inputRevision === null || sourcePin.inputRevision < 0
+      || !/^[a-f0-9]{64}$/u.test(fitFingerprint)) throw new TypeError("community cache publication identity invalid");
+  if (queueClaim && (queueClaim.participantId !== participantId || queueClaim.inputRevision !== sourcePin.inputRevision
+    || queueClaim.method !== communityAnalysisCacheVersion()
+    || queueClaim.day !== new Date(Date.parse(`${fromDay}T00:00:00.000Z`)
+      + V1_ANALYSIS_WINDOW_DAYS * MILLISECONDS_PER_DAY).toISOString().slice(0, 10))) {
+    throw new TypeError("community cache queue publication identity invalid");
+  }
+  const expectedSources = source === "mixed" ? ["v0.2", "v1"] : [source];
+  if (analyses.length !== expectedSources.length || expectedSources.some(expected =>
+    analyses.filter(input => input.source === expected).length !== 1)
+    || analyses.some(({analysis,source:analyticalSource}) => !validCompleteScalarAnalysis(analysis, analyticalSource, sourcePin.fingerprint))) {
+    throw new TypeError("only complete analytical results can be cached");
+  }
+  const fits = selectCommunityAllowanceAnalysisFits(participantId, analyses);
+  const fitsJson = JSON.stringify(fits), compositionJson = composition === null ? null : JSON.stringify(composition);
+  if (new TextEncoder().encode(fitsJson).byteLength > COMMUNITY_MODEL_CACHE_MAX_BYTES
+      || parsedCachedFits(fitsJson, participantId) === null) return false;
+  if (identity.compositionSupported && (composition === null || compositionJson === null
+      || new TextEncoder().encode(compositionJson).byteLength > COMPOSITION_CACHE_JSON_LIMIT_BYTES
+      || !validCompleteCachedComposition(composition, sourcePin.fingerprint, isV11Pin(sourcePin)
+        ? V11_PLAN_ATTRIBUTION_ADAPTER_VERSION : V1_PLAN_ATTRIBUTION_ADAPTER_VERSION))) return false;
+  if (!identity.compositionSupported && composition !== null) throw new TypeError("unsupported composition cache publication");
+  await assertCommunitySourcePinCurrent(db, sourcePin);
+  const guard = `EXISTS (SELECT 1 FROM participants p
+      JOIN community_analytical_input_versions v ON v.participant_id=p.id
+      WHERE p.id=?1 AND p.state='active' AND p.owner_kind='social' AND v.revision=?6
+        AND EXISTS (SELECT 1 FROM telemetry_v11_domain_heads h WHERE h.participant_id=p.id)=?7)
+    AND EXISTS (SELECT 1 FROM retention_state
+      WHERE singleton=1 AND maintenance_lease_token=?8
+        AND maintenance_lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now'))`;
+  const statements = [db.prepare(`INSERT INTO community_allowance_fit_cache
+      (participant_id,cache_key,fits_json,computed_at,input_fingerprint,source_method_version)
+    SELECT ?1,?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?4,?5 WHERE ${guard}
+    ON CONFLICT(participant_id) DO UPDATE SET cache_key=excluded.cache_key,fits_json=excluded.fits_json,
+      computed_at=excluded.computed_at,input_fingerprint=excluded.input_fingerprint,source_method_version=excluded.source_method_version
+    RETURNING participant_id`)
+    .bind(participantId, sourceCacheKey(sourcePin, fromDay, V1_FIT_CACHE_KEY_SUFFIX, source), fitsJson,
+      fitFingerprint, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourcePin.inputRevision, isV11Pin(sourcePin) ? 1 : 0, maintenanceLease)];
+  if (identity.compositionSupported) statements.push(db.prepare(`INSERT INTO community_model_composition_cache
+      (participant_id,cache_key,composition_json,computed_at,input_fingerprint,source_method_version)
+    SELECT ?1,?2,?3,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?4,?5 WHERE ${guard}
+    ON CONFLICT(participant_id) DO UPDATE SET cache_key=excluded.cache_key,composition_json=excluded.composition_json,
+      computed_at=excluded.computed_at,input_fingerprint=excluded.input_fingerprint,source_method_version=excluded.source_method_version
+    RETURNING participant_id`)
+    .bind(participantId, sourceCacheKey(sourcePin, fromDay, COMPOSITION_CACHE_KEY_SUFFIX, isV11Pin(sourcePin) ? "v1.1" : "v1"),
+      compositionJson, sourcePin.fingerprint, COMMUNITY_ATTRIBUTION_METHOD_VERSION, sourcePin.inputRevision,
+      isV11Pin(sourcePin) ? 1 : 0, maintenanceLease));
+  // Recheck inside the SAME transaction, including time expiry between the
+  // two writes. A failed condition must roll back an earlier successful write,
+  // not merely turn the second INSERT into a no-op. The existing NOT NULL
+  // constraint is an assertion; no null value can become durable.
+  statements.push(db.prepare(`UPDATE community_allowance_fit_cache
+    SET fits_json=CASE WHEN ${guard} THEN fits_json ELSE NULL END WHERE participant_id=?1 RETURNING participant_id`)
+    .bind(participantId, null, null, null, null, sourcePin.inputRevision, isV11Pin(sourcePin) ? 1 : 0, maintenanceLease));
+  if (queueClaim) {
+    const queue = currentAnalysisPublicationStatements(db, queueClaim, maintenanceLease);
+    statements.unshift(queue.before);
+    statements.push(queue.after);
+  }
+  try {
+    const results = await db.batch<{ participant_id: string }>(statements);
+    // D1 change counts include receipt-trigger effects. RETURNING attests the
+    // exact authorized top-level row instead; every write and the final
+    // in-transaction authority assertion must identify this participant once.
+    return results.length === statements.length && results.every(result =>
+      result.results.length === 1 && result.results[0]?.participant_id === participantId);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("NOT NULL constraint failed: community_allowance_fit_cache.fits_json")) return false;
+    if (queueClaim && error instanceof Error && error.message.includes("CHECK constraint failed: dirty_generation")) return false;
+    if (queueClaim && error instanceof Error
+      && error.message.includes("NOT NULL constraint failed: community_current_analysis_queue.pending")) return false;
+    throw error;
+  }
+}
+
+/** SELECT-only complete-cohort composition evidence. The 1,024 physical-row
+ * ceiling is a resource limit causing whole-cohort deferral, never an admission
+ * rule or permission to publish a prefix. Scheduler integration must supply the
+ * same budget used by the rest of that invocation; no caller is wired yet.
+ */
+export async function readCachedCommunityModelCompositions(
+  db: D1Database, nowMs: number = Date.now(),
+  options: { budget?: CommunityModelCacheReadBudget; pageSize?: number; maxPages?: number; maxBytes?: number } = {},
+): Promise<CachedCommunityModelCompositions | null> {
+  const pageSize = options.pageSize ?? COMMUNITY_MODEL_CACHE_PAGE_SIZE;
+  const maxPages = options.maxPages ?? COMMUNITY_MODEL_CACHE_MAX_PAGES;
+  const maxBytes = options.maxBytes ?? COMMUNITY_MODEL_CACHE_MAX_BYTES;
+  const budget = options.budget ?? { remainingQueries: COMMUNITY_MODEL_CACHE_MAX_QUERIES, deadlineMs: Date.now() + 30_000 };
+  if (!Number.isFinite(nowMs) || !Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > COMMUNITY_MODEL_CACHE_PAGE_SIZE
+      || !Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > COMMUNITY_MODEL_CACHE_MAX_PAGES
+      || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > COMMUNITY_MODEL_CACHE_MAX_BYTES) return null;
+  const charge = (): boolean => {
+    const reserve = budget.reserveQueries ?? 0;
+    const now = (budget.now ?? Date.now)();
+    if (!cacheCount(budget.remainingQueries) || !cacheCount(reserve) || !Number.isFinite(budget.deadlineMs)
+        || !Number.isFinite(now) || now >= budget.deadlineMs || budget.remainingQueries - reserve < 1) return false;
+    budget.remainingQueries -= 1;
+    return true;
+  };
+  const epoch = async (): Promise<number | null> => {
+    if (!charge()) return null;
+    const row = await db.prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1")
+      .first<{ mutation_epoch: number }>();
+    return cacheCount(row?.mutation_epoch) ? row!.mutation_epoch : null;
+  };
+  try {
+    const initialEpoch = await epoch();
+    if (initialEpoch === null) return null;
+    const fromDay = analysisFromDay(nowMs);
+    const result: CachedCommunityModelCompositions = { compositions: [], v1ParticipantCount: 0,
+      unsupportedSourceParticipantCount: 0, refusedParticipantCount: 0, storeAvailable: true };
+    let cursor = "", bytes = 0;
+    for (let page = 0; page < maxPages; page++) {
+      if (!charge()) return null;
+      const rows = (await db.prepare(CACHED_COMMUNITY_MODEL_COMPOSITIONS_PAGE_SQL)
+        .bind(cursor, pageSize + 1, `${fromDay}T00:00:00.000Z`, COMPOSITION_CACHE_JSON_LIMIT_BYTES)
+        .all<CachedModelPageRow>()).results;
+      if (!Array.isArray(rows) || rows.length > pageSize + 1) return null;
+      let previous = cursor;
+      for (const row of rows) {
+        if (typeof row.participant_id !== "string" || row.participant_id.length < 1 || row.participant_id.length > 128
+            || row.participant_id <= previous || !["active", "deleting"].includes(row.state)) return null;
+        previous = row.participant_id;
+      }
+      for (const row of rows.slice(0, pageSize)) {
+        cursor = row.participant_id;
+        if (row.state !== "active") continue;
+        if (![row.has_legacy, row.has_v1, row.has_v11, row.legacy_overlap].every(flag => flag === 0 || flag === 1)) return null;
+        if (row.has_legacy === 0 && row.has_v1 === 0 && row.has_v11 === 0) continue;
+        if (!cacheCount(row.input_revision)) return null;
+        if (row.has_v11 === 0 && (row.has_v1 === 0 || row.legacy_overlap === 1)) {
+          result.unsupportedSourceParticipantCount += 1;
+          continue;
+        }
+        const source = row.has_v11 === 1 ? "v1.1" : "v1";
+        if (row.cache_key !== `${source}:${row.input_revision}:${fromDay}:${COMPOSITION_CACHE_KEY_SUFFIX}`
+            || row.source_method_version !== COMMUNITY_ATTRIBUTION_METHOD_VERSION
+            || typeof row.input_fingerprint !== "string" || !/^[a-f0-9]{64}$/u.test(row.input_fingerprint)
+            || typeof row.composition_json !== "string") return null;
+        const rowBytes = new TextEncoder().encode(row.composition_json).byteLength;
+        if (rowBytes > COMPOSITION_CACHE_JSON_LIMIT_BYTES || (bytes += rowBytes) > maxBytes) return null;
+        const value: unknown = JSON.parse(row.composition_json);
+        if (!validCompleteCachedComposition(value, row.input_fingerprint, source === "v1.1"
+          ? V11_PLAN_ATTRIBUTION_ADAPTER_VERSION : V1_PLAN_ATTRIBUTION_ADAPTER_VERSION)) return null;
+        result.v1ParticipantCount += 1;
+        if (value.status === "ready") result.compositions.push({ participantId: row.participant_id, composition: value });
+        else result.refusedParticipantCount += 1;
+      }
+      if (rows.length <= pageSize) return await epoch() === initialEpoch ? result : null;
+    }
+    return null;
+  } catch {
+    // Missing store, invalid JSON, source churn and transport failures all defer.
+    return null;
+  }
 }
 
 function validCachedComposition(

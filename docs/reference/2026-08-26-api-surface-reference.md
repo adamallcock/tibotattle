@@ -43,7 +43,7 @@ Those remain separate verification gates in the relevant runbooks.
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
-| Hosted Worker API | Internet/native collector → Cloudflare Worker | 38 API paths, 39 method/path operations |
+| Hosted Worker API | Internet/native collector → Cloudflare Worker | 39 API paths, 40 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
 | Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
@@ -343,9 +343,10 @@ Authority vocabulary:
 | `POST` | `/api/v1/identity/apple/result` | Handoff | Deliver the bounded one-time Apple identity proof to its initiator |
 | `GET` | `/api/v1/session` | Session | Read the current web-session projection and CSRF material |
 | `POST` | `/api/v1/logout` | Session | Revoke the current web session |
-| `GET` | `/api/v1/admin/overview` | Admin | Read owner operations state plus bounded optional distribution integrations |
+| `GET` | `/api/v1/admin/overview` | Admin | Read owner operations state, bounded optional distribution integrations, and failure-isolated reconstruction progress; no calculation on refresh |
 | `GET` | `/api/v1/admin/metrics/history` | Admin | Read cached owner metrics history |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin | Preview the cached owner-only allowance merge without publishing it |
+| `GET` | `/api/v1/admin/reconstruction-progress` | Admin | Read bounded, content-free refresh and publication progress without advancing calculations; exact optional `detail=preparation` adds a capped retained-input census as version 2, while query-free version 1 is unchanged |
 | `POST` | `/api/v1/admin/action` | Admin | Run an allowlisted operations action; explicit owner participant erasure is a task of `run_maintenance`, not a new action or route |
 | `POST` | `/api/v1/me/security-reset` | Session | Rotate participant recovery and session authority |
 | `POST` | `/api/v1/me/device-pairings` | Session | Mint a one-use pairing code for a local collector |
@@ -369,6 +370,12 @@ Authority vocabulary:
 | all | `/.well-known/apple-developer-domain-association.txt` | None | Deliberately intercepted retired path; always `404`, never SPA content |
 
 ### Lifecycle review
+
+The existing daily route also supports the closed optional
+[`community-allowance-breakdowns-v1.1` projection](./api-surface.md#public-allowance-breakdowns).
+It adds bounded, source-fenced combined/plan/model summaries without adding a route or
+making the private admin preview public. Single-account estimates and visible
+counts are an explicitly approved disclosure, not a minimum-cohort guarantee.
 
 The [API lifecycle and redundancy review](../reviews/2026-08-26-api-lifecycle-review.md)
 records the source, caller, tagged-app, and persisted-state evidence behind the
@@ -801,13 +808,18 @@ undifferentiated names.
 - Speed accounting: `CODEX_SPEED_MODE_DECLARATION`, `CODEX_SPEED_MODE_OBSERVABILITY`, `DEFAULT_UNRESOLVED_SPEED_SCENARIO`, `FAST_MODE_ASSUMED_MULTIPLIER`, `FAST_MODE_ASSUMED_MULTIPLIER_SOURCE`, `FAST_MODE_MODEL_FAMILY_KEYS`, `FAST_MODE_MULTIPLIER_SOURCE`, `FAST_MODE_QUOTA_MULTIPLIERS`, `OBSERVED_SPEED_MODE_KEYS`, `QUOTA_WEIGHTED_API_PRICE_METRIC`, `SPEED_MODE_PROVENANCE_VALUES`, `deriveFastModePriorityRatiosFromRegistry`, `emptySpeedWeightingCrossing`, `fastModeModelFamilyKey`, `fastModeQuotaMultiplier`, `inferFastModeFromCalibrationWindows`, `quotaWeightedApiPriceEquivalent`, `resolveEffectiveSpeedMode`, `summarizeQuotaWeightedAccounting`.
 - Local pricing: `aggregateLocalApiPriceResults`, `apiPriceResolutionSummary`, `costWarningCodes`, `priceClaudeUsageRecord`, `priceCodexProviderToolUnits`, `priceCodexUsageEvent`.
 
-#### `@app-usagemonitor/quota-analysis` — 32 public symbols
+#### `@app-usagemonitor/quota-analysis` — 33 public symbols
 
 - Tracks: `buildResetEvidence`, `continuityKey`, `resetKey`.
 - Calibration: `QUOTA_CALIBRATION_POLICY`, `analyzeQuotaCalibration`, `fitResetCapacity`.
 - Rolling and pace: `buildRollingQuotaComparisons`, `analyzeQuotaPace`.
-- Composition: `MODEL_COMPOSITION_POLICY`, `blendedCompositionCapacityUsd`, `buildCompositionObservations`, `calibrateCompositionCapacities`, `compositionExpectedPp`.
+- Composition: `MODEL_COMPOSITION_POLICY`, `blendedCompositionCapacityUsd`, `buildCompositionObservations`, `buildCompositionObservationsFromOrderedUsage`, `calibrateCompositionCapacities`, `compositionExpectedPp`.
 - Windows and provider pools: `CODEX_PRIMARY_LIMIT_ID`, `CODEX_SPARK_LIMIT_ID`, `CODEX_SPARK_LIMIT_IDS`, `CODEX_SPARK_RESERVED_LIMIT_ID`, `FIVE_HOUR_WINDOW_MINUTES`, `formatQuotaWindowDuration`, `MAX_QUOTA_LIMIT_DISPLAY_NAME_LENGTH`, `MAX_QUOTA_WINDOW_DURATION_MINUTES`, `QUOTA_LIMIT_DISPLAY_ALIASES`, `QUOTA_WINDOW_KINDS`, `classifyQuotaWindowKind`, `isSparkQuotaLimitId`, `isSupportedQuotaWindowDuration`, `isValidQuotaWindowDuration`, `quotaLimitDisplayAlias`, `quotaWindowLabel`, `sanitizeQuotaLimitDisplayName`, `sanitizeQuotaLimitId`, `SEVEN_DAY_WINDOW_MINUTES`.
+
+The ordered composition builder accepts a one-pass usage iterable with
+nondecreasing valid time bins, preserving within-bin addition and model order.
+The existing unordered-array builder remains compatible; both share quota
+topology and calibration policy.
 
 #### `@app-usagemonitor/telemetry-contract` — 63 public symbols
 

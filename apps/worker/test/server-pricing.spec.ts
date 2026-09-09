@@ -251,7 +251,7 @@ describe("server pricing", () => {
     const missing = priceTelemetryUsageEvent(registryModelPricingFixture("gpt-5.6-sol-wm", { totalInputContextTokens: null }));
     expect(missing.coverageStatus).toBe("unpriced");
     expect(missing.unpricedReasonCodes).toContain("total_input_context_missing");
-    expect(SERVER_PRICING_METHOD_VERSION).toBe("server-api-price-equivalent-v0.4");
+    expect(SERVER_PRICING_METHOD_VERSION).toBe("server-api-price-equivalent-v0.5");
   });
 
   it("matches the frozen accounting kernel projection on supported fixtures", () => {
@@ -271,6 +271,46 @@ describe("server pricing", () => {
         selectedPriceCardIds: priced.selectedPriceCardIds,
       }, item.id).toEqual(item.expected);
     }
+  });
+
+  it("rejects unsupported providers instead of pricing them as Anthropic", () => {
+    const knownClaude = validateIngestibleEvent(fixture({
+      provider: "anthropic_claude_code",
+      modelId: "claude-sonnet-4-6",
+      billingSurface: "claude_subscription",
+      speedMode: "standard",
+      apiServiceTier: "unknown",
+      reasoningEffort: "unknown",
+      components: {
+        inputUncachedTokens: 100,
+        inputCacheReadTokens: 900,
+        inputCacheWriteTokens: 0,
+        inputCacheWrite5mTokens: 0,
+        inputCacheWrite1hTokens: 0,
+        outputTextTokens: null,
+        outputReasoningTokens: null,
+        outputCombinedTokens: 75,
+      },
+    }));
+    expect(priceTelemetryUsageEvent(knownClaude)).toMatchObject({
+      exactCostUsd: "0.001695",
+      coverageStatus: "fully_priced",
+    });
+    // Stored v1/v1.1 records admit bounded provider tokens, unlike the older
+    // fixture validator's enum. Widen only that field at the shared boundary.
+    const unsupported = {
+      ...knownClaude,
+      provider: "other" as TelemetryUsageEvent["provider"],
+    };
+    expect(priceTelemetryUsageEvent(unsupported)).toMatchObject({
+      exactCostUsd: "0",
+      costNanousd: 0,
+      coveragePercent: 0,
+      coverageStatus: "unpriced",
+      unpricedReasonCodes: ["unknown_provider"],
+      selectedPriceCardIds: [],
+      priceBasis: "unpriced",
+    });
   });
 
   it("keeps Anthropic cache writes unpriced when the TTL split is missing", () => {

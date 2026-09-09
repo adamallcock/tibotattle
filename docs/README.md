@@ -38,6 +38,10 @@ an informal archive.
 | Release trust | [Cross-platform release trust](./decisions/2026-08-18-cross-platform-release-trust.md) | Common evidence decision and artifact-specific native trust requirements |
 | Release publication | [Cross-platform release publication](./runbooks/2026-08-18-cross-platform-release-publication.md) | Activation-gated multi-platform evidence and immutable publication order; not a support claim |
 | macOS release | [macOS stable release](./runbooks/macos-stable-release-runbook.md) | Canonical build, signing, notarization, Sparkle, Homebrew, website, and GitHub release sequence |
+| Agent release tooling | [Agent release operations](./runbooks/agent-release-operations.md) | Read-only doctor/status, native phase resume, shared production ownership and explicit recovery; not publication authorization |
+| Publication reconciliation | [Exact release publication](./runbooks/release-publication-reconciliation.md) | Manifest-driven GitHub, ARM/Intel feeds, tap and website reconciliation; writes require explicit authorization |
+| Early release qualification | [Synthetic admission and evidence reuse](./runbooks/release-qualification-admission.md) | Reviewed local proof cache and owning test lanes; not R7 or installed-app qualification |
+| Migration rehearsal | [Release migration rehearsal](./runbooks/release-migration-rehearsal.md) | Deployed-prefix observation, populated synthetic upgrades and separately gated disposable remote syntax checks |
 | macOS credentials | [Silent native Keychain migration](./decisions/2026-08-31-silent-keychain-migration.md) | Accepted prompt-free automatic-operation and explicit fallback contract; source and synthetic qualification do not prove the installed release |
 | macOS distribution | [Homebrew distribution and macOS support](./decisions/2026-08-15-homebrew-distribution-and-macos-support.md) | First-party tap, uninstall boundary, and supported macOS floor |
 | Public-site preview | [Public site local preview](./runbooks/2026-08-17-public-site-local-preview.md) | Maintained local rendering/inspection path; not deployment proof |

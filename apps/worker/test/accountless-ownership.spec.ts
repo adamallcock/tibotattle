@@ -22,8 +22,9 @@ import {
 import { encodeBase64Url, sha256Hex } from "../src/crypto";
 import { handleRequest } from "../src/index";
 import { eraseParticipantAsOwner } from "../src/participant-erasure";
-import { accountScopedQuotaAnalysisV11 } from "../src/quota-analysis-v11";
-import { collectCommunityAllowanceFits } from "../src/community-allowance";
+import { accountScopedModelCompositionV11, accountScopedQuotaAnalysisV11 } from "../src/quota-analysis-v11";
+import { collectCommunityAllowanceFits, publishCommunityAnalysisCaches } from "../src/community-allowance";
+import { advanceCommunityPublication } from "../src/community-publication";
 import { loadV11SourcePin } from "../src/telemetry-v11-domain";
 import { makeV11Day, v11UsageRecord } from "./helpers/telemetry-v11";
 
@@ -230,6 +231,9 @@ interface PublicPublicationSnapshot {
   readonly weeklyRebuilds: readonly unknown[];
   readonly builders: readonly unknown[];
   readonly previewCache: unknown;
+  readonly publicationChanges: unknown;
+  readonly refreshLanes: readonly unknown[];
+  readonly preparationProgress: unknown;
 }
 
 async function publicPublicationSnapshot(): Promise<PublicPublicationSnapshot> {
@@ -243,6 +247,9 @@ async function publicPublicationSnapshot(): Promise<PublicPublicationSnapshot> {
     weeklyRebuilds,
     builders,
     previewCache,
+    publicationChanges,
+    refreshLanes,
+    preparationProgress,
   ] = await Promise.all([
     db().prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1").first(),
     db().prepare(`SELECT publication_state, expected_basis, safe_from_day, safe_to_day,
@@ -263,6 +270,12 @@ async function publicPublicationSnapshot(): Promise<PublicPublicationSnapshot> {
       created_at FROM community_snapshot_builders ORDER BY week_start`).all(),
     db().prepare(`SELECT singleton, generated_at, payload_json, attribution_method_version,
       source_mutation_epoch FROM admin_community_allowance_preview_cache WHERE singleton = 1`).first(),
+    db().prepare("SELECT revision FROM community_publication_changes WHERE singleton = 1").first(),
+    db().prepare(`SELECT lane, state, completed_at, restart_reason
+      FROM community_refresh_lanes ORDER BY lane`).all(),
+    db().prepare(`SELECT tracked_days, complete_days, building_days, retiring_days,
+      checkpoint_steps, quota_observations, usage_events, is_exact
+      FROM community_preparation_progress_counters WHERE singleton_id = 1`).first(),
   ]);
   return {
     mutationEpoch,
@@ -274,6 +287,9 @@ async function publicPublicationSnapshot(): Promise<PublicPublicationSnapshot> {
     weeklyRebuilds: weeklyRebuilds.results,
     builders: builders.results,
     previewCache,
+    publicationChanges,
+    refreshLanes: refreshLanes.results,
+    preparationProgress,
   };
 }
 
@@ -656,6 +672,54 @@ describe("accountless owner-to-v1.1 transport", () => {
       expect(await accountScopedQuotaAnalysisV11(db(), participantId!))
         .toMatchObject({ status: "ready" });
       expect(await publicPublicationSnapshot()).toEqual(publicBeforeActivation);
+
+      // A populated accountless v1.1 source remains private even if an old
+      // scheduler invocation reaches the cache/publication helpers directly.
+      // The source gates must repeat the owner boundary rather than relying on
+      // enrollment's ordinary absence of a queue row.
+      const accountlessSourcePin = await loadV11SourcePin(db(), participantId!);
+      if (accountlessSourcePin === null) throw new Error("synthetic accountless source missing");
+      const accountlessAnalysis = await accountScopedQuotaAnalysisV11(db(), participantId!, {
+        sourcePin: accountlessSourcePin,
+      });
+      const accountlessComposition = await accountScopedModelCompositionV11(db(), participantId!, {
+        sourcePin: accountlessSourcePin,
+      });
+      const accountlessLease = "synthetic-accountless-publication-lease";
+      await db().prepare(`UPDATE retention_state
+        SET maintenance_lease_token = ?, maintenance_lease_expires_at = '2030-01-01T00:00:00.000Z'
+        WHERE singleton = 1`).bind(accountlessLease).run();
+      expect(await publishCommunityAnalysisCaches(db(), {
+        participantId: participantId!,
+        source: "v1.1",
+        sourcePin: accountlessSourcePin,
+        fitFingerprint: accountlessSourcePin.fingerprint,
+        fromDay: accountlessSourcePin.fromDay,
+        compositionSupported: true,
+      }, [{ source: "v1.1", analysis: accountlessAnalysis }], accountlessComposition, accountlessLease)).toBe(false);
+      await db().prepare(`INSERT INTO community_current_analysis_queue
+        (participant_id, dirty_generation, window_generation, pending, last_served_sequence)
+        VALUES (?, 1, 0, 1, 0)`).bind(participantId).run();
+      await advanceCommunityPublication(db(), Date.now(), {
+        budget: { remainingQueries: 64, deadlineMs: Date.now() + 30_000 },
+        maxPages: 4,
+      });
+
+      // The populated private v1.1 domain creates no queue work itself. The
+      // one row below is an intentionally injected stale scheduler record; it
+      // remains pending and cannot enter the captured public cohort.
+      expect(await db().prepare(`SELECT COUNT(*) AS count
+        FROM community_current_analysis_queue WHERE participant_id = ?`)
+        .bind(participantId).first()).toEqual({ count: 1 });
+      expect(await db().prepare(`SELECT COUNT(*) AS count
+        FROM community_publication_members WHERE participant_id = ?`)
+        .bind(participantId).first()).toEqual({ count: 0 });
+      expect(await db().prepare(`SELECT COUNT(*) AS count
+        FROM community_allowance_fit_cache WHERE participant_id = ?`)
+        .bind(participantId).first()).toEqual({ count: 0 });
+      expect(await db().prepare(`SELECT COUNT(*) AS count
+        FROM community_model_composition_cache WHERE participant_id = ?`)
+        .bind(participantId).first()).toEqual({ count: 0 });
 
       // Accountless evidence remains eligible for its private, internal
       // v1.1 analytical domain, but its owner kind is deliberately excluded

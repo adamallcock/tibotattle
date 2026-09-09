@@ -31,6 +31,7 @@ export {
   MODEL_COMPOSITION_POLICY,
   blendedCompositionCapacityUsd,
   buildCompositionObservations,
+  buildCompositionObservationsFromOrderedUsage,
   calibrateCompositionCapacities,
   compositionExpectedPp,
 } from "./src/model-composition.js";

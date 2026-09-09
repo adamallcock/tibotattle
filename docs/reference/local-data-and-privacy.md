@@ -179,9 +179,27 @@ and arbitrary metadata. Canonical schemas and mirror ownership are listed in
 
 Hosted storage uses Cloudflare D1 for identity/session/device/contribution and
 derived aggregate state, R2 for encrypted contribution objects and update
-artifacts, and a Durable Object for shared upload admission. Public community
-figures are derived, delayed, rounded/capped, and withheld when privacy or
-quality thresholds are not met.
+artifacts, and a Durable Object for shared upload admission. Public daily
+activity totals and allowance estimates have no minimum account count or
+per-account cap. The owner explicitly approved plan/model dollar estimates
+and supporting account/fit counts even for one account. Such small samples can
+reveal a contributor's estimated capacity despite omitting identifiers; they
+are not anonymous. Plan/model comparisons use closed UTC dates, complete
+source-authorized caches and qualified evidence; missing or unstable estimates
+remain gaps. Only the older sealed weekly snapshot contract applies its own
+delay, minimum-account threshold, caps and rounding. Its guarantees are not
+weakened or attributed to the daily view.
+
+Derived calculation state also includes a per-participant dirty-work queue,
+one restartable captured publication generation, its selected fit/model cache
+payloads, and one preparation-counter row (migrations 0054–0056). These add no
+uploaded fields or raw session content. Participant deletion cascades captured
+membership and queued work; consent, erasure and source-policy invalidations
+immediately fence reading and promotion. Ordinary uploads can leave an
+authorized saved graph visible while the successor is prepared. Completed
+captures are retired in bounded pages when superseded; their generation date
+does not represent the latest live input revision. Preparation counters contain
+only aggregate derived ledger counts, not participant identifiers.
 
 Stable pseudonyms and identity reattachment permit longitudinal linkage.
 Content-free, pseudonymous contribution is not anonymous data.
