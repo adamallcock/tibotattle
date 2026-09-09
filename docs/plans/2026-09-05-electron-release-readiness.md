@@ -19,6 +19,64 @@ Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
 Latest continuation, 2026-09-09:
 
+- Source `c0c98040` now includes the stale tray percentage correction and
+  the signed automatic-contribution execution workflow. Its Windows normal
+  journey passed real synthetic ingestion (one event, 120 tokens), retained
+  totals and zero duplicate insertion after restart. The NSIS lifecycle passed
+  both native Credential Manager acknowledgements across top-level app launches.
+  Both Mac package targets and Windows packaging also passed in
+  [34372667438](https://github.com/adamallcock/tibotattle/actions/runs/34372667438).
+  These are synthetic native checks, not real user-credential evidence.
+- **Genuine Linux AppImage replacement passed** on `fa712b23` in
+  [34377227344](https://github.com/adamallcock/tibotattle/actions/runs/34377227344):
+  normal automatic discovery/download, actual Install-button action, exact next
+  image replacement, automatic restart with matching ASAR and healthy companion,
+  and retained refresh settings/opt-out. Normal startup and native credential
+  checks also passed. This uses isolated local HTTPS at the production hostname
+  and extraction mode; ordinary FUSE/desktop behavior and notification banners
+  remain user-test coverage. No public Linux feed was changed.
+- The isolated staging Mac app from `c0c98040`, build `2026090917`, is Developer
+  ID signed, notarized and stapled. Signature, Gatekeeper and immutable transport
+  hashes are verified. It is bound to the disposable runner account and staging
+  origin, with updater disabled. This is not a replacement for installed `.16`.
+  The first hosted intake hit HTTP403 from Python's downloader; the corrected
+  system downloader passes exact transport verification. The second execution
+  exposed rejection of Node's native environment/account object prototypes in
+  the profile helper, before app launch. Source `ed00bdae` normalizes only those
+  defaults, with real native-object regression tests. The third signed run is
+  [34375748352](https://github.com/adamallcock/tibotattle/actions/runs/34375748352),
+  using reviewed runner `7293828a` and unchanged signed app `c0c98040`.
+  **Signed execution passed:** automatic accepted upload, unchanged credential
+  binding after authenticated restart, persistent opt-out after another restart,
+  and owned process cleanup all passed. The profile explicitly seeds the policy's
+  default-on state; untouched first-install classification and migration-notice
+  delivery are not asserted by this test. Staging was restored to revision 14,
+  contained with all collection flags off and accountless runtime modes disabled.
+  Public publication stayed disabled throughout.
+- Normal Mac `.17`/`.18` candidates are staged from frozen source `7293828a`
+  for both architectures, builds `2026090919`/`2026090920`. All four apps and
+  disk images are signed, notarized and stapled; final archive, updater metadata,
+  architecture and mounted-image verification passed. They include the latest dashboard, history and tray fixes;
+  `.17` test-feed publication completed for both architectures with exact `.16`
+  predecessor checks and R2 readback. Receipt `initial-publication-20260909-v2.json`
+  is retained; the earlier pre-write local-tool failure is retained as v1.
+  Installed `.16` is not yet replaced: the Mac is locked, and normal UI update
+  awaits unlock. R13 stopped backup and exact before/after verifiers are prepared.
+- The protected Windows signing workflow now maps the existing Azure OIDC and
+  signing-resource configuration, signs native modules before integrity
+  rebinding, then signs and verifies the installer without publication.
+  [34373775022](https://github.com/adamallcock/tibotattle/actions/runs/34373775022)
+  first stopped at an incorrect native prebuild path; source `f5137477` fixes
+  it. Retry [34374830275](https://github.com/adamallcock/tibotattle/actions/runs/34374830275)
+  authenticated successfully through Azure OIDC, then local SignTool found the
+  staged native modules read-only. Fixed native and metadata permission transitions
+  now pass. Run `34376745223` signed both native modules successfully, then stopped
+  at Authenticode verification before the final installer. Source `8d29e945` emits
+  closed trust/publisher/timestamp diagnostics without certificate data; protected
+  retry `34378235956` is running. Final Windows installer signing and its installed
+  runtime are not yet claimed. No environment review rules were changed.
+
+
 - User acceptance update: the user confirms Mac tray dismissal works and accepts
   physical Intel acceptance as an assumption for this cutover. Signing is
   authorized on both Mac and Windows. Do not describe assumed Intel testing as
@@ -70,10 +128,10 @@ Latest continuation, 2026-09-09:
   reports 29 complete days and only the current day partial for the 30-day view;
   incomplete typed-tool history no longer contaminates independently verified
   token coverage. All 55 focused tray tests passed. Native outside-click and
-  tray-toggle event ordering still require the fresh packaged check.
-- Windows signing authorization is granted, but an authenticated Windows signing
-  environment is not available here. The current caller is a preflight/build
-  entrypoint, not completed native-module finalization or a signed release.
+  tray-toggle event ordering were subsequently accepted by the user above.
+- The earlier local-only Windows signing limitation is superseded by the
+  protected remote signing workflow above; final signed runtime evidence remains
+  separate from configuration and dispatch.
 
 Latest test-feed and platform continuation:
 
@@ -261,12 +319,11 @@ Latest continuation checkpoint (frozen candidate and installed signed Mac source
   with architecture and inventory checks clean.
   See the [draft staging rehearsal boundary](../runbooks/2026-09-08-signed-staging-scheduler-rehearsal.md).
 
-Remaining gates: protected R7 report regeneration still awaits approval;
-signed packaged scheduler/enrollment/upload qualification is unfinished; actual
-tray popup and physical Intel GUI qualification remain open; Windows production
-signing and remaining credential/process lifecycle evidence are separate from
-the passing development CI. Production contributions, public accountless figures,
-and public stable cutover remain unchanged.
+Historical open-gate snapshot (superseded by the current checkpoint above):
+R7 regeneration, signed scheduling, tray acceptance, Intel acceptance and Windows
+production signing were open at this point. Do not use this historical list as
+the current release decision. Production activation and stable cutover remain
+separate from private test qualification.
 
 Earlier `.11` qualification and recovery history follows; the `.13` checkpoint
 above supersedes its installed-version and open-state claims.
