@@ -2522,7 +2522,8 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-signed-staging.yml",
-        "test/electron-signed-staging-execution.test.js"
+        "test/electron-signed-staging-execution.test.js",
+        "scripts/run-signed-electron-production-canary.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2556,6 +2557,55 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "test/electron-linux-real-appimage-updater.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/run-signed-electron-production-canary.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Read-only preparation is separate from explicitly approved synthetic production execution and owner cleanup.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-production-canary.yml",
+        "test/electron-production-canary.test.js",
+        "docs/plans/2026-09-09-production-accountless-activation-proposal.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-09-production-accountless-activation-proposal.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-windows-signed-installed.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Exact signed installer qualification is restricted to a disposable Windows runner and owned install lifecycle.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-windows-signing.yml",
+        "test/electron-windows-signed-installed.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/verify-electron-windows-update-artifacts.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Read-only final installer and updater metadata binding; does not publish or exercise replacement.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/smoke-electron-windows-signed-installed.mjs",
+        "test/electron-windows-update-artifacts.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
