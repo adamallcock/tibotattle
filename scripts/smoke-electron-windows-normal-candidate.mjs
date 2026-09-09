@@ -30,6 +30,7 @@ import {
   DESKTOP_FIRST_RUN_RECEIPT_SCHEMA_VERSION,
   validateDesktopFirstRunReceipt,
 } from "../apps/electron/desktop-first-run.js";
+import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC } from "../apps/electron/errors.js";
 import {
   createDesktopSharingBackend,
   createDesktopSharingCoordinator,
@@ -132,6 +133,9 @@ const MAXIMUM_JSON_BYTES = 1024 * 1024;
 const MAXIMUM_PROGRAM_OUTPUT_BYTES = 1024;
 const STARTUP_TIMEOUT_MS = 30_000;
 const OPERATION_TIMEOUT_MS = 20_000;
+// A one-shot diagnostic must not extend the existing startup acceptance
+// deadline. It only classifies the already-failed loopback endpoint.
+const STARTUP_CDP_DIAGNOSTIC_TIMEOUT_MS = 1_000;
 const PROCESS_EXIT_TIMEOUT_MS = 15_000;
 const POWERSHELL_TIMEOUT_MS = 20_000;
 // Firewall setup/readback has an independent bounded preparation budget. The
@@ -159,6 +163,26 @@ const NORMAL_CANDIDATE_STARTUP_PHASES = new Set([
   "settings_persist",
   "clean_quit",
   "process_absence",
+]);
+const STARTUP_CDP_CHILD_STATES = new Set([
+  "alive",
+  "exited_zero",
+  "exited_nonzero",
+  "signaled",
+  "unavailable",
+]);
+const STARTUP_CDP_ENDPOINT_STATES = new Set([
+  "version_available",
+  "transport_unavailable",
+  "timed_out",
+  "response_rejected",
+  "response_invalid",
+  "unavailable",
+]);
+const STARTUP_CDP_ENTRY_MARKER_STATES = new Set([
+  "entry_failure_marked",
+  "marker_absent",
+  "stream_unavailable",
 ]);
 const PROTECTED_OPT_OUT_STAGES = new Set([
   "PROTECTED_OPT_OUT_ADAPTER_UNAVAILABLE",
@@ -1294,6 +1318,136 @@ export async function jsonFetch(url, {
   }
 }
 
+/** Keep a failed CDP startup receipt content-free while distinguishing a
+ * launched process that exited from a process whose listener never appeared. */
+export function classifyWindowsNormalCandidateStartupCdpChild(child) {
+  if (child === null || typeof child !== "object") return "unavailable";
+  if (typeof child.signalCode === "string" && child.signalCode.length > 0) return "signaled";
+  if (Number.isInteger(child.exitCode)) return child.exitCode === 0 ? "exited_zero" : "exited_nonzero";
+  return child.exitCode === null && child.signalCode === null
+      && Number.isSafeInteger(child.pid) && child.pid >= 1
+    ? "alive" : "unavailable";
+}
+
+/** A closed receipt shape: no exit number, signal value, endpoint, or process
+ * output can cross this boundary. */
+export function normalizeStartupCdpDiagnostic(value) {
+  if (!exactObject(value) || Object.keys(value).length !== 3
+      || !STARTUP_CDP_CHILD_STATES.has(value.child)
+      || !STARTUP_CDP_ENDPOINT_STATES.has(value.endpoint)
+      || !STARTUP_CDP_ENTRY_MARKER_STATES.has(value.entryMarker)) return null;
+  return Object.freeze({
+    child: value.child,
+    endpoint: value.endpoint,
+    entryMarker: value.entryMarker,
+  });
+}
+
+function startupCdpDiagnostic({ child, endpoint, entryMarker }) {
+  return normalizeStartupCdpDiagnostic({
+    // This is called only after spawn returned an owned child with a valid PID.
+    child: classifyWindowsNormalCandidateStartupCdpChild(child),
+    endpoint: STARTUP_CDP_ENDPOINT_STATES.has(endpoint) ? endpoint : "unavailable",
+    entryMarker: STARTUP_CDP_ENTRY_MARKER_STATES.has(entryMarker) ? entryMarker : "stream_unavailable",
+  }) ?? Object.freeze({ child: "unavailable", endpoint: "unavailable", entryMarker: "stream_unavailable" });
+}
+
+/** Scan only the one exact, source-defined entry failure marker. The bounded
+ * cross-chunk suffix is never retained or emitted after classification. */
+export function createWindowsNormalCandidateStartupStderrObserver(stream) {
+  const marker = Buffer.from(ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, "utf8");
+  const suffixLength = Math.max(marker.length - 1, 0);
+  let markerSeen = false;
+  let suffix = Buffer.alloc(0);
+  if (stream === null || typeof stream !== "object" || typeof stream.on !== "function") {
+    return Object.freeze({ state: () => "stream_unavailable", dispose: () => {} });
+  }
+  const onData = (chunk) => {
+    if (markerSeen || !Buffer.isBuffer(chunk)) return;
+    if (chunk.includes(marker)) {
+      markerSeen = true;
+      suffix = Buffer.alloc(0);
+      return;
+    }
+    const prefix = chunk.subarray(0, Math.min(chunk.length, suffixLength));
+    if (suffix.length > 0 && Buffer.concat([suffix, prefix]).includes(marker)) {
+      markerSeen = true;
+      suffix = Buffer.alloc(0);
+      return;
+    }
+    const retained = chunk.length >= suffixLength
+      ? chunk.subarray(chunk.length - suffixLength)
+      : Buffer.concat([suffix, chunk]).subarray(-suffixLength);
+    suffix = Buffer.from(retained);
+  };
+  stream.on("data", onData);
+  return Object.freeze({
+    state: () => markerSeen ? "entry_failure_marked" : "marker_absent",
+    dispose: () => {
+      try { stream.off?.("data", onData) ?? stream.removeListener?.("data", onData); } catch {}
+      suffix = Buffer.alloc(0);
+    },
+  });
+}
+
+async function readWindowsNormalCandidateCdpVersion(endpoint, {
+  fetchImpl = fetch,
+  timeoutMs = OPERATION_TIMEOUT_MS,
+} = {}) {
+  if (exactLoopbackOrigin(endpoint) === null || typeof fetchImpl !== "function"
+      || !Number.isSafeInteger(timeoutMs) || timeoutMs < 1) {
+    return Object.freeze({ state: "unavailable", value: null });
+  }
+  const controller = new AbortController();
+  let timedOut = false;
+  let timer = null;
+  const timeout = new Promise((_, rejectTimeout) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+      rejectTimeout(new Error("loopback response unavailable"));
+    }, timeoutMs);
+  });
+  try {
+    let response;
+    try {
+      response = await Promise.race([
+        fetchImpl(`${endpoint}/json/version`, { signal: controller.signal, redirect: "error" }),
+        timeout,
+      ]);
+    } catch {
+      return Object.freeze({ state: timedOut ? "timed_out" : "transport_unavailable", value: null });
+    }
+    if (!response?.ok || response.redirected === true) {
+      return Object.freeze({ state: "response_rejected", value: null });
+    }
+    if (typeof response.json !== "function") {
+      return Object.freeze({ state: "response_invalid", value: null });
+    }
+    let value;
+    try { value = await Promise.race([response.json(), timeout]); }
+    catch {
+      return Object.freeze({ state: timedOut ? "timed_out" : "response_invalid", value: null });
+    }
+    return exactObject(value)
+      ? Object.freeze({ state: "version_available", value })
+      : Object.freeze({ state: "response_invalid", value: null });
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+}
+
+/** Execute one bounded, loopback-only observation after the normal startup
+ * path has already failed. It has no effect on startup acceptance. */
+export async function inspectWindowsNormalCandidateCdpEndpoint(endpoint, options = {}) {
+  const value = await readWindowsNormalCandidateCdpVersion(endpoint, {
+    ...options,
+    timeoutMs: options?.timeoutMs ?? STARTUP_CDP_DIAGNOSTIC_TIMEOUT_MS,
+  });
+  return value.state;
+}
+
 function exactLoopbackOrigin(value) {
   if (typeof value !== "string") return null;
   try {
@@ -1745,11 +1899,17 @@ export async function stopOwnedCandidate(child, {
 async function connectDashboard({ port, fetchImpl, WebSocketConstructor, onPhase = () => {} }) {
   const endpoint = `http://127.0.0.1:${port}`;
   onPhase("cdp_version");
-  const version = await waitFor(
-    () => jsonFetch(`${endpoint}/json/version`, { fetchImpl }),
-    STARTUP_TIMEOUT_MS,
-  );
-  if (!exactObject(version)) fail("CDP_UNAVAILABLE");
+  let endpointState = "unavailable";
+  const version = await waitFor(async () => {
+    const observed = await readWindowsNormalCandidateCdpVersion(endpoint, { fetchImpl });
+    endpointState = observed.state;
+    return observed.value;
+  }, STARTUP_TIMEOUT_MS);
+  if (!exactObject(version)) {
+    const error = failure("CDP_UNAVAILABLE");
+    error.startupCdpEndpoint = endpointState;
+    throw error;
+  }
   onPhase("dashboard_target");
   const target = await waitFor(async () => {
     const targets = await jsonFetch(`${endpoint}/json`, { fetchImpl });
@@ -1759,7 +1919,11 @@ async function connectDashboard({ port, fetchImpl, WebSocketConstructor, onPhase
   onPhase("cdp_connection");
   let cdp;
   try { cdp = await connectCdp(target, { WebSocketConstructor }); }
-  catch { fail("CDP_UNAVAILABLE"); }
+  catch {
+    const error = failure("CDP_UNAVAILABLE");
+    error.startupCdpEndpoint = "version_available";
+    throw error;
+  }
   return Object.freeze({ cdp, endpoint, target });
 }
 
@@ -2474,7 +2638,7 @@ async function closeCandidate(child, quitProtocol) {
   return true;
 }
 
-async function launchAndRenderCandidate({
+export async function launchAndRenderCandidate({
   appPath,
   profile,
   environment,
@@ -2509,6 +2673,8 @@ async function launchAndRenderCandidate({
   let child = null;
   let cdp = null;
   let observer = null;
+  let stdoutObserver = null;
+  let stderrObserver = null;
   let quitProtocol = null;
   let clean = false;
   let tracked = null;
@@ -2517,16 +2683,34 @@ async function launchAndRenderCandidate({
       onPhase("process_spawn");
       child = spawnApplication(spec.command, spec.args, {
         ...spec.options,
-        stdio: ["ignore", "ignore", "ignore", "ipc"],
+        stdio: ["ignore", "pipe", "pipe", "ipc"],
       });
       child.once?.("error", () => {});
     } catch {
       fail("APPLICATION_LAUNCH_UNAVAILABLE");
     }
     if (!Number.isSafeInteger(child?.pid) || child.pid < 1) fail("APPLICATION_LAUNCH_UNAVAILABLE");
+    stdoutObserver = createWindowsNormalCandidateStartupStderrObserver(child.stdout);
+    stderrObserver = createWindowsNormalCandidateStartupStderrObserver(child.stderr);
     if (candidateState !== null) candidateState.quiescent = false;
     quitProtocol = createQuitProtocol(child);
-    const connected = await connectDashboard({ port, fetchImpl, WebSocketConstructor, onPhase });
+    let connected;
+    try {
+      connected = await connectDashboard({ port, fetchImpl, WebSocketConstructor, onPhase });
+    } catch (error) {
+      if (error?.code === `${PREFIX}CDP_UNAVAILABLE`) {
+        error.startupCdpDiagnostic = startupCdpDiagnostic({
+          child,
+          endpoint: error.startupCdpEndpoint,
+          entryMarker: stdoutObserver.state() === "entry_failure_marked"
+            || stderrObserver.state() === "entry_failure_marked"
+            ? "entry_failure_marked"
+            : stdoutObserver.state() === "stream_unavailable" && stderrObserver.state() === "stream_unavailable"
+              ? "stream_unavailable" : "marker_absent",
+        });
+      }
+      throw error;
+    }
     cdp = connected.cdp;
     const dashboard = await assertDashboard({ cdp, target: connected.target, fetchImpl,
       launch: changeSettings ? "first" : "restart", onPhase });
@@ -2582,6 +2766,8 @@ async function launchAndRenderCandidate({
       cleanQuit: true,
     });
   } finally {
+    stdoutObserver?.dispose?.();
+    stderrObserver?.dispose?.();
     observer?.dispose?.();
     cdp?.close?.();
     quitProtocol?.close?.();
@@ -2669,6 +2855,7 @@ function candidateReceipt({
   errorCode = null,
   cleanup = {},
   startupDiagnostic = null,
+  startupCdpDiagnostic = null,
   startupCompletionDiagnostic = null,
   startupFailureCode = null,
   startupPhase = null,
@@ -2709,6 +2896,9 @@ function candidateReceipt({
     ...(selectedStartupPhase === null ? {} : { startupPhase: selectedStartupPhase }),
     ...(normalizeStartupFailureDiagnostic(startupDiagnostic) === null ? {} : {
       startupDiagnostic: normalizeStartupFailureDiagnostic(startupDiagnostic),
+    }),
+    ...(normalizeStartupCdpDiagnostic(startupCdpDiagnostic) === null ? {} : {
+      startupCdpDiagnostic: normalizeStartupCdpDiagnostic(startupCdpDiagnostic),
     }),
     ...(normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic) === null ? {} : {
       startupCompletionDiagnostic: normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic),
@@ -2765,6 +2955,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
   let errorCode = null;
   let startupFailureCode = null;
   let startupDiagnostic = null;
+  let startupCdpDetail = null;
   let startupCompletionDiagnostic = null;
   const cleanup = { firewallInstalled: false, firewallRemoved: false, profileRemoved: false };
   const candidateState = {
@@ -2828,6 +3019,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
     errorCode = fixedCode(error);
     startupFailureCode = normalizeStartupFailureCode(errorCode);
     startupDiagnostic = normalizeStartupFailureDiagnostic(error?.startupDiagnostic);
+    startupCdpDetail = normalizeStartupCdpDiagnostic(error?.startupCdpDiagnostic);
     startupCompletionDiagnostic = normalizeStartupCompletionDiagnostic(
       error?.startupCompletionDiagnostic,
     );
@@ -2859,6 +3051,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
       errorCode,
       cleanup,
       startupDiagnostic,
+      startupCdpDiagnostic: startupCdpDetail,
       startupCompletionDiagnostic,
       startupFailureCode,
       startupPhase: candidateState.startupPhase,

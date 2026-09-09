@@ -10,6 +10,7 @@ import { startLocalCompanionServer } from "../apps/local/server.js";
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import { DesktopSettingsBackendError } from "../apps/electron/desktop-settings-backends.js";
 import { createDesktopSharingCoordinator } from "../apps/electron/desktop-sharing.js";
+import { ELECTRON_ENTRY_FAILURE_DIAGNOSTIC } from "../apps/electron/errors.js";
 import { normalizeLocalOnboarding } from "../apps/web/public/data-client.js";
 import {
   inspectLocalOnboarding,
@@ -26,11 +27,16 @@ import {
   buildWindowsNormalCandidateFirewallCreateArguments,
   buildWindowsNormalCandidateFirewallRemoveArguments,
   createWindowsNormalCandidateQuitProtocol,
+  createWindowsNormalCandidateStartupStderrObserver,
+  classifyWindowsNormalCandidateStartupCdpChild,
   installOutboundFirewallBlock,
+  inspectWindowsNormalCandidateCdpEndpoint,
   jsonFetch,
+  launchAndRenderCandidate,
   localNetworkObserver,
   inspectWindowsNormalCandidateStartupRefreshCompletion,
   normalizeStartupCompletionDiagnostic,
+  normalizeStartupCdpDiagnostic,
   normalizeStartupFailureDiagnostic,
   normalizeStartupPhase,
   removeOutboundFirewallBlock,
@@ -71,6 +77,129 @@ test("startup failure diagnostics retain only fixed categories and booleans", ()
     { ...value, refreshStatus: "private" }, { ...value, sourceReadable: "private" },
     { ...value, requests: 42 }, { ...value, launch: "private" }]) {
     assert.equal(normalizeStartupFailureDiagnostic(changed), null);
+  }
+});
+
+test("CDP startup diagnostics retain only fixed child, endpoint, and entry-marker categories", () => {
+  const value = {
+    child: "exited_nonzero",
+    endpoint: "transport_unavailable",
+    entryMarker: "entry_failure_marked",
+  };
+  assert.deepEqual(normalizeStartupCdpDiagnostic(value), value);
+  for (const changed of [
+    null,
+    { ...value, raw: "private" },
+    { ...value, child: "exit 123" },
+    { ...value, endpoint: "http://private" },
+    { ...value, entryMarker: "private" },
+  ]) {
+    assert.equal(normalizeStartupCdpDiagnostic(changed), null);
+  }
+});
+
+test("CDP startup child classifier omits exit numbers and signal values", () => {
+  assert.equal(classifyWindowsNormalCandidateStartupCdpChild({ pid: 1, exitCode: null, signalCode: null }), "alive");
+  assert.equal(classifyWindowsNormalCandidateStartupCdpChild({ pid: 1, exitCode: 0, signalCode: null }), "exited_zero");
+  assert.equal(classifyWindowsNormalCandidateStartupCdpChild({ pid: 1, exitCode: 41, signalCode: null }), "exited_nonzero");
+  assert.equal(classifyWindowsNormalCandidateStartupCdpChild({ pid: 1, exitCode: null, signalCode: "SIGTERM" }), "signaled");
+  assert.equal(classifyWindowsNormalCandidateStartupCdpChild({ pid: 1, exitCode: undefined, signalCode: undefined }), "unavailable");
+});
+
+test("CDP startup endpoint diagnostic keeps only loopback outcome categories", async () => {
+  const endpoint = "http://127.0.0.1:9222";
+  assert.equal(await inspectWindowsNormalCandidateCdpEndpoint(endpoint, {
+    fetchImpl: async () => { throw new Error("private transport"); },
+  }), "transport_unavailable");
+  assert.equal(await inspectWindowsNormalCandidateCdpEndpoint(endpoint, {
+    fetchImpl: async () => ({ ok: false, redirected: false }),
+  }), "response_rejected");
+  assert.equal(await inspectWindowsNormalCandidateCdpEndpoint(endpoint, {
+    fetchImpl: async () => ({ ok: true, redirected: false, json: async () => null }),
+  }), "response_invalid");
+  assert.equal(await inspectWindowsNormalCandidateCdpEndpoint(endpoint, {
+    fetchImpl: async () => ({ ok: true, redirected: false, json: async () => ({ Browser: "Electron" }) }),
+  }), "version_available");
+  assert.equal(await inspectWindowsNormalCandidateCdpEndpoint(endpoint, {
+    fetchImpl: async (_url, { signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => reject(new Error("private abort")), { once: true });
+    }),
+    timeoutMs: 1,
+  }), "timed_out");
+  assert.equal(await inspectWindowsNormalCandidateCdpEndpoint("http://localhost:9222"), "unavailable");
+});
+
+test("CDP startup marker observer retains no stream content across chunk boundaries", () => {
+  const stream = new EventEmitter();
+  const observer = createWindowsNormalCandidateStartupStderrObserver(stream);
+  const marker = Buffer.from(ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, "utf8");
+  stream.emit("data", marker.subarray(0, 8));
+  stream.emit("data", marker.subarray(8, 15));
+  stream.emit("data", marker.subarray(15));
+  assert.equal(observer.state(), "entry_failure_marked");
+  observer.dispose();
+
+  const absent = createWindowsNormalCandidateStartupStderrObserver(new EventEmitter());
+  assert.equal(absent.state(), "marker_absent");
+  absent.dispose();
+  assert.equal(createWindowsNormalCandidateStartupStderrObserver(null).state(), "stream_unavailable");
+});
+
+test("normal candidate snapshots the closed CDP diagnostic before owned cleanup", async () => {
+  const root = await mkdtemp(join(process.cwd(), ".tibotattle-cdp-diagnostic-"));
+  const appPath = join(root, "TiboTattle.exe");
+  const profile = await prepareWindowsDevelopmentProfile({ appPath, profilePath: join(root, "profile") });
+  const child = new EventEmitter();
+  child.pid = 8123;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.connected = true;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.send = (_message, callback) => callback?.();
+  let cleanupSnapshot = null;
+  try {
+    await assert.rejects(launchAndRenderCandidate({
+      appPath,
+      profile,
+      environment: { PATH: "/safe/bin" },
+      freePort: async () => 9222,
+      spawnApplication: () => {
+        queueMicrotask(() => child.stderr.emit("data", Buffer.from(ELECTRON_ENTRY_FAILURE_DIAGNOSTIC, "utf8")));
+        return child;
+      },
+      fetchImpl: async (url) => {
+        await Promise.resolve();
+        if (url.endsWith("/json/version")) {
+          return { ok: true, redirected: false, json: async () => ({ Browser: "Electron" }) };
+        }
+        return { ok: true, redirected: false, json: async () => ([{
+          type: "page",
+          url: "http://127.0.0.1:43123/",
+          webSocketDebuggerUrl: "ws://127.0.0.1:9222/devtools/page/dashboard",
+        }]) };
+      },
+      WebSocketConstructor: class { constructor() { throw new Error("private socket failure"); } },
+      processProof: async () => [],
+      processAbsence: async () => true,
+      stopChild: async (ownedChild) => {
+        cleanupSnapshot = { exitCode: ownedChild.exitCode, signalCode: ownedChild.signalCode };
+        ownedChild.exitCode = 0;
+        return true;
+      },
+      candidateState: { quiescent: false },
+    }), (error) => {
+      assert.equal(error.code, "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_CDP_UNAVAILABLE");
+      assert.deepEqual(error.startupCdpDiagnostic, {
+        child: "alive",
+        endpoint: "version_available",
+        entryMarker: "entry_failure_marked",
+      });
+      return true;
+    });
+    assert.deepEqual(cleanupSnapshot, { exitCode: null, signalCode: null });
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });
 
