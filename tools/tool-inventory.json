@@ -2391,7 +2391,8 @@
         "test/electron-macos-production-finalization.test.js",
         "test/electron-windows-production-signing.test.js",
         "test/windows-electron-release-config.test.js",
-        "test/electron-windows-native-rebinding.test.js"
+        "test/electron-windows-native-rebinding.test.js",
+        ".github/workflows/electron-windows-signing.yml"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2470,7 +2471,8 @@
       "additionalAliases": [],
       "callers": [
         "test/electron-windows-production-signing.test.js",
-        "scripts/rebind-electron-windows-native-modules.mjs"
+        "scripts/rebind-electron-windows-native-modules.mjs",
+        ".github/workflows/electron-windows-signing.yml"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2503,7 +2505,8 @@
       "additionalAliases": [],
       "callers": [
         "test/electron-windows-native-rebinding.test.js",
-        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+        ".github/workflows/electron-windows-signing.yml"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
