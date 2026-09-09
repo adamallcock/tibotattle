@@ -20,6 +20,7 @@ import * as preparedCompatibility from "../src/telemetry-prepared-set.js";
 const CONTRIBUTION_PUBLIC_EXPORTS = Object.freeze([
   "accountlessDeviceUnavailableCode",
   "accountlessLocalLaboratoryOrigin",
+  "accountlessTransportOrigin",
   "ACCOUNTLESS_UPLOAD_OWNER_AUTHORIZATION_BASIS",
   "ACCOUNTLESS_UPLOAD_OWNER_POLICY_VERSION",
   "ACCOUNTLESS_UPLOAD_OWNER_SCHEMA_VERSION",

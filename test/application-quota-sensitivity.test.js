@@ -21,6 +21,7 @@ const APPLICATION_PUBLIC_EXPORTS = [
   ...QUOTA_SENSITIVITY_EXPORTS,
   "ClaudeCallbackCapabilityError",
   "CONTRIBUTION_PREFERENCE_SCHEMA_VERSION",
+  "accountlessTransportOrigin",
   "createAccountlessContributionScheduler",
   "createClaudeCallbackCapabilityContext",
   "createExportCompatibilityContext",
