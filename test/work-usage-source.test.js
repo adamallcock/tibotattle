@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -13,6 +14,7 @@ import { join } from "node:path";
 import { promisify } from "node:util";
 import test from "node:test";
 
+import { ingestLocalUnifiedIndexIncrement } from "../src/local-unified-index-ingest.js";
 import { rebuildLocalUnifiedIndex } from "../src/local-unified-index-build.js";
 import {
   openLocalUnifiedIndex,
@@ -926,4 +928,108 @@ test("bounded collaboration ancestry follows nested workers, preserves absent ro
     assert.equal(roots.get(ids[5]),ids[5]);
     assert.deepEqual(await readCodexLocalThreadAncestry(home,['invalid']),new Map());
   } finally {await rm(home,{recursive:true,force:true});}
+});
+
+
+test("metadata reuse verifies source identity and observes repository changes afresh", async () => {
+  const fixture = await makeFixture({ events: [
+    { timestamp: "2026-08-24T00:01:00Z", total: 100, last: 100 },
+    { timestamp: "2026-08-24T00:02:00Z", kind: "quota-repeat", total: 100, last: 100 },
+  ] });
+  const cache = new Map();
+  const options = { ...fixture, ...interval("2026-08-24T00:00:00Z", "2026-08-25T00:00:00Z"), workUsageMetadataCache: cache };
+  try {
+    const cold = await readLocalWorkUsageSnapshot(options);
+    assert.equal(cold.status, "available");
+    assert.equal(cache.size, 1);
+    const saved = [...cache.values()][0];
+    assert.ok(saved.contexts.length);
+    assert.equal(saved.quotaOnly.length, 1);
+    const warm = await readLocalWorkUsageSnapshot(options);
+    assert.equal([...cache.values()][0], saved, "unchanged extraction is retained");
+    assert.deepEqual(query(warm, "project"), query(cold, "project"));
+    await rename(join(fixture.repository, ".git"), join(fixture.repository, ".git-saved"));
+    const remapped = await readLocalWorkUsageSnapshot(options);
+    assert.equal([...cache.values()][0], saved);
+    assert.equal(query(remapped, "project").totals.tokens, 100);
+    assert.notEqual(query(remapped, "project").rows[0].id, query(cold, "project").rows[0].id,
+      "fresh Git resolution cannot be replaced by a cached repository mapping");
+    await modifySourceSameSize(fixture.rolloutPath);
+    const changed = await readLocalWorkUsageSnapshot(options);
+    assert.equal(cache.size, 0, "failed source verification invalidates cached observations");
+    assert.equal(query(changed, "project").rows[0].id, "unassigned");
+    assert.ok(query(changed, "project").totals.unknownEvents > 0,
+      "stale quota classifications must not hide unknown facts");
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+
+test("metadata cache forgets sources that disappear from discovery", async () => {
+  const fixture = await makeFixture({ events: [
+    { timestamp: "2026-08-24T00:01:00Z", total: 100, last: 100 },
+  ] });
+  const cache = new Map();
+  const options = { ...fixture, ...interval("2026-08-24T00:00:00Z", "2026-08-25T00:00:00Z"), workUsageMetadataCache: cache };
+  try {
+    await readLocalWorkUsageSnapshot(options);
+    assert.equal(cache.size, 1);
+    await rm(fixture.rolloutPath);
+    const absent = await readLocalWorkUsageSnapshot(options);
+    assert.equal(cache.size, 0);
+    assert.equal(query(absent, "project").rows[0].id, "unassigned");
+    assert.equal(query(absent, "project").totals.tokens, 100);
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+
+test("metadata cache reuses an indexed prefix until a new generation admits appended context", async () => {
+  const fixture = await makeFixture({ events: [
+    { timestamp: "2026-08-24T00:01:00Z", total: 100, last: 100 },
+  ] });
+  const cache = new Map();
+  const options = { ...fixture, ...interval("2026-08-24T00:00:00Z", "2026-08-25T00:00:00Z"), workUsageMetadataCache: cache };
+  try {
+    const cold = await readLocalWorkUsageSnapshot(options);
+    const saved = [...cache.values()][0];
+    await appendFile(fixture.rolloutPath, [
+      turnContext("2026-08-24T00:02:00Z", fixture.worktree, 2),
+      tokenCount("2026-08-24T00:02:00Z", 300, 200),
+    ].map(line => JSON.stringify(line)).join("\n") + "\n");
+    const prefix = await readLocalWorkUsageSnapshot(options);
+    assert.equal([...cache.values()][0], saved);
+    assert.deepEqual(query(prefix, "worktree"), query(cold, "worktree"));
+    await ingestLocalUnifiedIndexIncrement({ indexFile: fixture.indexFile,
+      codexHome: fixture.codexHome, contractVersion: CONTRACT });
+    const advanced = await readLocalWorkUsageSnapshot(options);
+    assert.notEqual([...cache.values()][0], saved);
+    assert.equal(query(advanced, "project").totals.tokens, 300);
+    assert.equal(query(advanced, "project").rows.length, 1);
+    assert.equal(query(advanced, "worktree").rows.length, 2);
+    const independent = await readLocalWorkUsageSnapshot({ ...options, workUsageMetadataCache: null });
+    assert.deepEqual(query(advanced, "worktree"), query(independent, "worktree"));
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
+});
+
+
+test("oversized cache candidates fall back to streaming without changing accounting", async () => {
+  const fixture = await makeFixture({ events: [] });
+  const cache = new Map();
+  const options = { ...fixture, ...interval("2026-08-24T00:00:00Z", "2026-08-25T00:00:00Z"), workUsageMetadataCache: cache };
+  try {
+    // Repeated bounded cwd observations exceed the estimated 32 MiB admission
+    // budget, while remaining well below the extractor's semantic limits.
+    const cwd = "/" + "a".repeat(4095);
+    const lines = Array.from({ length: 4100 }, (_, i) =>
+      JSON.stringify(turnContext("2026-08-24T00:01:00Z", cwd, i)));
+    lines.push(JSON.stringify(tokenCount("2026-08-24T00:02:00Z", 100, 100)));
+    await appendFile(fixture.rolloutPath, lines.join("\n") + "\n");
+    await ingestLocalUnifiedIndexIncrement({ indexFile: fixture.indexFile,
+      codexHome: fixture.codexHome, contractVersion: CONTRACT });
+    const bounded = await readLocalWorkUsageSnapshot(options);
+    assert.equal(bounded.status, "available");
+    assert.equal(cache.size, 0);
+    assert.equal(query(bounded, "project").totals.tokens, 100);
+    const independent = await readLocalWorkUsageSnapshot({ ...options, workUsageMetadataCache: null });
+    assert.deepEqual(query(bounded, "project"), query(independent, "project"));
+  } finally { await rm(fixture.root, { recursive: true, force: true }); }
 });

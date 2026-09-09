@@ -363,9 +363,16 @@ is written to the index, exports, diagnostics, contributions or browser storage.
 Explicit collaboration parent links are read in a bounded local metadata pass
 to group subworkers into primary-thread families. Cycles and unresolved ancestry
 remain separate; names and title policy are independent of this grouping.
-The current implementation keeps its attribution observations only for an
-immutable, expiring report. Retained-source loss yields Unassigned; it cannot
-reconstruct historical repository ownership. This is independent of token-count
+Attribution reports are immutable and expiring. A serial local projection worker
+may reuse extracted workspace observations and quota-status offsets in private
+memory across refreshes, under a 32 MiB estimated payload budget and a 25,000-source
+limit. It holds no database connection between jobs. The cache is scoped to one
+index/home/secret configuration and disappears on abort, worker failure, shutdown or
+five minutes of worker inactivity. Changed indexed prefixes are reread; absent
+or rejected sources are evicted. Each hit still verifies the retained source,
+and Git mappings and ancestry are resolved afresh. This cache is not serialized,
+exported or returned to the browser. Retained-source loss yields Unassigned;
+it cannot reconstruct historical repository ownership. This is independent of token-count
 and event-time API-price coverage. See the
 [implementation plan](../plans/2026-09-08-thread-project-usage-implementation.md)
 for the preview's bounds and qualification status.

@@ -295,3 +295,76 @@ Architecture, documentation and preflight checks passed. Rendered seven-day
 preview has no missing-count warning, no Unassigned row and no partial-price
 labels; switching back to it retained the final build counter. The previously
 recorded baseline tool-inventory and protected release-receipt limitations remain.
+
+## Refresh performance follow-up, 2026-09-09
+
+Acceptance: reduce repeated real-history refresh time by at least half while
+preserving exact accounting, source integrity, scope isolation, cancellation and
+local-only storage. Qualify unchanged and newly published generations against
+the existing canonical reconciliation. First-build latency is a separate gate.
+
+A CPU profile of the 861,682-fact generation measured a 50.0-second read.
+Metadata traversal accounted for 21.1 seconds of sampled execution, including
+16.7 seconds of repeated byte searches; asynchronous I/O adds further cost.
+Memoized pricing accounted for about 1.2 seconds, so replacing the pricing engine
+is not justified. Profile timings are nested and must not be added together.
+
+The implementation reuses the existing metadata extractor in a serial worker
+that survives between refreshes. Its private cache stores only bounded workspace
+observations and quota-status offsets. No cache crosses to the browser, enters a
+persisted report, or reaches disk. Each cached source is tied to its indexed
+prefix, ordinal, identity and modification tokens. Every hit still opens and
+verifies the source through the canonical stable-source contract. Changed indexed
+prefixes are rescanned; removed indexed sources are pruned. Git resolution and
+worker ancestry are observed afresh rather than cached across reports.
+
+The cache has a 32 MiB estimated payload budget and 25,000-source limit, is scoped
+to one index/home/secret configuration, and is discarded on abort, worker failure,
+idle retirement or close. Queueing is bounded. Shared report service shutdown
+aborts pending work and closes the owned projection reader. Existing one-shot
+reader behavior remains available for callers that do not own a reusable reader.
+
+Initial paired direct-reader measurement at the same report time: 51.1 seconds
+cold, 23.5 seconds warm, with 8,127 cached sources and approximately 21.2 MB of
+estimated retained payload. Both passed 12,868 canonical and hierarchy checks.
+The loopback worker then measured 52.2 seconds cold and 24.8 seconds after
+existing incremental ingestion admitted 544 additional facts into a new canonical
+generation (862,226 total). The new generation passed 12,914 reconciliation checks.
+This is a 52% reduction in report-build time for that paired browser run. Index
+staging/publication itself took 53.3 seconds and is a separate, unchanged cost. Historical
+fact aggregation remains a full pass; this change does not claim persistent
+incremental accounting or faster initial startup.
+
+The all-history missing-count warning was investigated separately with bounded
+source probes. Of 1,214 affected records, 1,005 genuinely lack cache-write fields
+(June 4–12); 48 contain consistent per-response counts but the existing canonical
+parser selected contradictory cumulative differences (May 25–July 31); 161 are
+repeat/reset classification cases. The latter comprise 146 repeated counters
+whose reported total is inconsistent, 12 resets with explicit zero last usage,
+and three repeats with absent cache-write fields. Those distinctions must remain
+visible. Recovering the 48 records requires a reviewed canonical parser correction
+and reindex; the summary layer must not substitute its own token computation.
+This refresh optimization does not change ingestion or historical amounts.
+
+
+Final review also added eviction for sources absent from live discovery or
+rejected before opening. Oversized cache candidates now stop collecting raw
+observations and continue the existing streaming resolver; cache admission cannot
+make otherwise supported reports unavailable. An oversized-source regression
+checks identical accounting and no retained cache entry.
+
+
+Final bounded-memory implementation: the real loopback preview measured 53.6
+seconds for its first build and 23.6 seconds for explicit refresh, a 56% reduction.
+The retained report time advanced, and all-history navigation reused the result.
+The canonical reconciliation passed 12,914 checks on this 862,226-fact generation.
+First builds after restart or five minutes of worker inactivity still reread
+metadata; this is a bounded in-process optimization, not a durable index cache.
+
+Validation: 25 source/cache/combined-reader tests, 32 reporting/worker lifecycle
+tests and 328 local integration tests passed. The metadata tests cover unchanged
+reuse, live Git remapping, changed/deleted sources, appended indexed prefixes,
+new generations and oversized-cache fallback. Native source packaging passed
+98 tests with three artifact-only skips. Export/owner-boundary checks,
+architecture, documentation and preflight passed. No installed-app or release
+qualification is inferred from the loopback preview.

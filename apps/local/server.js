@@ -27,7 +27,7 @@ import {
   ingestLocalUnifiedIndexOffMain,
 } from "../../src/local-unified-index-off-main.js";
 import {
-  readLocalUnifiedCompanionProjectionOffMain,
+  createLocalUnifiedCompanionProjectionReader,
 } from "../../src/local-unified-companion-off-main.js";
 import {
   LEGACY_LOCAL_UNIFIED_INDEX_SCHEMA_VERSION,
@@ -554,7 +554,7 @@ function projectionAborted() {
 
 /** Reuse cloneable accounting results, with one cancellable build per exact key. */
 export function createCachedLocalUnifiedProjectionReader({
-  reader = readLocalUnifiedCompanionProjectionOffMain,
+  reader = createLocalUnifiedCompanionProjectionReader(),
   validUntil = localUnifiedProjectionValidUntil,
   readGeneration = currentUnifiedProjectionGeneration,
 } = {}) {
@@ -562,6 +562,7 @@ export function createCachedLocalUnifiedProjectionReader({
     if (typeof callback !== "function") throw new TypeError("reader must be a function");
   }
   let cached = null;
+  let closed = false;
   let revision = 0;
   const pending = new Map();
   function subscribe(build, signal, select = value => value) {
@@ -585,7 +586,8 @@ export function createCachedLocalUnifiedProjectionReader({
       }, error => finish(reject, error));
     });
   }
-  return async function read(options, controls = {}) {
+  const read = async function read(options, controls = {}) {
+    if (closed) throw projectionAborted();
     if (controls.signal?.aborted) throw projectionAborted();
     // Deferred startup reads do not invalidate a completed full result.
     const select = controls.selectProjection ?? (value => value);
@@ -597,7 +599,7 @@ export function createCachedLocalUnifiedProjectionReader({
     ]);
     const expectedFingerprint = controls.reuse?.generationFingerprint
       ?? (options.includeWorkUsage ? await readGeneration(options) : null);
-    if (controls.signal?.aborted) throw projectionAborted();
+    if (closed || controls.signal?.aborted) throw projectionAborted();
     if (cached && key === cached.key && expectedFingerprint === cached.generationFingerprint
         && Number.isFinite(nowMs) && nowMs >= cached.projectedAtMs && nowMs < cached.validUntilMs) {
       return structuredClone(select(cached.projection));
@@ -643,6 +645,15 @@ export function createCachedLocalUnifiedProjectionReader({
     }
     return subscribe(build, controls.signal, select);
   };
+  read.close = async () => {
+    if (closed) return;
+    closed = true;
+    revision += 1;
+    cached = null;
+    for (const build of pending.values()) build.controller.abort();
+    await reader.close?.();
+  };
+  return read;
 }
 
 /** Internal work summaries stay out of the dashboard's persisted/public DTO. */
@@ -5469,7 +5480,10 @@ function createPreparedLocalCompanionServer({
     });
   });
 
-  server.on("close", () => workUsage.close());
+  server.on("close", () => {
+    workUsage.close();
+    void Promise.resolve(sharedProjectionReader.close?.()).catch(() => onError("local_projection_shutdown_failed"));
+  });
 
   return {
     server,

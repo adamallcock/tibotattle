@@ -30,6 +30,43 @@ export async function runLocalUnifiedCompanionProjectionWorkerThread({
     error.code = "local_unified_companion_projection_worker_protocol_invalid";
     throw error;
   }
+  if (data.persistent === true) {
+    let cacheScope = null;
+    let workUsageMetadataCache = new Map();
+    let pending = Promise.resolve();
+    port.on("message", (message) => {
+      pending = pending.then(async () => {
+        const requestId = message?.requestId;
+        if (message?.type !== "read" || !Number.isSafeInteger(requestId)
+            || message.options === null || typeof message.options !== "object") {
+          port.postMessage({ type: "error", requestId,
+            code: "local_unified_companion_projection_worker_protocol_invalid" });
+          return;
+        }
+        const scope = JSON.stringify([message.options.indexFile,
+          message.options.codexHome, message.options.secretFile]);
+        if (scope !== cacheScope) {
+          cacheScope = scope;
+          workUsageMetadataCache = new Map();
+        }
+        try {
+          const options = { ...message.options, workUsageMetadataCache };
+          const result = await (options.operation === "work-usage"
+            ? readLocalWorkUsageSnapshot(options)
+            : readLocalUnifiedCompanionProjection(options));
+          port.postMessage({ type: "result", requestId, result });
+        } catch (error) {
+          workUsageMetadataCache = new Map();
+          port.postMessage({ type: "error", requestId, code: safeErrorCode(error) });
+        }
+      }).catch(() => {
+        // A closed port or an uncloneable error response cannot be recovered.
+        // Exiting makes the owner reject its active request with a fixed code.
+        port.close();
+      });
+    });
+    return;
+  }
   try {
     const result = await (data.options.operation === "work-usage"
       ? readLocalWorkUsageSnapshot(data.options)

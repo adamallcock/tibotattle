@@ -218,3 +218,22 @@ test("related periods reuse accounting even when a cold build outlasts moving-wi
     assert.equal(reads, 2);
   } finally { service.close(); }
 });
+
+
+test("closing the shared reader aborts work and prevents builds after asynchronous generation lookup", async () => {
+  let releaseGeneration;
+  let calls = 0, closes = 0;
+  const implementation = async () => { calls++; return combined(); };
+  implementation.close = async () => { closes++; };
+  const reader = createCachedLocalUnifiedProjectionReader({ reader: implementation,
+    readGeneration: () => new Promise(resolve => { releaseGeneration = resolve; }),
+    validUntil: async () => Infinity });
+  const pending = reader({ indexFile: "/synthetic", mode: "full", includeWorkUsage: true, nowMs: 1 });
+  await reader.close();
+  releaseGeneration(generation);
+  await assert.rejects(pending, { code: "local_unified_companion_projection_aborted" });
+  await assert.rejects(reader({ mode: "deferred" }), { code: "local_unified_companion_projection_aborted" });
+  await reader.close();
+  assert.equal(calls, 0);
+  assert.equal(closes, 1);
+});

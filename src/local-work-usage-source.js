@@ -51,6 +51,21 @@ function atContext(contexts, offset) {
 }
 
 const MAX_WORK_CELLS = 50_000;
+const MAX_METADATA_CACHE_BYTES = 32 * 1024 * 1024;
+// Private worker memory only. Cache extracted observations, not resolved Git
+// mappings: repository identity and ancestry are observed anew on every refresh.
+function retainMetadata(cache, key, entry) {
+  if (!cache) return;
+  cache.delete(key);
+  if (entry.weight > MAX_METADATA_CACHE_BYTES) return;
+  let weight = [...cache.values()].reduce((sum, value) => sum + value.weight, 0);
+  while (cache.size && (weight + entry.weight > MAX_METADATA_CACHE_BYTES || cache.size >= 25_000)) {
+    const oldest = cache.keys().next().value;
+    weight -= cache.get(oldest).weight;
+    cache.delete(oldest);
+  }
+  cache.set(key, entry);
+}
 function scopeKey(row) {
   return `scope-${createHash("sha256")
     .update(
@@ -75,6 +90,7 @@ export async function prepareWorkUsageCollector({
   signal = null,
   intervals = null,
   maximumCells = MAX_WORK_CELLS,
+  workUsageMetadataCache = null,
 }) {
   if (!generation || !["complete", "partial"].includes(generation.status))
     throw workUsageError("work_usage_unavailable");
@@ -126,6 +142,10 @@ export async function prepareWorkUsageCollector({
       .filter((s) => s.source_local)
       .map((s) => [Buffer.from(s.source_local).toString("hex"), s]),
   );
+  const cache = workUsageMetadataCache instanceof Map ? workUsageMetadataCache : null;
+  // Removed sources must not retain observations until process shutdown.
+  if (cache) for (const key of cache.keys()) if (!expected.has(key)) cache.delete(key);
+  const verifiedSources = new Set();
   const contexts = new Map();
   const quotaOnlyBySource = new Map();
   const projects = {};
@@ -196,47 +216,84 @@ export async function prepareWorkUsageCollector({
       }
       const segments = [];
       const quotaOnlyOffsets = new Set();
+      // A changed indexed prefix always misses. Monotonic live growth may reuse
+      // the already indexed prefix, under the canonical stable-source contract.
+      const signature = JSON.stringify([indexFile, codexHome, secretFile,
+        generation.parserVersion, generation.contractVersion, source.source_ordinal,
+        source.scanned_bytes, source.size_bytes, source.source_identity_token,
+        source.source_state_token]);
+      const cached = cache?.get(key);
+      let observations;
+      const resolveContext = async ({ offset, cwd }) => {
+        signal?.throwIfAborted();
+        segments.push({ offset, project: await resolveProject(cwd) });
+      };
       try {
-        await withStableRolloutSource(indexedInfo, async (handle) =>
-          extractRolloutWorkContexts(handle, {
+        await withStableRolloutSource(indexedInfo, async (handle) => {
+          if (cached?.signature === signature) {
+            observations = cached;
+            contextCount += observations.contexts.length + observations.quotaOnly.length;
+            if (contextCount > 250_000) throw workUsageError("work_usage_capacity_exceeded");
+            return;
+          }
+          let candidate = cache ? { signature, contexts: [], quotaOnly: [],
+            weight: 256 + signature.length * 2 } : null;
+          const admit = (weight) => {
+            if (!candidate) return false;
+            candidate.weight += weight;
+            if (candidate.weight > MAX_METADATA_CACHE_BYTES) candidate = null;
+            return candidate !== null;
+          };
+          await extractRolloutWorkContexts(handle, {
             end: source.scanned_bytes,
             signal,
             onQuotaOnly: ({ offset }) => {
               if (++contextCount > 250_000)
                 throw workUsageError("work_usage_capacity_exceeded");
               quotaOnlyOffsets.add(offset);
+              if (admit(16)) candidate.quotaOnly.push(offset);
             },
-            onContext: async ({ offset, cwd }) => {
+            onContext: async (context) => {
               if (++contextCount > 250_000)
                 throw workUsageError("work_usage_capacity_exceeded");
-              const project = await resolveProject(cwd);
-              segments.push({ offset, project });
-              if (project) {
-                projects[project.project] = {
-                  name: project.projectName,
-                  method: project.method,
-                };
-                worktrees[project.worktree] = { name: project.worktreeName };
-              }
+              if (admit(64 + (context.cwd?.length ?? 0) * 2)) candidate.contexts.push(context);
+              // Cache admission cannot raise the reader's semantic capacity or
+              // make an oversized source unavailable: keep resolving in-stream.
+              await resolveContext(context);
             },
-          }),
-        );
+          });
+          observations = candidate;
+        });
+        // Only publish reusable observations after descriptor/path verification.
+        if (cached && cached === observations) {
+          for (const context of observations.contexts) await resolveContext(context);
+          for (const offset of observations.quotaOnly) quotaOnlyOffsets.add(offset);
+        } else if (observations) retainMetadata(cache, key, observations);
+        else cache?.delete(key);
+        for (const { project } of segments) if (project) {
+          projects[project.project] = { name: project.projectName, method: project.method };
+          worktrees[project.worktree] = { name: project.worktreeName };
+        }
         contexts.set(`${key}:${source.source_ordinal}`, segments);
         quotaOnlyBySource.set(
           `${key}:${source.source_ordinal}`,
           quotaOnlyOffsets,
         );
         inspectedSources += 1;
+        verifiedSources.add(key);
       } catch (error) {
+        cache?.delete(key);
         if (error?.code === "work_usage_capacity_exceeded" || signal?.aborted)
           throw error;
       }
     }
   } catch (error) {
+    cache?.clear();
     if (error?.code === "work_usage_capacity_exceeded" || signal?.aborted)
       throw error;
     metadataAvailable = false;
   }
+  if (cache) for (const key of cache.keys()) if (!verifiedSources.has(key)) cache.delete(key);
 
   let threadCount = 0;
   const cellKeys = new Set();
@@ -487,6 +544,7 @@ export async function readLocalWorkUsageSnapshot({
   scope,
   secretFile = null,
   signal = null,
+  workUsageMetadataCache = null,
 } = {}) {
   if (
     !Number.isSafeInteger(fromMs) ||
@@ -520,6 +578,7 @@ export async function readLocalWorkUsageSnapshot({
       signal,
       nowMs: toMs,
       intervals: [{ id: "custom", fromMs, toMs }],
+      workUsageMetadataCache,
     });
     const pricer = createAccountingPricer();
     let count = 0;

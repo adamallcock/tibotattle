@@ -429,6 +429,7 @@ export async function readLocalUnifiedCompanionProjection({
   codexHome,
   secretFile = null,
   signal = null,
+  workUsageMetadataCache = null,
 } = {}) {
   const complete = (companion, workUsage = null) => includeWorkUsage
     ? { companion, workUsage: workUsage ?? { status: companion.status === "available" ? "unavailable" : companion.status, asOfMs: nowMs } }
@@ -498,7 +499,7 @@ export async function readLocalUnifiedCompanionProjection({
     if (includeWorkUsage) {
       try {
         workCollector = await prepareWorkUsageCollector({
-          database, generation, indexFile, codexHome, secretFile, nowMs, signal,
+          database, generation, indexFile, codexHome, secretFile, nowMs, signal, workUsageMetadataCache,
         });
       } catch (error) {
         signal?.throwIfAborted();
