@@ -459,6 +459,7 @@ export const CLIENT_TEST_FILES = Object.freeze([
   "test/local-archive-accounting-index.test.js",
   "test/local-cache-drop-thread-links.test.js",
   "test/local-codex-thread-metadata.test.js",
+  "test/local-unified-cache-write-assumption.test.js",
   "test/local-collector-state.test.js",
   "test/local-companion-data.test.js",
   "test/local-companion-refresh.test.js",

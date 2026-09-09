@@ -62,6 +62,7 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
       "src/platform/local-codex-thread-store.js",
       "test/local-cache-drop-thread-links.test.js",
       "test/local-codex-thread-metadata.test.js",
+      "test/local-unified-cache-write-assumption.test.js",
       "apps/web/test/cache-drop-thread-links-client.test.mjs",
       "apps/web/test/cache-drop-thread-links-ui.test.mjs",
       "apps/web/public/community-refresh.js",

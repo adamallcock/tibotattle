@@ -415,3 +415,36 @@ bounds/ambiguity tests, architecture, documentation and preflight passed.
 A final origin review additionally rejects a present malformed/unsupported origin
 as ambiguous when another record claims the same directory, independent of row
 order. Its SQL presence flag preserves this safeguard even for oversized values.
+
+
+## Normal app delivery qualification, 2026-09-09
+
+The accepted scope is normal-app integration and a local development build;
+persistent incremental accounting remains a separate later phase. Source review
+confirmed the normal dashboard sidebar/mount, default companion route and fused
+reader were already connected on this feature branch. No parallel implementation
+or alternative production parser was introduced. The explicit client export now
+also carries the cache-write assumption regression test.
+
+A development macOS arm64 bundle was built with the required Node 26.2.0 toolchain.
+Its verified dependency graphs include the reporting, application, platform and
+browser modules. The bundled Node executable and bundled production server/UI
+were launched on loopback using a separate copy of the real index and device
+salt, with normal data-store/accounting composition and central service disabled.
+No synthetic data store or injected work-usage builder was used. The shared-
+identity app was not launched against installed state. Full-dashboard browser
+qualification and isolated native smoke are separate checks; this is not a signed,
+installed, published, or merged release.
+
+
+Qualification passed: client export tests (3), preflight (20), and the isolated
+native test-profile build/smoke (1 test containing eight native smoke invocations).
+AppKit layout aborted inside the outer sandbox; the identical invocation and
+complete smoke suite passed outside it. The development artifact payload digest
+is `a597af49836313faf052deae44627eda5d0c78d7d8bf6ca3135710385e0dac5b`.
+The packaged full-dashboard page showed 34 project groups, 1,005 assumed records
+and 209 incomplete records on the copied canonical generation, matching the
+focused preview. Sidebar navigation, all-history selection and nested task
+expansion were verified. The app remains a development artifact; installed and
+release gates remain open. Cross-generation persistent incremental accounting
+has not been implemented by this delivery step.

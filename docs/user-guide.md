@@ -141,6 +141,25 @@ Changing presentation does not change collection, notifications, contribution,
 or dashboard filters. A save failure leaves the previous selection in use;
 settings written by a newer app are preserved rather than overwritten.
 
+## Projects and threads (development build)
+
+The development branch includes **Projects & threads** in the dashboard sidebar.
+Expand a repository to see named tasks and their grouped subworkers, then expand
+a task for model and contributor details. Worktrees share a repository group;
+folders with no identifiable repository appear under **Non-project tasks**.
+Missing source context remains **Unassigned**.
+
+Choose a period and model to compare token and API-equivalent shares. These are
+estimates of recorded usage, not subscription charges or quota shares. Omitted
+cache-write counts use the explicitly approved zero assumption when the remaining
+input counters support it; **Includes assumed counts** distinguishes them from
+observed values. Other missing counts remain labelled partial.
+
+**Refresh report** updates this view from the existing local index. Use the app's
+main **Refresh** to collect new usage first. Each report displays its own as-of
+time; opening another section does not rewrite an existing report's snapshot.
+This feature is qualified in a local development build and has not been released.
+
 ## Refresh, progress, and recovery
 
 Use **Refresh** (or Cmd-R in the native app) to update quota, retained history,
