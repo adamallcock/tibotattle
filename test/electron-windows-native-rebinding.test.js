@@ -74,12 +74,15 @@ async function fixture(run) {
     }
     await chmod(join(stage, FS), 0o555);
     await chmod(join(stage, KEYTAR), 0o555);
+    await chmod(join(stage, SIDECAR), 0o444);
+    await chmod(join(stage, "electron-runtime-manifest.json"), 0o444);
     await writeFile(candidateReceiptPath, json(candidate));
     const options = { candidateReceiptPath };
     const dependencies = { repositoryRoot: root, platform: "win32", architecture: "x64", version: "v26.2.0",
       verifySignature: async () => {}, loadBinding: () => native() };
     await run({ root, base, stage, manifest, options, dependencies, sign: async () => {
       await chmod(join(stage, FS), 0o644); await chmod(join(stage, KEYTAR), 0o644);
+      await chmod(join(stage, SIDECAR), 0o644); await chmod(join(stage, "electron-runtime-manifest.json"), 0o644);
       await writeFile(join(stage, FS), pe(true)); await writeFile(join(stage, KEYTAR), pe(true));
       await chmod(join(stage, FS), 0o555); await chmod(join(stage, KEYTAR), 0o555);
     } });
@@ -112,6 +115,10 @@ test("inspect uses the exact Windows keytar prebuild selected for packaging, the
     assert.equal(journal.nativeReadOnly[KEYTAR], true);
     assert.equal(typeof journal.nativeModes[FS], "number");
     assert.equal(typeof journal.nativeModes[KEYTAR], "number");
+    assert.equal(journal.rebindMetadataReadOnly[SIDECAR], true);
+    assert.equal(journal.rebindMetadataReadOnly["electron-runtime-manifest.json"], true);
+    assert.equal(typeof journal.rebindMetadataModes[SIDECAR], "number");
+    assert.equal(typeof journal.rebindMetadataModes["electron-runtime-manifest.json"], "number");
     await assert.rejects(prepareWindowsNativeRebinding(options, dependencies), { code: "EEXIST" });
     await assert.rejects(prepareWindowsNativeRebinding({ candidateReceiptPath: join(base, "wrong.json") }, dependencies), { code: "WINDOWS_NATIVE_REBIND_CANDIDATE_PATH_INVALID" });
   });
@@ -169,7 +176,7 @@ test("CLI defaults to inspection, rejects ambiguous mode, and native rebind refu
   if (process.platform !== "win32") await assert.rejects(rebindWindowsNativeModules({}), { code: "WINDOWS_NATIVE_REBIND_NATIVE_WINDOWS_REQUIRED" });
 });
 test("rebinding refuses linked native files and a modified metadata journal before writing", async () => {
-  for (const fault of ["symlink", "hardlink", "journal", "native-access"]) {
+  for (const fault of ["symlink", "hardlink", "journal", "metadata-access"]) {
     await fixture(async ({ options, dependencies, base, stage, sign }) => {
       await prepareWindowsNativeRebinding(options, dependencies); await sign();
       const before = await readFile(join(stage, "electron-runtime-manifest.json"));
@@ -180,7 +187,7 @@ test("rebinding refuses linked native files and a modified metadata journal befo
       } else {
         const path = join(base, "windows-native-rebinding/journal.json");
         const journal = JSON.parse(await readFile(path, "utf8"));
-        if (fault === "native-access") journal.nativeReadOnly[FS] = false;
+        if (fault === "metadata-access") journal.rebindMetadataReadOnly[SIDECAR] = false;
         else journal.candidate.sourceRevision = "b".repeat(40);
         await writeFile(path, json(journal));
       }

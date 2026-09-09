@@ -23,6 +23,7 @@ const SIDECAR = `${FS}.manifest.json`;
 const KEYTAR = "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node";
 const MANIFEST = "electron-runtime-manifest.json";
 const NATIVES = Object.freeze([FS, KEYTAR]);
+const REBIND_METADATA = Object.freeze([SIDECAR, MANIFEST]);
 const MAX_FILE = 128 * 1024 * 1024;
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const jsonBytes = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
@@ -162,9 +163,17 @@ async function snapshot(context) {
   }
   const manifestBytes = await capture(root, join(stage, MANIFEST), 8 * 1024 * 1024);
   const sidecarBytes = await capture(root, join(stage, SIDECAR), 128 * 1024);
+  const rebindMetadataModes = {};
+  const rebindMetadataReadOnly = {};
+  for (const path of REBIND_METADATA) {
+    const access = await nativeAccess(root, join(stage, path));
+    rebindMetadataModes[path] = access.mode;
+    rebindMetadataReadOnly[path] = access.readOnly;
+  }
   assertOriginalBinding(manifest, sidecarBytes);
   return { schemaVersion: SCHEMA, candidate, manifestBase64: manifestBytes.toString("base64"),
-    sidecarBase64: sidecarBytes.toString("base64"), nativeContent, nativeModes, nativeReadOnly };
+    sidecarBase64: sidecarBytes.toString("base64"), nativeContent, nativeModes, nativeReadOnly,
+    rebindMetadataModes, rebindMetadataReadOnly };
 }
 
 export async function inspectWindowsNativeRebinding(options = {}, dependencies = {}) {
@@ -236,15 +245,22 @@ async function rebind(options, dependencies) {
   assertHost(dependencies);
   const context = await selected(options, dependencies);
   const journal = parse(await capture(context.root, context.journalPath, 16 * 1024 * 1024));
-  if (!exactKeys(journal, ["schemaVersion", "candidate", "manifestBase64", "sidecarBase64", "nativeContent", "nativeModes", "nativeReadOnly"])
+  if (!exactKeys(journal, ["schemaVersion", "candidate", "manifestBase64", "sidecarBase64", "nativeContent", "nativeModes", "nativeReadOnly", "rebindMetadataModes", "rebindMetadataReadOnly"])
       || journal.schemaVersion !== SCHEMA || !isDeepStrictEqual(journal.candidate, context.candidate)
       || !exactKeys(journal.nativeContent, NATIVES)
       || !exactKeys(journal.nativeModes, NATIVES) || !exactKeys(journal.nativeReadOnly, NATIVES)
+      || !exactKeys(journal.rebindMetadataModes, REBIND_METADATA)
+      || !exactKeys(journal.rebindMetadataReadOnly, REBIND_METADATA)
       || typeof journal.manifestBase64 !== "string" || typeof journal.sidecarBase64 !== "string") fail("JOURNAL_INVALID");
-  for (const path of NATIVES) {
-    if (!Number.isInteger(journal.nativeModes[path]) || journal.nativeModes[path] < 0 || journal.nativeModes[path] > 0o777
-        || typeof journal.nativeReadOnly[path] !== "boolean"
-        || journal.nativeReadOnly[path] !== ((journal.nativeModes[path] & 0o222) === 0)) fail("JOURNAL_INVALID");
+  for (const [paths, modes, readOnly] of [
+    [NATIVES, journal.nativeModes, journal.nativeReadOnly],
+    [REBIND_METADATA, journal.rebindMetadataModes, journal.rebindMetadataReadOnly],
+  ]) {
+    for (const path of paths) {
+      if (!Number.isInteger(modes[path]) || modes[path] < 0 || modes[path] > 0o777
+          || typeof readOnly[path] !== "boolean"
+          || readOnly[path] !== ((modes[path] & 0o222) === 0)) fail("JOURNAL_INVALID");
+    }
   }
   const originalManifestBytes = Buffer.from(journal.manifestBase64, "base64");
   const originalSidecarBytes = Buffer.from(journal.sidecarBase64, "base64");

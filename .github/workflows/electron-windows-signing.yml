@@ -187,21 +187,44 @@ jobs:
           exclude-azure-developer-cli-credential: true
           exclude-interactive-browser-credential: true
           cache-dependencies: false
+      - name: Make the fixed rebinding metadata writable
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $readOnly = [System.IO.FileAttributes]::ReadOnly
+          $rebindMetadata = @(
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json'),
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/electron-runtime-manifest.json')
+          )
+          foreach ($path in $rebindMetadata) {
+            $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($null -eq $item -or $item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+              throw 'WINDOWS_REBIND_METADATA_UNSAFE'
+            }
+            $attributes = [System.IO.FileAttributes]$item.Attributes
+            if (($attributes -band $readOnly) -eq 0) { throw 'WINDOWS_REBIND_METADATA_READONLY_EXPECTED' }
+            $writableAttributes = [System.IO.FileAttributes](([int]$attributes) -band (-bnot ([int]$readOnly)))
+            [System.IO.File]::SetAttributes($path, $writableAttributes)
+            if (([System.IO.File]::GetAttributes($path) -band $readOnly) -ne 0) {
+              throw 'WINDOWS_REBIND_METADATA_WRITABLE_UNAVAILABLE'
+            }
+          }
       - name: Rebind signed native modules to their manifest
         run: |
           $ErrorActionPreference = 'Stop'
           $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
           node scripts/rebind-electron-windows-native-modules.mjs --rebind --candidate-receipt $candidateReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_FAILED' }
-      - name: Restore the fixed native modules' read-only state
+      - name: Restore the fixed native modules and rebinding metadata read-only state
         run: |
           $ErrorActionPreference = 'Stop'
           $readOnly = [System.IO.FileAttributes]::ReadOnly
-          $nativeModules = @(
+          $stagedFiles = @(
             (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/native/windows-filesystem/build/Release/windows_filesystem.node'),
-            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/node_modules/@github/keytar/prebuilds/win32-x64/keytar.node')
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/node_modules/@github/keytar/prebuilds/win32-x64/keytar.node'),
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json'),
+            (Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/app/electron-runtime-manifest.json')
           )
-          foreach ($path in $nativeModules) {
+          foreach ($path in $stagedFiles) {
             $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
             if ($null -eq $item -or $item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
               throw 'WINDOWS_NATIVE_SIGNING_INPUT_UNSAFE'
