@@ -4890,3 +4890,69 @@ html[data-theme="dark"] .noscript {
 .cache-impact-bullets li + li { margin-top: var(--space-1); }
 .model-identity .model-usage-icon { width: 1.25rem; height: 1.25rem; display: inline-block; vertical-align: middle; margin-inline-end: .45rem; }
 .allowance-model-spark { --allowance-color: #996315; }
+/* Local Projects & threads: shared paper surfaces, typography and controls. */
+.work-usage-heading, .work-usage-toolbar, .work-usage-pagination { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+.work-usage-heading h2 { margin:0 0 8px; }
+.work-usage-heading { margin-bottom:20px; }
+.work-usage-period { display:flex; gap:6px; flex-wrap:wrap; }
+.work-usage-period .button[aria-pressed="true"] { background:var(--action-bg); color:var(--action-ink); }
+.work-usage-toolbar { justify-content:flex-start; margin:24px 0 16px; }
+.work-usage-select { display:flex; flex-direction:column; gap:5px; font-size:12px; }
+.work-usage-select select, .work-usage-find input { background:var(--paper, #fffdf7); color:inherit; border:1px solid var(--line, #d8dbcf); border-radius:8px; padding:9px 12px; font:inherit; }
+.work-usage-find { display:flex; gap:8px; margin:0 0 18px; }
+.work-usage-find input { flex:1; min-width:0; max-width:440px; }
+.work-usage-status, .work-usage-caption, .work-usage-notes, .work-usage-muted { color:var(--muted, #657167); font-size:13px; }
+.work-usage-summary { display:grid; grid-template-columns:2fr 1fr 1fr; gap:16px; margin:24px 0; }
+.work-usage-card { padding:22px; border:1px solid var(--line, #d8dbcf); border-radius:12px; background:var(--paper, #fffdf7); }
+.work-usage-card span { display:block; font-size:13px; margin-bottom:10px; }
+.work-usage-card strong { display:block; font:clamp(24px, 3vw, 42px)/1.2 Georgia,serif; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+.work-usage-row-link { padding:0; border:0; background:none; color:inherit; text-align:start; font:inherit; font-weight:600; cursor:pointer; overflow-wrap:anywhere; }
+.work-usage-row-link:hover { text-decoration:underline; }
+.work-usage-value { font-variant-numeric:tabular-nums; font-weight:600; }
+.work-usage-muted { display:block; margin-top:5px; font-weight:400; }
+.work-usage-bar { height:4px; background:var(--line, #e0e4db); margin-top:8px; border-radius:4px; overflow:hidden; max-width:130px; }
+.work-usage-bar span { height:100%; display:block; background:var(--accent, #245c46); }
+.work-usage-date { font-size:12px; color:var(--muted, #657167); }
+.work-usage-pagination { padding:20px 0; font-size:13px; }
+.work-usage-notes { border-top:1px solid var(--line, #d8dbcf); margin-top:24px; padding-top:14px; line-height:1.7; }
+.work-usage-components { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+.work-usage-components div { border:1px solid var(--line, #d8dbcf); border-radius:8px; padding:14px; }
+.work-usage-components dt { font-size:12px; }
+.work-usage-components dd { margin:8px 0 0; font-size:20px; }
+.work-usage-empty { padding:32px 12px; }
+@media (max-width:600px) {
+ .work-usage-summary { grid-template-columns:1fr 1fr; gap:10px; }
+ .work-usage-card:first-child { grid-column:1 / -1; }
+ .work-usage-card { padding:16px; }
+ .work-usage-components { grid-template-columns:1fr 1fr; }
+}
+
+/* Projects use the existing accounting table's columns, row density, nesting,
+   quiet shares and named-thread links. All values remain visible on narrow
+   screens in the shared table-wrap scroll container. */
+.work-usage-table-panel { margin-top: 18px; }
+.work-usage-project-toggle { padding: 0; border: 0; background: none; color: inherit; font: inherit; font-weight: var(--weight-semibold); text-align: start; cursor: pointer; }
+.work-usage-project-toggle .model-disclosure-caret { display: inline-block; font-size: 1.25em; }
+.work-usage-project-toggle[aria-expanded="true"] .model-disclosure-caret { transform: rotate(90deg); }
+.work-usage-project-toggle:focus-visible, .work-usage-row-link:focus-visible { outline: 3px solid rgba(49,95,132,.42); outline-offset: 3px; }
+.work-usage-table .work-usage-muted { font-size: .65rem; }
+.work-usage-child-controls { white-space: normal; }
+.work-usage-child-controls .table-pagination { margin: 0 0 8px; }
+.work-usage-child-controls > .button { margin-inline-start: 12px; }
+.work-usage-children .cache-drop-thread-cell { padding-inline-start: calc(var(--pad-tile) + var(--space-5) + var(--space-3)); }
+
+.work-usage-model-toggle { display: inline-flex; margin-inline-end: 6px; }
+.work-usage-table .cache-drop-thread-content { display: inline-block; width: calc(100% - 32px); vertical-align: top; }
+.work-usage-table .cache-drop-thread-link { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.work-usage-primary-model { padding-inline-start: 22px; }
+.work-usage-model-detail > td { padding: 0 var(--pad-tile) var(--pad-tile) calc(var(--pad-tile) + var(--space-5)); }
+.work-usage-model-breakdown { padding: var(--pad-tile); background: var(--surface-quiet); border: 1px solid var(--line); border-radius: var(--radius-sm); overflow-x: auto; }
+.work-usage-model-table { width: 100%; }
+.work-usage-model-breakdown .annotation { margin-bottom: 0; }
+.work-usage-model-breakdown { white-space: normal; }
+.work-usage-model-table th { white-space: normal; }
+.work-usage-model-table th, .work-usage-model-table td { padding: var(--space-3); }
+
+.work-usage-family-count { padding-inline-start: 22px; }
+.work-usage-contributions { margin-bottom: var(--space-4); }
+.work-usage-contributions th, .work-usage-contributions td { padding: var(--space-3); }

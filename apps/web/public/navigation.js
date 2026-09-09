@@ -1,5 +1,6 @@
 const PAGE_BY_TARGET = new Map([
   ["overview", "overview"],
+  ["projects", "projects"],
   ["weekly", "weekly"],
   ["accounting", "method"],
   ["method", "method"],

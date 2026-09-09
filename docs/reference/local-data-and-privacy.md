@@ -339,3 +339,33 @@ behavior must update this file, the public privacy page, localized first-run
 and refresh disclosure, and source-backed privacy tests in the same change.
 Obsolete privacy documents should be deleted once this maintained inventory
 supersedes them; retaining contradictory consent boundaries is a product bug.
+
+## Projects and threads local display
+
+Owner-approved on 2026-09-08. The local reporting API can read canonical typed
+usage identities/counts and explicit `cwd` from `session_meta`, `turn_context`
+and `thread_settings_applied.thread_settings` through the existing
+bounded source reader. The same reader can qualify status-only quota records
+against canonical all-null rows; it never adds token usage. Reads stop at the
+indexed prefix, including when the stable reader accepts append-only growth.
+The initial session directory applies until a later explicit directory update.
+Sparse settings preserve the observed directory; malformed changes invalidate it.
+Later observations never backfill earlier usage.
+The owner approved Codex title fallbacks for this local view on 2026-09-08.
+Explicit session-index names and saved names take precedence. Titles are bounded
+to 512 characters inside SQLite before reaching JavaScript; whitespace is
+normalized and control-containing values are rejected. Titles can include opening
+message text, but are never exported, uploaded or persisted by this feature.
+No transcript or response bodies are read. The cache-drop tables and ancestry
+reader retain their title-free contract. A bounded local Git lookup groups worktrees; display labels and
+basenames are transient display decoration. No raw path, name or project handle
+is written to the index, exports, diagnostics, contributions or browser storage.
+Explicit collaboration parent links are read in a bounded local metadata pass
+to group subworkers into primary-thread families. Cycles and unresolved ancestry
+remain separate; names and title policy are independent of this grouping.
+The current implementation keeps its attribution observations only for an
+immutable, expiring report. Retained-source loss yields Unassigned; it cannot
+reconstruct historical repository ownership. This is independent of token-count
+and event-time API-price coverage. See the
+[implementation plan](../plans/2026-09-08-thread-project-usage-implementation.md)
+for the preview's bounds and qualification status.

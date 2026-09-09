@@ -23,7 +23,7 @@ export {
   readCodexConfigServiceTier,
 } from "./codex-config-service-tier.js";
 export { createLocalCodexLogPorts } from "./local-codex-log-ports.js";
-export { readCodexLocalThreadMetadata } from "./local-codex-thread-store.js";
+export { readCodexLocalThreadMetadata, readCodexLocalThreadAncestry } from "./local-codex-thread-store.js";
 export {
   createLocalExportSourcePorts,
   localIsProxy,
@@ -213,3 +213,4 @@ export {
   rotateParticipantSecret,
   withParticipantSecretLease,
 } from "./participant-identity.js";
+export { createWorkUsageProjectResolver } from "./work-usage-projects.js";

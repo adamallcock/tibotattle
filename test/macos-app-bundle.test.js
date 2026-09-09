@@ -7242,6 +7242,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "src/application/local-contribution-preparation.js",
     "src/application/local-export-set-verification.js",
     "src/application/local-prepared-contribution.js",
+    "src/application/work-usage.js",
     "src/contribution/telemetry-v11-chunks.js",
     "src/contribution/telemetry-v11-sync.js",
     "src/export/compression.js",
@@ -7251,6 +7252,9 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "src/platform/owner-only-prepared-contribution-storage.js",
     "src/platform/telemetry-v11-envelope.js",
     "src/local-unified-contribution-attribution.js",
+    "src/local-work-usage-source.js",
+    "src/platform/work-usage-projects.js",
+    "src/reporting/work-usage.js",
     "src/prepared-contribution-compatibility-internal.js",
   ]) {
     assert.equal(graph.relativeFiles.includes(ownedFile), true, ownedFile);
@@ -7296,6 +7300,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/telemetry-envelope.js",
     "apps/web/public/telemetry-shared.generated.js",
     "apps/web/public/ui-format.js",
+    "apps/web/public/work-usage-view.js",
   ]);
   assert.equal(
     webModules.relativeFiles.includes("apps/web/public/community.js"),
@@ -7352,6 +7357,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/telemetry-shared.generated.js",
     "apps/web/public/tibotattle-icon.png",
     "apps/web/public/ui-format.js",
+    "apps/web/public/work-usage-view.js",
   ]);
   assert.deepEqual(
     graph.relativeFiles.filter((path) =>

@@ -3594,3 +3594,24 @@ export function readUnifiedIndexAggregate(database) {
     lastObservedAtMs: totals?.last_ms === null ? null : Number(totals.last_ms),
   };
 }
+
+/** Internal reporting port: preserve admitted identities and nullable facts.
+ * Caller holds one read transaction/publication. No compatibility zero coercion,
+ * attribution joins or independent replay filtering occurs at this boundary.
+ */
+export function iterateUnifiedWorkUsageFacts(database, { fromMs, toMs, accountScopeId }) {
+  if (!Number.isSafeInteger(fromMs) || fromMs < 0 || !Number.isSafeInteger(toMs)
+      || toMs < fromMs || !Number.isSafeInteger(accountScopeId) || accountScopeId < 0) {
+    throw fixedError("local_unified_index_work_query_invalid");
+  }
+  return database.prepare(`SELECT u.event_key, u.observed_at_ms, u.source_local,
+    u.source_ordinal, u.source_offset, u.session_local, u.account_scope_id,
+    u.tokens_in_uncached, u.tokens_in_cache_read, u.tokens_in_cache_write,
+    u.tokens_out_text, u.tokens_out_reasoning, u.tokens_out_combined, u.total_input_context, u.quota_observation_id,
+    m.model_id, t.codex_speed_mode, t.api_service_tier, i.session_uuid, p.parser_version
+    FROM usage_event u JOIN model m ON m.id=u.model_id JOIN tier_semantics t ON t.id=u.tier_id
+    JOIN parser_version p ON p.id=u.parser_version_id
+    LEFT JOIN session_identity i ON i.session_local=u.session_local
+    WHERE u.observed_at_ms >= ? AND u.observed_at_ms < ? AND u.account_scope_id=?
+    ORDER BY u.observed_at_ms, u.event_key`).iterate(fromMs, toMs, accountScopeId);
+}

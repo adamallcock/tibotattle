@@ -168,6 +168,7 @@ function interpolate(message, values = {}) {
 export const WEB_MESSAGES = Object.freeze({
   ...Object.fromEntries(Object.keys(CATALOGS[DEFAULT_LOCALE])
     .filter((key) => key.startsWith("contribution.")
+      || key.startsWith("workUsage.")
       || key.startsWith("appearance.")
       || key.startsWith("electron.")
       || key.startsWith("weekly.controls.")

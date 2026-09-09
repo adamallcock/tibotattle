@@ -55,3 +55,4 @@ export {
 export {
   createLocalMetadataExportContext,
 } from "./local-metadata-export.js";
+export { createWorkUsageService, validateWorkUsageQuery } from "./work-usage.js";

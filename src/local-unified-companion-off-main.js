@@ -29,6 +29,16 @@ function validateOptions(options) {
   if (typeof options.indexFile !== "string" || options.indexFile.length < 1) {
     throw new TypeError("indexFile must be a non-empty string");
   }
+  if (options.operation === "work-usage") {
+    if (typeof options.codexHome !== "string" || !Number.isSafeInteger(options.fromMs)
+        || options.fromMs < 0 || !Number.isSafeInteger(options.toMs)
+        || options.toMs < options.fromMs) throw new TypeError("invalid work usage interval");
+    return { operation: "work-usage", indexFile: options.indexFile, codexHome: options.codexHome,
+      fromMs: options.fromMs, toMs: options.toMs, scope: options.scope, secretFile: options.secretFile };
+  }
+  if (options.includeWorkUsage === true && typeof options.codexHome !== "string") {
+    throw new TypeError("codexHome must be a string");
+  }
   const nowMs = options.nowMs ?? Date.now();
   if (!Number.isFinite(nowMs)) {
     throw new TypeError("nowMs must be a finite epoch timestamp");
@@ -44,6 +54,7 @@ function validateOptions(options) {
       ? options.declaredSpeedBaselines
       : [],
     mode,
+    ...(options.includeWorkUsage === true ? { includeWorkUsage: true, codexHome: options.codexHome, secretFile: options.secretFile } : {}),
   };
 }
 
@@ -80,14 +91,21 @@ export async function readLocalUnifiedCompanionProjectionOffMain(
   if (typeof WorkerClass !== "function") {
     throw new TypeError("WorkerClass must be a constructor");
   }
-  if (!shouldRunLocalUnifiedCompanionProjectionOffMain({
+  if (signal?.aborted === true) {
+    throw fixedError("local_unified_companion_projection_aborted");
+  }
+  if (selected.operation !== "work-usage" && !shouldRunLocalUnifiedCompanionProjectionOffMain({
     platform,
     mode: selected.mode,
   })) {
-    return readLocalUnifiedCompanionProjection(selected);
-  }
-  if (signal?.aborted === true) {
-    throw fixedError("local_unified_companion_projection_aborted");
+    try {
+      return await readLocalUnifiedCompanionProjection({ ...selected, signal });
+    } catch (error) {
+      if (signal?.aborted === true) {
+        throw fixedError("local_unified_companion_projection_aborted");
+      }
+      throw error;
+    }
   }
 
   let worker;

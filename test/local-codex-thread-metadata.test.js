@@ -377,3 +377,38 @@ test("Codex-home, database, and SQLite sidecar links cannot redirect display met
   assert.equal(result.get(WORKER).nickname, null);
   assert.deepEqual(await readFile(databaseFile), databaseBytes);
 });
+
+test("approved local title fallback is explicit, bounded and respects saved names and parent links", async (t) => {
+  const {home,databaseFile,namesFile}=await fixture(t,{explicitName:true});
+  await rm(namesFile);
+  const db=new DatabaseSync(databaseFile);
+  db.prepare('UPDATE threads SET title=? WHERE id=?').run('  Synthetic\nCodex\t title <b>literal</b>  ',WORKER);
+  db.close();
+  const before=await readFile(databaseFile);
+  const enabled=await readCodexLocalThreadMetadata(home,[ROOT,WORKER],{allowTitleFallback:true});
+  assert.equal(enabled.get(ROOT).name,'Explicit root name');
+  assert.equal(enabled.get(WORKER).name,'Synthetic Codex title <b>literal</b>');
+  assert.equal(enabled.get(WORKER).parent.name,'Explicit root name');
+  assert.equal((await readCodexLocalThreadMetadata(home,[WORKER])).get(WORKER).name,null);
+  assert.equal((await readCodexLocalThreadMetadata(home,[WORKER],{allowTitleFallback:'true'})).get(WORKER).name,null);
+  assert.deepEqual(await readFile(databaseFile),before);
+
+  const update=new DatabaseSync(databaseFile);
+  update.prepare('UPDATE threads SET name=NULL, title=? WHERE id=?').run('Synthetic parent title',ROOT);
+  update.prepare('UPDATE threads SET title=? WHERE id=?').run('x'.repeat(100_000),WORKER);
+  update.close();
+  const bounded=await readCodexLocalThreadMetadata(home,[WORKER],{allowTitleFallback:true});
+  assert.equal(bounded.get(WORKER).name.length,512);
+  assert.equal(bounded.get(WORKER).parent.name,'Synthetic parent title');
+  await writeFile(namesFile,`${named(WORKER,'Saved session name')}\n`);
+  assert.equal((await readCodexLocalThreadMetadata(home,[WORKER],{allowTitleFallback:true})).get(WORKER).name,'Saved session name');
+});
+
+test("title fallback rejects nontext and control-containing values", async (t) => {
+  const {home,databaseFile,namesFile}=await fixture(t);
+  await rm(namesFile);
+  for (const title of ['bad\u0000title','bad\u0007title','   ',null]) {
+    const db=new DatabaseSync(databaseFile);db.prepare('UPDATE threads SET title=? WHERE id=?').run(title,ROOT);db.close();
+    assert.equal((await readCodexLocalThreadMetadata(home,[ROOT],{allowTitleFallback:true})).get(ROOT).name,null);
+  }
+});

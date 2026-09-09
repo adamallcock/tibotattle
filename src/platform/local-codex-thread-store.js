@@ -230,7 +230,7 @@ async function safeSqliteSidecars(databaseFile) {
   return true;
 }
 
-async function readSelectedThreadMetadata(codexHome, ids) {
+async function readSelectedThreadMetadata(codexHome, ids, { ancestryOnly = false, allowTitleFallback = false } = {}) {
   const databaseFile = join(codexHome, "state_5.sqlite");
   let database;
   try {
@@ -248,19 +248,25 @@ async function readSelectedThreadMetadata(codexHome, ids) {
       return new Map();
     }
     const columns = new Set(info.map((column) => column.name));
-    // `title` is deliberately never selected: older Codex databases store the
-    // initial prompt there. Only an explicit `name`, the bounded agent nickname,
-    // and structured source ancestry belong in this transient UI lookup.
+    // Titles may contain opening-message text. Only the owner-approved local
+    // Projects & threads display opts into this bounded fallback. Ancestry and
+    // other callers keep the existing title-free contract.
     const selected = [
       "id",
-      boundedTextColumn(columns, "name", MAX_THREAD_DISPLAY_NAME_LENGTH),
-      boundedTextColumn(columns, "agent_nickname", MAX_AGENT_NICKNAME_LENGTH),
+      allowTitleFallback && !ancestryOnly && columns.has("title")
+        ? `CASE WHEN typeof(title) = 'text' AND instr(title, char(0)) = 0 THEN substr(title, 1, ${MAX_THREAD_DISPLAY_NAME_LENGTH}) ELSE NULL END AS display_title`
+        : "NULL AS display_title",
+      ancestryOnly ? "NULL AS name" : boundedTextColumn(columns, "name", MAX_THREAD_DISPLAY_NAME_LENGTH),
+      ancestryOnly ? "NULL AS agent_nickname" : boundedTextColumn(columns, "agent_nickname", MAX_AGENT_NICKNAME_LENGTH),
       boundedTextColumn(columns, "source", MAX_THREAD_SOURCE_LENGTH),
       boundedTextColumn(columns, "thread_source", MAX_THREAD_SOURCE_CLASS_LENGTH),
       boundedTextColumn(columns, "rollout_path", MAX_ROLLOUT_PATH_LENGTH),
     ].join(", ");
     const statement = database.prepare(`SELECT ${selected} FROM threads WHERE id = ?`);
     const result = new Map();
+    const selectedName = (row) => displayName(row.name) ??
+      (allowTitleFallback && !ancestryOnly && typeof row.display_title === "string"
+        ? displayName(row.display_title.replace(/\s+/gu, " ")) : null);
     const parentIds = new Set();
     for (const id of ids) {
       const row = statement.get(id);
@@ -273,12 +279,12 @@ async function readSelectedThreadMetadata(codexHome, ids) {
       const autoReview = threadStoreAutoReview || sourceAutoReview;
       const verifiedAutoReview = threadStoreAutoReview && sourceAutoReview;
       const worker = autoReview ? null : workerMetadata(source, id);
-      const parentId = verifiedAutoReview
+      const parentId = verifiedAutoReview && !ancestryOnly
         ? await readAutoReviewParent(codexHome, row.rollout_path, id)
         : worker?.parentId ?? null;
       if (parentId !== null) parentIds.add(parentId);
       result.set(id, {
-        name: displayName(row.name),
+        name: selectedName(row),
         nickname: displayName(row.agent_nickname, MAX_AGENT_NICKNAME_LENGTH)
           ?? worker?.nickname ?? null,
         parentId,
@@ -286,21 +292,19 @@ async function readSelectedThreadMetadata(codexHome, ids) {
       });
     }
     for (const id of parentIds) {
+      if (result.size + parentIds.size > 50_000) return new Map();
       if (result.has(id)) continue;
       const row = statement.get(id);
       if (row !== undefined && threadId(row.id) === id) {
         const source = parseThreadSource(row.source);
-        // A guardian review is an internal review surface even when it happens
-        // to exist locally. Do not chain it into another review's navigation.
+        // Internal guardian surfaces must not become navigation targets or
+        // collaboration ancestors. Preserve the current display contract.
         if (isAutoReviewThreadSource(row.thread_source) || isAutoReviewSource(source)) {
           continue;
         }
-        result.set(id, {
-          name: displayName(row.name),
-          nickname: null,
-          parentId: null,
-          origin: null,
-        });
+        const parentId = ancestryOnly ? workerMetadata(source, id)?.parentId ?? null : null;
+        if (parentId) parentIds.add(parentId);
+        result.set(id, { name: selectedName(row), nickname: null, parentId, origin: null });
       }
     }
     return sameOwnerControlledFile(before, await lstat(databaseFile))
@@ -375,16 +379,17 @@ async function readSelectedSessionIndexNames(codexHome, selectedIds) {
 
 /**
  * Resolve only selected usage-row UUIDs to ephemeral, local-only display
- * metadata. No prompt/transcript/body or `threads.title` is read; names and
- * ancestry must never enter accounting caches, derived indexes, or exports.
+ * metadata. The local Projects & threads caller may explicitly allow bounded
+ * Codex titles. No transcript/body is read; display text and ancestry must
+ * never enter accounting caches, derived indexes, or exports.
  */
-export async function readCodexLocalThreadMetadata(codexHome, threadIds) {
+export async function readCodexLocalThreadMetadata(codexHome, threadIds, { allowTitleFallback = false } = {}) {
   if (!Array.isArray(threadIds) || threadIds.length === 0
       || threadIds.length > MAX_LOCAL_THREAD_LOOKUPS
       || !await ownerControlledCodexHome(codexHome)) return new Map();
   const ids = [...new Set(threadIds.map(threadId))];
   if (ids.includes(null)) return new Map();
-  const selected = await readSelectedThreadMetadata(codexHome, ids);
+  const selected = await readSelectedThreadMetadata(codexHome, ids, { allowTitleFallback: allowTitleFallback === true });
   const nameIds = new Set(ids);
   for (const id of ids) {
     const parentId = selected.get(id)?.parentId;
@@ -413,4 +418,26 @@ export async function readCodexLocalThreadMetadata(codexHome, threadIds) {
     if (metadata?.origin === "auto_review") result.origin = "auto_review";
     return [id, result];
   }));
+}
+
+/** Read only explicit collaboration edges; no names or prompt-bearing titles. */
+export async function readCodexLocalThreadAncestry(codexHome, threadIds) {
+  if (!Array.isArray(threadIds) || threadIds.length > 25_000 || !await ownerControlledCodexHome(codexHome)) return new Map();
+  const ids = [...new Set(threadIds.map(threadId))];
+  if (ids.includes(null)) return new Map();
+  const selected = await readSelectedThreadMetadata(codexHome, ids, { ancestryOnly: true });
+  const roots = new Map();
+  for (const id of ids) {
+    let current = id;
+    const seen = new Set();
+    for (let depth = 0; depth <= 64; depth++) {
+      if (depth === 64 || seen.has(current)) { current = id; break; }
+      seen.add(current);
+      const parent = selected.get(current)?.parentId;
+      if (!parent) break;
+      current = parent;
+    }
+    roots.set(id, current);
+  }
+  return roots;
 }

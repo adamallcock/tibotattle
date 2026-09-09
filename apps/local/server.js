@@ -1,3 +1,5 @@
+import { createWorkUsageService } from "../../src/application/index.js";
+import { enrichWorkUsageRows } from "../../src/local-work-usage-source.js";
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
@@ -458,6 +460,7 @@ async function localUnifiedProjectionValidUntil({
   indexFile,
   generationFingerprint,
   nowMs,
+  includeWorkUsage = false,
   inspect = lstat,
   openDatabase = openImmutableLocalUnifiedIndex,
 } = {}) {
@@ -465,7 +468,7 @@ async function localUnifiedProjectionValidUntil({
   let database;
   try {
     before = await inspect(indexFile);
-    if (!ownerOnlyRegularUnifiedIndex(before)) return nowMs;
+    if (!ownerOnlyRegularUnifiedIndex(before) || localUnifiedIndexHasSidecar(indexFile, lstatSync)) return nowMs;
     database = openDatabase(indexFile);
     database.exec("PRAGMA query_only=ON; PRAGMA trusted_schema=OFF;");
     const generation = readUnifiedIndexGenerationDescriptor(database);
@@ -475,7 +478,7 @@ async function localUnifiedProjectionValidUntil({
       const rawObservedAt = database.prepare(`
         SELECT MIN(observed_at_ms) AS observed_at_ms
         FROM usage_event
-        WHERE observed_at_ms > ?
+        WHERE observed_at_ms >= ?
       `).get(nowMs - durationMs)?.observed_at_ms;
       const observedAt = rawObservedAt === null || rawObservedAt === undefined
         ? null
@@ -502,8 +505,17 @@ async function localUnifiedProjectionValidUntil({
         );
       }
     }
+    if (includeWorkUsage) {
+      const observedAt = database.prepare(`
+        SELECT MIN(observed_at_ms) AS observed_at_ms FROM usage_event
+        WHERE observed_at_ms >= ?
+      `).get(nowMs)?.observed_at_ms;
+      if (observedAt !== null && Number.isSafeInteger(observedAt)) {
+        boundaries.push(observedAt + 1);
+      }
+    }
     const after = await inspect(indexFile);
-    if (!unchangedUnifiedIndexTarget(before, after)) return nowMs;
+    if (!unchangedUnifiedIndexTarget(before, after) || localUnifiedIndexHasSidecar(indexFile, lstatSync)) return nowMs;
     return boundaries.length === 0
       ? Number.POSITIVE_INFINITY
       : Math.min(...boundaries.filter((value) => value > nowMs));
@@ -518,74 +530,143 @@ async function localUnifiedProjectionValidUntil({
   }
 }
 
-/**
- * Reuse one immutable, generation-bound projection until the next exact
- * time-window boundary. A cold start, changed generation, changed declared
- * baseline, unavailable result, or uncertain validity check always falls
- * through to the reviewed off-main reader.
- */
+async function currentUnifiedProjectionGeneration({ indexFile }) {
+  let database;
+  try {
+    const before = await lstat(indexFile);
+    if (!ownerOnlyRegularUnifiedIndex(before) || localUnifiedIndexHasSidecar(indexFile, lstatSync)) return null;
+    database = openImmutableLocalUnifiedIndex(indexFile);
+    const fingerprint = readUnifiedIndexGenerationDescriptor(database)?.fingerprint;
+    return unchangedUnifiedIndexTarget(before, await lstat(indexFile))
+      && !localUnifiedIndexHasSidecar(indexFile, lstatSync) ? fingerprint : null;
+  } catch {
+    return null;
+  } finally {
+    database?.close();
+  }
+}
+
+function projectionAborted() {
+  const error = new Error("local_unified_companion_projection_aborted");
+  error.code = "local_unified_companion_projection_aborted";
+  return error;
+}
+
+/** Reuse cloneable accounting results, with one cancellable build per exact key. */
 export function createCachedLocalUnifiedProjectionReader({
   reader = readLocalUnifiedCompanionProjectionOffMain,
   validUntil = localUnifiedProjectionValidUntil,
+  readGeneration = currentUnifiedProjectionGeneration,
 } = {}) {
-  if (typeof reader !== "function") throw new TypeError("reader must be a function");
-  if (typeof validUntil !== "function") {
-    throw new TypeError("validUntil must be a function");
+  for (const callback of [reader, validUntil, readGeneration]) {
+    if (typeof callback !== "function") throw new TypeError("reader must be a function");
   }
   let cached = null;
-  return async (options, controls = {}) => {
-    const baselineKey = JSON.stringify(
-      Array.isArray(options?.declaredSpeedBaselines)
-        ? options.declaredSpeedBaselines
-        : [],
-    );
-    const expectedFingerprint = controls?.reuse?.generationFingerprint ?? null;
-    const nowMs = options?.nowMs;
-    if (controls?.signal?.aborted === true) {
-      const error = new Error("local_unified_companion_projection_aborted");
-      error.code = "local_unified_companion_projection_aborted";
+  let revision = 0;
+  const pending = new Map();
+  function subscribe(build, signal, select = value => value) {
+    if (signal?.aborted) return Promise.reject(projectionAborted());
+    build.subscribers += 1;
+    return new Promise((resolve, reject) => {
+      let finished = false;
+      const finish = (callback, value) => {
+        if (finished) return;
+        finished = true;
+        signal?.removeEventListener("abort", abort);
+        build.subscribers -= 1;
+        if (build.subscribers === 0 && !build.settled) build.controller.abort();
+        callback(value);
+      };
+      const abort = () => finish(reject, projectionAborted());
+      signal?.addEventListener("abort", abort, { once: true });
+      build.promise.then(value => {
+        try { finish(resolve, structuredClone(select(value))); }
+        catch (error) { finish(reject, error); }
+      }, error => finish(reject, error));
+    });
+  }
+  return async function read(options, controls = {}) {
+    if (controls.signal?.aborted) throw projectionAborted();
+    // Deferred startup reads do not invalidate a completed full result.
+    const select = controls.selectProjection ?? (value => value);
+    if (options?.mode !== "full") return select(await reader(options, controls));
+    const nowMs = options.nowMs;
+    const key = JSON.stringify([
+      options.indexFile, options.declaredSpeedBaselines ?? [],
+      options.includeWorkUsage === true, options.codexHome ?? null, options.secretFile ?? null,
+    ]);
+    const expectedFingerprint = controls.reuse?.generationFingerprint
+      ?? (options.includeWorkUsage ? await readGeneration(options) : null);
+    if (controls.signal?.aborted) throw projectionAborted();
+    if (cached && key === cached.key && expectedFingerprint === cached.generationFingerprint
+        && Number.isFinite(nowMs) && nowMs >= cached.projectedAtMs && nowMs < cached.validUntilMs) {
+      return structuredClone(select(cached.projection));
+    }
+    // Exact timestamps can share immediately. Different timestamps use the
+    // finished cache only after its time-membership proof has completed.
+    const buildKey = JSON.stringify([key, expectedFingerprint, nowMs]);
+    const earlier = [...pending.values()].find(item => item.key === key
+      && expectedFingerprint !== null && item.fingerprint === expectedFingerprint
+      && item.nowMs < nowMs && !item.controller.signal.aborted);
+    if (earlier) {
+      await subscribe(earlier, controls.signal, () => null);
+      return read(options, controls);
+    }
+    let build = pending.get(buildKey);
+    if (!build || build.controller.signal.aborted) {
+      const buildRevision = ++revision;
+      build = { key, fingerprint: expectedFingerprint, nowMs, controller: new AbortController(), subscribers: 0, settled: false };
+      const selected = build;
+      selected.promise = Promise.resolve().then(async () => {
+        const projection = await reader(options, { ...controls, signal: selected.controller.signal });
+        const companion = projection?.companion ?? projection;
+        const generationFingerprint = companion?.generation?.fingerprint;
+        if (companion?.status === "available"
+            && (!options.includeWorkUsage || projection?.workUsage?.status === "available")
+            && /^generation-v2-[0-9a-f]{64}$/u.test(generationFingerprint ?? "")
+            && Number.isFinite(nowMs)) {
+          const validUntilMs = await validUntil({
+            indexFile: options.indexFile, generationFingerprint, nowMs,
+            includeWorkUsage: options.includeWorkUsage === true,
+          });
+          if (!selected.controller.signal.aborted && buildRevision === revision && validUntilMs > nowMs) {
+            cached = { key, generationFingerprint, projectedAtMs: nowMs, validUntilMs,
+              projection: structuredClone(projection) };
+          }
+        }
+        return projection;
+      }).finally(() => {
+        selected.settled = true;
+        if (pending.get(buildKey) === selected) pending.delete(buildKey);
+      });
+      pending.set(buildKey, selected);
+    }
+    return subscribe(build, controls.signal, select);
+  };
+}
+
+/** Internal work summaries stay out of the dashboard's persisted/public DTO. */
+export function selectSharedWorkUsageSnapshot(projection, query) {
+  const work = projection?.workUsage;
+  if (work?.status !== "available") {
+    if (/^work_usage_[a-z_]+$/u.test(work?.errorCode ?? "")) {
+      const error = new Error(work.errorCode);
+      error.code = work.errorCode;
       throw error;
     }
-    if (options?.mode === "full"
-        && cached !== null
-        && expectedFingerprint === cached.generationFingerprint
-        && options.indexFile === cached.indexFile
-        && baselineKey === cached.baselineKey
-        && Number.isFinite(nowMs)
-        && nowMs >= cached.projectedAtMs
-        && nowMs < cached.validUntilMs) {
-      return structuredClone(cached.projection);
-    }
-
-    const projection = await reader(options, controls);
-    // Startup/quick deferred reads are intentionally cheap and do not say
-    // anything about the still-valid completed projection cached beside them.
-    if (options?.mode !== "full") return projection;
-    cached = null;
-    const generationFingerprint = projection?.generation?.fingerprint;
-    if (options?.mode === "full"
-        && projection?.status === "available"
-        && typeof generationFingerprint === "string"
-        && /^generation-v2-[0-9a-f]{64}$/u.test(generationFingerprint)
-        && Number.isFinite(nowMs)) {
-      const validUntilMs = await validUntil({
-        indexFile: options.indexFile,
-        generationFingerprint,
-        nowMs,
-      });
-      if (validUntilMs > nowMs) {
-        cached = {
-          indexFile: options.indexFile,
-          generationFingerprint,
-          baselineKey,
-          projectedAtMs: nowMs,
-          validUntilMs,
-          projection: structuredClone(projection),
-        };
-      }
-    }
-    return projection;
-  };
+    return { status: work?.status ?? "unavailable" };
+  }
+  const period = work.periods?.[query.period];
+  if (!period) return { status: "unavailable" };
+  const scope = query.scope ?? period.scopes.find(item => item.status === "unavailable")?.id
+    ?? period.scopes[0]?.id ?? "scope-0";
+  const snapshot = period.snapshots[scope];
+  if (!snapshot) {
+    const error = new Error("work_usage_scope_unavailable");
+    error.code = "work_usage_scope_unavailable";
+    throw error;
+  }
+  return { ...snapshot, fromMs: period.fromMs, toMs: period.toMs };
 }
 
 function createAppAwareKeychainBackend(environment) {
@@ -831,6 +912,7 @@ const API_ROUTES = new Set([
   "/api/local/onboarding",
   "/api/local/overview",
   "/api/local/cache-drop-thread-links",
+  "/api/local/work-usage/query",
   "/api/local/gradient",
   "/api/local/weekly",
   "/api/local/weekly-pace-outlook",
@@ -2978,7 +3060,12 @@ function createPreparedLocalCompanionServer({
     ledgerFile: statePaths.codexSpeedBaselineFile,
     configFile: join(codexHome, "config.toml"),
   }),
-  unifiedProjectionReader = createCachedLocalUnifiedProjectionReader(),
+  sharedProjectionReader = createCachedLocalUnifiedProjectionReader(),
+  unifiedProjectionReader = async (options, controls) => {
+    return sharedProjectionReader({ ...options, includeWorkUsage: true, codexHome }, {
+      ...controls, selectProjection: projection => projection.companion ?? projection,
+    });
+  },
   dataStore = new LocalCompanionDataStore({
     snapshotFile: statePaths.authoritativeDashboardSnapshotFile,
     builder: async ({
@@ -3035,6 +3122,12 @@ function createPreparedLocalCompanionServer({
     codexHome,
     overview,
   }),
+  workUsageBuild = async (query, controls) => sharedProjectionReader({
+      mode: "full", nowMs: query.toMs, includeWorkUsage: true,
+      indexFile: statePaths.unifiedIndexFile, codexHome,
+      declaredSpeedBaselines: await codexSpeedBaseline.readWindows(),
+    }, { ...controls, selectProjection: projection => selectSharedWorkUsageSnapshot(projection, query) }),
+  workUsageEnrich = (query) => enrichWorkUsageRows({ ...query, codexHome }),
   // This is a programmatic, development-only gate: no environment variable,
   // settings control, route, or UI surface enables Claude usage collection.
   // A caller must explicitly opt into the production-shaped local shadow.
@@ -4206,6 +4299,7 @@ function createPreparedLocalCompanionServer({
     return authorization;
   };
 
+  const workUsage = createWorkUsageService({ build: workUsageBuild, enrich: workUsageEnrich });
   const server = createServer(async (request, response) => {
     try {
       if (!isLoopbackPeer(request)) {
@@ -4485,6 +4579,29 @@ function createPreparedLocalCompanionServer({
           return;
         }
         send(response, 200, dataStore.getOverview());
+        return;
+      }
+      if (path === "/api/local/work-usage/query") {
+        if (request.method !== "POST") { sendError(response, 405, "method_not_allowed"); return; }
+        if (!authorizeCacheDropThreadLinksRead(request, response)) return;
+        if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/iu.test(request.headers["content-type"] ?? "")) {
+          sendError(response, 415, "unsupported_media_type"); return;
+        }
+        if (Number(request.headers["content-length"]) > 4096) { sendError(response, 413, "request_too_large"); return; }
+        let bytes = 0; const chunks = [];
+        for await (const chunk of request) {
+          bytes += chunk.length;
+          if (bytes > 4096) { sendError(response, 413, "request_too_large"); return; }
+          chunks.push(chunk);
+        }
+        let query;
+        try { query = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+        catch { sendError(response, 400, "invalid_json"); return; }
+        try { send(response, 200, await workUsage.query(query)); }
+        catch (error) {
+          const code = /^work_usage_[a-z_]+$/u.test(error?.code ?? "") ? error.code : "work_usage_unavailable";
+          sendError(response, code.includes("snapshot") ? 409 : code.includes("query") ? 400 : 503, code);
+        }
         return;
       }
       if (path === "/api/local/cache-drop-thread-links") {
@@ -5351,6 +5468,8 @@ function createPreparedLocalCompanionServer({
       onError("automatic_contribution_retirement_lock_release_failed");
     });
   });
+
+  server.on("close", () => workUsage.close());
 
   return {
     server,

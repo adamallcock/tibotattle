@@ -1,3 +1,4 @@
+import { projectRecordedTokenComponents } from "./reporting/index.js";
 import {
   addUsdStrings,
   emptySpeedWeightingCrossing,
@@ -230,18 +231,10 @@ export function emptyDimension(keys) {
 }
 
 export function usageProjection(record, declaredSpeed = "unknown", pricer = null) {
-  const components = emptyComponents();
-  addComponents(components, record.components);
-  if (components.output_combined_tokens > 0
-      && components.output_text_tokens + components.output_reasoning_tokens > 0) {
-    components.output_combined_tokens = 0;
-  }
-  const totalTokens = components.input_uncached_tokens
-    + components.input_cache_read_tokens
-    + components.input_cache_write_tokens
-    + (components.output_combined_tokens > 0
-      ? components.output_combined_tokens
-      : components.output_text_tokens + components.output_reasoning_tokens);
+  const recorded = projectRecordedTokenComponents(record.components);
+  const components = Object.fromEntries(Object.entries(recorded.components)
+    .map(([key, value]) => [key, value ?? 0]));
+  const totalTokens = recorded.totalTokens ?? 0;
   if (totalTokens === 0) return null;
   const model = safeModel(record.model);
   const pricingEvent = { timestamp: record.observedAt, model };

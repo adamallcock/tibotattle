@@ -42,6 +42,8 @@ const APPLICATION_PUBLIC_EXPORTS = [
   "createLocalExportResourceContext",
   "createLocalMetadataExportContext",
   "createLocalMetadataBundleVerificationContext",
+  "createWorkUsageService",
+  "validateWorkUsageQuery",
   "selectProductionParticipantIdentity",
   "selectProductionClaudeCallbackBackend",
 ].sort();

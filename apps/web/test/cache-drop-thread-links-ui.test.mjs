@@ -1,4 +1,5 @@
 import test from "node:test";
+import { formatCodexThreadParts } from "../public/ui-format.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { cacheDropThreadLookupKey } from "../public/data-client.js";
@@ -66,6 +67,7 @@ function createHarness({ locale = "en-US", lookup, local = true } = {}) {
   };
   const dependencies = {
     dashboard: null,
+    formatCodexThreadParts,
     cacheDropThreadLinks: state,
     cacheDropThreadLookupKey,
     localClient: lookup === undefined ? {} : { cacheDropThreadLinks: lookup },

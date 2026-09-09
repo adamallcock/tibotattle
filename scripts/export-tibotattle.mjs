@@ -119,6 +119,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/application/local-prepared-contribution.js",
   "src/application/production-participant-identity.js",
   "src/application/subscription-speed-sensitivity.js",
+  "src/application/work-usage.js",
   "src/automatic-contribution-retirement.js",
   "src/bounded-jsonl.js",
   "src/bundle-verifier.js",
@@ -235,6 +236,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/local-unified-index-off-main.js",
   "src/local-unified-index-worker.js",
   "src/local-unified-index.js",
+  "src/local-work-usage-source.js",
   "src/passive-collector.js",
   "src/platform/bounded-directory-reader.js",
   "src/platform/bounded-jsonl-reader.js",
@@ -270,6 +272,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/platform/windows-filesystem.js",
   "src/platform/windows-protected-state-store.js",
   "src/platform/windows-qualification-mode.js",
+  "src/platform/work-usage-projects.js",
   "src/prepared-contribution-compatibility-internal.js",
   "src/providers/claude/statusline.js",
   "src/providers/codex/account-scope.js",
@@ -289,6 +292,7 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "src/reporting/index.js",
   "src/reporting/monitoring-quality.js",
   "src/reporting/weekly-calibration.js",
+  "src/reporting/work-usage.js",
   "src/rollout-line-reader.js",
   "src/rollout-source-snapshot.js",
   "src/side-chat-estimates.js",
@@ -331,6 +335,7 @@ export const CLIENT_WEB_FILES = Object.freeze([
   "apps/web/public/telemetry-envelope.js",
   "apps/web/public/telemetry-shared.generated.js",
   "apps/web/public/ui-format.js",
+  "apps/web/public/work-usage-view.js",
 ]);
 
 export const CLIENT_MACOS_FILES = Object.freeze([
@@ -431,6 +436,7 @@ export const CLIENT_TEST_FILES = Object.freeze([
   "apps/local/participant-relay-routes.test.mjs",
   "apps/local/participant-session-cookie-bridge.test.mjs",
   "apps/local/server.test.mjs",
+  "apps/local/work-usage.test.mjs",
   "apps/web/test/cache-drop-thread-links-client.test.mjs",
   "apps/web/test/cache-drop-thread-links-ui.test.mjs",
   "apps/web/test/cache-switch-impact.test.mjs",
@@ -441,6 +447,7 @@ export const CLIENT_TEST_FILES = Object.freeze([
   "apps/web/test/navigation.test.mjs",
   "apps/web/test/i18n-browser-parity.test.mjs",
   "apps/web/test/telemetry-shared-parity.test.mjs",
+  "apps/web/test/work-usage-view.test.mjs",
   "test/accounting-package-parity.test.js",
   "test/application-participant-identity.test.js",
   "test/cache-switch-impact.test.js",
@@ -466,6 +473,8 @@ export const CLIENT_TEST_FILES = Object.freeze([
   "test/telemetry-contract.test.js",
   "test/telemetry-envelope-adapter.test.js",
   "test/telemetry-schema-mirror.test.js",
+  "test/work-usage-source.test.js",
+  "test/work-usage.test.js",
 ]);
 
 export const CLIENT_TEST_FIXTURE_FILES = Object.freeze([

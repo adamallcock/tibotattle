@@ -1,4 +1,5 @@
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { mountWorkUsageView } from "./work-usage-view.js";
 import {
   CommunityClient,
   isPrimaryCodexQuotaWindow,
@@ -54,6 +55,9 @@ import {
 } from "./telemetry-shared.generated.js";
 import {
   compact,
+  formatCodexThreadParts,
+  formatApiMoney,
+  formatSharePercent,
   adaptiveChartTickCount,
   classifyTimelineEvidence,
   createDomHelpers,
@@ -695,25 +699,6 @@ function formatMoney(value, digits = 0) {
     });
 }
 
-function formatApiMoney(value) {
-  const number = finite(value);
-  if (number === null) return "—";
-  if (number > 0 && number < .01) {
-    return `<${formatNumber(.01, {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })}`;
-  }
-  return formatNumber(number, {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
 /**
  * A percentage near an end of the scale must not be printed as if it were at
  * that end. `Intl` rounds 99.96 to "100%" and 0.04 to "0%", and on this
@@ -748,37 +733,6 @@ function formatPercent(value, digits = 0) {
   const rendered = format(number);
   if (number > 0 && rendered === format(0)) return `<${format(step)}`;
   if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
-  return rendered;
-}
-
-/**
- * A share for a table column, always at one decimal place.
- *
- * `formatPercent` drops to whole numbers whenever the value happens to be an
- * integer, which is right for a sentence and wrong for a column: it renders
- * "20%" directly above "20.9%", so the decimal point moves down the page and
- * two figures that exist to be compared have to be read digit by digit. Here
- * the precision is fixed, and the same bounded "<" idiom keeps a sliver from
- * rendering as an exact zero it is not.
- *
- * Returns `null` when the denominator cannot carry a share at all, so callers
- * withhold the cell rather than printing a share of nothing.
- */
-function formatSharePercent(part, whole) {
-  const numerator = finite(part);
-  const denominator = finite(whole);
-  if (numerator === null || denominator === null || denominator <= 0) return null;
-  if (numerator < 0) return null;
-  const percentFormatter = numberFormatter({
-    maximumFractionDigits: 1,
-    minimumFractionDigits: 1,
-    style: "percent",
-  });
-  const format = (amount) => percentFormatter.format(amount / 100);
-  const value = numerator / denominator * 100;
-  const rendered = format(value);
-  if (value > 0 && rendered === format(0)) return `<${format(.1)}`;
-  if (value < 100 && rendered === format(100)) return `>${format(99.9)}`;
   return rendered;
 }
 
@@ -8757,60 +8711,8 @@ function isCacheDropThreadDashboard(data) {
 
 const CACHE_DROP_AUTO_REVIEW_LABEL = "Auto review";
 
-function cacheDropThreadId(value) {
-  return typeof value === "string"
-      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
-    ? value.toLowerCase()
-    : null;
-}
-
-function cacheDropThreadName(thread) {
-  return typeof thread?.name === "string" && thread.name.trim()
-    ? thread.name.trim()
-    : t("accounting.cacheDropThread.fallback", {
-      id: cacheDropThreadId(thread?.id)?.slice(0, 8) ?? "",
-    });
-}
-
 function cacheDropThreadParts(thread) {
-  const id = cacheDropThreadId(thread?.id);
-  if (id === null) return [];
-  const parentId = cacheDropThreadId(thread.parent?.id);
-  const parent = parentId !== null && parentId !== id ? thread.parent : null;
-  if (thread?.origin === "auto_review") {
-    // The internal guardian-review thread has no user-visible conversation of
-    // its own. Its resolver supplies a parent only after Codex metadata proves
-    // that parent remains accessible; do not fall back to the internal UUID.
-    return parent === null ? [{
-      name: CACHE_DROP_AUTO_REVIEW_LABEL,
-      href: null,
-      autoReview: true,
-    }] : [{
-      name: cacheDropThreadName(parent),
-      href: `codex://threads/${parentId}`,
-      worker: false,
-      autoReview: true,
-    }];
-  }
-  const nickname = typeof thread.nickname === "string"
-    ? thread.nickname.trim()
-    : "";
-  const worker = parent !== null || nickname !== "";
-  const parts = parent === null ? [] : [{
-    name: cacheDropThreadName(parent),
-    href: `codex://threads/${parentId}`,
-    worker: false,
-  }];
-  parts.push({
-    name: worker
-      ? t("accounting.cacheDropThread.subworker", {
-        name: nickname || cacheDropThreadName(thread),
-      })
-      : cacheDropThreadName(thread),
-    href: `codex://threads/${id}`,
-    worker,
-  });
-  return parts;
+  return formatCodexThreadParts(thread, t);
 }
 
 function fillCacheDropThreadCell(cell, thread, observedAt) {
@@ -15957,6 +15859,8 @@ document.addEventListener("scroll", () => {
   const current = activeInformationPopover;
   if (current) positionInformationPopover(current.popover, current.button);
 }, true);
+
+mountWorkUsageView({ root: document.querySelector("#projects"), t });
 
 mountDashboardNavigation({
   documentRef: document,

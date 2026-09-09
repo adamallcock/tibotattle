@@ -1,3 +1,4 @@
+import { readLocalWorkUsageSnapshot } from "./local-work-usage-source.js";
 import {
   isMainThread,
   parentPort,
@@ -30,7 +31,9 @@ export async function runLocalUnifiedCompanionProjectionWorkerThread({
     throw error;
   }
   try {
-    const result = await readLocalUnifiedCompanionProjection(data.options);
+    const result = await (data.options.operation === "work-usage"
+      ? readLocalWorkUsageSnapshot(data.options)
+      : readLocalUnifiedCompanionProjection(data.options));
     port.postMessage({ type: "result", result });
   } catch (error) {
     port.postMessage({ type: "error", code: safeErrorCode(error) });
