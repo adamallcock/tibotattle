@@ -260,3 +260,34 @@ gates.
 
 Keep the native Sparkle routes for users who do not take the guided handover
 until that rehearsal and rollout are complete.
+
+### Rehearsal generic-feed operator boundary
+
+`publish-electron-handover-rehearsal-feed.mjs` accepts only the closed
+handover pair and the two macOS target paths. Its default mode validates local
+proposal, receipt, manifest, archive hash, and size bindings without invoking
+Wrangler. It must be run against an owner-prepared local proposal and artifact
+root:
+
+```sh
+node scripts/publish-electron-handover-rehearsal-feed.mjs \
+  --artifact-root '<approved-artifact-root>' \
+  --proposal '<approved-local-proposal.json>' \
+  --stage initial
+```
+
+A protected publication additionally requires `--publish`, a new local
+receipt path, and `--confirm-exclusive-rehearsal-control`. The receipt is
+created as a local phase journal before any remote operation and retained on
+partial failure. Wrangler exposes no
+conditional R2 write, so that flag is an operational assertion: the tool reads
+the target feed before and immediately before replacement, then reads it back;
+it does not claim a cross-writer atomic update. It accepts only an absent or
+known `.11` feed for initial publication, and only known `.11` to advance to
+`.12`. Rollback restores the recorded `.11` bytes only from known `.12` (or is
+a no-op for a target already at known `.11` after an interrupted advance).
+
+The rehearsal namespace is isolated from stable paths, but it is not evidence
+that `updates.tibotattle.com` is access-controlled. Confirm the route and R2
+ACL separately before treating a rehearsal asset as private. Never use the
+Sparkle appcast publisher for this YAML feed.
