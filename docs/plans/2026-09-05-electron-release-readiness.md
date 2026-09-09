@@ -18,6 +18,12 @@ Current checkpoint, 2026-09-08 (supersedes the historical entries below):
 
 Latest continuation checkpoint (Mac fix `1a9e8913`; Windows publication fix `102a3dbe`):
 
+- Live GitHub verification confirms current `main` is `dffe64d6` (native tray
+  PR #112), and it is an ancestor of this candidate. Electron tray PR #113
+  (`23a506dd`) is also an ancestor. The latest merged cache-link, Trends and
+  model-attribution changes are included; this is source parity evidence, not
+  a substitute for installed rendering and interaction qualification.
+
 - Linux targeted run [34288818674](https://github.com/adamallcock/tibotattle/actions/runs/34288818674)
   passed at `34087112`. Its normal packaged receipt verifies package execution,
   account-observation lifecycle, unavailable-service response and cleanup;
@@ -64,8 +70,16 @@ Latest continuation checkpoint (Mac fix `1a9e8913`; Windows publication fix `102
   POSIX directory sync and the staged/published file flushes on Windows. Tests
   prove exact flush order and preserve the failure receipt when the published
   file itself cannot sync. Unified-index tests pass 134/134, companion refresh
-  96/96, and integrated architecture checks retain zero debt. Native runtime
-  verification of this concrete repair is next. The earlier full `34290262917` NSIS installed
+  96/96, and integrated architecture checks retain zero debt. Full run [34296247128](https://github.com/adamallcock/tibotattle/actions/runs/34296247128)
+  at `a1b838f1` now reports `SETTINGS_UNAVAILABLE` instead of the publication
+  failure. That receipt alone does not close the refresh gate; the exact settings
+  failure is under investigation. Both Mac targets, Windows development packaging
+  and the Linux job pass in this run; NSIS installed lifecycle also passes.
+  Source inspection identifies a deterministic settings observer mismatch: the
+  app emits `#general`, while the harness rejects every nonempty hash. Repair `fdd7ebde` selects the exact expected
+  route without changing the app route or weakening origin/path checks. Its
+  receipt also retains completed dashboard/refresh evidence when a later
+  settings step fails. Native qualification of this repair remains next. The earlier full `34290262917` NSIS installed
   lifecycle subsequently passed.
 - Corrected Mac `.5` arm64/x64 and `.6` arm64 from frozen `ba1e7cba` have complete
   signing, notarization and artifact receipts. `.6` x64 subsequently completed;
@@ -106,8 +120,11 @@ Latest continuation checkpoint (Mac fix `1a9e8913`; Windows publication fix `102
   restores native 0.1.18 with verified equality to its fresh APFS-cloned backup.
   The clone has an independent inode, no fallback and full content verification;
   this remains preparation proof, not a completed state migration. Full migration additionally
-  needs disk headroom: approximately 56 GiB is free against a 105 GiB reserve.
-  Verified lossless archival preparation of historical task backups is underway;
+  needs disk headroom: approximately 36 GiB is free against a 105 GiB reserve after archive preparation.
+  Historical backup archive verification found omitted filesystem flags in two
+  early generated archives; those archives are being regenerated before replacement.
+  No original backup has been removed. The frozen journal recovery tool passes
+  all nine synthetic tests with process-table access;
   originals remain preserved and no capacity rule has been relaxed.
 - The signed staging scheduler remains unqualified. Source review confirms the
   unsigned hosted profile uses generic safeStorage; reusing the production native
