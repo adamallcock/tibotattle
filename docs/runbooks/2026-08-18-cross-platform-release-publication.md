@@ -534,6 +534,40 @@ sign nested executables and the final package with Authenticode, and use a
 trusted SHA-256 timestamp. Add the native finalizer and manifest entry only
 after those checks pass. Microsoft Store output is a separate subject.
 
+#### Source-bound Azure builder preflight
+
+For the canonical prepared Windows source candidate, the no-write preflight is:
+
+```sh
+node scripts/finalize-electron-windows-signing.mjs \
+  --candidate-receipt .release-build/electron-production/win32-x64/production-source-candidate.json
+```
+
+It binds only that receipt, its SHA-256, the reviewed `win32-x64` staging
+layout, and the release builder configuration. It does not contact Azure,
+invoke electron-builder, sign a file, create an installer, or publish an
+update. A ready result still requires a Windows x64 host with Node 26.2.0 and
+the reviewed non-secret Azure resource selection; Azure CLI authentication is
+checked only by the protected operation.
+
+After separate authorization for the exact candidate and signing resource, the
+explicit builder pass is:
+
+```sh
+node scripts/finalize-electron-windows-signing.mjs \
+  --sign --confirm-azure-trusted-signing \
+  --candidate-receipt .release-build/electron-production/win32-x64/production-source-candidate.json
+```
+
+It requires a clean source revision matching the candidate, verifies the Azure
+CLI session without printing its identity, and invokes the reviewed builder
+with `--win nsis --x64 --publish never`. Its success remains
+`builder_signing_completed_pending_native_module_finalization`: it is not a
+signed-candidate receipt, production credential proof, installed-app proof, or
+publication permission. The unpacked native modules still need a separately
+reviewed signature/rebinding finalizer and final-byte artifact checks before any
+installer or updater claim.
+
 ### Linux
 
 Do not publish a loose AppImage, DEB, or RPM as a universally trusted Linux
