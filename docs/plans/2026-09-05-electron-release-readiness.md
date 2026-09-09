@@ -52,30 +52,63 @@ Latest continuation, 2026-09-09:
   default-on state; untouched first-install classification and migration-notice
   delivery are not asserted by this test. Staging was restored to revision 14,
   contained with all collection flags off and accountless runtime modes disabled.
-  Public publication stayed disabled throughout.
+  Public publication stayed disabled throughout. A bounded source/test audit also
+  found no missing fresh-classification or three-visible-notice integration; those
+  remain focused component/composition evidence rather than a signed seven-day run.
+  A separate hosted native-UI feasibility probe passed in `34385565580` without
+  reading app data. A bounded fresh-install-only runner is prepared to reuse the
+  signed app, leave all settings/acknowledgements untouched before launch and
+  exercise the actual native Continue dialog; it requires no staging activation.
 - Normal Mac `.17`/`.18` candidates are staged from frozen source `7293828a`
   for both architectures, builds `2026090919`/`2026090920`. All four apps and
   disk images are signed, notarized and stapled; final archive, updater metadata,
-  architecture and mounted-image verification passed. They include the latest dashboard, history and tray fixes;
+  architecture and mounted-image verification passed. They include the latest
+  dashboard, history and tray fixes;
   `.17` test-feed publication completed for both architectures with exact `.16`
   predecessor checks and R2 readback. Receipt `initial-publication-20260909-v2.json`
-  is retained; the earlier pre-write local-tool failure is retained as v1.
-  Installed `.16` is not yet replaced: the Mac is locked, and normal UI update
-  awaits unlock. R13 stopped backup and exact before/after verifiers are prepared.
-- The protected Windows signing workflow now maps the existing Azure OIDC and
-  signing-resource configuration, signs native modules before integrity
-  rebinding, then signs and verifies the installer without publication.
-  [34373775022](https://github.com/adamallcock/tibotattle/actions/runs/34373775022)
-  first stopped at an incorrect native prebuild path; source `f5137477` fixes
-  it. Retry [34374830275](https://github.com/adamallcock/tibotattle/actions/runs/34374830275)
-  authenticated successfully through Azure OIDC, then local SignTool found the
-  staged native modules read-only. Fixed native and metadata permission transitions
-  now pass. Run `34376745223` signed both native modules successfully, then stopped
-  at Authenticode verification before the final installer. Source `8d29e945` emits
-  closed trust/publisher/timestamp diagnostics without certificate data; protected
-  retry `34378235956` is running. Final Windows installer signing and its installed
-  runtime are not yet claimed. No environment review rules were changed.
+  is retained; independent public HTTPS verification of both manifests and all
+  four current ZIP/DMG bodies passed exact hashes, sizes and MIME types. The
+  earlier pre-write local-tool failure is retained as v1.
+  **Installed `.17` now passes normal launch and dashboard rendering.** R13
+  retained a fresh stopped `.16` app/profile snapshot, then manually exchanged
+  only the signed app bundle while preserving current profile, salt, opt-out
+  and the original `.16` app. General settings and explicit sharing-off text
+  were observed in `.17`; About shows `content-03c983798dec`. The attempted
+  `.16`→`.17` updater edge was correctly refused by `.16`'s immutable `.15`/`.16`
+  test-pair restriction. No unsupported update success is claimed. The valid
+  `.17`→`.18` before receipt is captured. Its feed advance failed before writing
+  because the existing Cloudflare OAuth token expired and automatic refresh
+  failed. The attempted same-scope login renewal was rejected by automatic
+  approval review because the existing grant includes broad write/admin scopes;
+  the user explicitly approved same-scope renewal. The renewed browser flow now
+  awaits the user's security-key verification; no new scopes were requested.
+  The CLI callback wait expired without completing renewal; a fresh callback
+  will be needed once browser verification succeeds. `.17` remains the test
+  feed and installed app. No failed `.18` publication is relabelled as completed.
+- Windows native modules have passed Azure signing, strict Authenticode
+  verification and integrity rebinding. The final installer and its installed
+  journey are still unqualified. Earlier failures are retained in runs
+  `34373775022`, `34374830275`, `34376745223`, `34378235956`, `34379698420`
+  and `34382343677`; these exposed native-path, read-only-file, PowerShell
+  invocation and source-check output defects, now repaired.
+  Run `34383208839` passed source verification but failed the Azure CLI probe.
+  Source `bd937eef` repairs its Windows `.cmd` launch through a fixed system
+  interpreter, with 23 focused tests and release-policy/trust checks passing.
+  Run `34384799570` then reached Azure but reported missing login context.
+  The Pro consultation independently identified Windows runner provisioning
+  of `AZURE_CONFIG_DIR` outside the user profile. Source `64cda924` preserves
+  only that verified fixed directory. Run `34385603744` rejected an abbreviated
+  source input before staging or signing; corrected exact-source run
+  [34385889388](https://github.com/adamallcock/tibotattle/actions/runs/34385889388)
+  is qualifying integrated `88156c30`, build `2026090928`. Existing protected-environment approval was used without rule changes.
 
+Production activation preparation: [the exact proposal](2026-09-09-production-accountless-activation-proposal.md)
+now separates read-only remote intake, pending migration rehearsal, deployment,
+private collection canary and public-sample admission. Updated public privacy,
+Docs and translated homepage copy are prepared and locally verified, not deployed.
+Production accountless modes remain disabled in source.
+
+## Earlier checkpoints (historical; latest continuation above takes precedence)
 
 - User acceptance update: the user confirms Mac tray dismissal works and accepts
   physical Intel acceptance as an assumption for this cutover. Signing is

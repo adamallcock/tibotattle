@@ -7,7 +7,7 @@ status: proposed
 
 # Scope and evidence
 
-Prepare production collection for the accepted [Electron sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md). This proposal authorizes no remote write, credential renewal, migration, deployment, public admission, or release publication. The production migration prefix, deployed Worker revision, collection controls, and secret availability have **not been inspected for this proposal**.
+Prepare production collection for the accepted [Electron sharing policy](../decisions/2026-09-04-accountless-sharing-policy.md). This proposal authorizes no remote write, credential renewal, migration, deployment, public admission, or release publication. Public health was read on 2026-09-09: deployment `32cd6317622c9aef9b7bf015b376b4cdb93c91fc`, operational collection with enrollment/upload registration/processing/publication enabled, and passing reported storage/lifecycle checks. This endpoint does not expose accountless mode fields. The production migration prefix, accountless runtime configuration, control revision and secret availability remain **unverified**. The credential-free observation is retained in the private qualification artifact directory.
 
 The [Electron readiness record](2026-09-05-electron-release-readiness.md) records the signed staging pass: automatic accepted upload, authenticated restart with retained installation binding, and persistent opt-out. Fresh classification and the three-visible-notice transition have focused source/composition evidence; the signed rehearsal seeded default-on and did not run an untouched installation or seven-day migration.
 
