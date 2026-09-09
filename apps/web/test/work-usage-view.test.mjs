@@ -987,3 +987,29 @@ test("mounted auto review rows link only the parent or remain non-linkable", asy
   assert.equal(rows.some(row => row.textContent.includes("Internal review session")), false);
   view.destroy();
 });
+
+test("period switches reuse the available report anchor, polling drops it, and refresh starts fresh", async () => {
+  const { root, windowRef } = mountedRoot();
+  const calls = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const body = JSON.parse(init.body); calls.push(body);
+      if (calls.length === 2) return httpResponse({ schemaVersion: WORK_USAGE_SCHEMA, status: "preparing", snapshotId: "related-report" });
+      return httpResponse({ ...PROJECT_ROWS_RESPONSE, snapshotId: calls.length > 1 ? "related-report" : PROJECT_ROWS_RESPONSE.snapshotId });
+    },
+  });
+  try {
+    await settleMountedView();
+    findMounted(root, node => node.dataset?.period === "all")[0].click();
+    await settleMountedView();
+    assert.equal(calls[1].sourceSnapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+    assert.equal(calls[1].snapshotId, undefined);
+    await new Promise(resolve => setTimeout(resolve, 800));
+    assert.equal(calls[2].snapshotId, "related-report");
+    assert.equal(calls[2].sourceSnapshotId, undefined);
+    view.refresh();
+    await settleMountedView();
+    assert.equal(calls.at(-1).snapshotId, undefined);
+    assert.equal(calls.at(-1).sourceSnapshotId, undefined);
+  } finally { view.destroy(); }
+});

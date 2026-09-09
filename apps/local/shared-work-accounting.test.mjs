@@ -186,3 +186,35 @@ test("real index cache validity expires exactly at work admission and lower-boun
     assert.equal(reads, 2);
   }
 });
+
+test("related periods reuse accounting even when a cold build outlasts moving-window validity", async () => {
+  let now = 10 * 86400000;
+  let reads = 0;
+  const cached = createCachedLocalUnifiedProjectionReader({
+    readGeneration: async () => generation,
+    validUntil: async o => o.nowMs + 1,
+    reader: async o => { reads++; now += 60000; return combined(o.nowMs); },
+  });
+  const service = createWorkUsageService({ clock: () => now,
+    build: async (q, controls) => selectSharedWorkUsageSnapshot(await cached(options(q.toMs), controls), q),
+  });
+  async function settle(query) {
+    const pending = await service.query({ schemaVersion: WORK_USAGE_SCHEMA, ...query });
+    await new Promise(resolve => setImmediate(resolve));
+    return service.query({ schemaVersion: WORK_USAGE_SCHEMA, period: query.period, snapshotId: pending.snapshotId });
+  }
+  try {
+    let report = await settle({ period: "7d" });
+    const originalAsOf = report.toMs;
+    for (const period of ["30d", "all", "24h", "7d"]) {
+      report = await settle({ period, sourceSnapshotId: report.snapshotId });
+      assert.equal(report.status, "available");
+      assert.equal(report.toMs, originalAsOf);
+      assert.equal(reads, 1);
+    }
+    const fresh = await settle({ period: "7d" });
+    assert.equal(fresh.status, "available");
+    assert.ok(fresh.toMs > originalAsOf);
+    assert.equal(reads, 2);
+  } finally { service.close(); }
+});

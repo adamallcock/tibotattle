@@ -204,7 +204,7 @@ export function mountWorkUsageView({
     const b = button(id === "all" ? tr("all") : id, () => {
       query = { ...query, period: id };
       delete query.scope;
-      refresh();
+      refresh(response?.snapshotId);
     });
     b.dataset.period = id;
     period.append(b);
@@ -265,7 +265,7 @@ export function mountWorkUsageView({
   });
   const scope = select(tr("scope"), [], (value) => {
     query.scope = value;
-    refresh();
+    refresh(response?.snapshotId);
   });
   scope.wrapper.hidden = true;
   const refreshButton = button(tr("refresh"), refresh);
@@ -359,8 +359,10 @@ export function mountWorkUsageView({
     delete query.cursor;
     pages = [];
   }
-  function refresh() {
+  function refresh(sourceSnapshotId = null) {
     delete query.snapshotId;
+    delete query.sourceSnapshotId;
+    if (typeof sourceSnapshotId === "string") query.sourceSnapshotId = sourceSnapshotId;
     resetPage();
     load();
   }
@@ -940,6 +942,7 @@ export function mountWorkUsageView({
       const result = validateWorkUsageResponse(await http.json());
       if (token !== serial) return;
       query.snapshotId = result.snapshotId;
+      delete query.sourceSnapshotId;
       if (result.status === "preparing") {
         timer = setTimeout(load, 750);
         return;

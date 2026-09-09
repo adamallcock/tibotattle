@@ -207,3 +207,91 @@ The cache is process-local. Restart, a changed canonical generation, or an exact
 window boundary still rebuilds the shared projection. No real-history speedup,
 cross-generation incremental performance, signed distribution or installation
 claim is made by this receipt.
+
+
+## Real-history follow-up, 2026-09-09
+
+This follow-up qualifies the production combined reader and work-usage route in
+an isolated loopback preview, using a consistent read-only backup of the installed
+index. It supersedes the synthetic-only limitation above for this local check;
+it does not qualify an installed app or release. Source is the first-stage
+`7b9dca88` commit plus the related-report and zero-usage fixes described here.
+Private validation scripts retain aggregate-only receipts outside the repository.
+No real task names, account IDs, source paths or transcript contents are retained
+in this record. The installed index and its generation were not modified.
+
+The initial backup contained 859,331 canonical usage facts under parser
+`unified-rollout-typed-v15`; SQLite integrity validation passed. Existing
+incremental ingestion on the isolated copy skipped 8,653 sources and scanned 78
+(13 resumed and 65 rescanned), publishing 861,682 facts. Inserted occurrences
+include replacements during rescans, so the insertion count is not net new usage.
+
+Two real-data defects were identified and repaired:
+
+- A roughly one-minute combined build could outlast the next moving-window
+  boundary by orders of magnitude. Period and scope switches now send the last
+  available `sourceSnapshotId` and retain its displayed accounting time. The
+  application validates that source and the resulting canonical generation,
+  rejects expired or changed anchors, and preserves the source during rapid
+  switches. Polling uses only the new snapshot ID. Explicit refresh uses the
+  current clock. Cache validity and freshness labels are not relaxed.
+- The existing positive-usage projection returns no price for zero-token facts.
+  The work accumulator now recognizes a fully known zero as zero API-equivalent
+  cost without requiring a model rate. Partial, contradictory or missing token
+  evidence remains unpriced. Existing nonzero exact amounts are conserved.
+
+The initial seven-day Unassigned bucket exactly matched 37 same-size source files
+whose modification identity differed from their index cursor. The metadata
+reader correctly withheld stale mappings. Reindexing those changed sources with
+existing ingestion resolved the bucket; no source-identity check was weakened.
+After refresh, all four reporting periods have no Unassigned contributions. The
+seven-day window also has no incomplete or unknown token facts; older history
+retains genuine gaps. The 192 seven-day unpriced facts were all fully known
+zero-token auto-review records, while all 64,089 positive-token facts had exact
+prices. The zero-usage fix removes that false coverage penalty.
+
+An independent canonical iterator and the existing accounting pricer reconcile
+all four windows and populated account scopes with the combined companion
+projection. Project, task-family, worktree, worker contribution, and model rows
+conserve components, event coverage and exact decimal money. The comparison
+explicitly accounts for the companion's five-minute future tolerance and its
+omission of zero/unknown usage facts. An initial audit-script accumulator bug
+in equivalent account identities was corrected before accepting the receipt.
+
+Measured on this local history, single runs (not a benchmark distribution):
+
+- Consistent backup and integrity check: 5.4 seconds.
+- Existing incremental ingestion and publication: 49.8 seconds, about 1.11 GB
+  scanned. The scan phase itself took 11.4 seconds; staging/publication also costs
+  time and is not claimed to scale solely with appended usage.
+- First combined report after publication: 53.8 seconds, 15,015 contribution
+  cells across four windows. Independent reconciliation: 12,870 checks passed
+  in 8.8 seconds.
+- Browser project expansion: about 0.3 seconds. Project/model disclosure,
+  keyboard collapse and a seven-day to 30-day switch kept the accounting build
+  counter at one and retained the displayed timestamp.
+- Explicit refresh advanced the displayed time and invoked one new combined
+  build, taking 51.2 seconds; its 12,870 reconciliation checks also passed.
+
+Refresh still traverses historical facts and source metadata. Shared computation
+and warm navigation are verified; cross-generation incremental accounting is
+not implemented. The next optimization should reuse unchanged contributions and
+metadata under explicit source/generation invalidation, while retaining these
+conservation checks. The initial report latency remains a material limitation.
+
+The final zero-usage fix was then rebuilt against the same isolated generation
+at a newer report time: 50.5 seconds and 12,868 conservation checks passed. The
+changed check count reflects the moving window. Seven-day unpriced and incomplete
+counts are both zero. Thirty-day history retains one unknown/unpriced fact;
+all history retains 1,214 incomplete and 196 unpriced facts. Those gaps are not
+relabelled as complete. Focused regression coverage includes known zero without
+a rate, partial zero, missing components, contradictory output, positive unpriced
+usage, and conservation when zero and priced usage share a row.
+
+
+Final scoped validation: 55 focused accounting/source/API/UI regression tests,
+327 local integration tests, 518 UI tests and API-reference contracts passed.
+Architecture, documentation and preflight checks passed. Rendered seven-day
+preview has no missing-count warning, no Unassigned row and no partial-price
+labels; switching back to it retained the final build counter. The previously
+recorded baseline tool-inventory and protected release-receipt limitations remain.

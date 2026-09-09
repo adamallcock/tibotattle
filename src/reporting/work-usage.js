@@ -154,14 +154,17 @@ export function createWorkUsageAccumulator({ maximumCells = 50_000 } = {}) {
         typeof price.amount === "string" &&
         /^\d+(?:\.\d+)?$/u.test(price.amount) &&
         price.amount.length <= 100;
+      // The shared positive-usage projection skips zero-token facts. A fully
+      // recorded zero needs no model rate; missing components remain unknown.
+      const knownZero = tokens.totalComplete && tokens.totalTokens === 0 && !event.partial;
       merge(row, {
         tokens: tokens.totalTokens,
         events: 1,
         incompleteEvents: tokens.totalComplete && !event.partial ? 0 : 1,
         unknownEvents: tokens.totalTokens === null ? 1 : 0,
         lastAt: event.at,
-        costUsdExact: priced ? price.amount : null,
-        unpricedEvents: priced ? 0 : 1,
+        costUsdExact: priced ? price.amount : knownZero ? "0" : null,
+        unpricedEvents: priced || knownZero ? 0 : 1,
         partialPriceEvents: priced && price.status !== "fully_priced" ? 1 : 0,
         components: tokens.components,
         threads: new Set([thread]),

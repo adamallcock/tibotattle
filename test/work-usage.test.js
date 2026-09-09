@@ -490,3 +490,75 @@ test("thread families group before ranking and pagination, conserving descendant
   assert.equal(filtered.tokens,100);assert.equal(filtered.id,'root');assert.equal(filtered.subworkerCount,1);
   assert.equal(filtered.contributions.length,1);assert.equal(filtered.contributions[0].id,'subworkers');
 });
+
+test("related reports reject invalid anchors and preserve their source across rapid switches", async () => {
+  let now = 10 * 86400000;
+  const service = createWorkUsageService({ clock: () => now, idleMs: 1000,
+    build: async () => availableResult([]),
+  });
+  const base = { schemaVersion: WORK_USAGE_SCHEMA, period: "7d" };
+  async function related(sourceSnapshotId, period) {
+    const preparing = await service.query({ ...base, period, sourceSnapshotId });
+    await new Promise(resolve => setImmediate(resolve));
+    return service.query({ ...base, period, snapshotId: preparing.snapshotId });
+  }
+  try {
+    const source = await waitForAvailable(service, base);
+    await related(source.snapshotId, "30d");
+    await related(source.snapshotId, "all");
+    assert.equal((await related(source.snapshotId, "24h")).status, "available");
+    for (const extra of [{ snapshotId: source.snapshotId }, { action: "cancel" }, { cursor: "cursor" }])
+      assertQueryError({ ...base, sourceSnapshotId: source.snapshotId, ...extra });
+    assertQueryError({ ...base, sourceSnapshotId: 1 });
+    await assert.rejects(service.query({ ...base, sourceSnapshotId: "missing" }), { code: "work_usage_snapshot_expired" });
+    now += 1001;
+    await assert.rejects(service.query({ ...base, sourceSnapshotId: source.snapshotId }), { code: "work_usage_snapshot_expired" });
+  } finally { service.close(); }
+});
+
+test("related reports cannot silently combine different canonical generations", async () => {
+  let generation = 1;
+  const service = createWorkUsageService({ build: async () => availableResult([], { generation }) });
+  const base = { schemaVersion: WORK_USAGE_SCHEMA, period: "7d" };
+  try {
+    const source = await waitForAvailable(service, base);
+    generation = 2;
+    const pending = await service.query({ ...base, period: "all", sourceSnapshotId: source.snapshotId });
+    await new Promise(resolve => setImmediate(resolve));
+    const rejected = await service.query({ ...base, period: "all", snapshotId: pending.snapshotId });
+    assert.equal(rejected.status, "unavailable");
+    assert.equal(rejected.errorCode, "work_usage_snapshot_changed");
+  } finally { service.close(); }
+});
+
+
+test("complete zero usage needs no model price while uncertain zero stays unpriced", () => {
+  const zero = { input_uncached_tokens: 0, input_cache_read_tokens: 0,
+    input_cache_write_tokens: 0, output_combined_tokens: 0 };
+  const cases = [
+    { project: "complete-zero", tokens: zero },
+    { project: "partial-zero", tokens: zero, partial: true },
+    { project: "missing-component", tokens: { ...zero, input_cache_read_tokens: null } },
+    { project: "unknown", tokens: {} },
+    { project: "positive", tokens: { ...zero, input_uncached_tokens: 1 } },
+    { project: "conflict", tokens: { ...zero, output_text_tokens: 0, output_reasoning_tokens: 1 } },
+  ];
+  const result = query(reportFrom(cases.map(item => event({ ...item,
+    model: "model-without-a-rate", price: { amount: null, status: "unpriced" } }))));
+  const known = result.rows.find(row => row.id === "complete-zero");
+  assert.equal(known.costUsdExact, "0");
+  assert.equal(known.priceStatus, "complete");
+  assert.equal(known.unpricedEvents, 0);
+  assert.equal(known.partialPriceEvents, 0);
+  for (const row of result.rows.filter(row => row !== known)) {
+    assert.equal(row.costUsdExact, null, row.id);
+    assert.equal(row.priceStatus, "unpriced", row.id);
+    assert.equal(row.unpricedEvents, 1, row.id);
+  }
+  const mixed = query(reportFrom([
+    event({ tokens: zero }),
+    event({ tokens: { ...zero, input_uncached_tokens: 10 }, price: { amount: "0.0001", status: "fully_priced" } }),
+  ]));
+  assert.equal(mixed.totals.costUsdExact, "0.0001");
+  assert.equal(mixed.rows[0].priceStatus, "complete");
+});
