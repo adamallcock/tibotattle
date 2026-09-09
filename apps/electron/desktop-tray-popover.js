@@ -503,8 +503,12 @@ export function createDesktopTrayPopover({
         allowRunningInsecureContent: false,
         partition: "in-memory",
       },
-      ...(platform === "darwin" ? { type: "panel" } : {}),
+      focusable: true,
     };
+    // A macOS nonactivating panel can leave the previous app focused, so no
+    // focus-loss event arrives when the user clicks back outside the popup.
+    // A normal frameless window follows the existing blur-dismissal contract.
+    if (platform === "darwin") delete options.type;
     try {
       window = new BrowserWindow(options);
     } catch {

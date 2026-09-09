@@ -843,6 +843,42 @@ function buildAllowances(
     });
 }
 
+function tokenHistoryCoverage(data) {
+  const timeline = data?.timeline?.history;
+  const coverage = normalizeCoverage(timeline);
+  const accounting = data?.accounting;
+  const history = accounting?.historyCoverage;
+  const generation = String(accounting?.generation ?? "");
+  const sourceCount = nonNegativeNumber(history?.sourceCount, { integer: true });
+  const sourceBytes = nonNegativeNumber(history?.sourceBytes, { integer: true });
+  // Typed tool events have independent coverage. They cannot make complete
+  // token history partial when the matching accounting generation verifies it.
+  const completeTokenIndex = coverage.status === "partial"
+    && timeline?.reason === "typed_tool_history_partial"
+    && coverage.source === "unified_local_index"
+    && projectionStatus(accounting) === "available"
+    && accounting?.generationMatched === true
+    && /^[1-9]\d*$/u.test(generation) && Number.isSafeInteger(Number(generation))
+    && history?.status === "complete" && ["complete", "idle"].includes(history.phase)
+    && history.errorCode == null && isoInstant(history.generatedAt) !== null
+    && sourceCount !== null && sourceCount > 0
+    && history.indexedSourceCount === sourceCount
+    && history.pendingSourceCount === 0 && history.skippedSourceCount === 0
+    && sourceBytes !== null && history.indexedBytes === sourceBytes;
+  if (!completeTokenIndex || coverage.coveredAt === null) return coverage;
+  const indexedCoverage = normalizeCoverage(history);
+  if (indexedCoverage.coveredAt === null) return coverage;
+  // Only the common attested interval can support a full day. Never extend
+  // the token chart into an earlier or later interval from another surface.
+  const startMs = Math.max(coverage.startMs, indexedCoverage.startMs);
+  const endMs = Math.min(coverage.endMs, indexedCoverage.endMs);
+  if (endMs <= startMs) return coverage;
+  return {
+    ...coverage, status: "complete", startMs, endMs,
+    coveredAt: Object.freeze({ startAt: new Date(startMs).toISOString(), endAt: new Date(endMs).toISOString() }),
+  };
+}
+
 function buildHistory(data, range, nowMs, timeZone, accountingState) {
   const formatters = createCalendarFormatters(timeZone);
   const projection = data?.accounting;
@@ -854,7 +890,7 @@ function buildHistory(data, range, nowMs, timeZone, accountingState) {
       ?? nowMs
     : nowMs;
   const dayWindows = createDayWindows(snapshotMs, MAX_HISTORY_DAYS, formatters);
-  const coverage = normalizeCoverage(data?.timeline?.history);
+  const coverage = tokenHistoryCoverage(data);
   const accountingHistory = projection?.historyCoverage;
   const discoveryPartial = accountingHistory?.status === "partial"
     && [accountingHistory.sourceCount, accountingHistory.indexedSourceCount,
@@ -1328,7 +1364,8 @@ function renderHistory(documentRef, projection, t, numberFormatter, formattingLo
   bars.dataset.range = history.range;
   bars.replaceChildren();
   setElementText(documentRef, "history-bar-detail", "");
-  setHidden(documentRef, "history-bar-detail", true);
+  // Reserve the readout before the first hover so the popup never jumps.
+  setHidden(documentRef, "history-bar-detail", false);
   const measured = history.days
     .map((day) => day.totalTokens)
     .filter((value) => value !== null);
@@ -1432,6 +1469,7 @@ export function applyTrayPopupPreferences(documentRef, projection, preferences, 
     setHidden(documentRef, id, !preferences.metrics.includes(metric));
   }
   setHidden(documentRef, "history-bars", !preferences.showChart);
+  setHidden(documentRef, "history-bar-detail", !preferences.showChart);
   setHidden(documentRef, "history-endpoints", !preferences.showChart);
   const cache = projection.cacheSummary;
   const available = cache?.status === "available";
@@ -1478,12 +1516,13 @@ export function renderTrayPopup(documentRef, projection, {
     button.textContent = action === "open"
       ? translated("electron.tray.open", { appName: PRODUCT_APP_NAME })
       : action === "more" ? "⋯"
-        : action === "customize" ? translated("electron.tray.customize")
+        : action === "customize" ? "⚙"
           : action === "usage" ? translated("electron.trayCustomization.usageLink")
             : translated("electron.trayPopover.refresh");
-    if (action === "more") {
-      button.setAttribute("aria-label", translated("electron.trayPopover.more"));
-      button.setAttribute("title", translated("electron.trayPopover.more"));
+    if (action === "more" || action === "customize") {
+      const label = translated(action === "more" ? "electron.trayPopover.more" : "electron.tray.customize");
+      button.setAttribute("aria-label", label);
+      button.setAttribute("title", label);
     }
     const transportReady = typeof bridge?.requestAction === "function";
     const refreshReady = action !== "refresh"

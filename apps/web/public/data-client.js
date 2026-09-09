@@ -4200,7 +4200,10 @@ function normalizeLocalTimeline(value = {}) {
     allowanceCapacity,
     planScoped,
     quota,
-    history: normalizeTimelineHistory(value.history)
+    history: normalizeTimelineHistory({
+      ...value.history,
+      source: value.history?.source ?? value.source,
+    })
   };
 }
 

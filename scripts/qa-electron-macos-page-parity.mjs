@@ -38,7 +38,9 @@ const SMOKE_CONTROL = "quit-v1";
 const STARTUP_TIMEOUT_MS = 30_000;
 const OPERATION_TIMEOUT_MS = 10_000;
 const SHUTDOWN_TIMEOUT_MS = 10_000;
-const NATIVE_HANDOFF_TIMEOUT_MS = STARTUP_TIMEOUT_MS;
+// Native CUA interaction is operator-paced; keep its bounded window separate
+// from the unchanged startup and app-operation deadlines.
+const NATIVE_HANDOFF_TIMEOUT_MS = 5 * 60_000;
 const SOURCE_REVISION_PATTERN = /^[0-9a-f]{40}$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 

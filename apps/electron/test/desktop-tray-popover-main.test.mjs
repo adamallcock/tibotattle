@@ -247,6 +247,8 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   await new Promise((resolve) => setTimeout(resolve, 0));
   const window = windows[0];
   assert.equal(window.options.frame, false);
+  assert.equal(window.options.type, undefined, "interactive popup must not use a macOS nonactivating panel");
+  assert.equal(window.options.focusable, true);
   assert.equal(window.options.skipTaskbar, true);
   assert.equal(window.options.height, 500);
   assert.equal(window.options.minWidth, 1);
@@ -278,8 +280,17 @@ test("popover controller lazily positions, updates, routes, and destroys a trust
   window.webContents.emit("ipc-message", {
     sender: window.webContents,
     senderFrame: window.webContents.mainFrame,
+  }, TRAY_POPOVER_ACTION_CHANNEL, "history-7d");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(popover.visible, true, "internal range controls keep the popup open");
+  window.emit("blur");
+  assert.equal(popover.visible, false, "moving focus outside dismisses the macOS popup");
+  assert.equal(popover.show(), true);
+  window.webContents.emit("ipc-message", {
+    sender: window.webContents,
+    senderFrame: window.webContents.mainFrame,
   }, TRAY_POPOVER_ACTION_CHANNEL, "weekly");
-  assert.deepEqual(actions, ["weekly"]);
+  assert.deepEqual(actions, ["history-7d", "weekly"]);
   assert.equal(popover.visible, false);
   assert.equal(window.webContents.sent.at(-1).channel, TRAY_POPOVER_VISIBILITY_CHANNEL);
   assert.equal(window.webContents.sent.at(-1).value, false);

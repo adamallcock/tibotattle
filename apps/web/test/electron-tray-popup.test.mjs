@@ -1,3 +1,4 @@
+import { normalizeDashboardPayload } from "../public/data-client.js";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -708,7 +709,8 @@ test("compact history keeps tokens primary and makes partial coverage explicit",
   assert.ok(bar);
   assert.match(bar.attributes.get("title"), /tokens.*\$0\.01/u);
   assert.equal(bar.attributes.get("tabindex"), "0");
-  assert.equal(documentRef.getElementById("history-bar-detail").hidden, true);
+  assert.equal(documentRef.getElementById("history-bar-detail").hidden, false);
+  assert.equal(documentRef.getElementById("history-bar-detail").textContent, "");
   bar.dispatch("mouseenter");
   assert.equal(documentRef.getElementById("history-bar-detail").hidden, false);
   assert.match(documentRef.getElementById("history-bar-detail").textContent, /tokens.*\$0\.01/u);
@@ -966,4 +968,47 @@ test("allowance list includes only current provider-reported windows", async () 
   const css = await readFile(new URL("../public/electron-tray-popup.css", import.meta.url), "utf8");
   assert.match(css, /\[data-density="compact"\] \.electron-tray-popup-allowance-detail \{ display: none; \}/u);
   assert.match(css, /\[data-density="compact"\] \.electron-tray-popup-allowance \{ height: 30px; \}/u);
+});
+
+
+test("token bars use complete matching accounting coverage when only typed tool history is partial", () => {
+  const data = fixture({ historyStatus: "partial" });
+  data.timeline.history.reason = "typed_tool_history_partial";
+  data.accounting.generation = "12";
+  data.accounting.generationMatched = true;
+  data.accounting.historyCoverage = {
+    status: "complete", phase: "complete", sourceCount: 2, indexedSourceCount: 2,
+    pendingSourceCount: 0, skippedSourceCount: 0, sourceBytes: 100, indexedBytes: 100,
+    generatedAt: NOW, errorCode: null,
+    coveredAt: { startAt: "2026-08-06T00:00:00.000Z", endAt: NOW },
+  };
+  const history = (value) => createTrayPopupProjection(value, { now: NOW, timeZone: "UTC" }).history;
+  assert.equal(history(data).days.find(day => day.key === "2026-09-03").evidence, "available");
+  assert.equal(history(data).days.find(day => day.key === "2026-09-04").evidence, "partial", "current day is still incomplete");
+  for (const change of [
+    copy => { copy.timeline.history.reason = "unified_index_partial"; },
+    copy => { copy.accounting.generationMatched = false; },
+    copy => { copy.accounting.generation = null; },
+    copy => { copy.accounting.historyCoverage.pendingSourceCount = 1; },
+    copy => { copy.accounting.historyCoverage.skippedSourceCount = 1; },
+    copy => { copy.accounting.historyCoverage.indexedBytes = 99; },
+    copy => { copy.accounting.historyCoverage.status = "partial"; },
+  ]) {
+    const copy = structuredClone(data); change(copy);
+    assert.equal(history(copy).days.find(day => day.key === "2026-09-03").evidence, "partial");
+  }
+  const bounded = structuredClone(data);
+  bounded.accounting.historyCoverage.coveredAt.startAt = "2026-09-03T12:00:00.000Z";
+  assert.equal(history(bounded).days.find(day => day.key === "2026-09-02").evidence, "unavailable");
+  assert.equal(history(bounded).days.find(day => day.key === "2026-09-03").evidence, "partial");
+});
+
+
+test("normalization preserves the companion's top-level timeline source for token history", () => {
+  const data = fixture();
+  data.timeline.source = "unified_local_index";
+  delete data.timeline.history.source;
+  assert.equal(normalizeDashboardPayload(data).timeline.history.source, "unified_local_index");
+  data.timeline.history.source = "recent_collector_window";
+  assert.equal(normalizeDashboardPayload(data).timeline.history.source, "recent_collector_window");
 });

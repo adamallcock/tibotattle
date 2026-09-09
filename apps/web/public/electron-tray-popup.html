@@ -97,9 +97,11 @@
       <footer class="electron-tray-popup-footer">
         <div class="electron-tray-popup-footer-actions">
           <button type="button" data-action="open" class="electron-tray-popup-primary" data-i18n="electron.tray.open">Open TiboTattle</button>
+          <button type="button" data-action="customize" class="electron-tray-popup-customize"
+            data-i18n-aria-label="electron.tray.customize" aria-label="Customize tray…"
+            data-i18n-title="electron.tray.customize" title="Customize tray…"><span aria-hidden="true">⚙</span></button>
           <button type="button" data-action="refresh" data-i18n="electron.trayPopover.refresh">Refresh</button>
         </div>
-        <button type="button" data-action="customize" data-i18n="electron.tray.customize">Customize tray…</button>
       </footer>
       <div class="sr-only" id="tray-popup-live" role="status" aria-live="polite"></div>
     </main>

@@ -456,7 +456,8 @@ body {
 }
 
 .electron-tray-popup-history-detail {
-  min-height: 15px;
+  height: 2.7em;
+  overflow-y: auto;
   margin: 3px 0 0;
   color: var(--tray-muted);
   font-size: 10.5px;
@@ -502,6 +503,14 @@ body {
 
 .electron-tray-popup-footer-actions {
   gap: 8px;
+}
+
+.electron-tray-popup-footer button.electron-tray-popup-customize {
+  flex: 0 0 28px;
+  width: 28px;
+  padding: 2px;
+  font-size: 18px;
+  line-height: 1;
 }
 
 .electron-tray-popup-footer button,
