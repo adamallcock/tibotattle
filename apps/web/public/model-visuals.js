@@ -32,7 +32,8 @@ export function modelUsagePresentation(modelId) {
   const numbered = /^gpt-(5\.4|5\.3|5\.2|5\.1|5|4\.1|4o|4)(?:-|$)/.exec(modelId);
   if (numbered) return { theme: numberedThemes[numbered[1]], className: "allowance-model-classic" };
   const aliases = { "gpt-5.5-codex": "gpt-5.5", "gpt-5.6-sol-wm": "gpt-5.6-sol" };
-  return allowanceModelPresentation(aliases[modelId] ?? modelId);
+  const presentation = allowanceModelPresentation(aliases[modelId] ?? modelId);
+  return presentation.theme ? presentation : { theme: "generic", className: "allowance-model-classic" };
 }
 
 export function modelThemeIcon(documentRef, theme) {
@@ -53,6 +54,7 @@ export function modelThemeIcon(documentRef, theme) {
     book: "M12 6C9 4 6 4 3 5v14c3-1 6-1 9 1 3-2 6-2 9-1V5c-3-1-6-1-9 1Z M12 6v14",
     rings: "M9 5a7 7 0 1 0 0 14 7 7 0 0 0 0-14 M15 5a7 7 0 1 0 0 14 7 7 0 0 0 0-14",
     file: "M6 3h8l4 4v14H6Z M14 3v5h4 M9 12h6 M9 16h6",
+    generic: "M12 3l8 4.5v9L12 21l-8-4.5v-9Z M12 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4",
   };
   if (!paths[theme]) return null;
   const icon = documentRef.createElementNS("http://www.w3.org/2000/svg", "svg");

@@ -11119,6 +11119,14 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
   for (const model of page.rows) {
     const row = node("tr");
     const identity = node("td", "model-identity");
+    const presentation = modelUsagePresentation(
+      model.pricingStatus === "unrecognized" ? "unknown" : model.model,
+    );
+    const icon = modelThemeIcon(document, presentation.theme);
+    if (icon) {
+      icon.classList.add("model-usage-icon", presentation.className);
+      identity.append(icon);
+    }
     // The unknown aggregate combines missing attribution and unreviewed
     // identifiers. Its label must not claim either cause as established.
     if (model.model === "unknown") {
@@ -11134,12 +11142,6 @@ function renderAccountingModels(accounting, { unavailable = false } = {}) {
       const name = formatModelName(model.model);
       const label = rawNode("span", "", name);
       if (name !== model.model) label.title = model.model;
-      const presentation = modelUsagePresentation(model.model);
-      const icon = modelThemeIcon(document, presentation.theme);
-      if (icon) {
-        icon.classList.add("model-usage-icon", presentation.className);
-        identity.append(icon);
-      }
       identity.append(label);
     }
     if (modelRowIsSeparateAllowance(model)) {

@@ -87,7 +87,9 @@ test("model table preserves unavailable, unreviewed, separate-allowance and pric
     assert.equal(contents(astra.children[4]), "$5.00");
     const unavailable = byName(t("accounting.model.identityUnavailable"));
     assert.ok(unavailable, locale);
-    assert.equal(unavailable.children[0].children[1].title, t("accounting.model.identityUnavailableTitle"));
+    assert.equal(unavailable.children[0].children[1].tag, "svg");
+    assert.equal(unavailable.children[0].children[1].attributes["aria-hidden"], "true");
+    assert.equal(unavailable.children[0].children[2].title, t("accounting.model.identityUnavailableTitle"));
     assert.equal(unavailable.children[4].title, t("accounting.model.identityUnavailableTitle"));
     assert.equal(contents(unavailable.children[4]), t("accounting.model.notPricedUnknown"));
     assert.equal(contents(unavailable.children[5]), t("accounting.model.shareWithheld"));
