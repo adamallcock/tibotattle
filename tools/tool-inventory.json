@@ -2652,6 +2652,66 @@
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
       "provenanceReason": null,
       "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_timing_research",
+      "canonicalPath": "tools/reports/inference-timing/parser.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Opt-in local timing experiment; not loaded by the app or a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/inference-timing-experiment.test.js"
+      ],
+      "decision": "retain_as_reusable_timing_research_instrument",
+      "provenance": "docs/plans/2026-09-09-local-inference-timing.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_timing_research",
+      "canonicalPath": "tools/reports/inference-timing/store.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Opt-in local timing experiment; not loaded by the app or a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/inference-timing-experiment.test.js"
+      ],
+      "decision": "retain_as_reusable_timing_research_instrument",
+      "provenance": "docs/plans/2026-09-09-local-inference-timing.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_timing_research",
+      "canonicalPath": "tools/reports/inference-timing/run.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Opt-in local timing experiment; not loaded by the app or a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/inference-timing-experiment.test.js"
+      ],
+      "decision": "retain_as_reusable_timing_research_instrument",
+      "provenance": "docs/plans/2026-09-09-local-inference-timing.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "reusable_benchmark",
+      "owner": "local_timing_research",
+      "canonicalPath": "tools/reports/inference-timing/plot.py",
+      "stableAlias": null,
+      "stableAliasReason": "Opt-in local timing experiment; not loaded by the app or a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "docs/plans/2026-09-09-local-inference-timing.md"
+      ],
+      "decision": "retain_as_reusable_timing_research_instrument",
+      "provenance": "docs/plans/2026-09-09-local-inference-timing.md",
+      "provenanceReason": null,
+      "legacyPaths": []
     }
   ]
 }
