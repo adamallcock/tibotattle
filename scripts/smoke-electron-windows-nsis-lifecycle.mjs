@@ -1579,6 +1579,14 @@ export async function defaultLaunchAndExercise({
       observedProcessTreeExited: true,
       installedExecutableAbsentAtPreLaunchSnapshot: true,
       installedExecutableAbsentAtPostExitSnapshot: true,
+      // Keep the two capability journeys separate in the outer receipt. The
+      // FD4 route creates a deterministic record before its first top-level
+      // Electron exit, then the second top-level Electron process can only
+      // complete this command by reading that same record through a new owned
+      // IPC channel. No value, account identifier, or native error crosses
+      // this boundary.
+      accountObservationStorageJourneyCompleted:
+        observations.accountObservationStoragePassed === true,
       storageJourneyCompleted: observations.storagePassed === true
         && observations.accountObservationStoragePassed === true,
     });
@@ -1835,10 +1843,13 @@ function lifecycleReceipt({
     fullOwnedDescendantCleanupVerified: false,
     profileReusedAcrossLaunches: launches.length === 2,
     // The accountless FD3 journey intentionally removes its synthetic record
-    // at exit. The FD4 observation credential is scoped only to this
-    // disposable runner account, so same-profile relaunch is not evidence of
-    // retained application credentials.
+    // at exit. The FD4 route below proves only a deterministic qualification
+    // record read through two top-level Electron processes in this disposable
+    // runner account. It is not evidence of retained application credentials.
     persistentApplicationCredentialStateVerified: false,
+    syntheticAccountObservationCredentialReadAcrossTopLevelRelaunches:
+      first?.accountObservationStorageJourneyCompleted === true
+      && second?.accountObservationStorageJourneyCompleted === true,
     accountlessSyntheticRecordDeleted: launches.length === 2
       && launches.every((launch) => launch.storageJourneyCompleted === true),
     accountObservationCredentialCleanup: "disposable_runner_account_lifetime",

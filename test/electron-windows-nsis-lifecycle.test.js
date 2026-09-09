@@ -84,6 +84,7 @@ function runInPlaceUninstallerResidueScenario({
   root,
   receiptPath,
   mutate = async () => {},
+  accountObservationStorageJourneyCompleted = true,
   waitForCleanupPoll,
   monotonicNow,
   uninstallPostconditionBudgetMs,
@@ -134,6 +135,9 @@ function runInPlaceUninstallerResidueScenario({
       observedProcessTreeExited: true,
       installedExecutableAbsentAtPreLaunchSnapshot: true,
       installedExecutableAbsentAtPostExitSnapshot: true,
+      accountObservationStorageJourneyCompleted: typeof accountObservationStorageJourneyCompleted === "function"
+        ? accountObservationStorageJourneyCompleted(launchOrdinal)
+        : accountObservationStorageJourneyCompleted,
       storageJourneyCompleted: true,
     }),
     executeUninstaller: async ({ uninstallerPath: selectedUninstallerPath, installationRoot: selectedInstallationRoot }) => {
@@ -913,6 +917,7 @@ test("launch proof fences ready snapshot and rejects a lingering exact installed
     assert.equal(result.observedProcessTreeExited, true);
     assert.equal(result.installedExecutableAbsentAtPreLaunchSnapshot, true);
     assert.equal(result.installedExecutableAbsentAtPostExitSnapshot, true);
+    assert.equal(result.accountObservationStorageJourneyCompleted, true);
     assert.deepEqual(processCalls, ["exact-executable", "snapshot", "snapshot", "exact-executable"]);
     assert.deepEqual(processRequestDetails, [
       { rootProcessId: child.pid, retainedProcessIds: null },
@@ -1114,6 +1119,7 @@ test("lifecycle binds installed bytes, uses two distinct top-level processes in 
           observedProcessTreeExited: true,
           installedExecutableAbsentAtPreLaunchSnapshot: true,
           installedExecutableAbsentAtPostExitSnapshot: true,
+          accountObservationStorageJourneyCompleted: true,
           storageJourneyCompleted: true,
         };
       },
@@ -1168,6 +1174,7 @@ test("lifecycle binds installed bytes, uses two distinct top-level processes in 
     assert.equal(receipt.firstLaunchPhase, "completed");
     assert.equal(receipt.firstLaunchFailureCode, null);
     assert.equal(receipt.persistentApplicationCredentialStateVerified, false);
+    assert.equal(receipt.syntheticAccountObservationCredentialReadAcrossTopLevelRelaunches, true);
     assert.equal(receipt.accountlessSyntheticRecordDeleted, true);
     assert.equal(receipt.accountObservationCredentialCleanup, "disposable_runner_account_lifetime");
     assert.equal(receipt.uninstallRegistryAbsent, true);
@@ -1195,6 +1202,25 @@ test("in-place NSIS residue cleanup removes only the unchanged generated uninsta
     assert.equal(receipt.cleanupConfirmed, true);
     await assert.rejects(lstat(scenario.uninstallerPath), { code: "ENOENT" });
     await assert.rejects(lstat(scenario.installationRoot), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("NSIS receipt keeps synthetic FD4 relaunch evidence unavailable when either launch lacks its closed acknowledgement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-fd4-relaunch-test-"));
+  const receiptPath = join(root, "receipt.json");
+  try {
+    const scenario = runInPlaceUninstallerResidueScenario({
+      root,
+      receiptPath,
+      accountObservationStorageJourneyCompleted: (launchOrdinal) => launchOrdinal === 1,
+    });
+    await scenario.operation;
+    const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
+    assert.equal(receipt.status, "passed");
+    assert.equal(receipt.syntheticAccountObservationCredentialReadAcrossTopLevelRelaunches, false);
+    assert.equal(receipt.persistentApplicationCredentialStateVerified, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
