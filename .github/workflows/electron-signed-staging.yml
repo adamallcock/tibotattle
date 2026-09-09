@@ -7,7 +7,7 @@ on:
       mode:
         description: Probe the disposable account or execute a verified signed staging app
         type: choice
-        options: [probe, execute]
+        options: [probe, native-ui-probe, execute]
         default: probe
         required: true
       source_revision:
@@ -56,6 +56,20 @@ jobs:
         run: |
           mkdir -m 700 staging-receipts
           node --input-type=module -e 'import {userInfo} from "node:os"; import {writeFileSync} from "node:fs"; const u=userInfo(); if(process.platform!=="darwin"||process.arch!=="arm64")process.exit(1); writeFileSync("staging-receipts/account.json",JSON.stringify({uid:u.uid,username:u.username,platform:process.platform,architecture:process.arch}),{mode:0o600});'
+      - name: Probe native UI automation on the disposable Mac
+        if: inputs.mode == 'native-ui-probe'
+        run: |
+          python3 - <<'PYPROBE'
+          import json,pathlib,subprocess
+          try:
+            p=subprocess.run(['/usr/bin/osascript','-e','tell application "System Events" to return UI elements enabled'],capture_output=True,text=True,timeout=15)
+            available=p.returncode==0 and p.stdout.strip()=='true'
+            reason=None if available else 'native_ui_automation_unavailable'
+          except subprocess.TimeoutExpired:
+            available=False;reason='native_ui_automation_timeout'
+          pathlib.Path('staging-receipts/native-ui.json').write_text(json.dumps({'schemaVersion':'tibotattle-signed-staging-native-ui-v1','available':available,'failureStage':reason,'applicationDataRead':False})+'\n')
+          raise SystemExit(0 if available else 1)
+          PYPROBE
       - name: Install locked verification dependencies
         if: inputs.mode == 'execute'
         run: |
