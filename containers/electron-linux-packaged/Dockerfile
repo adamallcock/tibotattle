@@ -7,6 +7,9 @@ FROM tibotattle-electron-linux-amd64:test
 ARG TIBOTATTLE_QUALIFICATION_REVISION
 USER root
 WORKDIR /workspace
+# Trust tooling is used only inside the disposable, network-none updater test.
+RUN apt-get update && apt-get install --yes --no-install-recommends openssl libnss3-tools \
+  && rm -rf /var/lib/apt/lists/*
 RUN node --input-type=module --eval \
   'if (!/^[0-9a-f]{40}$/.test(process.argv[1] ?? "") || process.argv[1] !== process.env.TIBOTATTLE_IMAGE_SOURCE_REVISION) process.exit(1)' \
   "${TIBOTATTLE_QUALIFICATION_REVISION}"
@@ -26,6 +29,10 @@ COPY .release-build/electron-candidates/${TIBOTATTLE_QUALIFICATION_REVISION}/lin
 COPY .release-build/electron-production/linux-x64/app ./.release-build/electron-production/linux-x64/app
 COPY .release-build/electron-production/linux-x64/production-source-candidate.json ./.release-build/electron-production/linux-x64/production-source-candidate.json
 COPY .release-build/electron-production/linux-x64/artifacts/linux-unpacked ./.release-build/electron-production/linux-x64/artifacts/linux-unpacked
+# Genuine updater pair: copy only final immutable AppImages and their receipt.
+COPY .release-build/electron-linux-updater-rehearsal/pair.json ./.release-build/electron-linux-updater-rehearsal/pair.json
+COPY .release-build/electron-linux-updater-rehearsal/current/*.AppImage ./.release-build/electron-linux-updater-rehearsal/current/
+COPY .release-build/electron-linux-updater-rehearsal/next/*.AppImage ./.release-build/electron-linux-updater-rehearsal/next/
 # Only the static synthetic CLI is executable; private runtime/profile mounts
 # remain noexec. The ordinary app reaches this fixture through its normal PATH.
 COPY test/fixtures/linux-packaged-codex/codex /opt/tibotattle-linux-packaged-smoke/bin/codex

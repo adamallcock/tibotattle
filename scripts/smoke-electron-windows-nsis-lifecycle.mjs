@@ -1627,6 +1627,12 @@ function assertLaunchResult(result) {
       || result.observedProcessTreeExited !== true
       || result.installedExecutableAbsentAtPreLaunchSnapshot !== true
       || result.installedExecutableAbsentAtPostExitSnapshot !== true
+      // This is not a generic smoke acknowledgement. The fixed FD4 child
+      // creates its deterministic synthetic record only on the first
+      // top-level launch and the second top-level launch can pass only by
+      // reading it again through the qualified native Credential Manager
+      // backend. A lifecycle receipt is not complete without both sides.
+      || result.accountObservationStorageJourneyCompleted !== true
       || result.storageJourneyCompleted !== true) {
     fail("APPLICATION_LIFECYCLE_INVALID");
   }
@@ -1843,11 +1849,16 @@ function lifecycleReceipt({
     fullOwnedDescendantCleanupVerified: false,
     profileReusedAcrossLaunches: launches.length === 2,
     // The accountless FD3 journey intentionally removes its synthetic record
-    // at exit. The FD4 route below proves only a deterministic qualification
-    // record read through two top-level Electron processes in this disposable
-    // runner account. It is not evidence of retained application credentials.
+    // at exit. The FD4 route below creates then reads the deterministic
+    // qualification record through the native Credential Manager backend in
+    // two top-level Electron processes under this disposable runner account.
+    // It is synthetic test evidence, not evidence of a production credential
+    // selector or retained user application credentials.
     persistentApplicationCredentialStateVerified: false,
     syntheticAccountObservationCredentialReadAcrossTopLevelRelaunches:
+      first?.accountObservationStorageJourneyCompleted === true
+      && second?.accountObservationStorageJourneyCompleted === true,
+    nativeCredentialManagerSyntheticRecordReadAcrossTopLevelRelaunches:
       first?.accountObservationStorageJourneyCompleted === true
       && second?.accountObservationStorageJourneyCompleted === true,
     accountlessSyntheticRecordDeleted: launches.length === 2

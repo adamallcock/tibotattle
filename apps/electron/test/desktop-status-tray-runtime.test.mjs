@@ -362,3 +362,18 @@ test("a native Windows menu presentation dismisses the visual tray first", async
   assert.equal(popup.isVisible(), false);
   assert.equal(tray.presentedMenus.length, 0);
 });
+
+
+test("lifecycle forwards an explicit stale display snapshot without notification evidence", async (t) => {
+  const observed = [];
+  const value = { schemaVersion: "tibotattle-desktop-shell-status-v2", state: "stale", allowance: null, notificationEvidence: null,
+    displayEvidence: { schemaVersion: "tibotattle-display-evidence-v1", scopeKey: null, staleAfterSeconds: 1800,
+      windows: [{ durationMinutes: 10080, remainingPercent: 53, observedAt: "2026-08-22T10:28:00.000Z", resetAt: "2026-08-27T12:00:00.000Z" }] } };
+  const f = fixture({ fetchImpl: async url => jsonResponse(value, url), onDesktopStatus: row => observed.push(row) });
+  t.after(() => f.lifecycle.dispose());
+  await f.lifecycle.start();
+  await waitFor(() => f.trays[0].titles.at(-1) === "7d 53%");
+  assert.match(f.trays[0].menu.template[1].label, /Stale/u);
+  assert.equal(observed.at(-1).state, "stale");
+  assert.equal(observed.at(-1).notificationEvidence, null);
+});

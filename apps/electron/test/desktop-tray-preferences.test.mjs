@@ -119,5 +119,6 @@ test("display-only overview supplies both lanes, reset choices and quiet low cue
   assert.equal(project(tray, { preset: "both" }, { now: now + 60_000 }).compactTitle, "5h — · 7d 94%");
   const retained = reduceDesktopTrayStatus(tray, { type: "analyzing" });
   assert.equal(project(retained, { preset: "both" }).compactTitle, "5h 10% · 7d 94%");
-  assert.equal(project(retained, { preset: "both" }, { now: now + 1801_000 }).compactTitle, "5h — · 7d —");
+  assert.equal(project(retained, { preset: "both" }, { now: now + 1801_000 }).compactTitle, "5h — · 7d 94%");
+  assert.match(project(retained, { preset: "both" }, { now: now + 1801_000 }).evidenceLabel, /Stale/u);
 });

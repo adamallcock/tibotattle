@@ -15,6 +15,8 @@ import {
   validateDesktopTrayStatus,
 } from "../desktop-tray-status.js";
 
+import { DESKTOP_TRAY_DEFAULTS } from "../desktop-tray-preferences.js";
+
 const freshWithoutAllowance = Object.freeze({
   status: "fresh",
   allowance: null,
@@ -412,4 +414,25 @@ test("stateful reducer serializes transitions and can reset to starting", () => 
   assert.equal(reducer.project().allowance.remainingPercent, 73);
   assert.deepEqual(reducer.reset(), DESKTOP_TRAY_INITIAL_STATUS);
   assert.equal(reducer.state.status, "starting");
+});
+
+
+test("explicit stale display snapshots keep an unexpired value without carrying alert authority", () => {
+  const now = Date.parse("2026-09-09T15:21:00.000Z");
+  const displayEvidence = { schemaVersion: "tibotattle-display-evidence-v1", scopeKey: null, staleAfterSeconds: 1800,
+    windows: [{ durationMinutes: 10080, remainingPercent: 53, observedAt: "2026-09-09T13:45:00.000Z", resetAt: "2026-09-14T13:00:00.000Z" }] };
+  const state = reduceDesktopTrayStatus(DESKTOP_TRAY_INITIAL_STATUS, {
+    type: "stale", allowance: null, notificationEvidence: null, displayEvidence,
+  });
+  const view = projectDesktopTrayStatus(state, { now });
+  assert.equal(view.status, "stale");
+  assert.equal(projectDesktopTrayStatus(state, { now, preferences: DESKTOP_TRAY_DEFAULTS }).compactTitle, "7d 53%");
+  assert.equal(view.windows[0].remainingPercent, 53);
+  assert.match(view.evidenceLabel, /Stale/u);
+  assert.doesNotMatch(view.evidenceLabel, /verified current/u);
+  assert.equal(state.notificationEvidence, null);
+  assert.equal(projectDesktopTrayStatus(state, { now: Date.parse(displayEvidence.windows[0].resetAt) }).windows.length, 0);
+  assert.equal(reduceDesktopTrayStatus(state, { type: "stale" }).displayEvidence, undefined);
+  assert.equal(reduceDesktopTrayStatus(state, { type: "unavailable" }).displayEvidence, undefined);
+  assert.throws(() => reduceDesktopTrayStatus(state, { type: "stale", allowance: directAllowance, notificationEvidence: null, displayEvidence }));
 });

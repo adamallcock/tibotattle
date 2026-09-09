@@ -112,6 +112,14 @@ const SYNTHETIC_CODEX_SESSION = `${[
     },
   },
 ].map((record) => JSON.stringify(record)).join("\n")}\n`;
+// The closed fixture is intentionally small enough to make its ingestion
+// contract auditable without retaining source rows or account data in a CI
+// receipt. These values are asserted from the app's existing loopback API.
+const SYNTHETIC_INGESTION_EXPECTATION = Object.freeze({
+  events: 1,
+  totalTokens: 120,
+  sourceCount: 1,
+});
 const SOURCE_REVISION = /^[0-9a-f]{40}$/u;
 const SHA256 = /^[0-9a-f]{64}$/u;
 const FIREWALL_RULE_PREFIX = "tibotattle-normal-candidate-";
@@ -237,6 +245,7 @@ const FAILURE_CODES = new Set([
   "LOCAL_EXPLICIT_REFRESH_REQUEST_UNOBSERVED",
   "LOCAL_EXPLICIT_REFRESH_ACCEPTANCE_UNAVAILABLE",
   "LOCAL_EXPLICIT_REFRESH_COMPLETION_UNAVAILABLE",
+  "LOCAL_SYNTHETIC_INGESTION_UNAVAILABLE",
   "SETTINGS_UNAVAILABLE",
   "SETTINGS_PERSISTENCE_INVALID",
   "CLEAN_QUIT_INVALID",
@@ -2114,6 +2123,67 @@ export async function waitForWindowsNormalCandidateStartupRefreshCompletion({
   return terminal.decision;
 }
 
+/**
+ * Confirm that the exact content-free rollout fixture reached the ordinary
+ * unified index and presentation model. This deliberately observes only
+ * fixed counts and totals through the same loopback routes the dashboard
+ * consumes; it never copies source rows, paths, or account data into a
+ * receipt. The restart pass must add no duplicate record.
+ */
+export function verifyWindowsNormalCandidateSyntheticIngestion({
+  refresh,
+  overview,
+  launch,
+  expectedRefreshId,
+} = {}) {
+  if (!['first', 'restart'].includes(launch)
+      || typeof expectedRefreshId !== 'string' || expectedRefreshId.length === 0
+      || refresh?.status !== 'succeeded' || refresh.refreshId !== expectedRefreshId) {
+    return false;
+  }
+  const index = refresh.result?.unifiedIndex;
+  const refreshAccounting = refresh.result?.accounting;
+  const accounting = overview?.accounting;
+  const coverage = accounting?.historyCoverage;
+  const all = Array.isArray(overview?.usage)
+    ? overview.usage.find((period) => period?.id === 'all')
+    : null;
+  const history = Array.isArray(accounting?.periods)
+    ? accounting.periods.find((period) => period?.periodId === 'history')
+    : null;
+  const expected = SYNTHETIC_INGESTION_EXPECTATION;
+  const freshOrReused = launch === 'first'
+    ? Number.isSafeInteger(index?.insertedUsageEvents)
+      && [0, expected.events].includes(index.insertedUsageEvents)
+      && typeof index?.unchanged === 'boolean'
+    : index?.insertedUsageEvents === 0 && index?.unchanged === true;
+  return index?.status === 'ingested'
+    && index.totalUsageEvents === expected.events
+    && freshOrReused
+    && refreshAccounting?.status === 'replay_safe'
+    && refreshAccounting.sourceMode === 'unified'
+    && refreshAccounting.coverageStatus === 'complete'
+    && refreshAccounting.generationMatched === true
+    && refreshAccounting.fallbackCount === 0
+    && refreshAccounting.diagnosticsAvailable === true
+    && refreshAccounting.events === expected.events
+    && overview?.mode === 'real_local_evidence'
+    && accounting?.sourceMode === 'unified'
+    && accounting.generationMatched === true
+    && accounting.events === expected.events
+    && accounting.totalTokens === expected.totalTokens
+    && coverage?.status === 'complete'
+    && coverage.phase === 'complete'
+    && coverage.sourceCount === expected.sourceCount
+    && coverage.indexedSourceCount === expected.sourceCount
+    && overview?.timeline?.history?.status === 'complete'
+    && overview.timeline.history.usageEvents === expected.events
+    && all?.events === expected.events
+    && all.totalTokens === expected.totalTokens
+    && history?.events === expected.events
+    && history.totalTokens === expected.totalTokens;
+}
+
 async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () => {} }) {
   const dashboard = exactLoopbackRootPage(target.url);
   if (dashboard === null) fail("DASHBOARD_INVALID");
@@ -2235,12 +2305,23 @@ async function assertDashboard({ cdp, target, fetchImpl, launch, onPhase = () =>
       return decision.status === "completed" ? decision : null;
     }, STARTUP_TIMEOUT_MS);
     if (explicitTerminal === null) fail("LOCAL_EXPLICIT_REFRESH_COMPLETION_UNAVAILABLE");
+    const explicitRefresh = (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh;
+    const overview = await jsonFetch(new URL("/api/local/overview", dashboard), { fetchImpl });
+    if (!verifyWindowsNormalCandidateSyntheticIngestion({
+      refresh: explicitRefresh,
+      overview,
+      launch,
+      expectedRefreshId: explicitAccepted.refreshId,
+    })) {
+      fail("LOCAL_SYNTHETIC_INGESTION_UNAVAILABLE");
+    }
     if (!observer.valid()) fail("DASHBOARD_INVALID");
     preloadContexts?.dispose?.();
     return Object.freeze({
       dashboardOrigin: dashboard.origin,
       observer,
       refreshTerminalStatus: explicitTerminal.terminalStatus,
+      syntheticIngestionVerified: true,
     });
   } catch (error) {
     observer.dispose();
@@ -2495,6 +2576,7 @@ async function launchAndRenderCandidate({
       dashboardRendered: true,
       localRefreshObserved: true,
       localRefreshTerminal: dashboard.refreshTerminalStatus,
+      syntheticIngestionVerified: dashboard.syntheticIngestionVerified === true,
       sharingOptOutRetained,
       settingsPersisted: true,
       cleanQuit: true,
@@ -2611,6 +2693,9 @@ function candidateReceipt({
     dashboardRendered: journey?.dashboardRendered === true || progress?.dashboardRendered === true,
     localRefreshObserved: journey?.localRefreshObserved === true || progress?.localRefreshObserved === true,
     localRefreshTerminal: terminal,
+    syntheticFixtureIngestionVerified: journey?.syntheticIngestionVerified === true,
+    syntheticFixtureTotalsRetainedAcrossRestart:
+      journey?.syntheticTotalsRetainedAcrossRestart === true,
     settingsPersistedAcrossRestart: journey?.settingsPersisted === true,
     durableContributionOptOutRetained: journey?.optOutRetained === true,
     loopbackJourneyVerified: journey?.loopbackJourneyVerified === true,
@@ -2717,7 +2802,9 @@ export async function runWindowsNormalCandidateSmoke(options, {
     if (first?.dashboardRendered !== true || first?.localRefreshObserved !== true
         || first?.settingsPersisted !== true || first?.cleanQuit !== true
         || !["succeeded", "degraded"].includes(first?.localRefreshTerminal)
+        || first?.syntheticIngestionVerified !== true
         || first?.sharingOptOutRetained !== true || second?.dashboardRendered !== true
+        || second?.syntheticIngestionVerified !== true
         || second?.sharingOptOutRetained !== true || second?.settingsPersisted !== true
         || second?.cleanQuit !== true || candidateState.quiescent !== true) {
       fail("DASHBOARD_INVALID");
@@ -2728,6 +2815,10 @@ export async function runWindowsNormalCandidateSmoke(options, {
       dashboardRendered: first.dashboardRendered === true && second.dashboardRendered === true,
       localRefreshObserved: first.localRefreshObserved === true,
       localRefreshTerminal: first.localRefreshTerminal,
+      syntheticIngestionVerified: first.syntheticIngestionVerified === true
+        && second.syntheticIngestionVerified === true,
+      syntheticTotalsRetainedAcrossRestart: first.syntheticIngestionVerified === true
+        && second.syntheticIngestionVerified === true,
       settingsPersisted: first.settingsPersisted === true && second.settingsPersisted === true,
       optOutRetained: optOutRetained === true
         && first.sharingOptOutRetained === true && second.sharingOptOutRetained === true,

@@ -639,7 +639,8 @@ async function readDisabledProjection(shareBackend, createCoordinator, destinati
  * If a write fails after directory creation, the partial profile is preserved
  * and later calls fail closed; this helper never deletes or repairs it.
  */
-export async function preseedSignedStagingDisposableOptOut({
+export async function prepareSignedStagingDisposableProfile({
+  initialSharing = "off",
   metadata,
   environment = process.env,
   getuid = typeof process.getuid === "function" ? process.getuid.bind(process) : undefined,
@@ -653,6 +654,7 @@ export async function preseedSignedStagingDisposableOptOut({
   createSharingCoordinator = createDesktopSharingCoordinator,
 } = {}) {
   assertTarget(platform, architecture);
+  if (!["off", "fresh"].includes(initialSharing)) fail(ERROR_CODES.inputInvalid);
   if (typeof getuid !== "function" || typeof getUserInfo !== "function") {
     fail(ERROR_CODES.accountContextInvalid);
   }
@@ -705,11 +707,16 @@ export async function preseedSignedStagingDisposableOptOut({
       destinationOrigin: validatedMetadata.origin,
     });
     try {
-      await coordinator.initialize();
-      const selection = await coordinator.setEnabled(false);
-      const authorization = await coordinator.readAuthorization();
-      const inspection = await coordinator.inspect();
-      assertDisabledProjection({ authorization, inspection, selection });
+      const initialized = await coordinator.initialize();
+      if (initialSharing === "off") {
+        const selection = await coordinator.setEnabled(false);
+        const authorization = await coordinator.readAuthorization();
+        const inspection = await coordinator.inspect();
+        assertDisabledProjection({ authorization, inspection, selection });
+      } else if (initialized.enabled !== true || initialized.current !== true
+          || initialized.basis !== "default_on") {
+        fail(ERROR_CODES.optOutInvalid);
+      }
     } finally {
       coordinator.dispose();
     }
@@ -725,6 +732,17 @@ export async function preseedSignedStagingDisposableOptOut({
     shareBackend,
     destinationOrigin: validatedMetadata.origin,
   });
+}
+
+export function preseedSignedStagingDisposableOptOut(options = {}, dependencies = {}) {
+  return prepareSignedStagingDisposableProfile({ ...options, initialSharing: "off" }, dependencies);
+}
+
+/** Private launch inputs; never serialize the returned paths or metadata. */
+export async function verifySignedStagingLaunchInputs(options = {}) {
+  const verified = await inspectSignedStagingArtifactInternal(options);
+  assertAccountlessSignedStagingOperatingAccount({ metadata: verified.metadata });
+  return verified;
 }
 
 /** Re-read the exact persisted records written by the preseed helper. */

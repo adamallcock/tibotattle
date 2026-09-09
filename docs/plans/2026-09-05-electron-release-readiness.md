@@ -19,6 +19,17 @@ Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
 Latest continuation, 2026-09-09:
 
+- User acceptance update: the user confirms Mac tray dismissal works and accepts
+  physical Intel acceptance as an assumption for this cutover. Signing is
+  authorized on both Mac and Windows. Do not describe assumed Intel testing as
+  measured hardware evidence. Current source `46a5fad7` passed all six jobs in
+  [34363070167](https://github.com/adamallcock/tibotattle/actions/runs/34363070167).
+- Release scope is frozen to the remaining delivery tracks: latest signed Mac
+  candidate and signed staging contributions; Windows credential/ingestion and
+  signing integration; genuine Linux AppImage replacement. Tray quota retention
+  is a correctness fix: unexpired last-known readings remain visibly stale,
+  while notification authority still requires fresh evidence.
+
 - Source `2bb58b5c02bf6e7ba4ab6ce69e5c201e44054f9f` passed all six
   jobs in [34356903351](https://github.com/adamallcock/tibotattle/actions/runs/34356903351):
   both Mac packages, Windows and Linux packages, Windows normal startup, and

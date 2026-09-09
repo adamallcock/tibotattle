@@ -512,6 +512,11 @@ const DESKTOP_MESSAGES = Object.freeze({
     "zh-Hans": "{appName} · 剩余 {allowance}",
     es: "{appName} · {allowance} disponible",
   }),
+  "electron.tray.evidenceStale": Object.freeze({
+    "en-US": "Observed {age} · Stale; refresh for current usage",
+    "zh-Hans": "{age}前观测 · 已过时；请刷新查看当前用量",
+    es: "Observado hace {age} · Desactualizado; actualiza el uso",
+  }),
   "electron.tray.evidenceCurrent": Object.freeze({
     "en-US": "Observed {age} · verified current evidence",
     "zh-Hans": "{age}前观测 · 当前证据已验证",

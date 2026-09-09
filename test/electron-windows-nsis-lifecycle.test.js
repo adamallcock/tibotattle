@@ -1175,6 +1175,7 @@ test("lifecycle binds installed bytes, uses two distinct top-level processes in 
     assert.equal(receipt.firstLaunchFailureCode, null);
     assert.equal(receipt.persistentApplicationCredentialStateVerified, false);
     assert.equal(receipt.syntheticAccountObservationCredentialReadAcrossTopLevelRelaunches, true);
+    assert.equal(receipt.nativeCredentialManagerSyntheticRecordReadAcrossTopLevelRelaunches, true);
     assert.equal(receipt.accountlessSyntheticRecordDeleted, true);
     assert.equal(receipt.accountObservationCredentialCleanup, "disposable_runner_account_lifetime");
     assert.equal(receipt.uninstallRegistryAbsent, true);
@@ -1207,7 +1208,7 @@ test("in-place NSIS residue cleanup removes only the unchanged generated uninsta
   }
 });
 
-test("NSIS receipt keeps synthetic FD4 relaunch evidence unavailable when either launch lacks its closed acknowledgement", async () => {
+test("NSIS lifecycle fails closed when either top-level launch lacks native FD4 acknowledgement", async () => {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-nsis-fd4-relaunch-test-"));
   const receiptPath = join(root, "receipt.json");
   try {
@@ -1216,10 +1217,13 @@ test("NSIS receipt keeps synthetic FD4 relaunch evidence unavailable when either
       receiptPath,
       accountObservationStorageJourneyCompleted: (launchOrdinal) => launchOrdinal === 1,
     });
-    await scenario.operation;
+    await assert.rejects(scenario.operation, {
+      code: "ELECTRON_WINDOWS_NSIS_LIFECYCLE_APPLICATION_LIFECYCLE_INVALID",
+    });
     const receipt = JSON.parse(await readFile(receiptPath, "utf8"));
-    assert.equal(receipt.status, "passed");
+    assert.equal(receipt.status, "failed");
     assert.equal(receipt.syntheticAccountObservationCredentialReadAcrossTopLevelRelaunches, false);
+    assert.equal(receipt.nativeCredentialManagerSyntheticRecordReadAcrossTopLevelRelaunches, false);
     assert.equal(receipt.persistentApplicationCredentialStateVerified, false);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -1407,6 +1411,7 @@ test("a mismatched reverify refuses the second launch and preserves the first fa
           observedProcessTreeExited: true,
           installedExecutableAbsentAtPreLaunchSnapshot: true,
           installedExecutableAbsentAtPostExitSnapshot: true,
+          accountObservationStorageJourneyCompleted: true,
           storageJourneyCompleted: true,
         };
       },
@@ -1468,6 +1473,7 @@ test("a failed uninstaller is terminal and retains its original cleanup uncertai
         observedProcessTreeExited: true,
         installedExecutableAbsentAtPreLaunchSnapshot: true,
         installedExecutableAbsentAtPostExitSnapshot: true,
+        accountObservationStorageJourneyCompleted: true,
         storageJourneyCompleted: true,
       }),
       executeUninstaller: async () => {
@@ -1536,6 +1542,7 @@ test("post-uninstall polling uses one monotonic budget across fixed probes", asy
         observedProcessTreeExited: true,
         installedExecutableAbsentAtPreLaunchSnapshot: true,
         installedExecutableAbsentAtPostExitSnapshot: true,
+        accountObservationStorageJourneyCompleted: true,
         storageJourneyCompleted: true,
       }),
       executeUninstaller: async () => ({ settled: true, succeeded: true }),
@@ -1606,6 +1613,7 @@ test("default post-uninstall budget leaves the full registry timeout before its 
         observedProcessTreeExited: true,
         installedExecutableAbsentAtPreLaunchSnapshot: true,
         installedExecutableAbsentAtPostExitSnapshot: true,
+        accountObservationStorageJourneyCompleted: true,
         storageJourneyCompleted: true,
       }),
       executeUninstaller: async () => ({ settled: true, succeeded: true }),
@@ -1747,6 +1755,7 @@ test("post-uninstall receipts isolate fixed probe failures without releasing the
             observedProcessTreeExited: true,
             installedExecutableAbsentAtPreLaunchSnapshot: true,
             installedExecutableAbsentAtPostExitSnapshot: true,
+            accountObservationStorageJourneyCompleted: true,
             storageJourneyCompleted: true,
           }),
           executeUninstaller: async () => ({ settled: true, succeeded: true }),
@@ -1848,6 +1857,7 @@ test("a repeated top-level PID refuses success and still runs the exact uninstal
         observedProcessTreeExited: true,
         installedExecutableAbsentAtPreLaunchSnapshot: true,
         installedExecutableAbsentAtPostExitSnapshot: true,
+        accountObservationStorageJourneyCompleted: true,
         storageJourneyCompleted: true,
       }),
       executeUninstaller: async () => {

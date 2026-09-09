@@ -521,13 +521,14 @@ test("critical weekly pace uses the dedicated urgency treatment", async () => {
   assert.match(css, /#pace-outlook[\s\S]*overflow-wrap:\s*anywhere/u);
 });
 
-test("allowance claims require each lane's live fresh observation and future reset", () => {
+test("allowance claims retain stale observations only until their own future reset", () => {
   const data = fixture();
   data.quotaWindows[0].usedPercent = 24.4;
   data.quotaWindows[0].remainingPercent = 75.6;
   data.quotaWindows[1].observedAt = "2026-09-04T17:29:59.000Z";
   const oneCurrentLane = createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" });
-  assert.deepEqual(oneCurrentLane.allowances.map((row) => row.durationMinutes), [300]);
+  assert.deepEqual(oneCurrentLane.allowances.map((row) => row.durationMinutes), [300, 10_080]);
+  assert.equal(oneCurrentLane.allowances[1].stale, true);
   assert.equal(oneCurrentLane.allowances[0].remainingPercent, 76);
 
   const resetPassed = fixture();
@@ -541,8 +542,8 @@ test("allowance claims require each lane's live fresh observation and future res
   const stale = fixture();
   stale.freshness.status = "stale";
   assert.deepEqual(
-    createTrayPopupProjection(stale, { now: NOW, timeZone: "UTC" }).allowances,
-    [],
+    createTrayPopupProjection(stale, { now: NOW, timeZone: "UTC" }).allowances.map(row => row.stale),
+    [true, true],
   );
 });
 
@@ -1011,4 +1012,19 @@ test("normalization preserves the companion's top-level timeline source for toke
   assert.equal(normalizeDashboardPayload(data).timeline.history.source, "unified_local_index");
   data.timeline.history.source = "recent_collector_window";
   assert.equal(normalizeDashboardPayload(data).timeline.history.source, "recent_collector_window");
+});
+
+
+test("stale allowance rendering is explicit and never presents a current pace forecast", () => {
+  const data = fixture();
+  data.quotaWindows.forEach(row => { row.observedAt = "2026-09-04T16:24:00.000Z"; });
+  const projection = createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" });
+  const documentRef = new FakeDocument();
+  renderTrayPopup(documentRef, projection);
+  assert.match(documentRef.getElementById("allowance-lanes").children[0].children[0].children[1].textContent, /75%.*Stale/u);
+  assert.equal(documentRef.getElementById("pace-section").hidden, true);
+  for (const state of ["offline", "unavailable", "demo"]) {
+    data.freshness.status = state;
+    assert.deepEqual(createTrayPopupProjection(data, { now: NOW, timeZone: "UTC" }).allowances, []);
+  }
 });

@@ -88,20 +88,12 @@ test("published overview display evidence supplies a zero-percent native-primary
 
 test("desktop shell display proof follows live current reset and primary-lane bounds", () => {
   const scenarios = [
-    ["stale", displayEvidence({ freshness: { status: "stale" } })],
     ["demo", displayEvidence({ freshness: { status: "demo" } })],
     ["offline", displayEvidence({ freshness: { status: "offline" } })],
     ["expired", displayEvidence({
       windows: [{
         ...displayEvidence().windows[0],
         resetAt: "2026-09-05T12:00:00.000Z",
-      }],
-    })],
-    ["old", displayEvidence({
-      windows: [{
-        ...displayEvidence().windows[0],
-        observedAt: "2026-09-05T11:20:00.000Z",
-        resetAt: "2026-09-05T12:20:00.000Z",
       }],
     })],
     ["malformed", displayEvidence({
@@ -184,4 +176,25 @@ test("strict v2 notification evidence remains the only notification-bearing path
     () => validateDesktopShellStatus(expected("fresh")),
     /desktop shell status is invalid/u,
   );
+});
+
+
+test("aged display-only observations survive until reset without notification authority", () => {
+  const input = displayEvidence({ freshness: { status: "stale" }, windows: [{
+    ...displayEvidence().windows[1], usedPercent: 47, remainingPercent: 53,
+    observedAt: "2026-09-05T10:24:00.000Z",
+  }] });
+  const value = projectDesktopShellStatus({ refresh: { status: "succeeded", result: {} }, displayEvidence: input, now: NOW });
+  assert.equal(value.state, "stale");
+  assert.equal(value.allowance, null);
+  assert.equal(value.notificationEvidence, null);
+  assert.equal(value.displayEvidence.windows[0].remainingPercent, 53);
+  assert.deepEqual(validateDesktopShellStatus(value), value);
+  for (const refresh of [{ status: "cancelled" }, { status: "failed" }]) {
+    assert.equal(projectDesktopShellStatus({ refresh, displayEvidence: input, now: NOW }).displayEvidence, undefined);
+  }
+  assert.equal(projectDesktopShellStatus({ refresh: { status: "idle" }, displayEvidence: input,
+    now: Date.parse(input.windows[0].resetAt) }).displayEvidence, undefined);
+  const replacement = projectDesktopShellStatus({ refresh: { status: "idle" }, displayEvidence: displayEvidence({ windows: [] }), now: NOW });
+  assert.equal(replacement.displayEvidence, undefined, "a new empty source snapshot does not borrow the previous observation");
 });

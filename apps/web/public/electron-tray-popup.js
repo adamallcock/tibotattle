@@ -425,7 +425,7 @@ function normalCodexAllowanceCandidate(window, nowMs) {
     observedAtMs,
     resetAt,
     resetAtMs,
-    status: window.status === "live" ? "live" : "unavailable",
+    status: ["live", "stale"].includes(window.status) ? window.status : "unavailable",
     stableKey: [slot, resetAt, observedAt, String(remainingPercent)].join("\0"),
   });
 }
@@ -830,12 +830,15 @@ function buildAllowances(
         && window.status === "live"
         && nowInstant - window.observedAtMs <= staleAfterSeconds * 1_000
         && window.resetAtMs > nowInstant;
-      if (!isCurrent) return [];
+      if (!["live", "stale"].includes(freshnessStatus)
+          || !["live", "stale"].includes(window.status)
+          || window.resetAtMs <= nowInstant) return [];
       const labelKey = window.durationMinutes === CODEX_FIVE_HOUR_ALLOWANCE_MINUTES
         ? "dashboard.quota.windowFiveHour" : "dashboard.quota.windowSevenDay";
       return [Object.freeze({
         durationMinutes: window.durationMinutes,
         labelKey,
+        stale: !isCurrent,
         remainingPercent: Math.round(window.remainingPercent),
         resetAt: window.resetAt,
         resetInSeconds: Math.max(0, (window.resetAtMs - nowInstant) / 1_000),
@@ -1174,7 +1177,7 @@ function renderAllowances(documentRef, projection, t, numberFormatter, preferenc
     heading.className = "electron-tray-popup-allowance-heading";
     const title = textNode(documentRef, t(allowance.labelKey));
     title.className = "electron-tray-popup-allowance-title";
-    const value = textNode(documentRef, t("electron.trayPopover.remaining", {
+    const value = textNode(documentRef, t(allowance.stale ? "electron.trayPopover.remainingStale" : "electron.trayPopover.remaining", {
       value: displayPercent(allowance.remainingPercent, numberFormatter),
     }));
     value.className = "electron-tray-popup-allowance-value";
@@ -1186,7 +1189,7 @@ function renderAllowances(documentRef, projection, t, numberFormatter, preferenc
     track.setAttribute("aria-valuemin", "0");
     track.setAttribute("aria-valuemax", "100");
     track.setAttribute("aria-valuenow", String(allowance.remainingPercent));
-    track.setAttribute("aria-valuetext", displayPercent(allowance.remainingPercent, numberFormatter));
+    track.setAttribute("aria-valuetext", value.textContent);
     const fill = documentRef.createElement("span");
     fill.className = "electron-tray-popup-progress-fill";
     fill.style.width = `${allowance.remainingPercent}%`;
@@ -1219,7 +1222,7 @@ function renderWeeklyPace(documentRef, projection, t, numberFormatter, localForm
   const section = documentRef.getElementById("pace-section");
   const pace = projection.weeklyPace;
   const weeklyAllowance = projection.allowances.find((allowance) =>
-    allowance.durationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES);
+    allowance.durationMinutes === CODEX_WEEKLY_ALLOWANCE_MINUTES && !allowance.stale);
   const resetMatches = weeklyAllowance !== undefined
     && instantMs(weeklyAllowance.resetAt) !== null
     && instantMs(pace.resetsAt) !== null

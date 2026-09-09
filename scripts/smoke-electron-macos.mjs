@@ -722,7 +722,7 @@ function jsonFetch(url) {
     });
 }
 
-async function connectCdp(target) {
+export async function connectCdp(target) {
   const socket = new WebSocket(target.webSocketDebuggerUrl);
   await withTimeout(new Promise((resolveOpen, rejectOpen) => {
     socket.addEventListener("open", resolveOpen, { once: true });

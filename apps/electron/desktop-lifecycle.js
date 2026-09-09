@@ -311,7 +311,7 @@ export function createDesktopLifecycle({
     let validated;
     try {
       validated = validateDesktopShellStatus(status);
-      const event = ["fresh", "analyzing"].includes(validated.state)
+      const event = ["fresh", "analyzing"].includes(validated.state) || (validated.state === "stale" && validated.displayEvidence)
         ? {
           type: validated.state,
           allowance: validated.allowance,

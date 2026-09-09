@@ -25,7 +25,7 @@ test("Electron explicitly selects default-on but exposes only a safe preference 
   assert.equal(value.basis, "default_on");
   assert.equal(value.transportStatus, "unavailable");
   assert.deepEqual(Object.keys(value).sort(), [
-    "available", "basis", "current", "earliestActivationAt", "enabled", "nextNoticeAt",
+    "available", "basis", "current", "earliestActivationAt", "enabled", "lastAcceptedAt", "nextNoticeAt",
     "nextNoticeIndex", "noticeCount", "noticeDue", "state", "transportStatus",
   ]);
   assert.equal(backend.read().includes("consentedAt"), false);
@@ -129,4 +129,20 @@ test("failed persistence cannot report a completed opt-out or allow later automa
   await coordinator.initialize();
   await assert.rejects(coordinator.setEnabled(false));
   await assert.rejects(coordinator.inspect());
+});
+
+
+test("sharing exposes only validated accepted-upload time and preserves it when disabled", async () => {
+  const coordinator = createDesktopSharingCoordinator({ ...OPTIONS, backend: memoryBackend() });
+  await coordinator.initialize();
+  assert.equal((await coordinator.inspect()).lastAcceptedAt, null);
+  coordinator.updateTransport({ state: "up_to_date", lastAcceptedAt: "bad" });
+  assert.equal((await coordinator.inspect()).lastAcceptedAt, null);
+  const timestamp = "2026-09-09T12:00:00.000Z";
+  coordinator.updateTransport({ state: "up_to_date", lastAcceptedAt: timestamp });
+  assert.equal((await coordinator.inspect()).lastAcceptedAt, timestamp);
+  coordinator.updateTransport({ state: "unknown", lastAcceptedAt: "2026-09-10T12:00:00.000Z" });
+  assert.equal((await coordinator.inspect()).lastAcceptedAt, timestamp);
+  assert.equal((await coordinator.setEnabled(false)).lastAcceptedAt, timestamp);
+  coordinator.dispose();
 });

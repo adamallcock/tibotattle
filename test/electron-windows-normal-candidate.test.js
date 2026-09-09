@@ -49,6 +49,7 @@ import {
   selectWindowsNormalCandidateDashboardTarget,
   selectWindowsNormalCandidateSettingsTarget,
   validateWindowsNormalCandidateSmokeMetadata,
+  verifyWindowsNormalCandidateSyntheticIngestion,
   verifyWindowsNormalCandidateOptOut,
   verifyWindowsNormalCandidateSmokePackage,
   WINDOWS_NORMAL_CANDIDATE_FIREWALL_TIMEOUT_MS,
@@ -578,11 +579,81 @@ function passedJourney() {
     dashboardRendered: true,
     localRefreshObserved: true,
     localRefreshTerminal: "succeeded",
+    syntheticIngestionVerified: true,
     sharingOptOutRetained: true,
     settingsPersisted: true,
     cleanQuit: true,
   };
 }
+
+function syntheticIngestion({
+  launch = "first",
+  insertedUsageEvents = launch === "restart" ? 0 : 1,
+  unchanged = launch === "restart",
+} = {}) {
+  const refreshId = "synthetic-refresh-v1";
+  return {
+    refresh: {
+      status: "succeeded",
+      refreshId,
+      result: {
+        unifiedIndex: {
+          status: "ingested",
+          insertedUsageEvents,
+          totalUsageEvents: 1,
+          unchanged,
+        },
+        accounting: {
+          status: "replay_safe",
+          sourceMode: "unified",
+          coverageStatus: "complete",
+          generationMatched: true,
+          fallbackCount: 0,
+          diagnosticsAvailable: true,
+          events: 1,
+        },
+      },
+    },
+    overview: {
+      mode: "real_local_evidence",
+      accounting: {
+        sourceMode: "unified",
+        generationMatched: true,
+        events: 1,
+        totalTokens: 120,
+        historyCoverage: {
+          status: "complete",
+          phase: "complete",
+          sourceCount: 1,
+          indexedSourceCount: 1,
+        },
+        periods: [{ periodId: "history", events: 1, totalTokens: 120 }],
+      },
+      timeline: { history: { status: "complete", usageEvents: 1 } },
+      usage: [{ id: "all", events: 1, totalTokens: 120 }],
+    },
+    launch,
+    expectedRefreshId: refreshId,
+  };
+}
+
+test("normal candidate synthetic ingestion proof requires exact unified totals and no restart duplicate", () => {
+  assert.equal(verifyWindowsNormalCandidateSyntheticIngestion(syntheticIngestion()), true);
+  assert.equal(verifyWindowsNormalCandidateSyntheticIngestion(syntheticIngestion({ launch: "restart" })), true);
+  for (const mutate of [
+    (value) => { value.refresh.result.unifiedIndex.totalUsageEvents = 2; },
+    (value) => { value.refresh.result.unifiedIndex.insertedUsageEvents = 1; },
+    (value) => { value.refresh.result.unifiedIndex.unchanged = false; },
+    (value) => { value.overview.accounting.totalTokens = 119; },
+    (value) => { value.overview.accounting.historyCoverage.phase = "partial_terminal"; },
+    (value) => { value.overview.timeline.history.usageEvents = 0; },
+    (value) => { value.refresh.result.accounting.fallbackCount = 1; },
+  ]) {
+    const value = syntheticIngestion({ launch: "restart" });
+    mutate(value);
+    assert.equal(verifyWindowsNormalCandidateSyntheticIngestion(value), false);
+  }
+});
 
 function normalCandidateSeedDependencies(overrides = {}) {
   let receipt = null;
@@ -766,18 +837,53 @@ test("normal candidate fixture passes Codex discovery, onboarding, and local ref
     while (Date.now() < deadline) {
       const status = await fetch(`${base}/api/local/refresh`).then((value) => value.json());
       if (["succeeded", "degraded"].includes(status?.refresh?.status)) {
-        terminal = status.refresh.status;
+        terminal = status.refresh;
         break;
       }
       await new Promise((resolveWait) => setTimeout(resolveWait, 25));
     }
-    assert.ok(["succeeded", "degraded"].includes(terminal));
+    assert.equal(terminal?.status, "succeeded");
+    const firstOverview = await fetch(`${base}/api/local/overview`).then((value) => value.json());
+    assert.equal(verifyWindowsNormalCandidateSyntheticIngestion({
+      refresh: terminal,
+      overview: firstOverview,
+      launch: "first",
+      expectedRefreshId: terminal.refreshId,
+    }), true);
     await app.close();
     app = await startLocalCompanionServer(serverOptions);
     const restartedBase = `http://127.0.0.1:${app.port}`;
     const restartedOnboarding = await fetch(`${restartedBase}/api/local/onboarding`);
     assert.equal(restartedOnboarding.status, 200);
     assert.equal(normalizeLocalOnboarding(await restartedOnboarding.json()).state, "ready");
+    const restartedRefresh = await fetch(`${restartedBase}/api/local/refresh`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Usage-Monitor-Local": "1",
+        Origin: restartedBase,
+      },
+      body: "{}",
+    });
+    assert.equal(restartedRefresh.status, 202);
+    const restartDeadline = Date.now() + 5_000;
+    let restartedTerminal = null;
+    while (Date.now() < restartDeadline) {
+      const status = await fetch(`${restartedBase}/api/local/refresh`).then((value) => value.json());
+      if (["succeeded", "degraded"].includes(status?.refresh?.status)) {
+        restartedTerminal = status.refresh;
+        break;
+      }
+      await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+    }
+    assert.equal(restartedTerminal?.status, "succeeded");
+    const restartedOverview = await fetch(`${restartedBase}/api/local/overview`).then((value) => value.json());
+    assert.equal(verifyWindowsNormalCandidateSyntheticIngestion({
+      refresh: restartedTerminal,
+      overview: restartedOverview,
+      launch: "restart",
+      expectedRefreshId: restartedTerminal.refreshId,
+    }), true);
   } finally {
     await app?.close();
     await rm(root, { recursive: true, force: true });
@@ -1479,6 +1585,8 @@ test("normal candidate runner orders firewall coverage around both ordinary laun
     dashboardRendered: true,
     localRefreshObserved: true,
     localRefreshTerminal: "succeeded",
+    syntheticFixtureIngestionVerified: true,
+    syntheticFixtureTotalsRetainedAcrossRestart: true,
     settingsPersistedAcrossRestart: true,
     durableContributionOptOutRetained: true,
     loopbackJourneyVerified: true,

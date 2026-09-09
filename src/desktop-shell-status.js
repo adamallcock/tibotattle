@@ -230,7 +230,7 @@ function displayWindows(displayEvidence, { now }) {
   if (!hasExactKeys(displayEvidence, DISPLAY_EVIDENCE_KEYS)
       || displayEvidence.evidenceStatus !== "available"
       || !hasExactKeys(displayEvidence.freshness, DISPLAY_FRESHNESS_KEYS)
-      || displayEvidence.freshness.status !== "live"
+      || !["live", "stale"].includes(displayEvidence.freshness.status)
       || typeof displayEvidence.freshness.staleAfterSeconds !== "number"
       || !Number.isFinite(displayEvidence.freshness.staleAfterSeconds)
       || displayEvidence.freshness.staleAfterSeconds < 0
@@ -271,7 +271,6 @@ function displayWindows(displayEvidence, { now }) {
     // independently expired. Match the native reader by excluding that one
     // lane instead of letting it erase its current sibling.
     if (observedAtMs > now
-        || now - observedAtMs > displayEvidence.freshness.staleAfterSeconds * 1_000
         || resetAtMs <= now) {
       continue;
     }
@@ -308,7 +307,7 @@ export function projectDesktopShellDisplayEvidence(value, { now = Date.now() } =
         || Date.parse(item.resetAt) - Date.parse(item.observedAt) > item.durationMinutes * 60_000) return null;
     seen.add(item.durationMinutes);
     if (now !== null && (!Number.isFinite(now) || now < Date.parse(item.observedAt)
-        || now - Date.parse(item.observedAt) > value.staleAfterSeconds * 1_000 || now >= Date.parse(item.resetAt))) continue;
+        || now >= Date.parse(item.resetAt))) continue;
     windows.push(Object.freeze({ ...item }));
   }
   return windows.length === 0 ? null : Object.freeze({ ...value, windows: Object.freeze(windows) });
@@ -345,7 +344,7 @@ function closedOutput(state, allowance = null, notificationEvidence = null, disp
   if (!["fresh", "analyzing"].includes(state)) {
     allowance = null;
     notificationEvidence = null;
-    displayEvidence = null;
+    if (state !== "stale") displayEvidence = null;
   } else {
     allowance = cloneAllowance(allowance);
   }
@@ -418,7 +417,13 @@ export function projectDesktopShellStatus({
   if (snapshotStatus === "failed") return closedOutput("unavailable");
 
   const currentDisplayEvidence = displayWindows(displayEvidence, { now });
-  const currentDisplayAllowance = displayAllowance(currentDisplayEvidence);
+  const displayIsStale = currentDisplayEvidence !== null
+    && (displayEvidence.freshness.status === "stale"
+      || currentDisplayEvidence.windows.some((item) => now - Date.parse(item.observedAt) > currentDisplayEvidence.staleAfterSeconds * 1_000));
+  const currentDisplayAllowance = displayIsStale ? null : displayAllowance(currentDisplayEvidence);
+  const displayOnlyStatus = () => currentDisplayEvidence === null
+    ? closedOutput("stale")
+    : closedOutput(displayIsStale ? "stale" : "fresh", currentDisplayAllowance, null, currentDisplayEvidence);
   const refreshStatus = safeRefreshState(refresh);
   if (refreshStatus === "running" || refreshStatus === "cancelling") {
     // A refresh receipt may retain the last closed provider observation while
@@ -444,9 +449,7 @@ export function projectDesktopShellStatus({
     return closedOutput("unavailable");
   }
   if (refreshStatus === "idle") {
-    return currentDisplayAllowance === null
-      ? closedOutput("unavailable")
-      : closedOutput("fresh", currentDisplayAllowance, null, currentDisplayEvidence);
+    return currentDisplayEvidence === null ? closedOutput("unavailable") : displayOnlyStatus();
   }
   if (refreshStatus !== "succeeded" && refreshStatus !== "degraded") {
     return closedOutput(
@@ -466,9 +469,7 @@ export function projectDesktopShellStatus({
       currentDisplayEvidence,
     );
   }
-  return currentDisplayAllowance === null
-    ? closedOutput("stale")
-    : closedOutput("fresh", currentDisplayAllowance, null, currentDisplayEvidence);
+  return displayOnlyStatus();
 }
 
 export function validateDesktopShellStatus(value) {
@@ -484,7 +485,7 @@ export function validateDesktopShellStatus(value) {
     throw new TypeError("desktop shell status is invalid");
   }
   const display = value.displayEvidence === undefined ? null : projectDesktopShellDisplayEvidence(value.displayEvidence, { now: null });
-  if (value.displayEvidence !== undefined && (display === null || value.schemaVersion !== DESKTOP_SHELL_STATUS_SCHEMA_VERSION || !["fresh", "analyzing"].includes(value.state))) throw new TypeError("desktop display evidence is invalid");
+  if (value.displayEvidence !== undefined && (display === null || value.schemaVersion !== DESKTOP_SHELL_STATUS_SCHEMA_VERSION || !["fresh", "analyzing", "stale"].includes(value.state))) throw new TypeError("desktop display evidence is invalid");
   const evidence = ["fresh", "analyzing"].includes(value.state)
     ? projectDesktopShellNotificationEvidence(
       value.notificationEvidence,

@@ -3628,7 +3628,7 @@ function desktopShellDisplayEvidence(snapshot) {
       ? "available"
       : "unavailable",
     freshness: Object.freeze({
-      status: freshness?.status === "live" ? "live" : "unavailable",
+      status: ["live", "stale"].includes(freshness?.status) ? freshness.status : "unavailable",
       staleAfterSeconds,
     }),
     windows: Object.freeze(DESKTOP_SHELL_DISPLAY_DURATIONS

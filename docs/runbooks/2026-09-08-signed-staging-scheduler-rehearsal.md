@@ -35,7 +35,7 @@ The package marker is mutually exclusive with stable distribution, handover,
 hosted rehearsal, development, and test-lane markers.
 
 This source change does not sign, publish, deploy, launch, or create a macOS
-account. A later consumer job must obtain an already-signed artifact, verify
+account. The consumer job must obtain an already-signed artifact, verify
 its code signature before launch, and supply the actual fresh hosted runner's
 UID and login name when the package is finalized. The hosted runner's native
 Keychain and ServiceManagement behavior remains a separate qualification
@@ -76,21 +76,34 @@ The preparation helper accepts validated metadata as a separate contract; it
 does not itself bind that metadata to a signature-verified artifact. Any future
 launcher must carry the verified artifact binding into preparation and launch.
 
-These helper tests do not qualify a packaged scheduler. A launch consumer still
-needs a bounded, reviewed macOS process boundary: prelaunch quiescence, ownership
-of the launched process and its debugger listener, exact dashboard binding,
-private temporary storage, bounded waits and verified cleanup. Real signed
-launch, restart, credential access, enrollment and upload evidence remains
-unfinished. No hosted requests are made by this intake command or its preparation
-helper.
+## Explicit execution boundary
 
+`electron-signed-staging.yml` is a manual disposable macOS arm64 consumer.
+Probe mode records the runner account so the package can bind its numeric UID
+and login name. Execute mode requires the exact source, archive and ASAR
+hashes. It downloads only from the isolated test-artifact namespace, refuses
+redirects, verifies the ZIP before extraction, and validates Developer ID and
+the package marker before profile creation or launch.
 
-For the next implementation, first reuse the bounded exit-observer,
-descendant-capture and cleanup patterns in `scripts/smoke-electron-macos.mjs`,
-and the failure-only TERM/KILL escalation in
-`scripts/qa-electron-macos-real-history.mjs`. The former is an unsigned
-synthetic-profile harness and the latter uses copied real history; neither
-qualifies this signed staging profile as-is. Their test-profile signals and
-launch settings must not be copied into an ordinary signed launch. The missing
-composition must bind the verified artifact to its executable, disposable
-profile and owned listener, then prove the captured process tree has stopped.
+`scripts/run-signed-electron-staging.mjs --execute-staging` is the separate
+execution entrypoint. It initializes a new profile through the existing
+policy controller with `default_on` and acknowledges first run. This is an
+explicitly seeded default-on integration rehearsal, not proof of untouched
+fresh-install classification or delivery of migration notices. The app then
+owns native credentials, enrollment, upload authorization and scheduling.
+The fixture contains only synthetic usage/quota records; the child uses the
+compiled staging endpoint and isolated source roots.
+
+The runner checks the main process's debugger listener before selecting its
+same-origin dashboard and Settings frame. It waits for a validated accepted
+upload timestamp, restarts the process, requires an authenticated sync with
+unchanged installation binding, disables sharing through the normal Settings
+bridge, and restarts again to confirm the durable opt-out. Only a closed,
+content-free receipt is retained. The profile and credentials remain on the
+disposable runner and are never uploaded.
+
+Controlled process-group termination and verified cleanup are recorded as
+such; this does not qualify native menu Quit, operating-system notification
+presentation, locked Keychain behavior, or interruption recovery for an
+ordinary user's installation. The source tests and prepared workflow do not
+establish an actual signed scheduler pass. Execution evidence remains required.

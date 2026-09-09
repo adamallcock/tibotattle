@@ -5,14 +5,14 @@ import { validateDesktopTrayPreferences } from "./desktop-tray-preferences.js";
  * The native menu-bar implementation deliberately separates lifecycle phase
  * from evidence freshness.  This smaller cross-platform contract exposes the
  * five user-visible states the tray may claim and carries only the companion's
- * closed, direct allowance windows when it has supplied fresh, validated
- * evidence. During an active refresh, a prior fresh observation may be
+ * closed, direct allowance windows. A stale display-only snapshot may retain
+ * an observed percentage until that window resets, with an explicit stale label. During an active refresh, a prior fresh observation may be
  * retained in the reducer, or the companion may publish a separately
  * validated overview allowance while notification evidence remains absent.
  * Retained v2 evidence is revalidated against its observation age at
  * projection time; the overview path is accepted only through the closed
  * main-process status contract. This module does not read the filesystem,
- * inspect a renderer, preserve raw errors, or infer a value from stale data.
+ * inspect a renderer, preserve raw errors, or infer a new value from stale data.
  */
 
 import { projectDesktopShellDisplayEvidence, projectDesktopShellNotificationEvidence } from "../../src/desktop-shell-status.js";
@@ -156,7 +156,7 @@ function statusSnapshot(status, allowance = null, notificationEvidence = null, d
     throw new TypeError("only fresh or analyzing status may carry evidence");
   }
   const display = displayEvidence === null ? null : projectDesktopShellDisplayEvidence(displayEvidence, { now: null });
-  if (displayEvidence !== null && (display === null || !["fresh", "analyzing"].includes(status))) throw new TypeError("tray display evidence is invalid");
+  if (displayEvidence !== null && (display === null || !["fresh", "analyzing", "stale"].includes(status))) throw new TypeError("tray display evidence is invalid");
   return Object.freeze({
     status,
     ...(display === null ? {} : { displayEvidence: display }),
@@ -196,8 +196,8 @@ export function validateDesktopTrayAllowance(value) {
  * prior fresh evidence in memory. An explicit analyzing snapshot replaces
  * that retained state with the companion's current closed allowance; it may
  * have null notification evidence because notification authority remains
- * separate from display authority. All other events reject evidence and error
- * payloads and clear every previously displayed numeric claim.
+ * separate from display authority. Explicit stale snapshots accept only display
+ * evidence; payload-free stale and unavailable events clear prior numeric claims.
  */
 export function reduceDesktopTrayStatus(current, event) {
   const previous = validateDesktopTrayStatus(current);
@@ -207,12 +207,15 @@ export function reduceDesktopTrayStatus(current, event) {
   }
   switch (event.type) {
     case "starting":
-    case "stale":
     case "unavailable":
       if (!hasExactKeys(event, ["type"])) {
         throw new TypeError("tray event has unexpected fields");
       }
       return statusSnapshot(event.type);
+    case "stale":
+      if (hasExactKeys(event, ["type"])) return statusSnapshot("stale");
+      if (!hasExactKeys(event, ["type", "allowance", "notificationEvidence", "displayEvidence"])) throw new TypeError("stale tray event has unexpected fields");
+      return statusSnapshot("stale", event.allowance, event.notificationEvidence, event.displayEvidence);
     case "analyzing": {
       const isPayloadFreeTransition = hasExactKeys(event, ["type"]);
       const isExplicitSnapshot = hasExactKeys(event, [
@@ -271,6 +274,7 @@ function defaultLocalize(key, values = {}) {
     const percent = values.remainingPercent;
     return `${DEFAULT_ALLOWANCE_LABELS[window]}: ${percent}% remaining`;
   }
+  if (key === "electron.tray.evidenceStale") return `Observed ${values.age} · Stale; refresh for current usage`;
   if (key === "electron.tray.evidenceCurrent") {
     return `Observed ${values.age} · verified current evidence`;
   }
@@ -336,7 +340,8 @@ export function projectDesktopTrayStatus(value, options = {}) {
   const evidenceExpired = (configured !== null || status.status === "analyzing")
     && status.notificationEvidence !== null
     && (evidence === null || (configured !== null && evidence.windows.every((window) => Date.parse(window.resetAt) <= now)));
-  const displayStatus = status.status === "fresh" && ((evidenceExpired && display === null) || (status.displayEvidence != null && display === null && evidence === null))
+  const displayIsStale = display !== null && (status.status === "stale" || display.windows.some((item) => now - Date.parse(item.observedAt) > display.staleAfterSeconds * 1_000));
+  const displayStatus = status.status === "fresh" && ((displayIsStale && evidence === null) || (evidenceExpired && display === null) || (status.displayEvidence != null && display === null && evidence === null))
     ? "stale"
     : status.status;
 
@@ -468,7 +473,7 @@ export function projectDesktopTrayStatus(value, options = {}) {
     compactTitle,
     evidenceLabel: observation === null ? statusLabel : localizeText(
       localize,
-      "electron.tray.evidenceCurrent",
+      displayIsStale ? "electron.tray.evidenceStale" : "electron.tray.evidenceCurrent",
       { age: observedMinutes === 0 ? "just now" : `${observedMinutes} minute${observedMinutes === 1 ? "" : "s"} ago` },
       "evidence label",
     ),

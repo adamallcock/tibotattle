@@ -228,7 +228,7 @@ test("the Linux normal candidate stays on the runner and executes only in the is
   assert.match(linux, /export TIBOTATTLE_ELECTRON_BUILD_NUMBER="\$GITHUB_RUN_NUMBER"/u);
   assert.match(linux, /--linux dir --x64 --publish never/u);
   const execution = linux.slice(linux.indexOf("- name: Exercise normal packaged Linux startup"),
-    linux.indexOf("- name: Retain verified development packages and receipts"));
+    linux.indexOf("- name: Exercise a genuine AppImage update and automatic restart in isolation"));
   assert.match(execution, /--cap-add=SYS_ADMIN --network none/u);
   assert.match(execution, /--entrypoint xvfb-run/u);
   assert.match(execution, /-nolisten tcp/u);

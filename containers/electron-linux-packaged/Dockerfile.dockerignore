@@ -27,3 +27,9 @@
 !.release-build/electron-production/linux-x64/artifacts/
 !.release-build/electron-production/linux-x64/artifacts/linux-unpacked/
 !.release-build/electron-production/linux-x64/artifacts/linux-unpacked/**
+!.release-build/electron-linux-updater-rehearsal/
+!.release-build/electron-linux-updater-rehearsal/pair.json
+!.release-build/electron-linux-updater-rehearsal/current/
+!.release-build/electron-linux-updater-rehearsal/current/*.AppImage
+!.release-build/electron-linux-updater-rehearsal/next/
+!.release-build/electron-linux-updater-rehearsal/next/*.AppImage

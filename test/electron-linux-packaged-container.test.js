@@ -47,7 +47,7 @@ test("the exact embedded Linux proof accepts real TAP lines and refuses zero-exi
 test("packaged Linux image admits only the chosen app and verifier inputs", async () => {
   const dockerfile = await read("containers/electron-linux-packaged/Dockerfile");
   const copies = dockerfile.split("\n").filter((line) => line.startsWith("COPY "));
-  assert.equal(copies.length, 11);
+  assert.equal(copies.length, 14);
   assert.ok(copies.every((line) => !line.includes("--chown")));
   assert.equal(copies.filter((line) => line.startsWith("COPY scripts ")).length, 1);
   assert.equal(copies.filter((line) => line.startsWith("COPY .release-build/electron-dev/linux-x64/app ")).length, 1);
@@ -65,6 +65,11 @@ test("packaged Linux image admits only the chosen app and verifier inputs", asyn
     "COPY .release-build/electron-dev/linux-x64/app/native/linux-credential-mutex/",
   )), [
     "COPY .release-build/electron-dev/linux-x64/app/native/linux-credential-mutex/build/qualification ./native/linux-credential-mutex/build/qualification",
+  ]);
+  assert.deepEqual(copies.filter((line) => line.startsWith("COPY .release-build/electron-linux-updater-rehearsal/")), [
+    "COPY .release-build/electron-linux-updater-rehearsal/pair.json ./.release-build/electron-linux-updater-rehearsal/pair.json",
+    "COPY .release-build/electron-linux-updater-rehearsal/current/*.AppImage ./.release-build/electron-linux-updater-rehearsal/current/",
+    "COPY .release-build/electron-linux-updater-rehearsal/next/*.AppImage ./.release-build/electron-linux-updater-rehearsal/next/",
   ]);
   const generated = copies.filter((line) => line.startsWith("COPY .release-build/electron-candidates/"));
   assert.equal(generated.length, 2);

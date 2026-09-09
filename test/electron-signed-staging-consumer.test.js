@@ -27,6 +27,7 @@ import {
   inspectSignedStagingArtifact,
   parseSignedStagingConsumerArguments,
   preseedSignedStagingDisposableOptOut,
+  prepareSignedStagingDisposableProfile,
   runSignedStagingConsumer,
   signedStagingProfilePathForHome,
   signedStagingRuntimeSettingsPathForProfile,
@@ -527,4 +528,18 @@ test("consumer preseed remains the actual signed-staging runtime sharing resolve
   } finally {
     await desktop.lifecycle.requestQuit();
   }
+});
+
+
+test("signed staging default-on preparation is explicit and uses the policy default", async (t) => {
+  const { home } = await homeFixture(t);
+  const seed = await prepareSignedStagingDisposableProfile({
+    ...preseedInputs({ home, metadata: signedMetadata() }), initialSharing: "fresh",
+  });
+  const stored = JSON.parse(await seed.shareBackend.load());
+  assert.equal(stored.basis, "default_on");
+  assert.equal(stored.enabled, true);
+  await assert.rejects(prepareSignedStagingDisposableProfile({
+    ...preseedInputs({ home, metadata: signedMetadata() }), initialSharing: "anything",
+  }), { code: "ELECTRON_SIGNED_STAGING_CONSUMER_INPUT_INVALID" });
 });

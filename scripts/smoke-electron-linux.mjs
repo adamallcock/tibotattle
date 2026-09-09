@@ -1101,7 +1101,7 @@ async function withTimeout(promise, timeoutMs, label) {
   }
 }
 
-async function freeTcpPort() {
+export async function freeTcpPort() {
   const server = createServer();
   await new Promise((resolveListen, rejectListen) => {
     server.once("error", rejectListen);
@@ -1329,7 +1329,7 @@ async function jsonFetch(url) {
   }
 }
 
-async function connectCdp(target) {
+export async function connectCdp(target) {
   const socket = new WebSocket(target.webSocketDebuggerUrl);
   try {
     await withTimeout(new Promise((resolveOpen, rejectOpen) => {

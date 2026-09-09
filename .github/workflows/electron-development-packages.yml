@@ -531,7 +531,7 @@ jobs:
       - name: Validate private Linux credential channel and identity selection
         run: node --test apps/electron/test/desktop-linux-secret-service-broker.test.mjs apps/electron/test/desktop-linux-secret-service-composition.test.mjs test/linux-credential-state.test.js test/export-identity-production.test.js test/account-observation-secret.test.js test/linux-account-observation-credential.test.js
       - name: Validate the normal Linux candidate and packaged harness contracts
-        run: node --test apps/electron/test/platform-gate.test.mjs test/linux-portability-workflow.test.js test/electron-linux-normal-packaged-smoke.test.js test/electron-linux-appimage-updater.test.js
+        run: node --test apps/electron/test/platform-gate.test.mjs test/linux-portability-workflow.test.js test/electron-linux-normal-packaged-smoke.test.js test/electron-linux-appimage-updater.test.js test/electron-linux-real-appimage-updater.test.js
       - name: Validate packaging contracts
         run: node --test test/electron-development-package.test.js test/electron-builder-package-json.test.js test/electron-development-artifact-verifier.test.js test/electron-appimage-launcher.test.js test/windows-electron-release-config.test.js
       - name: Build and verify development distributions
@@ -546,6 +546,8 @@ jobs:
           export TIBOTATTLE_ELECTRON_VERSION="$(node -p 'require("./package.json").version')"
           pnpm exec electron-builder --config apps/electron/electron-builder.production.config.cjs \
             --linux dir --x64 --publish never
+      - name: Build two private genuine Linux AppImages from the normal staged app
+        run: node scripts/build-linux-updater-rehearsal.mjs
       - name: Exercise the pinned Linux AppImage updater adapter on loopback
         run: |
           set -euo pipefail
@@ -666,6 +668,25 @@ jobs:
             --source-revision "$GITHUB_SHA" \
             --receipt /run/user/1000/linux-normal-packaged-smoke.json \
             > "$host_receipt"
+      - name: Exercise a genuine AppImage update and automatic restart in isolation
+        run: |
+          set -euo pipefail
+          host_receipt=".release-build/electron-candidates/$GITHUB_SHA/linux-x64/distribution/real-appimage-updater-smoke.json"
+          # Only the fixed feed host resolves to our local HTTPS fixture. Its
+          # CA is generated in this disposable profile; no host trust changes.
+          timeout 420s docker run --rm --init --platform=linux/amd64 --cap-add=SYS_ADMIN --network none \
+            --add-host updates.tibotattle.com:127.0.0.1 \
+            --sysctl net.ipv4.ip_unprivileged_port_start=0 \
+            --tmpfs /home/node:rw,noexec,nosuid,size=128m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /run/user/1000:rw,noexec,nosuid,size=1024m,uid=1000,gid=1000,mode=0700 \
+            --tmpfs /opt/tibotattle-updater-exec:rw,exec,nosuid,size=2048m,uid=1000,gid=1000,mode=0700 \
+            --env HOME=/home/node --env TMPDIR=/run/user/1000 --env XDG_RUNTIME_DIR=/run/user/1000 \
+            --env XDG_CONFIG_HOME=/home/node/.config --env XDG_CACHE_HOME=/home/node/.cache \
+            --env XDG_DATA_HOME=/home/node/.local/share --env TIBOTATTLE_LINUX_SECRET_SERVICE_ISOLATED=1 \
+            --env USAGE_MONITOR_LINUX_IMAGE_PLATFORM=linux/amd64 --env USAGE_MONITOR_LINUX_NETWORK_BOUNDARY=network-none \
+            --entrypoint xvfb-run tibotattle-electron-linux-packaged:test \
+            --auto-servernum --server-args='-screen 0 1280x900x24 -nolisten tcp' \
+            node scripts/smoke-electron-linux-real-appimage-updater.mjs > "$host_receipt"
       - name: Retain only the Linux normal-candidate receipt
         if: ${{ !cancelled() && hashFiles(format('.release-build/electron-candidates/{0}/linux-x64/distribution/normal-packaged-smoke.json', github.sha)) != '' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

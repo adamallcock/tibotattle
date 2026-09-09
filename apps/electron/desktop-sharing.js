@@ -61,6 +61,7 @@ export function createDesktopSharingCoordinator({
   let disposed = false;
   let changing = 0;
   let transportStatus = "unavailable";
+  let lastAcceptedAt = null;
   const signalChange = () => {
     try { return Promise.resolve(onAuthorizationChanged()); }
     catch { return Promise.reject(new Error("Sharing cancellation unavailable")); }
@@ -90,6 +91,7 @@ export function createDesktopSharingCoordinator({
       nextNoticeAt: value.nextNoticeAt ?? null,
       earliestActivationAt: value.earliestActivationAt ?? null,
       transportStatus: value.enabled === true ? transportStatus : "off",
+      lastAcceptedAt,
     });
   }
 
@@ -121,6 +123,11 @@ export function createDesktopSharingCoordinator({
     updateTransport(value) {
       if (["off", "unavailable", "uploading", "pending", "up_to_date", "retry_wait", "paused", "recovery_required"].includes(value?.state)) {
         transportStatus = value.state;
+        if (typeof value.lastAcceptedAt === "string"
+            && Number.isFinite(Date.parse(value.lastAcceptedAt))
+            && new Date(value.lastAcceptedAt).toISOString() === value.lastAcceptedAt) {
+          lastAcceptedAt = value.lastAcceptedAt;
+        }
       }
     },
     async markNoticePresented(index) {
