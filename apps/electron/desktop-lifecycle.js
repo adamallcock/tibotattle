@@ -201,6 +201,7 @@ export function createDesktopLifecycle({
   let shutdownPromise = null;
   let updatePreparationPromise = null;
   let updatePreparing = false;
+  let updateQuitRequested = false;
   let retryPromise = null;
   let automaticRetryPromise = null;
   let automaticRetryUsed = false;
@@ -668,7 +669,7 @@ export function createDesktopLifecycle({
       });
       const recoveryWindow = recovery.window;
       const onWindowClose = (event) => {
-        if (quitting || destroyingRecoveryWindow) return;
+        if (quitting || updateQuitRequested || destroyingRecoveryWindow) return;
         event?.preventDefault?.();
         recovery?.hide?.();
       };
@@ -1045,7 +1046,7 @@ export function createDesktopLifecycle({
       webContents?.off?.("render-process-gone", onRenderProcessGone);
     };
     const onWindowClose = (event) => {
-      if (quitting) return;
+      if (quitting || updateQuitRequested) return;
       event?.preventDefault?.();
       hideWindow();
     };
@@ -1140,7 +1141,7 @@ export function createDesktopLifecycle({
       webContents?.off?.("render-process-gone", onRenderProcessGone);
     };
     const onWindowClose = (event) => {
-      if (quitting || destroyingSettingsWindow) return;
+      if (quitting || updateQuitRequested || destroyingSettingsWindow) return;
       event?.preventDefault?.();
       settingsState.requestedVisible = false;
       settingsWindow?.hide?.();
@@ -1413,7 +1414,11 @@ export function createDesktopLifecycle({
       // electron-updater owns the native installer hand-off after the
       // companion has been stopped. Its quit must not be converted back into
       // the ordinary app.quit() path, which would race the installer.
-      if (quitting || updatePreparing) return;
+      if (quitting) return;
+      if (updatePreparing) {
+        updateQuitRequested = true;
+        return;
+      }
       event?.preventDefault?.();
       void requestQuit();
     });
@@ -1586,6 +1591,7 @@ export function createDesktopLifecycle({
   async function prepareForUpdate() {
     if (quitting) throw shellError("companion_not_running");
     if (updatePreparationPromise !== null) return updatePreparationPromise;
+    updateQuitRequested = false;
     updatePreparing = true;
     ++lifecycleEpoch;
     stopDesktopStatusMonitor();
@@ -1605,6 +1611,7 @@ export function createDesktopLifecycle({
       if (!quitting && updatePreparationPromise === preparation) {
         updatePreparationPromise = null;
         updatePreparing = false;
+        updateQuitRequested = false;
       }
     });
     return preparation;
@@ -1626,6 +1633,7 @@ export function createDesktopLifecycle({
     if (quitting || updatePreparationPromise !== preparation) return false;
     updatePreparationPromise = null;
     updatePreparing = false;
+    updateQuitRequested = false;
     if (!lifecycleActive) return false;
     try {
       await retry();

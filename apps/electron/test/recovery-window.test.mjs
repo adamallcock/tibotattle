@@ -462,6 +462,116 @@ test("recovery window keeps the same sandboxed renderer constraints", () => {
   });
 });
 
+test("prepared updater quit releases each desktop window only after Electron before-quit", async () => {
+  const scenarios = [
+    {
+      name: "recovery",
+      starts: [new Error("synthetic startup failure")],
+      async selectWindow({ lifecycle, windows }) {
+        const started = await lifecycle.start();
+        assert.equal(started.status, "recovery");
+        return recoveryWindows(windows)[0];
+      },
+    },
+    {
+      name: "dashboard",
+      async selectWindow({ lifecycle, windows }) {
+        const started = await lifecycle.start();
+        assert.equal(started.status, "ready");
+        const dashboard = dashboardWindows(windows)[0];
+        dashboard.emit("ready-to-show");
+        return dashboard;
+      },
+    },
+    {
+      name: "settings",
+      async selectWindow({ lifecycle, windows }) {
+        const started = await lifecycle.start();
+        assert.equal(started.status, "ready");
+        assert.equal(lifecycle.showSettingsWindow(), true);
+        const settings = windows.find((candidate) => (
+          candidate.loaded[0]?.includes("electron-settings.html")
+        ));
+        settings.emit("ready-to-show");
+        return settings;
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const { app, lifecycle, windows } = makeLifecycle({ starts: scenario.starts });
+    const target = await scenario.selectWindow({ lifecycle, windows });
+    assert.notEqual(target, undefined, `${scenario.name} window should exist`);
+    assert.equal(target.visible, true, `${scenario.name} window should be visible`);
+
+    await lifecycle.prepareForUpdate();
+    assert.equal(lifecycle.state.preparingForUpdate, true);
+
+    // Preparation alone must not turn a normal close-to-tray into a quit.
+    let preparationClosePrevented = false;
+    target.emit("close", {
+      preventDefault() {
+        preparationClosePrevented = true;
+      },
+    });
+    assert.equal(preparationClosePrevented, true, `${scenario.name} close remains tray-safe`);
+    target.show();
+
+    let beforeQuitPrevented = false;
+    app.emit("before-quit", {
+      preventDefault() {
+        beforeQuitPrevented = true;
+      },
+    });
+    assert.equal(beforeQuitPrevented, false, `${scenario.name} updater quit is allowed`);
+
+    let updateClosePrevented = false;
+    target.emit("close", {
+      preventDefault() {
+        updateClosePrevented = true;
+      },
+    });
+    assert.equal(updateClosePrevented, false, `${scenario.name} updater close is allowed`);
+    assert.equal(target.visible, true, `${scenario.name} close is not hidden by tray handler`);
+
+    await lifecycle.dispose();
+  }
+});
+
+test("canceling an updater handoff restores bounded recovery after an async restart failure", async () => {
+  const restartFailure = new Error("synthetic restart failure");
+  restartFailure.code = "electron_shell_companion_start_timeout";
+  const { app, lifecycle, supervisor, windows } = makeLifecycle({
+    starts: [{ origin: "http://127.0.0.1:5298" }, restartFailure],
+  });
+  await lifecycle.start();
+  const dashboard = dashboardWindows(windows)[0];
+  dashboard.emit("ready-to-show");
+
+  await lifecycle.prepareForUpdate();
+  app.emit("before-quit", { preventDefault() {} });
+  const canceled = await lifecycle.cancelUpdatePreparation();
+
+  assert.equal(canceled, true);
+  assert.equal(supervisor.starts, 2);
+  assert.equal(lifecycle.state.preparingForUpdate, false);
+  assert.equal(lifecycle.state.started, false);
+  assert.equal(lifecycle.state.recoveryWindowVisible, true);
+  assert.equal(dashboard.destroyed, true);
+
+  // Cancellation clears the updater-only close allowance, so a recovered
+  // failure surface still behaves like an ordinary close-to-tray window.
+  const recovery = recoveryWindows(windows).at(-1);
+  let closePrevented = false;
+  recovery.emit("close", {
+    preventDefault() {
+      closePrevented = true;
+    },
+  });
+  assert.equal(closePrevented, true);
+  await lifecycle.dispose();
+});
+
 test("createRecoveryWindow exposes only a fixed preload and action surface", () => {
   const actions = [];
   const recovery = createRecoveryWindow({
