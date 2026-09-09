@@ -99,9 +99,38 @@ Latest continuation, 2026-09-09:
   R13 retains `one-click-17-to-18-refresh-complete.json` separately from the
   earlier running observation. Earlier expired-login/pre-write and
   public-verifier input-shape failures are retained. The stable feed is unchanged.
+- Windows run [34392192849](https://github.com/adamallcock/tibotattle/actions/runs/34392192849)
+  at `6dbd7eae` now identifies the actual blocker: the patched builder rejects
+  its signing-operation ledger evidence root. Authenticated owner-only encrypted
+  diagnostics isolate this error. A separate Windows Authenticode probe of the
+  retained final EXE reports valid signature, expected publisher and timestamp.
+  The build still fails and the installed journey did not run; this narrow
+  signature result is not a finalizer or signed-installed pass. Source review
+  found the successful path never creates the required evidence
+  directory. The ledger also precedes universal NSIS finalization; the current
+  non-universal configuration had already signed its installer. Both defects
+  are corrected in source without relaxing path or signature validation. The direct
+  evidence-directory fix is committed as `09436501`; 14 focused and 78 release-
+  trust tests pass. Signed hosted run
+  [34394658343](https://github.com/adamallcock/tibotattle/actions/runs/34394658343)
+  passed installer signing, final installer/evidence verification, actual install,
+  installed signed-closure verification, uninstall and cleanup on that exact
+  source, build `2026090931`. It stopped before normal app launch because our
+  updater verifier required an optional size field. Both retained SHA-512 fields
+  match the final EXE; the non-differential NSIS manifest legitimately omits size.
+  Commit `57165992` corrects this with 13 tests, preserving both mandatory hash
+  checks and rejecting any incorrect supplied size. Exact-source run
+  [34396583241](https://github.com/adamallcock/tibotattle/actions/runs/34396583241),
+  build `2026090932`, is now executing the corrected flow. The broader lifecycle correction is
+  committed separately as `72f357e2`. Five tests against a fresh isolated
+  installation of the patched builder pass, including once-only emission after
+  deferred final signing and no emission after failure/cancellation. It was not
+  included in the first signed run and is included in the `57165992` retry.
 - Windows native modules have passed Azure signing, strict Authenticode
-  verification and integrity rebinding. The final installer and its installed
-  journey are still unqualified. Earlier failures are retained in runs
+  verification and integrity rebinding. The latest run has passed final
+  installer/evidence verification and installation/cleanup. Normal signed app
+  startup remains open until the metadata-corrected retry passes.
+  Earlier failures are retained in runs
   `34373775022`, `34374830275`, `34376745223`, `34378235956`, `34379698420`
   and `34382343677`; these exposed native-path, read-only-file, PowerShell
   invocation and source-check output defects, now repaired.
@@ -117,12 +146,15 @@ Latest continuation, 2026-09-09:
   passed native signing, rebinding and Azure authentication on `88156c30`,
   build `2026090928`, then failed inside electron-builder. The old finalizer
   discarded its useful output, so a bounded diagnostic and actual signing-host
-  preparation check are being added before a new run. Its retained installer
+  preparation check were added before the later runs. Its retained installer
   has a certificate table, but that is not signature validity or installed-runtime
   evidence. Existing protected-environment approval was used without rule changes.
   Exact-source retry [34389121508](https://github.com/adamallcock/tibotattle/actions/runs/34389121508)
-  is now running `2be8b282`, build `2026090929`, with a no-sign check of the
-  actual builder signing host/module and bounded error diagnostics.
+  passed the actual builder signing host/module, native signing and rebinding
+  on `2be8b282`, build `2026090929`, then failed inside the installer builder.
+  The bounded diagnostic remained insufficient to identify the cause. The subsequent
+  encrypted owner-only capture isolated the failure as recorded above;
+  that historical run claims no finalizer or signed-installed success.
   Source `ac50a1d9` also adds the approved TiboTattle ICO to the Windows installer
   configuration; seven decoded frames and the actual builder converter passed.
 
@@ -134,7 +166,23 @@ local rehearsal passed with 100,000 synthetic records in each telemetry table.
 Required secret names are present, live accountless modes remain disabled, and
 both D1 Time Travel bookmarks were retrieved read-only. These are recovery
 inputs, not a tested production restore. A bounded ordinary signed-app canary
-wrapper is being prepared for a separate concrete activation approval. Updated public privacy,
+wrapper and dispatch-only workflow are prepared. Hosted plan-only verification
+passed in [34391083322](https://github.com/adamallcock/tibotattle/actions/runs/34391083322),
+runner `a76c11ff`, checking the exact normal signed `.18` artifact without
+launch/upload. Production metadata subsequently reported a 5,328,384,000-byte
+primary database, about 35.2 times the local fixture. The migration scale and
+provider execution/temporary-space limits require investigation before approval;
+the small rehearsal does not establish production admission. A subsequent tiny
+synthetic staging file-import test passed late-failure rollback, successful
+linked-row/schema restoration and exact owned-object cleanup. Its three rows
+prove import transaction semantics only, not the full migration or resource scale.
+The first approved exact-migration test stopped at 0057 with its synthetic rows
+intact. A documented read-only import poll confirmed no current import, permitting
+verified cleanup and recreation of the same approved disposable names. The
+repeat adds bounded owner-private failure capture (`26974199`); the initial
+unsuccessful attempt and recovery evidence remain preserved. No production
+operation occurred.
+Updated public privacy,
 Docs and translated homepage copy are prepared and locally verified, not deployed.
 Production accountless modes remain disabled in source.
 
