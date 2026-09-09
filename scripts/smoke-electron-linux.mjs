@@ -1899,6 +1899,7 @@ async function defaultSmokeResultWriter(value) {
  */
 export async function runSmoke({
   afterRefresh = null,
+  beforeQuit = null,
   binary = null,
   binaryResolver = electronBinary,
   readContainerContract = assertContainerContract,
@@ -1909,11 +1910,13 @@ export async function runSmoke({
   onRendererReadinessDiagnostics = null,
   onCompanionProcessDiagnostics = null,
   onDashboardFailureDiagnostic = null,
+  preserveFixtureAfterCleanQuit = false,
   qualification = "development-only",
   sourceRevision = null,
   writeResult = defaultSmokeResultWriter,
 } = {}) {
   if (afterRefresh !== null && typeof afterRefresh !== "function"
+      || beforeQuit !== null && typeof beforeQuit !== "function"
       || binary !== null && (typeof binary !== "string" || binary.length === 0)
       || typeof binaryResolver !== "function" || typeof readContainerContract !== "function"
       || typeof environmentFactory !== "function" || typeof fixtureFactory !== "function"
@@ -1922,6 +1925,7 @@ export async function runSmoke({
       || onRendererReadinessDiagnostics !== null && typeof onRendererReadinessDiagnostics !== "function"
       || onCompanionProcessDiagnostics !== null && typeof onCompanionProcessDiagnostics !== "function"
       || onDashboardFailureDiagnostic !== null && typeof onDashboardFailureDiagnostic !== "function"
+      || typeof preserveFixtureAfterCleanQuit !== "boolean"
       || typeof writeResult !== "function"
       || typeof qualification !== "string" || qualification.length === 0
       || (sourceRevision !== null && !/^[0-9a-f]{40}$/u.test(sourceRevision))) {
@@ -2206,6 +2210,10 @@ export async function runSmoke({
       fail("renderer attempted a non-loopback network request");
     }
 
+    if (beforeQuit !== null) {
+      await beforeQuit(Object.freeze({ cdp, dashboardOrigin: dashboardUrl.origin, fixture }));
+    }
+
     // CDP window bounds are the most deterministic lifecycle control available
     // in a headless desktop lane. A real desktop can additionally exercise the
     // tray's hide/show actions; this lane proves that minimizing/restoring does
@@ -2323,7 +2331,7 @@ export async function runSmoke({
       page.cdp?.close?.();
     }
     if (!childHasExited(child)) await terminateLinuxSmokeChild(child);
-    if (cleanupConfirmed) {
+    if (cleanupConfirmed && !preserveFixtureAfterCleanQuit) {
       await rm(fixture.root, { recursive: true, force: true });
     }
     if (forcedShutdown) {

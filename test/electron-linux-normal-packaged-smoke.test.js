@@ -18,12 +18,15 @@ import {
   LINUX_STARTUP_DIAGNOSTIC_STEPS,
   readLinuxNormalStartupFailure,
   runLinuxNormalPackagedSmoke,
+  runLinuxNormalPackagedSmokeInside,
   runExactAsarSnapshot,
   runExactAsarSnapshotInside,
   parseLinuxNormalPackagedSmokeArguments,
   runLinuxNormalPackagedSmokeSession,
   validateLinuxNormalPackagedSmokeMetadata,
   verifyLinuxNormalPackagedSmokePackage,
+  persistLinuxNormalPackagedRestartPreferences,
+  verifyLinuxNormalPackagedRestartPreferences,
 } from "../scripts/smoke-electron-linux-packaged.mjs";
 import {
   LINUX_COMPANION_PROCESS_DIAGNOSTIC_SCHEMA,
@@ -168,6 +171,62 @@ test("Linux session and outer receipt preserve closed process observations and r
   }
 });
 
+test("normal packaged Linux cold restart keeps one profile and proves fixed settings and opt-out", async () => {
+  const fixture = Object.freeze({ root: "/private/tmp/linux-restart-fixture" });
+  const calls = [];
+  const receipt = await runLinuxNormalPackagedSmokeInside({
+    appPath: APP_PATH, sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256,
+  }, {
+    environment: {},
+    readContainerContract: () => ({ sourceRevision: SOURCE_REVISION }),
+    proveIsolation: async () => ({ status: "isolated" }),
+    assertCodexFixture: async () => {},
+    createFixture: async () => fixture,
+    startDaemon: async () => ({ status: "started" }),
+    runSnapshot: async () => ({ status: "passed" }),
+    persistRestartPreferences: async ({ cdp }) => { assert.deepEqual(cdp, { stage: "first" }); },
+    verifyRestartPreferences: async ({ cdp }) => { assert.deepEqual(cdp, { stage: "restart" }); },
+    runApp: async (_identity, value) => {
+      calls.push(value);
+      if (value.beforeQuit !== null && value.beforeQuit !== undefined) {
+        await value.beforeQuit({ cdp: { stage: calls.length === 1 ? "first" : "restart" } });
+      }
+      return value.service;
+    },
+  });
+  assert.equal(receipt.status, "passed");
+  assert.equal(receipt.coldRestartSettings, "persisted");
+  assert.equal(receipt.sharingOptOut, "persisted");
+  assert.deepEqual(calls.map(({ service }) => service), ["available", "available", "unavailable"]);
+  assert.equal(calls[0].fixture, fixture);
+  assert.equal(calls[1].fixture, fixture);
+  assert.equal(calls[0].preserveFixtureAfterCleanQuit, true);
+  assert.equal(calls[1].preserveFixtureAfterCleanQuit, false);
+  assert.equal(calls[2].fixture, undefined);
+});
+
+test("normal packaged Linux restart preference actions use only the ordinary bridge and fixed values", async () => {
+  const expressions = [];
+  const persistenceCdp = {
+    async evaluate(expression) { expressions.push(expression); return true; },
+  };
+  await persistLinuxNormalPackagedRestartPreferences({ cdp: persistenceCdp });
+  await verifyLinuxNormalPackagedRestartPreferences({ cdp: persistenceCdp });
+  assert.equal(expressions.length, 2);
+  assert.match(expressions[0], /setRefreshInterval\(900\)/u);
+  assert.match(expressions[0], /setSharingEnabled\(false\)/u);
+  assert.match(expressions[1], /getSettings\(\)/u);
+  assert.match(expressions[1], /getSharingPreference\(\)/u);
+  await assert.rejects(
+    persistLinuxNormalPackagedRestartPreferences({ cdp: { async evaluate() { return false; } } }),
+    { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SETTINGS_PERSISTENCE_INVALID" },
+  );
+  await assert.rejects(
+    verifyLinuxNormalPackagedRestartPreferences({ cdp: null }),
+    { code: "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_SETTINGS_PERSISTENCE_INVALID" },
+  );
+});
+
 test("Linux session retains only fixed automatic refresh failure classifiers", async () => {
   const identity = { sourceRevision: SOURCE_REVISION, artifactSha256: ARTIFACT_SHA256 };
   const fixed = "ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_RECEIPT_CHANGED";
@@ -272,6 +331,8 @@ function validInnerReceipt() {
     availableServiceRefresh: "completed",
     accountObservationLifecycle: "available",
     unavailableServiceResponse: "bounded",
+    coldRestartSettings: "persisted",
+    sharingOptOut: "persisted",
     cleanup: "owned_apps_stopped",
     productionReady: false,
   };

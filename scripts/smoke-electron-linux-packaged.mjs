@@ -64,10 +64,12 @@ const AUTOMATIC_REFRESH_FAILURE_CODES = new Set(
 );
 const CLI_FAILURE = "ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_FAILED";
 const MAX_JSON_BYTES = 1_048_576;
-// Two source-smoke journeys each retain their existing 30s startup, two 45s
-// refreshes, and 10s clean quit boundaries. The session budget merely covers
-// their serial composition and D-Bus startup; it does not relax either phase.
-const SESSION_DEADLINE_MS = 300_000;
+// The available service runs twice against one profile to prove a clean cold
+// restart after ordinary bridge persistence, then the unavailable-service run
+// remains separate. Each launch retains its existing 30s startup, two 45s
+// refreshes, and 10s clean quit boundaries. The added 150s is only the extra
+// restart journey; it does not relax an operation deadline.
+const SESSION_DEADLINE_MS = 450_000;
 const SESSION_TERMINATION_MS = 5_000;
 const SESSION_KILL_MS = 1_000;
 // This is a new diagnostic-only hard bound inside the unchanged total session
@@ -246,6 +248,7 @@ const CODES = new Set([
   "ARGUMENT_INVALID", "CONTAINER_INVALID", "SOURCE_CANDIDATE_INVALID",
   "PACKAGE_IDENTITY_INVALID", "NATIVE_PAIR_INVALID", "ASAR_UNAVAILABLE",
   "FIXTURE_INVALID", "OBSERVATION_UNAVAILABLE", "UNAVAILABLE_RESPONSE_INVALID",
+  "SETTINGS_PERSISTENCE_INVALID",
   "SESSION_START_FAILED", "SESSION_EXECUTION_FAILED", "SESSION_RECEIPT_INVALID",
   "PASS_RECEIPT_STDERR_REJECTED", "SESSION_DEADLINE_EXCEEDED", "SESSION_CLEANUP_UNCONFIRMED",
   ...SNAPSHOT_DIAGNOSTIC_CODES,
@@ -638,7 +641,15 @@ async function readCheckpoint(path) {
   return module.readLocalCollectorCheckpoint({ stateFile: path });
 }
 
-async function runOneNormalApp(identity, { appPath, environment, service, readState = readCheckpoint } = {}) {
+async function runOneNormalApp(identity, {
+  appPath,
+  beforeQuit = null,
+  environment,
+  fixture = null,
+  preserveFixtureAfterCleanQuit = false,
+  readState = readCheckpoint,
+  service,
+} = {}) {
   let observed = "invalid";
   let observationFailure = null;
   let smokeFailureStage = null;
@@ -653,7 +664,7 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
     result = await runSmoke({
       binary: appPath,
       fixtureFactory: async () => {
-        ownedFixture = await createLinuxNormalPackagedSmokeFixture();
+        ownedFixture = fixture ?? await createLinuxNormalPackagedSmokeFixture();
         return ownedFixture;
       },
       launchArguments: ({ fixture, port }) => [
@@ -684,6 +695,8 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
           fail(observationFailure);
         }
       },
+      beforeQuit,
+      preserveFixtureAfterCleanQuit,
       writeResult: async () => {},
     });
   } catch (error) {
@@ -715,6 +728,50 @@ async function runOneNormalApp(identity, { appPath, environment, service, readSt
   }
   if (result?.status !== "passed") fail("UNEXPECTED");
   return observed;
+}
+
+/** Mutate only fixed preferences through the ordinary sandboxed desktop bridge. */
+export async function persistLinuxNormalPackagedRestartPreferences({ cdp } = {}) {
+  if (typeof cdp?.evaluate !== "function") fail("SETTINGS_PERSISTENCE_INVALID");
+  let result;
+  try {
+    result = await cdp.evaluate(`(async () => {
+      const bridge = globalThis.tibotattleDesktop;
+      if (!bridge || typeof bridge.getSettings !== "function"
+          || typeof bridge.setRefreshInterval !== "function"
+          || typeof bridge.setSharingEnabled !== "function"
+          || typeof bridge.getSharingPreference !== "function") return false;
+      const before = await bridge.getSettings();
+      const settings = await bridge.setRefreshInterval(900);
+      const sharing = await bridge.setSharingEnabled(false);
+      const after = await bridge.getSettings();
+      const inspected = await bridge.getSharingPreference();
+      return before?.settings?.refreshIntervalSeconds === 300
+        && settings?.settings?.refreshIntervalSeconds === 900
+        && after?.settings?.refreshIntervalSeconds === 900
+        && sharing?.enabled === false && sharing?.current === true
+        && inspected?.enabled === false && inspected?.current === true;
+    })()`);
+  } catch { result = false; }
+  if (result !== true) fail("SETTINGS_PERSISTENCE_INVALID");
+}
+
+/** Read only the fixed persisted preferences through a newly launched bridge. */
+export async function verifyLinuxNormalPackagedRestartPreferences({ cdp } = {}) {
+  if (typeof cdp?.evaluate !== "function") fail("SETTINGS_PERSISTENCE_INVALID");
+  let result;
+  try {
+    result = await cdp.evaluate(`(async () => {
+      const bridge = globalThis.tibotattleDesktop;
+      if (!bridge || typeof bridge.getSettings !== "function"
+          || typeof bridge.getSharingPreference !== "function") return false;
+      const settings = await bridge.getSettings();
+      const sharing = await bridge.getSharingPreference();
+      return settings?.settings?.refreshIntervalSeconds === 900
+        && sharing?.enabled === false && sharing?.current === true;
+    })()`);
+  } catch { result = false; }
+  if (result !== true) fail("SETTINGS_PERSISTENCE_INVALID");
 }
 
 function sessionEnvironment(environment) {
@@ -851,20 +908,28 @@ export async function runExactAsarSnapshot(identity, {
 
 export async function runLinuxNormalPackagedSmokeInside(options, {
   environment = process.env,
+  createFixture = createLinuxNormalPackagedSmokeFixture,
+  readContainerContract = assertContainerContract,
   startDaemon = async () => (await import("./qualify-linux-secret-service.mjs"))
     .startLinuxSecretServiceDaemon({ environment }),
   proveIsolation = async () => (await import("./qualify-linux-secret-service.mjs"))
     .proveLinuxSecretServiceContainerIsolation({ environment }),
   assertCodexFixture = assertSyntheticCodexFixture,
+  persistRestartPreferences = persistLinuxNormalPackagedRestartPreferences,
   runApp = runOneNormalApp,
   runSnapshot = runExactAsarSnapshot,
+  verifyRestartPreferences = verifyLinuxNormalPackagedRestartPreferences,
 } = {}) {
   if (!options || !absolutePath(options.appPath) || !SHA.test(options.sourceRevision ?? "")
       || !SHA256.test(options.artifactSha256 ?? "") || typeof assertCodexFixture !== "function"
-      || typeof runApp !== "function") fail("ARGUMENT_INVALID");
+      || typeof createFixture !== "function" || typeof persistRestartPreferences !== "function"
+      || typeof readContainerContract !== "function" || typeof runApp !== "function"
+      || typeof verifyRestartPreferences !== "function") {
+    fail("ARGUMENT_INVALID");
+  }
   let contract;
   try {
-    contract = assertContainerContract();
+    contract = readContainerContract();
     if (environment.XDG_STATE_HOME !== undefined || (await proveIsolation())?.status !== "isolated") {
       fail("CONTAINER_INVALID");
     }
@@ -887,9 +952,27 @@ export async function runLinuxNormalPackagedSmokeInside(options, {
     if (String(error?.code ?? "").startsWith("ELECTRON_LINUX_NORMAL_PACKAGED_SMOKE_")) throw error;
     fail("CONTAINER_INVALID");
   }
-  if (await runApp(identity, { appPath: options.appPath, environment, service: "available" }) !== "available") {
+  let restartFixture;
+  try { restartFixture = await createFixture(); }
+  catch { fail("FIXTURE_INVALID"); }
+  if (await runApp(identity, {
+    appPath: options.appPath,
+    beforeQuit: persistRestartPreferences,
+    environment,
+    fixture: restartFixture,
+    preserveFixtureAfterCleanQuit: true,
+    service: "available",
+  }) !== "available") {
     fail("OBSERVATION_UNAVAILABLE");
   }
+  if (await runApp(identity, {
+    appPath: options.appPath,
+    beforeQuit: verifyRestartPreferences,
+    environment,
+    fixture: restartFixture,
+    preserveFixtureAfterCleanQuit: false,
+    service: "available",
+  }) !== "available") fail("OBSERVATION_UNAVAILABLE");
   if (await runApp(identity, { appPath: options.appPath, environment, service: "unavailable" }) !== "unavailable") {
     fail("UNAVAILABLE_RESPONSE_INVALID");
   }
@@ -898,6 +981,7 @@ export async function runLinuxNormalPackagedSmokeInside(options, {
     execution: "packaged_electron_normal", sourceRevision: options.sourceRevision,
     artifactSha256: options.artifactSha256, availableServiceRefresh: "completed",
     accountObservationLifecycle: "available", unavailableServiceResponse: "bounded",
+    coldRestartSettings: "persisted", sharingOptOut: "persisted",
     cleanup: "owned_apps_stopped", productionReady: false,
   });
 }
@@ -975,6 +1059,7 @@ function expectedInsideReceipt(value, identity) {
     execution: "packaged_electron_normal", sourceRevision: identity.sourceRevision,
     artifactSha256: identity.artifactSha256, availableServiceRefresh: "completed",
     accountObservationLifecycle: "available", unavailableServiceResponse: "bounded",
+    coldRestartSettings: "persisted", sharingOptOut: "persisted",
     cleanup: "owned_apps_stopped", productionReady: false,
   };
   if (!value || typeof value !== "object" || Array.isArray(value)
@@ -1144,6 +1229,8 @@ function outerReceipt({
     packageArtifactVerified: identity !== null, packagedElectronExecutionVerified: inner !== null,
     accountObservationLifecycleVerified: inner?.accountObservationLifecycle === "available",
     unavailableServiceResponseVerified: inner?.unavailableServiceResponse === "bounded",
+    coldRestartSettingsVerified: inner?.coldRestartSettings === "persisted",
+    sharingOptOutPersisted: inner?.sharingOptOut === "persisted",
     sessionCleanupConfirmed: inner?.cleanup === "owned_apps_stopped", errorCode, productionReady: false,
   };
   if (diagnostic !== null) receipt.rendererReadinessDiagnostics = diagnostic;
