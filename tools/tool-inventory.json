@@ -1911,7 +1911,8 @@
         "apps/electron/test/electron-profile-ready.test.mjs",
         "scripts/package-electron-development.mjs",
         "scripts/package-electron-production.mjs",
-        "test/electron-development-artifact-verifier.test.js"
+        "test/electron-development-artifact-verifier.test.js",
+        "test/electron-signed-staging-consumer.test.js"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2244,6 +2245,21 @@
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/consume-signed-electron-staging.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The protected CLI verifies an explicitly supplied signed staging artifact only. Its exported preseed helper preserves partial profiles for separate review, and no launcher or scheduler qualification command exists yet.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-signed-staging-consumer.test.js"
+      ],
+      "decision": "retain_as_protected_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-09-08-signed-staging-scheduler-rehearsal.md",
       "provenanceReason": null,
       "legacyPaths": []
     },

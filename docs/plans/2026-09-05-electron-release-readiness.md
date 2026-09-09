@@ -16,7 +16,7 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
-Latest continuation checkpoint (frozen candidate source `9be7da8d`; installed signed Mac source `c938a654`):
+Latest continuation checkpoint (frozen candidate and installed signed Mac source `9be7da8d`; updater tooling `8a70e38c`):
 
 - **The frozen source now passes all six development CI jobs.** Run
   [34328830735](https://github.com/adamallcock/tibotattle/actions/runs/34328830735)
@@ -34,10 +34,36 @@ Latest continuation checkpoint (frozen candidate source `9be7da8d`; installed si
   commit and verified identical source/staged manifests. The local build used
   unavailable-installer assets; it makes no live site or installer claim. No
   remote migration, deployment, binding or admission-control change occurred.
-- Corrected private Mac `.13` / `.14` candidates are staged from the clean
-  frozen source, and authorized signing/notarization is underway. Their
-  immutable artifacts, installed behavior and actual updater completion still
-  need verification; `.11` remains the installed application.
+- **All four corrected private Mac artifacts are finalized.** `.13` and `.14`
+  for arm64 and x64 are signed, notarized, stapled and independently hash-checked
+  under `signed-handover-9be7da8d`. Root verified all four ZIPs have no
+  owner-read-only regular files and both native modules use 0755. Signed `.13`
+  companion startup, loopback health and clean exit pass natively on arm64 and
+  on x64 under Rosetta; the latter is not physical Intel GUI proof.
+- **Corrected `.13` is installed and usable.** R10 preserved `.11`, both native
+  and Electron state snapshots, and the completed migration journal before
+  replacement. All five dashboard pages and five Settings tabs render; About
+  identifies `.13` / `content-7868f47147bb` and its alignment is visually checked.
+  The first refresh reached FRESH. Allowance range changes/restoration, Trends
+  cost expansion, cache disclosure/pagination, Settings-to-Community navigation,
+  and tray-cache preview toggle/undo work. Normal quit removes the installed
+  bundle's processes; restart renders the dashboard and preserves opt-out. The
+  actual scheduler preference (`desktop-settings/accountless-sharing-v1.json`)
+  and installation salt match the pre-install snapshot; the legacy retirement
+  record is checked separately. Start-at-login remains off. No unexpected
+  Keychain prompt was observed. R10 content-free receipts retain these results.
+- During `.13` active refresh, both endpoints passed 180/180 samples over
+  45 seconds: health p95 1 ms / maximum 19 ms; refresh status p95 1 ms / maximum
+  9 ms; zero failures. The original 250 ms p95 and 3,000 ms individual limits
+  are unchanged. This is an observed active-companion bound, not renderer or
+  all-cold-start latency qualification. Actual tray-popup selection remains
+  unavailable through the UI tool; the Settings preview is not substituted.
+- The corrected `.13` → `.14` installed updater rehearsal is prepared but has
+  not run. Its exact eight-object/two-feed proposal has SHA-256
+  `c712e0b39378fca24a0cd78c998e816965e2d1315c31158b702ab7248b180205`;
+  all three local-only stages pass. New explicit publication approval is pending
+  and supersedes the earlier `.12` → `.11` rollback request. No corrected feed
+  or artifact is published; the isolated feed still points to `.12`.
 - The rehearsal publisher now supports the exact corrected source and `.13` /
   `.14` pair while preserving the historical `.11` / `.12` rollback path.
   Corrected initial publication binds a completed historical receipt and exact
@@ -45,6 +71,26 @@ Latest continuation checkpoint (frozen candidate source `9be7da8d`; installed si
   rewriting it. Eight focused tests, the real historical rollback dry run and
   20 preflight tests pass. No corrected artifact or feed has been published.
 
+- Signed staging consumer review narrowed this delivery to read-only artifact
+  intake and canonical fail-closed profile preparation. The prototype launch
+  mode was removed after review found missing process ownership, timeout and
+  debugger-target guarantees. Execution flags are refused; partial preparation
+  is preserved and subsequent reuse refused. A separately reviewed launch
+  consumer and real signed scheduler/enrollment/upload evidence remain open.
+  Independent review and root verification resolved the intermediate-symlink
+  preseed gap; 15 focused consumer/inventory tests and 20 preflight tests pass,
+  with architecture and inventory checks clean.
+  See the [draft staging rehearsal boundary](../runbooks/2026-09-08-signed-staging-scheduler-rehearsal.md).
+
+Remaining gates: protected R7 report regeneration still awaits approval;
+signed packaged scheduler/enrollment/upload qualification is unfinished; actual
+tray popup and physical Intel GUI qualification remain open; Windows production
+signing and remaining credential/process lifecycle evidence are separate from
+the passing development CI. Production contributions, public accountless figures,
+and public stable cutover remain unchanged.
+
+Earlier `.11` qualification and recovery history follows; the `.13` checkpoint
+above supersedes its installed-version and open-state claims.
 
 - **Installed Mac launch, refresh and restart pass.** R8 completed the native
   migration; r9 launched signed `.11` from that completed profile after fresh,
