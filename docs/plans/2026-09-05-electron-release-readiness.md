@@ -17,6 +17,53 @@ visible notices before activation for existing undecided installations.
 Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
 
+Latest continuation, 2026-09-09:
+
+- Source `2bb58b5c02bf6e7ba4ab6ce69e5c201e44054f9f` passed all six
+  jobs in [34356903351](https://github.com/adamallcock/tibotattle/actions/runs/34356903351):
+  both Mac packages, Windows and Linux packages, Windows normal startup, and
+  Windows NSIS installation/restart/uninstall. The independent
+  [Linux run](https://github.com/adamallcock/tibotattle/actions/runs/34356902549)
+  also passed packaged Secret Service, normal startup, and the pinned updater
+  adapter exercise. The adapter exercise uses synthetic executables and a
+  disposable profile; it does not establish real AppImage replacement or native
+  notification display.
+- Installed Mac test version `.16` remains available for user testing. It is
+  based on `dcf2d6ca`; subsequent source changes are not yet installed there.
+- The temporary integration checkout was no longer present when work resumed.
+  Committed source was restored at the exact `2bb58b5c` revision into a durable
+  ignored project worktree. Uncommitted edits from the missing checkout are not
+  counted as delivered and are being reconstructed where still required.
+- Current parallel tasks: compact overhead/model copy and model icons; investigate
+  all-history coverage, observation labels, detail-list limits and the community
+  link; complete Windows post-sign native-manifest rebinding. Cosmetic requests
+  do not trigger another broad test run. Functional fixes receive focused checks.
+- Dashboard copy/icons, truthful capped-list captions, correct classified chart
+  hit targets, and fixed desktop community navigation are committed as `18079fd3`.
+  Focused UI/localization/assets checks passed; isolated rendered previews at
+  1100, 900 and 540 pixels showed no card overflow. The installed `.16` is unchanged.
+- Full-history calibration now streams the complete indexed corpus in bounded
+  reset batches rather than discarding rows beyond the global 750,000 ceiling.
+  An isolated real-index copy retained 829,532 admitted events, recovered Pro
+  fits back to May 31, and completed in 42.6 seconds under the unchanged RSS guard.
+  Exact usage metadata occupied 25.34 MB; peak process RSS was 1.626 GB, a separate
+  measurement. All 80 owning cache tests and 30 resource/shell checks passed.
+- Windows native-integrity rebinding has 14 focused passing tests and an
+  independent source review. It preserves exact candidate/inventory bindings
+  and required qualification; signature algorithms, final installer verification
+  and Windows power-loss durability remain unqualified. A complete pre-sign
+  journal is required for interrupted metadata-write recovery.
+- Tray source `eb92b7d4` reserves hover readout space, uses a compact Customize
+  button between Open and Refresh, and uses a focusable Mac window for the
+  existing blur-dismissal behavior. The read-only real-data projection now
+  reports 29 complete days and only the current day partial for the 30-day view;
+  incomplete typed-tool history no longer contaminates independently verified
+  token coverage. All 55 focused tray tests passed. Native outside-click and
+  tray-toggle event ordering still require the fresh packaged check.
+- Windows signing authorization is granted, but an authenticated Windows signing
+  environment is not available here. The current caller is a preflight/build
+  entrypoint, not completed native-module finalization or a signed release.
+
 Latest test-feed and platform continuation:
 
 - Desktop integration is now being completed as independent engineering and
@@ -49,9 +96,9 @@ Latest test-feed and platform continuation:
 - Latest pre-change source `bd60e686` passed both Mac packages, Linux package/
   runtime, and Windows package/normal-app jobs in run `34348058918`, but its
   Windows NSIS installer did not settle within 180 seconds before first launch.
-  The failure receipt is preserved, and an unchanged-source failed-job rerun
-  was requested to distinguish runner intermittency from a repeatable defect.
-  Earlier successful NSIS receipts do not erase this failure.
+  The unchanged-source retry subsequently passed installation, two launches,
+  uninstall and cleanup with the same installer digest. Both the first failure
+  and retry receipts are preserved; the timeout was not loosened.
 - Follow-up `.15`/`.16` candidates from frozen runtime `dcf2d6ca` are now
   signed, notarized, stapled and finalized for both Mac architectures. All 24
   retained files and four ZIP-contained ASARs were independently checked;

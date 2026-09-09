@@ -568,6 +568,39 @@ publication permission. The unpacked native modules still need a separately
 reviewed signature/rebinding finalizer and final-byte artifact checks before any
 installer or updater claim.
 
+#### Native-module integrity rebinding
+
+Before signing either staged native module, inspect and prepare the exact
+candidate's no-clobber journal:
+
+```sh
+node scripts/rebind-electron-windows-native-modules.mjs --candidate-receipt .release-build/electron-production/win32-x64/production-source-candidate.json
+node scripts/rebind-electron-windows-native-modules.mjs --prepare --candidate-receipt .release-build/electron-production/win32-x64/production-source-candidate.json
+```
+
+After an authorized signer has signed the two staged `.node` modules, run:
+
+```sh
+node scripts/rebind-electron-windows-native-modules.mjs --rebind --candidate-receipt .release-build/electron-production/win32-x64/production-source-candidate.json
+```
+
+Rebinding requires native Windows x64 and the pinned Node runtime. It verifies
+valid Authenticode, the expected publisher and timestamp presence before
+loading the filesystem binding; the PE content must match the journal apart
+from Authenticode fields. It replaces only the filesystem sidecar and runtime
+manifest, verifies all other inventory, and preserves the required runtime
+qualification. Repeating `--rebind` resumes a verified partial metadata write.
+If preparation is interrupted before a complete journal exists, both modes
+refuse the incomplete directory. Preserve it for explicit inspection and prepare
+a fresh verified candidate; do not delete or overwrite an unverifiable journal.
+
+This helper never signs, invokes the installer builder, or publishes. Its receipt
+explicitly leaves SHA-256 signature/timestamp algorithm policy, Windows
+power-loss directory durability and final packaged-artifact checks unqualified.
+Run it **before** producing the final installer; a previously built installer
+cannot acquire rebound native bytes by changing its staging directory. The
+signing caller is not yet an end-to-end native-signing/final-installer verifier.
+
 ### Linux
 
 Do not publish a loose AppImage, DEB, or RPM as a universally trusted Linux
@@ -576,6 +609,26 @@ repository, including credential/key storage, process/file access, clean
 install, update/no-update, and uninstall behavior. Add detached signature or
 repository metadata as the selected distribution requires. Flathub and Snap
 are separate `store` channel subjects.
+
+The selected direct Linux updater path is AppImage. It does not require a new
+detached-signing service merely to exercise updates. The pinned updater must
+still verify downloaded bytes from the selected feed, replace the correct
+installed image, restart, and preserve settings and sharing choice. DEB/RPM
+package-manager updates are a distinct delivery path.
+
+The bounded adapter qualification is:
+
+```sh
+node scripts/smoke-electron-linux-appimage-updater.mjs --self-test --receipt <new-receipt.json>
+```
+
+It exercises the pinned AppImage updater through a loopback feed using synthetic
+executables, a disposable profile and cache, checksum-verified download, and a
+replacement/relaunch marker. The receipt explicitly excludes real-product
+execution, real AppImage/FUSE integration, desktop notifications and production
+credentials. It refuses real-product execution mode. Run it on Linux; a skip
+on another operating system is not Linux evidence. Retain the native packaged
+startup/credential/cold-restart receipts separately from this adapter receipt.
 
 ### Stores and updater channels
 
