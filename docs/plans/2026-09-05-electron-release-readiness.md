@@ -19,6 +19,11 @@ Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
 Latest continuation, 2026-09-09:
 
+- Live `main` was checked at `77317f9f` (PR #114) and is an ancestor of both
+  the installed Mac source `7293828a` and current integration source. There are
+  no unseen main-branch commits to port at this observation; ancestry alone
+  does not replace feature/runtime acceptance.
+
 - Source `c0c98040` now includes the stale tray percentage correction and
   the signed automatic-contribution execution workflow. Its Windows normal
   journey passed real synthetic ingestion (one event, 120 tokens), retained
@@ -56,9 +61,13 @@ Latest continuation, 2026-09-09:
   found no missing fresh-classification or three-visible-notice integration; those
   remain focused component/composition evidence rather than a signed seven-day run.
   A separate hosted native-UI feasibility probe passed in `34385565580` without
-  reading app data. A bounded fresh-install-only runner is prepared to reuse the
-  signed app, leave all settings/acknowledgements untouched before launch and
-  exercise the actual native Continue dialog; it requires no staging activation.
+  reading app data. The signed untouched first-launch then passed in
+  [34386204318](https://github.com/adamallcock/tibotattle/actions/runs/34386204318),
+  runner `e33c6b37`, unchanged signed app `c0c98040`: no seeded preference or
+  acknowledgement, actual native Continue/login-checkbox interaction, app-created
+  acknowledgement and `default_on` observed through normal Settings, with owned
+  processes stopped. This single-launch proof correctly claims no restart/upload
+  of its own. No staging activation or new signing was required.
 - Normal Mac `.17`/`.18` candidates are staged from frozen source `7293828a`
   for both architectures, builds `2026090919`/`2026090920`. All four apps and
   disk images are signed, notarized and stapled; final archive, updater metadata,
@@ -76,15 +85,20 @@ Latest continuation, 2026-09-09:
   were observed in `.17`; About shows `content-03c983798dec`. The attempted
   `.16`→`.17` updater edge was correctly refused by `.16`'s immutable `.15`/`.16`
   test-pair restriction. No unsupported update success is claimed. The valid
-  `.17`→`.18` before receipt is captured. Its feed advance failed before writing
-  because the existing Cloudflare OAuth token expired and automatic refresh
-  failed. The attempted same-scope login renewal was rejected by automatic
-  approval review because the existing grant includes broad write/admin scopes;
-  the user explicitly approved same-scope renewal. The renewed browser flow now
-  awaits the user's security-key verification; no new scopes were requested.
-  The CLI callback wait expired without completing renewal; a fresh callback
-  will be needed once browser verification succeeds. `.17` remains the test
-  feed and installed app. No failed `.18` publication is relabelled as completed.
+  **`.17`→`.18` automatic update now passed.** Same-scope Cloudflare renewal
+  was explicitly approved and completed after browser verification. The `.18`
+  test-feed advance completed for both architectures with exact predecessor
+  and R2 readback; independent public HTTPS verification passed both manifests
+  and all four archive bodies. The ordinary Check/Download/Install and Restart
+  controls replaced the installed app and restarted it automatically. R13
+  verified the `.18` signature/ASAR/build, old PIDs absent and new app already
+  running before GUI inspection, plus preserved salt and opt-out. The dashboard
+  rendered; General settings and sharing-off text were retained; About shows
+  `content-afb24c32c23d`. The normal startup refresh subsequently completed:
+  the dashboard reports FRESH, local metadata readable and private state writable.
+  R13 retains `one-click-17-to-18-refresh-complete.json` separately from the
+  earlier running observation. Earlier expired-login/pre-write and
+  public-verifier input-shape failures are retained. The stable feed is unchanged.
 - Windows native modules have passed Azure signing, strict Authenticode
   verification and integrity rebinding. The final installer and its installed
   journey are still unqualified. Earlier failures are retained in runs
@@ -100,11 +114,27 @@ Latest continuation, 2026-09-09:
   only that verified fixed directory. Run `34385603744` rejected an abbreviated
   source input before staging or signing; corrected exact-source run
   [34385889388](https://github.com/adamallcock/tibotattle/actions/runs/34385889388)
-  is qualifying integrated `88156c30`, build `2026090928`. Existing protected-environment approval was used without rule changes.
+  passed native signing, rebinding and Azure authentication on `88156c30`,
+  build `2026090928`, then failed inside electron-builder. The old finalizer
+  discarded its useful output, so a bounded diagnostic and actual signing-host
+  preparation check are being added before a new run. Its retained installer
+  has a certificate table, but that is not signature validity or installed-runtime
+  evidence. Existing protected-environment approval was used without rule changes.
+  Exact-source retry [34389121508](https://github.com/adamallcock/tibotattle/actions/runs/34389121508)
+  is now running `2be8b282`, build `2026090929`, with a no-sign check of the
+  actual builder signing host/module and bounded error diagnostics.
+  Source `ac50a1d9` also adds the approved TiboTattle ICO to the Windows installer
+  configuration; seven decoded frames and the actual builder converter passed.
 
 Production activation preparation: [the exact proposal](2026-09-09-production-accountless-activation-proposal.md)
-now separates read-only remote intake, pending migration rehearsal, deployment,
-private collection canary and public-sample admission. Updated public privacy,
+now separates read-only remote intake, migration rehearsal, deployment,
+private collection canary and public-sample admission. Production migration
+metadata confirms only primary migrations 0057–0059 are pending; the populated
+local rehearsal passed with 100,000 synthetic records in each telemetry table.
+Required secret names are present, live accountless modes remain disabled, and
+both D1 Time Travel bookmarks were retrieved read-only. These are recovery
+inputs, not a tested production restore. A bounded ordinary signed-app canary
+wrapper is being prepared for a separate concrete activation approval. Updated public privacy,
 Docs and translated homepage copy are prepared and locally verified, not deployed.
 Production accountless modes remain disabled in source.
 
