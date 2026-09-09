@@ -97,6 +97,7 @@ function readInputs() {
     rehearsal,
     rehearsalCurrentVersion,
     rehearsalNextVersion,
+    sourceReleaseVersion,
     sourceRevision,
     target,
     targetSpec,
@@ -173,6 +174,9 @@ function asarUnpackFor(target) {
 
 const INPUTS = readInputs();
 const metadata = distributionMetadata(INPUTS);
+const packagedSourceReleaseVersion = INPUTS.version === INPUTS.sourceReleaseVersion
+  ? null
+  : INPUTS.sourceReleaseVersion;
 const stagingPathSegments = distribution.productionElectronStagingPathSegments({
   target: INPUTS.target,
   rehearsal: INPUTS.rehearsal,
@@ -220,6 +224,9 @@ function assertExactStagedManifest() {
     fail();
   }
   if (staged?.version !== INPUTS.version
+      || (packagedSourceReleaseVersion === null
+        ? Object.hasOwn(staged, "tibotattleSourceReleaseVersion")
+        : staged.tibotattleSourceReleaseVersion !== packagedSourceReleaseVersion)
       || JSON.stringify(staged.tibotattleDistribution) !== JSON.stringify(metadata)) {
     fail();
   }
@@ -247,6 +254,8 @@ const configuration = {
     name: "app-usagemonitor",
     productName: "TiboTattle",
     version: INPUTS.version,
+    ...(packagedSourceReleaseVersion === null
+      ? {} : { tibotattleSourceReleaseVersion: packagedSourceReleaseVersion }),
     tibotattleDistribution: metadata,
     // app-builder-lib uses these fields for Windows executable and NSIS
     // ProductVersion values. Keep them in the same valid four-component form

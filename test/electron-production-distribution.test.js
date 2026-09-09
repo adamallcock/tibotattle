@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import test from "node:test";
 
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
@@ -42,6 +43,126 @@ async function withTemporaryDirectory(run) {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+}
+
+async function assertStagedHandoverCompanionReady({ output, root }) {
+  const syntheticRoot = join(root, "synthetic-companion");
+  await mkdir(syntheticRoot, { recursive: true });
+  const companionModule = pathToFileURL(join(output, "apps", "local", "server.js")).href;
+  // Invoke the staged composition root directly so this is an import and
+  // readiness regression, independent of the test runner's argv semantics.
+  const launcher = [
+    `import { startLocalCompanionServer } from ${JSON.stringify(companionModule)};`,
+    "const app = await startLocalCompanionServer({ host: '127.0.0.1', port: 0 });",
+    "process.stdout.write(`USAGE_MONITOR_READY http://${app.host}:${app.port}/\\n`);",
+    "process.once('SIGTERM', () => { void app.close().then(() => process.exit(0), () => process.exit(1)); });",
+  ].join("\n");
+  const child = spawn(process.execPath, ["--input-type=module", "-e", launcher], {
+    cwd: output,
+    env: {
+      CLAUDE_CONFIG_DIR: join(syntheticRoot, "claude"),
+      CLAUDE_PROJECT_DIR: join(syntheticRoot, "project"),
+      CODEX_HOME: join(syntheticRoot, "codex"),
+      HOME: join(syntheticRoot, "home"),
+      PATH: process.env.PATH ?? "",
+      USAGE_MONITOR_ACCOUNTING_SOURCE_MODE: "unified",
+      USAGE_MONITOR_PORT: "0",
+      USAGE_MONITOR_STATE_ROOT: join(syntheticRoot, "state"),
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  await new Promise((resolveReady, rejectReady) => {
+    let ready = false;
+    let failure = null;
+    let outputBytes = 0;
+    let stdout = "";
+    let stderr = "";
+    const failureCategory = () => (
+      /Invalid app-usagemonitor release metadata/u.test(stderr)
+        ? "release_metadata"
+        : /Parent watchdog configuration is invalid/u.test(stderr)
+          ? "parent_watchdog"
+          : /listen EPERM/u.test(stderr)
+            ? "loopback_listener"
+            : "startup"
+    );
+    const requestStop = () => {
+      if (!child.killed) child.kill("SIGTERM");
+    };
+    const fail = (error) => {
+      failure ??= error;
+      requestStop();
+    };
+    const timeout = setTimeout(() => {
+      fail(new Error("staged handover companion did not become ready"));
+    }, 10_000);
+    const forcedExit = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }, 12_000);
+    child.once("error", () => {
+      fail(new Error("staged handover companion did not become ready"));
+    });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < 2048) stderr += chunk.slice(0, 2048 - stderr.length);
+    });
+    child.stdout.on("data", (chunk) => {
+      outputBytes += Buffer.byteLength(chunk, "utf8");
+      if (outputBytes > 512) {
+        fail(new Error("staged handover companion emitted unexpected output"));
+        return;
+      }
+      stdout += chunk;
+      if (/^USAGE_MONITOR_READY http:\/\/127\.0\.0\.1:\d+\/$/mu.test(stdout)) {
+        ready = true;
+        requestStop();
+      }
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timeout);
+      clearTimeout(forcedExit);
+      if (failure !== null) {
+        rejectReady(failure);
+        return;
+      }
+      if (!ready) {
+        rejectReady(new Error(`staged handover companion exited before ready: ${failureCategory()}`));
+        return;
+      }
+      if (code !== 0 && signal !== "SIGTERM") {
+        rejectReady(new Error("staged handover companion did not stop cleanly"));
+        return;
+      }
+      resolveReady();
+    });
+  });
+}
+
+async function assertStagedReleaseManifestRejects({ output, root, overrides }) {
+  const fixtureRoot = join(root, "release-manifest-fixture");
+  const fixtureConfig = join(fixtureRoot, "config");
+  await mkdir(fixtureConfig, { recursive: true });
+  const packageJson = JSON.parse(await readFile(join(output, "package.json"), "utf8"));
+  for (const name of [
+    "electron-production-distribution.cjs",
+    "product-brand.js",
+    "release-manifest.js",
+  ]) {
+    await writeFile(join(fixtureConfig, name), await readFile(join(output, "config", name)));
+  }
+  await writeFile(join(fixtureRoot, "package.json"), `${JSON.stringify({
+    ...packageJson,
+      ...overrides,
+  }, null, 2)}\n`);
+  assert.throws(() => execFileSync(process.execPath, [
+    "--input-type=module",
+    "-e",
+    "await import('./config/release-manifest.js');",
+  ], {
+    cwd: fixtureRoot,
+    stdio: "ignore",
+  }));
 }
 
 function loadProductionBuilderConfig(target, {
@@ -247,6 +368,8 @@ test("production builder source config binds app identity, target-specific build
       target, version: RELEASE_VERSION, buildNumber: BUILD_NUMBER,
     }), target);
     assert.equal(config.extraMetadata.version, RELEASE_VERSION, target);
+    assert.equal(Object.hasOwn(config.extraMetadata, "tibotattleSourceReleaseVersion"), false,
+      target);
     assert.deepEqual(config.extraMetadata.tibotattleDistribution,
       createProductionDistributionMetadata({ buildNumber: BUILD_NUMBER, sourceRevision: SOURCE_REVISION, target }), target);
     assert.deepEqual(config.publish, [{ provider: "generic", url: spec.feedURL }], target);
@@ -332,6 +455,7 @@ test("rehearsal builder config binds semantic updater versions to numeric macOS 
       target: "darwin-arm64",
     });
     assert.equal(config.extraMetadata.version, version, candidate);
+    assert.equal(config.extraMetadata.tibotattleSourceReleaseVersion, RELEASE_VERSION, candidate);
     assert.deepEqual(config.extraMetadata.tibotattleDistribution, metadata, candidate);
     assert.equal(config.mac.bundleShortVersion, "0.1.19", candidate);
     assert.equal(config.mac.bundleVersion, buildNumber, candidate);
@@ -623,10 +747,22 @@ test("rehearsal source staging binds each updater semantic version to its runtim
       const packageJson = JSON.parse(await readFile(join(result.output, "package.json"), "utf8"));
       const manifest = JSON.parse(await readFile(result.manifestPath, "utf8"));
       assert.equal(packageJson.version, version, candidate);
+      assert.equal(packageJson.tibotattleSourceReleaseVersion, RELEASE_VERSION, candidate);
       assert.deepEqual(packageJson.tibotattleDistribution, metadata, candidate);
       assert.equal(manifest.releaseVersion, version, candidate);
       assert.equal(manifest.target, "darwin", candidate);
       assert.equal(manifest.architecture, "arm64", candidate);
+      await assertStagedHandoverCompanionReady({ output: result.output, root: join(root, candidate) });
+      await assertStagedReleaseManifestRejects({
+        output: result.output,
+        root: join(root, candidate),
+        overrides: { tibotattleSourceReleaseVersion: "0.1.18-preview.1" },
+      });
+      await assertStagedReleaseManifestRejects({
+        output: result.output,
+        root: join(root, candidate),
+        overrides: { version: "0.1.19-native-to-electron-handover.99" },
+      });
       staged.push(result.output);
     }
     assert.notEqual(staged[0], staged[1]);

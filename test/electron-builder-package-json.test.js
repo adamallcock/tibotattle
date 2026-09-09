@@ -177,10 +177,12 @@ test("production package canonicalization accepts only metadata-bound rehearsal 
       distributionMetadata: metadata,
       packageVersion: REHEARSAL_CURRENT_VERSION,
       profile: "production",
+      sourceReleaseVersion: VERSION,
     },
   );
   const packageJson = JSON.parse(transformed.toString("utf8"));
   assert.equal(packageJson.version, REHEARSAL_CURRENT_VERSION);
+  assert.equal(packageJson.tibotattleSourceReleaseVersion, VERSION);
   assert.deepEqual(packageJson.tibotattleDistribution, metadata);
   assert.equal(transformElectronBuilderPackageJsonBytes(
     "package.json",
@@ -189,8 +191,28 @@ test("production package canonicalization accepts only metadata-bound rehearsal 
       distributionMetadata: metadata,
       packageVersion: REHEARSAL_NEXT_VERSION,
       profile: "production",
+      sourceReleaseVersion: VERSION,
     },
   ), null);
+  assert.throws(() => canonicalElectronBuilderPackageJsonBytes(
+    "package.json",
+    rootSource(),
+    {
+      distributionMetadata: metadata,
+      packageVersion: REHEARSAL_CURRENT_VERSION,
+      profile: "production",
+    },
+  ), /source release metadata is invalid/u);
+  assert.throws(() => canonicalElectronBuilderPackageJsonBytes(
+    "package.json",
+    rootSource(),
+    {
+      distributionMetadata: metadata,
+      packageVersion: REHEARSAL_CURRENT_VERSION,
+      profile: "production",
+      sourceReleaseVersion: "0.1.16-preview.1",
+    },
+  ), /source release metadata is invalid/u);
   assert.throws(() => canonicalElectronBuilderPackageJsonBytes(
     "package.json",
     rootSource(),
@@ -198,6 +220,7 @@ test("production package canonicalization accepts only metadata-bound rehearsal 
       distributionMetadata: { ...metadata, updateFeed: "https://untrusted.example.invalid/feed" },
       packageVersion: REHEARSAL_CURRENT_VERSION,
       profile: "production",
+      sourceReleaseVersion: VERSION,
     },
   ), /invalid/u);
 });

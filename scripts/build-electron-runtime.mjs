@@ -1657,6 +1657,9 @@ export async function buildElectronRuntime({
       ...(selectedDistributionMetadata
         ? { distributionMetadata: selectedDistributionMetadata }
         : {}),
+      ...(selectedDistributionMetadata?.semanticVersion !== undefined
+        ? { sourceReleaseVersion: RELEASE_VERSION }
+        : {}),
       ...(selectedHostedRehearsalMetadata
         ? { hostedRehearsalMetadata: selectedHostedRehearsalMetadata }
         : {}),

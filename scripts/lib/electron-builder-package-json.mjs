@@ -265,6 +265,7 @@ export function transformElectronBuilderPackageJsonBytes(
     profile = "development",
     packageVersion,
     distributionMetadata,
+    sourceReleaseVersion,
     hostedRehearsalMetadata,
   } = {},
 ) {
@@ -296,6 +297,14 @@ export function transformElectronBuilderPackageJsonBytes(
     && (productionMetadata?.semanticVersion === undefined
       ? RELEASE_VERSION_PATTERN.test(packageVersion)
       : packageVersion === productionMetadata.semanticVersion);
+  const handoverSourceReleaseVersion = productionMetadata?.semanticVersion === undefined
+    ? null
+    : sourceReleaseVersion;
+  if (handoverSourceReleaseVersion !== null
+      && (typeof handoverSourceReleaseVersion !== "string"
+        || !RELEASE_VERSION_PATTERN.test(handoverSourceReleaseVersion))) {
+    throw new TypeError("native handover source release metadata is invalid");
+  }
   if (!selectedProfile || (isMain && !packageVersionMatchesDistribution)) return null;
   if (profile !== "production" && distributionMetadata !== undefined) {
     throw new TypeError("production distribution metadata is not allowed for this profile");
@@ -310,6 +319,7 @@ export function transformElectronBuilderPackageJsonBytes(
       data,
       "tibotattleAccountlessHostedRehearsal",
     );
+    const hasSourceReleaseVersion = Object.hasOwn(data, "tibotattleSourceReleaseVersion");
     // The input package is shared by every unsigned development build. An
     // ordinary profile must not inherit an authority marker from a previous
     // staged rehearsal or distribution build. The selected profile below is
@@ -324,6 +334,14 @@ export function transformElectronBuilderPackageJsonBytes(
     if (profile === "accountless-hosted-rehearsal" && hasDistributionMetadata) {
       throw new TypeError("production distribution metadata is not allowed for this profile");
     }
+    if (handoverSourceReleaseVersion === null && hasSourceReleaseVersion) {
+      throw new TypeError("native handover source release metadata is not allowed");
+    }
+    if (handoverSourceReleaseVersion !== null
+        && hasSourceReleaseVersion
+        && data.tibotattleSourceReleaseVersion !== handoverSourceReleaseVersion) {
+      throw new TypeError("native handover source release metadata is invalid");
+    }
   }
   let changed = false;
   if (isMain) {
@@ -336,6 +354,8 @@ export function transformElectronBuilderPackageJsonBytes(
       productName: selectedProfile.productName,
       ...(selectedProfile.desktopName ? { desktopName: selectedProfile.desktopName } : {}),
       version: packageVersion,
+      ...(handoverSourceReleaseVersion === null
+        ? {} : { tibotattleSourceReleaseVersion: handoverSourceReleaseVersion }),
       ...(productionMetadata ? { tibotattleDistribution: productionMetadata } : {}),
       ...(rehearsalMetadata
         ? { tibotattleAccountlessHostedRehearsal: rehearsalMetadata }
