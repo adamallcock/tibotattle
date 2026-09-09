@@ -821,6 +821,8 @@ async function fixture() {
   await writeFile(join(staticRoot, "app.js"), "export const app = true;");
   await writeFile(join(staticRoot, "data-client.js"), "export const client = true;");
   await writeFile(join(staticRoot, "lib.js"), "export const lib = true;");
+  await writeFile(join(staticRoot, "model-performance.js"), "export const performance = true;");
+  await writeFile(join(staticRoot, "model-performance.css"), ".model-performance { color: black; }");
   await writeFile(
     join(staticRoot, "localization.js"),
     "export const localization = true;",
@@ -1127,6 +1129,14 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.doesNotMatch(pageBody, new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"));
     assert.equal((await fetch(`${base}/data-client.js`)).status, 200);
     assert.equal((await fetch(`${base}/localization.js`)).status, 200);
+    for (const [path, type] of [
+      ["model-performance.js", "text/javascript; charset=utf-8"],
+      ["model-performance.css", "text/css; charset=utf-8"],
+    ]) {
+      const asset = await fetch(`${base}/${path}`);
+      assert.equal(asset.status, 200, path);
+      assert.equal(asset.headers.get("content-type"), type, path);
+    }
     assert.equal(
       (await fetch(`${base}/telemetry-shared.generated.js`)).status,
       200,

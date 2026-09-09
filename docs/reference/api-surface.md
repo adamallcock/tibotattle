@@ -226,6 +226,7 @@ is never an arbitrary local proxy.
 | `GET` | `/api/local/overview` | Dashboard | Loopback read | Reads the current derived overview snapshot. | Local companion |
 | `GET` | `/api/local/cache-drop-thread-links` | Local dashboard only | Same-origin custom-header read | Ephemeral, generation-bound names and Codex thread IDs for recent cache-drop rows; no query parameters, persistence, or export. | Local companion |
 | `POST` | `/api/local/work-usage/query` | Local dashboard only | Same-origin custom-header read; closed 4 KiB JSON | Cancellable, read-only project/worktree/thread reports over a pinned index; bounded process-local snapshots with closed `touch` lease renewal, per-thread model/component breakdowns and transient display metadata; optional `search` (at most 100 characters) finds project/task names before pagination while preserving global share denominators; optional `sourceSnapshotId` anchors related period/scope queries to an available report and its canonical generation; no export or persistence. | Local reporting |
+| `GET` | `/api/local/model-performance` | Model performance page | Loopback read | Requires one `period` value: `7`, `30`, or `all`; returns bounded local timing aggregates and renews an independent background scan lease. No accounting or network effect. | Local timing |
 | `GET` | `/api/local/gradient` | Dashboard | Loopback read | Reads the derived cost/quota gradient. | Local analysis |
 | `GET` | `/api/local/weekly` | Dashboard | Loopback read | Reads derived weekly capacity and pace evidence. | Local analysis |
 | `GET` | `/api/local/weekly-pace-outlook` | Native shell | Loopback read | Reads the bounded account-scoped weekly pace presentation projection. | Local analysis |
@@ -253,6 +254,12 @@ bounded projection of the existing cache-continuity calculation. A zero
 comparable count has a null percentage; unavailable evidence has null counts.
 Consumers retain the parent accounting scope and freshness. This adds no
 collection, transcript access or independent retention authority.
+
+The development source exposes **Model performance** at `#performance` in the
+web and native navigation. Its timing route remains usable without a completed
+accounting snapshot and returns explicit loading, unavailable, or stale state.
+The diagnostic population covers this device's selected Codex sources across
+accounts; it is not an account-scoped billing measure.
 
 ## Fixed report pages
 
@@ -316,6 +323,7 @@ and bounded blob downloads. Provider sign-in opens in the system browser.
 | --- | --- | --- |
 | Codex app-server | Local collector | Spawns the local `codex app-server` binary and uses bounded JSON-RPC for account, rate-limit, and usage evidence. No provider credential is copied into documentation or telemetry. |
 | Claude status line | Explicit standalone callback hook to local broker | Bounded JSON input through the managed callback/socket boundary; content-free status projection only. It is not an installed-app API. |
+| Model performance worker | Page-leased local controller | Independent, bounded Codex timing scan and aggregate snapshots; no accounting or contribution input. Stops after 60 seconds without a page reader. |
 | R7 benchmark worker | Protected release-evidence generator | Bounded JSON request on stdin and one stable JSON result on stdout. It is not a routine documentation gate and may read private local corpus evidence. |
 | Local companion ready line | Native launcher | One `USAGE_MONITOR_READY` line containing the loopback URL after bind; stdout is not a general API. |
 

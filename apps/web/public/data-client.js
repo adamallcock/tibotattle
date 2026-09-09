@@ -6268,6 +6268,13 @@ export class LocalCompanionClient {
     return normalizeDashboardPayload({}, fragments);
   }
 
+  modelPerformance(period = "all", { signal } = {}) {
+    if (!["7", "30", "all"].includes(period)) throw new RangeError("Unsupported display period");
+    return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/model-performance?period=${period}`, {
+      cache: "no-store", signal, headers: { "X-Usage-Monitor-Local": "1" },
+    });
+  }
+
   health() {
     return fetchJson(this.fetchImpl, `${LOCAL_ROOT}/health`);
   }

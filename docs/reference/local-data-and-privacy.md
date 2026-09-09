@@ -90,6 +90,23 @@ for runtime and resource limits.
 | Export workspace | Explicit CLI or review flow | Only allowlisted metadata for the selected time range and sources. | Journaled workspace, chunks, manifest, and verification/deletion receipts at explicit paths. |
 | Contribution preparation | Explicit review/consent flow | Closed telemetry schema; exact payload is locally reviewable before first approval. | Prepared spool/review archive and replay-safe sync state under the app state root. |
 
+## Model performance timing in development source
+
+Opening **Model performance** (`#performance`) enables an independent worker
+for the selected Codex home's plain `.jsonl` session and archived-session files.
+This diagnostic population spans accounts on this device. It reads timestamps,
+allowlisted model metadata, token counters, and response/turn boundaries to
+reconstruct timing; raw content and raw IDs are never persisted or returned.
+Compressed-only histories and missing timing remain unavailable.
+
+Reads renew a 60-second page lease. Discovery is capped at 50,000 entries;
+scan passes target at most 32 MiB or 750 ms, checking between chunks of at most
+4 MiB and pausing five seconds between passes. The worker checkpoints progress
+and stops after the lease expires. It does not feed accounting, contribution,
+or network requests. Failures preserve available saved evidence with its
+stale/unavailable state. Windows remains unavailable until its protected-state
+adapter is qualified. These are source behavior, not installed-release proof.
+
 ## Installed local state
 
 The macOS app owns `~/Library/Application Support/Usage Monitor` with
@@ -98,6 +115,7 @@ owner-only permissions. Important entries include:
 | State | Purpose | Retention behavior |
 | --- | --- | --- |
 | `local-unified-index-v1.sqlite` plus device salt | Canonical replay-safe Codex usage/quota/tool projection and source provenance. | Accumulates locally; the 30-day UI horizon is not retention. |
+| `inference-timing-v2/timing-experiment.sqlite` (development source) | Separate owner-only timing sidecar: one row per completed turn, counts/durations/coverage, local HMAC keys, source cursors and bounded pending state. No raw content or IDs. | Maximum 256 MiB; method/SQLite user version 2. Incompatible stores, including version 1, are preserved and refused. Display periods do not delete evidence or migrate the accounting index. |
 | `local-collector-state-v1.sqlite` | App-server quota observations, checkpoints, dedupe, locks, and replay-safe collector state. | Accumulates until explicit local erase or a reviewed migration/retention workflow. |
 | `private/` settings/handoff state | Automatic/incremental contribution settings, bounded OAuth restart handle, fast-mode preference, and speed baselines. | Settings persist; the OAuth handle expires and is bounded. |
 | Prepared contribution/review directories and queue | Exact local review, delivery, retry, and audit state. | Retained for replay-safe completion, explicit cleanup, or local erase. |

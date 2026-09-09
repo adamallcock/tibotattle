@@ -92,6 +92,14 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "model-catalog.generated.js",
     type: "text/javascript; charset=utf-8",
   }),
+  "/model-performance.js": Object.freeze({
+    file: "model-performance.js",
+    type: "text/javascript; charset=utf-8",
+  }),
+  "/model-performance.css": Object.freeze({
+    file: "model-performance.css",
+    type: "text/css; charset=utf-8",
+  }),
   "/navigation.js": Object.freeze({
     file: "navigation.js",
     type: "text/javascript; charset=utf-8",

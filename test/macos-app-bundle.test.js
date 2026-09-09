@@ -1490,7 +1490,7 @@ test("native launcher keeps the requested foreground-only lifecycle", async () =
   assert.match(destinationSource, /case community\b/u);
   assert.deepEqual(
     [...destinationSource.matchAll(/^\s*case (\w+)$/gmu)].map((match) => match[1]),
-    ["overview", "weekly", "trends", "method", "community"],
+    ["overview", "weekly", "trends", "performance", "method", "community"],
   );
   assert.match(source, /private final class NativeDashboardReportPane/u);
   // The chrome is an NSSplitViewController with a real sidebar item, so the
@@ -7296,6 +7296,7 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/lib.js",
     "apps/web/public/localization.js",
     "apps/web/public/model-catalog.generated.js",
+    "apps/web/public/model-performance.js",
     "apps/web/public/model-visuals.js",
     "apps/web/public/navigation.js",
     "apps/web/public/telemetry-envelope.js",
@@ -7352,6 +7353,8 @@ test("macOS runtime graph is closed over exact source and dependency allowlists"
     "apps/web/public/lib.js",
     "apps/web/public/localization.js",
     "apps/web/public/model-catalog.generated.js",
+    "apps/web/public/model-performance.css",
+    "apps/web/public/model-performance.js",
     "apps/web/public/model-visuals.js",
     "apps/web/public/navigation.js",
     "apps/web/public/styles.css",

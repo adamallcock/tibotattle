@@ -1,5 +1,6 @@
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
 import { mountWorkUsageView } from "./work-usage-view.js";
+import { mountModelPerformance } from "./model-performance.js";
 import {
   CommunityClient,
   isPrimaryCodexQuotaWindow,
@@ -15861,6 +15862,11 @@ document.addEventListener("scroll", () => {
 }, true);
 
 mountWorkUsageView({ root: document.querySelector("#projects"), t });
+const modelPerformance = mountModelPerformance({
+  root: document.querySelector("#performance"), client: localClient,
+  t, locale: () => localization.formatLocale(),
+});
+window.addEventListener("tibotattle:locale-change", () => modelPerformance.render());
 
 mountDashboardNavigation({
   documentRef: document,

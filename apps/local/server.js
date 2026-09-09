@@ -45,6 +45,9 @@ import {
   readLocalUnifiedWindowBreakdown,
 } from "../../src/local-unified-window-breakdown.js";
 import {
+  createModelPerformanceController,
+} from "./model-performance-controller.js";
+import {
   buildLocalCacheDropThreadLinks,
 } from "../../src/local-cache-drop-thread-links.js";
 import { TELEMETRY_SCHEMA_VERSION } from "@app-usagemonitor/telemetry-contract";
@@ -931,6 +934,7 @@ const API_ROUTES = new Set([
   "/api/local/weekly-pace-outlook",
   "/api/local/quality",
   "/api/local/timeline/window-breakdown",
+  "/api/local/model-performance",
   "/api/local/refresh",
   "/api/local/refresh/quick",
   "/api/local/refresh/cancel",
@@ -957,14 +961,15 @@ function isAccountlessProductionClosedLocalRoute(path) {
 }
 
 // Routes that do not read the Codex dashboard snapshot must answer while that
-// snapshot is still being built (or even if it fails): readiness and
-// diagnostics.
+// snapshot is still being built (or even if it fails): readiness, diagnostics,
+// and the independently reconstructed timing analysis.
 const SNAPSHOT_INDEPENDENT_API_ROUTES = new Set([
   "/api/local/health",
   "/api/local/desktop-status",
   "/api/local/diagnostics/contribution",
   "/api/local/diagnostics/note",
   "/api/local/identity/hosted-signin-handoff",
+  "/api/local/model-performance",
 ]);
 
 
@@ -3128,6 +3133,7 @@ function createPreparedLocalCompanionServer({
     fromMs,
     toMs,
   }),
+  modelPerformanceProvider = null,
   // Never enrich the persisted overview or report DTOs with names. This
   // optional, transient read resolves only rows from the attested snapshot.
   cacheDropThreadLinksProvider = ({ overview }) => buildLocalCacheDropThreadLinks({
@@ -3319,6 +3325,26 @@ function createPreparedLocalCompanionServer({
   },
   onError = () => {},
 } = {}) {
+  // This optional analysis owns neither accounting refresh nor snapshot
+  // readiness. Create its controller only when its page is first requested.
+  let modelPerformanceController = null;
+  let modelPerformanceShutdown = null;
+  const readModelPerformance = modelPerformanceProvider ?? ((period) => {
+    if (modelPerformanceShutdown !== null) {
+      throw new Error("model_performance_unavailable");
+    }
+    modelPerformanceController ??= createModelPerformanceController({
+      directory: join(stateRoot, "inference-timing-v2"),
+      codexHome,
+    });
+    return modelPerformanceController.read(period);
+  });
+  const closeModelPerformance = () => {
+    modelPerformanceShutdown ??= Promise.resolve().then(() => (
+      modelPerformanceController?.close()
+    ));
+    return modelPerformanceShutdown;
+  };
   if (!environment || typeof environment !== "object"
       || Array.isArray(environment)) {
     throw new TypeError("environment must be an object");
@@ -3359,6 +3385,10 @@ function createPreparedLocalCompanionServer({
   }
   if (typeof cacheDropThreadLinksProvider !== "function") {
     throw new TypeError("cacheDropThreadLinksProvider must be a function");
+  }
+  if (modelPerformanceProvider !== null
+      && typeof modelPerformanceProvider !== "function") {
+    throw new TypeError("modelPerformanceProvider must be a function");
   }
   if (typeof claudeShadowEnabled !== "boolean"
       || typeof claudeShadowControllerFactory !== "function"
@@ -4331,14 +4361,15 @@ function createPreparedLocalCompanionServer({
         return;
       }
       const path = url.pathname;
-      // Only the window-breakdown route accepts a query string, and only its
-      // two bounded integer parameters. Hosted sign-in used to redirect back to
+      // Only window breakdown and model performance accept query strings,
+      // with closed route-specific parameters. Hosted sign-in redirected back to
       // a loopback callback on this companion, which was the previous
       // exception; both providers now redirect to the contribution service's
       // own callback and the dashboard collects the result over the relay, so
       // nothing on this origin ever receives a provider's ?code again. Every
       // other route stays query-free by construction.
-      const acceptsQueryString = path === "/api/local/timeline/window-breakdown";
+      const acceptsQueryString = path === "/api/local/timeline/window-breakdown"
+        || path === "/api/local/model-performance";
       if (url.hash !== "" || (url.search !== "" && !acceptsQueryString)) {
         sendError(response, 400, "invalid_request");
         return;
@@ -4672,6 +4703,24 @@ function createPreparedLocalCompanionServer({
             paceOutlook: dataStore.getWeeklyPaceOutlook(),
           },
         });
+        return;
+      }
+      if (path === "/api/local/model-performance") {
+        if (request.method !== "GET") {
+          sendError(response, 405, "method_not_allowed");
+          return;
+        }
+        const entries = [...url.searchParams.entries()];
+        if (entries.length !== 1 || entries[0][0] !== "period"
+            || !["7", "30", "all"].includes(entries[0][1])) {
+          sendError(response, 400, "invalid_request");
+          return;
+        }
+        try {
+          send(response, 200, await readModelPerformance(entries[0][1]));
+        } catch {
+          sendError(response, 503, "model_performance_unavailable");
+        }
         return;
       }
       if (path === "/api/local/quality") {
@@ -5477,6 +5526,9 @@ function createPreparedLocalCompanionServer({
   server.keepAliveTimeout = 90_000;
   server.headersTimeout = 95_000;
   server.once("close", () => {
+    void closeModelPerformance().catch(() => {
+      onError("model_performance_shutdown_failed");
+    });
     void shutdownContributionRuntime().catch(() => {
       onError("automatic_contribution_retirement_lock_release_failed");
     });
@@ -5506,6 +5558,7 @@ function createPreparedLocalCompanionServer({
         : { ...automaticContributionRetirement }
     ),
     shutdownContributionRuntime,
+    closeModelPerformance,
   };
 }
 
@@ -5576,7 +5629,10 @@ export async function startLocalCompanionServer({
     close: async () => {
       parentWatchdog.stop();
       await closeHttpServer(app.server);
-      await app.shutdownContributionRuntime();
+      await Promise.all([
+        app.closeModelPerformance(),
+        app.shutdownContributionRuntime(),
+      ]);
     },
   };
 }

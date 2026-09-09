@@ -93,6 +93,27 @@ uses a shortened thread ID. If attribution cannot be proven, it stays unlinked.
 Names are looked up locally and are not included in reports, share cards,
 diagnostics, or community contributions.
 
+## Model performance in development source
+
+Open **Model performance** from the dashboard sidebar, then choose a model
+and **7 days**, **30 days**, or **All time**. The web and native navigation
+include this page in development source; an installed release must contain
+these changes before the page is available there.
+
+**Output speed** estimates tokens per second from covered response windows.
+**First-token latency** uses independently available turn timing, so its sample
+count can be much larger. The plots show median trends and middle-50% bands
+where enough observations exist. Newer and older timing methods stay separate;
+missing timing is unavailable, never zero. Expand **About these measurements**
+for interpretation and coverage.
+
+These diagnostics cover Codex files on this device across accounts. Tool waits
+are excluded from matched output windows, but the estimate is not a provider
+benchmark or a billing measure. All reasoning efforts remain included. Opening
+the page collects timing in bounded background passes; saved data can appear
+before collection finishes. Leaving the page lets the worker stop, and a later
+visit resumes progress. Timing failures do not block usage accounting.
+
 ## Customize the menu bar and popup
 
 Tray customization is implemented in the development source; the published

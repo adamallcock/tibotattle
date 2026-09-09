@@ -288,6 +288,7 @@ export const MACOS_RUNTIME_STATIC_ASSETS = Object.freeze([
   "apps/web/public/icon-panel-left.svg",
   "apps/web/public/icon-refresh-cw.svg",
   "apps/web/public/icon-settings.svg",
+  "apps/web/public/model-performance.css",
   "apps/web/public/tibotattle-icon.png",
 ]);
 

@@ -214,3 +214,6 @@ export {
   withParticipantSecretLease,
 } from "./participant-identity.js";
 export { createWorkUsageProjectResolver, normalizeWorkUsageRepositoryOrigin } from "./work-usage-projects.js";
+
+export { openTimingStore, ingestTimingFile, timingReport, readTimingRows } from './inference-timing-store.js';
+export { forEachRolloutLine, ROLLOUT_LINE_BYTES } from './rollout-line-reader.js';

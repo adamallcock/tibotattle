@@ -2,15 +2,17 @@
 title: Compact local inference timing experiment
 date: 2026-09-09
 type: plan
-status: implemented-local-experiment
+status: implemented-local-page
 ---
 
 ## Scope and decision
 
 Implement an opt-in local research tool against raw Codex rollouts at source
 revision `77317f9f03079356b44f172dd1d6adbd93427127`. Its separate SQLite sidecar
-never opens the accounting database for writing and is not loaded by the app.
-Production integration and migration remain a subsequent gate.
+never opens the accounting database for writing. The subsequent local page
+integration below promotes the same parser and store into product owners; CLI
+entrypoints now delegate to those implementations. Installed-release
+qualification remains a subsequent gate.
 
 ## Measurement contract
 
@@ -66,9 +68,9 @@ Production integration and migration remain a subsequent gate.
    production, join accepted accounting occurrence IDs or prove exact parity
    through the existing normalizer; do not promote raw usage to billing truth.
 
-## Production follow-on (not part of this local experiment)
+## Original production follow-on and current implementation
 
-Use an optional observer in the existing single read pass and an independently
+The original preferred direction was an optional observer in the existing single read pass and an independently
 versioned local sidecar. Run after accounting commits, under a small background
 budget. Missing/locked/corrupt timing state disables timing only. No network
 payload/schema changes. Rehearse additive migration and old-writer refusal on a
@@ -413,3 +415,49 @@ was improved without changing admission semantics. Documentation, tool inventory
 architecture and preflight checks pass. Revised current, earlier and strict
 comparison charts were rendered for local inspection. No installed-app or live
 accounting migration was performed.
+
+
+## Local page implementation, 2026-09-09
+
+Implemented the approved compact model view in the existing web/native navigation.
+No reasoning-effort or custom date controls. Standard 7/30/All-time filters use
+cached local projections with daily medians (weekly beyond 366 days), separate
+receipt/legacy speed series, minimum-five P25/P75 bands, independent turn TTFT,
+coverage, synchronized keyboard/hover bin readouts and an aggregate table.
+
+The low-risk integration uses a separate lazy worker, rather than adding another
+observer to the accounting transaction. Source owners are the Codex provider
+(parser), platform (bounded reader and SQLite), reporting (pure aggregates),
+application (injected composition), and companion (worker lifecycle and HTTP).
+Existing CLI imports remain compatibility facades; product code never imports
+`tools/`. The shared rollout reader also keeps its original public facade.
+
+- Sidecar: `inference-timing-v2/timing-experiment.sqlite` beneath companion state.
+  The method-2 application ID, HMAC domain and schema remain unchanged. Creating
+  this independent store is additive; no accounting migration or destructive
+  conversion occurs. Method-1 stores remain preserved and refused.
+- First page request reads saved rows off the main thread. One worker coalesces
+  requests, leases for 60 seconds after the last page read, and cancels on close.
+  The UI polls only while this page and document are visible.
+- Discovery: plain JSONL sessions and archives, 50,000 entries, depth three, no
+  symlink traversal. Compressed/forked sources remain unsupported.
+- Background: maximum 32 MiB or 750 ms per pass, 4 MiB transactional chunks,
+  explicit yields and five-second pauses. Unchanged sources read zero rollout
+  bytes. Discovery and time-window refresh occur at most once a minute after
+  catch-up. Idle ticks do not recompute three full projections.
+- This conservative budget means a roughly 49 GB cold history can require over
+  two hours of page-active backfill; partial coverage stays labelled as updating.
+  Saved data remains immediately usable. No eager startup scan.
+- Storage retains the 256 MiB limit, 2 MiB SQLite cache, short lock timeout, bounded
+  parser state and atomic cursor/turn commits. Projection reads stop at 100,000
+  turns and preserve the last good view on overflow. Worker V8 old-generation
+  memory is capped at 128 MiB; this is not a total process RSS guarantee.
+- Failures are content-free and isolated from accounting. Stale data is labelled;
+  a full successful pass clears transient stale state. Unsupported Windows
+  ownership semantics fail unavailable rather than weakening the store contract.
+- These are device-local diagnostics across retained logs, not account-scoped
+  billing records or server decode-speed benchmarks. No contribution payloads
+  or external requests are added.
+
+Validation and rendered evidence are recorded in the
+[local page QA review](../reviews/2026-09-09-model-performance-page-qa.md).

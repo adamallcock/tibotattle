@@ -6,6 +6,7 @@ const PAGE_BY_TARGET = new Map([
   ["method", "method"],
   ["timeline", "trends"],
   ["trends", "trends"],
+  ["performance", "performance"],
   ["community", "community"],
   ["history", "community"],
   ["backend", "community"],
