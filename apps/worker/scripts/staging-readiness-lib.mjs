@@ -96,14 +96,30 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
     "0043_analytical_input_fencing.sql",
     "0044_attribution_transport_staging.sql",
     "0045_attribution_domain_activation.sql",
-    // Enrollment remains separate from direct upload ownership. Both modes
-    // are disabled by default; the successor adds an explicitly accountless
-    // authority graph without social sessions or public eligibility. Its
-    // lease renewal keeps that same graph private and does not create a new
-    // installation identity.
-    "0046_accountless_enrollment_ledger.sql",
-    "0047_accountless_upload_ownership.sql",
-    "0048_accountless_upload_renewal.sql",
+    "0046_v1_quota_fit_projection.sql",
+    "0047_community_analysis_work.sql",
+    // Separate, bounded historical-model checkpoints and terminal results.
+    // This does not activate telemetry v1.1 or rewrite accepted source rows.
+    "0048_community_model_history.sql",
+    // Preserve published graphs only across explicitly classified append-only
+    // inputs. Unknown mutations and corrections still invalidate atomically.
+    "0049_preserve_published_graph.sql",
+    // Scoped authorized corrections, exact historical dependencies, shared
+    // prepared source days, and change-triggered refresh completion receipts.
+    "0050_preserve_authorized_graph_updates.sql",
+    "0051_historical_window_dependencies.sql",
+    "0052_prepared_source_days.sql",
+    "0053_refresh_lane_watermarks.sql",
+    "0054_current_analysis_queue.sql",
+    "0055_captured_community_publication.sql",
+    "0056_preparation_progress_counters.sql",
+    // Accountless enrollment is a source-only, disabled-by-default boundary.
+    // These are forward successors to the deployed canonical 0046–0056
+    // lineage; the earlier staging-only 0046–0048 names are retained below
+    // solely as non-deployable rehearsal evidence.
+    "0057_accountless_enrollment_ledger.sql",
+    "0058_accountless_upload_ownership.sql",
+    "0059_accountless_upload_renewal.sql",
   ]),
   DELETION_LEDGER: Object.freeze([
     "0001_deletion_tombstones.sql",
@@ -111,11 +127,40 @@ export const EXPECTED_STAGING_MIGRATIONS = Object.freeze({
   ]),
 });
 
+// A prior synthetic-only staging rehearsal applied a divergent 0046–0048
+// accountless lineage. It must never be replayed or treated as current: its
+// database remains retained evidence until a separately approved canonical
+// replacement is prepared. Keep this closed sequence so unrelated drift is
+// never misclassified as that retained lineage.
+export const RETAINED_LEGACY_STAGING_MIGRATION_LINEAGE = Object.freeze([
+  ...EXPECTED_STAGING_MIGRATIONS.USAGE_MONITOR_DB.slice(0, 45),
+  "0046_accountless_enrollment_ledger.sql",
+  "0047_accountless_upload_ownership.sql",
+  "0048_accountless_upload_renewal.sql",
+]);
+
 // A current migration ledger is necessary, but not proof that its integrity
 // objects still exist. Both local release rehearsal and read-only staging
 // probes use this reviewed inventory; it never authorizes transport cutover.
 export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
   table: [
+    "community_graph_update_scope",
+    "community_model_history_dependencies",
+    "community_prepared_source_days",
+    "community_prepared_plan_rows",
+    "community_prepared_fit_rows",
+    "community_prepared_usage_rows",
+    "community_prepared_usage_bins",
+    "community_refresh_lanes",
+    "telemetry_v1_quota_fit_rows",
+    "telemetry_v1_quota_fit_backfill",
+    "community_analysis_work",
+    "community_analysis_work_parts",
+    "community_analysis_work_stage",
+    "community_model_history_work",
+    "community_model_history_work_parts",
+    "community_model_history_work_stage",
+    "community_model_history_results",
     "community_analytical_input_versions",
     "attribution_enrollments",
     "telemetry_transport_formats",
@@ -131,6 +176,15 @@ export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
     "telemetry_v11_domain_heads",
   ],
   index: [
+    "community_graph_update_scope_participant",
+    "community_model_history_dependencies_day",
+    "community_prepared_retirement_cursor",
+    "community_prepared_plan_cursor",
+    "community_prepared_fit_cursor",
+    "community_prepared_usage_cursor",
+    "community_prepared_bins_cursor",
+    "telemetry_v1_quota_fit_rows_cursor",
+    "community_model_history_results_day",
     "telemetry_contributions_successor_compatibility",
     "telemetry_v11_consents_device",
     "telemetry_v11_manifests_device_day",
@@ -151,6 +205,37 @@ export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
     "telemetry_v11_records_time_cursor",
   ],
   trigger: [
+    "community_refresh_fit_insert",
+    "community_refresh_fit_update",
+    "community_refresh_fit_delete",
+    "community_refresh_model_insert",
+    "community_refresh_model_update",
+    "community_refresh_model_delete",
+    "community_prepared_source_record_delete",
+    "community_prepared_source_record_update",
+    "community_model_history_dependency_legacy_insert",
+    "community_model_history_dependency_legacy_update",
+    "community_model_history_dependency_legacy_delete",
+    "community_model_history_dependency_successor_insert",
+    "community_model_history_dependency_successor_update",
+    "community_model_history_dependency_successor_delete",
+    "community_model_history_dependency_participant_state",
+    "community_analysis_work_parts_immutable",
+    "community_model_history_work_parts_immutable",
+    "community_model_history_v1_insert",
+    "community_model_history_v1_update",
+    "community_model_history_v1_delete",
+    "community_model_history_legacy_insert",
+    "community_model_history_legacy_update",
+    "community_model_history_legacy_delete",
+    "community_model_history_successor_insert",
+    "community_model_history_successor_update",
+    "community_model_history_successor_delete",
+    "community_model_history_participant_state",
+    "community_model_history_participant_delete",
+    "telemetry_v1_quota_fit_rows_insert",
+    "telemetry_v1_quota_fit_rows_update",
+    "telemetry_v1_quota_fit_rows_delete",
     "community_analytical_input_participant_created",
     "community_analytical_input_participant_state",
     "community_analytical_input_v1_insert",
@@ -207,12 +292,30 @@ export const ATTRIBUTION_SCHEMA_OBJECTS = Object.freeze(Object.entries({
 
 export const ATTRIBUTION_SCHEMA_COLUMNS = Object.freeze(Object.fromEntries(
   Object.entries({
+    community_graph_update_scope: ["singleton", "participant_id", "device_id", "stream", "chunk_day", "chunk_seq", "old_chunk_id", "new_chunk_id", "new_revision", "chunk_digest", "parser_version", "record_count", "authorization_id", "envelope_digest", "created_at", "expected_epoch", "phase"],
+    community_model_history_dependencies: ["participant_id", "day", "from_day", "dependency_revision", "input_fingerprint", "verified_input_revision"],
+    community_prepared_source_days: ["participant_id", "source_day", "generation", "source_fingerprint", "method_version", "device_id", "phase", "progress_revision", "cursor_time", "cursor_id", "quota_count", "usage_count", "plan_count", "fit_count", "fragment_count", "control_json", "control_sha256"],
+    community_prepared_plan_rows: ["participant_id", "source_day", "generation", "id", "observed_at", "device_id", "provider", "limit_id", "plan_type", "plan_variant"],
+    community_prepared_fit_rows: ["participant_id", "source_day", "generation", "id", "observed_at", "device_id", "provider", "limit_id", "plan_type", "plan_variant", "occurrence_id", "slot", "used_percent", "window_duration_minutes", "resets_at"],
+    community_prepared_usage_rows: ["participant_id", "source_day", "generation", "id", "observed_at", "occurrence_id", "provider", "session_uuid", "cost_nanousd", "pricing_status", "model_id"],
+    community_prepared_usage_bins: ["participant_id", "source_day", "generation", "id", "observed_at", "payload_json", "payload_sha256"],
+    community_refresh_lanes: ["lane", "source_epoch", "utc_day", "method_version", "state", "updated_at", "completed_at", "restart_reason"],
+    telemetry_v1_quota_fit_rows: ["record_id", "participant_id", "resets_at", "observed_at"],
+    telemetry_v1_quota_fit_backfill: ["singleton_id", "through_record_id", "last_record_id", "is_complete"],
+    community_analysis_work: ["participant_id", "run_id", "input_revision", "input_fingerprint", "source_kind", "source_method_version", "fixed_now", "observed_at_cutoff", "resets_at_cutoff", "window_minutes", "max_quota_rows", "phase", "progress_revision", "control_json", "manifest_json", "state_sha256", "reader_policy"],
+    community_analysis_work_parts: ["participant_id", "run_id", "component", "payload_json", "payload_sha256", "payload_bytes"],
+    community_analysis_work_stage: ["participant_id", "run_id", "stage_id", "base_progress_revision", "stage_revision", "mode", "target_phase", "target_control_json", "target_manifest_json", "write_manifest_json", "target_state_sha256", "replay_json", "write_offset", "verified_offset", "gc_component", "gc_sha256", "discard_input_revision", "state_sha256"],
+    community_model_history_work: ["participant_id", "run_id", "input_revision", "input_fingerprint", "source_kind", "source_method_version", "fixed_now", "observed_at_cutoff", "resets_at_cutoff", "window_minutes", "max_quota_rows", "phase", "progress_revision", "control_json", "manifest_json", "state_sha256", "reader_policy"],
+    community_model_history_work_parts: ["participant_id", "run_id", "component", "payload_json", "payload_sha256", "payload_bytes"],
+    community_model_history_work_stage: ["participant_id", "run_id", "stage_id", "base_progress_revision", "stage_revision", "mode", "target_phase", "target_control_json", "target_manifest_json", "write_manifest_json", "target_state_sha256", "replay_json", "write_offset", "verified_offset", "gc_component", "gc_sha256", "discard_input_revision", "state_sha256"],
+    community_model_history_results: ["participant_id", "day", "input_revision", "input_fingerprint", "method_version", "result_json", "computed_at", "dependency_revision"],
     community_analytical_input_versions: ["participant_id", "revision"],
+    community_snapshot_mutation_control: ["graph_append_epoch", "graph_invalidation_epoch", "graph_append_reason", "graph_last_change_reason", "graph_last_change_at", "graph_last_invalidated_at"],
     community_allowance_publication_state: ["attribution_method_version"],
     admin_community_allowance_preview_cache: ["attribution_method_version", "source_mutation_epoch"],
     community_allowance_fit_cache: ["input_fingerprint", "source_method_version"],
     community_model_composition_cache: ["input_fingerprint", "source_method_version"],
-    community_model_composition_days: ["attribution_method_version", "source_mutation_epoch"],
+    community_model_composition_days: ["attribution_method_version", "source_mutation_epoch", "history_method_version"],
     device_credential_rotations: ["recovery_proof_hash"],
     attribution_enrollments: ["participant_id", "namespace", "created_at"],
     telemetry_transport_formats: ["schema_version", "format_rank", "lifecycle"],
@@ -256,6 +359,829 @@ AND NOT EXISTS (
 ) AS v1_usage_cursor_index
 `;
 
+// The projection is indexed while empty and backfilled separately. Deployment
+// checks schema only: an incomplete backfill on a populated database is valid
+// here, while the runtime reader must refuse it until completion.
+// These are independent, exact stored-SQL contracts, not SQL loaded from the
+// migrations being checked. Preserve case and whitespace inside literals:
+// normalizing them could admit a different eligibility or checkpoint contract.
+const QUOTA_PROJECTION_SCHEMA_SQL = Object.freeze({
+  telemetry_v1_quota_fit_rows: `CREATE TABLE telemetry_v1_quota_fit_rows (
+  record_id INTEGER PRIMARY KEY
+    REFERENCES telemetry_v1_records(id) ON DELETE CASCADE,
+  participant_id TEXT NOT NULL,
+  resets_at TEXT NOT NULL,
+  observed_at TEXT NOT NULL
+) STRICT`,
+  telemetry_v1_quota_fit_backfill: `CREATE TABLE telemetry_v1_quota_fit_backfill (
+  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+  through_record_id INTEGER NOT NULL CHECK (through_record_id >= 0),
+  last_record_id INTEGER NOT NULL DEFAULT 0 CHECK (last_record_id >= 0),
+  is_complete INTEGER NOT NULL DEFAULT 0 CHECK (is_complete IN (0, 1)),
+  CHECK (last_record_id <= through_record_id)
+) STRICT`,
+  telemetry_v1_quota_fit_rows_insert: `CREATE TRIGGER telemetry_v1_quota_fit_rows_insert
+AFTER INSERT ON telemetry_v1_records
+WHEN NEW.stream = 'quota' AND NEW.limit_id = 'codex'
+  AND NEW.window_duration_minutes = 10080
+  AND NEW.provider IS NOT NULL AND NEW.plan_type IS NOT NULL
+  AND NEW.plan_variant IS NOT NULL AND NEW.resets_at IS NOT NULL
+  AND NEW.slot IS NOT NULL AND NEW.used_percent IS NOT NULL
+BEGIN
+  INSERT INTO telemetry_v1_quota_fit_rows
+    (record_id, participant_id, resets_at, observed_at)
+  VALUES (NEW.id, NEW.participant_id, NEW.resets_at, NEW.observed_at);
+END`,
+  telemetry_v1_quota_fit_rows_update: `CREATE TRIGGER telemetry_v1_quota_fit_rows_update
+AFTER UPDATE OF id, participant_id, stream, limit_id, window_duration_minutes,
+  provider, plan_type, plan_variant, resets_at, slot, used_percent, observed_at
+ON telemetry_v1_records
+BEGIN
+  DELETE FROM telemetry_v1_quota_fit_rows WHERE record_id = OLD.id;
+  INSERT INTO telemetry_v1_quota_fit_rows
+    (record_id, participant_id, resets_at, observed_at)
+  SELECT NEW.id, NEW.participant_id, NEW.resets_at, NEW.observed_at
+  WHERE NEW.stream = 'quota' AND NEW.limit_id = 'codex'
+    AND NEW.window_duration_minutes = 10080
+    AND NEW.provider IS NOT NULL AND NEW.plan_type IS NOT NULL
+    AND NEW.plan_variant IS NOT NULL AND NEW.resets_at IS NOT NULL
+    AND NEW.slot IS NOT NULL AND NEW.used_percent IS NOT NULL;
+END`,
+  telemetry_v1_quota_fit_rows_delete: `CREATE TRIGGER telemetry_v1_quota_fit_rows_delete
+AFTER DELETE ON telemetry_v1_records
+BEGIN
+  DELETE FROM telemetry_v1_quota_fit_rows WHERE record_id = OLD.id;
+END`,
+});
+
+const COMMUNITY_ANALYSIS_WORK_SCHEMA_SQL = Object.freeze({
+  community_analysis_work: `CREATE TABLE community_analysis_work (
+  participant_id TEXT PRIMARY KEY REFERENCES participants(id) ON DELETE CASCADE,
+  run_id TEXT NOT NULL,
+  input_revision INTEGER NOT NULL CHECK (input_revision >= 0 AND input_revision < 9007199254740991),
+  input_fingerprint TEXT NOT NULL CHECK (length(input_fingerprint) = 64 AND input_fingerprint NOT GLOB '*[^0-9a-f]*'),
+  source_kind TEXT NOT NULL CHECK (source_kind = 'v1'),
+  source_method_version TEXT NOT NULL CHECK (length(source_method_version) BETWEEN 1 AND 2048),
+  fixed_now TEXT NOT NULL,
+  observed_at_cutoff TEXT NOT NULL,
+  resets_at_cutoff TEXT NOT NULL,
+  window_minutes INTEGER NOT NULL CHECK (window_minutes > 0),
+  max_quota_rows INTEGER NOT NULL CHECK (max_quota_rows BETWEEN 1 AND 60000),
+  phase TEXT NOT NULL CHECK (phase IN ('plan', 'fitability', 'endpoints', 'complete')),
+  progress_revision INTEGER NOT NULL CHECK (progress_revision >= 0 AND progress_revision < 9007199254740991),
+  control_json TEXT NOT NULL CHECK (json_valid(control_json) AND length(CAST(control_json AS BLOB)) <= 16384),
+  manifest_json TEXT NOT NULL CHECK (json_valid(manifest_json) AND length(CAST(manifest_json AS BLOB)) <= 131072),
+  state_sha256 TEXT NOT NULL CHECK (length(state_sha256) = 64 AND state_sha256 NOT GLOB '*[^0-9a-f]*'),
+  UNIQUE (participant_id, run_id)
+) STRICT`,
+  community_analysis_work_parts: `CREATE TABLE community_analysis_work_parts (
+  participant_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  component TEXT NOT NULL CHECK (component IN ('plan-anchors', 'plan-runs', 'plan-equal-time', 'fit-stats', 'eligible', 'endpoint-runs', 'endpoints')),
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+  payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+  payload_bytes INTEGER NOT NULL CHECK (payload_bytes BETWEEN 1 AND 131072 AND payload_bytes = length(CAST(payload_json AS BLOB))),
+  PRIMARY KEY (participant_id, run_id, component, payload_sha256),
+  FOREIGN KEY (participant_id, run_id) REFERENCES community_analysis_work(participant_id, run_id) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID`,
+  community_analysis_work_parts_immutable: `CREATE TRIGGER community_analysis_work_parts_immutable
+BEFORE UPDATE ON community_analysis_work_parts
+BEGIN
+  SELECT RAISE(ABORT, 'community analysis part immutable');
+END`,
+  community_analysis_work_stage: `CREATE TABLE community_analysis_work_stage (
+  participant_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  stage_id TEXT NOT NULL,
+  base_progress_revision INTEGER NOT NULL CHECK (base_progress_revision >= 0 AND base_progress_revision < 9007199254740990),
+  stage_revision INTEGER NOT NULL CHECK (stage_revision >= 0 AND stage_revision < 9007199254740991),
+  mode TEXT NOT NULL CHECK (mode IN ('writing', 'verifying', 'garbage_collecting', 'discarding')),
+  target_phase TEXT NOT NULL CHECK (target_phase IN ('plan', 'fitability', 'endpoints', 'complete')),
+  target_control_json TEXT NOT NULL CHECK (json_valid(target_control_json) AND length(CAST(target_control_json AS BLOB)) <= 16384),
+  target_manifest_json TEXT NOT NULL CHECK (json_valid(target_manifest_json) AND json_type(target_manifest_json) = 'array' AND json_array_length(target_manifest_json) <= 1024 AND length(CAST(target_manifest_json AS BLOB)) <= 131072),
+  write_manifest_json TEXT NOT NULL CHECK (json_valid(write_manifest_json) AND json_type(write_manifest_json) = 'array' AND json_array_length(write_manifest_json) <= 1024 AND length(CAST(write_manifest_json AS BLOB)) <= 131072),
+  target_state_sha256 TEXT NOT NULL CHECK (length(target_state_sha256) = 64 AND target_state_sha256 NOT GLOB '*[^0-9a-f]*'),
+  replay_json TEXT NOT NULL CHECK (json_valid(replay_json) AND length(CAST(replay_json AS BLOB)) <= 16384),
+  write_offset INTEGER NOT NULL CHECK (write_offset BETWEEN 0 AND 1024),
+  verified_offset INTEGER NOT NULL CHECK (verified_offset BETWEEN 0 AND 1024),
+  gc_component TEXT NOT NULL,
+  gc_sha256 TEXT NOT NULL,
+  discard_input_revision INTEGER CHECK (discard_input_revision >= 0 AND discard_input_revision < 9007199254740991),
+  state_sha256 TEXT NOT NULL CHECK (length(state_sha256) = 64 AND state_sha256 NOT GLOB '*[^0-9a-f]*'),
+  FOREIGN KEY (participant_id, run_id) REFERENCES community_analysis_work(participant_id, run_id) ON DELETE CASCADE
+) STRICT`,
+});
+
+// History reuses the independently reviewed checkpoint contract in a separate
+// fixed namespace. Never read these expectations from the migration under
+// test: a changed migration must not silently redefine its own proof.
+const COMMUNITY_MODEL_HISTORY_SCHEMA_SQL = Object.freeze({
+  ...Object.fromEntries(Object.entries(COMMUNITY_ANALYSIS_WORK_SCHEMA_SQL)
+    .map(([name, sql]) => [
+      name.replaceAll("community_analysis_work", "community_model_history_work"),
+      sql.replaceAll("community_analysis_work", "community_model_history_work"),
+    ])),
+  community_model_history_results: `CREATE TABLE community_model_history_results (
+  participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  day TEXT NOT NULL CHECK (day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  input_revision INTEGER NOT NULL CHECK (input_revision >= 0 AND input_revision < 9007199254740991),
+  input_fingerprint TEXT NOT NULL CHECK (length(input_fingerprint) = 64 AND input_fingerprint NOT GLOB '*[^0-9a-f]*'),
+  method_version TEXT NOT NULL CHECK (length(method_version) BETWEEN 1 AND 4096),
+  result_json TEXT NOT NULL CHECK (json_valid(result_json) AND length(CAST(result_json AS BLOB)) <= 16384),
+  computed_at TEXT NOT NULL,
+  PRIMARY KEY (participant_id, day)
+) STRICT, WITHOUT ROWID`,
+  community_model_history_results_day: `CREATE INDEX community_model_history_results_day ON community_model_history_results(day, participant_id)`,
+  // SQLite preserves earlier ALTER-added columns in the stored CREATE SQL.
+  // Pin the final table to reject provenance defaults, affinity, nullability,
+  // hidden expressions or constraints that change the snapshot basis.
+  community_model_composition_days: `CREATE TABLE community_model_composition_days (
+  day TEXT PRIMARY KEY CHECK (day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  payload_json TEXT NOT NULL CHECK (length(payload_json) <= 16384),
+  computed_at TEXT NOT NULL
+, attribution_method_version TEXT, source_mutation_epoch INTEGER, history_method_version TEXT) STRICT`,
+  community_model_history_v1_insert: `CREATE TRIGGER community_model_history_v1_insert
+AFTER INSERT ON telemetry_v1_chunks FOR EACH ROW WHEN NEW.superseded_at IS NULL
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL AND day BETWEEN NEW.chunk_day AND date(NEW.chunk_day, '+100 days');
+END`,
+  community_model_history_v1_update: `CREATE TRIGGER community_model_history_v1_update
+AFTER UPDATE ON telemetry_v1_chunks FOR EACH ROW WHEN OLD.superseded_at IS NULL OR NEW.superseded_at IS NULL
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL AND (day BETWEEN OLD.chunk_day AND date(OLD.chunk_day, '+100 days') OR day BETWEEN NEW.chunk_day AND date(NEW.chunk_day, '+100 days'));
+END`,
+  community_model_history_v1_delete: `CREATE TRIGGER community_model_history_v1_delete
+AFTER DELETE ON telemetry_v1_chunks FOR EACH ROW WHEN OLD.superseded_at IS NULL
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL AND day BETWEEN OLD.chunk_day AND date(OLD.chunk_day, '+100 days');
+END`,
+  community_model_history_legacy_insert: `CREATE TRIGGER community_model_history_legacy_insert
+AFTER INSERT ON telemetry_contributions FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_legacy_update: `CREATE TRIGGER community_model_history_legacy_update
+AFTER UPDATE ON telemetry_contributions FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_legacy_delete: `CREATE TRIGGER community_model_history_legacy_delete
+AFTER DELETE ON telemetry_contributions FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_successor_insert: `CREATE TRIGGER community_model_history_successor_insert
+AFTER INSERT ON telemetry_v11_domain_heads FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_successor_update: `CREATE TRIGGER community_model_history_successor_update
+AFTER UPDATE ON telemetry_v11_domain_heads FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_successor_delete: `CREATE TRIGGER community_model_history_successor_delete
+AFTER DELETE ON telemetry_v11_domain_heads FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_participant_state: `CREATE TRIGGER community_model_history_participant_state
+AFTER UPDATE OF state ON participants FOR EACH ROW WHEN OLD.state IS NOT NEW.state
+BEGIN
+  DELETE FROM community_model_history_work WHERE participant_id = NEW.id;
+  DELETE FROM community_model_history_results WHERE participant_id = NEW.id;
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+END`,
+  community_model_history_participant_delete: `CREATE TRIGGER community_model_history_participant_delete
+BEFORE DELETE ON participants FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+  DELETE FROM admin_community_allowance_preview_cache;
+END`,
+});
+
+// Independently reviewed preservation policy. In particular, the append marker
+// is single-use and first-revision, active-owner, unmixed, single-device input
+// only. Every other mutation advances the hard fence and removes the preview.
+// Do not derive these expectations from 0049 or normalize its guard literals.
+const COMMUNITY_GRAPH_PRESERVATION_SCHEMA_SQL = Object.freeze({
+  // Historical seek indexes now explicitly required by the append classifier.
+  // Their names alone do not prove the bounded participant/device/day path.
+  device_credentials_participant_state: `CREATE INDEX device_credentials_participant_state
+  ON device_credentials(participant_id, state, expires_at)`,
+  telemetry_v1_chunks_device_day: `CREATE INDEX telemetry_v1_chunks_device_day
+  ON telemetry_v1_chunks(participant_id, device_id, chunk_day, stream,
+    chunk_seq)
+  WHERE superseded_at IS NULL`,
+  community_snapshot_mutation_control: `CREATE TABLE community_snapshot_mutation_control (
+  singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+  mutation_epoch INTEGER NOT NULL DEFAULT 0 CHECK (mutation_epoch >= 0)
+, graph_append_epoch INTEGER NOT NULL DEFAULT -1, graph_invalidation_epoch INTEGER NOT NULL DEFAULT 0) STRICT`,
+  community_allowance_input_mutated: `CREATE TRIGGER community_allowance_input_mutated
+AFTER UPDATE OF mutation_epoch ON community_snapshot_mutation_control
+FOR EACH ROW WHEN OLD.mutation_epoch IS NOT NEW.mutation_epoch
+BEGIN
+  UPDATE community_allowance_publication_state
+     SET publication_state = 'updating', changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+   WHERE singleton = 1;
+  UPDATE community_snapshot_mutation_control SET graph_invalidation_epoch = NEW.mutation_epoch
+   WHERE singleton_id = 1 AND NOT (
+     NEW.mutation_epoch = OLD.mutation_epoch + 1
+     AND NEW.graph_append_epoch = NEW.mutation_epoch
+     AND NEW.graph_append_epoch IS NOT OLD.graph_append_epoch
+   );
+  DELETE FROM admin_community_allowance_preview_cache WHERE NOT (
+    NEW.mutation_epoch = OLD.mutation_epoch + 1
+    AND NEW.graph_append_epoch = NEW.mutation_epoch
+    AND NEW.graph_append_epoch IS NOT OLD.graph_append_epoch
+  );
+END`,
+  community_analytical_input_v1_insert: `CREATE TRIGGER community_analytical_input_v1_insert
+AFTER INSERT ON telemetry_v1_chunks
+FOR EACH ROW WHEN NEW.superseded_at IS NULL
+BEGIN
+  INSERT INTO community_analytical_input_versions (participant_id, revision)
+    SELECT id, 1 FROM participants WHERE id = NEW.participant_id
+    ON CONFLICT(participant_id) DO UPDATE SET revision = revision + 1;
+  UPDATE community_snapshot_mutation_control SET
+    mutation_epoch = mutation_epoch + 1,
+    graph_append_epoch = (CASE WHEN
+      NEW.revision = 1
+      AND EXISTS (SELECT 1 FROM participants WHERE id = NEW.participant_id AND state = 'active')
+      AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads WHERE participant_id = NEW.participant_id)
+      AND NOT EXISTS (SELECT 1 FROM telemetry_contributions
+        WHERE participant_id = NEW.participant_id AND status = 'accepted')
+      AND NOT EXISTS (SELECT 1 FROM telemetry_v1_chunks c
+        WHERE c.participant_id = NEW.participant_id AND c.device_id = NEW.device_id
+          AND c.stream = NEW.stream AND c.chunk_day = NEW.chunk_day AND c.chunk_seq = NEW.chunk_seq
+          AND c.id <> NEW.id)
+      AND NOT EXISTS (SELECT 1 FROM device_credentials d
+        WHERE d.participant_id = NEW.participant_id AND d.id <> NEW.device_id
+          AND EXISTS (SELECT 1 FROM telemetry_v1_chunks c INDEXED BY telemetry_v1_chunks_device_day
+            WHERE c.participant_id = NEW.participant_id AND c.device_id = d.id
+              AND c.chunk_day = NEW.chunk_day AND c.superseded_at IS NULL AND c.accepted_record_count > 0))
+    THEN mutation_epoch + 1 ELSE -1 END)
+  WHERE singleton_id = 1;
+END`,
+});
+
+// Independently maintained latest contracts. These literals and closed field
+// lists are reviewed alongside (never loaded from) the migrations under test.
+// Keeping predecessor expectations separate preserves historical rehearsals.
+const CURRENT_GRAPH_PRESERVATION_SCHEMA_SQL = Object.freeze({
+  device_credentials_participant_state: COMMUNITY_GRAPH_PRESERVATION_SCHEMA_SQL.device_credentials_participant_state,
+  telemetry_v1_chunks_device_day: COMMUNITY_GRAPH_PRESERVATION_SCHEMA_SQL.telemetry_v1_chunks_device_day,
+  community_graph_update_scope: `CREATE TABLE community_graph_update_scope (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  device_id TEXT NOT NULL,
+  stream TEXT NOT NULL,
+  chunk_day TEXT NOT NULL,
+  chunk_seq INTEGER NOT NULL,
+  old_chunk_id TEXT,
+  new_chunk_id TEXT NOT NULL,
+  new_revision INTEGER NOT NULL,
+  chunk_digest TEXT NOT NULL,
+  parser_version TEXT NOT NULL,
+  record_count INTEGER NOT NULL,
+  authorization_id TEXT NOT NULL,
+  envelope_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expected_epoch INTEGER NOT NULL,
+  phase TEXT NOT NULL CHECK (phase IN ('supersede', 'insert'))
+) STRICT`,
+  community_graph_update_scope_participant: "CREATE INDEX community_graph_update_scope_participant ON community_graph_update_scope(participant_id)",
+  community_snapshot_mutation_control: `CREATE TABLE community_snapshot_mutation_control (
+  singleton_id INTEGER PRIMARY KEY NOT NULL CHECK (singleton_id = 1),
+  mutation_epoch INTEGER NOT NULL DEFAULT 0 CHECK (mutation_epoch >= 0)
+, graph_append_epoch INTEGER NOT NULL DEFAULT -1, graph_invalidation_epoch INTEGER NOT NULL DEFAULT 0, graph_append_reason TEXT, graph_last_change_reason TEXT, graph_last_change_at TEXT, graph_last_invalidated_at TEXT) STRICT`,
+  community_allowance_input_mutated: `CREATE TRIGGER community_allowance_input_mutated
+AFTER UPDATE OF mutation_epoch ON community_snapshot_mutation_control
+FOR EACH ROW WHEN OLD.mutation_epoch IS NOT NEW.mutation_epoch
+BEGIN
+  UPDATE community_allowance_publication_state
+    SET publication_state = 'updating', changed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE singleton = 1;
+  UPDATE community_snapshot_mutation_control SET
+    graph_last_change_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+    graph_last_change_reason = (CASE WHEN
+      NEW.mutation_epoch = OLD.mutation_epoch + 1
+      AND NEW.graph_append_epoch = NEW.mutation_epoch
+      AND NEW.graph_append_epoch IS NOT OLD.graph_append_epoch
+      THEN COALESCE(NEW.graph_append_reason, 'accepted-append')
+      ELSE 'authority-or-unrecognized-change' END)
+    WHERE singleton_id = 1;
+  UPDATE community_snapshot_mutation_control SET
+    graph_invalidation_epoch = NEW.mutation_epoch,
+    graph_last_invalidated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+    WHERE singleton_id = 1 AND NOT (
+      NEW.mutation_epoch = OLD.mutation_epoch + 1
+      AND NEW.graph_append_epoch = NEW.mutation_epoch
+      AND NEW.graph_append_epoch IS NOT OLD.graph_append_epoch
+    );
+  DELETE FROM admin_community_allowance_preview_cache WHERE NOT (
+    NEW.mutation_epoch = OLD.mutation_epoch + 1
+    AND NEW.graph_append_epoch = NEW.mutation_epoch
+    AND NEW.graph_append_epoch IS NOT OLD.graph_append_epoch
+  );
+END`,
+  community_analytical_input_v1_update: `CREATE TRIGGER community_analytical_input_v1_update
+AFTER UPDATE ON telemetry_v1_chunks
+FOR EACH ROW WHEN (OLD.superseded_at IS NULL OR NEW.superseded_at IS NULL) AND (
+  OLD.id IS NOT NEW.id OR OLD.participant_id IS NOT NEW.participant_id
+  OR OLD.device_id IS NOT NEW.device_id OR OLD.stream IS NOT NEW.stream
+  OR OLD.chunk_day IS NOT NEW.chunk_day OR OLD.chunk_seq IS NOT NEW.chunk_seq
+  OR OLD.revision IS NOT NEW.revision OR OLD.chunk_digest IS NOT NEW.chunk_digest
+  OR OLD.parser_version IS NOT NEW.parser_version OR OLD.record_count IS NOT NEW.record_count
+  OR OLD.accepted_record_count IS NOT NEW.accepted_record_count
+  OR OLD.created_at IS NOT NEW.created_at OR OLD.superseded_at IS NOT NEW.superseded_at
+  OR OLD.device_upload_authorization_id IS NOT NEW.device_upload_authorization_id
+)
+BEGIN
+  INSERT INTO community_analytical_input_versions (participant_id, revision)
+    SELECT id, 1 FROM participants WHERE id = OLD.participant_id OR id = NEW.participant_id
+    ON CONFLICT(participant_id) DO UPDATE SET revision = revision + 1;
+  UPDATE community_snapshot_mutation_control SET
+    mutation_epoch = mutation_epoch + 1,
+    graph_append_reason = 'accepted-correction',
+    graph_append_epoch = (CASE WHEN EXISTS (
+      SELECT 1 FROM community_graph_update_scope u
+      WHERE u.singleton = 1 AND u.phase = 'supersede' AND u.expected_epoch = mutation_epoch
+        AND u.old_chunk_id = OLD.id AND u.participant_id = OLD.participant_id
+        AND u.device_id = OLD.device_id AND u.stream = OLD.stream
+        AND u.chunk_day = OLD.chunk_day AND u.chunk_seq = OLD.chunk_seq
+        AND u.new_revision = OLD.revision + 1
+        AND OLD.superseded_at IS NULL AND NEW.superseded_at = u.created_at
+        AND NEW.id = OLD.id AND NEW.participant_id = OLD.participant_id
+        AND NEW.device_id = OLD.device_id AND NEW.stream = OLD.stream
+        AND NEW.chunk_day = OLD.chunk_day AND NEW.chunk_seq = OLD.chunk_seq
+        AND NEW.revision = OLD.revision AND NEW.chunk_digest = OLD.chunk_digest
+        AND NEW.parser_version = OLD.parser_version AND NEW.record_count = OLD.record_count
+        AND NEW.accepted_record_count = OLD.accepted_record_count AND NEW.created_at = OLD.created_at
+        AND NEW.device_upload_authorization_id = OLD.device_upload_authorization_id
+    ) THEN mutation_epoch + 1 ELSE -1 END)
+    WHERE singleton_id = 1;
+  UPDATE community_graph_update_scope SET expected_epoch = expected_epoch + 1, phase = 'insert'
+    WHERE old_chunk_id = OLD.id AND phase = 'supersede'
+      AND expected_epoch + 1 = (SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1)
+      AND expected_epoch + 1 = (SELECT graph_append_epoch FROM community_snapshot_mutation_control WHERE singleton_id = 1);
+END`,
+  community_analytical_input_v1_insert: `CREATE TRIGGER community_analytical_input_v1_insert
+AFTER INSERT ON telemetry_v1_chunks
+FOR EACH ROW WHEN NEW.superseded_at IS NULL
+BEGIN
+  INSERT INTO community_analytical_input_versions (participant_id, revision)
+    SELECT id, 1 FROM participants WHERE id = NEW.participant_id
+    ON CONFLICT(participant_id) DO UPDATE SET revision = revision + 1;
+  UPDATE community_snapshot_mutation_control SET
+    mutation_epoch = mutation_epoch + 1,
+    graph_append_reason = (CASE WHEN EXISTS (SELECT 1 FROM community_graph_update_scope
+      WHERE new_chunk_id = NEW.id AND old_chunk_id IS NOT NULL) THEN 'accepted-correction' ELSE 'accepted-append' END),
+    graph_append_epoch = (CASE WHEN EXISTS (
+      SELECT 1 FROM community_graph_update_scope u
+      WHERE u.singleton = 1 AND u.phase = 'insert' AND u.expected_epoch = mutation_epoch
+        AND u.new_chunk_id = NEW.id AND u.participant_id = NEW.participant_id
+        AND u.device_id = NEW.device_id AND u.stream = NEW.stream
+        AND u.chunk_day = NEW.chunk_day AND u.chunk_seq = NEW.chunk_seq
+        AND u.new_revision = NEW.revision AND u.chunk_digest = NEW.chunk_digest
+        AND u.parser_version = NEW.parser_version AND u.record_count = NEW.record_count
+        AND u.record_count = NEW.accepted_record_count AND u.created_at = NEW.created_at
+        AND u.authorization_id = NEW.device_upload_authorization_id AND u.envelope_digest = NEW.envelope_digest
+    ) OR (
+      NEW.revision = 1
+      AND EXISTS (SELECT 1 FROM participants WHERE id = NEW.participant_id AND state = 'active')
+      AND NOT EXISTS (SELECT 1 FROM telemetry_v11_domain_heads WHERE participant_id = NEW.participant_id)
+      AND NOT EXISTS (SELECT 1 FROM telemetry_contributions WHERE participant_id = NEW.participant_id AND status = 'accepted')
+      AND NOT EXISTS (SELECT 1 FROM telemetry_v1_chunks c WHERE c.participant_id = NEW.participant_id
+        AND c.device_id = NEW.device_id AND c.stream = NEW.stream AND c.chunk_day = NEW.chunk_day
+        AND c.chunk_seq = NEW.chunk_seq AND c.id <> NEW.id)
+      AND NOT EXISTS (SELECT 1 FROM device_credentials d WHERE d.participant_id = NEW.participant_id
+        AND d.id <> NEW.device_id AND EXISTS (SELECT 1 FROM telemetry_v1_chunks c INDEXED BY telemetry_v1_chunks_device_day
+          WHERE c.participant_id = NEW.participant_id AND c.device_id = d.id AND c.chunk_day = NEW.chunk_day
+            AND c.superseded_at IS NULL AND c.accepted_record_count > 0))
+    ) THEN mutation_epoch + 1 ELSE -1 END)
+    WHERE singleton_id = 1;
+  DELETE FROM community_graph_update_scope WHERE new_chunk_id = NEW.id;
+END`,
+});
+const LEGACY_ANALYTICAL_CHANGE_FIELDS = Object.freeze([
+  "id", "participant_id", "plaintext_digest", "status", "schema_version", "range_start", "range_end",
+  "client_platform", "provider_policy_epoch", "estimated_api_cost_usd", "priced_event_coverage_percent",
+  "unknown_model_event_count", "unknown_billable_units", "price_basis", "declared_record_count", "created_at",
+  "upload_authorization_id", "device_upload_authorization_id", "server_cost_nanousd", "server_priced_event_count",
+  "server_partially_priced_event_count", "server_unpriced_event_count", "server_pricing_method_version",
+  "server_price_registry_version", "server_price_registry_sha256", "transport_schema_version", "dataset_id",
+  "dataset_part_index", "dataset_part_count", "dataset_completeness", "dataset_range_start", "dataset_range_end",
+  "accepted_record_count", "server_price_basis", "server_price_epoch_basis", "server_price_event_time_start",
+  "server_price_event_time_end",
+]);
+const LEGACY_ANALYTICAL_UPDATE_PREDICATE = LEGACY_ANALYTICAL_CHANGE_FIELDS
+  .map((name, index) => `  ${index === 0 ? "" : "OR "}OLD.${name} IS NOT NEW.${name}`).join("\n");
+const legacyUpdateTrigger = (name, body) => `CREATE TRIGGER ${name}
+AFTER UPDATE ON telemetry_contributions FOR EACH ROW WHEN (OLD.status = 'accepted' OR NEW.status = 'accepted') AND (
+${LEGACY_ANALYTICAL_UPDATE_PREDICATE}
+)
+BEGIN
+${body}
+END`;
+const INCREMENTAL_HISTORY_SCHEMA_SQL = Object.freeze({
+  community_model_history_dependencies: `CREATE TABLE community_model_history_dependencies (
+  participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  day TEXT NOT NULL CHECK (day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+  from_day TEXT NOT NULL CHECK (from_day = date(day, '-100 days')),
+  dependency_revision INTEGER NOT NULL DEFAULT 0
+    CHECK (dependency_revision >= 0 AND dependency_revision < 9007199254740991),
+  input_fingerprint TEXT CHECK (input_fingerprint IS NULL OR
+    (length(input_fingerprint) = 64 AND input_fingerprint NOT GLOB '*[^0-9a-f]*')),
+  verified_input_revision INTEGER CHECK (verified_input_revision IS NULL OR
+    (verified_input_revision >= 0 AND verified_input_revision < 9007199254740991)),
+  PRIMARY KEY (participant_id, day)
+) STRICT, WITHOUT ROWID`,
+  community_model_history_dependencies_day: `CREATE INDEX community_model_history_dependencies_day
+  ON community_model_history_dependencies(day, participant_id)`,
+  community_model_history_v1_insert: `CREATE TRIGGER community_model_history_v1_insert
+AFTER INSERT ON telemetry_v1_chunks FOR EACH ROW WHEN NEW.superseded_at IS NULL
+BEGIN
+  UPDATE community_model_history_dependencies
+     SET dependency_revision = dependency_revision + 1, input_fingerprint = NULL, verified_input_revision = NULL
+   WHERE participant_id = NEW.participant_id AND day BETWEEN NEW.chunk_day AND date(NEW.chunk_day, '+100 days');
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL
+    AND day BETWEEN NEW.chunk_day AND date(NEW.chunk_day, '+100 days');
+END`,
+  community_model_history_v1_update: `CREATE TRIGGER community_model_history_v1_update
+AFTER UPDATE ON telemetry_v1_chunks FOR EACH ROW
+WHEN (OLD.superseded_at IS NULL OR NEW.superseded_at IS NULL) AND (
+  OLD.id IS NOT NEW.id OR OLD.participant_id IS NOT NEW.participant_id OR OLD.device_id IS NOT NEW.device_id
+  OR OLD.stream IS NOT NEW.stream OR OLD.chunk_day IS NOT NEW.chunk_day OR OLD.chunk_seq IS NOT NEW.chunk_seq
+  OR OLD.revision IS NOT NEW.revision OR OLD.chunk_digest IS NOT NEW.chunk_digest
+  OR OLD.parser_version IS NOT NEW.parser_version OR OLD.record_count IS NOT NEW.record_count
+  OR OLD.accepted_record_count IS NOT NEW.accepted_record_count OR OLD.created_at IS NOT NEW.created_at
+  OR OLD.superseded_at IS NOT NEW.superseded_at
+  OR OLD.device_upload_authorization_id IS NOT NEW.device_upload_authorization_id
+)
+BEGIN
+  UPDATE community_model_history_dependencies
+     SET dependency_revision = dependency_revision + 1, input_fingerprint = NULL, verified_input_revision = NULL
+   WHERE (participant_id = OLD.participant_id AND day BETWEEN OLD.chunk_day AND date(OLD.chunk_day, '+100 days'))
+      OR (participant_id = NEW.participant_id AND day BETWEEN NEW.chunk_day AND date(NEW.chunk_day, '+100 days'));
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL
+    AND (day BETWEEN OLD.chunk_day AND date(OLD.chunk_day, '+100 days')
+      OR day BETWEEN NEW.chunk_day AND date(NEW.chunk_day, '+100 days'));
+END`,
+  community_model_history_v1_delete: `CREATE TRIGGER community_model_history_v1_delete
+AFTER DELETE ON telemetry_v1_chunks FOR EACH ROW WHEN OLD.superseded_at IS NULL
+BEGIN
+  UPDATE community_model_history_dependencies
+     SET dependency_revision = dependency_revision + 1, input_fingerprint = NULL, verified_input_revision = NULL
+   WHERE participant_id = OLD.participant_id AND day BETWEEN OLD.chunk_day AND date(OLD.chunk_day, '+100 days');
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL
+    AND day BETWEEN OLD.chunk_day AND date(OLD.chunk_day, '+100 days');
+END`,
+  community_analytical_input_legacy_update: legacyUpdateTrigger("community_analytical_input_legacy_update", `  INSERT INTO community_analytical_input_versions (participant_id,revision)
+    SELECT id,1 FROM participants WHERE id=OLD.participant_id OR id=NEW.participant_id
+    ON CONFLICT(participant_id) DO UPDATE SET revision=revision+1;
+  UPDATE community_snapshot_mutation_control SET mutation_epoch=mutation_epoch+1 WHERE singleton_id=1;`),
+  community_model_history_legacy_update: legacyUpdateTrigger("community_model_history_legacy_update",
+    "  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;"),
+  community_model_history_dependency_legacy_update: legacyUpdateTrigger("community_model_history_dependency_legacy_update", `  UPDATE community_model_history_dependencies
+     SET dependency_revision = dependency_revision + 1, input_fingerprint = NULL, verified_input_revision = NULL
+   WHERE participant_id = OLD.participant_id OR participant_id = NEW.participant_id;`),
+  ...Object.fromEntries([["insert", "NEW"], ["delete", "OLD"]].map(([event, row]) => [
+    `community_model_history_dependency_legacy_${event}`, `CREATE TRIGGER community_model_history_dependency_legacy_${event}
+AFTER ${event.toUpperCase()} ON telemetry_contributions FOR EACH ROW WHEN ${row}.status = 'accepted'
+BEGIN
+  UPDATE community_model_history_dependencies
+     SET dependency_revision = dependency_revision + 1, input_fingerprint = NULL, verified_input_revision = NULL
+   WHERE participant_id = ${row}.participant_id;
+END`,
+  ])),
+  ...Object.fromEntries([["insert", "participant_id = NEW.participant_id"],
+    ["update", "participant_id = OLD.participant_id OR participant_id = NEW.participant_id"],
+    ["delete", "participant_id = OLD.participant_id"]].map(([event, predicate]) => [
+    `community_model_history_dependency_successor_${event}`, `CREATE TRIGGER community_model_history_dependency_successor_${event}
+AFTER ${event.toUpperCase()} ON telemetry_v11_domain_heads FOR EACH ROW
+BEGIN
+  DELETE FROM community_model_history_dependencies WHERE ${predicate};
+END`,
+  ])),
+  community_model_history_dependency_participant_state: `CREATE TRIGGER community_model_history_dependency_participant_state
+AFTER UPDATE OF state ON participants FOR EACH ROW WHEN OLD.state IS NOT NEW.state
+BEGIN
+  DELETE FROM community_model_history_dependencies WHERE participant_id = NEW.id;
+END`,
+});
+
+const READER_POLICY_COLUMN_SQL = `reader_policy TEXT NOT NULL DEFAULT 'raw-source-pages-1'
+  CHECK (reader_policy IN ('raw-source-pages-1', 'prepared-source-days-1'))`;
+function withReviewedReaderPolicy(sql) {
+  return sql.replace(",\n  UNIQUE (participant_id, run_id)", `, ${READER_POLICY_COLUMN_SQL},\n  UNIQUE (participant_id, run_id)`);
+}
+const CURRENT_ANALYSIS_WORK_SCHEMA_SQL = Object.freeze({
+  ...COMMUNITY_ANALYSIS_WORK_SCHEMA_SQL,
+  community_analysis_work: withReviewedReaderPolicy(COMMUNITY_ANALYSIS_WORK_SCHEMA_SQL.community_analysis_work),
+});
+const CURRENT_MODEL_HISTORY_SCHEMA_SQL = Object.freeze({
+  ...COMMUNITY_MODEL_HISTORY_SCHEMA_SQL,
+  ...INCREMENTAL_HISTORY_SCHEMA_SQL,
+  community_model_history_work: withReviewedReaderPolicy(COMMUNITY_MODEL_HISTORY_SCHEMA_SQL.community_model_history_work),
+  community_model_history_results: COMMUNITY_MODEL_HISTORY_SCHEMA_SQL.community_model_history_results.replace(
+    "computed_at TEXT NOT NULL,", `computed_at TEXT NOT NULL, dependency_revision INTEGER
+  CHECK (dependency_revision IS NULL OR (dependency_revision >= 0 AND dependency_revision < 9007199254740991)),`),
+});
+
+const PREPARED_SOURCE_DAY_SCHEMA_SQL = Object.freeze({
+  community_prepared_source_days: `CREATE TABLE community_prepared_source_days (
+  participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  source_day TEXT NOT NULL,
+  generation TEXT NOT NULL CHECK (length(generation) = 64 AND generation NOT GLOB '*[^0-9a-f]*'),
+  source_fingerprint TEXT NOT NULL CHECK (length(source_fingerprint) = 64 AND source_fingerprint NOT GLOB '*[^0-9a-f]*'),
+  method_version TEXT NOT NULL CHECK (length(method_version) BETWEEN 1 AND 256),
+  device_id TEXT NOT NULL,
+  phase TEXT NOT NULL CHECK (phase IN ('quota', 'usage', 'complete', 'discarding')),
+  progress_revision INTEGER NOT NULL CHECK (progress_revision >= 0 AND progress_revision < 9007199254740991),
+  cursor_time TEXT NOT NULL,
+  cursor_id INTEGER NOT NULL CHECK (cursor_id >= 0 AND cursor_id < 9007199254740991),
+  quota_count INTEGER NOT NULL CHECK (quota_count >= 0 AND quota_count < 9007199254740991),
+  usage_count INTEGER NOT NULL CHECK (usage_count >= 0 AND usage_count < 9007199254740991),
+  plan_count INTEGER NOT NULL CHECK (plan_count >= 0 AND plan_count < 9007199254740991),
+  fit_count INTEGER NOT NULL CHECK (fit_count >= 0 AND fit_count < 9007199254740991),
+  fragment_count INTEGER NOT NULL CHECK (fragment_count >= 0 AND fragment_count < 9007199254740991),
+  control_json TEXT NOT NULL CHECK (json_valid(control_json) AND length(CAST(control_json AS BLOB)) <= 16384),
+  control_sha256 TEXT NOT NULL CHECK (length(control_sha256) = 64 AND control_sha256 NOT GLOB '*[^0-9a-f]*'),
+  PRIMARY KEY (participant_id, source_day),
+  UNIQUE (participant_id, source_day, generation)
+) STRICT, WITHOUT ROWID`,
+  community_prepared_retirement_cursor: "CREATE INDEX community_prepared_retirement_cursor ON community_prepared_source_days(phase, participant_id, source_day)",
+  community_prepared_plan_rows: `CREATE TABLE community_prepared_plan_rows (
+  participant_id TEXT NOT NULL,
+  source_day TEXT NOT NULL,
+  generation TEXT NOT NULL,
+  id INTEGER NOT NULL CHECK (id > 0),
+  observed_at TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  provider TEXT,
+  limit_id TEXT,
+  plan_type TEXT,
+  plan_variant TEXT,
+  PRIMARY KEY (participant_id, source_day, generation, id),
+  FOREIGN KEY (participant_id, source_day, generation)
+    REFERENCES community_prepared_source_days(participant_id, source_day, generation) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID`,
+  community_prepared_plan_cursor: "CREATE INDEX community_prepared_plan_cursor ON community_prepared_plan_rows(participant_id, source_day, generation, observed_at, id)",
+  community_prepared_fit_rows: `CREATE TABLE community_prepared_fit_rows (
+  participant_id TEXT NOT NULL,
+  source_day TEXT NOT NULL,
+  generation TEXT NOT NULL,
+  id INTEGER NOT NULL CHECK (id > 0),
+  observed_at TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  limit_id TEXT NOT NULL,
+  plan_type TEXT NOT NULL,
+  plan_variant TEXT NOT NULL,
+  occurrence_id TEXT NOT NULL,
+  slot TEXT NOT NULL,
+  used_percent REAL NOT NULL,
+  window_duration_minutes INTEGER NOT NULL CHECK (window_duration_minutes = 10080),
+  resets_at TEXT NOT NULL,
+  PRIMARY KEY (participant_id, source_day, generation, id),
+  FOREIGN KEY (participant_id, source_day, generation)
+    REFERENCES community_prepared_source_days(participant_id, source_day, generation) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID`,
+  community_prepared_fit_cursor: "CREATE INDEX community_prepared_fit_cursor ON community_prepared_fit_rows(participant_id, source_day, generation, resets_at, observed_at, id)",
+  community_prepared_usage_rows: `CREATE TABLE community_prepared_usage_rows (
+  participant_id TEXT NOT NULL,
+  source_day TEXT NOT NULL,
+  generation TEXT NOT NULL,
+  id INTEGER NOT NULL CHECK (id > 0),
+  observed_at TEXT NOT NULL,
+  occurrence_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  session_uuid TEXT,
+  cost_nanousd INTEGER CHECK (cost_nanousd >= 0 AND cost_nanousd <= 9007199254740991),
+  pricing_status TEXT CHECK (pricing_status IN ('fully_priced', 'partially_priced', 'unpriced')),
+  model_id TEXT,
+  CHECK ((cost_nanousd IS NULL) = (pricing_status IS NULL)),
+  PRIMARY KEY (participant_id, source_day, generation, id),
+  FOREIGN KEY (participant_id, source_day, generation)
+    REFERENCES community_prepared_source_days(participant_id, source_day, generation) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID`,
+  community_prepared_usage_cursor: "CREATE INDEX community_prepared_usage_cursor ON community_prepared_usage_rows(participant_id, source_day, generation, observed_at, id)",
+  community_prepared_usage_bins: `CREATE TABLE community_prepared_usage_bins (
+  participant_id TEXT NOT NULL,
+  source_day TEXT NOT NULL,
+  generation TEXT NOT NULL,
+  id INTEGER NOT NULL CHECK (id > 0),
+  observed_at TEXT NOT NULL,
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json) AND length(CAST(payload_json AS BLOB)) BETWEEN 1 AND 131072),
+  payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64 AND payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+  PRIMARY KEY (participant_id, source_day, generation, id),
+  FOREIGN KEY (participant_id, source_day, generation)
+    REFERENCES community_prepared_source_days(participant_id, source_day, generation) ON DELETE CASCADE
+) STRICT, WITHOUT ROWID`,
+  community_prepared_bins_cursor: "CREATE INDEX community_prepared_bins_cursor ON community_prepared_usage_bins(participant_id, source_day, generation, observed_at, id)",
+  community_prepared_source_record_delete: `CREATE TRIGGER community_prepared_source_record_delete AFTER DELETE ON telemetry_v1_records
+BEGIN
+  UPDATE community_prepared_source_days SET phase='discarding', progress_revision=progress_revision+1
+  WHERE participant_id=OLD.participant_id AND source_day=OLD.observed_day AND phase!='discarding';
+END`,
+  community_prepared_source_record_update: `CREATE TRIGGER community_prepared_source_record_update AFTER UPDATE ON telemetry_v1_records
+BEGIN
+  UPDATE community_prepared_source_days SET phase='discarding', progress_revision=progress_revision+1
+  WHERE ((participant_id=OLD.participant_id AND source_day=OLD.observed_day)
+    OR (participant_id=NEW.participant_id AND source_day=NEW.observed_day)) AND phase!='discarding';
+END`,
+});
+const REFRESH_LANE_SCHEMA_SQL = Object.freeze({
+  community_refresh_lanes: `CREATE TABLE community_refresh_lanes (
+  lane TEXT PRIMARY KEY CHECK (lane IN ('current', 'daily')),
+  source_epoch INTEGER NOT NULL CHECK (source_epoch >= 0),
+  utc_day TEXT NOT NULL,
+  method_version TEXT NOT NULL,
+  state TEXT NOT NULL CHECK (state IN ('queued', 'complete')),
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  restart_reason TEXT CHECK (restart_reason IN ('input_changed', 'method_changed', 'retry'))
+) STRICT`,
+  ...Object.fromEntries([["fit", "community_allowance_fit_cache"], ["model", "community_model_composition_cache"]]
+    .flatMap(([kind, table]) => ["insert", "delete"].map(event => [
+      `community_refresh_${kind}_${event}`, `CREATE TRIGGER community_refresh_${kind}_${event} AFTER ${event.toUpperCase()} ON ${table}
+BEGIN
+  UPDATE community_refresh_lanes SET state='queued',completed_at=NULL,restart_reason='retry'
+    WHERE state='complete';
+END`,
+    ]))),
+  community_refresh_fit_update: `CREATE TRIGGER community_refresh_fit_update AFTER UPDATE ON community_allowance_fit_cache
+WHEN OLD.participant_id IS NOT NEW.participant_id OR OLD.cache_key IS NOT NEW.cache_key
+  OR OLD.fits_json IS NOT NEW.fits_json OR OLD.input_fingerprint IS NOT NEW.input_fingerprint
+  OR OLD.source_method_version IS NOT NEW.source_method_version
+  OR OLD.model_observations_json IS NOT NEW.model_observations_json
+BEGIN
+  UPDATE community_refresh_lanes SET state='queued',completed_at=NULL,restart_reason='retry'
+    WHERE state='complete';
+END`,
+  community_refresh_model_update: `CREATE TRIGGER community_refresh_model_update AFTER UPDATE ON community_model_composition_cache
+WHEN OLD.participant_id IS NOT NEW.participant_id OR OLD.cache_key IS NOT NEW.cache_key
+  OR OLD.composition_json IS NOT NEW.composition_json OR OLD.input_fingerprint IS NOT NEW.input_fingerprint
+  OR OLD.source_method_version IS NOT NEW.source_method_version
+BEGIN
+  UPDATE community_refresh_lanes SET state='queued',completed_at=NULL,restart_reason='retry'
+    WHERE state='complete';
+END`,
+});
+
+// Migration 0059 deliberately replaces these previously exact DDL objects to
+// add the social-owner predicate. Preserve exact checks for every unaffected
+// object and make the replacement set a closed, explicit post-accountless
+// contract. A current 0059 ledger without these predicates is not ready.
+const ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES = Object.freeze({
+  history: Object.freeze([
+    "community_analytical_input_legacy_update",
+    "community_model_history_v1_insert",
+    "community_model_history_v1_update",
+    "community_model_history_v1_delete",
+    "community_model_history_legacy_insert",
+    "community_model_history_legacy_update",
+    "community_model_history_legacy_delete",
+    "community_model_history_successor_insert",
+    "community_model_history_successor_update",
+    "community_model_history_successor_delete",
+    "community_model_history_participant_state",
+    "community_model_history_participant_delete",
+  ]),
+  graph: Object.freeze([
+    "community_analytical_input_v1_insert",
+    "community_analytical_input_v1_update",
+  ]),
+  refresh: Object.freeze([
+    "community_refresh_fit_insert",
+    "community_refresh_fit_delete",
+    "community_refresh_fit_update",
+    "community_refresh_model_insert",
+    "community_refresh_model_delete",
+    "community_refresh_model_update",
+  ]),
+  scale: Object.freeze([
+    "community_current_analysis_revision_insert",
+    "community_current_analysis_revision_update",
+    "community_current_analysis_fit_insert",
+    "community_current_analysis_fit_delete",
+    "community_current_analysis_fit_update",
+    "community_current_analysis_model_insert",
+    "community_current_analysis_model_delete",
+    "community_current_analysis_model_update",
+    "community_publication_fit_insert",
+    "community_publication_fit_delete",
+    "community_publication_fit_update",
+    "community_publication_model_insert",
+    "community_publication_model_delete",
+    "community_publication_model_update",
+    "community_preparation_progress_insert",
+    "community_preparation_progress_update",
+    "community_preparation_progress_delete",
+  ]),
+});
+
+const ACCOUNTLESS_SOCIAL_OWNER_COMPACT_SQL =
+  "replace(replace(replace(replace(lower(sql), char(10), ''), char(13), ''), char(9), ''), ' ', '')";
+
+function exactStoredSchemaProbe(objects, omittedNames = []) {
+  const omitted = new Set(omittedNames);
+  return Object.entries(objects).filter(([name]) => !omitted.has(name)).map(([name, sql]) => `EXISTS (
+  SELECT 1 FROM sqlite_master WHERE name = ${sqlStringLiteral(name)}
+    AND type = ${sqlStringLiteral(sql.startsWith("CREATE TABLE") ? "table"
+      : sql.startsWith("CREATE INDEX") ? "index" : "trigger")}
+    AND sql IS ${sqlStringLiteral(sql)}
+)`).join(" AND ");
+}
+
+function socialOwnerGatedTriggerProbe(names) {
+  return names.map((name) => `EXISTS (
+  SELECT 1 FROM sqlite_master WHERE name = ${sqlStringLiteral(name)}
+    AND type = 'trigger'
+    AND instr(${ACCOUNTLESS_SOCIAL_OWNER_COMPACT_SQL},
+      ${sqlStringLiteral("owner_kind='social'")}) > 0
+)`).join(" AND ");
+}
+
+export const V1_QUOTA_FIT_CURSOR_INDEX_PROBE_SQL = `
+SELECT EXISTS (
+  SELECT 1 FROM pragma_table_info('telemetry_v1_quota_fit_rows')
+   WHERE name = 'record_id' AND upper(type) = 'INTEGER' AND pk = 1
+) AND (SELECT count(*) FROM pragma_table_info('telemetry_v1_quota_fit_rows') WHERE pk > 0) = 1
+AND NOT EXISTS (
+  SELECT 1 FROM pragma_index_list('telemetry_v1_quota_fit_rows') WHERE origin = 'pk'
+) AND EXISTS (
+  SELECT 1 FROM pragma_index_list('telemetry_v1_quota_fit_rows')
+   WHERE name = 'telemetry_v1_quota_fit_rows_cursor'
+     AND "unique" = 0 AND partial = 0 AND origin = 'c'
+) AND (SELECT count(*) FROM pragma_index_xinfo(
+  'telemetry_v1_quota_fit_rows_cursor')) = 4
+AND NOT EXISTS (
+  SELECT 1 FROM pragma_index_xinfo('telemetry_v1_quota_fit_rows_cursor')
+   WHERE "desc" IS NOT 0 OR coll IS NOT 'BINARY' OR NOT (
+     (seqno = 0 AND name IS 'participant_id' AND "key" = 1) OR
+     (seqno = 1 AND name IS 'resets_at' AND "key" = 1) OR
+     (seqno = 2 AND name IS 'observed_at' AND "key" = 1) OR
+     (seqno = 3 AND cid = -1 AND name IS NULL AND "key" = 0)
+   )
+) AS v1_quota_fit_cursor_index
+`;
+
+export const V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL = `
+SELECT (${V1_QUOTA_FIT_CURSOR_INDEX_PROBE_SQL})
+AND ${exactStoredSchemaProbe(QUOTA_PROJECTION_SCHEMA_SQL)} AS v1_quota_fit_projection_schema
+`;
+export const PRE_INCREMENTAL_ANALYSIS_WORK_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(COMMUNITY_ANALYSIS_WORK_SCHEMA_SQL)} AS community_analysis_work_schema
+`;
+export const PRE_INCREMENTAL_MODEL_HISTORY_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(COMMUNITY_MODEL_HISTORY_SCHEMA_SQL)} AS community_model_history_schema
+`;
+export const PRE_INCREMENTAL_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(COMMUNITY_GRAPH_PRESERVATION_SCHEMA_SQL)} AS community_graph_preservation_schema
+`;
+export const COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(CURRENT_ANALYSIS_WORK_SCHEMA_SQL)} AS community_analysis_work_schema
+`;
+export const COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(CURRENT_MODEL_HISTORY_SCHEMA_SQL)} AS community_model_history_schema
+`;
+export const COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(CURRENT_GRAPH_PRESERVATION_SCHEMA_SQL)} AS community_graph_preservation_schema
+`;
+export const PREPARED_SOURCE_DAY_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(PREPARED_SOURCE_DAY_SCHEMA_SQL)} AS prepared_source_day_schema
+`;
+export const REFRESH_LANE_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(REFRESH_LANE_SCHEMA_SQL)} AS refresh_lane_schema
+`;
+
+export const POST_ACCOUNTLESS_COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(
+  CURRENT_MODEL_HISTORY_SCHEMA_SQL,
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history,
+)} AND ${socialOwnerGatedTriggerProbe(
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.history,
+)} AS community_model_history_schema
+`;
+export const POST_ACCOUNTLESS_COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(
+  CURRENT_GRAPH_PRESERVATION_SCHEMA_SQL,
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.graph,
+)} AND ${socialOwnerGatedTriggerProbe(
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.graph,
+)} AS community_graph_preservation_schema
+`;
+export const POST_ACCOUNTLESS_REFRESH_LANE_SCHEMA_PROBE_SQL = `
+SELECT ${exactStoredSchemaProbe(
+  REFRESH_LANE_SCHEMA_SQL,
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.refresh,
+)} AND ${socialOwnerGatedTriggerProbe(
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.refresh,
+)} AS refresh_lane_schema
+`;
+
 // One bounded metadata query: no contribution, identity, token or policy-state
 // values leave the database, and no table-per-column remote round trips.
 export const ATTRIBUTION_SCHEMA_PROBE_SQL = `
@@ -271,7 +1197,40 @@ SELECT NOT EXISTS (
   SELECT 1 FROM required_objects expected
    WHERE NOT EXISTS (SELECT 1 FROM sqlite_master actual
      WHERE actual.type = expected.type AND actual.name = expected.name)
-) AND (${V1_USAGE_CURSOR_INDEX_PROBE_SQL}) AS attribution_objects,
+) AND (${V1_USAGE_CURSOR_INDEX_PROBE_SQL})
+AND (${V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL})
+AND (${COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL})
+AND (${COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL})
+AND (${COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL})
+AND (${PREPARED_SOURCE_DAY_SCHEMA_PROBE_SQL})
+AND (${REFRESH_LANE_SCHEMA_PROBE_SQL}) AS attribution_objects,
+NOT EXISTS (
+  SELECT 1 FROM required_columns expected
+   WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual
+     WHERE actual.name = expected.column_name)
+) AS attribution_columns;
+`;
+
+export const POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL = `
+WITH required_objects(type, name) AS (VALUES
+  ${ATTRIBUTION_SCHEMA_OBJECTS.map((entry) =>
+    `(${entry.map(sqlStringLiteral).join(", ")})`).join(",\n  ")}
+), required_columns(table_name, column_name) AS (VALUES
+  ${Object.entries(ATTRIBUTION_SCHEMA_COLUMNS).flatMap(([table, columns]) =>
+    columns.map((column) => `(${sqlStringLiteral(table)}, ${sqlStringLiteral(column)})`))
+    .join(",\n  ")}
+)
+SELECT NOT EXISTS (
+  SELECT 1 FROM required_objects expected
+   WHERE NOT EXISTS (SELECT 1 FROM sqlite_master actual
+     WHERE actual.type = expected.type AND actual.name = expected.name)
+) AND (${V1_USAGE_CURSOR_INDEX_PROBE_SQL})
+AND (${V1_QUOTA_FIT_PROJECTION_SCHEMA_PROBE_SQL})
+AND (${COMMUNITY_ANALYSIS_WORK_SCHEMA_PROBE_SQL})
+AND (${POST_ACCOUNTLESS_COMMUNITY_MODEL_HISTORY_SCHEMA_PROBE_SQL})
+AND (${POST_ACCOUNTLESS_COMMUNITY_GRAPH_PRESERVATION_SCHEMA_PROBE_SQL})
+AND (${PREPARED_SOURCE_DAY_SCHEMA_PROBE_SQL})
+AND (${POST_ACCOUNTLESS_REFRESH_LANE_SCHEMA_PROBE_SQL}) AS attribution_objects,
 NOT EXISTS (
   SELECT 1 FROM required_columns expected
    WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual
@@ -281,6 +1240,321 @@ NOT EXISTS (
 
 export function attributionSchemaComplete(row) {
   return row?.attribution_objects === 1 && row?.attribution_columns === 1;
+}
+
+// Independently reviewed stored DDL, never loaded from the migrations under
+// test. Keep this separate from the predecessor proof: joining both statements
+// would exceed D1's per-statement size budget as the migration history grows.
+const SCALE_SCHEMA_SQL = Object.freeze({
+  community_current_analysis_queue_state: `CREATE TABLE community_current_analysis_queue_state (
+  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+  utc_day TEXT NOT NULL,
+  method_version TEXT NOT NULL,
+  window_generation INTEGER NOT NULL CHECK (window_generation >= 0 AND window_generation < 9007199254740991),
+  last_sequence INTEGER NOT NULL CHECK (last_sequence >= 0 AND last_sequence < 9007199254740991)
+) STRICT`,
+  community_current_analysis_queue: `CREATE TABLE community_current_analysis_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  participant_id TEXT NOT NULL UNIQUE REFERENCES participants(id) ON DELETE CASCADE,
+  dirty_generation INTEGER NOT NULL CHECK (dirty_generation > 0 AND dirty_generation < 9007199254740991),
+  window_generation INTEGER NOT NULL CHECK (window_generation >= 0 AND window_generation < 9007199254740991),
+  pending INTEGER NOT NULL CHECK (pending IN (0, 1)),
+  last_served_sequence INTEGER NOT NULL CHECK (last_served_sequence >= 0 AND last_served_sequence < 9007199254740991),
+  completed_day TEXT,
+  completed_method TEXT
+) STRICT`,
+  community_current_analysis_queue_ready: `CREATE INDEX community_current_analysis_queue_ready
+  ON community_current_analysis_queue(window_generation, last_served_sequence, id) WHERE pending = 1`,
+  community_current_analysis_queue_window: `CREATE INDEX community_current_analysis_queue_window
+  ON community_current_analysis_queue(window_generation, id)`,
+  community_current_analysis_identity_immutable: `CREATE TRIGGER community_current_analysis_identity_immutable
+BEFORE UPDATE OF id, participant_id ON community_current_analysis_queue
+WHEN OLD.id IS NOT NEW.id OR OLD.participant_id IS NOT NEW.participant_id
+BEGIN
+  SELECT RAISE(ABORT, 'current analysis membership identity is immutable');
+END`,
+  community_current_analysis_revision_insert: `CREATE TRIGGER community_current_analysis_revision_insert AFTER INSERT ON community_analytical_input_versions
+WHEN NEW.revision > 0
+BEGIN
+  INSERT INTO community_current_analysis_queue
+    (participant_id,dirty_generation,window_generation,pending,last_served_sequence)
+    SELECT p.id,1,s.window_generation,1,0 FROM participants p,community_current_analysis_queue_state s
+    WHERE p.id=NEW.participant_id AND p.state='active' AND s.singleton_id=1
+    ON CONFLICT(participant_id) DO UPDATE SET dirty_generation=dirty_generation+1,pending=1;
+  UPDATE community_refresh_lanes SET state='queued',completed_at=NULL,restart_reason='input_changed'
+    WHERE lane='current' AND state='complete';
+END`,
+  community_current_analysis_revision_update: `CREATE TRIGGER community_current_analysis_revision_update AFTER UPDATE OF revision ON community_analytical_input_versions
+WHEN OLD.revision IS NOT NEW.revision
+BEGIN
+  INSERT INTO community_current_analysis_queue
+    (participant_id,dirty_generation,window_generation,pending,last_served_sequence)
+    SELECT p.id,1,s.window_generation,1,0 FROM participants p,community_current_analysis_queue_state s
+    WHERE p.id=NEW.participant_id AND p.state='active' AND s.singleton_id=1
+    ON CONFLICT(participant_id) DO UPDATE SET dirty_generation=dirty_generation+1,pending=1;
+  UPDATE community_refresh_lanes SET state='queued',completed_at=NULL,restart_reason='input_changed'
+    WHERE lane='current' AND state='complete';
+END`,
+  community_current_analysis_participant_state: `CREATE TRIGGER community_current_analysis_participant_state AFTER UPDATE OF state ON participants
+WHEN NEW.state != 'active'
+BEGIN
+  DELETE FROM community_current_analysis_queue WHERE participant_id=NEW.id;
+END`,
+  community_current_analysis_fit_insert: `CREATE TRIGGER community_current_analysis_fit_insert AFTER INSERT ON community_allowance_fit_cache
+BEGIN
+  INSERT INTO community_current_analysis_queue
+    (participant_id,dirty_generation,window_generation,pending,last_served_sequence)
+    SELECT p.id,1,s.window_generation,1,0 FROM participants p,community_current_analysis_queue_state s
+    WHERE p.id=NEW.participant_id AND p.state='active' AND s.singleton_id=1
+    ON CONFLICT(participant_id) DO UPDATE SET dirty_generation=dirty_generation+1,pending=1;
+END`,
+  community_current_analysis_fit_delete: `CREATE TRIGGER community_current_analysis_fit_delete AFTER DELETE ON community_allowance_fit_cache
+BEGIN
+  INSERT INTO community_current_analysis_queue
+    (participant_id,dirty_generation,window_generation,pending,last_served_sequence)
+    SELECT p.id,1,s.window_generation,1,0 FROM participants p,community_current_analysis_queue_state s
+    WHERE p.id=OLD.participant_id AND p.state='active' AND s.singleton_id=1
+    ON CONFLICT(participant_id) DO UPDATE SET dirty_generation=dirty_generation+1,pending=1;
+END`,
+  community_current_analysis_fit_update: `CREATE TRIGGER community_current_analysis_fit_update AFTER UPDATE ON community_allowance_fit_cache
+WHEN OLD.participant_id IS NOT NEW.participant_id OR OLD.cache_key IS NOT NEW.cache_key
+  OR OLD.fits_json IS NOT NEW.fits_json OR OLD.input_fingerprint IS NOT NEW.input_fingerprint
+  OR OLD.source_method_version IS NOT NEW.source_method_version
+  OR OLD.model_observations_json IS NOT NEW.model_observations_json
+BEGIN
+  INSERT INTO community_current_analysis_queue
+    (participant_id,dirty_generation,window_generation,pending,last_served_sequence)
+    SELECT p.id,1,s.window_generation,1,0 FROM participants p,community_current_analysis_queue_state s
+    WHERE p.id IN (OLD.participant_id,NEW.participant_id) AND p.state='active' AND s.singleton_id=1
+    ON CONFLICT(participant_id) DO UPDATE SET dirty_generation=dirty_generation+1,pending=1;
+END`,
+  community_current_analysis_model_insert: `CREATE TRIGGER community_current_analysis_model_insert AFTER INSERT ON community_model_composition_cache
+BEGIN
+  INSERT INTO community_current_analysis_queue
+    (participant_id,dirty_generation,window_generation,pending,last_served_sequence)
+    SELECT p.id,1,s.window_generation,1,0 FROM participants p,community_current_analysis_queue_state s
+    WHERE p.id=NEW.participant_id AND p.state='active' AND s.singleton_id=1
+    ON CONFLICT(participant_id) DO UPDATE SET dirty_generation=dirty_generation+1,pending=1;
+END`,
+  community_current_analysis_model_delete: `CREATE TRIGGER community_current_analysis_model_delete AFTER DELETE ON community_model_composition_cache
+BEGIN
+  INSERT INTO community_current_analysis_queue
+    (participant_id,dirty_generation,window_generation,pending,last_served_sequence)
+    SELECT p.id,1,s.window_generation,1,0 FROM participants p,community_current_analysis_queue_state s
+    WHERE p.id=OLD.participant_id AND p.state='active' AND s.singleton_id=1
+    ON CONFLICT(participant_id) DO UPDATE SET dirty_generation=dirty_generation+1,pending=1;
+END`,
+  community_current_analysis_model_update: `CREATE TRIGGER community_current_analysis_model_update AFTER UPDATE ON community_model_composition_cache
+WHEN OLD.participant_id IS NOT NEW.participant_id OR OLD.cache_key IS NOT NEW.cache_key
+  OR OLD.composition_json IS NOT NEW.composition_json OR OLD.input_fingerprint IS NOT NEW.input_fingerprint
+  OR OLD.source_method_version IS NOT NEW.source_method_version
+BEGIN
+  INSERT INTO community_current_analysis_queue
+    (participant_id,dirty_generation,window_generation,pending,last_served_sequence)
+    SELECT p.id,1,s.window_generation,1,0 FROM participants p,community_current_analysis_queue_state s
+    WHERE p.id IN (OLD.participant_id,NEW.participant_id) AND p.state='active' AND s.singleton_id=1
+    ON CONFLICT(participant_id) DO UPDATE SET dirty_generation=dirty_generation+1,pending=1;
+END`,
+  community_publication_changes: `CREATE TABLE community_publication_changes (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  revision INTEGER NOT NULL CHECK (revision >= 0 AND revision < 9007199254740991)
+) STRICT`,
+  community_publication_generation: `CREATE TABLE community_publication_generation (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  generation TEXT NOT NULL UNIQUE CHECK (length(generation) = 36),
+  utc_day TEXT NOT NULL CHECK (length(utc_day) = 10),
+  from_day TEXT NOT NULL CHECK (length(from_day) = 10),
+  method_version TEXT NOT NULL,
+  source_epoch INTEGER NOT NULL CHECK (source_epoch >= 0),
+  hard_epoch INTEGER NOT NULL CHECK (hard_epoch >= 0 AND hard_epoch <= source_epoch),
+  cache_revision INTEGER NOT NULL CHECK (cache_revision >= 0),
+  membership_watermark INTEGER NOT NULL CHECK (membership_watermark >= 0),
+  capture_cursor INTEGER NOT NULL CHECK (capture_cursor >= 0),
+  load_cursor INTEGER NOT NULL CHECK (load_cursor >= 0),
+  phase TEXT NOT NULL CHECK (phase IN ('capturing', 'loading', 'ready', 'retiring')),
+  published INTEGER NOT NULL DEFAULT 0 CHECK (published IN (0, 1)),
+  member_count INTEGER NOT NULL CHECK (member_count >= 0),
+  prepared_count INTEGER NOT NULL CHECK (prepared_count >= 0 AND prepared_count <= member_count),
+  payload_bytes INTEGER NOT NULL CHECK (payload_bytes >= 0 AND payload_bytes <= 16777216),
+  progress_revision INTEGER NOT NULL CHECK (progress_revision >= 0),
+  created_at TEXT NOT NULL
+) STRICT`,
+  community_publication_members: `CREATE TABLE community_publication_members (
+  generation TEXT NOT NULL REFERENCES community_publication_generation(generation) ON DELETE CASCADE,
+  member_id INTEGER NOT NULL CHECK (member_id > 0),
+  participant_id TEXT NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+  minimum_revision INTEGER NOT NULL CHECK (minimum_revision >= 0),
+  source TEXT NOT NULL CHECK (source IN ('v0.2', 'v1', 'mixed', 'v1.1')),
+  composition_supported INTEGER NOT NULL CHECK (composition_supported IN (0, 1)),
+  selected_revision INTEGER,
+  fit_fingerprint TEXT,
+  composition_fingerprint TEXT,
+  fits_json TEXT,
+  composition_json TEXT,
+  payload_bytes INTEGER NOT NULL DEFAULT 0 CHECK (payload_bytes >= 0 AND payload_bytes <= 16777216),
+  PRIMARY KEY (generation, member_id),
+  UNIQUE (generation, participant_id),
+  CHECK ((selected_revision IS NULL AND fits_json IS NULL AND fit_fingerprint IS NULL AND payload_bytes = 0)
+    OR (selected_revision >= minimum_revision AND fits_json IS NOT NULL AND length(fit_fingerprint) = 64 AND payload_bytes > 0)),
+  CHECK (composition_supported = 1 OR (composition_json IS NULL AND composition_fingerprint IS NULL))
+) STRICT`,
+  community_publication_members_pending: `CREATE INDEX community_publication_members_pending
+  ON community_publication_members(generation, member_id) WHERE selected_revision IS NULL`,
+  community_publication_members_participant: `CREATE INDEX community_publication_members_participant ON community_publication_members(participant_id)`,
+  community_publication_generation_published: `CREATE TRIGGER community_publication_generation_published AFTER UPDATE OF published ON community_publication_generation
+WHEN OLD.published = 0 AND NEW.published = 1
+BEGIN
+  UPDATE community_refresh_lanes SET state='queued',completed_at=NULL,restart_reason='retry'
+    WHERE lane='daily' AND state='complete';
+END`,
+  community_publication_fit_insert: `CREATE TRIGGER community_publication_fit_insert AFTER INSERT ON community_allowance_fit_cache
+BEGIN UPDATE community_publication_changes SET revision = revision + 1 WHERE singleton = 1; END`,
+  community_publication_fit_delete: `CREATE TRIGGER community_publication_fit_delete AFTER DELETE ON community_allowance_fit_cache
+BEGIN UPDATE community_publication_changes SET revision = revision + 1 WHERE singleton = 1; END`,
+  community_publication_fit_update: `CREATE TRIGGER community_publication_fit_update AFTER UPDATE ON community_allowance_fit_cache
+WHEN OLD.participant_id IS NOT NEW.participant_id OR OLD.cache_key IS NOT NEW.cache_key
+  OR OLD.fits_json IS NOT NEW.fits_json OR OLD.input_fingerprint IS NOT NEW.input_fingerprint
+  OR OLD.source_method_version IS NOT NEW.source_method_version
+BEGIN UPDATE community_publication_changes SET revision = revision + 1 WHERE singleton = 1; END`,
+  community_publication_model_insert: `CREATE TRIGGER community_publication_model_insert AFTER INSERT ON community_model_composition_cache
+BEGIN UPDATE community_publication_changes SET revision = revision + 1 WHERE singleton = 1; END`,
+  community_publication_model_delete: `CREATE TRIGGER community_publication_model_delete AFTER DELETE ON community_model_composition_cache
+BEGIN UPDATE community_publication_changes SET revision = revision + 1 WHERE singleton = 1; END`,
+  community_publication_model_update: `CREATE TRIGGER community_publication_model_update AFTER UPDATE ON community_model_composition_cache
+WHEN OLD.participant_id IS NOT NEW.participant_id OR OLD.cache_key IS NOT NEW.cache_key
+  OR OLD.composition_json IS NOT NEW.composition_json OR OLD.input_fingerprint IS NOT NEW.input_fingerprint
+  OR OLD.source_method_version IS NOT NEW.source_method_version
+BEGIN UPDATE community_publication_changes SET revision = revision + 1 WHERE singleton = 1; END`,
+  community_preparation_progress_counters: `CREATE TABLE community_preparation_progress_counters (
+  singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+  is_exact INTEGER NOT NULL CHECK (is_exact IN (0, 1)),
+  tracked_days INTEGER NOT NULL CHECK (tracked_days BETWEEN 0 AND 9007199254740991),
+  complete_days INTEGER NOT NULL CHECK (complete_days BETWEEN 0 AND 9007199254740991),
+  building_days INTEGER NOT NULL CHECK (building_days BETWEEN 0 AND 9007199254740991),
+  retiring_days INTEGER NOT NULL CHECK (retiring_days BETWEEN 0 AND 9007199254740991),
+  checkpoint_steps INTEGER NOT NULL CHECK (checkpoint_steps BETWEEN 0 AND 9007199254740991),
+  quota_observations INTEGER NOT NULL CHECK (quota_observations BETWEEN 0 AND 9007199254740991),
+  usage_events INTEGER NOT NULL CHECK (usage_events BETWEEN 0 AND 9007199254740991),
+  CHECK (complete_days + building_days + retiring_days = tracked_days)
+) STRICT`,
+  community_preparation_progress_insert: `CREATE TRIGGER community_preparation_progress_insert AFTER INSERT ON community_prepared_source_days
+BEGIN
+  UPDATE community_preparation_progress_counters SET is_exact=0
+  WHERE singleton_id=1 AND is_exact=1 AND (tracked_days=9007199254740991
+    OR checkpoint_steps>9007199254740991-NEW.progress_revision
+    OR quota_observations>9007199254740991-NEW.quota_count
+    OR usage_events>9007199254740991-NEW.usage_count);
+  UPDATE community_preparation_progress_counters SET tracked_days=tracked_days+1,
+    complete_days=complete_days+(NEW.phase='complete'),
+    building_days=building_days+(NEW.phase IN ('quota','usage')),
+    retiring_days=retiring_days+(NEW.phase='discarding'),
+    checkpoint_steps=checkpoint_steps+NEW.progress_revision,
+    quota_observations=quota_observations+NEW.quota_count,usage_events=usage_events+NEW.usage_count
+  WHERE singleton_id=1 AND is_exact=1;
+END`,
+  community_preparation_progress_update: `CREATE TRIGGER community_preparation_progress_update AFTER UPDATE ON community_prepared_source_days
+WHEN OLD.phase IS NOT NEW.phase OR OLD.progress_revision IS NOT NEW.progress_revision
+  OR OLD.quota_count IS NOT NEW.quota_count OR OLD.usage_count IS NOT NEW.usage_count
+BEGIN
+  UPDATE community_preparation_progress_counters SET is_exact=0
+  WHERE singleton_id=1 AND is_exact=1 AND (tracked_days=0
+    OR complete_days<(OLD.phase='complete') OR building_days<(OLD.phase IN ('quota','usage'))
+    OR retiring_days<(OLD.phase='discarding') OR checkpoint_steps<OLD.progress_revision
+    OR quota_observations<OLD.quota_count OR usage_events<OLD.usage_count
+    OR checkpoint_steps-OLD.progress_revision>9007199254740991-NEW.progress_revision
+    OR quota_observations-OLD.quota_count>9007199254740991-NEW.quota_count
+    OR usage_events-OLD.usage_count>9007199254740991-NEW.usage_count);
+  UPDATE community_preparation_progress_counters SET
+    complete_days=complete_days-(OLD.phase='complete')+(NEW.phase='complete'),
+    building_days=building_days-(OLD.phase IN ('quota','usage'))+(NEW.phase IN ('quota','usage')),
+    retiring_days=retiring_days-(OLD.phase='discarding')+(NEW.phase='discarding'),
+    checkpoint_steps=checkpoint_steps-OLD.progress_revision+NEW.progress_revision,
+    quota_observations=quota_observations-OLD.quota_count+NEW.quota_count,
+    usage_events=usage_events-OLD.usage_count+NEW.usage_count
+  WHERE singleton_id=1 AND is_exact=1;
+END`,
+  community_preparation_progress_delete: `CREATE TRIGGER community_preparation_progress_delete AFTER DELETE ON community_prepared_source_days
+BEGIN
+  UPDATE community_preparation_progress_counters SET is_exact=0
+  WHERE singleton_id=1 AND is_exact=1 AND (tracked_days=0
+    OR complete_days<(OLD.phase='complete') OR building_days<(OLD.phase IN ('quota','usage'))
+    OR retiring_days<(OLD.phase='discarding') OR checkpoint_steps<OLD.progress_revision
+    OR quota_observations<OLD.quota_count OR usage_events<OLD.usage_count);
+  UPDATE community_preparation_progress_counters SET tracked_days=tracked_days-1,
+    complete_days=complete_days-(OLD.phase='complete'),
+    building_days=building_days-(OLD.phase IN ('quota','usage')),
+    retiring_days=retiring_days-(OLD.phase='discarding'),
+    checkpoint_steps=checkpoint_steps-OLD.progress_revision,
+    quota_observations=quota_observations-OLD.quota_count,usage_events=usage_events-OLD.usage_count
+  WHERE singleton_id=1 AND is_exact=1;
+END`,
+});
+
+export const SCALE_SCHEMA_OBJECTS = Object.freeze(Object.entries(SCALE_SCHEMA_SQL).map(([name, sql]) =>
+  Object.freeze([sql.startsWith("CREATE TABLE") ? "table" : sql.startsWith("CREATE INDEX") ? "index" : "trigger", name])));
+export const SCALE_SCHEMA_COLUMNS = Object.freeze({
+  community_current_analysis_queue_state: Object.freeze([
+    "singleton_id", "utc_day", "method_version", "window_generation", "last_sequence",
+  ]),
+  community_current_analysis_queue: Object.freeze([
+    "id", "participant_id", "dirty_generation", "window_generation", "pending",
+    "last_served_sequence", "completed_day", "completed_method",
+  ]),
+  community_publication_changes: Object.freeze(["singleton", "revision"]),
+  community_publication_generation: Object.freeze([
+    "singleton", "generation", "utc_day", "from_day", "method_version", "source_epoch", "hard_epoch",
+    "cache_revision", "membership_watermark", "capture_cursor", "load_cursor", "phase", "published",
+    "member_count", "prepared_count", "payload_bytes", "progress_revision", "created_at",
+  ]),
+  community_publication_members: Object.freeze([
+    "generation", "member_id", "participant_id", "minimum_revision", "source", "composition_supported",
+    "selected_revision", "fit_fingerprint", "composition_fingerprint", "fits_json", "composition_json", "payload_bytes",
+  ]),
+  community_preparation_progress_counters: Object.freeze([
+    "singleton_id", "is_exact", "tracked_days", "complete_days", "building_days", "retiring_days",
+    "checkpoint_steps", "quota_observations", "usage_events",
+  ]),
+  admin_community_allowance_preview_cache: Object.freeze(["publication_generation"]),
+});
+export const SCALE_SCHEMA_PROBE_SQL = `
+WITH required_columns(table_name, column_name) AS (VALUES
+  ${Object.entries(SCALE_SCHEMA_COLUMNS).flatMap(([table, columns]) =>
+    columns.map(column => `(${sqlStringLiteral(table)}, ${sqlStringLiteral(column)})`)).join(",\n  ")}
+)
+SELECT ${exactStoredSchemaProbe(SCALE_SCHEMA_SQL)} AS scale_objects,
+NOT EXISTS (
+  SELECT 1 FROM required_columns expected
+   WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual
+     WHERE actual.name = expected.column_name)
+) AND EXISTS (
+  SELECT 1 FROM pragma_table_info('admin_community_allowance_preview_cache')
+   WHERE name = 'publication_generation' AND type = 'TEXT' AND "notnull" = 0
+     AND dflt_value IS NULL AND pk = 0
+) AS scale_columns;
+`;
+export const POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL = `
+WITH required_columns(table_name, column_name) AS (VALUES
+  ${Object.entries(SCALE_SCHEMA_COLUMNS).flatMap(([table, columns]) =>
+    columns.map(column => `(${sqlStringLiteral(table)}, ${sqlStringLiteral(column)})`)).join(",\n  ")}
+)
+SELECT ${exactStoredSchemaProbe(
+  SCALE_SCHEMA_SQL,
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale,
+)} AND ${socialOwnerGatedTriggerProbe(
+  ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale,
+)} AS scale_objects,
+NOT EXISTS (
+  SELECT 1 FROM required_columns expected
+   WHERE NOT EXISTS (SELECT 1 FROM pragma_table_info(expected.table_name) actual
+     WHERE actual.name = expected.column_name)
+) AND EXISTS (
+  SELECT 1 FROM pragma_table_info('admin_community_allowance_preview_cache')
+   WHERE name = 'publication_generation' AND type = 'TEXT' AND "notnull" = 0
+     AND dflt_value IS NULL AND pk = 0
+) AS scale_columns;
+`;
+export function scaleSchemaComplete(row) {
+  return row?.scale_objects === 1 && row?.scale_columns === 1;
 }
 export const REQUIRED_RATE_LIMITS = Object.freeze([
   Object.freeze({ name: "ENROLLMENT_RATE_LIMIT", limit: 20 }),
@@ -1020,7 +2294,11 @@ function migrationNames(value) {
     : null;
 }
 
-function classifyMigrationProbe(result, expectedNames) {
+function classifyMigrationProbe(
+  result,
+  expectedNames,
+  { legacyLineage = null } = {},
+) {
   if (!result.ok) {
     const output = `${result.stdout}${result.stderr}`;
     if (/no such table[\s:]+.*d1_migrations|d1_migrations.*no such table/iu.test(
@@ -1042,6 +2320,12 @@ function classifyMigrationProbe(result, expectedNames) {
   }
   if (sameStringArray(names, expectedNames)) {
     return { status: "current", code: null };
+  }
+  if (legacyLineage !== null && sameStringArray(names, legacyLineage)) {
+    return {
+      status: "legacy_replacement_required",
+      code: "REMOTE_MIGRATION_LEGACY_LINEAGE_REPLACEMENT_REQUIRED",
+    };
   }
   if (names.every((name, index) => name === expectedNames[index])) {
     return { status: "pending", code: "REMOTE_MIGRATIONS_PENDING" };
@@ -1539,6 +2823,9 @@ export function probeStagingLive({
       const state = classifyMigrationProbe(
         result,
         EXPECTED_STAGING_MIGRATIONS[entry.binding],
+        entry.binding === "USAGE_MONITOR_DB"
+          ? { legacyLineage: RETAINED_LEGACY_STAGING_MIGRATION_LINEAGE }
+          : undefined,
       );
       return Object.freeze({
         binding: entry.binding,
@@ -1640,7 +2927,7 @@ export function probeStagingLive({
         [
           "d1", "execute", "USAGE_MONITOR_DB",
           "--remote", "--env", "staging",
-          "--command", ATTRIBUTION_SCHEMA_PROBE_SQL,
+          "--command", POST_ACCOUNTLESS_ATTRIBUTION_SCHEMA_PROBE_SQL,
           "--json",
         ],
         spawn,
@@ -1649,6 +2936,20 @@ export function probeStagingLive({
         && attributionSchemaComplete(collectionControlRow(
           parseJson(attributionSchemaProbe.stdout),
         ));
+      const scaleSchemaProbe = runWrangler(
+        wrangler,
+        workerDirectory,
+        [
+          "d1", "execute", "USAGE_MONITOR_DB",
+          "--remote", "--env", "staging",
+          "--command", POST_ACCOUNTLESS_SCALE_SCHEMA_PROBE_SQL,
+          "--json",
+        ],
+        spawn,
+      );
+      checks.attributionSchemaCurrent = checks.attributionSchemaCurrent
+        && scaleSchemaProbe.ok
+        && scaleSchemaComplete(collectionControlRow(parseJson(scaleSchemaProbe.stdout)));
       if (!checks.attributionSchemaCurrent) {
         blockers.push("REMOTE_ATTRIBUTION_SCHEMA_INCOMPLETE");
       }

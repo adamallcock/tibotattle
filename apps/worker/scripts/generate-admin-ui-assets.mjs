@@ -71,6 +71,7 @@ export const ADMIN_UI_SHARED_SOURCES = Object.freeze([
   "i18n.generated.js",
   "community-data.js",
   "community-view.js",
+  "model-catalog.generated.js",
 ]);
 
 async function verifyModuleClosure(contents, webPublicDirectory) {

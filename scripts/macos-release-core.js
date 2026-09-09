@@ -72,6 +72,8 @@ import {
   resolveSignedMacOSBundleVersion,
 } from "./macos-bundle-version.js";
 import { RELEASE_VERSION } from "../config/release-manifest.js";
+import { artifactDigest, runJournaledMacOSRelease } from "./macos-release-journal.js";
+import { identityDigest } from "./lib/release-operation.mjs";
 
 const SCRIPT_FILE = fileURLToPath(import.meta.url);
 const REPOSITORY_ROOT = resolve(dirname(SCRIPT_FILE), "..");
@@ -2934,6 +2936,35 @@ export function stapleAndValidate(path, {
   }
 }
 
+export function submitAppleNotaryWithId(path, { notaryProfile, commandRunner = runMacOSReleaseCommand }) {
+  let result;
+  try { result = commandRunner("/usr/bin/xcrun", ["notarytool", "submit", path,
+    "--keychain-profile", notaryProfile, "--output-format", "json"], {
+    env: releaseEnvironment(), secrets: [notaryProfile], timeout: 30 * 60_000,
+    failureMessage: "Apple submission outcome requires reconciliation",
+  }); } catch { fail("Apple submission outcome is unknown; reconcile before retry", "MACOS_NOTARY_SUBMISSION_UNCERTAIN"); }
+  let value;
+  try { value = JSON.parse(result.stdout); } catch { fail("Apple submission outcome is unknown", "MACOS_NOTARY_SUBMISSION_UNCERTAIN"); }
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(value?.id ?? "")) {
+    fail("Apple submission identity is unknown", "MACOS_NOTARY_SUBMISSION_UNCERTAIN");
+  }
+  return { id: value.id };
+}
+
+export function waitForAppleNotary(id, { notaryProfile, commandRunner = runMacOSReleaseCommand }) {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(id)) fail("Invalid Apple submission identity");
+  let result;
+  try { result = commandRunner("/usr/bin/xcrun", ["notarytool", "wait", id,
+    "--keychain-profile", notaryProfile, "--output-format", "json"], {
+    env: releaseEnvironment(), secrets: [notaryProfile], timeout: 30 * 60_000,
+    failureMessage: "Apple submission is awaiting verification; resume the existing operation",
+  }); } catch { fail("Apple submission status is unknown; resume existing operation", "MACOS_NOTARY_STATUS_UNKNOWN"); }
+  let value;
+  try { value = JSON.parse(result.stdout); } catch { fail("Apple submission status is unknown", "MACOS_NOTARY_STATUS_UNKNOWN"); }
+  if (value?.id !== id || value.status !== "Accepted") fail("Apple notarization has not accepted the artifact", "MACOS_NOTARIZATION_REJECTED");
+  return { status: "Accepted" };
+}
+
 function attachDMG(path) {
   const attached = runMacOSReleaseCommand("/usr/bin/hdiutil", [
     "attach",
@@ -3544,6 +3575,23 @@ export async function prepareMacOSReleaseCandidate({
   });
 }
 
+function createMacOSFinalManifest({ inspected, architecture, source, releaseChannel, artifact }) {
+  return {
+    schemaVersion: RELEASE_MANIFEST_SCHEMA,
+    application: { architecture, bundleIdentifier: inspected.bundleIdentifier,
+      bundleVersion: inspected.bundleVersion, shortVersion: inspected.shortVersion },
+    artifact, source,
+    assurances: Object.fromEntries(REQUIRED_SIGNED_RELEASE_ASSURANCES.map((name) => [name, true])),
+    build: { payloadSha256: inspected.buildManifest.payload.payloadSha256,
+      sourceSha256: inspected.buildManifest.inputs.sourceSha256 },
+    channel: createReleaseChannelProvenance(releaseChannel.name, {
+      architecture, publicEdKeySha256: inspected.buildManifest.release.updater.publicEdKeySha256 }),
+    privacy: { credentialsRecorded: false, identityRecorded: false, notaryProfileRecorded: false },
+    updater: { ...inspected.buildManifest.release.updater },
+    replacement: createMacOSSignedReplacementContract(),
+  };
+}
+
 export async function releaseMacOSApp({
   architecture = "arm64",
   nodeRuntime = null,
@@ -3554,6 +3602,8 @@ export async function releaseMacOSApp({
   previousStableManifestPath = null,
   replace = false,
   stableBootstrap = false,
+  journalDirectory = null,
+  resume = false,
 }) {
   const releaseChannel = resolveReleaseChannel(channel, { architecture });
   if (previousStableManifestPath !== null
@@ -3643,6 +3693,90 @@ export async function releaseMacOSApp({
   if (await realpath(outputParent) !== outputParent) {
     fail("Release output parent must not traverse a symbolic link");
   }
+  if (journalDirectory !== null) {
+    if (replace) fail("Journaled releases never replace existing artifacts", "MACOS_RELEASE_JOURNAL_REPLACE_FORBIDDEN");
+    const copyApp = (from, to) => {
+      runMacOSReleaseCommand("/usr/bin/ditto", ["--noqtn", from, to], { failureMessage: "Release stage copy failed" });
+      return to;
+    };
+    return runJournaledMacOSRelease({
+      directory: resolve(journalDirectory), resume, output: selectedOutput, manifestPath: releaseManifestPath,
+      binding: {
+        policy: 1, source, architecture, channel: releaseChannel.name,
+        output: identityDigest(selectedOutput), candidate: await artifactDigest(appPath),
+        runtime: await sha256File(nodeRuntime ?? process.execPath),
+        framework: await artifactDigest(updaterConfiguration.framework.path),
+        previousManifest: previousStableManifest === null ? null : identityDigest(previousStableManifest),
+        provisioning: buildConfiguration.provisioningProfile ? await sha256File(buildConfiguration.provisioningProfile) : null,
+        configuration: identityDigest(buildConfiguration), credentials: identityDigest(credentials), stableBootstrap,
+      },
+      progress: ({ phase, state }) => process.stderr.write(`macOS release: ${phase} ${state}\n`),
+      actions: {
+        async build(root) {
+          const staged = join(root, APP_NAME);
+          await buildMacOSAppForRelease({ architecture, nodeRuntime, output: staged,
+            centralOrigin: buildConfiguration.productionOrigin, externalDistribution: true,
+            candidateAppPath: appPath, environment, previousStableManifestPath, stableBootstrap,
+            releaseChannel: releaseChannel.name, bundleVersion: buildConfiguration.bundleVersion,
+            sparkleFramework: updaterConfiguration.framework.path, sparkleAppcastURL: updaterConfiguration.appcastURL,
+            sparklePublicEdKey: updaterConfiguration.publicEdKey });
+          const actual = await inspectMacOSApp(staged, { architecture, channel: releaseChannel.name, requireExternalDistribution: true });
+          if (actual.buildManifest.inputs?.sourceSha256 !== inspectedCandidate.buildManifest.inputs?.sourceSha256
+              || actual.buildManifest.payload?.payloadSha256 !== inspectedCandidate.buildManifest.payload?.payloadSha256
+              || actual.buildManifest.payload?.totalBytes !== inspectedCandidate.buildManifest.payload?.totalBytes
+              || actual.source?.commit !== source.commit || actual.source?.tag !== source.tag) {
+            fail("Candidate is not reproducible from approved source", "MACOS_RELEASE_CANDIDATE_NOT_REPRODUCIBLE");
+          }
+          return staged;
+        },
+        async signApp(from, root) {
+          const staged = copyApp(from, join(root, APP_NAME));
+          if (buildConfiguration.provisioningProfile) await copyFile(buildConfiguration.provisioningProfile, join(staged, EMBEDDED_PROFILE_PATH));
+          await developerIDSignMacOSApp(staged, { architecture, channel: releaseChannel.name, identity: credentials.identity });
+          return staged;
+        },
+        async archive(from, root) {
+          const path = join(root, `${PRODUCT_BRAND.executableName}.zip`);
+          runMacOSReleaseCommand("/usr/bin/ditto", ["-c", "-k", "--keepParent", from, path], { env: releaseEnvironment(), failureMessage: "Notarization archive creation failed" });
+          return path;
+        },
+        submit: (path) => submitAppleNotaryWithId(path, credentials),
+        wait: (id) => waitForAppleNotary(id, credentials),
+        async stapleApp(from, root) {
+          const staged = copyApp(from, join(root, APP_NAME));
+          stapleAndValidate(staged);
+          return staged;
+        },
+        validateApp: (path) => validateInstalledMacOSApp(path, { architecture, channel: releaseChannel.name, production: true }),
+        async package(from, root) {
+          const path = join(root, `${PRODUCT_BRAND.executableName}.dmg`);
+          await packageMacOSDMG({ architecture, appPath: from, output: path, replace: false, distribution: "release", channel: releaseChannel.name });
+          return path;
+        },
+        async signDMG(from, root) {
+          const path = join(root, `${PRODUCT_BRAND.executableName}.dmg`);
+          await copyFile(from, path); await chmod(path, 0o644);
+          await developerIDSignMacOSDMG(path, { identity: credentials.identity });
+          return path;
+        },
+        async stapleDMG(from, root) {
+          const path = join(root, `${PRODUCT_BRAND.executableName}.dmg`);
+          await copyFile(from, path); await chmod(path, 0o644); stapleAndValidate(path);
+          return path;
+        },
+        async validateDMG(path) {
+          const actual = await validateMacOSDMG(path, { architecture, channel: releaseChannel.name, production: true });
+          if (actual.source?.commit !== source.commit || actual.source?.tag !== source.tag) fail("Packaged source mismatch", "MACOS_RELEASE_ARTIFACT_SOURCE_MISMATCH");
+        },
+        async manifest(built, dmg) {
+          const inspected = await inspectMacOSApp(built, { architecture, channel: releaseChannel.name, requireExternalDistribution: true });
+          return createMacOSFinalManifest({ inspected, architecture, source, releaseChannel,
+            artifact: { bytes: (await stat(dmg)).size, fileName: basename(selectedOutput), sha256: await sha256File(dmg) } });
+        },
+      },
+    });
+  }
+  if (resume) fail("Resume requires a journal directory", "MACOS_RELEASE_JOURNAL_REQUIRED");
   await assertReplaceableReleaseTarget(selectedOutput, {
     label: "DMG",
     replace,

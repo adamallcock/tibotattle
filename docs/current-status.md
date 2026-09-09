@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-07
+date: 2026-09-09
 type: status
 status: current
-source_commit: 6a06df23fd15d8365a6fb92a997b62d7370d681e
-observation_date: 2026-09-07
+source_commit: bdfce5a32da113b48a4c05f60a2363111e304961
+observation_date: 2026-09-09
 ---
 
 # Current product and release status
@@ -14,21 +14,28 @@ applications, public downloads, update feeds and hosted service behavior are
 independent observations. Re-check their own source of truth for a later
 operational decision.
 
-## Source boundaries for this snapshot
+## Source boundary and reconciliation status
 
-The `source_commit` above is the local Electron development-integration
-boundary: `6a06df23fd15d8365a6fb92a997b62d7370d681e`. It combines the accountless
-source line with the completed Electron tray source, but is neither a
-main-branch merge nor the provenance of the published native release. The
-Electron PR #111 remains a draft development branch. The native `v0.1.18` tag
-resolves to the distinct commit `55c813a1bf7e67c00e47410b760104c0d9fbc0ea`.
-Those histories diverge at `3a785e6d2c3421345151a32f07195ddaa6e9a614`; neither
-source is an ancestor of the other.
+`bdfce5a3` is the local Electron integration boundary for this status update.
+It is a source boundary only: it does not identify a published native artifact,
+deployed Worker, update feed, or hosted observation.
+
+The incoming hosted and release-tooling work from PR #114 is being reconciled
+with this Electron line. The reconciliation preserves the deployed canonical
+migration lineage through `0056`; accountless migrations `0057`–`0059` are
+source-only and are not deployed. The earlier synthetic staging-only
+accountless `0046`–`0048` lineage remains retained evidence and requires a
+separately approved replacement target. It must not be replayed, renamed in a
+remote ledger, or treated as current.
+
+Accountless contribution remains excluded from public aggregate publication and
+ordinary scheduler paths. No source merge authorizes remote migrations,
+enrollment, contribution, deployment, or public release.
 
 Published-native facts below are carried forward from the 2026-09-05 release
-record. This Electron source review did not rerun the native source-to-artifact,
-signing, notarization/stapling, Gatekeeper, installed-runtime, update-feed or
-public-site checks that produced that record.
+record. This reconciliation did not rerun native source-to-artifact, signing,
+notarization, Gatekeeper, installed-runtime, update-feed, public-site, or live
+hosted checks.
 
 ## Published native release
 
@@ -67,7 +74,19 @@ and [ARM installed-runtime](./receipts/2026-09-05-macos-rc3-installed-runtime.md
 receipts retain their own point-in-time scope; neither is relabeled as the
 published stable artifact.
 
-## Hosted service and accountless boundary
+## Dated hosted evidence
+
+The [thousand-contributor publication receipt](./receipts/2026-09-08-thousand-contributor-publication.md)
+records a guarded deployment and rendered public/admin checks on 2026-09-08,
+including the canonical `0054`–`0056` migration boundary. It is retained
+point-in-time evidence, not a new observation made by this reconciliation.
+
+The [incremental refresh publication receipt](./receipts/2026-09-08-incremental-refresh-publication.md)
+records the earlier 2026-09-08 deployment and its `0050`–`0053` migration
+boundary. The retained receipts describe that point in time; cache state,
+backfill progress, and rendered behavior require a new live check.
+
+## Retained hosted recovery boundary
 
 The published 2026-09-05 release record states that approved forward migrations
 `0042`–`0045` are applied. Exact migration prefix 45, complete schema and the
@@ -77,29 +96,29 @@ files must not be rewritten.
 
 [PR #105](https://github.com/adamallcock/tibotattle/pull/105) repaired the
 authenticated admin module dependency and atomic weekly revision replacement.
-The website deployment is source
-`26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad`, whose tree matches that reviewed
-repair. Public downloads and the optional hosted analyzer have separate gates.
+Its merged source `26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad` is the
+then-schema-compatible code rollback target, with both 0.1.18 website downloads.
+It is not a rollback target for the subsequently upgraded prepared-work protocol;
+current recovery requires the compatibility checks in the operations runbook.
+Public downloads and the optional hosted analyzer have separate gates.
 
-That published record also retains the database memory-limit incident in quota
-endpoint sampling. The website displays history-updating status instead of an
-incomplete estimate. Recovery requires successful scheduled rebuilding, a
-subsequent valid preview cache and a rendered live graph; health HTTP 200 alone
-is not sufficient. This Electron review did not re-observe that hosted state.
+Earlier recovery records, including [PR #106](https://github.com/adamallcock/tibotattle/pull/106),
+remain dated evidence. They do not substitute for current public cache,
+rendered-view, or scheduler verification.
 
-The Electron checkout retains accountless source work through local migrations
-`0046`–`0048` as an un-deployed prototype. It does not alter the deployed
-`0042`–`0045` prefix, activate accountless enrollment, renewal or contribution,
-deploy the Worker, or authorize a remote migration. The [Electron readiness plan](./plans/2026-09-05-electron-release-readiness.md)
-is development planning, not hosted or release evidence.
+Detailed recovery history remains in its dated receipts and decisions. It is
+not current hosted evidence and does not authorize accountless activation,
+remote migration, or a desktop release.
 
 ## Platform support and qualification limits
 
 - **Supported:** macOS 14+ Apple silicon and Intel through the published 0.1.18
   artifacts and their independent update feeds.
 - **Not released or supported:** Windows, Linux or Electron.
-- Homebrew selects Apple silicon or Intel with the same install command; both
-  DMGs also remain available through the website and GitHub release.
+- The live first-party Homebrew cask was rechecked on 2026-09-08: version 0.1.18
+  selects Apple silicon or Intel with each release's exact checksum. Both use
+  `brew install --cask adamallcock/tap/tibotattle`.
+  Both DMGs also remain available through the website and GitHub release.
 
 The owner explicitly accepted the unavailable disposable-profile/manual Login
 Item matrix and formal physical Intel install/runtime/update/upload evidence

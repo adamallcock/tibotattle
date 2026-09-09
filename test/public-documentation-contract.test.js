@@ -273,7 +273,7 @@ test("component READMEs delegate executable route inventories to the canonical r
   const workerRoutesList = [
     ...workerRoutes.matchAll(/pathname:\s*"([^"]+)"/gu),
   ].map(([, route]) => route);
-  assert.equal(workerRoutesList.length, 39, "review Worker route-count changes");
+    assert.equal(workerRoutesList.length, 40, "review Worker route-count changes");
   for (const route of workerRoutesList) {
     assert.ok(apiReference.includes(route), `API reference covers Worker ${route}`);
   }

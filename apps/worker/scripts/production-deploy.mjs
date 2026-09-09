@@ -31,6 +31,8 @@ import { checkLocalWorkspacePackages } from "./check-local-workspace-packages.mj
 import { stageProductionAssets } from "./stage-production-assets.mjs";
 import { ADMIN_UI_SOURCES } from "./generate-admin-ui-assets.mjs";
 import { runReleasePreflight } from "./release-preflight.mjs";
+import { openOperation, operationError, readOperation } from "../../../scripts/lib/release-operation.mjs";
+import { createProductionDeploymentLock } from "./production-deployment-lock.mjs";
 
 // Renamed from DEPLOY_CONTAINED_PRODUCTION on 2026-08-07: production deploys
 // no longer assert a contained/paused intake posture, so the old token lied.
@@ -51,6 +53,7 @@ const PRODUCTION_PUBLIC_SURFACE_FORBIDDEN_PATHS = Object.freeze([
   "/admin",
   ...ADMIN_UI_SOURCES.map(({ route }) => route),
   "/api/v1/admin/community/allowance-preview",
+  "/api/v1/admin/reconstruction-progress",
 ]);
 const PRODUCTION_PUBLIC_ROOT_FORBIDDEN_MARKERS = Object.freeze([
   'src="./app.js"',
@@ -696,7 +699,8 @@ export async function recheckProductionHealth({
   if (!healthyProductionHealth(body)) {
     return localFailure("PRODUCTION_HEALTH_RECHECK_UNHEALTHY");
   }
-  return { ok: true, code: null };
+  const sourceCommit = body.deployment?.sourceCommit;
+  return { ok: true, code: null, sourceCommit: /^[0-9a-f]{40}$/.test(sourceCommit ?? "") ? sourceCommit : null };
 }
 
 export async function recheckProductionPublicSurface({
@@ -880,6 +884,8 @@ async function runProductionDeploymentFromSnapshot({
   fetchImpl = globalThis.fetch,
   healthRecheck = recheckProductionHealth,
   publicSurfaceRecheck = recheckProductionPublicSurface,
+  beforeMutation = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
+  mutationIntent = async () => { throw operationError("PRODUCTION_COORDINATION_REQUIRED"); },
 }) {
   // The dependency tree the deploy executes from is not under Git provenance, so
   // it is bound by digest instead: reverify it against the snapshot digest
@@ -1013,6 +1019,14 @@ async function runProductionDeploymentFromSnapshot({
   const preDeployDependency = await verifyDependencyDigest();
   if (preDeployDependency) return preDeployDependency;
 
+  await beforeMutation();
+  const lockedSource = verifySourceSnapshot({ workerDirectory: sourceCheckDirectory,
+    expectedSourceCommit: sourceCommit, sourceCommitCheck, sourceTreeCleanCheck });
+  if (!lockedSource.ok) return lockedSource;
+  const lockedDependencies = await verifyDependencyDigest();
+  if (lockedDependencies) return lockedDependencies;
+  await mutationIntent();
+
   let deployment;
   try {
     deployment = spawn(
@@ -1067,6 +1081,7 @@ async function runProductionDeploymentFromSnapshot({
       : "AMBIGUOUS";
     return localFailure(`PRODUCTION_POST_DEPLOY_HEALTH_RECHECK_${reason}`);
   }
+  if (postDeployHealth.sourceCommit !== sourceCommit) return localFailure("PRODUCTION_POST_DEPLOY_SOURCE_MISMATCH");
   let postDeployPublicSurface;
   try {
     postDeployPublicSurface = await publicSurfaceRecheck({
@@ -1106,7 +1121,7 @@ async function runProductionDeploymentFromSnapshot({
   };
 }
 
-export async function runProductionDeployment({
+async function runUncoordinatedProductionDeployment({
   confirmation,
   confirmedMigrations = null,
   wrangler,
@@ -1127,6 +1142,8 @@ export async function runProductionDeployment({
   fetchImpl = globalThis.fetch,
   healthRecheck = recheckProductionHealth,
   publicSurfaceRecheck = recheckProductionPublicSurface,
+  beforeMutation,
+  mutationIntent,
 }) {
   if (confirmation !== PRODUCTION_DEPLOY_CONFIRMATION) {
     return localFailure("CONFIRMATION_REQUIRED");
@@ -1195,36 +1212,150 @@ export async function runProductionDeployment({
       fetchImpl,
       healthRecheck,
       publicSurfaceRecheck,
+      beforeMutation,
+      mutationIntent,
     });
-  } catch {
-    result = localFailure("PRODUCTION_DEPLOYMENT_FAILED");
+  } catch (error) {
+    result = localFailure(/^PRODUCTION_[A-Z_]+$/.test(error?.code ?? "") ? error.code : "PRODUCTION_DEPLOYMENT_FAILED");
   }
 
   try {
     await snapshot.cleanup();
   } catch {
-    return localFailure("PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED");
+    return { ...result, cleanup: "PRODUCTION_SOURCE_SNAPSHOT_CLEANUP_FAILED" };
   }
   return result;
 }
 
-function option(name) {
-  const index = process.argv.indexOf(name);
-  const value = index < 0 ? null : process.argv[index + 1];
-  return !value || value.startsWith("--") ? null : value;
+const EXACT_COMMIT = /^[a-f0-9]{40}$/;
+
+export async function runProductionDeployment(options) {
+  const { confirmation, workerDirectory, expectedPreviousSourceCommit,
+    sourceCommitCheck = checkedOutSourceCommit, sourceTreeCleanCheck = checkedOutSourceTreeClean,
+    coordinationFactory = createProductionDeploymentLock, operationDirectory = null,
+    healthRecheck = recheckProductionHealth, fetchImpl = globalThis.fetch } = options;
+  if (confirmation !== PRODUCTION_DEPLOY_CONFIRMATION) return localFailure("CONFIRMATION_REQUIRED");
+  if (!EXACT_COMMIT.test(expectedPreviousSourceCommit ?? "")) return localFailure("PRODUCTION_PREVIOUS_SOURCE_REQUIRED");
+  const source = verifySourceSnapshot({ workerDirectory, expectedSourceCommit: options.expectedSourceCommit,
+    sourceCommitCheck, sourceTreeCleanCheck });
+  if (!source.ok) return source;
+  if (!EXACT_COMMIT.test(source.sourceCommit)) return localFailure("PRODUCTION_SOURCE_COMMIT_INVALID");
+  const repositoryRoot = resolve(workerDirectory, "../..");
+  const directory = operationDirectory ?? join(repositoryRoot, ".release-build", "production-operations", source.sourceCommit);
+  let operation;
+  let lock;
+  let state;
+  let acquired = false;
+  let attempted = false;
+  let result;
+  try {
+    lock = coordinationFactory({ repositoryRoot });
+    if (!lock.isAncestor(expectedPreviousSourceCommit, source.sourceCommit)) return localFailure("PRODUCTION_PREVIOUS_SOURCE_NOT_ANCESTOR");
+    operation = await openOperation({ directory, kind: "production", binding: {
+      sourceCommit: source.sourceCommit, previousSourceCommit: expectedPreviousSourceCommit,
+      confirmedMigrations: options.confirmedMigrations ?? null,
+    } });
+    const owner = lock.createOwner({ id: operation.record.id, sourceCommit: source.sourceCommit, previousSourceCommit: expectedPreviousSourceCommit });
+    state = { owner, sourceCommit: source.sourceCommit, previousSourceCommit: expectedPreviousSourceCommit,
+      confirmedMigrations: options.confirmedMigrations ?? null,
+      stage: "preflight", outcome: "not_started", code: null, lock: "not_acquired" };
+    await operation.save(state);
+    result = await runUncoordinatedProductionDeployment({ ...options,
+      beforeMutation: async () => {
+        state.stage = "acquiring_lock"; state.lock = "uncertain"; await operation.save(state);
+        lock.acquire(owner); acquired = true;
+        state.lock = "held"; state.stage = "predecessor_check"; await operation.save(state);
+        const health = await healthRecheck({ fetchImpl, timeoutMs: PRODUCTION_HEALTH_RECHECK_TIMEOUT_MS });
+        if (!health?.ok || health.sourceCommit !== expectedPreviousSourceCommit) throw operationError("PRODUCTION_PREVIOUS_SOURCE_MISMATCH");
+        lock.assertOwned(owner);
+      },
+      mutationIntent: async () => {
+        lock.assertOwned(owner);
+        state.stage = "deploy"; state.outcome = "outcome_unknown";
+        await operation.save(state); // durable intent precedes Wrangler
+        attempted = true;
+      },
+    });
+    // Verify ownership after the provider call too. The lock is cooperative;
+    // raw Wrangler/old checkouts remain unsupported bypasses, not fenced writers.
+    if (attempted) lock.assertOwned(owner);
+    state.outcome = attempted ? (result.ok ? "verified" : "deployed_unverified") : "not_started";
+    state.stage = result.ok ? "verified" : "failed";
+    state.code = result.code;
+    if (result.cleanup) state.cleanup = result.cleanup;
+    await operation.save(state);
+  } catch (error) {
+    const code = /^(?:PRODUCTION|RELEASE_OPERATION)_[A-Z_]+$/.test(error?.code ?? "") ? error.code : "PRODUCTION_DEPLOYMENT_FAILED";
+    result = localFailure(code);
+    if (state) {
+      state.code = code; state.stage = "failed";
+      state.outcome = attempted ? "outcome_unknown" : "not_started";
+      try { await operation.save(state); } catch { result.journal = "write_failed"; }
+    }
+  } finally {
+    if (operation && acquired && (!attempted || state?.outcome === "verified")) {
+      try { lock.release(state.owner); state.lock = "released"; await operation.save(state); }
+      catch { result = { ...result, coordination: "release_unverified" }; }
+    }
+    operation?.close();
+  }
+  return { ...result, outcome: state?.outcome ?? "not_started", stage: state?.stage ?? "preflight",
+    coordination: result?.coordination ?? state?.lock ?? "not_acquired" };
+}
+
+// Reconciliation never invokes Wrangler. Owner must first establish that the
+// interrupted executor cannot still run; a lost HTTP response is not that proof.
+export async function reconcileProductionDeployment({ operationDirectory, workerDirectory,
+  confirmation, executorStopped = false, coordinationFactory = createProductionDeploymentLock,
+  healthRecheck = recheckProductionHealth, publicSurfaceRecheck = recheckProductionPublicSurface,
+  fetchImpl = globalThis.fetch }) {
+  if (confirmation !== "RECONCILE_PRODUCTION_DEPLOYMENT" || executorStopped !== true) return localFailure("RECONCILIATION_CONFIRMATION_REQUIRED");
+  let operation;
+  try {
+    const prior = await readOperation(operationDirectory);
+    if (prior.kind !== "production") throw operationError("PRODUCTION_RECONCILIATION_INVALID");
+    // Binding is independently checked by reading the closed deployment fields.
+    const { state } = prior;
+    if (!EXACT_COMMIT.test(state.sourceCommit ?? "") || !EXACT_COMMIT.test(state.previousSourceCommit ?? "") || !EXACT_COMMIT.test(state.owner ?? "")) throw operationError("PRODUCTION_RECONCILIATION_INVALID");
+    operation = await openOperation({ directory: operationDirectory, kind: "production", binding: { sourceCommit: state.sourceCommit,
+      previousSourceCommit: state.previousSourceCommit, confirmedMigrations: state.confirmedMigrations ?? null }, resume: true });
+    const lock = coordinationFactory({ repositoryRoot: resolve(workerDirectory, "../..") });
+    lock.assertOwned(state.owner);
+    const health = await healthRecheck({ fetchImpl });
+    if (!health?.ok || health.sourceCommit !== state.sourceCommit || !(await publicSurfaceRecheck({ fetchImpl }))?.ok) throw operationError("PRODUCTION_RECONCILIATION_UNVERIFIED");
+    state.outcome = "verified"; state.stage = "verified"; state.code = "PRODUCTION_DEPLOYED";
+    await operation.save(state);
+    lock.release(state.owner); state.lock = "released"; await operation.save(state);
+    return { ok: true, code: "PRODUCTION_RECONCILED", outcome: "verified", coordination: "released" };
+  } catch (error) { return localFailure(/^(?:PRODUCTION|RELEASE_OPERATION)_[A-Z_]+$/.test(error?.code ?? "") ? error.code : "PRODUCTION_RECONCILIATION_FAILED"); }
+  finally { operation?.close(); }
+}
+
+export function parseProductionDeploymentArgs(argv) {
+  const names = new Map([["--confirm", "confirmation"], ["--confirm-migrations", "confirmedMigrations"],
+    ["--expected-previous-source", "expectedPreviousSourceCommit"], ["--operation", "operationDirectory"]]);
+  const result = {};
+  for (let i = 0; i < argv.length; i += 1) {
+    if (argv[i] === "--executor-stopped" && !result.executorStopped) { result.executorStopped = true; continue; }
+    const name = names.get(argv[i]); const value = argv[++i];
+    if (!name || name in result || !value || value.startsWith("--") || value.includes("\0")) throw operationError("PRODUCTION_ARGUMENTS_INVALID");
+    result[name] = value;
+  }
+  if (result.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT") {
+    if (!result.operationDirectory || !result.executorStopped || result.confirmedMigrations || result.expectedPreviousSourceCommit) throw operationError("PRODUCTION_ARGUMENTS_INVALID");
+  } else if (result.confirmation !== PRODUCTION_DEPLOY_CONFIRMATION || !EXACT_COMMIT.test(result.expectedPreviousSourceCommit ?? "") || result.executorStopped) throw operationError("PRODUCTION_ARGUMENTS_INVALID");
+  return result;
 }
 
 async function main() {
-  const plainShape = process.argv.length === 4
-    && process.argv[2] === "--confirm";
-  const migrationShape = process.argv.length === 6
-    && process.argv[2] === "--confirm"
-    && process.argv[4] === "--confirm-migrations";
-  if (!plainShape && !migrationShape) {
+  let options;
+  try { options = parseProductionDeploymentArgs(process.argv.slice(2)); } catch {
     process.stderr.write(
       "Usage: production-deploy.mjs "
         + `--confirm ${PRODUCTION_DEPLOY_CONFIRMATION} `
-        + "[--confirm-migrations BINDING:0000_name.sql,...]\n",
+        + "--expected-previous-source FULL_SHA [--operation PRIVATE_DIRECTORY] "
+        + "[--confirm-migrations BINDING:0000_name.sql,...]\n"
+        + "Reconcile only: --confirm RECONCILE_PRODUCTION_DEPLOYMENT --operation PRIVATE_DIRECTORY --executor-stopped\n",
     );
     process.exit(2);
   }
@@ -1237,9 +1368,9 @@ async function main() {
       ".bin",
       process.platform === "win32" ? "wrangler.cmd" : "wrangler",
     );
-    result = await runProductionDeployment({
-      confirmation: option("--confirm"),
-      confirmedMigrations: option("--confirm-migrations"),
+    const run = options.confirmation === "RECONCILE_PRODUCTION_DEPLOYMENT" ? reconcileProductionDeployment : runProductionDeployment;
+    result = await run({
+      ...options,
       wrangler,
       workerDirectory,
     });

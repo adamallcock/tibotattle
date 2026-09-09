@@ -437,7 +437,7 @@ describe("admin metrics history aggregate cache", () => {
     }]);
   });
 
-  it("fails closed for a missing, stale, or corrupt cache", async () => {
+  it("preserves a valid older publication, but fails closed for a missing or corrupt cache", async () => {
     const unavailable = {
       status: 503,
       code: "ADMIN_METRICS_HISTORY_CACHE_UNAVAILABLE",
@@ -466,6 +466,14 @@ describe("admin metrics history aggregate cache", () => {
     await expect(readCachedAdminMetricsHistory(
       bindings.USAGE_MONITOR_DB,
       nowEpoch,
+    )).resolves.toMatchObject({ generatedAt: staleAt });
+    await expect(readCachedAdminMetricsHistory(
+      bindings.USAGE_MONITOR_DB,
+      nowEpoch + 7 * 24 * 60 * 60 * 1_000,
+    )).resolves.toMatchObject({ generatedAt: staleAt });
+    await expect(readCachedAdminMetricsHistory(
+      bindings.USAGE_MONITOR_DB,
+      Date.parse(staleAt) - 6 * 60 * 1_000,
     )).rejects.toMatchObject(unavailable);
 
     await bindings.USAGE_MONITOR_DB.prepare(
@@ -487,6 +495,20 @@ describe("admin metrics history aggregate cache", () => {
     )).resolves.toMatchObject({
       schemaVersion: "admin-metrics-history-v0.2",
     });
+  });
+
+  it("distinguishes a temporary cache read failure from confirmed absence", async () => {
+    const unavailableDb = new Proxy(bindings.USAGE_MONITOR_DB, {
+      get(target, property, receiver) {
+        if (property === "prepare") return () => { throw new Error("synthetic storage failure"); };
+        return Reflect.get(target, property, receiver);
+      },
+    });
+    await expect(readCachedAdminMetricsHistory(unavailableDb, nowEpoch))
+      .rejects.toMatchObject({
+        status: 503,
+        code: "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE",
+      });
   });
 
   it("self-throttles scheduled warming before the raw history builder", async () => {

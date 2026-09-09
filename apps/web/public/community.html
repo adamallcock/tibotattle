@@ -442,8 +442,8 @@
             <div class="community-allowance hero-community-allowance" id="community-allowance-figure">
               <div class="activity-heading">
                 <div>
-                  <h2 id="community-allowance-heading" data-i18n="community.allowance.heading">Combined Pro 20x-equivalent allowance</h2>
-                  <p data-i18n="community.allowance.heroCopy">One combined estimate across contributing personal-plan accounts, normalized to a Pro 20x equivalent and valued at API prices.</p>
+                  <h2 id="community-allowance-heading" data-i18n="community.allowance.heading">Pro 20x-equivalent allowance</h2>
+                  <p data-i18n="community.allowance.heroCopy">API-price value of a Pro 20x-equivalent week: overall, by plan or by model.</p>
                 </div>
                 <div class="allowance-controls">
                   <span class="evidence-chip neutral" id="community-allowance-state">
@@ -461,6 +461,11 @@
                     <button type="button" data-range-days="" aria-pressed="false">All</button>
                   </div>
                 </div>
+              </div>
+              <div class="segmented-control allowance-view-controls" data-allowance-view-controls role="group" aria-label="Allowance graph view" data-i18n-aria-label="community.allowance.viewLabel">
+                <button type="button" data-allowance-view="aggregate" class="active" aria-pressed="true" data-i18n="community.allowance.viewAggregate">Aggregate</button>
+                <button type="button" data-allowance-view="plans" aria-pressed="false" data-i18n="community.allowance.viewPlans">By plan</button>
+                <button type="button" data-allowance-view="models" aria-pressed="false" data-i18n="community.allowance.viewModels">By model</button>
               </div>
               <div class="result-summary" id="community-allowance-result">
                 <p>Checking for published allowance estimates…</p>
@@ -529,8 +534,8 @@
         <header class="community-chart-dialog-header">
           <div>
             <span class="community-chart-dialog-eyebrow" data-i18n="community.allowance.dialogEyebrow">Community view</span>
-            <h2 id="community-allowance-dialog-title" data-i18n="community.allowance.dialogTitle">Explore community allowance history</h2>
-            <p id="community-allowance-dialog-copy" data-i18n="community.allowance.dialogCopy">A larger view of the same published estimate. Hover, tap, or use the arrow keys to inspect a day.</p>
+            <h2 id="community-allowance-dialog-title" data-i18n="community.allowance.dialogTitle">Community allowance history</h2>
+            <p id="community-allowance-dialog-copy" data-i18n="community.allowance.dialogCopy">Hover, tap or use arrow keys to inspect a day.</p>
           </div>
           <button
             class="community-chart-dialog-close"
@@ -546,6 +551,11 @@
           </button>
         </header>
         <div class="community-chart-dialog-toolbar">
+          <div class="segmented-control allowance-view-controls" data-allowance-view-controls role="group" aria-label="Allowance graph view" data-i18n-aria-label="community.allowance.viewLabel">
+            <button type="button" data-allowance-view="aggregate" class="active" aria-pressed="true" data-i18n="community.allowance.viewAggregate">Aggregate</button>
+            <button type="button" data-allowance-view="plans" aria-pressed="false" data-i18n="community.allowance.viewPlans">By plan</button>
+            <button type="button" data-allowance-view="models" aria-pressed="false" data-i18n="community.allowance.viewModels">By model</button>
+          </div>
           <span data-i18n="community.allowance.dialogRange">Time range</span>
           <div
             class="segmented-control"

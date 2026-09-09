@@ -1,12 +1,18 @@
 import {
+  AdminResponseError,
   adminActionErrorMessage,
   adminResponseError,
+  createAdminReadLane,
+  isTransientAdminReadError,
   projectAdminAllowancePreview,
   projectAdminAction,
   projectAdminMetricsHistory,
   projectAdminOverview,
+  projectAdminReconstructionProgress,
 } from "./admin-client.js";
 import { formatNumber, formatReportingTime } from "./ui-format.js";
+import { planWeeklyApiEquivalentUsd } from "./community-data.js";
+import { allowanceModelPresentation, modelThemeIcon } from "./community-view.js";
 
 const state = {
   csrfToken: "",
@@ -21,9 +27,14 @@ const state = {
   allowanceMode: "combined",
   allowancePlanFilter: null,
   allowanceModelFilter: "observed",
+  allowanceModelFocus: null,
   allowanceRangeDays: 30,
+  allowanceChartWidth: null,
   notificationPreferences: null,
   metricsHistory: undefined,
+  reconstructionProgress: null,
+  reconstructionProgressFailed: false,
+  overviewReadSucceeded: false,
   auditRows: [],
   auditPage: 0,
   auditSignature: null,
@@ -633,11 +644,15 @@ async function request(path, init = {}) {
       // reach the API. Always sent on the same-origin admin page (no preflight).
       "x-usage-monitor-admin": "1",
     },
+  }).catch(() => {
+    // Retain only a fixed transport classification, never browser error text.
+    throw new AdminResponseError("ADMIN_NETWORK_ERROR");
   });
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     throw adminResponseError(response.status, body);
   }
+  if (body === null) throw new AdminResponseError("ADMIN_RESPONSE_INVALID");
   return body;
 }
 
@@ -1016,7 +1031,7 @@ function renderGrowth(history) {
   if (cohortCard) cards.push(cohortCard);
   container.replaceChildren(...cards);
   badge.className = "admin-source-badge admin-source-available";
-  badge.textContent = "History available";
+  badge.textContent = `History through ${formatTime(history.generatedAt)}`;
 }
 
 function growthBandCard(snapshots) {
@@ -1121,19 +1136,9 @@ function growthPlanCohortCard(snapshots) {
   return card;
 }
 
-async function loadGrowthHistory(loadGeneration) {
+async function loadGrowthHistory() {
   if (!isAdminPage) return;
-  try {
-    const history = projectAdminMetricsHistory(await request("/api/v1/admin/metrics/history"));
-    if (history.schemaVersion !== GROWTH_SCHEMA_VERSION) throw new Error("unexpected metrics-history schema");
-    if (!isCurrentLoadGeneration(loadGeneration, state.loadGeneration)) return;
-    state.metricsHistory = history;
-    renderHistoryBackedSections();
-  } catch {
-    if (!isCurrentLoadGeneration(loadGeneration, state.loadGeneration)) return;
-    state.metricsHistory = null;
-    renderHistoryBackedSections();
-  }
+  return adminReadLanes.history.run();
 }
 
 function renderHistoryBackedSections() {
@@ -1172,7 +1177,7 @@ function renderCounts(overview) {
       label: "Accounts with accepted data",
       value: count(contributorEvidence.total, contributorEvidence.totalBounded),
       detail: contributorEvidence.exact
-        ? "Exact scheduled aggregate · refreshed hourly"
+        ? `Exact scheduled aggregate · ${formatTime(state.metricsHistory.generatedAt)}`
         : `${count(contributors.acceptedLast30Days, contributors.bounded)} sent data in the last 30 days`,
       points: contributorHistory.points,
       historyUnavailable: contributorHistory.unavailable,
@@ -2191,16 +2196,10 @@ function scheduleRefresh({ retry = false } = {}) {
 const ADMIN_ALLOWANCE_DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const ADMIN_ALLOWANCE_CHART_WIDTH = 960;
 const ADMIN_ALLOWANCE_CHART_HEIGHT = 300;
-const ADMIN_ALLOWANCE_MODEL_STYLES = Object.freeze({
-  "gpt-5.6-sol": Object.freeze({ className: "model-sol" }),
-  "gpt-5.6-terra": Object.freeze({ className: "model-terra" }),
-  "gpt-5.6-luna": Object.freeze({ className: "model-luna" }),
-  "gpt-5.5": Object.freeze({ className: "model-gpt55" }),
-});
 const ADMIN_ALLOWANCE_PLAN_STYLES = Object.freeze({
-  pro: Object.freeze({ label: "Pro 20x", className: "pro" }),
-  prolite: Object.freeze({ label: "Pro 5x → 20x", className: "prolite" }),
-  plus: Object.freeze({ label: "Plus → 20x", className: "plus" }),
+  pro: Object.freeze({ label: "Pro 20×", className: "allowance-series-0" }),
+  prolite: Object.freeze({ label: "Pro 5×", className: "allowance-series-1" }),
+  plus: Object.freeze({ label: "Plus", className: "allowance-series-2" }),
 });
 
 function adminAllowanceTickStep(span, target = 4) {
@@ -2244,6 +2243,7 @@ export function adminAllowanceChartModel(preview, {
   mode = "combined",
   planFilter = null,
   modelFilter = "all",
+  modelFocus = null,
   rangeDays = 30,
   width = ADMIN_ALLOWANCE_CHART_WIDTH,
   height = ADMIN_ALLOWANCE_CHART_HEIGHT,
@@ -2257,10 +2257,10 @@ export function adminAllowanceChartModel(preview, {
     ? Number.NEGATIVE_INFINITY
     : Date.parse(`${anchor}T00:00:00.000Z`)
       - (rangeDays - 1) * ADMIN_ALLOWANCE_DAY_MILLISECONDS;
-  const days = preview.days.filter((day) => (
+  const rangeDaysWithEvidence = preview.days.filter((day) => (
     Date.parse(`${day.day}T00:00:00.000Z`) >= cutoffMs
   ));
-  if (days.length === 0) return null;
+  if (rangeDaysWithEvidence.length === 0) return null;
   const planSeries = preview.plans.map((plan) => ({
     key: plan.planType,
     ...ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType],
@@ -2271,9 +2271,9 @@ export function adminAllowanceChartModel(preview, {
   const modelSeries = (preview.models?.modelConfig ?? []).map((model, index) => ({
     key: model.modelId,
     label: model.label,
-    className: ADMIN_ALLOWANCE_MODEL_STYLES[model.modelId]?.className
-      ?? `model-catalog-${index % 8}`,
-  }));
+    hasEvidence: rangeDaysWithEvidence.some(day => modelDayByDay.get(day.day)?.byModel?.[model.modelId]?.capacityUsd != null),
+    ...allowanceModelPresentation(model.modelId, index),
+  })).sort((left, right) => left.order - right.order);
   const activePlanFilter = mode === "plans"
     && planSeries.some((plan) => plan.key === planFilter)
     ? planFilter
@@ -2282,13 +2282,14 @@ export function adminAllowanceChartModel(preview, {
     ? [{ key: "combined", label: "Combined", className: "combined" }]
     : mode === "models"
       ? modelSeries.filter((model) => modelFilter === "all"
-        || (modelFilter === "observed" ? days.some((day) => (
-          modelDayByDay.get(day.day)?.byModel?.[model.key]?.capacityUsd != null
-        )) : model.key === modelFilter))
+        || (modelFilter === "observed" ? model.hasEvidence : model.key === modelFilter))
       : planSeries;
-  const series = mode !== "plans" || activePlanFilter === null
-    ? legendSeries
-    : planSeries.filter((plan) => plan.key === activePlanFilter);
+  const activeModelFocus = mode === "models"
+    && legendSeries.some((model) => model.key === modelFocus && model.hasEvidence)
+    ? modelFocus : null;
+  const activeSeriesKey = activePlanFilter ?? activeModelFocus;
+  const series = activeSeriesKey === null ? legendSeries
+    : legendSeries.filter((definition) => definition.key === activeSeriesKey);
   const summaryFor = (day, key) => {
     if (mode === "models") {
       const modelDay = modelDayByDay.get(day.day);
@@ -2309,9 +2310,18 @@ export function adminAllowanceChartModel(preview, {
     }
     return key === "combined" ? day.combined : day.byPlanType[key];
   };
+  // Trim empty edges in All, but not interior gaps. Focusing a legend never
+  // moves the date axis; all series in the selected view share its bounds.
+  let days = rangeDaysWithEvidence;
+  if (rangeDays === null) {
+    const hasEstimate = day => legendSeries.some(definition => summaryFor(day, definition.key)?.centralUsd != null);
+    const first = days.findIndex(hasEstimate);
+    if (first < 0) return null;
+    days = days.slice(first, days.findLastIndex(hasEstimate) + 1);
+  }
   let visibleValueCount = 0;
   const valueCandidates = [];
-  for (const day of days) {
+  for (const day of rangeDaysWithEvidence) {
     for (const definition of series) {
       const summary = summaryFor(day, definition.key);
       if (summary?.centralUsd !== null && summary?.centralUsd !== undefined) {
@@ -2370,13 +2380,14 @@ export function adminAllowanceChartModel(preview, {
         * (plot.right - plot.left);
   };
   const step = adminAllowanceTickStep(Math.max(...valueCandidates));
-  const axisTop = Math.ceil(Math.max(...valueCandidates) / step) * step;
+  const axisTop = Math.max(step, Math.ceil(Math.max(...valueCandidates) / step) * step);
   const y = (value) => plot.bottom
     - (value / axisTop) * (plot.bottom - plot.top);
   const dollarTicks = [];
   for (let value = 0; value <= axisTop + step / 100; value += step) {
     dollarTicks.push({ value, y: y(value) });
   }
+  const daySpacing = (plot.right - plot.left) / Math.max(1, (endMs - startMs) / ADMIN_ALLOWANCE_DAY_MILLISECONDS);
   const modeledSeries = series.map((definition) => {
     const points = days.flatMap((day) => {
       const summary = summaryFor(day, definition.key);
@@ -2386,14 +2397,18 @@ export function adminAllowanceChartModel(preview, {
         value: summary.centralUsd,
         fitCount: summary.fitCount,
         participantCount: summary.participantCount,
+        radius: Math.min(5, Math.max(1.6, daySpacing * .3), 2.6 + Math.sqrt(summary.fitCount)),
         x: x(day.day),
         y: y(summary.centralUsd),
       }];
     });
+    const segments = adminAllowanceSegments(points);
     return {
       ...definition,
       points,
-      segments: adminAllowanceSegments(points),
+      segments,
+      markerPoints: daySpacing < 14
+        ? segments.flatMap(segment => segment.length === 1 ? segment : [segment[0], segment.at(-1)]) : points,
       latest: points.at(-1) ?? null,
     };
   });
@@ -2410,7 +2425,7 @@ export function adminAllowanceChartModel(preview, {
     const segments = adminAllowanceSegments(points);
     return segments.length === 0 ? [] : [{ ...definition, segments }];
   });
-  const maximumTicks = 6;
+  const maximumTicks = width < 480 ? 4 : 6;
   const dayTicks = Array.from({ length: maximumTicks }, (_, index) => {
     const atMs = startMs + Math.round(
       ((endMs - startMs) * index) / (maximumTicks - 1)
@@ -2425,9 +2440,11 @@ export function adminAllowanceChartModel(preview, {
     plot,
     dollarTicks,
     dayTicks,
-    tickLabelStyle: days.length > 45 ? "month" : "day",
+    tickLabelStyle: endMs - startMs > 150 * ADMIN_ALLOWANCE_DAY_MILLISECONDS ? "month" : "day",
     mode,
     activePlanFilter,
+    activeModelFocus,
+    activeSeriesKey,
     legendSeries,
     series: modeledSeries,
     bandSeries,
@@ -2475,34 +2492,40 @@ function allowanceCountLabel(value, singular) {
 function appendAdminAllowanceLegend(figure, model) {
   const legend = document.createElement("div");
   legend.className = "admin-allowance-legend";
-  if (model.mode === "plans") {
+  const interactive = model.mode !== "combined";
+  if (interactive) {
     legend.classList.add("admin-allowance-legend-interactive");
-    if (model.activePlanFilter !== null) {
+    if (model.activeSeriesKey !== null) {
       legend.classList.add("admin-allowance-legend-filtered");
     }
     legend.setAttribute("role", "group");
-    legend.setAttribute("aria-label", "Filter allowance chart by plan");
+    legend.setAttribute("aria-label", `Focus allowance chart by ${model.mode === "plans" ? "plan" : "model"}`);
   }
   for (const series of model.legendSeries) {
-    const item = document.createElement(model.mode === "plans" ? "button" : "span");
-    if (model.mode === "plans") {
-      const selected = model.activePlanFilter === series.key;
+    const item = document.createElement(interactive ? "button" : "span");
+    if (interactive) {
+      const selected = model.activeSeriesKey === series.key;
       item.type = "button";
       item.className = "admin-allowance-legend-button";
-      item.dataset.allowancePlan = series.key;
+      if (model.mode === "plans") item.dataset.allowancePlan = series.key;
+      else item.dataset.allowanceModelFocus = series.key;
       item.setAttribute("aria-pressed", String(selected));
       item.setAttribute(
         "aria-label",
-        selected ? `Show all plans` : `Show only ${series.label}`,
+        selected ? `Show all ${model.mode}` : `Show only ${series.label}`,
       );
       item.title = selected
-        ? "Show all plans"
-        : `Filter chart to ${series.label}`;
+        ? `Show all ${model.mode}`
+        : `Focus chart on ${series.label}`;
+      if (series.hasEvidence === false) {
+        item.disabled = true;
+        item.title = "No qualifying fits in this range";
+      }
     }
     const swatch = document.createElement("span");
     swatch.className = model.mode === "plans"
-      ? `admin-allowance-plan-key admin-allowance-plan-key-${series.className}`
-      : `admin-allowance-swatch admin-allowance-swatch-${series.className}`;
+      ? `admin-allowance-plan-key ${series.className}`
+      : `admin-allowance-swatch ${series.className}`;
     swatch.setAttribute("aria-hidden", "true");
     const label = document.createElement("span");
     label.textContent = series.label;
@@ -2520,14 +2543,29 @@ function appendAdminAllowanceLegend(figure, model) {
     legend.append(item);
   }
   figure.append(legend);
+  if (interactive) {
+    const hint = document.createElement("p");
+    hint.className = "allowance-legend-hint";
+    hint.textContent = "Select a legend to focus; select it again to show all.";
+    figure.append(hint);
+  }
 }
 
 function appendAdminAllowanceChart(container, preview) {
+  const availableWidth = container.getBoundingClientRect?.().width;
+  // Size the coordinate system to the actual chart surface so phone layouts
+  // retain readable axes instead of shrinking a desktop-wide SVG to a strip.
+  const width = Number.isFinite(availableWidth) && availableWidth > 0
+    ? Math.max(280, Math.min(ADMIN_ALLOWANCE_CHART_WIDTH, availableWidth - 30))
+    : ADMIN_ALLOWANCE_CHART_WIDTH;
+  state.allowanceChartWidth = availableWidth;
   const model = adminAllowanceChartModel(preview, {
     mode: state.allowanceMode,
     planFilter: state.allowancePlanFilter,
     modelFilter: state.allowanceModelFilter,
+    modelFocus: state.allowanceModelFocus,
     rangeDays: state.allowanceRangeDays,
+    width,
   });
   if (model === null) {
     const empty = document.createElement("p");
@@ -2538,13 +2576,15 @@ function appendAdminAllowanceChart(container, preview) {
   }
   const figure = document.createElement("div");
   figure.className = "community-daily-chart community-allowance-chart";
-  if (model.activePlanFilter !== null) {
+  if (model.activeSeriesKey !== null) {
     figure.classList.add("community-allowance-chart-filtered");
   }
   appendAdminAllowanceLegend(figure, model);
   const svg = adminAllowanceSvg("svg", "", {
     viewBox: `0 0 ${model.width} ${model.height}`,
     role: "img",
+    tabindex: 0,
+    "aria-description": "Weekly API-equivalent USD on a Pro 20× basis. Hover, tap or use arrow keys to inspect each day's estimate. Missing days stay gaps.",
     "aria-label": state.allowanceMode === "combined"
       ? "Combined Pro 20x-equivalent community allowance by day"
       : state.allowanceMode === "models"
@@ -2591,13 +2631,13 @@ function appendAdminAllowanceChart(container, preview) {
         ));
         svg.append(adminAllowanceSvg(
           "path",
-          `admin-allowance-band-area admin-allowance-band-area-${bandSeries.className}`,
+          `admin-allowance-band-area ${bandSeries.className}`,
           { d: `M${[...forward, ...backward].join(" L")} Z` },
         ));
       } else {
         svg.append(adminAllowanceSvg(
           "line",
-          `admin-allowance-band-mark admin-allowance-band-mark-${bandSeries.className}`,
+          `admin-allowance-band-mark ${bandSeries.className}`,
           {
             x1: band[0].x,
             x2: band[0].x,
@@ -2608,38 +2648,76 @@ function appendAdminAllowanceChart(container, preview) {
       }
     }
   }
+  const inspection = document.createElement("p");
+  inspection.className = "admin-allowance-inspection";
+  inspection.setAttribute("aria-live", "polite");
+  inspection.textContent = "Hover, tap or use arrow keys to inspect a day.";
+  const inspectionPoints = [];
   for (const series of model.series) {
     for (const segment of series.segments) {
       if (segment.length >= 2) {
         svg.append(adminAllowanceSvg(
           "polyline",
-          `admin-allowance-line admin-allowance-line-${series.className}`,
+          `admin-allowance-line ${series.className}`,
           { points: segment.map((point) => (
             `${point.x.toFixed(1)},${point.y.toFixed(1)}`
           )).join(" ") },
         ));
       }
     }
+    const markers = new Set(series.markerPoints);
     for (const point of series.points) {
+      const detail = `${series.label} · ${point.day} · ${allowanceUsd(point.value)}/Pro 20× week at API prices`
+        + ` · ${allowanceCountLabel(point.participantCount, "account")}`
+        + (model.mode === "models" ? "" : ` · ${allowanceCountLabel(point.fitCount, "fit")}`);
       const dot = adminAllowanceSvg(
         "circle",
-        `admin-allowance-dot admin-allowance-dot-${series.className}`,
+        `admin-allowance-dot ${series.className}`,
         {
           cx: point.x,
           cy: point.y,
-          r: Math.min(6, 2.4 + Math.sqrt(point.fitCount)),
-          tabindex: 0,
-          "aria-label": `${series.label}, ${point.day}: ${allowanceUsd(point.value)}, ${allowanceCountLabel(point.participantCount, "account")}, ${allowanceCountLabel(point.fitCount, "fit")}`,
+          r: point.radius,
+          tabindex: -1,
+          "data-permanent-marker": String(markers.has(point)),
+          "aria-label": detail,
         },
       );
       const title = adminAllowanceSvg("title");
-      title.textContent = `${series.label} · ${point.day} · ${allowanceUsd(point.value)} · ${allowanceCountLabel(point.participantCount, "account")} · ${allowanceCountLabel(point.fitCount, "fit")}`;
+      title.textContent = detail;
       dot.append(title);
+      const inspect = () => { inspection.textContent = detail; };
+      dot.addEventListener("pointerenter", inspect);
+      dot.addEventListener("click", inspect);
+      dot.addEventListener("focus", inspect);
+      inspectionPoints.push({ day: point.day, dot });
       svg.append(dot);
     }
   }
-  figure.append(svg);
+  // One tab stop for the chart, chronological arrow-key access to every point
+  // (including markers hidden to keep dense lines legible).
+  inspectionPoints.sort((left, right) => left.day.localeCompare(right.day));
+  let inspectionIndex = -1;
+  svg.addEventListener("keydown", event => {
+    if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const focused = inspectionPoints.findIndex(point => point.dot === event.target);
+    if (focused >= 0) inspectionIndex = focused;
+    if (event.key === "Home") inspectionIndex = 0;
+    else if (event.key === "End") inspectionIndex = inspectionPoints.length - 1;
+    else inspectionIndex = Math.max(0, Math.min(inspectionPoints.length - 1,
+      inspectionIndex + (["ArrowLeft", "ArrowUp"].includes(event.key) ? -1 : 1)));
+    inspectionPoints[inspectionIndex]?.dot.focus();
+  });
+  figure.append(svg, inspection);
   container.append(figure);
+  if (model.mode === "plans") {
+    const method = document.createElement("p");
+    method.className = "admin-allowance-meta";
+    method.textContent = "Chart scaled to Pro 20×: Pro 20× ×1, Pro 5× ×4, Plus ×20."
+      + " Smaller card values show each plan’s own week at API prices."
+      + " Shading: middle 80% of qualifying reset fits. Missing days stay gaps.";
+    container.append(method);
+  }
 }
 
 function appendCombinedAllowanceSummary(container, preview) {
@@ -2652,7 +2730,7 @@ function appendCombinedAllowanceSummary(container, preview) {
   value.textContent = allowanceUsd(latest.summary.centralUsd);
   const unit = document.createElement("span");
   unit.className = "admin-allowance-unit";
-  unit.textContent = "per 7 days, Pro 20x equivalent";
+  unit.textContent = "API-equivalent USD / Pro 20× week";
   const meta = document.createElement("p");
   meta.className = "admin-allowance-meta";
   const evidence = document.createElement("span");
@@ -2679,33 +2757,50 @@ function appendCombinedAllowanceSummary(container, preview) {
 }
 
 function appendPlanAllowanceSummaries(container, preview) {
+  appendAllowanceCardsCaption(container);
   const list = document.createElement("div");
-  list.className = "admin-allowance-plan-summaries";
+  list.className = "admin-allowance-plan-summaries allowance-summary-cards";
   for (const plan of preview.plans) {
     const latest = latestAllowanceSummary(preview, plan.planType);
     const style = ADMIN_ALLOWANCE_PLAN_STYLES[plan.planType];
     const item = document.createElement("div");
-    item.className = "admin-allowance-plan-summary";
+    item.className = `admin-allowance-plan-summary allowance-summary-card ${style.className}`;
     if (state.allowancePlanFilter === plan.planType) {
       item.classList.add("admin-allowance-plan-summary-selected");
     }
-    const label = document.createElement("span");
+    const label = document.createElement("h3");
     label.textContent = style.label;
     const value = document.createElement("strong");
+    value.className = "allowance-summary-value";
     value.textContent = latest === null ? "—" : allowanceUsd(latest.summary.centralUsd);
-    const meta = document.createElement("small");
+    const meta = document.createElement("p");
     meta.textContent = latest === null
       ? "No qualifying fits"
-      : `${allowanceCountLabel(latest.summary.participantCount, "account")} · ${allowanceCountLabel(latest.summary.fitCount, "fit")}`;
-    const range = document.createElement("small");
+      : `${latest.day} · ${allowanceCountLabel(latest.summary.participantCount, "account")} · ${allowanceCountLabel(latest.summary.fitCount, "fit")}`;
+    const range = document.createElement("p");
     range.className = "admin-allowance-plan-range";
     range.textContent = latest?.summary.band80Usd
       ? `Middle 80% ${allowanceUsd(latest.summary.band80Usd.lowerUsd)}–${allowanceUsd(latest.summary.band80Usd.upperUsd)}`
       : "Middle 80% unavailable";
-    item.append(label, value, meta, range);
+    item.append(label, value);
+    const planUsd = planWeeklyApiEquivalentUsd(latest?.summary.centralUsd, plan.planType);
+    if (planUsd !== null) {
+      const actual = document.createElement("p");
+      actual.className = "allowance-plan-value";
+      actual.textContent = `This plan: ${allowanceUsd(planUsd)}/week at API prices`;
+      item.append(actual);
+    }
+    item.append(meta, range);
     list.append(item);
   }
   container.append(list);
+}
+
+function appendAllowanceCardsCaption(container) {
+  const caption = document.createElement("p");
+  caption.className = "allowance-summary-caption";
+  caption.textContent = "API-equivalent USD / Pro 20× week";
+  container.append(caption);
 }
 
 function appendAllowanceCoverage(container, coverage) {
@@ -2751,6 +2846,9 @@ function renderAdminAllowanceControls() {
 
 function appendModelAllowanceSummaries(container, preview) {
   const models = preview.models;
+  const modelConfig = models.modelConfig.map((model, index) => ({
+    ...model, ...allowanceModelPresentation(model.modelId, index),
+  })).sort((left, right) => left.order - right.order);
   const filterLabel = document.createElement("label");
   filterLabel.className = "admin-allowance-model-filter";
   filterLabel.textContent = "Model view ";
@@ -2759,7 +2857,7 @@ function appendModelAllowanceSummaries(container, preview) {
   for (const [value, text] of [
     ["observed", "Models with identified fits"],
     ["all", "All reviewed models"],
-    ...models.modelConfig.map((model) => [model.modelId, model.label]),
+    ...modelConfig.map((model) => [model.modelId, model.label]),
   ]) {
     const option = document.createElement("option");
     option.value = value;
@@ -2769,6 +2867,7 @@ function appendModelAllowanceSummaries(container, preview) {
   filter.value = state.allowanceModelFilter;
   filter.addEventListener("change", () => {
     state.allowanceModelFilter = filter.value;
+    state.allowanceModelFocus = null;
     renderAdminCommunityAllowance(preview);
     $(".admin-allowance-model-filter select")?.focus();
   });
@@ -2778,48 +2877,46 @@ function appendModelAllowanceSummaries(container, preview) {
   if (latest === null) {
     const empty = document.createElement("p");
     empty.className = "admin-allowance-empty";
-    empty.textContent = "No identification-passing per-model fits recorded"
-      + " yet. The series accrues from the first day the composition kernel"
-      + " accepts a fit.";
+    empty.textContent = "No identification-passing per-model fits are available yet."
+      + " Qualified historical points fill in as background calculations complete.";
     container.append(empty);
   }
+  appendAllowanceCardsCaption(container);
   const grid = document.createElement("div");
-  grid.className = "admin-allowance-plan-summaries";
-  for (const model of models.modelConfig) {
+  grid.className = "admin-allowance-plan-summaries allowance-summary-cards";
+  for (const model of modelConfig) {
     const summary = latest?.byModel[model.modelId];
     if (state.allowanceModelFilter === "observed"
         ? summary?.capacityUsd == null
         : state.allowanceModelFilter !== "all"
           && state.allowanceModelFilter !== model.modelId) continue;
     const tile = document.createElement("div");
-    tile.className = "admin-allowance-plan-summary";
-    const label = document.createElement("p");
-    label.className = "admin-allowance-plan-label";
+    tile.className = `admin-allowance-plan-summary allowance-summary-card ${model.className}`;
+    const heading = document.createElement("div");
+    heading.className = "allowance-summary-heading";
+    const label = document.createElement("h3");
     label.textContent = model.label;
-    const value = document.createElement("p");
-    value.className = "admin-allowance-value";
+    heading.append(label);
+    const icon = modelThemeIcon(document, model.theme);
+    if (icon) heading.append(icon);
+    const value = document.createElement("strong");
+    value.className = "allowance-summary-value";
     value.textContent = summary?.capacityUsd == null
       ? "—"
       : allowanceUsd(summary.capacityUsd);
-    const unit = document.createElement("p");
-    unit.className = "admin-allowance-unit";
-    unit.textContent = model.allowanceTrack === "spark"
-      ? "Separate Spark allowance track"
-      : "per 100pp weekly, Pro 20x equivalent";
     const meta = document.createElement("p");
-    meta.className = "admin-allowance-meta";
+    meta.className = "allowance-headline-caveat";
     meta.textContent = model.allowanceTrack === "spark"
-      ? "Not comparable with the primary allowance; API pricing unavailable"
+      ? "Separate Spark allowance; no comparable API value"
       : summary?.participantCount == null
         ? "Not covered by this retained day’s model roster"
         : summary.capacityUsd === null
           ? "No identification-passing fit carries this model"
-      : `${allowanceCountLabel(summary.participantCount, "account")}`
-        + ` · ${latest.day}`;
+      : `${latest.day} · ${allowanceCountLabel(summary.participantCount, "account")}`;
     if (model.pricingStatus === "assumed_alias") {
       meta.textContent += " · Price alias assumption; identity kept separate";
     }
-    tile.append(label, value, unit, meta);
+    tile.append(heading, value, meta);
     grid.append(tile);
   }
   container.append(grid);
@@ -2832,6 +2929,13 @@ function appendModelAllowanceSummaries(container, preview) {
       + ` contributing accounts pass on ${latest.day}.`)
     + " Catalog visibility does not imply Codex availability or an allowance estimate.";
   container.append(note);
+  const historyNote = document.createElement("p");
+  historyNote.className = "admin-allowance-meta admin-allowance-history-note";
+  historyNote.textContent = "Missing historical days are reconstructed from retained evidence,"
+    + " using the same 100-day lookback and only observations through each UTC day."
+    + " These are retrospective estimates, not a record of what was displayed then."
+    + " Unstable or unsupported periods remain gaps; later model usage is not carried backward.";
+  container.append(historyNote);
 }
 
 function renderAdminCommunityAllowance(preview) {
@@ -2867,19 +2971,184 @@ function renderAdminCommunityAllowance(preview) {
   renderAdminAllowanceControls();
 }
 
-async function loadAdminCommunityAllowance(loadGeneration) {
+async function loadAdminCommunityAllowance() {
   if (!isAdminPage) return;
-  let preview;
-  try {
-    preview = projectAdminAllowancePreview(await request(
-      "/api/v1/admin/community/allowance-preview",
-    ));
-  } catch {
-    preview = null;
+  return adminReadLanes.allowance.run();
+}
+
+function renderReconstructionProgress(progress, { stale = false } = {}) {
+  if (!isAdminPage) return;
+  const panel = $("#admin-reconstruction-progress");
+  const badge = $("#admin-reconstruction-status");
+  const details = $("#admin-reconstruction-details");
+  if (!panel || !badge || !details) return;
+  panel.className = `admin-reconstruction${stale ? " admin-reconstruction-stale" : ""}`;
+  details.replaceChildren();
+  const paragraph = (parent, text, className = "") => {
+    const node = document.createElement("p");
+    node.className = className;
+    node.textContent = text;
+    parent.append(node);
+    return node;
+  };
+  const modeLabel = {
+    resumable: "Resumable calculation",
+    synchronous: "Synchronous calculation",
+    paused: "Paused",
+    unknown: "Mode unknown",
+  }[progress?.mode];
+  const available = progress?.status === "available";
+  badge.className = `admin-source-badge admin-source-${!available || stale || progress.mode === "paused" ? "partial" : "available"}`;
+  badge.textContent = stale && available
+    ? "Stale · last known progress"
+    : !available
+      ? `${progress?.mode === "paused" ? "Paused · " : ""}Progress unavailable`
+      : modeLabel;
+  if (!available) {
+    paragraph(details, "Reconstruction progress is unavailable. Missing progress does not mean there is no work remaining.");
+  } else {
+    const { lookup, calculations, maintenance, publication } = progress;
+    const explanation = paragraph(details,
+      "Daily publication waits for account calculations. Acquired checkpoints are saved calculation inputs, not ready allowance estimates.");
+    explanation.id = "admin-reconstruction-explanation";
+    const grid = document.createElement("dl");
+    grid.className = "admin-reconstruction-grid";
+    const metric = (label, value) => {
+      const group = document.createElement("div");
+      const term = document.createElement("dt");
+      term.textContent = label;
+      const description = document.createElement("dd");
+      description.textContent = value;
+      group.append(term, description);
+      grid.append(group);
+      return group;
+    };
+    const lookupGroup = metric("Record lookup", lookup.complete ? "Complete" : "In progress");
+    if (!lookup.complete) paragraph(lookupGroup,
+      `Lookup position: ${formatNumber(lookup.lastRecordId)} / ${formatNumber(lookup.throughRecordId)}. Positions may have gaps; not a processed-record count.`);
+    const accountCount = `${formatNumber(calculations.completedAccounts)} of ${formatNumber(calculations.trackedAccounts)} ${calculations.bounded ? "shown " : ""}tracked accounts`;
+    const accountGroup = metric("Account checkpoint acquisition",
+      accountCount);
+    if (calculations.trackedAccounts > 0) {
+      const meter = document.createElement("progress");
+      meter.setAttribute("max", calculations.trackedAccounts);
+      meter.setAttribute("value", calculations.completedAccounts);
+      meter.setAttribute("aria-label", "Account checkpoint acquisition");
+      meter.setAttribute("aria-valuetext", `${accountCount} have acquired checkpoints`);
+      meter.setAttribute("aria-describedby", "admin-reconstruction-explanation");
+      meter.textContent = accountCount;
+      accountGroup.append(meter);
+    }
+    paragraph(accountGroup, `Preparing ${formatNumber(calculations.preparingAccounts)} · scanning ${formatNumber(calculations.scanningAccounts)} · finalizing ${formatNumber(calculations.finalizingAccounts)} · source, window or method changed ${formatNumber(calculations.sourceChangedAccounts)}`);
+    paragraph(accountGroup, `${formatNumber(calculations.checkpointsWritten)} checkpoint steps saved in current runs`);
+    paragraph(accountGroup, `Latest cached result: ${calculations.newestResultAt === null ? "not recorded" : `${formatTime(calculations.newestResultAt)} (may be outdated)`}`);
+    if (calculations.bounded) paragraph(accountGroup, `At least ${formatNumber(calculations.trackedAccounts)} tracked accounts; the meter covers only those shown, not overall completion.`);
+    const publicationGroup = metric("Daily publication", {
+      updating: "Updating",
+      ready: "Ready",
+      unknown: "State unknown",
+    }[publication.state]);
+    paragraph(publicationGroup, `${publication.pendingDaysBounded ? "At least " : ""}${formatNumber(publication.pendingDays)} pending days across all history`);
+    paragraph(publicationGroup, `Last 366 days: ${formatNumber(publication.publishedDays)} published · ${formatNumber(publication.pricedDays)} with price data (may be partial)`);
+    details.append(grid);
+    paragraph(details, `${modeLabel} · maintenance ${maintenance.running ? "lock held" : "idle"} · last run ${maintenance.lastRunAt === null ? "not recorded" : formatTime(maintenance.lastRunAt)} · latest publication ${publication.latestPublishedAt === null ? "not recorded" : formatTime(publication.latestPublishedAt)}`);
   }
-  if (!isCurrentLoadGeneration(loadGeneration, state.loadGeneration)) return;
-  state.allowancePreview = preview;
-  renderAdminCommunityAllowance(state.allowancePreview);
+  paragraph(details,
+    `${stale ? "Refresh failed; showing the last available observation. " : ""}${progress ? `Observed ${formatTime(progress.observedAt)}. ` : ""}Updates with the dashboard refresh; no time estimate is available.`,
+    "admin-reconstruction-freshness");
+}
+
+function renderCurrentReconstructionProgress() {
+  const progress = state.reconstructionProgress;
+  if (progress === null) {
+    renderReconstructionProgress(state.overview?.reconstruction);
+    return;
+  }
+  const panel = $("#admin-reconstruction-progress");
+  const badge = $("#admin-reconstruction-status");
+  const details = $("#admin-reconstruction-details");
+  if (!panel || !badge || !details) return;
+  const { publication, work, history } = progress;
+  panel.className = "admin-reconstruction";
+  badge.className = `admin-source-badge admin-source-${work.state === "unavailable" || work.state === "paused" ? "partial" : "available"}`;
+  const workLabel = {
+    idle: "Up to date", queued: "Update queued", building: "Updating",
+    paused: "Updates paused", unavailable: "Work state unavailable",
+  }[work.state];
+  badge.textContent = publication.state === "ready"
+    ? `Graph available · ${workLabel.toLowerCase()}` : workLabel;
+  const paragraph = text => {
+    const node = document.createElement("p");
+    node.textContent = text;
+    return node;
+  };
+  const grid = document.createElement("dl");
+  grid.className = "admin-reconstruction-grid";
+  const metric = (label, text) => {
+    const group = document.createElement("div");
+    const term = document.createElement("dt");
+    term.textContent = label;
+    const description = document.createElement("dd");
+    description.textContent = text;
+    group.append(term, description);
+    grid.append(group);
+    return group;
+  };
+  const historyText = `${formatNumber(history.resolvedDays)} of ${formatNumber(history.requiredDays)} days resolved`;
+  const historyGroup = metric("Historical model days", historyText);
+  if (history.requiredDays > 0) {
+    const meter = document.createElement("progress");
+    meter.setAttribute("max", history.requiredDays);
+    meter.setAttribute("value", history.resolvedDays);
+    meter.setAttribute("aria-label", "Historical model days resolved");
+    meter.setAttribute("aria-valuetext", historyText);
+    meter.textContent = historyText;
+    historyGroup.append(meter);
+  }
+  historyGroup.append(paragraph("Resolved days include completed calculations with insufficient evidence; a missing estimate is never zero."));
+  const phaseLabel = {
+    current: "Current account calculations", history: "Historical day calculations",
+    daily: "Daily activity and spend", publication: "Preparing graph publication",
+  }[work.phase] ?? "Not recorded";
+  const phaseGroup = metric("Calculation phase", phaseLabel);
+  if (history.activeDay !== null) phaseGroup.append(paragraph(`Active history day: ${history.activeDay}`));
+  const accountText = history.completeAccounts === null || history.requiredAccounts === null
+    ? "Account progress not recorded"
+    : `${formatNumber(history.completeAccounts)} of ${formatNumber(history.requiredAccounts)} account calculations complete`;
+  phaseGroup.append(paragraph(accountText));
+  if (progress.schemaVersion === 2) {
+    const { preparation } = progress;
+    const preparationGroup = metric("Reusable source preparation", preparation === null
+      ? "Preparation counters unavailable"
+      : `${formatNumber(preparation.completeDays)} of ${formatNumber(preparation.trackedDays)} tracked source days complete`);
+    if (preparation === null) {
+      preparationGroup.append(paragraph("Preparation counters are unavailable or exceed the display limit; they are not zero."));
+    } else {
+      preparationGroup.append(paragraph(`${formatNumber(preparation.buildingDays)} building · ${formatNumber(preparation.retiringDays)} retiring`));
+      preparationGroup.append(paragraph(`${formatNumber(preparation.checkpointSteps)} saved checkpoint steps · ${formatNumber(preparation.quotaObservations)} quota observations processed · ${formatNumber(preparation.usageEvents)} usage events processed`));
+      preparationGroup.append(paragraph("Source days span retained work, not the remaining historical window. Preparation can advance before account completion. Counts can change when work is replaced or retired."));
+    }
+  }
+  const generation = value => value === null ? "not recorded" : formatNumber(value);
+  const publicationGroup = metric("Graph publication", {
+    ready: "Available", empty: "Awaiting publication", invalidated: "Invalidated",
+  }[publication.state]);
+  publicationGroup.append(paragraph(`Requested generation: ${generation(publication.requestedGeneration)} · prepared: ${generation(publication.preparedGeneration)} · published: ${generation(publication.publishedGeneration)}`));
+  publicationGroup.append(paragraph(`Published: ${publication.publishedAt === null ? "not recorded" : formatTime(publication.publishedAt)}`));
+  const trigger = {
+    contribution: "New contribution", correction: "Contribution correction",
+    day_boundary: "New calendar day", method_change: "Calculation method changed",
+    reconciliation: "Scheduled reconciliation", privacy: "Privacy or publication change",
+  }[work.trigger] ?? "Not recorded";
+  const restart = {
+    input_changed: "Inputs changed", lease_expired: "Work lease expired",
+    method_changed: "Calculation method changed", retry: "Retry",
+  }[work.restartReason] ?? "Not recorded";
+  const triggerGroup = metric("Update trigger", trigger);
+  triggerGroup.append(paragraph(`Restart reason: ${restart}`));
+  const freshness = paragraph(`${state.reconstructionProgressFailed ? "Progress refresh unavailable. " : ""}Observed ${formatTime(progress.generatedAt)}${work.updatedAt === null ? "" : ` · work updated ${formatTime(work.updatedAt)}`}. No time estimate is available.`);
+  freshness.className = "admin-reconstruction-freshness";
+  details.replaceChildren(grid, freshness);
 }
 
 function render(overview) {
@@ -2893,42 +3162,156 @@ function render(overview) {
   renderIngress(overview.ingress);
   renderErrors(overview.errors);
   renderAudit(overview.audit);
+  renderCurrentReconstructionProgress();
   $("#last-refresh").textContent = formatTime(overview.generatedAt);
   $("#service-state").textContent = `${overview.service.environment} · ${overview.collection.state}`;
   notifyAttention(attention);
 }
 
+function renderOverviewUnavailable() {
+  const hasPreviousData = state.overview !== null;
+  if (state.reconstructionProgress === null) {
+    renderReconstructionProgress(state.overview?.reconstruction, { stale: hasPreviousData });
+  }
+  const serviceState = $("#service-state");
+  if (serviceState) {
+    serviceState.textContent = hasPreviousData
+      ? "Refresh unavailable · showing last successful data"
+      : "Refresh unavailable · no successful data loaded";
+  }
+  const badge = $("#operator-attention-badge");
+  if (badge) {
+    badge.className = "admin-source-badge admin-source-partial";
+    badge.textContent = hasPreviousData
+      ? "Stale · refresh unavailable"
+      : "Unavailable · not loaded";
+  }
+  if (isAdminPage) document.title = `• ${ADMIN_TITLE}`;
+}
+
+function refuseAdminAccess(error) {
+  if (![401, 403, 410].includes(error?.httpStatus)) return false;
+  // A refusal on any owner route invalidates every independent lane. A late
+  // successful response from before the refusal cannot restore private data.
+  for (const lane of Object.values(adminReadLanes)) lane.invalidate();
+  state.overview = null;
+  state.overviewReadSucceeded = false;
+  state.metricsHistory = null;
+  state.allowancePreview = null;
+  state.reconstructionProgress = null;
+  state.diagnosticLookup = null;
+  state.diagnosticLookupGeneration += 1;
+  state.auditRows = [];
+  for (const id of [
+    "counts", "quarantine-counts", "quarantine-status", "distribution-counts",
+    "distribution-version-rows", "distribution-source-status", "github-release-rows",
+    "ingress-status", "lifecycle-status", "snapshot-rows", "error-groups",
+    "recent-diagnostic-rows", "diagnostic-lookup", "audit-rows", "operator-attention",
+  ]) $(`#${id}`)?.replaceChildren();
+  if (isAdminPage) {
+    renderGrowth(null);
+    renderAdminCommunityAllowance(null);
+    renderReconstructionProgress(null);
+  }
+  $("#last-refresh").textContent = "Not loaded";
+  renderOverviewUnavailable();
+  showNotice("Owner access is unavailable. Sign in again, then refresh.");
+  return true;
+}
+
+const adminReadLanes = {
+  overview: createAdminReadLane({
+    read: async ({ signal }) => projectAdminOverview(await request("/api/v1/admin/overview", { signal })),
+    publish: overview => {
+      render(overview);
+      $("#notice").hidden = true;
+      state.lastSuccessfulLoadAt = Date.now();
+      state.retryDelayMilliseconds = 30_000;
+      state.overviewReadSucceeded = true;
+    },
+    failed: error => {
+      if (refuseAdminAccess(error)) return;
+      renderOverviewUnavailable();
+      showNotice(`Operations view unavailable: ${error.message}.`);
+      state.retryDelayMilliseconds = Math.min(state.retryDelayMilliseconds * 2, 5 * 60 * 1_000);
+    },
+  }),
+  history: createAdminReadLane({
+    read: async ({ signal }) => projectAdminMetricsHistory(await request("/api/v1/admin/metrics/history", { signal })),
+    publish: history => {
+      if (JSON.stringify(history) === JSON.stringify(state.metricsHistory)) return;
+      state.metricsHistory = history;
+      renderHistoryBackedSections();
+    },
+    failed: error => {
+      if (refuseAdminAccess(error)) return;
+      if (isTransientAdminReadError(error) && state.metricsHistory) return;
+      state.metricsHistory = null;
+      renderHistoryBackedSections();
+    },
+  }),
+  allowance: createAdminReadLane({
+    read: async ({ signal }) => projectAdminAllowancePreview(await request("/api/v1/admin/community/allowance-preview", { signal })),
+    publish: preview => {
+      if (JSON.stringify(preview) === JSON.stringify(state.allowancePreview)) return;
+      state.allowancePreview = preview;
+      renderAdminCommunityAllowance(preview);
+    },
+    failed: error => {
+      if (refuseAdminAccess(error)) return;
+      if (isTransientAdminReadError(error) && state.allowancePreview !== null) return;
+      state.allowancePreview = null;
+      renderAdminCommunityAllowance(null);
+    },
+  }),
+  progress: createAdminReadLane({
+    read: async ({ signal }) => projectAdminReconstructionProgress(await request("/api/v1/admin/reconstruction-progress?detail=preparation", { signal })),
+    publish: progress => {
+      state.reconstructionProgress = progress;
+      state.reconstructionProgressFailed = false;
+      if (progress.publication.state === "invalidated") {
+        // A confirmed hard-invalidation floor failure, not ordinary queued
+        // work. Fence an older in-flight preview before removing it.
+        adminReadLanes.allowance.invalidate();
+        state.allowancePreview = null;
+        renderAdminCommunityAllowance(null);
+      }
+      renderCurrentReconstructionProgress();
+    },
+    failed: error => {
+      if (refuseAdminAccess(error)) return;
+      state.reconstructionProgressFailed = true;
+      // A failed progress read is not authority to remove a graph. Retain its
+      // recorded timestamp; old Workers can still supply overview progress.
+      if (state.reconstructionProgress !== null) renderCurrentReconstructionProgress();
+    },
+  }),
+};
+
 async function load() {
   if (state.loading) return;
-  const loadGeneration = ++state.loadGeneration;
+  state.loadGeneration += 1;
   state.loading = true;
-  let succeeded = false;
+  state.overviewReadSucceeded = false;
   $("#refresh").disabled = true;
   refreshStatusText();
+  // Each resource is owner-authenticated independently. A slow or unavailable
+  // overview cannot block graph/progress refresh, and repeated refreshes join
+  // each resource's existing bounded request rather than overlapping it.
+  const overviewRead = adminReadLanes.overview.run();
+  void loadAdminCommunityAllowance();
+  void loadGrowthHistory();
+  if (isAdminPage) void adminReadLanes.progress.run();
   try {
     // No app session on the admin host: authentication is Cloudflare Access and
     // the owner-email pin, and CSRF is the always-sent x-usage-monitor-admin
     // header. The old /api/v1/session pre-fetch 401'd here and was the dead
     // console symptom.
-    const overview = projectAdminOverview(await request("/api/v1/admin/overview"));
-    state.metricsHistory = undefined;
-    render(overview);
-    $("#notice").hidden = true;
-    state.lastSuccessfulLoadAt = Date.now();
-    state.retryDelayMilliseconds = 30_000;
-    succeeded = true;
-    void loadAdminCommunityAllowance(loadGeneration);
-    void loadGrowthHistory(loadGeneration);
-  } catch (error) {
-    showNotice(`Operations view unavailable: ${error.message}.`);
-    state.retryDelayMilliseconds = Math.min(
-      state.retryDelayMilliseconds * 2,
-      5 * 60 * 1_000,
-    );
+    await overviewRead;
   } finally {
     state.loading = false;
     $("#refresh").disabled = false;
-    if (isAdminPage) scheduleRefresh({ retry: !succeeded });
+    if (isAdminPage) scheduleRefresh({ retry: !state.overviewReadSucceeded });
   }
 }
 
@@ -3076,6 +3459,16 @@ if (isAdminPage) {
     }
   });
   window.addEventListener("focus", updateNotificationControls);
+  let allowanceResizePending = false;
+  window.addEventListener("resize", () => {
+    if (allowanceResizePending || state.allowancePreview === null) return;
+    allowanceResizePending = true;
+    window.requestAnimationFrame(() => {
+      allowanceResizePending = false;
+      const width = $("#admin-community-allowance-result")?.getBoundingClientRect().width;
+      if (width !== state.allowanceChartWidth) renderAdminCommunityAllowance(state.allowancePreview);
+    });
+  });
   $("#admin-community-mode-controls").addEventListener("click", (event) => {
     const button = event.target.closest("button[data-allowance-mode]");
     if (!button) return;
@@ -3091,14 +3484,24 @@ if (isAdminPage) {
     renderAdminCommunityAllowance(state.allowancePreview);
   });
   $("#admin-community-allowance-result").addEventListener("click", (event) => {
-    const button = event.target.closest("button[data-allowance-plan]");
+    const button = event.target.closest("button[data-allowance-plan], button[data-allowance-model-focus]");
     if (!button || state.allowancePreview === null) return;
-    state.allowancePlanFilter = toggleAdminAllowancePlanFilter(
-      state.allowancePlanFilter,
-      button.dataset.allowancePlan,
-      state.allowancePreview.plans,
-    );
+    const modelId = button.dataset.allowanceModelFocus;
+    if (modelId !== undefined) {
+      if (!state.allowancePreview.models.modelConfig.some(model => model.modelId === modelId)) return;
+      state.allowanceModelFocus = state.allowanceModelFocus === modelId ? null : modelId;
+    } else {
+      state.allowancePlanFilter = toggleAdminAllowancePlanFilter(
+        state.allowancePlanFilter,
+        button.dataset.allowancePlan,
+        state.allowancePreview.plans,
+      );
+    }
     renderAdminCommunityAllowance(state.allowancePreview);
+    const selector = modelId !== undefined
+      ? `button[data-allowance-model-focus="${modelId}"]`
+      : `button[data-allowance-plan="${button.dataset.allowancePlan}"]`;
+    $(selector)?.focus();
   });
   $("#sync-distribution").addEventListener("click", async () => {
     const button = $("#sync-distribution");
@@ -3151,6 +3554,11 @@ if (isAdminPage) {
     clearRefreshSchedule();
     refreshStatusText();
   });
+  window.addEventListener("pagehide", () => {
+    clearRefreshSchedule();
+    for (const lane of Object.values(adminReadLanes)) lane.invalidate();
+  });
+  window.addEventListener("pageshow", () => { void load(); });
 }
 
 void load();

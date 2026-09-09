@@ -7,13 +7,15 @@ import {
 } from "@app-usagemonitor/accounting";
 import type { TelemetryUsageEvent } from "./telemetry-validation";
 
+// v0.5 (2026-09-06): Fail closed for unsupported providers; the stored-record
+// adapter preserves unknown input context and recognizes known-zero cache writes.
 // v0.4 (2026-08-30): Codex subscription Fast events are priced at the
 // published Priority (Fast) API rate - the Standard counterfactual multiplied
 // by the exact model's eligible Priority/Standard price ratio (proven uniform per
 // component by the accounting package), or by the disclosed assumed 2x when
 // no Priority rate is published. Standard and unknown speed stay the plain
 // Standard counterfactual, as does every claude_subscription event.
-export const SERVER_PRICING_METHOD_VERSION = "server-api-price-equivalent-v0.4";
+export const SERVER_PRICING_METHOD_VERSION = "server-api-price-equivalent-v0.5";
 
 type PricingStatus = "fully_priced" | "partially_priced" | "unpriced";
 export type ServerPriceBasis = "historical_api_prices" | "unpriced";
@@ -194,6 +196,9 @@ function failClosed(
 
 export function priceTelemetryUsageEvent(row: TelemetryUsageEvent): ServerPricingResult {
   const tier = tierForEvent(row);
+  if (row.provider !== "openai_codex" && row.provider !== "anthropic_claude_code") {
+    return failClosed(row, "unknown_provider", tier);
+  }
   if (row.modelRecognition !== "recognized" || row.modelId === "unknown") {
     return failClosed(row, "unknown_model", tier);
   }

@@ -33,11 +33,10 @@ const RECENT_EVENT_CALENDAR_DAYS = 30;
 // Snapshots are captured by the per-minute maintenance cron but self-throttle
 // to roughly hourly; 55 minutes tolerates cron jitter without doubling rows.
 const SNAPSHOT_MIN_INTERVAL_MILLISECONDS = 55 * 60 * 1_000;
-// Cache refresh uses the same jitter-tolerant cadence as gauge capture. A
-// browser may consume a cache for up to two hours, covering one missed Cron
-// invocation without silently serving an indefinitely old dashboard.
+// Cache refresh uses the same jitter-tolerant cadence as gauge capture.
+// A missed refresh must not erase a valid publication: its own generatedAt
+// and date window remain the evidence boundary, rather than elapsed wall time.
 const HISTORY_CACHE_MIN_INTERVAL_MILLISECONDS = 55 * 60 * 1_000;
-const HISTORY_CACHE_MAX_AGE_MILLISECONDS = 2 * 60 * 60 * 1_000;
 const HISTORY_CACHE_MAX_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 // 30 day-buckets across nine event series plus at most ~hourly gauge points is
 // comfortably below this. The cap is deliberately far below D1's value limit
@@ -619,8 +618,7 @@ function validCachedAdminMetricsHistory(
     return false;
   }
   const generatedEpoch = Date.parse(history.generatedAt);
-  if (generatedEpoch > nowEpoch + HISTORY_CACHE_MAX_FUTURE_SKEW_MILLISECONDS
-      || nowEpoch - generatedEpoch > HISTORY_CACHE_MAX_AGE_MILLISECONDS) {
+  if (generatedEpoch > nowEpoch + HISTORY_CACHE_MAX_FUTURE_SKEW_MILLISECONDS) {
     return false;
   }
   const generatedDay = history.generatedAt.slice(0, 10);
@@ -660,7 +658,7 @@ export async function readCachedAdminMetricsHistory(
     ).bind(HISTORY_CACHE_JSON_LIMIT_BYTES)
       .first<{ generated_at: string; payload_json: string }>();
   } catch {
-    return cacheUnavailable();
+    throw new ApiError(503, "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE");
   }
   if (row === null
       || typeof row.generated_at !== "string"

@@ -2,12 +2,32 @@ import { env } from "cloudflare:workers";
 import { applyD1Migrations, reset } from "cloudflare:test";
 import type { D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
+import { ADMIN_MODEL_HISTORY_CATALOG_VERSION, projectAdminModelHistoryDay } from "@app-usagemonitor/telemetry-contract";
 
 import { handleRequest } from "../src/index";
 import {
   readPublishedCommunityDailyAggregates,
+  readPublishedCommunityDailyAggregatesWithAllowanceState,
   rebuildPendingCommunityDailyAggregates,
 } from "../src/community-daily-aggregates";
+import {
+  ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
+  ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+  ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
+  PREVIEW_CACHE_JSON_LIMIT_BYTES,
+  buildAdminCommunityAllowancePreview,
+} from "../src/admin-community-allowance";
+import {
+  COMMUNITY_ALLOWANCE_BASIS,
+  COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS,
+  COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+} from "../src/community-allowance";
+import type { PublicAllowanceBreakdowns } from "../src/public-allowance-breakdowns";
+import {
+  COMMUNITY_DAILY_SPEND_BASIS, COMMUNITY_DAILY_SPEND_PRICING_METHOD,
+  COMMUNITY_DAILY_SPEND_REGISTRY_SHA256,
+  DAILY_SPEND_CAPACITY_POLICY,
+} from "../src/community-daily-spend";
 
 interface TestBindings extends Env {
   TEST_MIGRATIONS: D1Migration[];
@@ -123,6 +143,50 @@ async function seedDailyRevision(seed: SeededRevision): Promise<void> {
   ).run();
 }
 
+function utcDay(nowMs: number, offset = 0): string {
+  return new Date(nowMs + offset * 86_400_000).toISOString().slice(0, 10);
+}
+
+function breakdownPreview(nowMs: number) {
+  const day = utcDay(nowMs, -1);
+  const modelDay = projectAdminModelHistoryDay({ day,
+    catalogVersion: ADMIN_MODEL_HISTORY_CATALOG_VERSION,
+    values: [["gpt-6-astra", 1_166, 1]], fittedParticipantCount: 1,
+    unstableParticipantCount: 1, staleParticipantCount: 0,
+    refusedParticipantCount: 1, v1ParticipantCount: 3,
+    unsupportedSourceParticipantCount: 1 });
+  if (modelDay === null) throw new Error("invalid synthetic model day");
+  return buildAdminCommunityAllowancePreview([{ participantId: "synthetic-private-single-account",
+    planType: "plus", capacityNanousd: 60_000_000_000,
+    lastObservedAt: `${day}T12:00:00.000Z` }], nowMs, undefined, {
+    modelConfig: ADMIN_COMMUNITY_ALLOWANCE_MODEL_CONFIG,
+    basis: ADMIN_COMMUNITY_ALLOWANCE_MODELS_BASIS,
+    gate: ADMIN_COMMUNITY_ALLOWANCE_MODELS_GATE,
+    days: [modelDay],
+  });
+}
+
+async function seedReadyAllowanceState(nowMs: number): Promise<void> {
+  await db().prepare(`INSERT OR REPLACE INTO community_allowance_publication_state
+    (singleton, publication_state, expected_basis, safe_from_day, safe_to_day,
+     changed_at, attribution_method_version) VALUES (1,'ready',?,?,?,?,?)`)
+    .bind(COMMUNITY_ALLOWANCE_BASIS, utcDay(nowMs, 1 - COMMUNITY_ALLOWANCE_RECONSTRUCTABLE_DAYS),
+      utcDay(nowMs), new Date(nowMs).toISOString(), COMMUNITY_ATTRIBUTION_METHOD_VERSION).run();
+}
+
+async function seedBreakdownCache(nowMs: number, options: {
+  generatedAt?: string; payload?: string; epoch?: number | null; method?: string;
+} = {}): Promise<void> {
+  const source = await db().prepare("SELECT mutation_epoch FROM community_snapshot_mutation_control WHERE singleton_id=1")
+    .first<{ mutation_epoch: number }>();
+  await db().prepare(`INSERT OR REPLACE INTO admin_community_allowance_preview_cache
+    (singleton, generated_at, payload_json, attribution_method_version, source_mutation_epoch)
+    VALUES (1,?,?,?,?)`).bind(options.generatedAt ?? new Date(nowMs).toISOString(),
+      options.payload ?? JSON.stringify(breakdownPreview(nowMs)),
+      options.method ?? COMMUNITY_ATTRIBUTION_METHOD_VERSION,
+      options.epoch === undefined ? source!.mutation_epoch : options.epoch).run();
+}
+
 beforeEach(async () => {
   await reset();
   const bindings = env as TestBindings;
@@ -134,6 +198,210 @@ beforeEach(async () => {
 });
 
 describe("GET /api/v1/community/daily", () => {
+  it("publishes only requested closed plan/model summaries and keeps the private diagnostic shape stripped", async () => {
+    const nowMs = Date.now(), today = utcDay(nowMs), yesterday = utcDay(nowMs, -1);
+    const earlier = utcDay(nowMs, -2), withdrawn = utcDay(nowMs, -3);
+    await seedReadyAllowanceState(nowMs);
+    await seedBreakdownCache(nowMs);
+    await seedDailyRevision({ day: earlier, revision: 1 });
+    await seedDailyRevision({ day: yesterday, revision: 1, payload: {
+      capacityByPlanType: { plus: { privateDiagnostic: "synthetic-private-canary" } },
+    } });
+    await seedDailyRevision({ day: today, revision: 1 });
+    await seedDailyRevision({ day: withdrawn, revision: 1, state: "withdrawn" });
+    const response = await api(`/api/v1/community/daily?from=${withdrawn}&to=${today}`);
+    expect(response.status).toBe(200);
+    const body = await response.json<{
+      allowanceState: string; allowanceBreakdowns: PublicAllowanceBreakdowns;
+      days: Array<{ day: string; payload: Record<string, unknown> }>;
+    }>();
+    expect(body.allowanceState).toBe("ready");
+    expect(body.days.map((day) => day.day)).toEqual([earlier, yesterday, today]);
+    expect(body.allowanceBreakdowns.days.map((day) => day.day)).toEqual([earlier, yesterday]);
+    expect(body.allowanceBreakdowns.days[0]?.models).toEqual([]);
+    expect(body.allowanceBreakdowns.days[1]?.models).toEqual([["gpt-6-astra", 1_166, 1]]);
+    expect(body.allowanceBreakdowns.days[1]?.byPlanType.plus).toEqual({
+      centralUsd: 1_200, participantCount: 1, fitCount: 1, band80Usd: null,
+    });
+    for (const privateField of ["capacityByPlanType", "synthetic-private", "coverage", "catalogVersion",
+      "modelConfig", "source_mutation_epoch", "refusedParticipantCount", "unsupportedSourceParticipantCount"]) {
+      expect(JSON.stringify(body)).not.toContain(privateField);
+    }
+    const narrow = await api(`/api/v1/community/daily?from=${yesterday}&to=${yesterday}`);
+    expect((await narrow.json<{ allowanceBreakdowns: PublicAllowanceBreakdowns }>())
+      .allowanceBreakdowns.days.map((day) => day.day)).toEqual([yesterday]);
+  });
+
+  it("reads one bounded preview and daily readiness in a single read-only batch", async () => {
+    const nowMs = Date.now();
+    await seedReadyAllowanceState(nowMs);
+    await seedBreakdownCache(nowMs);
+    await seedDailyRevision({ day: utcDay(nowMs, -1), revision: 1 });
+    const statements: string[] = [], batches: number[] = [];
+    const guardedDb = new Proxy(db(), {
+      get(target, property) {
+        if (property === "prepare") return (sql: string) => {
+          statements.push(sql);
+          expect(sql).toMatch(/^\s*(?:WITH|SELECT)\b/u);
+          expect(sql).not.toMatch(/telemetry_(?:analytical|v1)_|community_allowance_fit_cache|participants\b/u);
+          return target.prepare(sql);
+        };
+        if (property === "batch") return async (prepared: D1PreparedStatement[]) => {
+          batches.push(prepared.length);
+          return target.batch(prepared);
+        };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const read = await readPublishedCommunityDailyAggregatesWithAllowanceState(
+      guardedDb, utcDay(nowMs, -365), utcDay(nowMs),
+    );
+    expect(read.rows).toHaveLength(1);
+    expect(read.allowanceBreakdownsCache?.generated_at).toBe(new Date(nowMs).toISOString());
+    expect(batches).toEqual([2]);
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).not.toContain("admin_community_allowance_preview_cache");
+    expect(statements[1]).toContain("length(CAST(cache.payload_json AS BLOB)) <= ?1");
+    expect(statements[1]).toContain("cache.source_mutation_epoch >= source.graph_invalidation_epoch");
+    expect(statements[1]).toContain("cache.source_mutation_epoch <= source.mutation_epoch");
+    expect(statements[1]).toContain("LIMIT 1");
+  });
+
+  it("preserves one complete graph while daily publication rebuilds, but refuses a hard-invalidated source epoch", async () => {
+    const nowMs = Date.now(), day = utcDay(nowMs, -1);
+    await seedDailyRevision({ day, revision: 1 });
+    await seedBreakdownCache(nowMs);
+    const path = `/api/v1/community/daily?from=${day}&to=${day}`;
+    const updating = await api(path);
+    const published = await updating.json();
+    expect(published).toMatchObject({ allowanceState: "ready", days: [{ day }], allowanceBreakdowns: {
+      generatedAt: new Date(nowMs).toISOString(),
+      days: [{ day, combined: { centralUsd: 1200, participantCount: 1, fitCount: 1 } }],
+    } });
+    // Partially recomputed daily amounts cannot displace any graph mode.
+    await seedDailyRevision({ day, revision: 2, payload: { allowance: { centralUsd: 9999 } } });
+    expect(await (await api(path)).json()).toMatchObject({
+      days: [{ day, revision: 2 }],
+      allowanceBreakdowns: (published as Record<string, unknown>).allowanceBreakdowns,
+    });
+    const immutable = await db().prepare("SELECT payload_json FROM community_daily_aggregates WHERE day=? AND revision=2").bind(day)
+      .first<{ payload_json: string }>();
+    expect(JSON.parse(immutable!.payload_json).allowance.centralUsd).toBe(9999);
+    await seedReadyAllowanceState(nowMs);
+    // Move the source immediately before the atomic read. Existing mutation
+    // triggers must invalidate readiness/cache before either SELECT observes it.
+    const racingDb = new Proxy(db(), {
+      get(target, property) {
+        if (property === "batch") return async (statements: D1PreparedStatement[]) => {
+          await target.prepare("UPDATE community_snapshot_mutation_control SET mutation_epoch=mutation_epoch+1 WHERE singleton_id=1").run();
+          return target.batch(statements);
+        };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const read = await readPublishedCommunityDailyAggregatesWithAllowanceState(racingDb, day, day);
+    expect(read.allowancePublicationState?.publication_state).toBe("updating");
+    expect(read.rows).toHaveLength(1);
+    expect(read.allowanceBreakdownsCache).toBeNull();
+    // Deliberately restore a ready flag and a stale-epoch cache fixture. The
+    // read's own epoch JOIN still refuses the old preview independently of
+    // the invalidation triggers.
+    await seedReadyAllowanceState(nowMs);
+    await seedBreakdownCache(nowMs, { epoch: 0 });
+    const response = await api(path);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({ allowanceState: "ready", days: [{ day }] });
+    expect(body).not.toHaveProperty("allowanceBreakdowns");
+  });
+
+  it("keeps activity available when breakdown cache content is absent, stale, malformed, or oversized", async () => {
+    // Keep the requested day before even the two-hour-old generation at UTC midnight.
+    const nowMs = Date.now(), day = utcDay(nowMs, -2);
+    await seedDailyRevision({ day, revision: 1 });
+    await seedReadyAllowanceState(nowMs);
+    const assertAbsent = async () => {
+      const response = await api(`/api/v1/community/daily?from=${day}&to=${day}`);
+      expect(response.status).toBe(200);
+      const body = await response.json();
+      expect(body).toMatchObject({ allowanceState: "ready", days: [{ day }] });
+      expect(body).not.toHaveProperty("allowanceBreakdowns");
+    };
+    await assertAbsent();
+    for (const options of [
+      { payload: "{" },
+      { payload: JSON.stringify({ ...breakdownPreview(nowMs), privateAccountId: "synthetic-private-canary" }) },
+      // Retained schema caps character count at 128 KiB. This synthetic UTF-8
+      // row satisfies that constraint but exceeds the stricter read byte cap.
+      { payload: "界".repeat(Math.floor(PREVIEW_CACHE_JSON_LIMIT_BYTES / 3) + 1) },
+      { method: "superseded-attribution" },
+      { epoch: null },
+      { generatedAt: "2026-01-01T00:00:00.000Z" },
+    ]) {
+      await seedBreakdownCache(nowMs, options);
+      await assertAbsent();
+    }
+    const previousMs = nowMs - 2 * 60 * 60 * 1_000 - 1;
+    await seedBreakdownCache(previousMs);
+    expect(await (await api(`/api/v1/community/daily?from=${day}&to=${day}`)).json()).toMatchObject({
+      allowanceBreakdowns: { generatedAt: new Date(previousMs).toISOString() },
+    });
+    await seedBreakdownCache(nowMs + 5 * 60 * 1_000 + 5_000);
+    await assertAbsent();
+  });
+
+  it("preserves activity without any cross-snapshot preview if the optional cache schema is unavailable", async () => {
+    const nowMs = Date.now(), day = utcDay(nowMs, -1);
+    await seedDailyRevision({ day, revision: 1 });
+    await seedReadyAllowanceState(nowMs);
+    await db().prepare("DROP TABLE admin_community_allowance_preview_cache").run();
+    const response = await api(`/api/v1/community/daily?from=${day}&to=${day}`);
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({ allowanceState: "ready", days: [{ day }] });
+    expect(body).not.toHaveProperty("allowanceBreakdowns");
+  });
+
+  it("keeps explicit resource-unavailable publication distinct and settled until policy/source changes", async () => {
+    const resource = { basis: COMMUNITY_DAILY_SPEND_BASIS, currency: "USD", knownCostUsd: null,
+      coverage: "unavailable", usageEvents: 200001, fullyPricedUsageEvents: 0,
+      partiallyPricedUsageEvents: 0, unpricedUsageEvents: 0, unprocessedUsageEvents: 200001,
+      unavailableReason: "processing_capacity_exceeded", processingPolicyVersion: DAILY_SPEND_CAPACITY_POLICY,
+      pricingMethodVersion: COMMUNITY_DAILY_SPEND_PRICING_METHOD, registrySha256: COMMUNITY_DAILY_SPEND_REGISTRY_SHA256 };
+    await seedDailyRevision({ day: "2026-08-01", revision: 1, usageEvents: 200001,
+      payload: { apiEquivalentSpend: resource } });
+    const response = await api("/api/v1/community/daily?from=2026-08-01&to=2026-08-01");
+    expect(response.status).toBe(200);
+    const body = await response.json<{ days: Array<{ payload: Record<string, unknown> }> }>();
+    expect(body.days[0]?.payload.apiEquivalentSpend).toEqual(resource);
+    expect(body.days[0]?.payload.totals).toMatchObject({ usageEvents: 200001 });
+    // Existing immutable cache metadata, not a synthetic 200k-row live corpus.
+    expect(await rebuildPendingCommunityDailyAggregates(db(), Date.parse("2026-11-01T00:00:00.000Z")))
+      .toEqual({ processed: 0, remaining: false, aggregateIds: [] });
+  });
+  it("publishes only current complete-contract spend and leaves old pricing unavailable", async () => {
+    const current = { basis: COMMUNITY_DAILY_SPEND_BASIS, currency: "USD", knownCostUsd: 0.01,
+      coverage: "complete", usageEvents: 1, fullyPricedUsageEvents: 1,
+      partiallyPricedUsageEvents: 0, unpricedUsageEvents: 0,
+      pricingMethodVersion: COMMUNITY_DAILY_SPEND_PRICING_METHOD,
+      registrySha256: COMMUNITY_DAILY_SPEND_REGISTRY_SHA256 };
+    const blocks = [undefined, current, { ...current, registrySha256: "0".repeat(64) },
+      { ...current, knownCostUsd: null }, { ...current, usageEvents: 2, fullyPricedUsageEvents: 2 },
+      { ...current, privateDiagnostic: "synthetic-private-canary" }];
+    for (let index = 0; index < blocks.length; index += 1) {
+      await seedDailyRevision({ day: `2026-08-0${index + 1}`, revision: 1,
+        payload: blocks[index] === undefined ? {} : { apiEquivalentSpend: blocks[index] } });
+    }
+    const response = await api("/api/v1/community/daily?from=2026-08-01&to=2026-08-06");
+    expect(response.status).toBe(200);
+    const body = await response.json<{ days: Array<{ payload: Record<string, unknown> }> }>();
+    expect(body.days).toHaveLength(6);
+    expect(body.days[1]?.payload.apiEquivalentSpend).toEqual(current);
+    for (const index of [0, 2, 3, 4, 5]) expect(body.days[index]?.payload).not.toHaveProperty("apiEquivalentSpend");
+    expect(JSON.stringify(body)).not.toContain("synthetic-private-canary");
+  });
   it("returns the latest published revision per day and omits withdrawn-only days", async () => {
     // Day 1: two published revisions — only r2 is current.
     await seedDailyRevision({ day: "2026-08-01", revision: 1, usageEvents: 1 });

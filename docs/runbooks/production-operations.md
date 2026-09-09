@@ -16,13 +16,22 @@ publication; those remain explicit owner operations.
 The Sparkle artifact/publication sequence is separate and remains governed by
 the [macOS stable release runbook](./macos-stable-release-runbook.md).
 
+For a release containing schema changes, use
+[release migration admission and rehearsal](./release-migration-rehearsal.md)
+before expensive candidate qualification: observe the deployed prefix and test
+the pending migrations on populated synthetic data. Its local receipt neither
+authorizes remote writes nor replaces the live schema and recovery checks below.
+For release-site coordination with GitHub, architecture feeds and Homebrew, use
+[publication reconciliation](./release-publication-reconciliation.md); it delegates
+website writes to this runbook's existing guarded deployment path.
+
 ## Production topology
 
 | Surface | Authority and boundary |
 |---|---|
 | Public and `www` hosts | One production Worker and manifest-verified static release-site assets |
 | Admin host | Same Worker, but admin routes exist only on `admin.tibotattle.com`, behind Cloudflare Access and a Worker-side owner check |
-| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0045_attribution_domain_activation.sql`; this is a source inventory, not proof of remote application |
+| Primary durable state | `USAGE_MONITOR_DB` D1 binding; checked-in migrations through `0053_refresh_lane_watermarks.sql`; this is a source inventory, not proof of remote application |
 | Deletion ledger | Separate `DELETION_LEDGER` D1 binding and migration ledger |
 | Encrypted/quarantined objects | Production `QUARANTINE` R2 binding with explicit deletion/reconciliation and deletion-safe restore rules; automatic age-based deletion is disabled in this source snapshot |
 | Upload admission | `UPLOAD_INGRESS_BUDGET` Durable Object plus explicit rate-limit bindings |
@@ -32,6 +41,192 @@ the [macOS stable release runbook](./macos-stable-release-runbook.md).
 The exact binding names, routes, required secret names, controls, and limits live
 in `apps/worker/wrangler.jsonc`; [api-surface.md](../reference/api-surface.md)
 owns the route inventory.
+
+### Bounded allowance reconstruction
+
+`ALLOWANCE_RECONSTRUCTION_MODE` controls optional calculation only. Explicit
+`resumable` uses the restartable lookup/checkpoint path; `paused` leaves
+required lifecycle, retention, deletion-safe restore, upload reconciliation
+and weekly publication running. Missing or unrecognized production values
+fail closed. The compatibility `enabled` value selects the old direct path;
+it is not an incident-recovery fallback.
+
+The resumable path requires migrations `0046` and `0047`. The first adds an
+initially empty quota lookup with a finite, restartable historical backfill;
+triggers maintain later source corrections and erasure. The second stores
+bounded source-pinned acquisition checkpoints. Neither rewrites telemetry.
+Preserve their source and migration ledgers; do not clear a checkpoint or cache
+to conceal a source mismatch.
+
+Migration `0048` adds an isolated historical model acquisition/result namespace,
+an explicit retrospective day marker, and correction/withdrawal invalidation
+guards. It does not rewrite source telemetry or change the deletion ledger.
+Historical reconstruction works latest-first on missing closed UTC days, using
+the same statement meter, lease and deadline as current calculations. Every
+third minute it receives first use of the optional budget; other minutes offer
+remaining resources after daily publication. It retains the existing 100-day model
+lookback and never fills missing evidence with today's fit. Publish only a
+complete eligible cohort; unsupported or unidentified history remains absent.
+Content-free `scheduled_model_history` events report this separate backfill;
+the existing admin reconstruction counters do not measure its completion.
+Up to sixteen account attempts may use available resources in one run. Rotate
+the first account by three-minute priority round so large accounts cannot alias
+with the schedule. When the last account finishes, re-read the same complete
+cohort once for source-fenced publication within the same budget. Keep a healthy
+preview; a bounded date-index check lets newly completed model dates trigger
+publication without clearing the cache. See the
+[allowance diagnosis runbook](2026-08-13-community-allowance-band-diagnosis.md)
+for historical interpretation and gap semantics.
+
+`MAINTENANCE_IN_PROGRESS` acknowledges an existing maintenance lease; it is not
+proof that the skipped invocation performed lifecycle or reconstruction work.
+An abruptly canceled invocation may leave the existing 20-minute lease until
+expiry. Inspect only the last-run and lease-expiry metadata, preserve saved
+checkpoints, and verify that a natural scheduled run resumes after expiry.
+Do not clear the lease, force maintenance, or delete caches to manufacture a
+successful recovery observation. A `canceled` outcome without an exception does
+not establish a database, memory or application-level cause.
+
+One physical-statement meter covers both D1 bindings and all scheduled phases
+(900 statements, with lease-release headroom). Required maintenance runs
+first. Optional calculation has a 40-second admission deadline and yields durable
+progress when it cannot finish. Migration 0054 replaces the current lane's
+whole-account polling and four-attempt cap with an indexed, coalescing dirty
+queue. Claiming moves an account to the back before work begins; revision,
+window and lease checks make completion restart-safe. The actual remaining
+statement/time budget governs attempts. An unchanged completed lane performs
+one metadata read and no source scan or write. This does not add parallel
+database or pricing work. A completed
+head is admitted before rehydration only if its entire read and the shared
+usage-finishing reserve fit. Sustained required-work saturation may defer
+large accounts; it is not permission to lower evidence caps.
+
+Public and admin graph rebuilds consume only complete, source-authorized caches.
+The minute cron rotates optional priority over three UTC-minute slots: shared
+preview first, current-account reconstruction first, then historical models first.
+This gives ready graphs an early refresh opportunity without letting a large
+incomplete cohort repeatedly crowd out the calculations needed to repair it.
+An unavailable early preview retries after reconstruction and before daily
+reconciliation. Migration 0050 extends preserved publication to validated v1
+corrections and newly elected devices, using a one-use marker inside the same
+atomic upload transaction. The hard-invalidation epoch still excludes
+withdrawals, erasure, source-format transitions, policy changes and unrecognized
+direct mutations. With migration 0055, new previews pin an immutable captured
+generation and its hard-invalidation epoch, not a globally quiet upload epoch.
+Each captured member must supply a complete cache revision at least as new as
+its captured requirement. The source epoch identifies capture start; it must
+not be relabelled as the latest live revision. Ordinary later uploads queue the
+next generation while the complete captured one can publish. Daily activity
+and spend retain their separate exact source/revision guards.
+Elapsed time alone does not rebuild or expire an allowance preview. Changed
+inputs, UTC days and newly completed model dates trigger a successor. A replacement
+cannot drop model dates still awaiting reconstruction. Public aggregate/plan/
+model charts use one snapshot, separate from immutable activity/spend revisions.
+
+Claimed pure-v1 account caches are checked through one indexed joined read
+per account, using the existing work fingerprint, current journal revision,
+method/window keys and strict payload validation. Only changed accounts enter
+source-vector acquisition and calculation. Legacy/mixed/successor and unfinished
+work retain the exact-source path. Final medians still recombine compact cohort
+fits; this is not additive billing math or permission to parallelize unbounded
+database work. Migration and deployment are separate owner-authorized gates.
+
+Migration 0051 tracks exact historical-window dependencies separately from
+participant write revisions. An out-of-window upload may rebind unchanged
+work/results under the current revision and live maintenance lease; it does
+not restart acquisition. Old revision-dependent fingerprints are adopted only
+after recomputing their exact prior digest from the current bounded source
+vector. A changed dependency, authority, method or raced lease refuses reuse.
+
+Migration 0052 stores restartable, elected-day quota summaries and already-priced
+usage. Overlapping windows reuse these inputs and the unchanged estimator.
+Raw and prepared physical readers have separate persisted policies and replay
+versions; never reinterpret an old in-flight page as a new one. Migration 0053
+stores exact epoch/day/method completion receipts for current and daily lanes.
+An unchanged completed lane needs one metadata lookup, not a fresh account or
+raw-evidence scan. Queued corrections prevent a daily receipt from being reused.
+Preparation, reconstruction and publication still share the existing budget.
+
+Migration 0055 freezes publication membership behind a finite queue watermark,
+then copies validated cache payloads in restartable 64-member, byte-bounded
+pages. A complete authorized capture promotes atomically; unfinished captures
+never replace saved graphs. Retirement deletes derived members in bounded
+pages, not telemetry. Capture and direct cohort readers batch payload reads
+instead of issuing one query per contributor. Final exact medians still require
+the complete captured cohort; they are not additive per-account totals.
+
+The isolated `npm --prefix apps/worker run test:scale` qualification measures
+100/500/1,000 synthetic contributors without hosted traffic. Read its receipt
+for workload-specific throughput: local drain time omits scheduled waiting and
+is not production CPU or latency. The unchanged one-minute cron and shared
+mandatory-work budget limit cold-start catch-up. History still enumerates a
+bounded complete eligible cohort (at most 1,024 contributors, excluding empty
+or inactive registrations), and its final exact-date epoch check can defer on
+concurrent mutation. Do not infer sustained 1,000-user upload throughput from
+a population-scale or two-date history test. More parallel D1 calls do not
+remove these bottlenecks; qualify arrival rate and background scheduling before
+claiming that capacity.
+
+Preview-first passes also admit owner gauge capture and growth-history cache
+refresh after the allowance preview but before reconstruction. Each retains its
+55-minute self-throttle and runs at most once per invocation; other priority slots
+and other reconstruction modes retain the late fallback. GitHub synchronization
+remains late. Required lifecycle work still comes first, and every optional
+admission uses the same statement meter and deadline.
+Content-free preview/analysis phase logs include elapsed time, remaining time
+and actual statement counts. The lifecycle `last_completed_at` stamp precedes
+optional work and must not be mistaken for the whole invocation duration.
+A cache miss, stale source, deadline or malformed value defers the whole
+cohort. New unpublished activity days may publish token/spend totals without
+an allowance; their rebuild queue stays pending, and existing published
+allowance days are preserved until a complete replacement is available.
+
+Resume only after the approved migration set, full validation and recovery
+review pass, through the normal guarded deploy wrapper. Verify natural
+scheduled progress, cache source identity, public/admin responses and the
+rendered graph independently. See the
+[recovery decision](../decisions/2026-09-06-hosted-calculator-recovery.md).
+
+The admin allowance section reads independent owner-only progress from
+`GET /api/v1/admin/reconstruction-progress`. Its closed response separates
+requested, prepared and published generations, exact historical date/account
+completion, recorded trigger/restart reason and observation time. Unknown
+counts stay null; it never estimates an unmeasured completion time. This GET
+does not start work. Overview, allowance, growth and progress use independent
+single-flight browser request lanes with a 15-second request timeout, not a
+15-second polling interval. Automatic polling retains the owner's existing
+cadence and pauses when hidden/offline. Temporary storage/network failure
+preserves the prior validated graph; confirmed invalidation or lost owner
+access clears it. Growth snapshots have no age-only read expiry.
+
+The admin client requests `?detail=preparation` for the backward-compatible
+version-2 progress view. Query-free version 1 remains unchanged. Retained
+prepared-source metadata shows completed/building/retiring days, saved steps,
+quota observations and usage events. Preparation can advance before a legacy
+account checkpoint resumes, so a fixed account-completion count does not imply
+stalled work. Counts are not a total-work denominator and may change after
+replacement or retirement. Migration 0056 initializes one aggregate row from
+the existing head ledger, then maintains exact counters on head transitions.
+The progress read touches that row, not every account/day. Missing migration,
+an unavailable row, or an inexact/unsafe counter produces unknown counters
+without hiding the graph; there is no 10,000-head preparation reporting ceiling.
+The older overview checkpoint census below is separate. No source record is read,
+no calculation is triggered, and no throughput or ETA is inferred.
+
+The existing overview's optional compatibility `reconstruction` block reads bounded derived
+metadata: lookup position, acquisition phases, invalidated sources, maintenance
+lease state, last cached-result time, and the daily publication/price backlog.
+The display survives an unavailable allowance preview; a failed overview refresh
+labels its last observation stale. Missing diagnostics do not take Operations
+down or become zero work. Refresh never starts a calculation.
+
+Acquisition completion is not a finished allowance estimate. The account census
+is capped at 10,000 tracked checkpoints and explicitly indicates truncation.
+Publication coverage uses 366 indexed day lookups; a day with known price data
+may still be partially priced. Neither account progress nor queued-day counts
+is an estimate of remaining time. Parallelizing days alone does not remove the
+complete-account-cache prerequisite; source fencing and shared resource budgets
+must remain intact in any later concurrency change.
 
 ## Read-only observation
 
@@ -221,7 +416,8 @@ Only after explicit authorization and green preflight, use the wrapper from
 `apps/worker`:
 
 ```bash
-npm run production:deploy -- --confirm DEPLOY_PRODUCTION
+npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
+  --expected-previous-source <reviewed-full-deployed-source-sha>
 ```
 
 If and only if the wrapper reports a reviewed pending set and the separate
@@ -229,6 +425,7 @@ migration operation has been handled, append its exact comma-separated tokens:
 
 ```bash
 npm run production:deploy -- --confirm DEPLOY_PRODUCTION \
+  --expected-previous-source <reviewed-full-deployed-source-sha> \
   --confirm-migrations BINDING:0000_name.sql
 ```
 
@@ -236,6 +433,34 @@ Capture the structured result. Success means the wrapper observed its named
 pre/post conditions; it is not a release, appcast publication, identity-flow,
 participant-deletion, or admin-UI end-to-end receipt. Compare the health
 `deployment.sourceCommit` with the intended commit and probe the affected route.
+
+The wrapper now makes the exact source comparison itself and requires the
+reviewed predecessor to be an ancestor of the candidate. Both direct and
+web-only deployment participate in a shared, non-expiring Git coordination ref.
+The Git remote must allow that exact coordination branch to be created/deleted;
+the wrapper does not change repository rules. A lock retained after an uncertain
+provider response is a stop, not permission to retry raw Wrangler.
+
+Private operation records default to
+`.release-build/production-operations/<candidate-sha>` in the repository.
+Inspect them using `node scripts/release-agent.mjs status --operation <directory>`
+from the repository root. Only after establishing that the old executor cannot
+still run, use the explicit reconciliation path:
+
+```bash
+npm run production:deploy -- --confirm RECONCILE_PRODUCTION_DEPLOYMENT \
+  --operation <private-operation-directory> --executor-stopped
+```
+
+Reconciliation does not deploy. It verifies the intended source and public
+surface, then releases only the exact recorded owner. If verification is
+unavailable or the old executor might still run, retain the lock and investigate.
+A proven pre-mutation failure with no retained lock can be retried using a new
+`--operation <fresh-private-directory>`, preserving the old evidence. Cleanup
+warnings do not erase a verified deployment outcome. These are cooperative
+guards: raw Wrangler, old checkouts and privileged manual provider actions are
+not fenced and must not be used concurrently. See
+[agent release operations](agent-release-operations.md) for recovery boundaries.
 
 ## Private owner participant erasure
 
@@ -353,6 +578,11 @@ and read-back; never treat “contain” as permission to “restore.”
   so concurrent maintenance cannot finish an owner's in-flight erasure.
 - A Worker rollback must still understand the live schemas and current durable
   state. If it cannot, contain the affected path and deploy a forward repair.
+  After migrations 0049–0053, preserve their ledger entries, columns, triggers,
+  prepared/raw reader policies and schema inventory when preparing a rollback
+  repair; an untouched older checkout's
+  migration gate rejects the newer ledger. Do not reverse the schema to make
+  that old checkout deployable.
 - Do not roll back appcast bytes by ordinary R2 overwrite. The signed feed,
   immutable enclosure, version ordering, and atomic guard are one release
   contract.

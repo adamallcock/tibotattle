@@ -61,8 +61,9 @@ site.
 | `POST` | `/api/v1/identity/apple/result` | Initiating client | Handoff | Reads/delivers the state-and-verifier-bound result. | Hosted identity |
 | `GET` | `/api/v1/session` | Website or loopback relay | Session | Reads the current participant session and CSRF projection. | Participant account |
 | `POST` | `/api/v1/logout` | Website or loopback relay | Session | Revokes/clears the current web session. | Participant account |
-| `GET` | `/api/v1/admin/overview` | Admin application | Admin | Reads bounded operational, distribution, lifecycle, and sampled error evidence. | Operations |
+| `GET` | `/api/v1/admin/overview` | Admin application | Admin | Reads bounded operational, distribution, lifecycle, sampled error evidence, and optional failure-isolated reconstruction progress. Refresh never advances calculation. | Operations |
 | `GET` | `/api/v1/admin/metrics/history` | Admin application | Admin | Reads bounded operational history. | Operations |
+| `GET` | `/api/v1/admin/reconstruction-progress` | Admin application | Admin | Reads bounded refresh-generation and historical-completion metadata; never advances calculation. | Operations |
 | `GET` | `/api/v1/admin/community/allowance-preview` | Admin application | Admin | Reads unpublished allowance-fit previews; does not publish. | Operations |
 | `POST` | `/api/v1/admin/action` | Owner/admin application | Admin | Collection controls, maintenance, and distribution actions; explicit participant erasure uses the existing maintenance action with auditable D1/R2 effects. | Operations |
 | `POST` | `/api/v1/me/security-reset` | Participant browser | Session | Rotates session/recovery state and invalidates affected credentials. | Participant account |
@@ -83,11 +84,85 @@ site.
 | `GET` | `/api/v1/envelope-key` | Native or web client | Public | Returns the public wrapping key; never returns private key material. | Contribution crypto |
 | `POST` | `/api/v1/contributions` | Prepared uploader | Upload | Validates and deduplicates an encrypted contribution, writes D1 state and quarantined R2 object data, and schedules aggregation. | Contribution ingestion |
 | `GET` | `/api/v1/me/export` | Participant browser | Session | Returns a bounded export of the participant's hosted data. | Participant data |
-| `GET` | `/api/v1/community/daily` | Website | Public | Reads a bounded published daily range and omits unavailable allowance evidence. | Community publication |
+| `GET` | `/api/v1/community/daily` | Website | Public | Reads a bounded published daily range; omits unavailable allowance evidence and stale or invalid optional API-equivalent spend. | Community publication |
 
 Production admin API and UI paths are served only on the configured admin host.
 Public-host requests to those paths are deliberately 404. Static site assets
 are not part of the API registry.
+
+### Public allowance breakdowns
+
+`GET /api/v1/community/daily` may add `allowanceBreakdowns` with schema
+`community-allowance-breakdowns-v1.1`. Its only fields are schema version,
+aggregate basis, reference plan, normalization, model basis/gate, generation
+timestamp and up to 70 date rows. Each row contains the day, the combined
+summary, the three reviewed
+personal-plan summaries and reviewed model tuples `[modelId, usd, accountCount]`.
+Combined and plan summaries contain only median dollars, account/fit counts and an optional
+middle-80%-of-fits band. Model estimates have no band or reset-fit count.
+
+All comparisons use the same Pro 20x-equivalent weekly basis: Pro ×1,
+Pro 5x ×4, Plus ×20. Unknown plans and separate-track Spark estimates are
+excluded. Model values require the existing composition identification gate;
+historical values are never carried backward from today's fit.
+
+The daily range/state and cached preview are read in one two-statement
+transaction. The optional cache is limited to 256 KiB, must match the current
+method and fall between the last hard-invalidation epoch and current input
+epoch, and is projected into a new closed
+object. Only requested, actually published days before both the current and
+generation UTC dates are included. A validated v1 append or same-device chunk
+correction preserves the published graph while changed accounts and affected
+days are processed. Corrections require a one-use capability created and consumed
+inside the same accepted-upload transaction. Source-device changes, withdrawal,
+policy changes and unknown mutations hard-invalidate it. Missing/invalidated/invalid
+cache or an unavailable optional cache schema omits the breakdown, preserving
+the independent daily activity response. No public request invokes analysis,
+writes state, accepts cohort filters or exposes the private admin response.
+
+All three graph views use the same published snapshot; immutable daily rows
+are not rewritten or relabelled to achieve this. Generation/evidence dates are
+preserved, with no additional "last good" label or age-only expiration. New
+publications use complete cached inputs from one immutable captured generation,
+with its hard authorization epoch checked at promotion. Ordinary uploads queue
+the next generation without requiring a quiet interval across every account;
+capture start is not presented as a latest-live source revision. Daily
+activity/spend retains separate exact source guards.
+The browser continues to understand v1.0 breakdowns, refreshes visible pages
+once a minute with non-overlapping, timed requests, and backs off on failures.
+Transient failures preserve the displayed result; authoritative invalidation or
+publication-disabled responses clear it. No hidden-tab polling or client-side
+analytical reconstruction occurs. Refresh preserves the open daily disclosure,
+selected legend and keyboard inspection position without retaining old values.
+The owner page likewise keeps its graph through classified network/storage
+failures, but clears it for access/policy refusals, invalid payloads or an
+authoritative unavailable-cache response.
+
+The additive `allowanceReadState` distinguishes `confirmed` from
+`temporarily_unavailable`. An optional storage-read failure keeps independent
+daily activity available, uses `no-store`, and does not clear an already displayed
+graph. It is not permission to retain a graph after a confirmed invalidation.
+
+The owner-only `GET /api/v1/admin/reconstruction-progress` returns the closed
+metadata contract (`schemaVersion: 1`): requested, prepared and
+published generations; current phase/trigger; and resolved/required historical
+days. The exact optional query `detail=preparation` negotiates schema version 2
+with retained source-day counts, saved preparation steps and prepared quota/usage
+counts. With migration 0056 its single metadata query reads one maintained
+aggregate row, independent of contributor/day count. Missing schema, inexact,
+unsafe or unavailable counts return null, not an invented total. These are
+retained reusable inputs, not a remaining-work denominator. All other query
+fields and repeated selectors are rejected. Both versions are read-only and
+return no account IDs or raw evidence. The owner UI uses independent,
+non-overlapping reads with a 15-second timeout; automatic polling respects the
+existing user-selected cadence and pauses while hidden/offline. A slow graph
+read cannot conceal progress. Access loss clears private state.
+
+The owner explicitly approved dollar estimates and sample counts even when
+based on one account. This can reveal that contributor's estimated capacity;
+omitting identifiers is not an anonymity guarantee. The visible small-sample
+disclosure applies to all three views. Older sealed weekly snapshot thresholds
+are unchanged; contribution consent and v1.1 activation are unchanged.
 
 ### Self-service retirement and private owner erasure
 

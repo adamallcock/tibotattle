@@ -4,6 +4,14 @@ import {
 } from "./telemetry-shared.generated.js";
 
 const ADMIN_OVERVIEW_SCHEMA_VERSION = "admin-overview-v0.3";
+const ADMIN_RECONSTRUCTION_SCHEMA_VERSION = "admin-reconstruction-progress-v0.1";
+const ADMIN_RECONSTRUCTION_STATUSES = new Set(["available", "unavailable"]);
+const ADMIN_RECONSTRUCTION_MODES = new Set([
+  "resumable", "synchronous", "paused", "unknown",
+]);
+const ADMIN_RECONSTRUCTION_PUBLICATION_STATES = new Set([
+  "updating", "ready", "unknown",
+]);
 const ADMIN_ACTION_SCHEMA_VERSION = "admin-action-v0.1";
 const ADMIN_ALLOWANCE_PREVIEW_SCHEMA_VERSION =
   "admin-community-allowance-preview-v0.3";
@@ -49,12 +57,75 @@ const ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9_]{2,79}$/u;
 const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 
 export class AdminResponseError extends Error {
-  constructor(code, requestId = null) {
+  constructor(code, requestId = null, httpStatus = null) {
     super(code);
     this.name = "AdminResponseError";
     this.code = code;
     this.requestId = requestId;
+    this.httpStatus = Number.isSafeInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599
+      ? httpStatus : null;
   }
+}
+
+/** One bounded read per resource. Invalidating a lane fences even a fetch or
+ * body reader that ignores abort, so a revoked page cannot be repopulated by
+ * an older in-flight response. Mutating actions do not use this retry lane. */
+export function createAdminReadLane({
+  read, publish, failed, timeoutMs = 15_000,
+  schedule = globalThis.setTimeout, cancel = globalThis.clearTimeout,
+}) {
+  let active = null;
+  return {
+    run() {
+      if (active !== null) return active.promise;
+      const operation = { controller: new AbortController(), promise: null, timer: null };
+      active = operation;
+      const cancelled = new Promise((_, reject) => {
+        operation.controller.signal.addEventListener("abort", () => {
+          reject(new AdminResponseError("ADMIN_READ_CANCELLED"));
+        }, { once: true });
+      });
+      const timedOut = new Promise((_, reject) => {
+        operation.timer = schedule(() => {
+          reject(new AdminResponseError("ADMIN_READ_TIMEOUT"));
+          operation.controller.abort();
+        }, timeoutMs);
+      });
+      operation.promise = Promise.race([
+        Promise.resolve().then(() => read({ signal: operation.controller.signal })),
+        timedOut, cancelled,
+      ]).then(value => {
+        if (active === operation) publish(value);
+      }, error => {
+        if (active === operation) failed(error);
+      }).finally(() => {
+        cancel(operation.timer);
+        if (active === operation) active = null;
+      });
+      return operation.promise;
+    },
+    invalidate() {
+      const operation = active;
+      active = null;
+      if (operation !== null) {
+        cancel(operation.timer);
+        operation.controller.abort();
+      }
+    },
+  };
+}
+
+export function isTransientAdminReadError(error) {
+  if (!(error instanceof AdminResponseError)) return false;
+  if (error.httpStatus === null) return [
+    "ADMIN_NETWORK_ERROR", "ADMIN_READ_TIMEOUT", "ADMIN_RESPONSE_INVALID",
+  ].includes(error.code);
+  // An absent/invalid cache is authoritative, unlike an unsuccessful read.
+  return error.httpStatus >= 500 && error.httpStatus <= 599 && [
+    "INTERNAL_ERROR", "BACKEND_STORAGE_UNAVAILABLE",
+    "ADMIN_ALLOWANCE_STORAGE_UNAVAILABLE", "ADMIN_METRICS_HISTORY_STORAGE_UNAVAILABLE",
+    `HTTP_${error.httpStatus}`,
+  ].includes(error.code);
 }
 
 function invalid(code) {
@@ -124,6 +195,92 @@ function isoTimestamp(value, code) {
   const epoch = Date.parse(timestamp);
   if (!Number.isFinite(epoch)) invalid(code);
   return timestamp;
+}
+
+/** Closed, aggregate-only owner progress. It describes recorded work and
+ * publication generations, never estimates remaining time or missing counts. */
+export function projectAdminReconstructionProgress(value) {
+  const code = "ADMIN_RECONSTRUCTION_PROGRESS_INVALID";
+  const closed = (candidate, keys) => {
+    const result = record(candidate, code);
+    const actual = Object.keys(result);
+    if (actual.length !== keys.length || actual.some(key => !keys.includes(key))) invalid(code);
+    return result;
+  };
+  const timestamp = value => {
+    const result = isoTimestamp(value, code);
+    if (new Date(result).toISOString() !== result) invalid(code);
+    return result;
+  };
+  const nullableTime = value => value === null ? null : timestamp(value);
+  const nullableCount = value => value === null ? null : count(value, code);
+  const nullableEnum = (value, values) => value === null ? null : enumValue(value, new Set(values), code);
+  const candidate = record(value, code);
+  if (candidate.schemaVersion !== 1 && candidate.schemaVersion !== 2) invalid(code);
+  const progress = closed(candidate, [
+    "schemaVersion", "generatedAt", "publication", "work", "history",
+    ...(candidate.schemaVersion === 2 ? ["preparation"] : []),
+  ]);
+  const publication = closed(progress.publication, [
+    "state", "requestedGeneration", "preparedGeneration", "publishedGeneration", "publishedAt",
+  ]);
+  const work = closed(progress.work, ["state", "phase", "updatedAt", "trigger", "restartReason"]);
+  const history = closed(progress.history, [
+    "resolvedDays", "requiredDays", "activeDay", "completeAccounts", "requiredAccounts",
+  ]);
+  const projectedPublication = Object.freeze({
+    state: enumValue(publication.state, new Set(["ready", "empty", "invalidated"]), code),
+    requestedGeneration: nullableCount(publication.requestedGeneration),
+    preparedGeneration: nullableCount(publication.preparedGeneration),
+    publishedGeneration: nullableCount(publication.publishedGeneration),
+    publishedAt: nullableTime(publication.publishedAt),
+  });
+  if (projectedPublication.requestedGeneration !== null
+      && [projectedPublication.preparedGeneration, projectedPublication.publishedGeneration]
+        .some(value => value !== null && value > projectedPublication.requestedGeneration)) invalid(code);
+  const projectedHistory = Object.freeze({
+    resolvedDays: count(history.resolvedDays, code),
+    requiredDays: count(history.requiredDays, code),
+    activeDay: history.activeDay === null ? null : calendarDay(history.activeDay, code),
+    completeAccounts: nullableCount(history.completeAccounts),
+    requiredAccounts: nullableCount(history.requiredAccounts),
+  });
+  if (projectedHistory.requiredDays > 70
+      || projectedHistory.resolvedDays > projectedHistory.requiredDays
+      || (projectedHistory.completeAccounts !== null && projectedHistory.requiredAccounts !== null
+        && projectedHistory.completeAccounts > projectedHistory.requiredAccounts)) invalid(code);
+  let preparation = null;
+  if (progress.schemaVersion === 2 && progress.preparation !== null) {
+    const source = closed(progress.preparation, [
+      "trackedDays", "completeDays", "buildingDays", "retiringDays", "checkpointSteps",
+      "quotaObservations", "usageEvents",
+    ]);
+    preparation = Object.freeze({
+      trackedDays: count(source.trackedDays, code),
+      completeDays: count(source.completeDays, code),
+      buildingDays: count(source.buildingDays, code),
+      retiringDays: count(source.retiringDays, code),
+      checkpointSteps: count(source.checkpointSteps, code),
+      quotaObservations: count(source.quotaObservations, code),
+      usageEvents: count(source.usageEvents, code),
+    });
+    if (preparation.completeDays + preparation.buildingDays + preparation.retiringDays
+          !== preparation.trackedDays) invalid(code);
+  }
+  return Object.freeze({
+    schemaVersion: progress.schemaVersion,
+    generatedAt: timestamp(progress.generatedAt),
+    publication: projectedPublication,
+    work: Object.freeze({
+      state: enumValue(work.state, new Set(["idle", "queued", "building", "paused", "unavailable"]), code),
+      phase: nullableEnum(work.phase, ["current", "history", "daily", "publication"]),
+      updatedAt: nullableTime(work.updatedAt),
+      trigger: nullableEnum(work.trigger, ["contribution", "correction", "day_boundary", "method_change", "reconciliation", "privacy"]),
+      restartReason: nullableEnum(work.restartReason, ["input_changed", "lease_expired", "method_changed", "retry"]),
+    }),
+    history: projectedHistory,
+    ...(progress.schemaVersion === 2 ? { preparation } : {}),
+  });
 }
 
 function boundedArray(value, maximum, code) {
@@ -216,11 +373,13 @@ function projectAllowanceModels(value, latestAllowedDay) {
     const expected = ADMIN_ALLOWANCE_PREVIEW_MODELS[index];
     if (!expected
         || model.modelId !== expected.modelId
-        || model.label !== expected.label
+        || typeof model.label !== "string" || model.label.length === 0 || model.label.length > 80
         || model.allowanceTrack !== expected.allowanceTrack
         || model.pricingStatus !== expected.pricingStatus) {
       invalid(code);
     }
+    // Display copy is not an analytical version. Render the current reviewed
+    // catalog label without discarding otherwise compatible results.
     return expected;
   });
   if (modelConfig.length !== ADMIN_ALLOWANCE_PREVIEW_MODELS.length) invalid(code);
@@ -1118,6 +1277,90 @@ function projectIngress(value) {
   });
 }
 
+/**
+ * Reconstruction is additive operational evidence, not a prerequisite for the
+ * existing overview. Omit invalid evidence without concealing other sections.
+ */
+function projectReconstruction(value) {
+  if (value === null || value === undefined) return null;
+  const code = "ADMIN_RECONSTRUCTION_INVALID";
+  const timestamp = (value) => {
+    const result = isoTimestamp(value, code);
+    if (new Date(result).toISOString() !== result) invalid(code);
+    return result;
+  };
+  const nullableTimestamp = (value) => value === null ? null : timestamp(value);
+  try {
+    const reconstruction = record(value, code);
+    if (reconstruction.schemaVersion !== ADMIN_RECONSTRUCTION_SCHEMA_VERSION) {
+      invalid(code);
+    }
+    const base = {
+      schemaVersion: ADMIN_RECONSTRUCTION_SCHEMA_VERSION,
+      status: enumValue(reconstruction.status, ADMIN_RECONSTRUCTION_STATUSES, code),
+      observedAt: timestamp(reconstruction.observedAt),
+      mode: enumValue(reconstruction.mode, ADMIN_RECONSTRUCTION_MODES, code),
+    };
+    if (base.status === "unavailable") return Object.freeze(base);
+
+    const lookup = record(reconstruction.lookup, code);
+    const calculations = record(reconstruction.calculations, code);
+    const maintenance = record(reconstruction.maintenance, code);
+    const publication = record(reconstruction.publication, code);
+    const projectedLookup = Object.freeze({
+      complete: boolean(lookup.complete, code),
+      lastRecordId: count(lookup.lastRecordId, code),
+      throughRecordId: count(lookup.throughRecordId, code),
+    });
+    if (projectedLookup.lastRecordId > projectedLookup.throughRecordId
+        || (projectedLookup.complete
+          && projectedLookup.lastRecordId !== projectedLookup.throughRecordId)) invalid(code);
+    const projectedCalculations = Object.freeze({
+      trackedAccounts: count(calculations.trackedAccounts, code),
+      completedAccounts: count(calculations.completedAccounts, code),
+      preparingAccounts: count(calculations.preparingAccounts, code),
+      scanningAccounts: count(calculations.scanningAccounts, code),
+      finalizingAccounts: count(calculations.finalizingAccounts, code),
+      sourceChangedAccounts: count(calculations.sourceChangedAccounts, code),
+      checkpointsWritten: count(calculations.checkpointsWritten, code),
+      bounded: boolean(calculations.bounded, code),
+      newestResultAt: nullableTimestamp(calculations.newestResultAt),
+    });
+    const phaseCount = projectedCalculations.completedAccounts
+      + projectedCalculations.preparingAccounts
+      + projectedCalculations.scanningAccounts
+      + projectedCalculations.finalizingAccounts
+      + projectedCalculations.sourceChangedAccounts;
+    if (!Number.isSafeInteger(phaseCount)
+        || phaseCount !== projectedCalculations.trackedAccounts) invalid(code);
+    const publishedDays = count(publication.publishedDays, code);
+    const pricedDays = count(publication.pricedDays, code);
+    if (pricedDays > publishedDays) invalid(code);
+
+    return Object.freeze({
+      ...base,
+      lookup: projectedLookup,
+      calculations: projectedCalculations,
+      maintenance: Object.freeze({
+        running: boolean(maintenance.running, code),
+        lastRunAt: nullableTimestamp(maintenance.lastRunAt),
+        leaseExpiresAt: nullableTimestamp(maintenance.leaseExpiresAt),
+      }),
+      publication: Object.freeze({
+        state: enumValue(publication.state, ADMIN_RECONSTRUCTION_PUBLICATION_STATES, code),
+        pendingDays: count(publication.pendingDays, code),
+        pendingDaysBounded: boolean(publication.pendingDaysBounded, code),
+        publishedDays,
+        pricedDays,
+        latestPublishedAt: nullableTimestamp(publication.latestPublishedAt),
+      }),
+    });
+  } catch (error) {
+    if (error instanceof AdminResponseError && error.code === code) return null;
+    throw error;
+  }
+}
+
 function projectErrors(value) {
   const errors = record(value, "ADMIN_OVERVIEW_INVALID");
   const groups = array(errors.groups, "ADMIN_OVERVIEW_INVALID").map((value) => {
@@ -1227,6 +1470,7 @@ export function projectAdminOverview(value) {
     lifecycle: projectLifecycle(overview.lifecycle),
     reconciliation: projectReconciliation(overview.reconciliation),
     ingress: projectIngress(overview.ingress),
+    reconstruction: projectReconstruction(overview.reconstruction),
     distribution: projectDistribution(overview.distribution),
     snapshots: Object.freeze(snapshots),
     dailyPublication: projectDailyPublication(overview.dailyPublication),
@@ -1275,7 +1519,7 @@ export function adminResponseError(status, value) {
       && REQUEST_ID_PATTERN.test(details.requestId)
     ? details.requestId
     : null;
-  return new AdminResponseError(code, requestId);
+  return new AdminResponseError(code, requestId, status);
 }
 
 export function adminActionErrorMessage(error) {

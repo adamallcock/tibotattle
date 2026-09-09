@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 /**
  * D1 cannot drop NOT NULL from the social-only participant columns. Migration
- * 0047 therefore snapshots the complete participant/device descendant graph,
+ * 0058 therefore snapshots the complete participant/device descendant graph,
  * rebuilds both roots, then restores the graph while foreign keys are
  * deferred. This is intentionally a dense fixture: each participant-owned
  * table captured by the migration has a real structural row, including the
@@ -52,6 +52,29 @@ const SNAPSHOT_TABLES = [
   "telemetry_v1_records",
   "upload_authorizations",
   "web_sessions",
+  // Canonical production 0046–0056 descendants that are removed by the
+  // participant-root cascade during 0058 and must be restored verbatim.
+  "community_analysis_work",
+  "community_analysis_work_parts",
+  "community_analysis_work_stage",
+  "community_current_analysis_queue",
+  "community_graph_update_scope",
+  "community_model_history_dependencies",
+  "community_model_history_results",
+  "community_model_history_work",
+  "community_model_history_work_parts",
+  "community_model_history_work_stage",
+  "community_prepared_fit_rows",
+  "community_prepared_plan_rows",
+  "community_prepared_source_days",
+  "community_prepared_usage_bins",
+  "community_prepared_usage_rows",
+  "community_publication_members",
+  "telemetry_v1_quota_fit_rows",
+  // These two canonical control rows do not cascade, so they prove that the
+  // rebuild neither replays nor recalculates unrelated production state.
+  "community_preparation_progress_counters",
+  "community_publication_generation",
 ] as const;
 
 const expectedCounts = Object.freeze({
@@ -90,6 +113,25 @@ const expectedCounts = Object.freeze({
   telemetry_v1_records: 1,
   upload_authorizations: 1,
   web_sessions: 1,
+  community_analysis_work: 1,
+  community_analysis_work_parts: 1,
+  community_analysis_work_stage: 1,
+  community_current_analysis_queue: 1,
+  community_graph_update_scope: 1,
+  community_model_history_dependencies: 1,
+  community_model_history_results: 1,
+  community_model_history_work: 1,
+  community_model_history_work_parts: 1,
+  community_model_history_work_stage: 1,
+  community_prepared_fit_rows: 1,
+  community_prepared_plan_rows: 1,
+  community_prepared_source_days: 1,
+  community_prepared_usage_bins: 1,
+  community_prepared_usage_rows: 1,
+  community_publication_members: 1,
+  telemetry_v1_quota_fit_rows: 1,
+  community_preparation_progress_counters: 1,
+  community_publication_generation: 1,
 });
 
 const SCALE_PARTICIPANT_COUNT = 10_000;
@@ -136,8 +178,42 @@ const EXPECTED_SCHEMA_DIFFERENCE = Object.freeze({
     "trigger:community_analytical_input_v1_delete",
     "trigger:community_analytical_input_v1_insert",
     "trigger:community_analytical_input_v1_update",
+    "trigger:community_current_analysis_fit_delete",
+    "trigger:community_current_analysis_fit_insert",
+    "trigger:community_current_analysis_fit_update",
+    "trigger:community_current_analysis_model_delete",
+    "trigger:community_current_analysis_model_insert",
+    "trigger:community_current_analysis_model_update",
+    "trigger:community_current_analysis_revision_insert",
+    "trigger:community_current_analysis_revision_update",
     "trigger:community_daily_aggregate_participant_withdrawal",
     "trigger:community_model_composition_day_withdrawal",
+    "trigger:community_model_history_legacy_delete",
+    "trigger:community_model_history_legacy_insert",
+    "trigger:community_model_history_legacy_update",
+    "trigger:community_model_history_participant_delete",
+    "trigger:community_model_history_participant_state",
+    "trigger:community_model_history_successor_delete",
+    "trigger:community_model_history_successor_insert",
+    "trigger:community_model_history_successor_update",
+    "trigger:community_model_history_v1_delete",
+    "trigger:community_model_history_v1_insert",
+    "trigger:community_model_history_v1_update",
+    "trigger:community_preparation_progress_delete",
+    "trigger:community_preparation_progress_insert",
+    "trigger:community_preparation_progress_update",
+    "trigger:community_publication_fit_delete",
+    "trigger:community_publication_fit_insert",
+    "trigger:community_publication_fit_update",
+    "trigger:community_publication_model_delete",
+    "trigger:community_publication_model_insert",
+    "trigger:community_publication_model_update",
+    "trigger:community_refresh_fit_delete",
+    "trigger:community_refresh_fit_insert",
+    "trigger:community_refresh_fit_update",
+    "trigger:community_refresh_model_delete",
+    "trigger:community_refresh_model_insert",
+    "trigger:community_refresh_model_update",
     "trigger:community_snapshot_contribution_deleting",
     "trigger:community_snapshot_contribution_direct_delete",
     "trigger:community_snapshot_participant_withdrawal",
@@ -162,9 +238,9 @@ function db(): D1Database {
   return bindings().USAGE_MONITOR_DB;
 }
 
-function migrationsBefore0047(): D1Migration[] {
+function migrationsBefore0058(): D1Migration[] {
   const migrations = bindings().TEST_MIGRATIONS;
-  const index = migrations.findIndex((migration) => migration.name.startsWith("0047"));
+  const index = migrations.findIndex((migration) => migration.name.startsWith("0058"));
   expect(index).toBeGreaterThan(0);
   return migrations.slice(0, index);
 }
@@ -183,7 +259,7 @@ interface SourceTableShape {
 }
 
 interface SchemaObject {
-  readonly type: "index" | "trigger" | "view";
+  readonly type: "table" | "index" | "trigger" | "view";
   readonly name: string;
   readonly table: string;
   readonly sql: string;
@@ -224,7 +300,7 @@ async function sourceRows(shapes: readonly SourceTableShape[]): Promise<Record<s
   const tables = await Promise.all(shapes.map(async ({ table, columns }) => {
     const projection = columns.map(quoted).join(", ");
     const rows = await db().prepare(
-      `SELECT ${projection} FROM ${quoted(table)} ORDER BY rowid`,
+      `SELECT ${projection} FROM ${quoted(table)} ORDER BY ${projection}`,
     ).all<Record<string, unknown>>();
     return [table, rows.results.map((row) => Object.fromEntries(
       columns.map((column) => [column, stableValue(row[column])]),
@@ -239,6 +315,29 @@ async function sourceSchemaObjects(): Promise<readonly SchemaObject[]> {
       FROM sqlite_master
      WHERE type IN ('index', 'trigger', 'view')
        AND name NOT LIKE 'sqlite_autoindex%'
+       AND sql IS NOT NULL
+     ORDER BY type, name
+  `).all<{
+    type: SchemaObject["type"];
+    name: string;
+    table_name: string;
+    sql: string;
+  }>();
+  return objects.results.map((object) => Object.freeze({
+    type: object.type,
+    name: object.name,
+    table: object.table_name,
+    sql: object.sql,
+  }));
+}
+
+async function completeSchemaObjects(): Promise<readonly SchemaObject[]> {
+  const objects = await db().prepare(`
+    SELECT type, name, tbl_name AS table_name, sql
+      FROM sqlite_master
+     WHERE type IN ('table', 'index', 'trigger', 'view')
+       AND name NOT LIKE 'sqlite_%'
+       AND name != 'd1_migrations'
        AND sql IS NOT NULL
      ORDER BY type, name
   `).all<{
@@ -599,6 +698,110 @@ async function seedCompleteSocialGraph(): Promise<{
   return { participantId, deviceId, manifestId, domainId };
 }
 
+/** Seed every canonical 0046–0056 descendant whose rows a participant-root
+ * rebuild can erase. Source triggers are intentionally absent in this
+ * migration-rehearsal fixture, so these rows prove 0058's explicit snapshots,
+ * not normal scheduler side effects. */
+async function seedCanonicalPrefixRows(fixture: {
+  participantId: string;
+  deviceId: string;
+}): Promise<void> {
+  const now = "2026-09-01T12:00:00.000Z";
+  const day = "2026-09-01";
+  const fingerprint = hash("a");
+  const generation = "11111111-1111-1111-1111-111111111111";
+  const checkpoint = (table: "community_analysis_work" | "community_model_history_work") => [
+    db().prepare(`INSERT INTO ${table} (
+      participant_id,run_id,input_revision,input_fingerprint,source_kind,
+      source_method_version,fixed_now,observed_at_cutoff,resets_at_cutoff,
+      window_minutes,max_quota_rows,phase,progress_revision,control_json,
+      manifest_json,state_sha256,reader_policy
+    ) VALUES (?, 'canonical-run', 1, ?, 'v1', 'canonical-method', ?, ?, ?,
+      10080, 60000, 'plan', 3, '{}', '[]', ?, 'prepared-source-days-1')`)
+      .bind(fixture.participantId, fingerprint, now, now, now, fingerprint),
+    db().prepare(`INSERT INTO ${table}_parts
+      (participant_id,run_id,component,payload_json,payload_sha256,payload_bytes)
+      VALUES (?, 'canonical-run', 'plan-anchors', '[]', ?, 2)`)
+      .bind(fixture.participantId, fingerprint),
+    db().prepare(`INSERT INTO ${table}_stage
+      (participant_id,run_id,stage_id,base_progress_revision,stage_revision,
+       mode,target_phase,target_control_json,target_manifest_json,
+       write_manifest_json,target_state_sha256,replay_json,write_offset,
+       verified_offset,gc_component,gc_sha256,discard_input_revision,state_sha256)
+      VALUES (?, 'canonical-run', 'canonical-stage', 0, 0, 'writing', 'plan',
+       '{}', '[]', '[]', ?, '{}', 0, 0, '', '', NULL, ?)`)
+      .bind(fixture.participantId, fingerprint, fingerprint),
+  ];
+  await db().batch([
+    ...checkpoint("community_analysis_work"),
+    ...checkpoint("community_model_history_work"),
+    db().prepare(`INSERT INTO community_current_analysis_queue
+      (participant_id,dirty_generation,window_generation,pending,last_served_sequence)
+      VALUES (?, 1, 0, 1, 0)`).bind(fixture.participantId),
+    db().prepare(`INSERT INTO community_graph_update_scope
+      (singleton,participant_id,device_id,stream,chunk_day,chunk_seq,old_chunk_id,
+       new_chunk_id,new_revision,chunk_digest,parser_version,record_count,
+       authorization_id,envelope_digest,created_at,expected_epoch,phase)
+      VALUES (1, ?, ?, 'quota', ?, 0, NULL, 'canonical-new-chunk', 1, ?,
+        'canonical-parser', 1, 'canonical-authority', ?, ?, 1, 'insert')`)
+      .bind(fixture.participantId, fixture.deviceId, day, fingerprint, fingerprint, now),
+    db().prepare(`INSERT INTO community_model_history_dependencies
+      (participant_id,day,from_day,dependency_revision,input_fingerprint,verified_input_revision)
+      VALUES (?, ?, '2026-05-24', 1, ?, 1)`)
+      .bind(fixture.participantId, day, fingerprint),
+    db().prepare(`INSERT INTO community_model_history_results
+      (participant_id,day,input_revision,input_fingerprint,method_version,result_json,computed_at,dependency_revision)
+      VALUES (?, ?, 1, ?, 'canonical-method', '{}', ?, 1)`)
+      .bind(fixture.participantId, day, fingerprint, now),
+    db().prepare(`INSERT INTO community_prepared_source_days
+      (participant_id,source_day,generation,source_fingerprint,method_version,
+       device_id,phase,progress_revision,cursor_time,cursor_id,quota_count,
+       usage_count,plan_count,fit_count,fragment_count,control_json,control_sha256)
+      VALUES (?, ?, ?, ?, 'canonical-method', ?, 'complete', 1, ?, 1, 1, 1,
+       1, 1, 1, '{}', ?)`)
+      .bind(fixture.participantId, day, fingerprint, fingerprint, fixture.deviceId, now, fingerprint),
+    db().prepare(`INSERT INTO community_prepared_fit_rows
+      (participant_id,source_day,generation,id,observed_at,device_id,provider,
+       limit_id,plan_type,plan_variant,occurrence_id,slot,used_percent,
+       window_duration_minutes,resets_at)
+      VALUES (?, ?, ?, 1, ?, ?, 'openai_codex', 'codex', 'pro', 'default',
+       'canonical-quota', 'primary', 10, 10080, ?)`)
+      .bind(fixture.participantId, day, fingerprint, now, fixture.deviceId, now),
+    db().prepare(`INSERT INTO community_prepared_plan_rows
+      (participant_id,source_day,generation,id,observed_at,device_id,provider,
+       limit_id,plan_type,plan_variant)
+      VALUES (?, ?, ?, 1, ?, ?, 'openai_codex', 'codex', 'pro', 'default')`)
+      .bind(fixture.participantId, day, fingerprint, now, fixture.deviceId),
+    db().prepare(`INSERT INTO community_prepared_usage_bins
+      (participant_id,source_day,generation,id,observed_at,payload_json,payload_sha256)
+      VALUES (?, ?, ?, 1, ?, '[]', ?)`)
+      .bind(fixture.participantId, day, fingerprint, now, fingerprint),
+    db().prepare(`INSERT INTO community_prepared_usage_rows
+      (participant_id,source_day,generation,id,observed_at,occurrence_id,provider,
+       session_uuid,cost_nanousd,pricing_status,model_id)
+      VALUES (?, ?, ?, 1, ?, 'canonical-usage', 'openai_codex', NULL, 1,
+       'fully_priced', 'gpt-5.6-sol')`)
+      .bind(fixture.participantId, day, fingerprint, now),
+    db().prepare(`INSERT INTO community_publication_generation
+      (singleton,generation,utc_day,from_day,method_version,source_epoch,
+       hard_epoch,cache_revision,membership_watermark,capture_cursor,load_cursor,
+       phase,published,member_count,prepared_count,payload_bytes,progress_revision,created_at)
+      VALUES (1, ?, ?, '2026-05-24', 'canonical-method', 1, 1, 1, 1, 0, 0,
+       'capturing', 0, 1, 0, 0, 0, ?)`)
+      .bind(generation, day, now),
+    db().prepare(`INSERT INTO community_publication_members
+      (generation,member_id,participant_id,minimum_revision,source,
+       composition_supported,selected_revision,fit_fingerprint,
+       composition_fingerprint,fits_json,composition_json,payload_bytes)
+      VALUES (?, 1, ?, 1, 'v1', 1, NULL, NULL, NULL, NULL, NULL, 0)`)
+      .bind(generation, fixture.participantId),
+    db().prepare(`INSERT INTO telemetry_v1_quota_fit_rows
+      (record_id,participant_id,resets_at,observed_at)
+      VALUES (88, ?, '2026-09-08T12:00:00.000Z', ?)`)
+      .bind(fixture.participantId, now),
+  ]);
+}
+
 beforeEach(async () => {
   await reset();
   await applyD1Migrations(
@@ -607,15 +810,35 @@ beforeEach(async () => {
   );
 });
 
-describe("migration 0047 accountless owner rebuild", () => {
+describe("migration 0058 accountless owner rebuild", () => {
+  it("uses one canonical active lineage and gives fresh installs the production-0056 final schema", async () => {
+    const activeNames = bindings().TEST_MIGRATIONS.map((migration) => migration.name);
+    expect(activeNames).toContain("0046_v1_quota_fit_projection.sql");
+    expect(activeNames).toContain("0057_accountless_enrollment_ledger.sql");
+    expect(activeNames).toContain("0058_accountless_upload_ownership.sql");
+    expect(activeNames).toContain("0059_accountless_upload_renewal.sql");
+    expect(activeNames).not.toContain("0046_accountless_enrollment_ledger.sql");
+    expect(activeNames).not.toContain("0047_accountless_upload_ownership.sql");
+    expect(activeNames).not.toContain("0048_accountless_upload_renewal.sql");
+
+    await applyD1Migrations(db(), bindings().TEST_MIGRATIONS);
+    const freshSchema = await completeSchemaObjects();
+    await reset();
+    await applyD1Migrations(db(), migrationsBefore0058());
+    await applyD1Migrations(db(), bindings().TEST_MIGRATIONS);
+    expect(await completeSchemaObjects()).toEqual(freshSchema);
+    expect((await db().prepare("PRAGMA foreign_key_check").all()).results).toEqual([]);
+  });
+
   it("preserves every preexisting social participant/device descendant and rebuilds its source graph", async () => {
-    await applyD1Migrations(db(), migrationsBefore0047());
+    await applyD1Migrations(db(), migrationsBefore0058());
     const preMigrationObjects = await sourceSchemaObjects();
     // The old source guards are tested elsewhere. Removing them here lets one
-    // fixture exercise every historical child table simultaneously; 0047 must
+    // fixture exercise every historical child table simultaneously; 0058 must
     // recreate the complete source graph after restoring these typed rows.
     await removeSourceTriggers();
     const fixture = await seedCompleteSocialGraph();
+    await seedCanonicalPrefixRows(fixture);
     const preMigrationShapes = await sourceTableShapes();
     const preMigrationRows = await sourceRows(preMigrationShapes);
     expect(await sourceGraphCounts()).toEqual(expectedCounts);
@@ -670,7 +893,7 @@ describe("migration 0047 accountless owner rebuild", () => {
 
     const savedTables = await db().prepare(`
       SELECT name FROM sqlite_master
-       WHERE type = 'table' AND name LIKE '%_0047_save'
+       WHERE type = 'table' AND name LIKE '%_0058_save'
     `).all<{ name: string }>();
     expect(savedTables.results).toEqual([]);
     const sourceObjects = await db().prepare(`
@@ -716,6 +939,20 @@ describe("migration 0047 accountless owner rebuild", () => {
     ]) {
       expect(schema.get(name)?.sql).toContain("owner_kind = 'social'");
     }
+    // 0058 restores the canonical 0046–0056 state after rebuilding the two
+    // root tables. These public scheduler/publication triggers intentionally
+    // gain a social-owner gate: accountless analytical evidence remains
+    // private until a separate public-eligibility decision exists.
+    for (const name of [
+      "trigger:community_analytical_input_v1_insert",
+      "trigger:community_current_analysis_revision_insert",
+      "trigger:community_current_analysis_fit_insert",
+      "trigger:community_publication_fit_insert",
+      "trigger:community_refresh_fit_insert",
+      "trigger:community_preparation_progress_insert",
+    ]) {
+      expect(schema.get(name)?.sql).toContain("owner_kind='social'");
+    }
     for (const name of [
       "trigger:telemetry_v11_chunk_admission",
       "trigger:telemetry_v11_manifest_admission",
@@ -727,11 +964,11 @@ describe("migration 0047 accountless owner rebuild", () => {
     }
   });
 
-  it("rehearses 0046 to 0047 with a 10,000-participant social graph", { timeout: 120_000 }, async () => {
+  it("rehearses production 0056 to 0058 with a 10,000-participant social graph", { timeout: 120_000 }, async () => {
     const startedAt = Date.now();
     let result = "failed";
     try {
-      await applyD1Migrations(db(), migrationsBefore0047());
+      await applyD1Migrations(db(), migrationsBefore0058());
       // The scale fixture intentionally uses the same complete descendant
       // shape as the focused preservation test, while keeping only one
       // representative linked device/session/upload/chunk graph. The other
@@ -739,6 +976,7 @@ describe("migration 0047 accountless owner rebuild", () => {
       await removeSourceTriggers();
       await seedSocialParticipantScale(SCALE_PARTICIPANT_COUNT);
       const fixture = await seedCompleteSocialGraph();
+      await seedCanonicalPrefixRows(fixture);
       const preMigrationShapes = await sourceTableShapes();
       const expectedScaleCounts = {
         ...expectedCounts,
@@ -783,7 +1021,7 @@ describe("migration 0047 accountless owner rebuild", () => {
 
       const savedTables = await db().prepare(`
         SELECT name FROM sqlite_master
-         WHERE type = 'table' AND name LIKE '%_0047_save'
+         WHERE type = 'table' AND name LIKE '%_0058_save'
       `).all<{ name: string }>();
       expect(savedTables.results).toEqual([]);
 
@@ -808,7 +1046,7 @@ describe("migration 0047 accountless owner rebuild", () => {
       result = "pass";
     } finally {
       console.info(
-        `[migration-0047-scale] result=${result} participants=${SCALE_PARTICIPANT_COUNT + 1} elapsed_ms=${Date.now() - startedAt}`,
+        `[migration-0058-scale] result=${result} participants=${SCALE_PARTICIPANT_COUNT + 1} elapsed_ms=${Date.now() - startedAt}`,
       );
     }
   });

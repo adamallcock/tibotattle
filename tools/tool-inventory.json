@@ -4,6 +4,132 @@
   "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
   "records": [
     {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/reconcile-release-publication.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release tooling entrypoint or private helper; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/release-publication.test.js",
+        "docs/runbooks/release-publication-reconciliation.md"
+      ],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/release-publication-reconciliation.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/release-qualification-inputs.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release tooling entrypoint or private helper; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qualify-release.mjs",
+        "test/release-qualification-inputs.test.js",
+        "docs/runbooks/release-qualification-admission.md"
+      ],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/release-qualification-admission.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/release-qualification-cache.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release tooling entrypoint or private helper; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qualify-release.mjs",
+        "test/release-qualification-cache.test.js",
+        "docs/runbooks/release-qualification-admission.md"
+      ],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/release-qualification-admission.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/qualify-release.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release tooling entrypoint or private helper; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/release-qualification-cache.test.js",
+        "docs/runbooks/release-qualification-admission.md"
+      ],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/release-qualification-admission.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/release-agent.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit node entrypoint for read-only agent release doctor and private operation status.",
+      "additionalAliases": [],
+      "callers": [
+        "test/release-agent.test.js",
+        "docs/runbooks/agent-release-operations.md"
+      ],
+      "decision": "retain_as_read_only_release_entrypoint",
+      "provenance": "docs/runbooks/agent-release-operations.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/macos-release-journal.js",
+      "stableAlias": null,
+      "stableAliasReason": "Private phase coordinator called only through native finalization and synthetic tests.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/macos-release-core.js",
+        "test/macos-release-journal.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/agent-release-operations.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/release-operation.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private operation durability and local mutex support; not a standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/macos-release-journal.js",
+        "scripts/macos-release-core.js",
+        "scripts/release-agent.mjs",
+        "apps/worker/scripts/production-deploy.mjs",
+        "apps/worker/scripts/production-deployment-lock.mjs",
+        "apps/worker/scripts/production-deploy.check.mjs",
+        "test/release-agent.test.js",
+        "test/macos-release-journal.test.js",
+        "test/release-operation.test.js",
+        "scripts/qualify-release.mjs",
+        "scripts/reconcile-release-publication.mjs",
+        "scripts/lib/release-qualification-cache.mjs",
+        "test/release-qualification-cache.test.js",
+        "test/release-publication.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/agent-release-operations.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
       "classification": "reusable_benchmark",
       "owner": "quota_research",
       "canonicalPath": "scripts/analyze-credit-drawdown.js",
@@ -203,7 +329,8 @@
       "callers": [
         "docs/runbooks/2026-08-17-web-only-release.md",
         "package.json#scripts.product:web-release:deploy",
-        "test/web-release-lane.test.js"
+        "test/web-release-lane.test.js",
+        "scripts/reconcile-release-publication.mjs"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
@@ -277,7 +404,8 @@
         "docs/runbooks/2026-08-17-web-only-release.md",
         "scripts/deploy-web-release.js",
         "scripts/prepare-web-release.js",
-        "test/web-release-lane.test.js"
+        "test/web-release-lane.test.js",
+        "scripts/reconcile-release-publication.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
@@ -560,7 +688,13 @@
       "stableAliasReason": "Windows development launch is invoked explicitly with an already-built candidate and is not a supported product command.",
       "additionalAliases": [],
       "callers": [
-        "test/electron-windows-development-launcher.test.js"
+        "apps/electron/test/desktop-windows-account-observation-qualification.test.mjs",
+        "test/electron-windows-development-launcher.test.js",
+        "scripts/smoke-electron-windows-accountless.mjs",
+        "scripts/smoke-electron-windows-normal-candidate.mjs",
+        "scripts/smoke-electron-windows-nsis-lifecycle.mjs",
+        "test/electron-windows-accountless-smoke.test.js",
+        "test/electron-windows-normal-candidate.test.js"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -624,6 +758,7 @@
       "stableAliasReason": "Imported parser helper is not a command entry point.",
       "additionalAliases": [],
       "callers": [
+        "apps/worker/scripts/generate-admin-ui-assets.mjs",
         "scripts/benchmark-detailed-accounting.mjs",
         "scripts/build-local-review-artifact.js",
         "scripts/build-macos-app.js",
@@ -640,7 +775,9 @@
         "test/participant-identity-owner-boundary.test.js",
         "test/r7-release-evidence-schema.test.js",
         "test/reporting-owner-boundary.test.js",
-        "test/tool-inventory.test.js"
+        "test/tool-inventory.test.js",
+        "scripts/lib/release-qualification-inputs.mjs",
+        "scripts/build-electron-runtime.mjs"
       ],
       "decision": "retain_as_internal_tooling_support",
       "provenance": null,
@@ -813,13 +950,15 @@
       "stableAliasReason": "Internal Apple bundle-version grammar, migration epoch, and comparator shared by macOS release tools; it is not a standalone command.",
       "additionalAliases": [],
       "callers": [
+        "scripts/release-agent.mjs",
         "scripts/build-macos-app.js",
         "scripts/generate-sparkle-appcast.js",
         "scripts/macos-release-core.js",
         "scripts/publish-sparkle-update.js",
         "scripts/sparkle-signed-feed-validation.js",
         "scripts/verify-macos-preview-remote.js",
-        "test/macos-app-bundle.test.js"
+        "test/macos-app-bundle.test.js",
+        "scripts/reconcile-release-publication.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/decisions/2026-08-27-local-state-schema-and-release-channel-isolation.md",
@@ -835,6 +974,8 @@
       "additionalAliases": [],
       "callers": [
         "docs/runbooks/macos-stable-release-runbook.md",
+        "scripts/release-agent.mjs",
+        "test/macos-release-journal.test.js",
         "scripts/build-macos-app.js",
         "scripts/build-public-release-site.js",
         "scripts/package-macos-dmg.js",
@@ -975,7 +1116,8 @@
         "test/macos-updater.test.js",
         "test/publish-sparkle-update.test.js",
         "test/release-channel-policy.test.js",
-        "test/sparkle-signed-feed-validation.test.js"
+        "test/sparkle-signed-feed-validation.test.js",
+        "scripts/reconcile-release-publication.mjs"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
@@ -1359,7 +1501,10 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/windows-portability.yml",
-        "test/windows-filesystem-manifest.test.js"
+        "test/windows-filesystem-manifest.test.js",
+        "apps/electron/test/shell-core.test.mjs",
+        "test/electron-development-artifact-verifier.test.js",
+        "test/windows-filesystem-loader.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/goals/2026-08-17-windows-security-credentials-goal.md",
@@ -1724,7 +1869,9 @@
         "scripts/validate-release-sbom.mjs",
         "test/public-release-site.test.js",
         "test/release-attestation-action.test.js",
-        "test/release-evidence.test.js"
+        "test/release-evidence.test.js",
+        "test/release-publication.test.js",
+        "scripts/reconcile-release-publication.mjs"
       ],
       "decision": "retain_as_release_evidence_compatibility_facade",
       "provenance": null,
@@ -1759,7 +1906,11 @@
         "scripts/build-electron-app.mjs",
         "scripts/build-electron-runtime.mjs",
         "scripts/verify-electron-development-artifact.mjs",
-        "test/electron-builder-package-json.test.js"
+        "test/electron-builder-package-json.test.js",
+        "apps/electron/test/shell-core.test.mjs",
+        "scripts/package-electron-development.mjs",
+        "scripts/package-electron-production.mjs",
+        "test/electron-development-artifact-verifier.test.js"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -1776,7 +1927,9 @@
       "callers": [
         ".github/workflows/windows-portability.yml",
         "scripts/package-electron-development.mjs",
-        "test/electron-app-package.test.js"
+        "test/electron-app-package.test.js",
+        "scripts/package-electron-production.mjs",
+        "test/electron-production-distribution.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -1796,7 +1949,9 @@
         "scripts/verify-electron-development-artifact.mjs",
         "test/electron-app-package.test.js",
         "test/electron-development-artifact-verifier.test.js",
-        "test/electron-package-layout.test.js"
+        "test/electron-package-layout.test.js",
+        "scripts/package-electron-production.mjs",
+        "test/electron-production-distribution.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -1812,7 +1967,9 @@
       "additionalAliases": [],
       "callers": [
         "scripts/package-electron-development.mjs",
-        "test/electron-development-artifact-verifier.test.js"
+        "test/electron-development-artifact-verifier.test.js",
+        "scripts/smoke-electron-linux-secret-service.mjs",
+        "scripts/smoke-electron-windows-accountless.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -1879,7 +2036,8 @@
       "stableAliasReason": "The isolated Linux development launcher is an explicit qualification entrypoint, not a supported product command.",
       "additionalAliases": [],
       "callers": [
-        "test/electron-linux-development-launcher.test.js"
+        "test/electron-linux-development-launcher.test.js",
+        "scripts/smoke-electron-linux-secret-service.mjs"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -1929,7 +2087,9 @@
         ".github/workflows/linux-portability.yml",
         "package.json#scripts.test:linux:credentials",
         "scripts/run-linux-secret-service-qualification.mjs",
-        "test/linux-secret-service-qualification.test.js"
+        "test/linux-secret-service-qualification.test.js",
+        "scripts/smoke-electron-linux-packaged.mjs",
+        "scripts/smoke-electron-linux-secret-service.mjs"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -1947,10 +2107,107 @@
         ".github/workflows/linux-portability.yml",
         "containers/electron-linux-amd64/Dockerfile",
         "package.json#scripts.container:electron-linux:test:credentials:amd64",
-        "test/linux-secret-service-supervisor.test.js"
+        "test/linux-secret-service-supervisor.test.js",
+        "scripts/smoke-electron-linux-secret-service.mjs"
       ],
       "decision": "retain_as_development_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/qa-electron-macos-page-parity.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Targeted development-only rendered QA requires a frozen macOS Electron bundle and a synthetic profile; it is not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-macos-page-parity-qa-contract.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-linux-packaged.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The normal packaged Linux candidate proof runs only inside the disposable GUI and Secret Service container; it is not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-development-packages.yml",
+        "test/electron-linux-normal-packaged-smoke.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-windows-normal-candidate.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The normal Windows candidate proof binds an exact disposable runner package and closed receipt; it is not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-development-packages.yml",
+        "test/electron-windows-normal-candidate.test.js"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/smoke-electron-windows-nsis-lifecycle.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The Windows development-installer lifecycle uses an exact disposable runner and private child installation path; it is not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        ".github/workflows/electron-development-packages.yml",
+        "scripts/smoke-electron-windows-normal-candidate.mjs",
+        "test/electron-windows-nsis-lifecycle.test.js"
+      ],
+      "decision": "retain_as_development_qualification_entrypoint",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/publish-electron-handover-rehearsal-feed.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Protected native-to-Electron rehearsal-feed publisher defaults to local proposal validation; a remote write requires the explicit exclusive-control flag and is not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "docs/runbooks/2026-09-07-macos-native-to-electron-handover.md",
+        "test/electron-handover-feed-publisher.test.js"
+      ],
+      "decision": "retain_as_protected_release_publication_entrypoint",
+      "provenance": "docs/runbooks/2026-09-07-macos-native-to-electron-handover.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/reconcile-native-electron-collector-observations.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "The stopped-state native-to-Electron collector reconciliation defaults to private-copy inspection; append-only application requires two explicit private-copy flags and is not a supported product command.",
+      "additionalAliases": [],
+      "callers": [
+        "docs/runbooks/2026-09-07-macos-native-to-electron-handover.md",
+        "test/native-electron-collector-reconciliation.test.js"
+      ],
+      "decision": "retain_as_protected_release_reconciliation_entrypoint",
+      "provenance": "docs/runbooks/2026-09-07-macos-native-to-electron-handover.md",
       "provenanceReason": null,
       "legacyPaths": []
     },
@@ -1963,7 +2220,10 @@
       "additionalAliases": [],
       "callers": [
         "package.json#scripts.smoke:electron:linux",
-        "test/electron-linux-smoke-contract.test.js"
+        "test/electron-linux-smoke-contract.test.js",
+        "scripts/smoke-electron-linux-packaged.mjs",
+        "scripts/smoke-electron-windows-normal-candidate.mjs",
+        "test/electron-linux-normal-packaged-smoke.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -1995,7 +2255,8 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-development-packages.yml",
-        "test/electron-windows-accountless-smoke.test.js"
+        "test/electron-windows-accountless-smoke.test.js",
+        "scripts/smoke-electron-windows-nsis-lifecycle.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2012,7 +2273,8 @@
       "callers": [
         ".github/workflows/electron-development-packages.yml",
         "containers/electron-linux-packaged/Dockerfile",
-        "test/electron-linux-secret-service-smoke.test.js"
+        "test/electron-linux-secret-service-smoke.test.js",
+        "scripts/smoke-electron-linux-packaged.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2044,7 +2306,8 @@
       "additionalAliases": [],
       "callers": [
         "scripts/package-electron-production.mjs",
-        "test/electron-native-handover-helper.test.js"
+        "test/electron-native-handover-helper.test.js",
+        "test/electron-native-handover-bundle-context.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2060,7 +2323,9 @@
       "additionalAliases": [],
       "callers": [
         ".github/workflows/electron-development-packages.yml",
-        "test/linux-credential-mutex-manifest.test.js"
+        "test/linux-credential-mutex-manifest.test.js",
+        "test/helpers/linux-packaging-binding.js",
+        "test/linux-credential-mutex-staging.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2077,7 +2342,10 @@
       "callers": [
         "package.json#scripts.package:electron:production:prepare",
         ".github/workflows/electron-production-source-preparation.yml",
-        "test/electron-production-distribution.test.js"
+        "test/electron-production-distribution.test.js",
+        "scripts/finalize-electron-macos-update-metadata.mjs",
+        "test/electron-development-package.test.js",
+        "test/electron-macos-production-finalization.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2092,7 +2360,8 @@
       "stableAliasReason": "Inspect and plan the guided native-to-Electron handover without mutating the installed application.",
       "additionalAliases": [],
       "callers": [
-        "test/electron-native-handover-bundle-context.test.js"
+        "test/electron-native-handover-bundle-context.test.js",
+        "test/electron-native-handover-helper.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
