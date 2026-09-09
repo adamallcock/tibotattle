@@ -282,6 +282,9 @@
       },
       "vars": {
         "ENVIRONMENT": "production",
+        // Owner-approved hosted recovery. Deploy only after migrations 0046/0047
+        // and the maintained Worker checks pass; paused remains the incident brake.
+        "ALLOWANCE_RECONSTRUCTION_MODE": "resumable",
         "PUBLIC_ORIGIN": "https://tibotattle.com",
         // Owner decision 2026-08-07: community enrollment is OPEN. The
         // containment-era "disabled" default was never a product choice, and

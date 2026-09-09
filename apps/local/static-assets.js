@@ -35,6 +35,10 @@ export const LOCAL_COMPANION_STATIC_FILES = Object.freeze({
     file: "localization.js",
     type: "text/javascript; charset=utf-8",
   }),
+  "/model-catalog.generated.js": Object.freeze({
+    file: "model-catalog.generated.js",
+    type: "text/javascript; charset=utf-8",
+  }),
   "/navigation.js": Object.freeze({
     file: "navigation.js",
     type: "text/javascript; charset=utf-8",

@@ -26,6 +26,7 @@ import {
   resolveInitialPublicPlatform,
   renderPublicInstallerJourney,
   wirePublicPlatformSelector,
+  selectCommunityAllowancePayload,
 } from "../public/community.js";
 import {
   compactMacOSVersion,
@@ -1309,9 +1310,15 @@ test("the community allowance surface leads the product hero with honest labelin
     html,
     /data-range-days="30" class="active" aria-pressed="true"/u,
   );
-  assert.match(html, /Combined Pro 20x-equivalent allowance/u);
-  assert.match(html, /One combined estimate across contributing personal-plan accounts/u);
-  assert.doesNotMatch(html, /data-allowance-mode|By plan|plan selector/u);
+  assert.match(html, /Pro 20x-equivalent allowance/u);
+  assert.match(html, /API-price value of a Pro 20x-equivalent week: overall, by plan or by model/u);
+  for (const view of ["aggregate", "plans", "models"]) {
+    assert.equal(html.match(new RegExp(`data-allowance-view="${view}"`, "gu"))?.length, 2);
+  }
+  assert.equal(html.match(/data-allowance-view-controls/gu)?.length, 2);
+  assert.match(html, /role="group" aria-label="Allowance graph view"/u);
+  assert.doesNotMatch(source, /admin-client|admin\.js|\/admin\/community/u,
+    "public controls must never call or import the private admin surface");
 
   // The larger chart is a standard native-dialog lightbox. The launcher is
   // hidden until a published chart is actually renderable, then exposes the
@@ -1334,7 +1341,7 @@ test("the community allowance surface leads the product hero with honest labelin
   );
   assert.match(
     html,
-    /<h2 id="community-allowance-dialog-title"[^>]*>Explore community allowance history<\/h2>/u,
+    /<h2 id="community-allowance-dialog-title"[^>]*>Community allowance history<\/h2>/u,
   );
   assert.match(
     html,
@@ -1439,6 +1446,28 @@ function publishedDailySeries(overrides = {}) {
   };
 }
 
+test("an activity-only storage fallback preserves only the confirmed allowance observation", () => {
+  const previous = publishedDailySeries();
+  const temporary = publishedDailySeries({
+    allowanceState: "updating", allowanceReadState: "temporarily_unavailable",
+    days: [publishedDailyDay("2026-08-07", 3)],
+  });
+  assert.equal(selectCommunityAllowancePayload(previous, temporary), previous);
+  assert.equal(normalizeCommunityDailySeries(temporary).days[0].revision, 3,
+    "the new daily activity remains independently renderable");
+  assert.equal(selectCommunityAllowancePayload(null, temporary), null,
+    "a temporary response cannot invent a first graph");
+  const withdrawn = publishedDailySeries({ allowanceState: "updating", allowanceReadState: "confirmed", days: [] });
+  assert.equal(selectCommunityAllowancePayload(previous, withdrawn), withdrawn);
+  assert.equal(selectCommunityAllowancePayload(withdrawn, temporary), withdrawn,
+    "later read failures cannot resurrect a withdrawn graph");
+  assert.equal(selectCommunityAllowancePayload(previous, null), null);
+  const malformed = { ...temporary, days: "malformed" };
+  assert.equal(selectCommunityAllowancePayload(previous, malformed), malformed,
+    "an invalid payload cannot use a fallback marker as authority");
+  assert.equal(normalizeCommunityDailySeries({ ...temporary, allowanceReadState: "unreviewed" }).state, "unsupported_schema");
+});
+
 test("the public daily client requests exactly the inclusive year window", async () => {
   const calls = [];
   const payload = publishedDailySeries();
@@ -1461,7 +1490,7 @@ test("the public daily client requests exactly the inclusive year window", async
   );
   assert.deepEqual(calls, [[
     `/api/v1/community/daily?from=${from}&to=${to}`,
-    { headers: { Accept: "application/json" } },
+    { headers: { Accept: "application/json" }, cache: "no-cache" },
   ]]);
 });
 
@@ -1573,16 +1602,16 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     .map(({ textContent }) => textContent);
   assert.deepEqual(terms, [
     "Activity through",
-    "Contributors that day",
+    "Total API-equivalent spend",
     "Turns counted",
-    "Output tokens counted",
+    "All tokens counted",
   ]);
-  assert.deepEqual(values, ["Aug 7, 2026", "3", "240", "1K"]);
+  assert.deepEqual(values, ["Aug 7, 2026", "—", "240", "3K"]);
   assert.deepEqual(details, [
     "Most recent community day",
-    "Accounts represented on that day",
+    "API-equivalent spend unavailable; not an actual bill",
     "Usage events across 2 shared days",
-    "Combined output across 2 shared days",
+    "Input and output across 2 shared days",
   ]);
   for (const retiredOperationalLabel of [
     "Latest published day",
@@ -1590,6 +1619,7 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     "Revision age",
     "Released",
     "Published days in window",
+    "Contributors that day",
   ]) {
     assert.equal(quality.text.includes(retiredOperationalLabel), false, retiredOperationalLabel);
   }
@@ -1599,7 +1629,7 @@ test("a published daily series renders friendly cumulative activity, latest-firs
   );
 
   // The chart precedes the table: bars for usage events, a line series for
-  // combined output, and — while the series is one or two days long — dots
+  // all input/output tokens, and — while the series is one or two days long — dots
   // plus the still-filling note.
   const svg = container.descendants().find(({ tag }) => tag === "svg");
   assert.ok(svg, "a published daily series renders its inline SVG chart");
@@ -1615,10 +1645,10 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     .filter((element) => element.attributes.get("class") === "daily-events-bar");
   assert.equal(bars.length, 2);
   const dots = svg.descendants().filter(({ tag }) => tag === "circle");
-  assert.equal(dots.length, 2, "a sparse series marks every output point with a dot");
+  assert.equal(dots.length, 2, "a sparse series marks every token point with a dot");
   assert.match(container.text, /still filling/u);
   assert.match(container.text, /Usage events/u);
-  assert.match(container.text, /Output tokens/u);
+  assert.match(container.text, /All tokens/u);
 
   const table = container.descendants().find(({ tag }) => tag === "table");
   assert.ok(table, "a published daily series renders its table");
@@ -1631,7 +1661,7 @@ test("a published daily series renders friendly cumulative activity, latest-firs
     "Usage events",
     "Quota observations",
     "Contributing devices",
-    "Output tokens",
+    "All tokens",
   ]) {
     assert.equal(columnLabels.includes(label), true, label);
   }
@@ -1652,6 +1682,88 @@ test("a published daily series renders friendly cumulative activity, latest-firs
   const numericCells = bodyRows[0].children
     .filter((cell) => cell.className === "numeric");
   assert.equal(numericCells.length, 4);
+});
+
+test("daily detail disclosure keeps its open state across publication refreshes without reviving unavailable content", () => {
+  const documentRef = fakeDocument(), container = documentRef.createElement("div");
+  const render = (payload = publishedDailySeries()) => renderCommunityDailySeries({ documentRef, container, payload });
+  const disclosure = () => container.descendants().find(element => element.tag === "details");
+  render(); const first = disclosure();
+  assert.equal(first.open, false); first.open = true;
+  render(); assert.notEqual(disclosure(), first); assert.equal(disclosure().open, true);
+  disclosure().open = false; render(); assert.equal(disclosure().open, false);
+  disclosure().open = true;
+  const separate = documentRef.createElement("div");
+  renderCommunityDailySeries({ documentRef, container: separate, payload: publishedDailySeries() });
+  assert.equal(separate.descendants().find(element => element.tag === "details").open, false);
+  assert.equal(render(null), "service_unavailable"); assert.equal(disclosure(), undefined);
+  render(); assert.equal(disclosure().open, false);
+});
+
+test("community spend card sums only reported equivalents and qualifies incomplete history", () => {
+  function spendBlock(knownCostUsd, overrides = {}) {
+    return {
+      basis: "reported_usage_event_time_api_price_equivalent_v1",
+      currency: "USD", knownCostUsd, coverage: "complete", usageEvents: 120,
+      fullyPricedUsageEvents: 120, partiallyPricedUsageEvents: 0, unpricedUsageEvents: 0,
+      pricingMethodVersion: "server-api-price-equivalent-v1.0", registrySha256: "a".repeat(64),
+      ...overrides,
+    };
+  }
+  const completeDay = (day, value) => publishedDailyDay(day, 1, {
+    payload: { apiEquivalentSpend: spendBlock(value), allowance: allowanceBlock({ centralUsd: 9999 }) },
+  });
+  const partialDay = publishedDailyDay("2026-08-07", 1, {
+    payload: { apiEquivalentSpend: spendBlock(2.5, {
+      coverage: "partial", fullyPricedUsageEvents: 100, unpricedUsageEvents: 20,
+    }) },
+  });
+  const unpricedDay = publishedDailyDay("2026-08-07", 1, {
+    payload: { apiEquivalentSpend: spendBlock(null, {
+      coverage: "unavailable", fullyPricedUsageEvents: 0, unpricedUsageEvents: 120,
+    }) },
+  });
+  const zeroDay = publishedDailyDay("2026-08-07", 1);
+  zeroDay.payload.totals.usageEvents = 0;
+  zeroDay.payload.apiEquivalentSpend = spendBlock(0, { usageEvents: 0, fullyPricedUsageEvents: 0 });
+  for (const [label, days, value, detail] of [
+    ["complete", [completeDay("2026-08-06", 1.25), completeDay("2026-08-07", 2.5)], "$3.75",
+      "Across 2 shared days in USD; not an actual bill"],
+    ["partial pricing", [completeDay("2026-08-06", 1.25), partialDay], "$3.75",
+      "Priced portion across 2 of 2 shared days in USD; not an actual bill"],
+    ["old day missing spend", [completeDay("2026-08-06", 1.25), publishedDailyDay("2026-08-07", 1)], "$1.25",
+      "Priced portion across 1 of 2 shared days in USD; not an actual bill"],
+    ["unpriced day", [completeDay("2026-08-06", 1.25), unpricedDay], "$1.25",
+      "Priced portion across 1 of 2 shared days in USD; not an actual bill"],
+    ["all unpriced", [unpricedDay], "—", "API-equivalent spend unavailable; not an actual bill"],
+    ["genuine zero", [zeroDay], "$0", "Across 1 shared days in USD; not an actual bill"],
+    ["overflow", [completeDay("2026-08-06", Number.MAX_VALUE), completeDay("2026-08-07", Number.MAX_VALUE)], "—",
+      "API-equivalent spend unavailable; not an actual bill"],
+  ]) {
+    const documentRef = fakeDocument();
+    const container = documentRef.createElement("div");
+    renderCommunityDailySeries({ documentRef, container, payload: publishedDailySeries({ days }) });
+    const cards = container.descendants().find((element) => element.className === "snapshot-quality-grid").children;
+    assert.equal(cards[1].children[0].textContent, "Total API-equivalent spend", label);
+    assert.equal(cards[1].children[1].textContent, value, label);
+    assert.equal(cards[1].children[2].textContent, detail, label);
+    assert.doesNotMatch(container.text, /Contributors that day|9,999/u, label);
+  }
+});
+
+test("community spend coverage wording is translated in every shipped language", () => {
+  for (const [locale, label, detail] of [
+    ["en-US", "Total API-equivalent spend", "API-equivalent spend unavailable; not an actual bill"],
+    ["zh-Hans", "API 等值总支出", "API 等值支出不可用；非实际账单"],
+    ["es", "Gasto total equivalente de API", "Gasto equivalente de API no disponible; no es una factura real"],
+  ]) {
+    const documentRef = fakeDocument();
+    documentRef.documentElement.lang = locale;
+    const container = documentRef.createElement("div");
+    renderCommunityDailySeries({ documentRef, container, payload: publishedDailySeries() });
+    assert.ok(container.text.includes(label), locale);
+    assert.ok(container.text.includes(detail), locale);
+  }
 });
 
 test("daily table columns share one unit chosen from the column maximum", () => {
@@ -1707,7 +1819,8 @@ test("the public site hosts the daily series containers", async () => {
   assert.doesNotMatch(html, /latest published revision/u);
   const source = await readFile(SITE_SOURCE, "utf8");
   assert.match(source, /renderCommunityDailySeries/u);
-  assert.match(source, /communityDaily\(\)/u);
+  assert.match(source, /communityDaily\(options\)/u);
+  assert.match(source, /createCommunityRefresh/u);
   assert.doesNotMatch(source, /communityStats|renderCommunitySnapshot/u);
 });
 
@@ -1731,13 +1844,13 @@ test("the daily chart model maps published days honestly", () => {
   );
   assert.equal(sparse.sparse, true);
   assert.deepEqual(sparse.bars.map(({ day }) => day), ["2026-08-06", "2026-08-07"]);
-  assert.equal(sparse.outputSegments.length, 1);
-  assert.equal(sparse.outputSegments[0].length, 2);
+  assert.equal(sparse.tokenSegments.length, 1);
+  assert.equal(sparse.tokenSegments[0].length, 2);
   assert.deepEqual(sparse.dayTicks.map(({ day }) => day), ["2026-08-06", "2026-08-07"]);
   assert.equal(sparse.tickLabelStyle, "day");
   assert.ok(sparse.bars[0].x < sparse.bars[1].x, "bars advance with the calendar");
 
-  // Events scale from zero on the left axis; output tokens scale on the right.
+  // Events scale from zero on the left axis; all tokens scale on the right.
   assert.equal(sparse.eventsTicks[0].value, 0);
   assert.equal(sparse.eventsTicks[0].y, sparse.plot.bottom);
   assert.ok(
@@ -1745,8 +1858,8 @@ test("the daily chart model maps published days honestly", () => {
     "the events axis covers the maximum usage-event total",
   );
   assert.ok(
-    sparse.outputTicks[sparse.outputTicks.length - 1].value >= 500,
-    "the output axis covers the maximum combined-output total",
+    sparse.tokenTicks[sparse.tokenTicks.length - 1].value >= 1500,
+    "the token axis covers the maximum all-token total",
   );
 });
 
@@ -1761,10 +1874,10 @@ test("the daily chart model renders unpublished days as gaps, not zeros", () => 
   const model = buildCommunityDailyChartModel(series);
   assert.equal(model.sparse, false);
   assert.equal(model.bars.length, 3, "only published days draw a bar");
-  // The output line breaks at the two-day publication gap: one connected
+  // The token line breaks at the two-day publication gap: one connected
   // segment for the adjacent days, then an isolated single-point segment.
   assert.deepEqual(
-    model.outputSegments.map((segment) => segment.map(({ day }) => day)),
+    model.tokenSegments.map((segment) => segment.map(({ day }) => day)),
     [["2026-08-01", "2026-08-02"], ["2026-08-05"]],
   );
   const positions = model.bars.map(({ x }) => x);
@@ -1804,15 +1917,75 @@ test("the daily chart model thins ticks and bars for a year of days", () => {
   }
 });
 
-test("the daily chart keeps an all-zero output series on the baseline", () => {
-  // Combined-output totals were zero before the server-side fix; a series of
-  // zeros must chart as a flat baseline, never as an invented scale.
+test("all-token totals count disjoint inputs and combined output exactly once", () => {
+  const day = publishedDailyDay("2026-08-06", 1);
+  Object.assign(day.payload.totals, {
+    inputUncachedTokens: 100,
+    inputCacheReadTokens: 200,
+    inputCacheWriteTokens: 300,
+    outputTextTokens: 40,
+    outputReasoningTokens: 60,
+    outputCombinedTokens: 100,
+  });
+  const payload = publishedDailySeries({ days: [day] });
+  const model = buildCommunityDailyChartModel(normalizeCommunityDailySeries(payload));
+  assert.equal(model.tokenPoints[0].allTokens, 700);
+  const documentRef = fakeDocument();
+  const container = documentRef.createElement("div");
+  renderCommunityDailySeries({ documentRef, container, payload });
+  const summaryValues = container.descendants()
+    .filter(({ tag }) => tag === "dd").map(({ textContent }) => textContent);
+  assert.equal(summaryValues[3], "700");
+  const tableRow = container.descendants().filter(({ tag }) => tag === "tr")[1];
+  assert.equal(tableRow.children[4].textContent, "700");
+  assert.doesNotMatch(container.text, /Output tokens/u);
+});
+
+test("unsafe all-token sums stay unavailable and break the token line", () => {
+  const invalidDay = publishedDailyDay("2026-08-07", 1);
+  invalidDay.payload.totals.inputUncachedTokens = Number.MAX_SAFE_INTEGER;
+  const payload = publishedDailySeries({ days: [
+    publishedDailyDay("2026-08-06", 1), invalidDay,
+    publishedDailyDay("2026-08-08", 1),
+  ] });
+  const model = buildCommunityDailyChartModel(normalizeCommunityDailySeries(payload));
+  assert.equal(model.bars.length, 3, "valid event totals still render");
+  assert.deepEqual(model.tokenSegments.map((segment) => segment.map(({ day }) => day)),
+    [["2026-08-06"], ["2026-08-08"]]);
+  const documentRef = fakeDocument();
+  const container = documentRef.createElement("div");
+  renderCommunityDailySeries({ documentRef, container, payload });
+  const summaryValues = container.descendants()
+    .filter(({ tag }) => tag === "dd").map(({ textContent }) => textContent);
+  assert.equal(summaryValues[3], "—");
+  const invalidRow = container.descendants().filter(({ tag }) => tag === "tr")[2];
+  assert.equal(invalidRow.children[4].textContent, "—");
+});
+
+test("all-token activity labels preserve their meaning in every shipped language", () => {
+  for (const [locale, label, detail] of [
+    ["en-US", "All tokens counted", "Input and output across 2 shared days"],
+    ["zh-Hans", "已计入的全部 token", "跨 2 个共享日期的输入与输出"],
+    ["es", "Todos los tokens contabilizados", "Entrada y salida en 2 días compartidos"],
+  ]) {
+    const documentRef = fakeDocument();
+    documentRef.documentElement.lang = locale;
+    const container = documentRef.createElement("div");
+    renderCommunityDailySeries({ documentRef, container, payload: publishedDailySeries() });
+    assert.ok(container.text.includes(label), locale);
+    assert.ok(container.text.includes(detail), locale);
+  }
+});
+
+test("the daily chart keeps an all-zero token series on the baseline", () => {
+  // A genuine series of zeros must stay on the baseline, not invent activity.
   const series = normalizeCommunityDailySeries(publishedDailySeries({
     days: [
       publishedDailyDay("2026-08-06", 1, {
         payload: {
           totals: {
             ...publishedDailyDay("2026-08-06", 1).payload.totals,
+            inputUncachedTokens: 0,
             outputCombinedTokens: 0,
           },
         },
@@ -1821,6 +1994,7 @@ test("the daily chart keeps an all-zero output series on the baseline", () => {
         payload: {
           totals: {
             ...publishedDailyDay("2026-08-07", 1).payload.totals,
+            inputUncachedTokens: 0,
             outputCombinedTokens: 0,
           },
         },
@@ -1828,7 +2002,7 @@ test("the daily chart keeps an all-zero output series on the baseline", () => {
     ],
   }));
   const model = buildCommunityDailyChartModel(series);
-  for (const point of model.outputPoints) {
+  for (const point of model.tokenPoints) {
     assert.equal(point.y, model.plot.bottom);
   }
 });

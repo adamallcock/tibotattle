@@ -10,7 +10,8 @@
 // Every rendering routine below is imported, not copied: the install card and
 // the community view are the same modules the in-app dashboard entry uses.
 
-import { PublicCommunityClient } from "./community-data.js";
+import { PublicCommunityClient, normalizeCommunityDailySeries } from "./community-data.js";
+import { createCommunityRefresh } from "./community-refresh.js";
 import {
   renderCommunityAllowanceSection,
   renderCommunityDailySeries,
@@ -56,12 +57,14 @@ const publicErrorCodePattern =
 const publicRequestIdPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 let lastCommunityDailyPayload = null;
+let lastCommunityAllowancePayload = null;
 let lastCommunityDailyFailure = null;
 let communityDailySettled = false;
 // The allowance range selection: 30 calendar days or null for the whole
 // published series. Re-rendering is purely client-side — the year window is
 // already fetched — so a range change never issues a request.
 let allowanceRangeDays = 30;
+let allowanceView = "aggregate";
 let allowanceDialogReturnFocus = null;
 const communityClient = new PublicCommunityClient();
 
@@ -420,6 +423,7 @@ function renderCommunityAllowanceResult(payload) {
     stateNode: $("#community-allowance-state"),
     payload,
     rangeDays: allowanceRangeDays,
+    view: allowanceView,
   });
   updateAllowanceDialogAvailability(state);
   if ($("#community-allowance-dialog")?.open) {
@@ -436,6 +440,7 @@ function renderCommunityAllowanceDialogResult(payload) {
     container,
     payload,
     rangeDays: allowanceRangeDays,
+    view: allowanceView,
   });
 }
 
@@ -448,12 +453,21 @@ function allowanceDialogSupported() {
 function updateAllowanceDialogAvailability(state) {
   const launcher = $("#community-allowance-expand");
   const dialog = $("#community-allowance-dialog");
+  // Empty/stale tabs stay inside an already-open dialog: users can switch back,
+  // and the close action retains its visible return-focus target.
+  if (dialog?.open) return;
   const available = state === "published" && allowanceDialogSupported();
   if (launcher) launcher.hidden = !available;
-  if (!available && dialog?.open) dialog.close();
 }
 
 function syncAllowanceRangeControls() {
+  for (const controls of document.querySelectorAll("[data-allowance-view-controls]")) {
+    for (const candidate of controls.querySelectorAll("button[data-allowance-view]")) {
+      const active = candidate.dataset.allowanceView === allowanceView;
+      candidate.classList.toggle("active", active);
+      candidate.setAttribute("aria-pressed", String(active));
+    }
+  }
   for (const controls of document.querySelectorAll("[data-allowance-range-controls]")) {
     for (const candidate of controls.querySelectorAll("button[data-range-days]")) {
       const candidateRange = candidate.dataset.rangeDays === ""
@@ -472,11 +486,23 @@ function selectAllowanceRange(value) {
   allowanceRangeDays = rangeDays;
   syncAllowanceRangeControls();
   if (communityDailySettled) {
-    renderCommunityAllowanceResult(lastCommunityDailyPayload);
+    renderCommunityAllowanceResult(lastCommunityAllowancePayload);
   }
 }
 
 function wireAllowanceRangeControls() {
+  for (const controls of document.querySelectorAll("[data-allowance-view-controls]")) {
+    if (controls.dataset.allowanceViewBound === "true") continue;
+    controls.dataset.allowanceViewBound = "true";
+    controls.addEventListener("click", (event) => {
+      const button = event.target?.closest?.("button[data-allowance-view]");
+      if (!button || !controls.contains(button)
+          || !["aggregate", "plans", "models"].includes(button.dataset.allowanceView)) return;
+      allowanceView = button.dataset.allowanceView;
+      syncAllowanceRangeControls();
+      if (communityDailySettled) renderCommunityAllowanceResult(lastCommunityAllowancePayload);
+    });
+  }
   for (const controls of document.querySelectorAll("[data-allowance-range-controls]")) {
     if (controls.dataset.allowanceRangeBound === "true") continue;
     controls.dataset.allowanceRangeBound = "true";
@@ -499,7 +525,7 @@ function wireAllowanceDialog() {
   }
   launcher.addEventListener("click", () => {
     if (!communityDailySettled || dialog.open) return;
-    renderCommunityAllowanceDialogResult(lastCommunityDailyPayload);
+    renderCommunityAllowanceDialogResult(lastCommunityAllowancePayload);
     syncAllowanceRangeControls();
     allowanceDialogReturnFocus = launcher;
     dialog.showModal();
@@ -524,8 +550,8 @@ function wireAllowanceDialog() {
   });
 }
 
-function renderCommunityDailyResult({ payload, failure = null }) {
-  renderCommunityAllowanceResult(payload);
+function renderCommunityDailyResult({ payload, failure = null, refreshAllowance = true }) {
+  if (refreshAllowance) renderCommunityAllowanceResult(lastCommunityAllowancePayload);
   const container = $("#community-daily-result");
   const state = renderCommunityDailySeries({
     documentRef: document,
@@ -553,21 +579,30 @@ function renderCommunityDailyResult({ payload, failure = null }) {
   return state;
 }
 
-async function loadCommunityDailySeries() {
-  let payload = null;
-  let failure = null;
-  try {
-    payload = await communityClient.communityDaily();
-  } catch (error) {
-    failure = error;
-  }
+function publishCommunityDailySeries({ payload, failure }) {
+  if (communityDailySettled && failure === null && lastCommunityDailyFailure === null
+      && JSON.stringify(payload) === JSON.stringify(lastCommunityDailyPayload)) return;
   // A null payload renders the fixed "service unavailable" state, which is
   // separate from a service that answered and has published nothing yet. Keep
   // the settled failure too so a language switch rerenders its safe copy.
+  const nextAllowance = selectCommunityAllowancePayload(
+    lastCommunityAllowancePayload, payload,
+  );
+  const refreshAllowance = !communityDailySettled || nextAllowance !== lastCommunityAllowancePayload;
   lastCommunityDailyPayload = payload;
+  lastCommunityAllowancePayload = nextAllowance;
   lastCommunityDailyFailure = failure;
   communityDailySettled = true;
-  renderCommunityDailyResult({ payload, failure });
+  renderCommunityDailyResult({ payload, failure, refreshAllowance });
+}
+
+// An activity-only fallback is not proof that the allowance was withdrawn.
+// Keep the two observations separate: no old activity/revision is copied into
+// a newer response, and the next confirmed empty/updating answer clears it.
+export function selectCommunityAllowancePayload(previous, payload) {
+  if (payload?.allowanceReadState === "temporarily_unavailable"
+      && ["published", "none_published"].includes(normalizeCommunityDailySeries(payload).state)) return previous;
+  return payload;
 }
 
 if (typeof document !== "undefined") {
@@ -579,7 +614,15 @@ if (typeof document !== "undefined") {
   wireInstallerChecksumCopy("intel-");
   wireAllowanceRangeControls();
   wireAllowanceDialog();
-  void loadCommunityDailySeries();
+  const refresh = createCommunityRefresh({
+    read: options => communityClient.communityDaily(options),
+    publish: publishCommunityDailySeries,
+    visible: () => document.visibilityState !== "hidden",
+  });
+  refresh.start();
+  document.addEventListener("visibilitychange", () => refresh.visibilityChanged());
+  window.addEventListener("pagehide", () => refresh.stop());
+  window.addEventListener("pageshow", () => refresh.start());
   window.addEventListener("tibotattle:locale-change", (event) => {
     setFormattingLocale(event.detail?.formatLocale ?? localization.formatLocale());
     setMessageLocale(event.detail?.locale ?? localization.locale());

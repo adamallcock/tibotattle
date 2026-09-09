@@ -17,6 +17,10 @@ import {
   ATTRIBUTION_SCHEMA_OBJECTS,
   ATTRIBUTION_SCHEMA_PROBE_SQL,
   attributionSchemaComplete,
+  SCALE_SCHEMA_COLUMNS,
+  SCALE_SCHEMA_OBJECTS,
+  SCALE_SCHEMA_PROBE_SQL,
+  scaleSchemaComplete,
   EXPECTED_STAGING_MIGRATIONS,
 } from "./staging-readiness-lib.mjs";
 
@@ -74,6 +78,7 @@ export const REQUIRED_SCHEMA_OBJECTS = Object.freeze([
   ["trigger", "community_aggregate_exclusion_no_delete"],
   ["trigger", "participants_identity_reenrollment_cooldown_guard"],
   ...ATTRIBUTION_SCHEMA_OBJECTS,
+  ...SCALE_SCHEMA_OBJECTS,
 ]);
 
 export const REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS = Object.freeze([
@@ -84,6 +89,7 @@ export const REQUIRED_DELETION_LEDGER_SCHEMA_OBJECTS = Object.freeze([
 ]);
 
 export const REQUIRED_COLUMNS = Object.freeze({
+  ...SCALE_SCHEMA_COLUMNS,
   participants: Object.freeze([
     "identity_link_key",
     "identity_cooldown_digest",
@@ -726,10 +732,21 @@ export async function runReleasePreflight({
         spawn,
         sql: ATTRIBUTION_SCHEMA_PROBE_SQL,
       });
+      const scaleRows = runQuery({
+        wrangler,
+        workerDirectory,
+        configPath,
+        stateDirectory,
+        binding: "USAGE_MONITOR_DB",
+        spawn,
+        sql: SCALE_SCHEMA_PROBE_SQL,
+      });
       receipt.checks.requiredSchemaPresent = objectsPresent
         && columnsPresent.every(Boolean)
         && Array.isArray(attributionRows) && attributionRows.length === 1
-        && attributionSchemaComplete(attributionRows[0]);
+        && attributionSchemaComplete(attributionRows[0])
+        && Array.isArray(scaleRows) && scaleRows.length === 1
+        && scaleSchemaComplete(scaleRows[0]);
       if (!receipt.checks.requiredSchemaPresent) {
         receipt.blockers.push("LOCAL_SCHEMA_INCOMPLETE");
       }

@@ -4,6 +4,132 @@
   "scope": "Executable and executable-adjacent sources under root scripts/** and tools/**, legacy root report builders and verifiers, and product contribution preparation.",
   "records": [
     {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/reconcile-release-publication.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release tooling entrypoint or private helper; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/release-publication.test.js",
+        "docs/runbooks/release-publication-reconciliation.md"
+      ],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/release-publication-reconciliation.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/release-qualification-inputs.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release tooling entrypoint or private helper; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qualify-release.mjs",
+        "test/release-qualification-inputs.test.js",
+        "docs/runbooks/release-qualification-admission.md"
+      ],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/release-qualification-admission.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/release-qualification-cache.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release tooling entrypoint or private helper; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/qualify-release.mjs",
+        "test/release-qualification-cache.test.js",
+        "docs/runbooks/release-qualification-admission.md"
+      ],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/release-qualification-admission.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/qualify-release.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit release tooling entrypoint or private helper; not a product command.",
+      "additionalAliases": [],
+      "callers": [
+        "test/release-qualification-cache.test.js",
+        "docs/runbooks/release-qualification-admission.md"
+      ],
+      "decision": "retain_as_reviewed_release_support",
+      "provenance": "docs/runbooks/release-qualification-admission.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/release-agent.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Explicit node entrypoint for read-only agent release doctor and private operation status.",
+      "additionalAliases": [],
+      "callers": [
+        "test/release-agent.test.js",
+        "docs/runbooks/agent-release-operations.md"
+      ],
+      "decision": "retain_as_read_only_release_entrypoint",
+      "provenance": "docs/runbooks/agent-release-operations.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/macos-release-journal.js",
+      "stableAlias": null,
+      "stableAliasReason": "Private phase coordinator called only through native finalization and synthetic tests.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/macos-release-core.js",
+        "test/macos-release-journal.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/agent-release-operations.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "macos_release",
+      "canonicalPath": "scripts/lib/release-operation.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Private operation durability and local mutex support; not a standalone command.",
+      "additionalAliases": [],
+      "callers": [
+        "scripts/macos-release-journal.js",
+        "scripts/macos-release-core.js",
+        "scripts/release-agent.mjs",
+        "apps/worker/scripts/production-deploy.mjs",
+        "apps/worker/scripts/production-deployment-lock.mjs",
+        "apps/worker/scripts/production-deploy.check.mjs",
+        "test/release-agent.test.js",
+        "test/macos-release-journal.test.js",
+        "test/release-operation.test.js",
+        "scripts/qualify-release.mjs",
+        "scripts/reconcile-release-publication.mjs",
+        "scripts/lib/release-qualification-cache.mjs",
+        "test/release-qualification-cache.test.js",
+        "test/release-publication.test.js"
+      ],
+      "decision": "retain_as_internal_release_support",
+      "provenance": "docs/runbooks/agent-release-operations.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
       "classification": "reusable_benchmark",
       "owner": "quota_research",
       "canonicalPath": "scripts/analyze-credit-drawdown.js",
@@ -201,7 +327,8 @@
       "callers": [
         "package.json#scripts.product:web-release:deploy",
         "test/web-release-lane.test.js",
-        "docs/runbooks/2026-08-17-web-only-release.md"
+        "docs/runbooks/2026-08-17-web-only-release.md",
+        "scripts/reconcile-release-publication.mjs"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
@@ -275,7 +402,8 @@
         "scripts/deploy-web-release.js",
         "scripts/prepare-web-release.js",
         "test/web-release-lane.test.js",
-        "docs/runbooks/2026-08-17-web-only-release.md"
+        "docs/runbooks/2026-08-17-web-only-release.md",
+        "scripts/reconcile-release-publication.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/runbooks/2026-08-17-web-only-release.md",
@@ -590,6 +718,7 @@
       "stableAliasReason": "Imported parser helper is not a command entry point.",
       "additionalAliases": [],
       "callers": [
+        "apps/worker/scripts/generate-admin-ui-assets.mjs",
         "scripts/benchmark-detailed-accounting.mjs",
         "scripts/build-local-review-artifact.js",
         "scripts/build-macos-app.js",
@@ -605,7 +734,8 @@
         "test/participant-identity-owner-boundary.test.js",
         "test/r7-release-evidence-schema.test.js",
         "test/reporting-owner-boundary.test.js",
-        "test/tool-inventory.test.js"
+        "test/tool-inventory.test.js",
+        "scripts/lib/release-qualification-inputs.mjs"
       ],
       "decision": "retain_as_internal_tooling_support",
       "provenance": null,
@@ -778,13 +908,15 @@
       "stableAliasReason": "Internal Apple bundle-version grammar, migration epoch, and comparator shared by macOS release tools; it is not a standalone command.",
       "additionalAliases": [],
       "callers": [
+        "scripts/release-agent.mjs",
         "scripts/build-macos-app.js",
         "scripts/generate-sparkle-appcast.js",
         "scripts/macos-release-core.js",
         "scripts/publish-sparkle-update.js",
         "scripts/sparkle-signed-feed-validation.js",
         "scripts/verify-macos-preview-remote.js",
-        "test/macos-app-bundle.test.js"
+        "test/macos-app-bundle.test.js",
+        "scripts/reconcile-release-publication.mjs"
       ],
       "decision": "retain_as_internal_release_support",
       "provenance": "docs/decisions/2026-08-27-local-state-schema-and-release-channel-isolation.md",
@@ -799,6 +931,8 @@
       "stableAliasReason": "Shared release module is imported by macOS release commands and tests, not invoked directly.",
       "additionalAliases": [],
       "callers": [
+        "scripts/release-agent.mjs",
+        "test/macos-release-journal.test.js",
         "scripts/build-macos-app.js",
         "scripts/validate-macos-replacement.js",
         "scripts/package-macos-dmg.js",
@@ -940,7 +1074,8 @@
         "test/macos-updater.test.js",
         "test/publish-sparkle-update.test.js",
         "test/release-channel-policy.test.js",
-        "test/sparkle-signed-feed-validation.test.js"
+        "test/sparkle-signed-feed-validation.test.js",
+        "scripts/reconcile-release-publication.mjs"
       ],
       "decision": "retain_and_relocate_after_inventory",
       "provenance": "docs/runbooks/macos-stable-release-runbook.md",
@@ -1689,7 +1824,9 @@
         "scripts/validate-release-sbom.mjs",
         "test/public-release-site.test.js",
         "test/release-attestation-action.test.js",
-        "test/release-evidence.test.js"
+        "test/release-evidence.test.js",
+        "test/release-publication.test.js",
+        "scripts/reconcile-release-publication.mjs"
       ],
       "decision": "retain_as_release_evidence_compatibility_facade",
       "provenance": null,

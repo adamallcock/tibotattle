@@ -1168,8 +1168,22 @@ describe("backend readiness and scheduled observability", () => {
     } finally {
       console.log = originalLog;
     }
-    expect(messages).toHaveLength(1);
-    expect(JSON.parse(messages[0]!)).toEqual({
+    const logs = messages.map(message => JSON.parse(message) as Record<string, unknown>);
+    expect(logs.map(log => log.event)).toEqual([
+      "admin_metrics_snapshot", "admin_metrics_history_cache", "scheduled_backend_maintenance",
+    ]);
+    for (const [index, event, code, phaseQueries] of [
+      [0, "admin_metrics_snapshot", "SNAPSHOT_CAPTURED", 5],
+      [1, "admin_metrics_history_cache", "HISTORY_CACHE_REFRESHED", 18],
+    ] as const) {
+      expect(logs[index]).toEqual({
+        level: "info", event, outcome: "success", code, phase: "after_analysis", phaseQueries,
+        queriesUsed: expect.any(Number), elapsedMs: expect.any(Number), deadlineRemainingMs: expect.any(Number),
+      });
+      expect(logs[index]!.elapsedMs).toBeGreaterThanOrEqual(0);
+      expect(logs[index]!.deadlineRemainingMs).toBeGreaterThanOrEqual(0);
+    }
+    expect(logs[2]).toEqual({
       level: "info",
       event: "scheduled_backend_maintenance",
       outcome: "success",

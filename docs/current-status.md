@@ -1,10 +1,10 @@
 ---
 title: Current product and release status
-date: 2026-09-05
+date: 2026-09-08
 type: status
 status: current
-source_commit: 55c813a1bf7e67c00e47410b760104c0d9fbc0ea
-observation_date: 2026-09-05
+source_commit: 32cd6317622c9aef9b7bf015b376b4cdb93c91fc
+observation_date: 2026-09-08
 ---
 
 # Current product and release status
@@ -47,7 +47,117 @@ store fields unset. GitHub's immutable release/asset attestations are not
 substitutes for SLSA build provenance. Follow
 [verify-release.md](./verify-release.md) for independent artifact verification.
 
-## Hosted service and current graph incident
+## Hosted service and community graphs
+
+### Current presentation and live-data availability
+
+The thousand-contributor calculator changes are deployed at
+`32cd6317622c9aef9b7bf015b376b4cdb93c91fc`, at 14:39:51 UTC on 2026-09-08.
+The owner-approved migrations 0054–0056 applied successfully. Exact schema
+checks and both migration ledgers passed, with no pending migrations. Normal
+guarded deployment, exact-source health, public asset checks and rendered
+public/admin views passed. See the
+[scale publication receipt](./receipts/2026-09-08-thousand-contributor-publication.md)
+and [local scale qualification](./reviews/2026-09-08-thousand-contributor-qualification.md).
+
+Current refreshes use a durable dirty-account queue; publication captures a
+finite cohort without restarting on ordinary new contributions. Admin source
+preparation reads transactionally maintained counters. Existing authorized
+graphs remain available during work. At 14:41 UTC, the admin showed 31 of 69
+historical days resolved and all 738 retained source days prepared. Historical
+work then advanced August 7 from 7 to 10 of 15 accounts in a successful natural
+refresh; unchanged current work was skipped and daily publication used one
+query. Backfill remains incomplete. Local qualification covers 1,000 contributors,
+not simultaneous production traffic or a fast initial-backfill SLA. Consent,
+retention, v1.1 activation and desktop distribution remain unchanged.
+
+### Earlier incremental-refresh deployment
+
+The hosted incremental-refresh repair and owner progress detail were deployed at
+`080142f65918b7abdd6e346332cbad42bcb31fbc`. The final guarded deployment completed
+at 02:52:46 UTC on 2026-09-08, following core deployment `2e3fbdc7` and reviewed
+forward migrations 0050–0053. Both migration ledgers have no pending migrations;
+health, exact public asset bytes, public-route isolation and live public/admin
+rendering passed. See the
+[publication receipt](./receipts/2026-09-08-incremental-refresh-publication.md).
+
+Authorized published graphs remain visible while ordinary uploads and accepted
+same-device corrections prepare a successor. Erasure, withdrawal, changed
+authority and policy invalidation still take effect immediately; temporary
+request failure does not masquerade as confirmed invalidation. There is no new
+"last good" label or age-only expiry. All allowance modes use one complete
+published snapshot, separate from daily activity.
+
+Historical work now reuses exact, prepared daily inputs across overlapping
+windows. Unaffected work can continue after unrelated contributions; unchanged
+current/daily lanes avoid raw reads, calculations and publication. Three natural
+core refreshes and a final-deployment refresh completed without exceptions,
+skipped unchanged current calculations and used one query for the daily lane.
+The final observed history pass used 225 queries in 17.027 seconds; the entire
+optional phase used 268 queries in 20.693 seconds, within the existing
+900-statement/40-second limits. This is bounded live evidence, not a throughput
+guarantee or a claim that all historical processing has finished.
+
+The owner Graph reconstruction panel independently shows requested/published
+generations, historical completion and reusable-source preparation. Live saved
+steps increased from 448 at 02:35 UTC to 2,048 at 03:00 UTC, while completed
+source days increased from 13 to 42. Historical completion still read 11 of 69
+days, with 14 of 15 accounts complete for August 27: preparation can advance
+before that account count changes. The original query-free progress contract
+remains compatible; the new detail is opt-in, owner-only and read-only. The
+user's selected refresh interval is preserved; 15 seconds is the request
+timeout, not the polling interval.
+
+The preserved public snapshot contains 69 allowance dates from July 1 through
+September 7. Identified GPT-5.5 and GPT-5.6 histories now cover August 28 through
+September 7; Astra covers September 5–7. Earlier backfill remains in progress,
+and unsupported or unstable estimates remain gaps. Public Aggregate, By plan
+and By model and the authenticated admin chart all render. Both 0.1.18 downloads,
+the architecture-selecting Homebrew cask, consent, retention and v1.1 staging
+remain unchanged. No desktop app was rebuilt or republished.
+
+Earlier milestones retain their dated boundaries in the
+[history repair](./receipts/2026-09-07-historical-model-progress.md),
+[initial incremental publication](./receipts/2026-09-07-incremental-graph-publication.md)
+and [scheduler recovery](./receipts/2026-09-07-cache-publisher-repair.md) receipts.
+
+### Earlier verified public graph state
+
+On 2026-09-07 the guarded deployment published
+`3f82d9aca1c5de73b63f929b61a3f0b5fa842cad`. Independent health, public response
+validation and rendered Chrome checks confirm Aggregate, By plan, and By model
+views on [the public website](https://tibotattle.com/), including Astra. Expanded
+and inline selections stay synchronized; all comparisons use the same Pro 20x
+weekly reference basis. Cards are ordered Astra, Sol, Terra, Luna, GPT-5.5 with
+compact shared-unit captions and matching restrained model themes. All-history
+dates fit the selected view's actual evidence, while dollar scales stay shared;
+dense markers are thinned without discarding inspection points and legends can
+focus one series. See the [presentation receipt](./receipts/2026-09-07-public-graph-polish.md)
+and the [original view deployment](./receipts/2026-09-07-public-allowance-views-deployment.md).
+
+The earlier inspected public cache supplied 69 closed-date breakdown rows. Identified
+GPT-5.5 and GPT-5.6 history covered September 2–6; Astra covered September 5–6.
+Read-only metadata confirms September 1 completed at 13:21:16 UTC, after the
+13:05:41 public snapshot; August 31 is next. Automatic backfill targets the
+rolling 70-day preview, not unlimited history; on September 7 the closed target
+is June 30–September 6. The historical observation above predates the dedicated
+history priority slot and prompt new-day refresh repair. Public response caching
+can still briefly delay visibility. Missing/unstable model estimates remain
+gaps. This establishes real
+public history and working views, not unlimited retrospective coverage or a
+provider-authoritative allowance. The owner explicitly approved small-sample
+dollar estimates and counts, including one account; the page explains the
+associated capacity-inference risk while excluding account identifiers and
+private admin diagnostics.
+
+The activity graph still measures all tokens. Its live spend card explicitly
+labels the priced portion: USD 100,671.8 across 279 of 318 shared days at this
+observation, not complete historical spend. Both 0.1.18 Mac downloads, exact
+asset bytes, private-route isolation and social-image metadata passed independent
+checks. No migrations, telemetry rewrites, consent changes, v1.1 activation,
+desktop rebuilds or updater changes accompanied this feature deployment.
+
+### Recovery history and retained qualification boundaries
 
 All approved forward migrations `0042`–`0045` are applied. Exact migration
 prefix 45, complete schema and the preservation reconciliation were verified
@@ -56,24 +166,91 @@ activating v1.1 transport. Applied migration files must not be rewritten.
 
 [PR #105](https://github.com/adamallcock/tibotattle/pull/105) repaired the
 authenticated admin module dependency and atomic weekly revision replacement.
-The website deployment is source
-`26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad`, whose tree matches that reviewed
-repair. Public downloads and the optional hosted analyzer have separate gates.
+Its merged source `26f372a7b3cb7dbf6885b8a75a0019d47d04c7ad` is the
+then-schema-compatible code rollback target, with both 0.1.18 website downloads.
+It is not a rollback target for the subsequently upgraded prepared-work protocol;
+current recovery requires the compatibility checks in the operations runbook.
+Public downloads and the optional hosted analyzer have separate gates.
 
-The remaining graph incident is a database memory-limit failure in quota
-endpoint sampling. The website truthfully displays history-updating status
-instead of an incomplete estimate. A bounded-memory query repair is being
-qualified separately from the frozen desktop release. Recovery requires
-successful scheduled rebuilding, a subsequent valid preview cache and a
-rendered live graph; health HTTP 200 alone is not sufficient.
+[PR #106](https://github.com/adamallcock/tibotattle/pull/106) deployed quota
+sampling source `39e35686480ec0c41a54f29ec42a469a80491fc5`. Its dense synthetic
+memory checks passed, but production exposed quadratic work on sparse quota
+partitions. Cloudflare reported database CPU exhaustion/reset (7429), and some
+public data and health requests returned 503. The earlier memory failure is
+not resolved by replacing it with this timeout.
+
+At 15:48 UTC on 2026-09-06, source
+`1a14a9efb443914b965a84dd1143b036178b10e0` deployed the narrowly scoped
+allowance-reconstruction pause. Normal pre/post health and source checks
+passed; the approved emergency health exception was not used. Natural
+scheduled runs completed essential maintenance without exceptions, and the
+authenticated Operations view recovered. The allowance graph was still a
+separate, unfinished recovery gate.
+
+The [restartable calculator replacement](./decisions/2026-09-06-hosted-calculator-recovery.md)
+deployed as `91171029fb5a16255502b380677fac27df18a70a`, with exact source
+confirmed at 19:00 UTC on 2026-09-06. Approved migrations `0046`–`0047` are
+applied and verified; the normal guarded deployment passed with no health
+exception. The lookup backfill had completed, and natural scheduled runs were
+advancing restartable calculations without exceptions at that observation. The
+authenticated Operations view loaded. The main allowance graph was unavailable
+while fresh caches and historical publications rebuilt: that receipt established
+deployment and progress, not completed graph recovery. See the
+[deployment receipt](./receipts/2026-09-06-hosted-calculator-deployment.md).
+
+The two root R7 evidence checks are stale after the shared-library change.
+They remain open for future desktop qualification, not a requirement of the
+maintained hosted deployment gate. The hosted repair neither reads private
+local usage history nor rebuilds the published desktop app.
+
+The requested [all-token detail and API-equivalent spend](./decisions/2026-09-06-community-detail-totals.md)
+are deployed. Live Chrome rendering confirms the all-token activity chart and
+replacement spend card. At 20:34 UTC on 2026-09-06, one published day had partial
+price data (USD 114.9153), while 316 published days still lacked repriced totals;
+the displayed partial amount is not the complete historical spend. Recovery preserves pricing and analytical
+refusal rules, with no historical telemetry rewrite or statistical-policy change.
+
+The scoped [admin progress and useful-work scheduling change](./plans/2026-09-06-admin-reconstruction-progress.md)
+deployed as `daa82a939020cb74ad5054c4ee7e6091019502be`, independently confirmed
+healthy at 21:11 UTC on 2026-09-06. The normal guarded deployment required no
+migrations or health exception. Live authenticated Chrome shows calculation
+phases and publication backlog even while the admin graph preview is unavailable:
+13 of 15 tracked account checkpoints acquired, one account preparing, one
+scanning, and 266 pending daily rebuilds. Current accounts no longer consume
+unfinished-work slots; concurrency, query limits and calculation budgets are
+unchanged. This closes progress visibility and useful-work scheduling, not the
+separate graph-recovery gate.
+
+The owner-approved [historical model reconstruction](./receipts/2026-09-07-model-allowance-history-deployment.md)
+deployed as `0207a3c1f728ae6682d4423cf31540f72cc4d19c` at 00:08:54 UTC on
+2026-09-07. Migration `0048` and the complete stored schema passed read-back;
+both migration ledgers have no pending source migrations. The normal guarded
+deployment and independent exact-source health checks passed, preserving source
+telemetry, consent and transport activation. This supersedes the older source
+observations above, not their point-in-time qualification boundaries.
+
+Live authenticated Chrome renders the per-model chart and its retrospective
+history explanation, including Astra's existing September 6 point. At the first
+observation, no earlier historical points had been produced: low-priority
+history selected September 5 but deferred behind current-day calculation. A
+later scheduled run was canceled without a recorded exception. Its ordinary
+maintenance lease expired and natural schedules resumed successfully; the
+00:38 UTC read confirmed no held lease and 11 complete current-account heads,
+with four still acquiring. No lease override was used. Historical checkpoint,
+day-publication and rendered-series verification were open at that observation.
+The public all-token activity chart then rendered 317 days and labeled USD
+101,954.04 as the priced portion across 262 of them; the separate public allowance
+graph reported that merged history was updating. The verified public graph state
+above supersedes those earlier availability and coverage observations.
 
 The existing dated social preview was temporarily retained to prioritize the
 verified 0.1.18 download rollout. Regenerate it from the recovered live estimate;
 do not describe that retained image as a new release preview.
 
 The admin per-model view supports the reviewed model catalog, including Astra
-and older model families. Source support does not establish that its live
-preview has recovered. Contribution consent and staged v1.1 activation remain
+and older model families. Its live preview is available at the observation
+above; that does not establish completed historical backfill. Contribution
+consent and staged v1.1 activation remain
 unchanged. The source health contract retains `participantDeletion: false`
 and `deletionSafeRestoreReplay: true`; these flags do not prove every route.
 
@@ -82,8 +259,10 @@ and `deletionSafeRestoreReplay: true`; these flags do not prove every route.
 - **Supported:** macOS 14+ Apple silicon and Intel through the published 0.1.18
   artifacts and their independent update feeds.
 - **Not released or supported:** Windows, Linux or Electron.
-- Homebrew selects Apple silicon or Intel with the same install command; both
-  DMGs also remain available through the website and GitHub release.
+- The live first-party Homebrew cask was rechecked on 2026-09-08: version 0.1.18
+  selects Apple silicon or Intel with each release's exact checksum. Both use
+  `brew install --cask adamallcock/tap/tibotattle`.
+  Both DMGs also remain available through the website and GitHub release.
 
 The owner explicitly accepted the unavailable disposable-profile/manual Login
 Item matrix and formal physical Intel install/runtime/update/upload evidence

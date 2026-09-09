@@ -9,7 +9,7 @@ function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-export type V1SourceScope = { participantId: string; fromDay?: string } | { day: string };
+export type V1SourceScope = { participantId: string; fromDay?: string; throughDay?: string } | { day: string };
 
 export interface V1SourceChunk {
   readonly id: string;
@@ -31,6 +31,15 @@ export interface V1WinningDevice {
   readonly evidence: "analytical" | "session_only";
 }
 
+export interface V1SourceDayDependency {
+  readonly participantId: string;
+  readonly day: string;
+  readonly deviceId: string;
+  readonly fingerprint: string;
+  readonly usageRecordCount: number;
+  readonly quotaRecordCount: number;
+}
+
 export interface V1SourcePin {
   readonly methodVersion: typeof V1_SOURCE_SELECTION_METHOD_VERSION;
   readonly scope: V1SourceScope;
@@ -39,6 +48,9 @@ export interface V1SourcePin {
   readonly fingerprint: string;
   readonly winners: readonly V1WinningDevice[];
   readonly winnersJson: string;
+  /** Requested only by the one-time historical checkpoint migration bridge. */
+  readonly legacyFingerprints?: Readonly<Record<string, string>>;
+  readonly dayDependencies?: readonly V1SourceDayDependency[];
 }
 
 /**
@@ -94,9 +106,43 @@ export function selectV1WinningDevices(chunks: readonly V1SourceChunk[]): V1Winn
     || compareText(left.observed_day, right.observed_day));
 }
 
+/** Shared elected-day identity for reusable quota/usage preparation. Transport
+ * revisions outside this day, and nonwinning devices, are not dependencies. */
+export async function selectV1SourceDayDependencies(chunks: readonly V1SourceChunk[]): Promise<readonly V1SourceDayDependency[]> {
+  const winners = selectV1WinningDevices(chunks);
+  const selected = new Map(winners.map(winner => [JSON.stringify([winner.participant_id, winner.observed_day]),
+    { winner, chunks: [] as V1SourceChunk[] }]));
+  for (const chunk of chunks) {
+    const day = selected.get(JSON.stringify([chunk.participant_id, chunk.chunk_day]));
+    if (day && chunk.device_id === day.winner.device_id && chunk.stream !== "session" && chunk.accepted_record_count > 0) day.chunks.push(chunk);
+  }
+  const result: V1SourceDayDependency[] = [];
+  for (const { winner, chunks: dayChunks } of selected.values()) {
+    dayChunks.sort((a, b) => compareText(a.stream, b.stream) || compareText(a.id, b.id));
+    result.push(Object.freeze({ participantId: winner.participant_id, day: winner.observed_day, deviceId: winner.device_id,
+      fingerprint: await sha256Hex(canonicalJson({ method: V1_SOURCE_SELECTION_METHOD_VERSION, winner, chunks: dayChunks })),
+      usageRecordCount: dayChunks.reduce((sum, chunk) => sum + (chunk.stream === "usage" ? chunk.accepted_record_count : 0), 0),
+      quotaRecordCount: dayChunks.reduce((sum, chunk) => sum + (chunk.stream === "quota" ? chunk.accepted_record_count : 0), 0) }));
+  }
+  return Object.freeze(result);
+}
+
 function sourceScope(scope: V1SourceScope): { sql: string; bindings: string[] } {
   if ("participantId" in scope) {
     if (!scope.participantId) throw new TypeError("v1 source participant scope required");
+    if (scope.throughDay !== undefined) {
+      const validDay = (day: unknown): day is string => typeof day === "string"
+        && /^\d{4}-\d{2}-\d{2}$/u.test(day)
+        && Number.isFinite(Date.parse(`${day}T00:00:00.000Z`))
+        && new Date(`${day}T00:00:00.000Z`).toISOString().slice(0, 10) === day;
+      if (!validDay(scope.fromDay) || !validDay(scope.throughDay) || scope.fromDay > scope.throughDay) {
+        throw new TypeError("v1 source historical range required");
+      }
+      // Scope the journal election as well as the record readers. A model or
+      // plan introduced after this day cannot enter its historical winner set.
+      return { sql: "c.participant_id = ? AND c.chunk_day >= ? AND c.chunk_day <= ?",
+        bindings: [scope.participantId, scope.fromDay, scope.throughDay] };
+    }
     return scope.fromDay === undefined
       ? { sql: "c.participant_id = ?", bindings: [scope.participantId] }
       : { sql: "c.participant_id = ? AND c.chunk_day >= ?", bindings: [scope.participantId, scope.fromDay] };
@@ -119,10 +165,14 @@ function sourceScope(scope: V1SourceScope): { sql: string; bindings: string[] } 
 export async function loadV1SourcePin(
   db: D1Database,
   scope: V1SourceScope,
-  options: { maxChunks?: number } = {},
+  options: { maxChunks?: number; legacyInputRevisions?: readonly number[]; includeDayDependencies?: boolean } = {},
 ): Promise<V1SourcePin> {
   const maxChunks = options.maxChunks ?? MAX_V1_SOURCE_CHUNKS;
   if (!Number.isSafeInteger(maxChunks) || maxChunks < 1) throw new TypeError("v1 source chunk cap invalid");
+  const legacyRevisions = options.legacyInputRevisions ?? [];
+  if (legacyRevisions.length > 2 || legacyRevisions.some(revision => !Number.isSafeInteger(revision) || revision < 0)) {
+    throw new TypeError("v1 legacy source revisions invalid");
+  }
   const where = sourceScope(scope);
   const epochStatement = "participantId" in scope
     ? db.prepare(`SELECT mutation_epoch, (SELECT revision FROM community_analytical_input_versions
@@ -159,16 +209,34 @@ export async function loadV1SourcePin(
     throw new Error("v1 source participant revision unavailable");
   }
   const winners = selectV1WinningDevices(chunks);
+  const historical = "participantId" in scope && scope.throughDay !== undefined;
+  const selectedDays = historical ? new Set(winners.map(winner =>
+    JSON.stringify([winner.participant_id, winner.observed_day, winner.device_id]))) : null;
+  const dependencyChunks = selectedDays ? chunks.filter(chunk => chunk.stream !== "session"
+    && selectedDays.has(JSON.stringify([chunk.participant_id, chunk.chunk_day, chunk.device_id]))) : chunks;
   const fingerprint = await sha256Hex(canonicalJson({
     // A different participant's upload must not invalidate this participant's
     // expensive fit. The global epoch is a publication fence, not cache input.
-    methodVersion: V1_SOURCE_SELECTION_METHOD_VERSION, scope, inputRevision, chunks, winners,
+    // A closed historical window also excludes OTHER DAYS from its dependency
+    // identity. Non-elected and session-only chunks are not analytical inputs;
+    // the winner identity still covers an actual session-only fallback change.
+    // inputRevision is still returned and must fence every promotion.
+    methodVersion: V1_SOURCE_SELECTION_METHOD_VERSION, scope,
+    ...(historical ? { dependency: "closed-window-1" } : { inputRevision }), chunks: dependencyChunks, winners,
   }));
+  const legacyFingerprints: Record<string, string> = {};
+  for (const revision of new Set(legacyRevisions)) {
+    legacyFingerprints[String(revision)] = await sha256Hex(canonicalJson({
+      methodVersion: V1_SOURCE_SELECTION_METHOD_VERSION, scope, inputRevision: revision, chunks, winners,
+    }));
+  }
   return Object.freeze({
     methodVersion: V1_SOURCE_SELECTION_METHOD_VERSION,
     scope: Object.freeze({ ...scope }), mutationEpoch, inputRevision, fingerprint,
     winners: Object.freeze(winners.map((winner) => Object.freeze(winner))),
     winnersJson: JSON.stringify(winners.map((winner) => [winner.participant_id, winner.observed_day, winner.device_id])),
+    ...(legacyRevisions.length ? { legacyFingerprints: Object.freeze(legacyFingerprints) } : {}),
+    ...(options.includeDayDependencies ? { dayDependencies: await selectV1SourceDayDependencies(chunks) } : {}),
   });
 }
 

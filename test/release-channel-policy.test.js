@@ -153,6 +153,10 @@ test("package and publisher CLIs require explicit named channel consent", () => 
   ]);
   assert.equal(dogfoodRelease.channel, INTERNAL_DOGFOOD_RELEASE_CHANNEL);
   assert.equal(dogfoodRelease.prepareCandidate, true);
+  assert.equal(dogfoodRelease.journalDirectory, `${dogfoodRelease.output}.operation`);
+  for (const flags of [["--resume", "--prepare-candidate"], ["--replace"], ["--journal", "/tmp/other-operation"]]) {
+    assert.throws(() => parseReleaseArguments(["--app", "TiboTattle.app", "--channel", INTERNAL_DOGFOOD_RELEASE_CHANNEL, ...flags]));
+  }
   const bootstrapRelease = parseReleaseArguments([
     "--app", "TiboTattle.app",
     "--channel", STABLE_RELEASE_CHANNEL,

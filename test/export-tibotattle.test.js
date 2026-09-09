@@ -53,6 +53,8 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     // index/archive modules in the reviewed runtime inventory while rollback
     // remains supported; this test makes both halves of that boundary explicit.
     for (const path of [
+      "scripts/lib/release-operation.mjs",
+      "scripts/macos-release-journal.js",
       "scripts/validate-macos-login-item-release.js",
       "src/local-cache-drop-thread-links.js",
       "src/platform/local-codex-thread-store.js",
@@ -60,6 +62,8 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
       "test/local-codex-thread-metadata.test.js",
       "apps/web/test/cache-drop-thread-links-client.test.mjs",
       "apps/web/test/cache-drop-thread-links-ui.test.mjs",
+      "apps/web/public/community-refresh.js",
+      "apps/web/test/community-refresh.test.mjs",
       "src/local-unified-accounting-source.js",
       "src/local-analysis-index.js",
       "src/local-archive-accounting-index.js",
@@ -85,7 +89,7 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     );
     assert.match(
       osvWorkflow,
-      /google\/osv-scanner-action\/\.github\/workflows\/osv-scanner-reusable\.yml@8deb546fdb875b9996d27d4950be7312dac076a1/u,
+      /google\/osv-scanner-action\/\.github\/workflows\/osv-scanner-reusable\.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67/u,
     );
 
     // The pinned reusable workflow declares actions:read + contents:read +

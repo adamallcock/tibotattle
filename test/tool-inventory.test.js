@@ -303,7 +303,7 @@ test("the checked-in inventory classifies every retained tool entry point and np
     true,
     formatToolInventoryReport(result),
   );
-  // 94 records / 96 executable paths: release-documentation, Codex contract,
+  // 102 records / 104 executable paths: release-documentation, Codex contract,
   // documentation governance, repository-layout, macOS bundle-version, and
   // local index-recovery gates are reviewed repository operations invoked by
   // CI, release runbooks, or supported internal product tooling.
@@ -311,8 +311,11 @@ test("the checked-in inventory classifies every retained tool entry point and np
   // decision.
   // Includes the reviewed exact-output accounting child benchmark and eight
   // protected PR94 qualification entrypoints/helpers; neither is a product API.
-  assert.equal(result.records, 94);
-  assert.equal(result.candidates.length, 96);
+  // Also includes the read-only release doctor and two private release helpers.
+  // Four further records own publication reconciliation and admission reuse.
+  // Main also contributes the reviewed purchased-credit drawdown analyzer.
+  assert.equal(result.records, 102);
+  assert.equal(result.candidates.length, 104);
   assert.ok(result.aliases >= 25);
 });
 
