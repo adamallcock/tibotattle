@@ -6,7 +6,7 @@ import { createReadStream } from "node:fs";
 import { createServer } from "node:https";
 import { lookup } from "node:dns/promises";
 import { chmod, copyFile, lstat, mkdir, readFile, readdir, readlink, rename } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertContainerContract, connectCdp, freeTcpPort, terminateLinuxSmokeChild } from "./smoke-electron-linux.mjs";
 import { createLinuxNormalPackagedSmokeFixture, normalPackagedSmokeEnvironment } from "./smoke-electron-linux-packaged.mjs";
@@ -85,17 +85,50 @@ async function connectPage(port, predicate) {
     return page ? connectCdp(page) : null;
   });
 }
+export function isOwnedLinuxUpdaterExecutable(value) {
+  return typeof value === "string" && resolve(value) === value
+    && value.startsWith(`${EXEC}/tmp/`) && basename(value) === "tibotattle";
+}
+async function processExecutable(pid) {
+  // /proc/environ is an initial process environment view, not an authority for
+  // AppImage runtime variables set later by a loader. Bind the executable in
+  // this test's private extraction mount instead. A proc link is preferred;
+  // the argv fallback is confined to those same owned, hash-checked bytes.
+  const args = (await readFile(`/proc/${pid}/cmdline`, "utf8")).split("\0");
+  if (args.some((arg) => arg.startsWith("--type="))) return null;
+  const executable = await readlink(`/proc/${pid}/exe`).catch(() => args[0]);
+  if (!isOwnedLinuxUpdaterExecutable(executable)) return null;
+  const stat = await lstat(executable);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== process.getuid()) return null;
+  return executable;
+}
 async function appPids(image) {
+  if (image !== join(EXEC, "TiboTattle.AppImage")) fail("ISOLATION_REQUIRED");
   const selected = [];
   for (const entry of await readdir("/proc")) {
     if (!/^\d+$/u.test(entry)) continue;
-    try {
-      const env = (await readFile(`/proc/${entry}/environ`, "utf8")).split("\0");
-      const args = (await readFile(`/proc/${entry}/cmdline`, "utf8")).split("\0");
-      if (env.includes(`APPIMAGE=${image}`) && !args.some((arg) => arg.startsWith("--type="))) selected.push(Number(entry));
-    } catch { /* Exited or unrelated process. */ }
+    try { if (await processExecutable(Number(entry))) selected.push(Number(entry)); }
+    catch { /* Exited or unrelated process. */ }
   }
   return selected;
+}
+async function processIdentityDiagnostics() {
+  const result = { executableLinksUnavailable: 0, productExecutables: 0, productExecutablesInsidePrivateMount: 0, productArgv: 0 };
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/u.test(entry)) continue;
+    try {
+      const args = (await readFile(`/proc/${entry}/cmdline`, "utf8")).split("\0");
+      if (args.some((arg) => arg.startsWith("--type="))) continue;
+      if (basename(args[0] ?? "") === "tibotattle") result.productArgv++;
+      const executable = await readlink(`/proc/${entry}/exe`).catch(() => null);
+      if (executable === null) { result.executableLinksUnavailable++; continue; }
+      if (basename(executable) === "tibotattle") {
+        result.productExecutables++;
+        if (isOwnedLinuxUpdaterExecutable(executable)) result.productExecutablesInsidePrivateMount++;
+      }
+    } catch {}
+  }
+  return result;
 }
 async function processHealth(pid) {
   // Read only socket identities for this process and its children; never
@@ -195,8 +228,11 @@ export async function runRealLinuxAppImageUpdater() {
         ? "document.querySelector('#settings-check-for-updates').click()"
         : "document.querySelector('#settings-download-update').click()"),
     });
+    stage = "current_process_identity";
     const oldPids = new Set(await appPids(image));
-    if (!oldPids.size) fail("CURRENT_PROCESS_MISSING");
+    if (!oldPids.size) { receipt.processIdentityDiagnostics = await processIdentityDiagnostics(); fail("CURRENT_PROCESS_MISSING"); }
+    const currentExecutable = await processExecutable([...oldPids][0]);
+    if (await digest(join(dirname(currentExecutable), "resources/app.asar")) !== pair.images.current.asarSha256) fail("CURRENT_ASAR_MISMATCH");
     stage = "update_install";
     await settings.evaluate("setTimeout(() => document.querySelector('#settings-install-update').click(), 25)");
     let checkedImageStamp;
@@ -213,7 +249,8 @@ export async function runRealLinuxAppImageUpdater() {
       const rows = await appPids(image);
       for (const pid of rows) {
         if (oldPids.has(pid)) continue;
-        try { const executable = await readlink(`/proc/${pid}/exe`);
+        try { const executable = await processExecutable(pid);
+          if (executable === null) continue;
           if (await digest(join(dirname(executable), "resources/app.asar")) !== pair.images.next.asarSha256) continue;
           if (await processHealth(pid)) return pid;
         } catch {}

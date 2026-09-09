@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { linuxUpdaterRehearsalVersions, linuxAppImageIdentity } from "../scripts/build-linux-updater-rehearsal.mjs";
-import { validateLinuxRealUpdaterPair, realUpdaterFeed, isLinuxUpdaterSettingsURL, prepareLinuxUpdaterDownload } from "../scripts/smoke-electron-linux-real-appimage-updater.mjs";
+import { validateLinuxRealUpdaterPair, realUpdaterFeed, isLinuxUpdaterSettingsURL, prepareLinuxUpdaterDownload, isOwnedLinuxUpdaterExecutable } from "../scripts/smoke-electron-linux-real-appimage-updater.mjs";
 import { readProductionDistribution } from "../apps/electron/main.js";
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 const revision = "a".repeat(40);
@@ -106,4 +106,11 @@ test("manual update path clicks each action once while automatic in-flight downl
   const result = await prepareLinuxUpdaterDownload({ readUpdate: async () => ++reads < 3 ? { status: "downloading" } : downloaded,
     automaticDownload: true, click: async () => assert.fail("automatic download already in progress") });
   assert.deepEqual(result, { check: "automatic", download: "automatic" });
+});
+
+test("AppImage process identity is confined to the private extraction mount", () => {
+  assert.equal(isOwnedLinuxUpdaterExecutable("/opt/tibotattle-updater-exec/tmp/appimage_extracted_abc/tibotattle"), true);
+  for (const path of ["/usr/bin/tibotattle", "/tmp/tibotattle", "/opt/tibotattle-updater-exec/tmp/../tibotattle", "/opt/tibotattle-updater-exec/tmp/appimage/chrome_crashpad_handler", "/opt/tibotattle-updater-exec/tmp/appimage/tibotattle --type=renderer"]) {
+    assert.equal(isOwnedLinuxUpdaterExecutable(path), false);
+  }
 });
