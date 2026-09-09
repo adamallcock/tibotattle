@@ -117,7 +117,7 @@ termination or login-item change. Private failures retain only fixed stage codes
 approval-pending, service-not-found and unknown service states remain distinct.
 Another running bundle with the same identity blocks preparation; the helper
 never terminates it by name or bundle identifier alone.
-the user-facing recovery message remains generic. Nonzero helper exits cannot
+The user-facing recovery message remains generic. Nonzero helper exits cannot
 be accepted as success, even when their output resembles a successful reply.
 
 After that result, the coordinator:

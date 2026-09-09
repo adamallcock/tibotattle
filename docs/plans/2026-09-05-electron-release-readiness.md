@@ -16,7 +16,7 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-08 (supersedes the historical entries below):
 
-Latest continuation checkpoint (source pushed through `1ff67d51`):
+Latest continuation checkpoint (Windows diagnostics integrated at `e9389f04`):
 
 - Linux targeted run [34288818674](https://github.com/adamallcock/tibotattle/actions/runs/34288818674)
   passed at `34087112`. Its normal packaged receipt verifies package execution,
@@ -43,8 +43,14 @@ Latest continuation checkpoint (source pushed through `1ff67d51`):
   writable state, Electron marker present. The test seeded the development
   override while ordinary settings selected `HOME/.codex`. The normal fixture
   and environment now match that actual default; 30 focused checks pass.
-  Targeted run `34292088445` verifies this at `1ff67d51`. The earlier full
-  `34290262917` NSIS installed lifecycle subsequently passed.
+  Targeted run `34292088445` at `1ff67d51` now passes startup acceptance,
+  confirming the source-discovery blocker is cleared, but fails refresh
+  completion. Its receipt confirms firewall removal and owned-profile cleanup.
+  Completion classifier failures now leave polling immediately and retain a
+  fixed phase/status/reason/controller-step diagnostic, including when cleanup
+  overrides the top-level error. The 28 focused tests pass; deadlines and
+  accepted terminal states are unchanged. The earlier full `34290262917` NSIS installed
+  lifecycle subsequently passed.
 - Corrected Mac `.5` arm64/x64 and `.6` arm64 from frozen `ba1e7cba` have complete
   signing, notarization and artifact receipts. `.6` x64 subsequently completed;
   all four final archives were independently hash-verified and preserved under
@@ -64,6 +70,18 @@ Latest continuation checkpoint (source pushed through `1ff67d51`):
   tests passing. Review caught and fixed acceptance of success JSON with a
   nonzero helper exit. ServiceManagement status categories are now separate;
   other same-identity writers block preparation without being terminated.
+  Frozen `2c70efa4` stages `.7/.8` for both architectures; 17 focused helper
+  checks and 38 staging/finalization checks pass. Root independently verified
+  clean source plus all eight receipt/wrapper hashes. `.7` arm64 is signed,
+  notarized and final-verified, with both archive hashes independently checked.
+  Installed read-only probe r6 passes bundle and initial login-item status
+  checks, then reports the closed failure stage `preferences`. The probe took
+  a full stopped-state backup and automatically restored native 0.1.18 with
+  verified state equality. No Electron GUI was launched and the existing `.5`
+  journal is unchanged. The prior r5 attempt stopped before bundle exchange
+  on its full-migration space reserve; r6 is a distinct read-only transaction
+  with a backup plus full-restore reserve. Full migration keeps its original
+  capacity guard. Legacy preference compatibility is the next concrete repair.
 - The signed staging scheduler remains unqualified. Source review confirms the
   unsigned hosted profile uses generic safeStorage; reusing the production native
   binary would share fixed production identity/services. Two unimplemented
@@ -76,9 +94,9 @@ Latest continuation checkpoint (source pushed through `1ff67d51`):
   account usage limit. No usage-reset credit was requested or consumed. The
   user approved continuation; privileged tools and both Mac investigation agents
   resumed. The Windows agent remained unavailable, so root implemented and
-  validated the quick-route observer fix directly. Mac read-only preparation
-  diagnostics and preference-validation ordering are being implemented before
-  another signed installed trial. No new trial has run yet.
+  validated the quick-route observer and default-source fixes directly. Mac
+  read-only preparation diagnostics and preference-validation ordering are now
+  implemented; installed verification remains open.
 
 - Hosted client qualification passed against isolated staging, including real
   enrollment, ownership, encrypted upload, activation, deliberately lost-response
