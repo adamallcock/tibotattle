@@ -29,6 +29,8 @@ import {
   installOutboundFirewallBlock,
   jsonFetch,
   localNetworkObserver,
+  inspectWindowsNormalCandidateStartupRefreshCompletion,
+  normalizeStartupCompletionDiagnostic,
   normalizeStartupFailureDiagnostic,
   removeOutboundFirewallBlock,
   parseWindowsNormalCandidateSmokeArguments,
@@ -40,6 +42,7 @@ import {
   inspectWindowsNormalCandidateStartupRefreshGate,
   observeWindowsNormalCandidatePreloadContexts,
   waitForWindowsNormalCandidateStartupRefreshGate,
+  waitForWindowsNormalCandidateStartupRefreshCompletion,
   seedWindowsNormalCandidateCodexFixture,
   selectWindowsNormalCandidateDashboardTarget,
   selectWindowsNormalCandidateSettingsTarget,
@@ -66,6 +69,109 @@ test("startup failure diagnostics retain only fixed categories and booleans", ()
     { ...value, requests: 42 }, { ...value, launch: "private" }]) {
     assert.equal(normalizeStartupFailureDiagnostic(changed), null);
   }
+});
+
+test("startup completion diagnostics retain fixed classifier and controller categories", () => {
+  const value = {
+    phase: "completion",
+    requestCount: "one",
+    refreshStatus: "failed",
+    classifierStatus: "failed",
+    classifierReason: "failed",
+    failedStep: "accounting",
+    controllerError: "refresh_resource_limited",
+  };
+  assert.deepEqual(normalizeStartupCompletionDiagnostic(value), value);
+  for (const changed of [
+    null,
+    { ...value, failureCode: "private" },
+    { ...value, failedStep: "private" },
+    { ...value, controllerError: "private" },
+    { ...value, classifierReason: "private" },
+    { ...value, classifierStatus: "pending" },
+    { ...value, requestCount: "zero" },
+  ]) {
+    assert.equal(normalizeStartupCompletionDiagnostic(changed), null);
+  }
+
+  const unknownController = inspectWindowsNormalCandidateStartupRefreshCompletion({
+    requestCount: 1,
+    refresh: {
+      status: "failed",
+      refreshId: "startup-refresh-id",
+      errorCode: "private_controller_detail",
+      failedStep: "private_step",
+      failureCode: "private_failure_code",
+    },
+    expectedRefreshId: "startup-refresh-id",
+  });
+  assert.equal(unknownController.decision.status, "failed");
+  assert.deepEqual(unknownController.diagnostic, {
+    phase: "completion",
+    requestCount: "one",
+    refreshStatus: "failed",
+    classifierStatus: "failed",
+    classifierReason: "failed",
+    failedStep: "other",
+    controllerError: "other",
+  });
+  assert.doesNotMatch(JSON.stringify(unknownController.diagnostic), /private/u);
+
+  const unknownStatus = inspectWindowsNormalCandidateStartupRefreshCompletion({
+    requestCount: 1,
+    refresh: { status: "not_observed", refreshId: "startup-refresh-id" },
+    expectedRefreshId: "startup-refresh-id",
+  });
+  assert.equal(unknownStatus.diagnostic.refreshStatus, "other");
+
+  const unavailable = inspectWindowsNormalCandidateStartupRefreshCompletion({
+    requestCount: 1,
+    expectedRefreshId: "startup-refresh-id",
+    unavailable: true,
+  });
+  assert.equal(unavailable.decision.status, "pending");
+  assert.deepEqual(unavailable.diagnostic, {
+    phase: "completion",
+    requestCount: "one",
+    refreshStatus: "unavailable",
+    classifierStatus: "pending",
+    classifierReason: "none",
+    failedStep: "none",
+    controllerError: "none",
+  });
+});
+
+test("normal candidate startup completion returns a failed classifier without waiting for a timeout", async () => {
+  let polls = 0;
+  await assert.rejects(waitForWindowsNormalCandidateStartupRefreshCompletion({
+    refreshCount: () => 1,
+    readRefresh: async () => ({
+      status: "failed",
+      refreshId: "startup-refresh-id",
+      errorCode: "refresh_resource_limited",
+      failedStep: "accounting",
+      failureCode: "private_failure_code",
+    }),
+    expectedRefreshId: "startup-refresh-id",
+    waitForPoll: async (operation) => {
+      polls += 1;
+      return operation();
+    },
+  }), (error) => {
+    assert.equal(error?.code, "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_LOCAL_STARTUP_REFRESH_COMPLETION_UNAVAILABLE");
+    assert.deepEqual(error?.startupCompletionDiagnostic, {
+      phase: "completion",
+      requestCount: "one",
+      refreshStatus: "failed",
+      classifierStatus: "failed",
+      classifierReason: "failed",
+      failedStep: "accounting",
+      controllerError: "refresh_resource_limited",
+    });
+    assert.doesNotMatch(JSON.stringify(error?.startupCompletionDiagnostic), /private/u);
+    return true;
+  });
+  assert.equal(polls, 1);
 });
 
 test("normal Windows refresh observer counts detailed and returning-profile quick requests", () => {
@@ -1143,6 +1249,15 @@ test("normal candidate runner retains the outbound block and profile when proces
   const startupDiagnostic = { launch: "first", requests: "zero", refreshStatus: "idle",
     onboarding: "ready", electronMarked: true, refreshDisabled: true,
     sourceReadable: true, rolloutPresent: true, stateWritable: true };
+  const startupCompletionDiagnostic = {
+    phase: "completion",
+    requestCount: "one",
+    refreshStatus: "failed",
+    classifierStatus: "failed",
+    classifierReason: "failed",
+    failedStep: "accounting",
+    controllerError: "refresh_resource_limited",
+  };
   let removedFirewall = false;
   let removedProfile = false;
   await assert.rejects(() => runWindowsNormalCandidateSmoke(smokeOptions(), {
@@ -1167,6 +1282,7 @@ test("normal candidate runner retains the outbound block and profile when proces
       throw Object.assign(new Error("dashboard"), {
         code: "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_DASHBOARD_UNAVAILABLE",
         startupDiagnostic,
+        startupCompletionDiagnostic,
       });
     },
     verifyOptOut: async () => true,
@@ -1182,6 +1298,7 @@ test("normal candidate runner retains the outbound block and profile when proces
   assert.equal(receipt.ownedProfileRemoved, false);
   assert.equal(receipt.errorCode, "ELECTRON_WINDOWS_NORMAL_CANDIDATE_SMOKE_OWNED_PROCESS_REMAINS");
   assert.deepEqual(receipt.startupDiagnostic, startupDiagnostic);
+  assert.deepEqual(receipt.startupCompletionDiagnostic, startupCompletionDiagnostic);
 });
 
 test("normal candidate refuses to launch before the outbound block is verified", async () => {

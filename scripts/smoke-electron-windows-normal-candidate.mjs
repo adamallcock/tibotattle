@@ -44,7 +44,10 @@ import {
   WINDOWS_ELECTRON_KEYTAR_RELATIVE_PATH,
   WINDOWS_NORMAL_CANDIDATE_APP_NAME,
 } from "./launch-electron-windows-development.mjs";
-import { classifyAutomaticStartupRefreshReceipt } from "./smoke-electron-linux.mjs";
+import {
+  classifyAutomaticStartupRefreshReceipt,
+  ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES,
+} from "./smoke-electron-linux.mjs";
 import {
   assertWindowsProcessTreeExited,
   buildWindowsExactExecutableProcessQueryArguments,
@@ -1727,6 +1730,182 @@ export function normalizeStartupFailureDiagnostic(value) {
     stateWritable: value.stateWritable });
 }
 
+const STARTUP_COMPLETION_REQUEST_COUNTS = new Set(["zero", "one", "multiple", "invalid"]);
+const STARTUP_COMPLETION_REFRESH_STATUSES = new Set([
+  "not_observed", "missing", "idle", "running", "succeeded", "degraded", "failed", "cancelled",
+  "other", "unavailable",
+]);
+const STARTUP_COMPLETION_OBSERVED_REFRESH_STATUSES = new Set([
+  "idle", "running", "succeeded", "degraded", "failed", "cancelled",
+]);
+const STARTUP_COMPLETION_CLASSIFIER_STATUSES = new Set(["pending", "completed", "failed"]);
+const STARTUP_COMPLETION_CLASSIFIER_REASONS = new Set([
+  "none", "duplicate", "invalid_receipt", "changed_receipt", "degraded_invalid", "failed", "cancelled", "other",
+]);
+const STARTUP_COMPLETION_FAILED_STEPS = new Set([
+  "none", "collector", "accounting", "archive_index", "unified_index", "assemble", "other",
+]);
+const STARTUP_COMPLETION_CONTROLLER_ERRORS = new Set([
+  "none", "refresh_failed", "refresh_resource_limited", "refresh_timed_out", "refresh_cancelled",
+  "refresh_degraded", "other",
+]);
+const STARTUP_COMPLETION_CLASSIFIER_REASON_BY_ERROR_CODE = new Map([
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.duplicate, "duplicate"],
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.invalidReceipt, "invalid_receipt"],
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.changedReceipt, "changed_receipt"],
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.degradedInvalid, "degraded_invalid"],
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.failed, "failed"],
+  [ELECTRON_LINUX_SMOKE_STARTUP_REFRESH_ERROR_CODES.cancelled, "cancelled"],
+]);
+
+function startupCompletionRequestCount(requestCount) {
+  if (!Number.isInteger(requestCount) || requestCount < 0) return "invalid";
+  return requestCount === 0 ? "zero" : requestCount === 1 ? "one" : "multiple";
+}
+
+function startupCompletionRefreshStatus({ requestCount, refresh, unavailable = false } = {}) {
+  const requestCountCategory = startupCompletionRequestCount(requestCount);
+  if (requestCountCategory === "zero") return "not_observed";
+  if (unavailable === true) return "unavailable";
+  if (refresh === null || refresh === undefined) return "missing";
+  return STARTUP_COMPLETION_OBSERVED_REFRESH_STATUSES.has(refresh?.status)
+    ? refresh.status
+    : "other";
+}
+
+function startupCompletionControllerError(refresh) {
+  if (refresh?.errorCode === null || refresh?.errorCode === undefined) return "none";
+  return STARTUP_COMPLETION_CONTROLLER_ERRORS.has(refresh.errorCode) ? refresh.errorCode : "other";
+}
+
+function startupCompletionFailedStep(refresh) {
+  if (refresh?.failedStep === null || refresh?.failedStep === undefined) return "none";
+  return STARTUP_COMPLETION_FAILED_STEPS.has(refresh.failedStep) ? refresh.failedStep : "other";
+}
+
+function startupCompletionClassifierReason(decision) {
+  if (decision?.status !== "failed") return "none";
+  return STARTUP_COMPLETION_CLASSIFIER_REASON_BY_ERROR_CODE.get(decision.errorCode) ?? "other";
+}
+
+/**
+ * Retain the completion boundary as fixed categories only. This deliberately
+ * excludes failureCode and all provider/controller text from the receipt.
+ */
+export function normalizeStartupCompletionDiagnostic(value) {
+  if (!exactObject(value) || Object.keys(value).length !== 7
+      || value.phase !== "completion"
+      || !STARTUP_COMPLETION_REQUEST_COUNTS.has(value.requestCount)
+      || !STARTUP_COMPLETION_REFRESH_STATUSES.has(value.refreshStatus)
+      || !STARTUP_COMPLETION_CLASSIFIER_STATUSES.has(value.classifierStatus)
+      || !STARTUP_COMPLETION_CLASSIFIER_REASONS.has(value.classifierReason)
+      || !STARTUP_COMPLETION_FAILED_STEPS.has(value.failedStep)
+      || !STARTUP_COMPLETION_CONTROLLER_ERRORS.has(value.controllerError)
+      || value.requestCount === "zero" && value.refreshStatus !== "not_observed"
+      || value.requestCount !== "zero" && value.refreshStatus === "not_observed"
+      || value.classifierStatus === "failed" && value.classifierReason === "none"
+      || value.classifierStatus !== "failed" && value.classifierReason !== "none") return null;
+  return Object.freeze({
+    phase: value.phase,
+    requestCount: value.requestCount,
+    refreshStatus: value.refreshStatus,
+    classifierStatus: value.classifierStatus,
+    classifierReason: value.classifierReason,
+    failedStep: value.failedStep,
+    controllerError: value.controllerError,
+  });
+}
+
+/**
+ * Classify one completion observation and project only fixed receipt fields.
+ * A loopback read failure is still a bounded pending condition; malformed
+ * successful reads remain classifier failures.
+ */
+export function inspectWindowsNormalCandidateStartupRefreshCompletion({
+  requestCount,
+  refresh = null,
+  expectedRefreshId = null,
+  unavailable = false,
+} = {}) {
+  const decision = unavailable === true
+    ? Object.freeze({ status: "pending" })
+    : classifyAutomaticStartupRefreshReceipt({
+      phase: "completion",
+      requestCount,
+      refresh,
+      expectedRefreshId,
+    });
+  const diagnostic = normalizeStartupCompletionDiagnostic({
+    phase: "completion",
+    requestCount: startupCompletionRequestCount(requestCount),
+    refreshStatus: startupCompletionRefreshStatus({ requestCount, refresh, unavailable }),
+    classifierStatus: STARTUP_COMPLETION_CLASSIFIER_STATUSES.has(decision.status)
+      ? decision.status
+      : "failed",
+    classifierReason: startupCompletionClassifierReason(decision),
+    failedStep: startupCompletionFailedStep(refresh),
+    controllerError: startupCompletionControllerError(refresh),
+  });
+  return Object.freeze({ decision, diagnostic });
+}
+
+function startupCompletionFailure(diagnostic) {
+  const error = failure("LOCAL_STARTUP_REFRESH_COMPLETION_UNAVAILABLE");
+  const selected = normalizeStartupCompletionDiagnostic(diagnostic);
+  if (selected !== null) error.startupCompletionDiagnostic = selected;
+  return error;
+}
+
+/**
+ * Poll the startup completion receipt without allowing a failed classifier
+ * result to be swallowed by the generic retry helper.
+ */
+export async function waitForWindowsNormalCandidateStartupRefreshCompletion({
+  refreshCount,
+  readRefresh,
+  expectedRefreshId,
+  waitForPoll = waitFor,
+  timeoutMs = STARTUP_TIMEOUT_MS,
+} = {}) {
+  let diagnostic = normalizeStartupCompletionDiagnostic({
+    phase: "completion",
+    requestCount: "invalid",
+    refreshStatus: "missing",
+    classifierStatus: "pending",
+    classifierReason: "none",
+    failedStep: "none",
+    controllerError: "none",
+  });
+  const terminal = await waitForPoll(async () => {
+    const requestCount = refreshCount();
+    if (requestCount !== 1) {
+      const observed = inspectWindowsNormalCandidateStartupRefreshCompletion({
+        requestCount,
+        expectedRefreshId,
+      });
+      diagnostic = observed.diagnostic;
+      return observed.decision.status === "pending" ? null : observed;
+    }
+    let refresh = null;
+    let unavailable = false;
+    try {
+      refresh = await readRefresh();
+    } catch {
+      unavailable = true;
+    }
+    const observed = inspectWindowsNormalCandidateStartupRefreshCompletion({
+      requestCount,
+      refresh,
+      expectedRefreshId,
+      unavailable,
+    });
+    diagnostic = observed.diagnostic;
+    return observed.decision.status === "pending" ? null : observed;
+  }, timeoutMs);
+  if (terminal?.decision?.status !== "completed") throw startupCompletionFailure(diagnostic);
+  return terminal.decision;
+}
+
 async function assertDashboard({ cdp, target, fetchImpl, launch }) {
   const dashboard = exactLoopbackRootPage(target.url);
   if (dashboard === null) fail("DASHBOARD_INVALID");
@@ -1799,17 +1978,11 @@ async function assertDashboard({ cdp, target, fetchImpl, launch }) {
         code: `${PREFIX}LOCAL_STARTUP_REFRESH_UNAVAILABLE`, startupDiagnostic: diagnostic,
       });
     }
-    const terminal = await waitFor(async () => {
-      if (observer.refreshCount() > 1) fail("DASHBOARD_INVALID");
-      const decision = classifyAutomaticStartupRefreshReceipt({
-        phase: "completion",
-        requestCount: observer.refreshCount(),
-        refresh: (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
-        expectedRefreshId: accepted.refreshId,
-      });
-      return decision.status === "completed" ? decision : null;
-    }, STARTUP_TIMEOUT_MS);
-    if (terminal === null) fail("LOCAL_STARTUP_REFRESH_COMPLETION_UNAVAILABLE");
+    const terminal = await waitForWindowsNormalCandidateStartupRefreshCompletion({
+      refreshCount: () => observer.refreshCount(),
+      readRefresh: async () => (await jsonFetch(refreshEndpoint, { fetchImpl }))?.refresh,
+      expectedRefreshId: accepted.refreshId,
+    });
     // The startup pass is terminal now, so ordinary user interaction must be
     // restored. Reset the observer only after preserving that proof: the next
     // one local POST is the user-requested detailed refresh, not a duplicate
@@ -2165,7 +2338,15 @@ async function ensureWindowsNormalCandidateReceiptParent(receiptPath) {
   return parent;
 }
 
-function candidateReceipt({ sourceRevision, identity = null, journey = null, errorCode = null, cleanup = {}, startupDiagnostic = null } = {}) {
+function candidateReceipt({
+  sourceRevision,
+  identity = null,
+  journey = null,
+  errorCode = null,
+  cleanup = {},
+  startupDiagnostic = null,
+  startupCompletionDiagnostic = null,
+} = {}) {
   return Object.freeze({
     schemaVersion: RECEIPT_SCHEMA,
     status: errorCode === null ? "passed" : "failed",
@@ -2190,6 +2371,9 @@ function candidateReceipt({ sourceRevision, identity = null, journey = null, err
     errorCode,
     ...(normalizeStartupFailureDiagnostic(startupDiagnostic) === null ? {} : {
       startupDiagnostic: normalizeStartupFailureDiagnostic(startupDiagnostic),
+    }),
+    ...(normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic) === null ? {} : {
+      startupCompletionDiagnostic: normalizeStartupCompletionDiagnostic(startupCompletionDiagnostic),
     }),
     productionReady: false,
   });
@@ -2242,6 +2426,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
   let journey = null;
   let errorCode = null;
   let startupDiagnostic = null;
+  let startupCompletionDiagnostic = null;
   const cleanup = { firewallInstalled: false, firewallRemoved: false, profileRemoved: false };
   const candidateState = { quiescent: false, tracked: null };
   try {
@@ -2290,6 +2475,9 @@ export async function runWindowsNormalCandidateSmoke(options, {
   } catch (error) {
     errorCode = fixedCode(error);
     startupDiagnostic = normalizeStartupFailureDiagnostic(error?.startupDiagnostic);
+    startupCompletionDiagnostic = normalizeStartupCompletionDiagnostic(
+      error?.startupCompletionDiagnostic,
+    );
   } finally {
     if (firewallName !== null && candidateState.quiescent === true) {
       cleanup.firewallRemoved = await removeFirewall({
@@ -2317,6 +2505,7 @@ export async function runWindowsNormalCandidateSmoke(options, {
       errorCode,
       cleanup,
       startupDiagnostic,
+      startupCompletionDiagnostic,
     });
     try {
       await receiptHandle.writeFile(`${JSON.stringify(receipt, null, 2)}\n`);
