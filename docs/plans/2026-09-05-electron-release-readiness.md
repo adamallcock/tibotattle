@@ -128,7 +128,15 @@ Latest continuation, 2026-09-09:
   remains unverified; the wrapper records uninstall/cleanup false after handing
   process ownership to the normal runner. That runner separately confirms its
   owned profile and firewall rule were removed. No timeout or acceptance threshold
-  is relaxed. The broader lifecycle correction is
+  is relaxed. Closed startup diagnostics at `1c8548ae` passed 38 focused tests
+  and independent review. Signed run
+  [34399486986](https://github.com/adamallcock/tibotattle/actions/runs/34399486986),
+  build `2026090933`, has passed signing and final installer verification and
+  failed its installed journey at the same CDP gate. Its closed diagnostic shows
+  the child alive, loopback transport unavailable, and the entry-failure marker
+  absent. A bounded owned-PID native-dialog probe is being prepared to distinguish
+  pre-entry loader failure from a listener stall; no cause is yet proven.
+  The broader lifecycle correction is
   committed separately as `72f357e2`. Five tests against a fresh isolated
   installation of the patched builder pass, including once-only emission after
   deferred final signing and no emission after failure/cancellation. It was not
@@ -196,9 +204,24 @@ a 500-statement gap passed; restoring it after the gap failed and fully rolled
 back. All owned probe tables were removed. This reproduces gap-sensitive deferred
 foreign-key behavior without claiming an undocumented batch size. The unchanged
 file-import route is unsuitable for 0058; no further unchanged retry is planned.
-The next engineering step is bounded local storage and transaction timing at
-roughly production size, followed by admission of the normal transaction route
-or a reviewed migration redesign. No production operation occurred.
+The fixed local 5 GiB stress profile at `565364a7` passed 33 focused tests and
+independent review. Its first attempt stopped safely when the sandbox denied
+process-memory observation. The same source/limits with that observation enabled
+then reached 5 GiB but failed during the 0058 interruption pass with a classified
+resource-ceiling error. Sampled peak scratch was 9,970,833,041 bytes and combined
+RSS 287,047,680 bytes; termination and exact owned scratch absence were verified.
+The receipt groups SQLite full/memory and configured resource failures, so it does
+not assert the exact SQLite error class or production allocation. The unchanged
+migration is unqualified on this synthetic distribution. A small local proof
+of children-first evacuation and parent-first restoration then passed: 52 committed
+batches of at most three rows, reopened/FK-checked after every commit, two injected
+interruption rollbacks, unchanged 0058 and ledger exactly once, preserved original
+rows and final all-table data/schema matching the canonical control. It took
+478 ms with 75,857,920-byte peak RSS. Its required exclusive maintenance fence
+and trustworthy in-flight drain are not implemented. Existing controls do not
+cover every write, and an old ingest error handler can perform R2 cleanup after
+reading a temporarily empty table, so a database write barrier alone is
+insufficient. No production operation occurred.
 Updated public privacy,
 Docs and translated homepage copy are prepared and locally verified, not deployed.
 Production accountless modes remain disabled in source.
