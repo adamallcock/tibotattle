@@ -45,6 +45,7 @@ test("desktop contract freezes the exact bridge action and enum vocabulary", () 
     "setRefreshInterval",
     "setStartAtLogin",
     "setNotificationPreferences",
+    "sendTestNotification",
     "openSystemSettings",
     "openExternal",
     "openHostedSignIn",
@@ -341,4 +342,14 @@ test("v1 scalar migration creates one stable v2 root and path-free projection", 
   assert.equal(scalar.schemaVersion, DESKTOP_SETTINGS_SCHEMA_VERSION);
   assert.equal(scalar.language, "system");
   assert.equal(scalar.codexHomes.activityRoots[0].kind, "custom");
+});
+
+
+test("test notification accepts no renderer content", () => {
+  assert.deepEqual(createDesktopRequest("sendTestNotification", {}), {
+    action: "sendTestNotification", args: {},
+  });
+  for (const args of [{ body: "text" }, { title: "title" }, { enabled: true }, { url: "https://example.com" }]) {
+    assert.throws(() => createDesktopRequest("sendTestNotification", args), TypeError);
+  }
 });

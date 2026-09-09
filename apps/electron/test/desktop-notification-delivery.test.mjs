@@ -242,3 +242,30 @@ test("invalid semantic input is rejected before capability or native delivery", 
   assert.equal(fake.state.constructorCalls.length, 0);
   assert.equal(fake.state.showCalls, 0);
 });
+
+
+test("test delivery uses the native adapter with fixed localized copy and unchanged gates", () => {
+  for (const [locale, title] of [
+    ["en-US", "TiboTattle test notification"],
+    ["zh-Hans", "TiboTattle 测试通知"],
+    ["es", "Notificación de prueba de TiboTattle"],
+  ]) {
+    const { Notification, state } = fakeNotification();
+    const delivery = createDesktopNotificationDelivery({ Notification, app: PACKAGED_APP, platform: "linux", locale });
+    assert.deepEqual(delivery.sendTest(), { status: "delivered" });
+    assert.equal(state.constructorCalls[0].title, title);
+    assert.equal(state.showCalls, 1);
+    assert.throws(() => delivery.sendTest({ body: "arbitrary" }), TypeError);
+    assert.equal(state.showCalls, 1);
+  }
+  for (const [app, platform, expected] of [
+    [{ isPackaged: false }, "linux", "not_packaged"],
+    [PACKAGED_APP, "win32", "windows_identity_unavailable"],
+  ]) {
+    const { Notification, state } = fakeNotification();
+    assert.equal(createDesktopNotificationDelivery({ Notification, app, platform }).sendTest().status, expected);
+    assert.equal(state.showCalls, 0);
+  }
+  const { Notification } = fakeNotification({ showError: new Error("native failure") });
+  assert.equal(createDesktopNotificationDelivery({ Notification, app: PACKAGED_APP, platform: "darwin" }).sendTest().status, "native_error");
+});

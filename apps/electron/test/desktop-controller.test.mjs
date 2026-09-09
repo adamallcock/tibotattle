@@ -1047,3 +1047,24 @@ test("tray customization applies only after persistence and leaves collection, n
   assert.deepEqual(restored.settings.tray, DESKTOP_DEFAULT_SETTINGS.tray);
   await value.controller.handlers.openTraySettings(); assert.equal(value.settingsWindows.at(-1), "tray");
 });
+
+
+test("manual notification test preserves settings and coordinator policy and bounds repeat requests", async () => {
+  let calls = 0;
+  let now = 1_000;
+  const value = fixture({
+    clock: () => now,
+    actionOverrides: { notificationDelivery: { sendTest() { calls++; return { status: "delivered" }; } } },
+  });
+  const before = await value.controller.handlers.getSettings({});
+  assert.deepEqual(await value.controller.handlers.sendTestNotification({}), { status: "requested" });
+  assert.deepEqual(await value.controller.handlers.getSettings({}), before);
+  await assert.rejects(value.controller.handlers.sendTestNotification({}), { code: "desktop_notification_test_rate_limited" });
+  assert.equal(calls, 1);
+  now += 5_000;
+  await value.controller.handlers.sendTestNotification({});
+  assert.equal(calls, 2);
+  const unsupported = fixture({ actionOverrides: { notificationDelivery: { sendTest: () => ({ status: "unsupported" }) } } });
+  await assert.rejects(unsupported.controller.handlers.sendTestNotification({}), { code: "desktop_notifications_unavailable" });
+  await assert.rejects(fixture().controller.handlers.sendTestNotification({}), { code: "desktop_notifications_unavailable" });
+});

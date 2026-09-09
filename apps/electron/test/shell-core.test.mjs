@@ -4544,6 +4544,7 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "setAppearance",
     "setRefreshInterval",
     "setStartAtLogin",
+    "sendTestNotification",
     "setNotificationPreferences",
     "openSystemSettings",
     "openExternal",
@@ -4560,6 +4561,11 @@ test("preload exposes only the exact frozen v1 desktop bridge allowlist", async 
     "refreshSettled",
   ]);
   assert.equal(bridge.version, "v1");
+  await assert.rejects(bridge.sendTestNotification({ body: "arbitrary" }));
+  await bridge.sendTestNotification();
+  assert.deepEqual(JSON.parse(JSON.stringify(calls.pop())), {
+    channel: "tibotattle:desktop:v1", request: { action: "sendTestNotification", args: {} },
+  });
   const commands = [];
   const unsubscribe = bridge.onCommand((command) => commands.push(command));
   assert.equal(typeof unsubscribe, "function");

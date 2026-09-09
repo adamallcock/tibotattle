@@ -553,6 +553,7 @@ test("Settings asks Electron for notification permission before opening system s
     "#settings-open-login-items", "#settings-refresh-login-status",
     "#settings-notifications-enabled", "#settings-notifications-detail",
     "#settings-notification-status", "#settings-open-notification-settings",
+    "#settings-test-notification", "#settings-notification-test-status",
     "#settings-automatic-updates", "#settings-check-for-updates",
     "#settings-download-update", "#settings-install-update",
     "#settings-open-dashboard-browser", "#settings-show-diagnostics",
@@ -567,6 +568,8 @@ test("Settings asks Electron for notification permission before opening system s
     querySelectorAll() { return []; },
   };
   const opened = [];
+  let testCalls = 0;
+  let testFails = false;
   const bridge = {
     version: "v1",
     getSettings: async () => ({
@@ -587,6 +590,11 @@ test("Settings asks Electron for notification permission before opening system s
       about: { version: "0.1.18", build: "test", update: {}, automaticUpdates: {} },
     }),
     openSystemSettings: async (target) => opened.push(target),
+    sendTestNotification: async () => {
+      testCalls++;
+      if (testFails) throw new Error("unavailable");
+      return { status: "requested" };
+    },
   };
   let permission = "default";
   let requests = 0;
@@ -603,6 +611,17 @@ test("Settings asks Electron for notification permission before opening system s
     },
   };
   const mounted = await mountSettingsPage({ documentRef, windowRef, bridge });
+  const testButton = elements.get("#settings-test-notification");
+  assert.equal(testButton.disabled, false);
+  testButton.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(testCalls, 1);
+  assert.equal(elements.get("#settings-notifications-enabled").checked, false);
+  assert.match(elements.get("#settings-notification-test-status").textContent, /Test requested/u);
+  testFails = true;
+  testButton.click();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(elements.get("#settings-notification-test-status").textContent, /could not be sent/u);
   const permissionButton = elements.get("#settings-open-notification-settings");
   assert.equal(permissionButton.textContent, "Allow Notifications");
   permissionButton.click();

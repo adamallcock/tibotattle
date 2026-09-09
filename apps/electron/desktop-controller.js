@@ -322,6 +322,7 @@ export function createDesktopController({
   platformServices,
   desktopPlatform = process.platform,
   notificationCoordinator,
+  notificationDelivery,
   getLifecycle = () => null,
   applyCodexHome = async () => {},
   applyCodexHomes,
@@ -383,6 +384,9 @@ export function createDesktopController({
   const coordinator = notificationCoordinator === undefined
     ? createUnavailableNotificationCoordinator()
     : assertPort(notificationCoordinator, ["initialize", "status", "setPreferences"], "notificationCoordinator");
+  const testDelivery = notificationDelivery === undefined ? null
+    : assertPort(notificationDelivery, ["sendTest"], "notificationDelivery");
+  let lastNotificationTestAt = null;
   const sharing = sharingCoordinator === undefined ? null
     : assertPort(sharingCoordinator, ["inspect", "setEnabled", "markNoticePresented"], "sharingCoordinator");
   function requireSharing() {
@@ -1215,6 +1219,19 @@ export function createDesktopController({
           throw controllerError("desktop_start_at_login_persistence_failed");
         }
         return snapshot();
+      });
+    },
+    async sendTestNotification() {
+      return enqueue(async () => {
+        if (testDelivery === null) throw controllerError("desktop_notifications_unavailable");
+        const now = clock();
+        if (lastNotificationTestAt !== null && now - lastNotificationTestAt < 5_000) {
+          throw controllerError("desktop_notification_test_rate_limited");
+        }
+        lastNotificationTestAt = now;
+        const result = await testDelivery.sendTest();
+        if (result?.status !== "delivered") throw controllerError("desktop_notifications_unavailable");
+        return Object.freeze({ status: "requested" });
       });
     },
     async setNotificationPreferences({ enabled, threshold }) {

@@ -102,6 +102,16 @@ const DESKTOP_MESSAGES = Object.freeze({
     "zh-Hans": "退出",
     es: "Salir",
   }),
+  "electron.notification.test.title": Object.freeze({
+    "en-US": "TiboTattle test notification",
+    "zh-Hans": "TiboTattle 测试通知",
+    es: "Notificación de prueba de TiboTattle",
+  }),
+  "electron.notification.test.body": Object.freeze({
+    "en-US": "This is a local notification test. Your alert settings and usage history have not changed.",
+    "zh-Hans": "这是一条本地测试通知。提醒设置和用量历史均未改变。",
+    es: "Esta es una prueba de notificación local. La configuración de alertas y el historial de uso no han cambiado.",
+  }),
   "electron.notification.threshold80.title": Object.freeze({
     "en-US": "Quota usage reached 80%",
     "zh-Hans": "配额使用量已达到 80%",

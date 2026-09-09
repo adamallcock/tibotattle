@@ -10,7 +10,7 @@ import { desktopText } from "./desktop-copy.js";
  * The policy owns evidence, thresholds, reset precedence, and duplicate
  * suppression. This adapter deliberately accepts only its small frozen
  * semantic notification value. It never accepts a body, title, provider,
- * account, path, identity, or renderer request. The platform capability gate
+ * account, path, identity, or renderer-supplied copy. A separate no-argument test action uses fixed copy. The platform capability gate
  * is explicit so a development build cannot claim that it can deliver an
  * alert merely because Electron exposes a Notification constructor.
  */
@@ -136,9 +136,8 @@ function capabilityStatus({ Notification, app, platform, windowsIdentityReady })
   // identity. Keep this gate before probing the native constructor.
   if (app?.isPackaged !== true) return fixedStatus("not_packaged");
   if (platform === "win32" && windowsIdentityReady !== true) {
-    // Windows requires the packaged Start Menu shortcut/AppUserModelID and
-    // matching ToastActivatorCLSID. The parent runtime must set this flag
-    // only after those production identity prerequisites are verified.
+    // The runtime verifies the installed Start Menu target and AppUserModelID,
+    // then supplies the fixed toast activator identity before enabling this port.
     return fixedStatus("windows_identity_unavailable");
   }
   let supported;
@@ -188,14 +187,13 @@ export function createDesktopNotificationDelivery(options = {}) {
     return capability;
   }
 
-  function deliver(value) {
-    const notification = validateDesktopNotificationToDeliver(value);
+  function showCopy(copyFactory) {
     const capability = status();
     if (capability.status !== "ready") return capability;
 
     let copy;
     try {
-      copy = copyForNotification(notification, textOptions);
+      copy = copyFactory();
       const nativeNotification = new Notification(copy);
       if (nativeNotification === null
           || typeof nativeNotification !== "object"
@@ -212,8 +210,22 @@ export function createDesktopNotificationDelivery(options = {}) {
     return fixedStatus("delivered");
   }
 
+  function deliver(value) {
+    const notification = validateDesktopNotificationToDeliver(value);
+    return showCopy(() => copyForNotification(notification, textOptions));
+  }
+
+  function sendTest(...args) {
+    if (args.length !== 0) throw new TypeError("test notification accepts no arguments");
+    return showCopy(() => Object.freeze({
+      title: desktopText("electron.notification.test.title", {}, textOptions),
+      body: desktopText("electron.notification.test.body", {}, textOptions),
+    }));
+  }
+
   return Object.freeze({
     status,
     deliver,
+    sendTest,
   });
 }

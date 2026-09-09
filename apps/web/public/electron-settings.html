@@ -307,6 +307,15 @@
             </fieldset>
           </section>
 
+          <section class="settings-card" aria-labelledby="settings-notification-test-title">
+            <div class="settings-card-copy">
+              <h3 id="settings-notification-test-title" data-i18n="electron.settings.notifications.testTitle">Test delivery</h3>
+              <p data-i18n="electron.settings.notifications.testDetail">Send a test without changing alert settings or usage history. Your operating system may silence banners.</p>
+              <p id="settings-notification-test-status" class="settings-status" role="status" aria-live="polite"></p>
+            </div>
+            <button class="button button-secondary" id="settings-test-notification" type="button" disabled data-i18n="electron.settings.notifications.sendTest">Send test notification</button>
+          </section>
+
           <section class="settings-card" aria-labelledby="settings-notification-permission-title">
             <div class="settings-card-copy">
               <h3 id="settings-notification-permission-title" data-i18n="electron.settings.notifications.permissionTitle">Operating system permission</h3>

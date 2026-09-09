@@ -61,6 +61,7 @@ export const SETTINGS_ACTION_NAMES = Object.freeze([
   "setRefreshInterval",
   "setStartAtLogin",
   "setNotificationPreferences",
+  "sendTestNotification",
   "openSystemSettings",
   "checkForUpdates",
   "downloadUpdate",
@@ -981,6 +982,9 @@ function renderSettingsState(
     && state.notifications.permission === "authorized";
   notificationStatus.classList?.toggle?.("is-ready", permissionAuthorized);
   notificationStatus.classList?.toggle?.("is-unavailable", !permissionAuthorized);
+  const testNotification = documentRef.querySelector?.("#settings-test-notification");
+  if (testNotification) testNotification.disabled = !bridgeAvailable
+    || state.notifications.delivery !== "ready";
   const notificationPermission = state.notifications.permission;
   openNotificationSettings.textContent = translateSettingsMessage(
     localizer,
@@ -1264,6 +1268,11 @@ export async function mountSettingsPage({
         currentSharingPreference,
         settingsSharingBridge !== null,
       );
+      if (actionName === "sendTestNotification") {
+        if (result?.status !== "requested") throw new Error("notification test unavailable");
+        setText(documentRef, "#settings-notification-test-status",
+          translateSettingsMessage(pageLocalizer, "electron.settings.notifications.testRequested"));
+      }
       if (actionName === "setNotificationPreferences") {
         notificationOperationStatus(documentRef, currentState, pageLocalizer);
       } else {
@@ -1272,6 +1281,10 @@ export async function mountSettingsPage({
       trayController.update(currentState, true);
       setBridgeStatus(documentRef, "electron.settings.bridge.connected", true, pageLocalizer);
     } catch {
+      if (actionName === "sendTestNotification") {
+        setText(documentRef, "#settings-notification-test-status",
+          translateSettingsMessage(pageLocalizer, "electron.settings.notifications.testFailed"));
+      }
       operationError(documentRef, pageLocalizer);
       pageLocalizer?.setLanguagePreference?.(
         browserLanguagePreference(currentState.language),
@@ -1398,6 +1411,10 @@ export async function mountSettingsPage({
       });
     });
   }
+  const testNotificationButton = documentRef.querySelector?.("#settings-test-notification");
+  if (testNotificationButton) listen(testNotificationButton, "click", () => {
+    void invoke("sendTestNotification");
+  });
   listen(queryRequired(documentRef, "#settings-open-notification-settings"), "click", () => {
     if (currentState.notifications.permission === "denied") {
       void invoke("openSystemSettings", "notifications");

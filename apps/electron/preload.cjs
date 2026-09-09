@@ -348,6 +348,7 @@ function installDesktopBridge() {
       values,
       (enabled) => booleanMethod("setStartAtLogin", enabled),
     ),
+    sendTestNotification: (...values) => noArguments("sendTestNotification", values),
     setNotificationPreferences: (...values) => oneArgument(
       "setNotificationPreferences",
       values,
