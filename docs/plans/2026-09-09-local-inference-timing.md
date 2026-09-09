@@ -27,9 +27,10 @@ Production integration and migration remain a subsequent gate.
 - Require unique response IDs and reconciliation with final turn token totals;
   any missing window makes full-turn TPS unavailable. Reject inherited/forked
   histories and conflicting attribution. Keep quality/coverage counts.
-- Two aligned scatter panels show per-turn TPS and recorded TTFT against turn
-  completion time, split by model. No connecting lines across sparse samples.
-  Show sample counts and effort context; exclude automatic-review/unknown models.
+- Model panels show median per-turn TPS and recorded TTFT by completion date,
+  with percentile bands, sample counts and effort context. Sparse bins use hollow
+  points; missing bins break lines. The original scatter view remains available.
+  Exclude automatic-review/unknown models.
   Produce local PNG/SVG plus content-free scalar data; inspect the rendered plot.
 
 ## Cost and persistence design
@@ -94,8 +95,9 @@ startup. These are proposed acceptance thresholds, not achieved production claim
   immutable valid measurements, conflict invalidation and resumable oversized-line
   skipping. No production module imports these experimental tools.
 - [Plot renderer](../../tools/reports/inference-timing/plot.py): local Matplotlib
-  PNG/SVG and per-model scalar summary. The plot uses logarithmic TTFT axes and
-  explicitly empty Sol panels when the sample has no supported Sol turns.
+  PNG/SVG and per-model scalar summary. Median trends use linear axes; the
+  optional scatter view uses a symlog TTFT axis, including recorded zeros.
+  Panels explicitly indicate when the sample has no supported measurements.
 - [Focused tests](../../test/inference-timing-experiment.test.js): synthetic
   structural fixtures only, including the 200-second tool wait example.
 
@@ -183,3 +185,67 @@ installed-app additive migration. A full-prefix rewrite that preserves file
 identity and evades the bounded prefix/tail fingerprints is outside this local
 experiment's source-integrity guarantee; production must reuse the index's
 stronger source/lineage admission rules.
+
+## Expanded scan and robust trends, 2026-09-09 follow-up
+
+The earlier 191/200 skip count means unchanged sources were not re-read; their
+stored observations remained in the chart and aggregates. It is an incremental
+I/O saving, not an exclusion of those sources from statistics.
+
+Expanded selection: all eligible uncompressed JSONL files under sessions and
+archived_sessions with modification time on or after August 10. The bounded file
+limit is now 5,000 (default still 50); each invocation retains the 8 GiB byte
+ceiling. Four resumed passes scanned 4,768 distinct source paths, approximately
+26 GB of source data. Live creation/appends mean directory counts can change
+between passes. Every pass completed without source failures; the first two
+stopped at the byte budget and resumed from committed checkpoints.
+
+The combined sidecar contains 20,209 completed-turn rows in 6,156,288 bytes
+(5.87 MiB). The August 10–September 9 chart window contains 19,988 turns;
+1,925 have one of the four displayed model labels. Unknown/other-model turns
+remain excluded from per-model claims. The plotted data has 114 supported TPS
+observations and 1,689 recorded TTFT observations. TTFT is available back to
+August 10; supported TPS starts September 3 (September 4 for Astra). Reading older
+files cannot recover timestamps absent from their recorded evidence.
+
+The renderer defaults to daily median plus P25–P75, the middle 50% of observations.
+`--band p10-p90` provides the middle 80%; `--style scatter` shows individual
+observations. `--bin-hours` accepts 6, 12, 24, 48 or 168. All valid observations
+enter quantile calculations, including extreme values. These are spread bands,
+not confidence intervals or an error filter. No winsorization, deletion or
+retry inference is applied. A band/line requires at least five observations;
+sparser bins appear as hollow median points. Metrics use their actual supported
+date ranges, labelled separately, with a shared range across models per row.
+
+The wider P10–P90 view retains a very broad Sol range on August 22. The IQR view
+is easier to read while still showing elevated daily medians around August 22–24
+in several model cohorts. Workload and effort mix could explain some change;
+these data do not establish a cause.
+
+| Model | TPS sample | Median estimated TPS | TTFT sample | Median recorded TTFT | TTFT above 30 s |
+|---|---:|---:|---:|---:|---:|
+| Luna | 28 | 54.11 | 333 | 4.85 s | 11 |
+| Terra | 35 | 51.34 | 488 | 4.96 s | 15 |
+| Astra | 47 | 29.15 | 213 | 5.47 s | 8 |
+| Sol | 4 | 32.84 | 655 | 7.56 s | 35 |
+
+These TPS values are medians of per-turn rates, unlike the weighted TPS values
+in the initial receipt above. Sol's four TPS observations do not support a trend.
+
+Metadata-only outlier inspection reviewed the ten longest known-model TTFTs from
+the original sidecar across six sources, reading 1.13 GB. No explicit retry,
+reconnect or error event types appeared, and no completion error was set. This
+does not exclude provider retries: eight turns included oversized records and
+rollouts need not expose provider-internal attempts. The longest observations
+included Astra TTFT 152.6 s with first reasoning starting at 143.1 s, and Terra
+TTFT 108.1 s with reasoning starting at 106.7 s. Another Terra turn began reasoning
+at 1.47 s but recorded TTFT at 37.35 s, close to its first message. Retain the
+recorded metric and avoid labelling its tail as an error without independent
+evidence. This inspection is not a review of every expanded-history outlier.
+
+Validation adds four Python statistical tests for quantile/outlier behavior,
+median-of-rates semantics, missing-day gaps, unknown measurements and recorded
+zero TTFT, plus a Node test for the expanded file ceiling. Run Python checks in
+the plotting environment with `python test/inference-timing-plot.test.py`.
+Nineteen Node tests and four Python tests pass; main and companion PNGs are
+visually inspected. The production accounting code and database are unchanged.

@@ -179,3 +179,9 @@ test('CLI refuses unknown options and unbounded budgets', () => {
   assert.throws(() => argumentsFor(['--unknown']));
   assert.throws(() => argumentsFor(['--root', '.', '--output', '.', '--since', '2026-09-01', '--max-bytes', '-1']));
 });
+
+test('expanded scan file limit remains explicitly bounded', () => {
+  const base = ['--root', '.', '--output', '.', '--since', '2026-08-10'];
+  assert.equal(argumentsFor([...base, '--max-files', '5000'])['max-files'], 5000);
+  assert.throws(() => argumentsFor([...base, '--max-files', '5001']));
+});

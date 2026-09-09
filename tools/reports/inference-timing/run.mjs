@@ -15,7 +15,7 @@ export function argumentsFor(argv) {
   } });
   if (!values.root || !values.output || !/^\d{4}-\d{2}-\d{2}$/.test(values.since ?? '')
     || !Number.isFinite(Date.parse(values.since))) throw new Error('invalid_arguments');
-  for (const [name, upper] of [['max-bytes', 8 * 1024 ** 3], ['max-files', 500], ['max-seconds', 300]]) {
+  for (const [name, upper] of [['max-bytes', 8 * 1024 ** 3], ['max-files', 5000], ['max-seconds', 300]]) {
     const n = Number(values[name]);
     if (!Number.isSafeInteger(n) || n < 1 || n > upper) throw new Error('invalid_budget');
     values[name] = n;
