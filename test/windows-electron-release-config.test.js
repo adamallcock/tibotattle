@@ -4,12 +4,13 @@ import { createHash } from "node:crypto";
 import * as fsPromises from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { runInNewContext } from "node:vm";
 
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import { productionElectronCandidatePlan } from "../scripts/package-electron-production.mjs";
+import { extractEsmImports } from "../scripts/lib/esm-imports.mjs";
 
 const require = createRequire(import.meta.url);
 const electronBuilderRequire = createRequire(require.resolve("electron-builder/package.json"));
@@ -185,6 +186,7 @@ function loadReleaseConfig(environment) {
     "  forceCodeSigning: config.forceCodeSigning,",
     "  nsisGuid: config.nsis.guid,",
     "  publish: config.publish,",
+    "  files: config.files,",
     "  signExts: config.win.signExts,",
     "  icon: config.win.icon,",
     "  ledgerLeaf: config.win.windowsSigningOperationLedgerLeaf,",
@@ -218,6 +220,27 @@ function validateReleaseConfig(environment) {
   });
 }
 
+async function staticallyImportedMacOSCredentialContract() {
+  const mainPath = resolve("apps/electron/main.js");
+  const mainImports = await extractEsmImports(await fsPromises.readFile(mainPath, "utf8"), {
+    sourceName: mainPath,
+  });
+  const macOSCredentialImport = mainImports.find((entry) => entry.kind === "import"
+    && entry.specifier === "./desktop-macos-keychain.js");
+  assert.notEqual(macOSCredentialImport, undefined, "main must retain its credential composition import");
+  const macOSCredentialPath = resolve(dirname(mainPath), macOSCredentialImport.specifier);
+  const credentialImports = await extractEsmImports(
+    await fsPromises.readFile(macOSCredentialPath, "utf8"),
+    { sourceName: macOSCredentialPath },
+  );
+  const contractImport = credentialImports.find((entry) => entry.kind === "import"
+    && typeof entry.specifier === "string"
+    && entry.specifier.startsWith("../../native/macos-keychain/"));
+  assert.notEqual(contractImport, undefined, "credential facade must retain its native contract import");
+  return relative(resolve("."), resolve(dirname(macOSCredentialPath), contractImport.specifier))
+    .split(sep).join("/");
+}
+
 test("Windows release config requires the patched signing runtime contract", async () => {
   await withReleaseConfigFixture(async ({ candidate, environment }) => {
     const result = loadReleaseConfig(environment);
@@ -242,6 +265,8 @@ test("Windows release config requires the patched signing runtime contract", asy
     assert.equal(config.extraMetadata.tibotattleDistribution.target, "win32-x64");
     assert.equal(config.forceCodeSigning, true);
     assert.equal(config.icon, resolve("apps/electron/assets/tibotattle.ico"));
+    assert.ok(config.files[0].filter.includes(await staticallyImportedMacOSCredentialContract()));
+    assert.equal(config.files[0].filter.includes("native/macos-keychain.node"), false);
     assert.deepEqual(config.signExts, [".dll", "!.node"]);
     assert.equal(config.ledgerLeaf, "windows-signing-operation-ledger.json");
     assert.equal(basename(config.ledgerRoot), "evidence");

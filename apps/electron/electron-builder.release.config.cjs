@@ -448,6 +448,10 @@ function createWindowsStagingFileClosure() {
         "apps/web/public/**",
         "config/**",
         "contracts/**",
+        // main.js imports the cross-platform credential facade before the
+        // platform gate selects a native adapter. This is JavaScript-only;
+        // the macOS native resource remains excluded from Windows packages.
+        "native/macos-keychain/contract.js",
         "native/windows-filesystem/build/Release/windows_filesystem.node",
         "native/windows-filesystem/build/Release/windows_filesystem.node.manifest.json",
         "schemas/**",
