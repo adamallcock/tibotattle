@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createDecipheriv, createHash, generateKeyPairSync, privateDecrypt } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -37,6 +37,39 @@ const WINDOWS_SIGNING_ENVIRONMENT = Object.freeze({
   AZURE_CONFIG_DIR: "C:\\azureCli",
   SystemRoot: "C:\\Windows",
 });
+const DIAGNOSTIC_PUBLIC_KEY_BASE64_ENV = "TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_BASE64";
+const DIAGNOSTIC_PUBLIC_KEY_SHA256_ENV = "TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_SHA256";
+
+function diagnosticKeyPair() {
+  const pair = generateKeyPairSync("rsa", { modulusLength: 4096 });
+  const publicKey = Buffer.from(pair.publicKey.export({ format: "pem", type: "spki" }), "utf8");
+  return {
+    environment: Object.freeze({
+      ...WINDOWS_SIGNING_ENVIRONMENT,
+      [DIAGNOSTIC_PUBLIC_KEY_BASE64_ENV]: publicKey.toString("base64"),
+      [DIAGNOSTIC_PUBLIC_KEY_SHA256_ENV]: createHash("sha256").update(publicKey).digest("hex"),
+    }),
+    privateKey: pair.privateKey,
+  };
+}
+
+function decryptDiagnosticEnvelope(envelope, privateKey) {
+  const aes = privateDecrypt({ key: privateKey, oaepHash: "sha256" }, Buffer.from(envelope.wrappedKey, "base64"));
+  try {
+    const decipher = createDecipheriv("aes-256-gcm", aes, Buffer.from(envelope.iv, "base64"));
+    decipher.setAAD(Buffer.from(JSON.stringify({
+      binding: envelope.binding,
+      schemaVersion: envelope.schemaVersion,
+    }), "utf8"));
+    decipher.setAuthTag(Buffer.from(envelope.tag, "base64"));
+    return Buffer.concat([
+      decipher.update(Buffer.from(envelope.ciphertext, "base64")),
+      decipher.final(),
+    ]);
+  } finally {
+    aes.fill(0);
+  }
+}
 
 async function withFixture(run) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-windows-signing-"));
@@ -411,6 +444,175 @@ test("Windows builder failures expose only fixed diagnostic fields", async () =>
   });
 });
 
+test("Windows builder failure capture encrypts bounded raw output and binds it to the exact candidate", async () => {
+  await withFixture(async ({ bytes, candidatePath, root }) => {
+    const { environment, privateKey } = diagnosticKeyPair();
+    const calls = [];
+    const dependencies = testDependencies({
+      calls,
+      environment,
+      builderResult: {
+        error: undefined,
+        signal: null,
+        status: 1,
+        stdout: "private builder stdout that must not reach CI logs",
+        stderr: "private builder stderr that must not reach CI logs",
+      },
+    });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({
+        candidateReceiptPath: candidatePath,
+        captureEncryptedBuilderDiagnostic: true,
+      }, dependencies),
+      (error) => {
+        assert.equal(error.code, "ELECTRON_WINDOWS_SIGNING_BUILDER_SIGNING_FAILED");
+        assert.equal(error.encryptedDiagnostic, "written");
+        assert.doesNotMatch(error.diagnostic, /private builder/u);
+        return true;
+      },
+    );
+    const builderEnvironment = calls.at(-1).environment;
+    assert.equal(builderEnvironment[DIAGNOSTIC_PUBLIC_KEY_BASE64_ENV], undefined);
+    assert.equal(builderEnvironment[DIAGNOSTIC_PUBLIC_KEY_SHA256_ENV], undefined);
+    const envelopePath = join(
+      root,
+      ".release-build",
+      "electron-production",
+      "win32-x64",
+      "evidence",
+      "windows-builder-failure.envelope.json",
+    );
+    const serialized = await readFile(envelopePath, "utf8");
+    assert.doesNotMatch(serialized, /private builder/u);
+    assert.doesNotMatch(serialized, /BEGIN PRIVATE KEY/u);
+    const envelope = JSON.parse(serialized);
+    assert.deepEqual(envelope.binding, {
+      buildNumber: BUILD_NUMBER,
+      candidateSha256: createHash("sha256").update(bytes).digest("hex"),
+      sourceRevision: SOURCE_REVISION,
+      target: "win32-x64",
+    });
+    assert.equal(envelope.publicKeySha256, environment[DIAGNOSTIC_PUBLIC_KEY_SHA256_ENV]);
+    const plaintext = decryptDiagnosticEnvelope(envelope, privateKey);
+    try {
+      assert.match(plaintext.toString("utf8"), /private builder stdout/u);
+      assert.match(plaintext.toString("utf8"), /private builder stderr/u);
+    } finally {
+      plaintext.fill(0);
+    }
+    assert.throws(
+      () => decryptDiagnosticEnvelope({
+        ...envelope,
+        binding: { ...envelope.binding, candidateSha256: "b".repeat(64) },
+      }, privateKey),
+    );
+    const metadata = await lstat(envelopePath);
+    assert.equal(metadata.isFile(), true);
+    assert.equal(metadata.isSymbolicLink(), false);
+    assert.equal(metadata.nlink, 1);
+  });
+});
+
+test("encrypted builder capture reserves bounded diagnostic tails for both output streams", async () => {
+  await withFixture(async ({ candidatePath, root }) => {
+    const { environment, privateKey } = diagnosticKeyPair();
+    const dependencies = testDependencies({
+      environment,
+      builderResult: {
+        error: undefined,
+        signal: null,
+        status: 1,
+        stdout: `${"stdout-noise".repeat(16 * 1024)}\nSTDOUT_TAIL_DIAGNOSTIC`,
+        stderr: `${"stderr-noise".repeat(16 * 1024)}\nSTDERR_TAIL_DIAGNOSTIC`,
+      },
+    });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({
+        candidateReceiptPath: candidatePath,
+        captureEncryptedBuilderDiagnostic: true,
+      }, dependencies),
+      (error) => error.code === "ELECTRON_WINDOWS_SIGNING_BUILDER_SIGNING_FAILED"
+        && error.encryptedDiagnostic === "written",
+    );
+    const envelope = JSON.parse(await readFile(join(
+      root,
+      ".release-build",
+      "electron-production",
+      "win32-x64",
+      "evidence",
+      "windows-builder-failure.envelope.json",
+    ), "utf8"));
+    const plaintext = decryptDiagnosticEnvelope(envelope, privateKey);
+    try {
+      assert.ok(plaintext.byteLength <= 256 * 1024);
+      const output = plaintext.toString("utf8");
+      assert.match(output, /STDOUT_TAIL_DIAGNOSTIC/u);
+      assert.match(output, /STDERR_TAIL_DIAGNOSTIC/u);
+      assert.equal((output.match(/\[tibotattle-builder-output-truncated\]/gu) ?? []).length, 2);
+    } finally {
+      plaintext.fill(0);
+    }
+  });
+});
+
+test("encrypted builder capture rejects a private or mismatched public key before signer commands", async () => {
+  await withFixture(async ({ candidatePath, root }) => {
+    const { privateKey } = diagnosticKeyPair();
+    const privatePem = Buffer.from(privateKey.export({ format: "pem", type: "pkcs8" }), "utf8");
+    const calls = [];
+    const dependencies = testDependencies({
+      calls,
+      environment: {
+        ...WINDOWS_SIGNING_ENVIRONMENT,
+        [DIAGNOSTIC_PUBLIC_KEY_BASE64_ENV]: privatePem.toString("base64"),
+        [DIAGNOSTIC_PUBLIC_KEY_SHA256_ENV]: createHash("sha256").update(privatePem).digest("hex"),
+      },
+    });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({
+        candidateReceiptPath: candidatePath,
+        captureEncryptedBuilderDiagnostic: true,
+      }, dependencies),
+      { code: "ELECTRON_WINDOWS_SIGNING_ENCRYPTED_BUILDER_DIAGNOSTIC_KEY_INVALID" },
+    );
+    assert.equal(calls.length, 0);
+  });
+});
+
+test("encrypted builder capture never overwrites an existing evidence envelope", async () => {
+  await withFixture(async ({ candidatePath, root }) => {
+    const { environment } = diagnosticKeyPair();
+    const evidenceRoot = join(root, ".release-build", "electron-production", "win32-x64", "evidence");
+    await mkdir(evidenceRoot, { mode: 0o700 });
+    const envelopePath = join(evidenceRoot, "windows-builder-failure.envelope.json");
+    const original = Buffer.from("retained-envelope-must-not-change\n", "utf8");
+    await writeFile(envelopePath, original, { flag: "wx", mode: 0o600 });
+    const dependencies = testDependencies({
+      environment,
+      builderResult: {
+        error: undefined,
+        signal: null,
+        status: 1,
+        stderr: "private builder output",
+        stdout: "",
+      },
+    });
+    dependencies.repositoryRoot = root;
+    await assert.rejects(
+      invokeElectronWindowsSigning({
+        candidateReceiptPath: candidatePath,
+        captureEncryptedBuilderDiagnostic: true,
+      }, dependencies),
+      (error) => error.code === "ELECTRON_WINDOWS_SIGNING_BUILDER_SIGNING_FAILED"
+        && error.encryptedDiagnostic === "unavailable",
+    );
+    assert.deepEqual(await readFile(envelopePath), original);
+  });
+});
+
 test("Windows signing refuses ambiguous invocation and unavailable prerequisites before a signer runs", async () => {
   assert.deepEqual(
     parseElectronWindowsSigningArguments([
@@ -429,6 +631,18 @@ test("Windows signing refuses ambiguous invocation and unavailable prerequisites
       "--sign", "--confirm-azure-trusted-signing", "--candidate-receipt", "candidate.json",
     ]),
     { candidateReceiptPath: "candidate.json", prepareBuilderHost: false, sign: true },
+  );
+  assert.deepEqual(
+    parseElectronWindowsSigningArguments([
+      "--sign", "--confirm-azure-trusted-signing", "--capture-encrypted-builder-diagnostic",
+      "--candidate-receipt", "candidate.json",
+    ]),
+    {
+      candidateReceiptPath: "candidate.json",
+      captureEncryptedBuilderDiagnostic: true,
+      prepareBuilderHost: false,
+      sign: true,
+    },
   );
   assert.throws(
     () => parseElectronWindowsSigningArguments(["--sign", "--candidate-receipt", "candidate.json"]),

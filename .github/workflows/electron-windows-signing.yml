@@ -16,6 +16,14 @@ on:
         description: Approved positive Windows build number
         required: true
         type: string
+      diagnostic-public-key-base64:
+        description: Canonical base64 of the owner RSA-4096 PUBLIC KEY PEM for encrypted builder failure capture
+        required: true
+        type: string
+      diagnostic-public-key-sha256:
+        description: SHA-256 of the exact owner public-key PEM bytes
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -248,11 +256,48 @@ jobs:
             }
           }
       - name: Sign the reviewed installer without publishing
+        env:
+          TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_BASE64: ${{ inputs.diagnostic-public-key-base64 }}
+          TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_SHA256: ${{ inputs.diagnostic-public-key-sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
           $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
-          node scripts/finalize-electron-windows-signing.mjs --sign --confirm-azure-trusted-signing --candidate-receipt $candidateReceipt
+          node scripts/finalize-electron-windows-signing.mjs --sign --confirm-azure-trusted-signing --capture-encrypted-builder-diagnostic --candidate-receipt $candidateReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_INSTALLER_SIGNING_FAILED' }
+      - name: Inspect the exact installer Authenticode state after signing-path failure
+        if: ${{ always() }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $summary = 'status=unavailable;publisher_match=none;timestamp_present=none'
+          try {
+            $candidateRoot = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64'
+            $packagePath = Join-Path $candidateRoot 'app/package.json'
+            $package = Get-Content -LiteralPath $packagePath -Raw | ConvertFrom-Json
+            if ($package.version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') { throw 'PACKAGE_VERSION_INVALID' }
+            $installerPath = Join-Path $candidateRoot ("artifacts/TiboTattle-{0}-Windows-x64.exe" -f $package.version)
+            $item = Get-Item -LiteralPath $installerPath -Force -ErrorAction Stop
+            if ($item.PSIsContainer -or $item.Length -le 0 -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'INSTALLER_UNAVAILABLE' }
+            $signature = Get-AuthenticodeSignature -LiteralPath $installerPath
+            $status = switch ([string]$signature.Status) {
+              'Valid' { 'valid'; break }
+              'NotSigned' { 'not_signed'; break }
+              'HashMismatch' { 'hash_mismatch'; break }
+              'NotTrusted' { 'not_trusted'; break }
+              'NotSupportedFileFormat' { 'not_supported_file_format'; break }
+              'Incompatible' { 'incompatible'; break }
+              'PublisherNotTrusted' { 'publisher_not_trusted'; break }
+              'Revoked' { 'revoked'; break }
+              'UnknownError' { 'unknown_error'; break }
+              default { 'other'; break }
+            }
+            $publisherMatch = $false
+            if ($null -ne $signature.SignerCertificate) {
+              $publisherMatch = $signature.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false) -ceq $env:TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME
+            }
+            $timestampPresent = $null -ne $signature.TimeStamperCertificate
+            $summary = "status=$status;publisher_match=$($publisherMatch.ToString().ToLowerInvariant());timestamp_present=$($timestampPresent.ToString().ToLowerInvariant())"
+          } catch {}
+          Write-Host "WINDOWS_INSTALLER_FAILURE_PATH_AUTHENTICODE;$summary"
       - name: Verify the signed final installer and retained signing evidence
         run: |
           $ErrorActionPreference = 'Stop'
@@ -306,6 +351,7 @@ jobs:
             .release-build/electron-production/win32-x64/artifacts/TiboTattle-*-Windows-x64.exe.blockmap
             .release-build/electron-production/win32-x64/artifacts/latest.yml
             .release-build/electron-production/win32-x64/evidence/windows-signing-operation-ledger.json
+            .release-build/electron-production/win32-x64/evidence/windows-builder-failure.envelope.json
             .release-build/electron-production/win32-x64/windows-native-rebinding/rebound.json
             .release-build/electron-production/win32-x64/evidence/windows-signed-installed.json
             .release-build/electron-windows-normal-candidate/normal-candidate-smoke.json

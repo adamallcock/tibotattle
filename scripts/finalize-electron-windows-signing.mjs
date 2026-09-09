@@ -18,8 +18,8 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { lstat, readFile } from "node:fs/promises";
+import { createCipheriv, createHash, createPublicKey, publicEncrypt, randomBytes } from "node:crypto";
+import { lstat, mkdir, open, readFile, unlink } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join, relative, resolve, sep, win32 } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,10 +37,18 @@ const CANDIDATE_RECEIPT_LEAF = "production-source-candidate.json";
 const CONFIGURATION_RELATIVE_PATH = "apps/electron/electron-builder.release.config.cjs";
 const MAXIMUM_CANDIDATE_BYTES = 128 * 1024;
 const MAXIMUM_CAPTURED_PROCESS_OUTPUT_BYTES = 256 * 1024;
+const MAXIMUM_ENCRYPTED_DIAGNOSTIC_KEY_BYTES = 16 * 1024;
 const SOURCE_REVISION = /^[0-9a-f]{40}$/u;
 const BUILD_NUMBER = /^[1-9][0-9]{0,9}$/u;
 const VERSION = /^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/u;
 const REQUIRED_NODE_VERSION = "v26.2.0";
+const SHA256 = /^[0-9a-f]{64}$/u;
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+const RSA_PUBLIC_KEY_PEM = /^-----BEGIN PUBLIC KEY-----\r?\n(?:[A-Za-z0-9+/=]{1,64}\r?\n)+-----END PUBLIC KEY-----\r?\n?$/u;
+const ENCRYPTED_BUILDER_DIAGNOSTIC_SCHEMA = "tibotattle-electron-windows-builder-diagnostic-envelope-v1";
+const ENCRYPTED_BUILDER_DIAGNOSTIC_LEAF = "windows-builder-failure.envelope.json";
+const ENCRYPTED_BUILDER_DIAGNOSTIC_PUBLIC_KEY_BASE64_ENV = "TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_BASE64";
+const ENCRYPTED_BUILDER_DIAGNOSTIC_PUBLIC_KEY_SHA256_ENV = "TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_SHA256";
 
 const AZURE_RESOURCE_ENVIRONMENT = Object.freeze([
   "TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME",
@@ -180,10 +188,11 @@ const BUILDER_HOST_MODULE_PREFLIGHT_SCRIPT = [
   '})().catch(() => { process.exitCode = 1; });',
 ].join("\n");
 
-function failure(code, { diagnostic = null } = {}) {
+function failure(code, { diagnostic = null, encryptedDiagnostic = null } = {}) {
   const error = new Error(`ELECTRON_WINDOWS_SIGNING_${code}`);
   error.code = error.message;
   if (diagnostic !== null) error.diagnostic = diagnostic;
+  if (encryptedDiagnostic !== null) error.encryptedDiagnostic = encryptedDiagnostic;
   return error;
 }
 
@@ -196,6 +205,57 @@ function safeString(value, maximum = 512) {
     && value.length > 0
     && value.length <= maximum
     && !value.includes("\0");
+}
+
+function canonicalBase64(value, maximum = MAXIMUM_ENCRYPTED_DIAGNOSTIC_KEY_BYTES * 2) {
+  if (!safeString(value, maximum) || !BASE64.test(value)) return null;
+  const bytes = Buffer.from(value, "base64");
+  return bytes.byteLength > 0 && bytes.byteLength <= MAXIMUM_ENCRYPTED_DIAGNOSTIC_KEY_BYTES
+      && bytes.toString("base64") === value
+    ? bytes : null;
+}
+
+function encryptedBuilderDiagnosticBinding(candidate) {
+  return Object.freeze({
+    buildNumber: candidate.buildNumber,
+    candidateSha256: candidate.sha256,
+    sourceRevision: candidate.sourceRevision,
+    target: candidate.target,
+  });
+}
+
+function encryptedBuilderDiagnosticAuthenticatedData(binding) {
+  return Buffer.from(JSON.stringify({
+    binding,
+    schemaVersion: ENCRYPTED_BUILDER_DIAGNOSTIC_SCHEMA,
+  }), "utf8");
+}
+
+function encryptedBuilderDiagnosticContext(candidate, environment) {
+  const keyBytes = canonicalBase64(environment?.[ENCRYPTED_BUILDER_DIAGNOSTIC_PUBLIC_KEY_BASE64_ENV]);
+  const expectedDigest = environment?.[ENCRYPTED_BUILDER_DIAGNOSTIC_PUBLIC_KEY_SHA256_ENV];
+  if (keyBytes === null || !SHA256.test(expectedDigest ?? "")) {
+    fail("ENCRYPTED_BUILDER_DIAGNOSTIC_KEY_INVALID");
+  }
+  const pem = keyBytes.toString("utf8");
+  if (!RSA_PUBLIC_KEY_PEM.test(pem)) fail("ENCRYPTED_BUILDER_DIAGNOSTIC_KEY_INVALID");
+  const keyDigest = createHash("sha256").update(keyBytes).digest("hex");
+  if (keyDigest !== expectedDigest) fail("ENCRYPTED_BUILDER_DIAGNOSTIC_KEY_INVALID");
+  let key;
+  try {
+    key = createPublicKey(keyBytes);
+  } catch {
+    fail("ENCRYPTED_BUILDER_DIAGNOSTIC_KEY_INVALID");
+  }
+  if (key.type !== "public" || key.asymmetricKeyType !== "rsa"
+      || key.asymmetricKeyDetails?.modulusLength !== 4096) {
+    fail("ENCRYPTED_BUILDER_DIAGNOSTIC_KEY_INVALID");
+  }
+  return Object.freeze({
+    binding: encryptedBuilderDiagnosticBinding(candidate),
+    key,
+    keyDigest,
+  });
 }
 
 function canonicalCandidateReceiptPath(repositoryRoot) {
@@ -394,6 +454,111 @@ function capturedText(result) {
     .join("\n");
 }
 
+function boundedBuilderFailurePayload(result) {
+  const header = Buffer.from("tibotattle-electron-windows-builder-output-v1\nstdout:\n", "utf8");
+  const separator = Buffer.from("\nstderr:\n", "utf8");
+  const sectionBytes = Math.floor((MAXIMUM_CAPTURED_PROCESS_OUTPUT_BYTES
+    - header.byteLength - separator.byteLength) / 2);
+  const stdout = boundedBuilderOutputTail(result?.stdout, sectionBytes);
+  const stderr = boundedBuilderOutputTail(result?.stderr, sectionBytes);
+  try {
+    return Buffer.concat([header, stdout, separator, stderr]);
+  } finally {
+    stdout.fill(0);
+    stderr.fill(0);
+  }
+}
+
+function boundedBuilderOutputTail(value, maximum) {
+  const marker = Buffer.from("[tibotattle-builder-output-truncated]\n", "utf8");
+  if (typeof value !== "string" || maximum < marker.byteLength) return Buffer.alloc(0);
+  // spawnSync bounds normal captured output. Clamp injected or malformed
+  // results as well, then retain the tail where builder errors are emitted.
+  const source = value.length > MAXIMUM_CAPTURED_PROCESS_OUTPUT_BYTES
+    ? value.slice(-MAXIMUM_CAPTURED_PROCESS_OUTPUT_BYTES) : value;
+  const bytes = Buffer.from(source, "utf8");
+  try {
+    if (bytes.byteLength <= maximum) return Buffer.from(bytes);
+    return Buffer.concat([
+      marker,
+      bytes.subarray(bytes.byteLength - (maximum - marker.byteLength)),
+    ]);
+  } finally {
+    bytes.fill(0);
+  }
+}
+
+function sealEncryptedBuilderDiagnostic(context, result) {
+  const aes = randomBytes(32);
+  const iv = randomBytes(12);
+  const plaintext = boundedBuilderFailurePayload(result);
+  const authenticatedData = encryptedBuilderDiagnosticAuthenticatedData(context.binding);
+  try {
+    const cipher = createCipheriv("aes-256-gcm", aes, iv);
+    cipher.setAAD(authenticatedData);
+    const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+    return Object.freeze({
+      binding: context.binding,
+      ciphertext: ciphertext.toString("base64"),
+      iv: iv.toString("base64"),
+      publicKeySha256: context.keyDigest,
+      schemaVersion: ENCRYPTED_BUILDER_DIAGNOSTIC_SCHEMA,
+      tag: cipher.getAuthTag().toString("base64"),
+      wrappedKey: publicEncrypt({ key: context.key, oaepHash: "sha256" }, aes).toString("base64"),
+    });
+  } finally {
+    aes.fill(0);
+    plaintext.fill(0);
+    authenticatedData.fill(0);
+  }
+}
+
+async function writeEncryptedBuilderDiagnostic({ candidateReceiptPath, diagnosticContext,
+  repositoryRoot, result }) {
+  const candidateRoot = dirname(candidateReceiptPath);
+  const evidenceRoot = join(candidateRoot, "evidence");
+  const envelopePath = join(evidenceRoot, ENCRYPTED_BUILDER_DIAGNOSTIC_LEAF);
+  try {
+    await mkdir(evidenceRoot, { mode: 0o700, recursive: true });
+    await assertNoSymbolicLinkPathComponents(repositoryRoot, evidenceRoot);
+    const evidenceMetadata = await lstat(evidenceRoot);
+    if (!evidenceMetadata.isDirectory() || evidenceMetadata.isSymbolicLink()) {
+      fail("ENCRYPTED_BUILDER_DIAGNOSTIC_WRITE_FAILED");
+    }
+  } catch (error) {
+    if (error?.code === "ELECTRON_WINDOWS_SIGNING_ENCRYPTED_BUILDER_DIAGNOSTIC_WRITE_FAILED") throw error;
+    fail("ENCRYPTED_BUILDER_DIAGNOSTIC_WRITE_FAILED");
+  }
+  const envelope = Buffer.from(`${JSON.stringify(sealEncryptedBuilderDiagnostic(diagnosticContext, result))}\n`, "utf8");
+  let handle;
+  let created = false;
+  let writeFailure = null;
+  try {
+    handle = await open(envelopePath, "wx", 0o600);
+    created = true;
+    await handle.writeFile(envelope);
+    await handle.sync();
+    const metadata = await handle.stat();
+    if (!metadata.isFile() || metadata.nlink !== 1 || metadata.size !== envelope.byteLength) {
+      fail("ENCRYPTED_BUILDER_DIAGNOSTIC_WRITE_FAILED");
+    }
+  } catch (error) {
+    writeFailure = error;
+  } finally {
+    envelope.fill(0);
+    if (handle !== undefined) {
+      try { await handle.close(); } catch (error) { writeFailure ??= error; }
+    }
+  }
+  if (writeFailure !== null) {
+    if (created) {
+      try { await unlink(envelopePath); } catch {}
+    }
+    fail("ENCRYPTED_BUILDER_DIAGNOSTIC_WRITE_FAILED");
+  }
+  return "written";
+}
+
 function finalMatchIndex(pattern, text) {
   pattern.lastIndex = 0;
   let finalIndex = -1;
@@ -547,6 +712,17 @@ export function parseElectronWindowsSigningArguments(argv) {
       && argv[2] === "--candidate-receipt" && safeString(argv[3])) {
     return Object.freeze({ candidateReceiptPath: argv[3], prepareBuilderHost: false, sign: true });
   }
+  if (argv.length === 5 && argv[0] === "--sign"
+      && argv[1] === "--confirm-azure-trusted-signing"
+      && argv[2] === "--capture-encrypted-builder-diagnostic"
+      && argv[3] === "--candidate-receipt" && safeString(argv[4])) {
+    return Object.freeze({
+      candidateReceiptPath: argv[4],
+      captureEncryptedBuilderDiagnostic: true,
+      prepareBuilderHost: false,
+      sign: true,
+    });
+  }
   fail("ARGUMENT_INVALID");
 }
 
@@ -586,7 +762,8 @@ export async function preflightElectronWindowsSigning({ candidateReceiptPath } =
   });
 }
 
-async function protectedSigningContext({ candidateReceiptPath } = {}, testOnly = {}) {
+async function protectedSigningContext({ candidateReceiptPath,
+  captureEncryptedBuilderDiagnostic = false } = {}, testOnly = {}) {
   const repositoryRoot = resolve(testOnly.repositoryRoot ?? REPOSITORY_ROOT);
   const expectedCandidatePath = canonicalCandidateReceiptPath(repositoryRoot);
   const selectedCandidatePath = typeof candidateReceiptPath === "string"
@@ -596,6 +773,11 @@ async function protectedSigningContext({ candidateReceiptPath } = {}, testOnly =
   const candidate = parseCanonicalCandidate(bytes);
   const environment = testOnly.environment ?? process.env;
   const run = testOnly.run ?? defaultRun;
+  if (captureEncryptedBuilderDiagnostic !== false && captureEncryptedBuilderDiagnostic !== true) {
+    fail("ARGUMENT_INVALID");
+  }
+  const diagnosticContext = captureEncryptedBuilderDiagnostic
+    ? encryptedBuilderDiagnosticContext(candidate, environment) : null;
   if (!hostEligible({
     platform: testOnly.platform ?? process.platform,
     architecture: testOnly.architecture ?? process.arch,
@@ -620,6 +802,7 @@ async function protectedSigningContext({ candidateReceiptPath } = {}, testOnly =
   return Object.freeze({
     builderEnvironment,
     candidate,
+    diagnosticContext,
     configurationPath,
     repositoryRoot,
     run,
@@ -695,8 +878,12 @@ function assertCleanFrozenSource(candidate, run) {
  * Its result intentionally remains short of a final signed-candidate receipt:
  * the two unpacked native modules require later signature/rebinding evidence.
  */
-export async function invokeElectronWindowsSigning({ candidateReceiptPath } = {}, testOnly = {}) {
-  const context = await protectedSigningContext({ candidateReceiptPath }, testOnly);
+export async function invokeElectronWindowsSigning({ candidateReceiptPath,
+  captureEncryptedBuilderDiagnostic = false } = {}, testOnly = {}) {
+  const context = await protectedSigningContext({
+    candidateReceiptPath,
+    captureEncryptedBuilderDiagnostic,
+  }, testOnly);
   assertCleanFrozenSource(context.candidate, context.run);
   const azureCliInvocation = azureCliAccountShowInvocation(context.builderEnvironment);
   if (azureCliInvocation === null) fail("AZURE_CLI_ACCOUNT_SHOW_LAUNCH_UNAVAILABLE");
@@ -714,8 +901,22 @@ export async function invokeElectronWindowsSigning({ candidateReceiptPath } = {}
     "--win", "nsis", "--x64", "--publish", "never",
   ], { environment: context.builderEnvironment, captureOutput: true });
   if (!successful(builderResult)) {
+    let encryptedDiagnostic = null;
+    if (context.diagnosticContext !== null) {
+      try {
+        encryptedDiagnostic = await writeEncryptedBuilderDiagnostic({
+          candidateReceiptPath: context.selectedCandidatePath,
+          diagnosticContext: context.diagnosticContext,
+          repositoryRoot: context.repositoryRoot,
+          result: builderResult,
+        });
+      } catch {
+        encryptedDiagnostic = "unavailable";
+      }
+    }
     throw failure("BUILDER_SIGNING_FAILED", {
       diagnostic: builderFailureDiagnostic(builderResult),
+      encryptedDiagnostic,
     });
   }
   return Object.freeze({
@@ -743,6 +944,11 @@ if (process.argv[1] && resolve(process.argv[1]) === SCRIPT_FILE) {
       ? error.code : "ELECTRON_WINDOWS_SIGNING_FAILED"}\n`);
     if (isBuilderFailureDiagnostic(error?.diagnostic)) {
       process.stderr.write(`${error.diagnostic}\n`);
+    }
+    if (error?.encryptedDiagnostic === "written") {
+      process.stderr.write("ELECTRON_WINDOWS_SIGNING_BUILDER_ENCRYPTED_DIAGNOSTIC_WRITTEN\n");
+    } else if (error?.encryptedDiagnostic === "unavailable") {
+      process.stderr.write("ELECTRON_WINDOWS_SIGNING_BUILDER_ENCRYPTED_DIAGNOSTIC_UNAVAILABLE\n");
     }
     process.exitCode = 1;
   }

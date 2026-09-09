@@ -21,6 +21,10 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   assert.match(workflow, /ref: \$\{\{ github\.sha \}\}/u);
   assert.match(workflow, /SOURCE_REVISION: \$\{\{ inputs\.source-revision \}\}/u);
   assert.match(workflow, /EXPECTED_DISPATCH_SHA: \$\{\{ github\.sha \}\}/u);
+  assert.match(workflow, /diagnostic-public-key-base64:\n        description: Canonical base64 of the owner RSA-4096 PUBLIC KEY PEM/u);
+  assert.match(workflow, /diagnostic-public-key-sha256:\n        description: SHA-256 of the exact owner public-key PEM bytes/u);
+  assert.match(workflow, /TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_BASE64: \$\{\{ inputs\.diagnostic-public-key-base64 \}\}/u);
+  assert.match(workflow, /TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_SHA256: \$\{\{ inputs\.diagnostic-public-key-sha256 \}\}/u);
   assert.match(workflow, /WINDOWS_SIGNING_SOURCE_REVISION_MISMATCH/u);
   assert.match(workflow, /TIBOTATTLE_ELECTRON_AZURE_PUBLISHER_NAME: \$\{\{ vars\.AZURE_CODE_SIGNING_PUBLISHER_NAME \}\}/u);
   assert.match(workflow, /TIBOTATTLE_ELECTRON_AZURE_ENDPOINT: \$\{\{ vars\.AZURE_CODE_SIGNING_ENDPOINT \}\}/u);
@@ -34,7 +38,7 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   assert.match(workflow, /windows_filesystem\.node/u);
   assert.match(workflow, /@github\\keytar\\prebuilds\\win32-x64\\keytar\.node/u);
   assert.doesNotMatch(workflow, /@github\\keytar\\build\\Release\\keytar\.node/u);
-  assert.match(workflow, /--sign --confirm-azure-trusted-signing/u);
+  assert.match(workflow, /--sign --confirm-azure-trusted-signing --capture-encrypted-builder-diagnostic/u);
   assert.doesNotMatch(workflow, /--publish\s+(?!never)/u);
   assert.match(workflow, /WINDOWS_SIGNED_INSTALLER_VERIFIED/u);
   assert.match(workflow, /--prepare-builder-host --candidate-receipt \$candidateReceipt/u);
@@ -51,14 +55,27 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   const rebind = workflow.indexOf("Rebind signed native modules to their manifest");
   const restoreReadOnly = workflow.indexOf("Restore the fixed native modules and rebinding metadata read-only state");
   const installerSigning = workflow.indexOf("Sign the reviewed installer without publishing");
+  const failurePathAuthenticode = workflow.indexOf("Inspect the exact installer Authenticode state after signing-path failure");
   const verification = workflow.indexOf("Verify the signed final installer and retained signing evidence");
   const signedInstalled = workflow.indexOf("Qualify the signed installed Windows journey");
   const retention = workflow.indexOf("Retain the signed installer and content-free evidence");
   assert.ok(preflight >= 0 && preflight < builderHostPreflight && builderHostPreflight < journal);
   assert.ok(journal < probePreSign && probePreSign < makeWritable && makeWritable < azureLogin && azureLogin < nativeSigning);
   assert.ok(nativeSigning < makeRebindMetadataWritable && makeRebindMetadataWritable < rebind);
-  assert.ok(rebind < restoreReadOnly && restoreReadOnly < installerSigning && installerSigning < verification
+  assert.ok(rebind < restoreReadOnly && restoreReadOnly < installerSigning && installerSigning < failurePathAuthenticode
+    && failurePathAuthenticode < verification
     && verification < signedInstalled && signedInstalled < retention);
+  const beforeInstallerSigning = workflow.slice(0, installerSigning);
+  const installerSigningInputs = workflow.slice(installerSigning, verification);
+  assert.doesNotMatch(beforeInstallerSigning, /TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_(?:BASE64|SHA256):/u);
+  assert.match(installerSigningInputs, /TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_BASE64: \$\{\{ inputs\.diagnostic-public-key-base64 \}\}/u);
+  assert.match(installerSigningInputs, /TIBOTATTLE_ELECTRON_WINDOWS_BUILDER_DIAGNOSTIC_PUBLIC_KEY_SHA256: \$\{\{ inputs\.diagnostic-public-key-sha256 \}\}/u);
+  const failurePathProbe = workflow.slice(failurePathAuthenticode, verification);
+  assert.match(failurePathProbe, /^        if: \$\{\{ always\(\) \}\}/mu);
+  assert.match(failurePathProbe, /Get-AuthenticodeSignature -LiteralPath \$installerPath/u);
+  assert.match(failurePathProbe, /WINDOWS_INSTALLER_FAILURE_PATH_AUTHENTICODE;\$summary/u);
+  assert.match(failurePathProbe, /status=unavailable;publisher_match=none;timestamp_present=none/u);
+  assert.doesNotMatch(failurePathProbe, /SignerCertificate\.Subject|TimeStamperCertificate\.Subject/u);
   assert.match(workflow, /WINDOWS_NATIVE_SIGNING_INPUT_READONLY_EXPECTED/u);
   assert.match(workflow, /--probe-authenticode-pre-sign/u);
   assert.match(workflow, /WINDOWS_NATIVE_SIGNING_INPUT_WRITABLE_UNAVAILABLE/u);
@@ -86,5 +103,6 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   assert.match(signedInstalledInputs, /--source-revision \$env:SOURCE_REVISION --receipt \$signedInstalledReceipt/u);
   assert.match(retained, /^        if: \$\{\{ always\(\) \}\}/mu);
   assert.match(retained, /evidence\/windows-signed-installed\.json/u);
+  assert.match(retained, /evidence\/windows-builder-failure\.envelope\.json/u);
   assert.match(retained, /electron-windows-normal-candidate\/normal-candidate-smoke\.json/u);
 });
