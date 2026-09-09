@@ -40,6 +40,7 @@ test("Windows signing workflow registers safely, while signing stays manual and 
 
   const preflight = workflow.indexOf("Preflight the exact protected Azure resource selection");
   const journal = workflow.indexOf("Inspect and journal native module bytes before signing");
+  const probePreSign = workflow.indexOf("Execute the native Authenticode verifier before signing");
   const makeWritable = workflow.indexOf("Make the fixed signed native modules writable");
   const azureLogin = workflow.indexOf("Authenticate to Azure with protected OIDC inputs");
   const nativeSigning = workflow.indexOf("Sign only the staged native modules");
@@ -49,10 +50,11 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   const installerSigning = workflow.indexOf("Sign the reviewed installer without publishing");
   const verification = workflow.indexOf("Verify the signed final installer and retained signing evidence");
   assert.ok(preflight >= 0 && preflight < journal);
-  assert.ok(journal < makeWritable && makeWritable < azureLogin && azureLogin < nativeSigning);
+  assert.ok(journal < probePreSign && probePreSign < makeWritable && makeWritable < azureLogin && azureLogin < nativeSigning);
   assert.ok(nativeSigning < makeRebindMetadataWritable && makeRebindMetadataWritable < rebind);
   assert.ok(rebind < restoreReadOnly && restoreReadOnly < installerSigning && installerSigning < verification);
   assert.match(workflow, /WINDOWS_NATIVE_SIGNING_INPUT_READONLY_EXPECTED/u);
+  assert.match(workflow, /--probe-authenticode-pre-sign/u);
   assert.match(workflow, /WINDOWS_NATIVE_SIGNING_INPUT_WRITABLE_UNAVAILABLE/u);
   assert.match(workflow, /WINDOWS_REBIND_METADATA_READONLY_EXPECTED/u);
   assert.match(workflow, /WINDOWS_REBIND_METADATA_WRITABLE_UNAVAILABLE/u);

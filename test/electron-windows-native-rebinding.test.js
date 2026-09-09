@@ -11,8 +11,11 @@ import { verifyStagedElectronRuntime } from "../scripts/build-electron-runtime.m
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 import {
   classifyWindowsAuthenticodeForTest,
+  createWindowsAuthenticodeProbeForTest,
+  createWindowsAuthenticodePowerShellArgumentsForTest,
   inspectWindowsNativeRebinding, parseWindowsNativeRebindingArguments,
   prepareWindowsNativeRebinding, rebindWindowsNativeModules, rebindWindowsNativeModulesForTest,
+  probeWindowsAuthenticodePreSignForTest,
   windowsNativeUnsignedContentDigest,
 } from "../scripts/rebind-electron-windows-native-modules.mjs";
 const FS = "native/windows-filesystem/build/Release/windows_filesystem.node";
@@ -134,6 +137,19 @@ test("Authenticode diagnostics remain closed while distinguishing trust failures
     { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE_INVALID" },
   );
 });
+test("the native Authenticode probe uses a fixed, content-free status branch set", () => {
+  const probe = createWindowsAuthenticodeProbeForTest();
+  const invocation = createWindowsAuthenticodePowerShellArgumentsForTest();
+  assert.deepEqual(invocation.slice(0, 3), ["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+  assert.equal(Buffer.from(invocation[3], "base64").toString("utf16le"), probe);
+  assert.doesNotMatch(probe, /switch\s*\(/iu);
+  assert.match(probe, /Get-AuthenticodeSignature -LiteralPath \$env:TIBOTATTLE_NATIVE_VERIFY_PATH/u);
+  for (const status of ["Valid", "NotSigned", "HashMismatch", "NotTrusted", "NotSupported", "Incompatible", "NotAllowed"]) {
+    assert.match(probe, new RegExp(`Status -ceq '${status}'`, "u"));
+  }
+  assert.match(probe, /status=\$status;signer=\$signer;timestamp=\$timestamp;publisher=\$publisher/u);
+  assert.doesNotMatch(probe, /Format-List|ConvertTo-Json|Subject|IssuedTo/u);
+});
 test("inspect uses the exact Windows keytar prebuild selected for packaging, then prepare is no-clobber", async () => {
   const releaseConfig = await readFile(
     new URL("../apps/electron/electron-builder.release.config.cjs", import.meta.url),
@@ -158,6 +174,52 @@ test("inspect uses the exact Windows keytar prebuild selected for packaging, the
     assert.equal(typeof journal.rebindMetadataModes["electron-runtime-manifest.json"], "number");
     await assert.rejects(prepareWindowsNativeRebinding(options, dependencies), { code: "EEXIST" });
     await assert.rejects(prepareWindowsNativeRebinding({ candidateReceiptPath: join(base, "wrong.json") }, dependencies), { code: "WINDOWS_NATIVE_REBIND_CANDIDATE_PATH_INVALID" });
+  });
+});
+test("the pre-sign Authenticode probe executes the exact verifier on both fixed native paths", async () => {
+  await fixture(async ({ options, dependencies, stage }) => {
+    const invocations = [];
+    const diagnostics = [
+      "status=not_signed;signer=absent;timestamp=absent;publisher=not_checked",
+      "status=not_trusted;signer=present;timestamp=absent;publisher=mismatch",
+    ];
+    const receipt = await probeWindowsAuthenticodePreSignForTest(options, {
+      ...dependencies,
+      runAuthenticodeProbe(script, environment) {
+        invocations.push({ script, environment });
+        return { status: 0, signal: null, stderr: "", stdout: diagnostics.shift() };
+      },
+    });
+    assert.equal(receipt.status, "pre_sign_authenticode_probe_verified");
+    assert.equal(invocations.length, 2);
+    assert.deepEqual(invocations.map(({ environment }) => environment.TIBOTATTLE_NATIVE_VERIFY_PATH), [
+      join(stage, FS), join(stage, KEYTAR),
+    ]);
+    assert.ok(invocations.every(({ script }) => script === createWindowsAuthenticodeProbeForTest()));
+  });
+  for (const [result, code] of [
+    [{ error: { code: "ENOENT" } }, "TOOL_UNAVAILABLE"],
+    [{ signal: "SIGTERM" }, "INTERRUPTED"],
+    [{ status: 1, stderr: "ParserError" }, "PARSE_FAILED"],
+    [{ status: 1, stderr: "Get-AuthenticodeSignature not recognized" }, "COMMAND_UNAVAILABLE"],
+    [{ status: 1, stderr: "Access is denied" }, "ACCESS_DENIED"],
+    [{ status: 1, stderr: "unclassified" }, "EXECUTION_FAILED"],
+  ]) {
+    await fixture(async ({ options, dependencies }) => {
+      await assert.rejects(
+        probeWindowsAuthenticodePreSignForTest(options, { ...dependencies, runAuthenticodeProbe: () => result }),
+        { code: `WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE_${code}` },
+      );
+    });
+  }
+  await fixture(async ({ options, dependencies }) => {
+    await assert.rejects(
+      probeWindowsAuthenticodePreSignForTest(options, {
+        ...dependencies,
+        runAuthenticodeProbe: () => ({ status: 0, signal: null, stderr: "", stdout: "unparseable" }),
+      }),
+      { code: "WINDOWS_NATIVE_REBIND_SIGNATURE_PROBE_INVALID" },
+    );
   });
 });
 test("rebinding changes only native rows, sidecar and payload; policy and replay remain stable", async () => {
@@ -209,6 +271,7 @@ test("rebind refuses native payload mutation, unrelated files, and unverified si
 test("CLI defaults to inspection, rejects ambiguous mode, and native rebind refuses a foreign host", async () => {
   assert.equal(parseWindowsNativeRebindingArguments(["--candidate-receipt", "a.json"]).mode, "inspect");
   assert.equal(parseWindowsNativeRebindingArguments(["--prepare", "--candidate-receipt", "a.json"]).mode, "prepare");
+  assert.equal(parseWindowsNativeRebindingArguments(["--probe-authenticode-pre-sign", "--candidate-receipt", "a.json"]).mode, "probe");
   assert.throws(() => parseWindowsNativeRebindingArguments(["--rebind", "--prepare", "--candidate-receipt", "a.json"]));
   if (process.platform !== "win32") await assert.rejects(rebindWindowsNativeModules({}), { code: "WINDOWS_NATIVE_REBIND_NATIVE_WINDOWS_REQUIRED" });
 });

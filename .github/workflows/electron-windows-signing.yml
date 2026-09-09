@@ -137,6 +137,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_INSPECTION_FAILED' }
           node scripts/rebind-electron-windows-native-modules.mjs --prepare --candidate-receipt $candidateReceipt
           if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_PREPARATION_FAILED' }
+      - name: Execute the native Authenticode verifier before signing
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateReceipt = Join-Path $env:GITHUB_WORKSPACE '.release-build/electron-production/win32-x64/production-source-candidate.json'
+          node scripts/rebind-electron-windows-native-modules.mjs --probe-authenticode-pre-sign --candidate-receipt $candidateReceipt
+          if ($LASTEXITCODE -ne 0) { throw 'WINDOWS_NATIVE_REBIND_PROBE_PRE_SIGN_FAILED' }
       - name: Make the fixed signed native modules writable
         run: |
           $ErrorActionPreference = 'Stop'

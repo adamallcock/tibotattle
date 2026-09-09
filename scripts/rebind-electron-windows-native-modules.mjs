@@ -27,15 +27,6 @@ const REBIND_METADATA = Object.freeze([SIDECAR, MANIFEST]);
 const MAX_FILE = 128 * 1024 * 1024;
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const jsonBytes = (value) => Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
-const AUTHENTICODE_STATUS = Object.freeze({
-  Valid: "valid",
-  NotSigned: "not_signed",
-  HashMismatch: "hash_mismatch",
-  NotTrusted: "not_trusted",
-  NotSupported: "not_supported",
-  Incompatible: "incompatible",
-  NotAllowed: "not_allowed",
-});
 const AUTHENTICODE_DIAGNOSTIC = /^status=(valid|not_signed|hash_mismatch|not_trusted|not_supported|incompatible|not_allowed|other);signer=(present|absent);timestamp=(present|absent);publisher=(match|mismatch|not_checked)$/u;
 function fail(code) {
   const error = new Error(`WINDOWS_NATIVE_REBIND_${code}`);
@@ -61,6 +52,49 @@ function assertAuthenticodeDiagnostic(value) {
 }
 function closedAuthenticodeDiagnostic(value) {
   return `status=${value.status};signer=${value.signer};timestamp=${value.timestamp};publisher=${value.publisher}`;
+}
+function authenticodeProbeFailureCode(result) {
+  if (result?.error?.code === "ENOENT") return "SIGNATURE_PROBE_TOOL_UNAVAILABLE";
+  if (result?.error) return "SIGNATURE_PROBE_SPAWN_FAILED";
+  if (result?.signal) return "SIGNATURE_PROBE_INTERRUPTED";
+  const standardError = typeof result?.stderr === "string" ? result.stderr : "";
+  if (/ParserError|Unexpected token|Missing .*[\]}]/iu.test(standardError)) return "SIGNATURE_PROBE_PARSE_FAILED";
+  if (/Get-AuthenticodeSignature.*(?:not recognized|not found)|CommandNotFoundException/iu.test(standardError)) {
+    return "SIGNATURE_PROBE_COMMAND_UNAVAILABLE";
+  }
+  if (/Access is denied|UnauthorizedAccessException|PermissionDenied/iu.test(standardError)) {
+    return "SIGNATURE_PROBE_ACCESS_DENIED";
+  }
+  return "SIGNATURE_PROBE_EXECUTION_FAILED";
+}
+function createAuthenticodeProbeScript() {
+  return "$ErrorActionPreference='Stop'; $s=Get-AuthenticodeSignature -LiteralPath $env:TIBOTATTLE_NATIVE_VERIFY_PATH; "
+    + "$status='other'; "
+    + "if([string]$s.Status -ceq 'Valid'){$status='valid'}elseif([string]$s.Status -ceq 'NotSigned'){$status='not_signed'}elseif([string]$s.Status -ceq 'HashMismatch'){$status='hash_mismatch'}elseif([string]$s.Status -ceq 'NotTrusted'){$status='not_trusted'}elseif([string]$s.Status -ceq 'NotSupported'){$status='not_supported'}elseif([string]$s.Status -ceq 'Incompatible'){$status='incompatible'}elseif([string]$s.Status -ceq 'NotAllowed'){$status='not_allowed'}; "
+    + "$signer=if($null -eq $s.SignerCertificate){'absent'}else{'present'}; "
+    + "$timestamp=if($null -eq $s.TimeStamperCertificate){'absent'}else{'present'}; "
+    + "$publisher=if($signer -eq 'absent'){'not_checked'}elseif($s.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,$false) -ceq 'Adam Allcock'){'match'}else{'mismatch'}; "
+    + "[Console]::Out.Write(\"status=$status;signer=$signer;timestamp=$timestamp;publisher=$publisher\"); exit 0";
+}
+function createAuthenticodePowerShellArguments(script) {
+  return ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")];
+}
+/** Synthetic-only test seam; the probe never prints certificate fields. */
+export function createWindowsAuthenticodeProbeForTest() {
+  return createAuthenticodeProbeScript();
+}
+/** Synthetic-only test seam for the fixed Windows command-line encoding. */
+export function createWindowsAuthenticodePowerShellArgumentsForTest() {
+  return createAuthenticodePowerShellArguments(createAuthenticodeProbeScript());
+}
+function runAuthenticodePowerShell(script, environment) {
+  return spawnSync("powershell.exe", createAuthenticodePowerShellArguments(script), {
+    env: environment, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 30000,
+    windowsHide: true,
+  });
+}
+function assertAuthenticodeProbeSucceeded(result) {
+  if (result?.error || result?.signal || result?.status !== 0) fail(authenticodeProbeFailureCode(result));
 }
 /** Synthetic-only test seam; the live signer emits no certificate text. */
 export function classifyWindowsAuthenticodeForTest(value) {
@@ -226,6 +260,30 @@ export async function prepareWindowsNativeRebinding(options = {}, dependencies =
   await exclusive(context.journalPath, jsonBytes(journal));
   return { schemaVersion: SCHEMA, candidate: context.candidate, status: "pre_sign_journal_prepared", signing: "not_performed", windowsRuntimeQualification: "required" };
 }
+function probeAuthenticode(path, run = runAuthenticodePowerShell) {
+  const result = run(createAuthenticodeProbeScript(), {
+    ...process.env, TIBOTATTLE_NATIVE_VERIFY_PATH: path,
+  });
+  assertAuthenticodeProbeSucceeded(result);
+  const diagnostic = parseAuthenticodeDiagnostic(result.stdout);
+  if (!diagnostic) fail("SIGNATURE_PROBE_INVALID");
+  return diagnostic;
+}
+async function probeAuthenticodeBeforeSigning(options, dependencies = {}) {
+  assertHost(dependencies);
+  const context = await selected(options, dependencies);
+  for (const path of NATIVES) {
+    // The workflow journals these same fixed files immediately before this
+    // probe. Capture keeps the probe on ordinary files inside that stage.
+    await capture(context.root, join(context.stage, path));
+    probeAuthenticode(join(context.stage, path), dependencies.runAuthenticodeProbe);
+  }
+  return { schemaVersion: SCHEMA, candidate: context.candidate, status: "pre_sign_authenticode_probe_verified", signing: "not_performed", windowsRuntimeQualification: "required" };
+}
+/** Synthetic dependency seam; product code never imports this operations tool. */
+export async function probeWindowsAuthenticodePreSignForTest(options, dependencies) {
+  return probeAuthenticodeBeforeSigning(options, dependencies);
+}
 
 function verifyAuthenticode(path) {
   // Fixed script and environment-carried path avoid shell/path interpolation.
@@ -233,21 +291,7 @@ function verifyAuthenticode(path) {
   // final signer must separately qualify SHA-256 file/timestamp algorithms.
   // The probe emits a fixed, content-free diagnostic rather than certificate
   // fields so a trust failure is actionable without disclosing signer data.
-  const statusCases = Object.entries(AUTHENTICODE_STATUS)
-    .map(([source, target]) => ` '${source}' { '${target}' }`).join(";");
-  const script = "$ErrorActionPreference='Stop'; $s=Get-AuthenticodeSignature -LiteralPath $env:TIBOTATTLE_NATIVE_VERIFY_PATH; "
-    + `$status=switch ([string]$s.Status) {${statusCases};default{'other'}}; `
-    + "$signer=if($null -eq $s.SignerCertificate){'absent'}else{'present'}; "
-    + "$timestamp=if($null -eq $s.TimeStamperCertificate){'absent'}else{'present'}; "
-    + "$publisher=if($signer -eq 'absent'){'not_checked'}elseif($s.SignerCertificate.GetNameInfo([System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,$false) -ceq 'Adam Allcock'){'match'}else{'mismatch'}; "
-    + "[Console]::Out.Write(\"status=$status;signer=$signer;timestamp=$timestamp;publisher=$publisher\"); exit 0";
-  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], {
-    env: { ...process.env, TIBOTATTLE_NATIVE_VERIFY_PATH: path }, encoding: "utf8",
-    stdio: ["ignore", "pipe", "ignore"], timeout: 30000,
-    windowsHide: true,
-  });
-  if (result.error || result.signal || result.status !== 0) fail("SIGNATURE_PROBE_FAILED");
-  const diagnostic = parseAuthenticodeDiagnostic(result.stdout);
+  const diagnostic = probeAuthenticode(path);
   const code = authenticodeFailureCode(diagnostic);
   if (code) {
     if (diagnostic) console.error(`WINDOWS_NATIVE_REBIND_AUTHENTICODE ${closedAuthenticodeDiagnostic(diagnostic)}`);
@@ -390,7 +434,10 @@ export async function rebindWindowsNativeModules(options = {}) { return rebind(o
 /** Synthetic dependency seam; product code never imports this operations tool. */
 export async function rebindWindowsNativeModulesForTest(options, dependencies) { return rebind(options, dependencies); }
 export function parseWindowsNativeRebindingArguments(argv) {
-  const mode = argv[0] === "--prepare" ? "prepare" : argv[0] === "--rebind" ? "rebind" : "inspect";
+  const mode = argv[0] === "--prepare" ? "prepare"
+    : argv[0] === "--rebind" ? "rebind"
+      : argv[0] === "--probe-authenticode-pre-sign" ? "probe"
+        : "inspect";
   const args = mode === "inspect" ? argv : argv.slice(1);
   if (args.length !== 2 || args[0] !== "--candidate-receipt" || !args[1] || args[1].includes("\0")) fail("ARGUMENT_INVALID");
   return { mode, candidateReceiptPath: args[1] };
@@ -398,7 +445,8 @@ export function parseWindowsNativeRebindingArguments(argv) {
 if (process.argv[1] && resolve(process.argv[1]) === SCRIPT) {
   const main = async () => {
     const { mode, ...options } = parseWindowsNativeRebindingArguments(process.argv.slice(2));
-    const run = { inspect: inspectWindowsNativeRebinding, prepare: prepareWindowsNativeRebinding, rebind: rebindWindowsNativeModules }[mode];
+    const run = { inspect: inspectWindowsNativeRebinding, prepare: prepareWindowsNativeRebinding,
+      probe: probeAuthenticodeBeforeSigning, rebind: rebindWindowsNativeModules }[mode];
     console.log(JSON.stringify(await run(options)));
   };
   main().catch((error) => { console.error(error.code?.startsWith("WINDOWS_NATIVE_REBIND_") ? error.code : "WINDOWS_NATIVE_REBIND_FAILED"); process.exitCode = 1; });
