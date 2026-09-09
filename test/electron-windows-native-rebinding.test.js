@@ -16,7 +16,7 @@ import {
 } from "../scripts/rebind-electron-windows-native-modules.mjs";
 const FS = "native/windows-filesystem/build/Release/windows_filesystem.node";
 const SIDECAR = `${FS}.manifest.json`;
-const KEYTAR = "node_modules/@github/keytar/build/Release/keytar.node";
+const KEYTAR = "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node";
 const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
 const json = (value) => `${JSON.stringify(value, null, 2)}\n`;
 function native() {
@@ -90,7 +90,15 @@ test("native content digest permits Authenticode fields only and rejects malform
   assert.throws(() => windowsNativeUnsignedContentDigest(truncated), { code: "WINDOWS_NATIVE_REBIND_PE_INVALID" });
   assert.throws(() => windowsNativeUnsignedContentDigest(Buffer.alloc(512)), { code: "WINDOWS_NATIVE_REBIND_PE_INVALID" });
 });
-test("inspect does not write; prepare is no-clobber and binds exact candidate", async () => {
+test("inspect uses the exact Windows keytar prebuild selected for packaging, then prepare is no-clobber", async () => {
+  const releaseConfig = await readFile(
+    new URL("../apps/electron/electron-builder.release.config.cjs", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    releaseConfig,
+    /"node_modules\/@github\/keytar\/prebuilds\/win32-x64\/keytar\.node"/u,
+  );
   await fixture(async ({ options, dependencies, base }) => {
     assert.equal((await inspectWindowsNativeRebinding(options, dependencies)).status, "original_stage_verified");
     await assert.rejects(readFile(join(base, "windows-native-rebinding/journal.json")), { code: "ENOENT" });

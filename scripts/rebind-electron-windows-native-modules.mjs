@@ -17,7 +17,10 @@ const ROOT = resolve(dirname(SCRIPT), "..");
 const SCHEMA = "tibotattle-windows-native-rebinding-v1";
 const FS = "native/windows-filesystem/build/Release/windows_filesystem.node";
 const SIDECAR = `${FS}.manifest.json`;
-const KEYTAR = "node_modules/@github/keytar/build/Release/keytar.node";
+// This is the shipped Windows N-API prebuild. The source candidate is staged
+// after an install with lifecycle scripts disabled, so `build/Release` is not
+// present; the production builder unpacks this same fixed prebuild path.
+const KEYTAR = "node_modules/@github/keytar/prebuilds/win32-x64/keytar.node";
 const MANIFEST = "electron-runtime-manifest.json";
 const NATIVES = Object.freeze([FS, KEYTAR]);
 const MAX_FILE = 128 * 1024 * 1024;

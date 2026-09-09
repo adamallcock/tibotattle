@@ -32,7 +32,8 @@ test("Windows signing workflow registers safely, while signing stays manual and 
   assert.match(workflow, /exclude-azure-cli-credential: false/u);
   assert.match(workflow, /cache-dependencies: false/u);
   assert.match(workflow, /windows_filesystem\.node/u);
-  assert.match(workflow, /@github\\keytar\\build\\Release\\keytar\.node/u);
+  assert.match(workflow, /@github\\keytar\\prebuilds\\win32-x64\\keytar\.node/u);
+  assert.doesNotMatch(workflow, /@github\\keytar\\build\\Release\\keytar\.node/u);
   assert.match(workflow, /--sign --confirm-azure-trusted-signing/u);
   assert.doesNotMatch(workflow, /--publish\s+(?!never)/u);
   assert.match(workflow, /WINDOWS_SIGNED_INSTALLER_VERIFIED/u);

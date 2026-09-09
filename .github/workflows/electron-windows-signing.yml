@@ -151,7 +151,7 @@ jobs:
           certificate-profile-name: ${{ vars.AZURE_CODE_SIGNING_PROFILE_NAME }}
           files: |
             ${{ github.workspace }}\.release-build\electron-production\win32-x64\app\native\windows-filesystem\build\Release\windows_filesystem.node
-            ${{ github.workspace }}\.release-build\electron-production\win32-x64\app\node_modules\@github\keytar\build\Release\keytar.node
+            ${{ github.workspace }}\.release-build\electron-production\win32-x64\app\node_modules\@github\keytar\prebuilds\win32-x64\keytar.node
           file-digest: SHA256
           timestamp-rfc3161: http://timestamp.acs.microsoft.com
           timestamp-digest: SHA256
