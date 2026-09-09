@@ -16,6 +16,9 @@ import {
   HANDOVER_PREFIX,
   HANDOVER_SOURCE_REVISION,
   NEXT_VERSION,
+  QUALIFIED_CURRENT_VERSION,
+  QUALIFIED_HANDOVER_SOURCE_REVISION,
+  QUALIFIED_NEXT_VERSION,
   parseElectronHandoverFeedPublisherArguments,
   publishElectronHandoverRehearsalFeed,
 } from "../scripts/publish-electron-handover-rehearsal-feed.mjs";
@@ -206,7 +209,29 @@ async function fixture(run) {
       });
       return { ...followUp, corrected, predecessorReceiptPath };
     };
-    return await run({ root, proposal, proposalPath, makeCorrected, makeFollowUp });
+    const makeQualified = async ({ predecessorState = "advance" } = {}) => {
+      const followUp = await makeFollowUp();
+      const predecessorReceiptPath = join(root, `follow-up-${predecessorState}.receipt.json`);
+      await writeFile(predecessorReceiptPath, JSON.stringify(completedPublicationReceipt({
+        proposal: followUp.proposal,
+        sourceRevision: FOLLOW_UP_HANDOVER_SOURCE_REVISION,
+        state: predecessorState,
+      })));
+      const qualified = await makeFamilyProposal({
+        root,
+        directory: "qualified",
+        sourceRevision: QUALIFIED_HANDOVER_SOURCE_REVISION,
+        currentVersion: QUALIFIED_CURRENT_VERSION,
+        nextVersion: QUALIFIED_NEXT_VERSION,
+        predecessor: {
+          state: predecessorState,
+          proposal: { localPath: "follow-up.proposal.json", sha256: sha256(await readFile(followUp.proposalPath)) },
+          publicationReceipt: { localPath: `follow-up-${predecessorState}.receipt.json`, sha256: sha256(await readFile(predecessorReceiptPath)) },
+        },
+      });
+      return { ...qualified, followUp, predecessorReceiptPath };
+    };
+    return await run({ root, proposal, proposalPath, makeCorrected, makeFollowUp, makeQualified });
   } finally { await rm(root, { recursive: true, force: true }); }
 }
 function fakeWrangler(objects, calls, { failPut = () => false } = {}) {
@@ -516,4 +541,175 @@ test("follow-up initial retry writes only the target still at the bound .14 feed
   assert.deepEqual(retryFeedPuts.map((args) => args[3]), [
     `tibotattle-updates/${followUp.proposal.initialPublication["darwin-x64"].manifest.objectKey}`,
   ]);
+}));
+
+test("qualified family starts only from .16, then advances and rolls back without replacing historical archives", async () => fixture(async ({ root, makeQualified }) => {
+  const qualified = await makeQualified();
+  const objects = new Map(); const calls = []; const runner = fakeWrangler(objects, calls);
+  for (const target of TARGETS) {
+    const predecessor = qualified.followUp.proposal.feedAdvance[target].replaceOnlyManifest;
+    objects.set(`tibotattle-updates/${predecessor.objectKey}`, await readFile(join(root, predecessor.localPath)));
+  }
+  const initialReceiptPath = join(root, "qualified-initial.json");
+  await publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: qualified.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: initialReceiptPath,
+    runWrangler: runner,
+  });
+  const initialReceipt = JSON.parse(await readFile(initialReceiptPath));
+  assert.equal(initialReceipt.sourceRevision, QUALIFIED_HANDOVER_SOURCE_REVISION);
+  for (const target of TARGETS) {
+    const key = `tibotattle-updates/${qualified.proposal.initialPublication[target].manifest.objectKey}`;
+    assert.deepEqual(objects.get(key), await readFile(join(root, qualified.proposal.initialPublication[target].manifest.localPath)));
+  }
+  await publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: qualified.proposalPath,
+    stage: "advance",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "qualified-advance.json"),
+    runWrangler: runner,
+  });
+  await publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: qualified.proposalPath,
+    stage: "rollback",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "qualified-rollback.json"),
+    runWrangler: runner,
+  });
+  for (const target of TARGETS) {
+    const key = `tibotattle-updates/${qualified.proposal.initialPublication[target].manifest.objectKey}`;
+    assert.deepEqual(objects.get(key), await readFile(join(root, qualified.proposal.rollback[target].restoreOnlyManifest.localPath)));
+  }
+  const historicalArchivePuts = calls.filter((args) => (
+    args[2] === "put"
+    && /native-to-electron-handover\.(?:11|12|13|14|15|16)-mac-/u.test(args[3])
+  ));
+  assert.deepEqual(historicalArchivePuts, []);
+}));
+
+test("qualified family refuses forged source or receipt, a .15 proof, and a .15 remote feed before puts", async () => fixture(async ({ root, makeQualified }) => {
+  const calls = [];
+  const forgedSource = await makeQualified();
+  forgedSource.proposal.sourceRevision = "0".repeat(40);
+  await writeFile(forgedSource.proposalPath, JSON.stringify(forgedSource.proposal));
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: forgedSource.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "forged-source.json"),
+    runWrangler: fakeWrangler(new Map(), calls),
+  }), { code: "ELECTRON_HANDOVER_FEED_INVALID" });
+  assert.equal(calls.filter((args) => args[2] === "put").length, 0);
+
+  const rollbackProof = await makeQualified({ predecessorState: "rollback" });
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: rollbackProof.proposalPath,
+    stage: "initial",
+  }), { code: "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID" });
+
+  const forgedPredecessorSource = await makeQualified();
+  forgedPredecessorSource.followUp.proposal.sourceRevision = "f".repeat(40);
+  await writeFile(forgedPredecessorSource.followUp.proposalPath, JSON.stringify(forgedPredecessorSource.followUp.proposal));
+  forgedPredecessorSource.proposal.predecessor.proposal.sha256 = sha256(await readFile(forgedPredecessorSource.followUp.proposalPath));
+  await writeFile(forgedPredecessorSource.proposalPath, JSON.stringify(forgedPredecessorSource.proposal));
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: forgedPredecessorSource.proposalPath,
+    stage: "initial",
+  }), { code: "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID" });
+
+  const forgedReceipt = await makeQualified();
+  const receipt = JSON.parse(await readFile(forgedReceipt.predecessorReceiptPath));
+  receipt.targets["darwin-arm64"].immutableKeys.reverse();
+  await writeFile(forgedReceipt.predecessorReceiptPath, JSON.stringify(receipt));
+  forgedReceipt.proposal.predecessor.publicationReceipt.sha256 = sha256(await readFile(forgedReceipt.predecessorReceiptPath));
+  await writeFile(forgedReceipt.proposalPath, JSON.stringify(forgedReceipt.proposal));
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: forgedReceipt.proposalPath,
+    stage: "initial",
+  }), { code: "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID" });
+
+  const valid = await makeQualified();
+  const remoteObjects = new Map();
+  for (const target of TARGETS) {
+    const old = valid.followUp.proposal.initialPublication[target].manifest;
+    remoteObjects.set(`tibotattle-updates/${old.objectKey}`, await readFile(join(root, old.localPath)));
+  }
+  const remoteCalls = [];
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: valid.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "remote-.15.json"),
+    runWrangler: fakeWrangler(remoteObjects, remoteCalls),
+  }), { code: "ELECTRON_HANDOVER_FEED_FEED_CONFLICT" });
+  assert.equal(remoteCalls.filter((args) => args[2] === "put").length, 0);
+}));
+
+test("qualified initial retry writes only the target still at the bound .16 feed", async () => fixture(async ({ root, makeQualified }) => {
+  const qualified = await makeQualified();
+  const objects = new Map(); const calls = [];
+  for (const target of TARGETS) {
+    const predecessor = qualified.followUp.proposal.feedAdvance[target].replaceOnlyManifest;
+    objects.set(`tibotattle-updates/${predecessor.objectKey}`, await readFile(join(root, predecessor.localPath)));
+  }
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: qualified.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "qualified-mixed-first.json"),
+    runWrangler: fakeWrangler(objects, calls, {
+      failPut: (key) => key.endsWith("darwin-x64/native-to-electron-handover-mac.yml"),
+    }),
+  }), { code: "ELECTRON_HANDOVER_FEED_R2_WRITE_FAILED" });
+  const retryCalls = [];
+  await publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: qualified.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "qualified-mixed-retry.json"),
+    runWrangler: fakeWrangler(objects, retryCalls),
+  });
+  const retryFeedPuts = retryCalls.filter((args) => (
+    args[2] === "put" && args[3].endsWith("native-to-electron-handover-mac.yml")
+  ));
+  assert.deepEqual(retryFeedPuts.map((args) => args[3]), [
+    `tibotattle-updates/${qualified.proposal.initialPublication["darwin-x64"].manifest.objectKey}`,
+  ]);
+}));
+
+
+test("qualified family retains the complete nested historical artifact proof", async () => fixture(async ({ root, proposal, makeQualified }) => {
+  const qualified = await makeQualified();
+  const historicalArchive = proposal.initialPublication["darwin-arm64"].objects[0];
+  await writeFile(join(root, historicalArchive.localPath), "changed historical .11 archive");
+  const calls = [];
+  await assert.rejects(() => publishElectronHandoverRehearsalFeed({
+    artifactRoot: root,
+    proposalPath: qualified.proposalPath,
+    stage: "initial",
+    publish: true,
+    confirmExclusiveRehearsalControl: true,
+    receiptPath: join(root, "deep-lineage-invalid.json"),
+    runWrangler: fakeWrangler(new Map(), calls),
+  }), { code: "ELECTRON_HANDOVER_FEED_PREDECESSOR_INVALID" });
+  assert.deepEqual(calls, []);
 }));

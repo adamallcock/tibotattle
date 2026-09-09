@@ -28,6 +28,9 @@ export const CORRECTED_NEXT_VERSION = "0.1.19-native-to-electron-handover.14";
 export const FOLLOW_UP_HANDOVER_SOURCE_REVISION = "dcf2d6caddbcded88dcadfe6c52282a6cd21afb5";
 export const FOLLOW_UP_CURRENT_VERSION = "0.1.19-native-to-electron-handover.15";
 export const FOLLOW_UP_NEXT_VERSION = "0.1.19-native-to-electron-handover.16";
+export const QUALIFIED_HANDOVER_SOURCE_REVISION = "7293828ade187f6fd9e50c67d7018704150ca156";
+export const QUALIFIED_CURRENT_VERSION = "0.1.19-native-to-electron-handover.17";
+export const QUALIFIED_NEXT_VERSION = "0.1.19-native-to-electron-handover.18";
 const PROPOSAL_SCHEMA = "tibotattle-private-updater-publication-proposal-v1";
 // A successor family retains this same proposal shape. Its source revision and
 // statically selected predecessor family remain the closed authority.
@@ -62,7 +65,17 @@ const FOLLOW_UP_FAMILY = Object.freeze({
   predecessorFamily: CORRECTED_FAMILY,
   predecessorStates: Object.freeze(["advance"]),
 });
-const FAMILIES = Object.freeze([LEGACY_FAMILY, CORRECTED_FAMILY, FOLLOW_UP_FAMILY]);
+const QUALIFIED_FAMILY = Object.freeze({
+  id: "7293828a-17-18",
+  sourceRevision: QUALIFIED_HANDOVER_SOURCE_REVISION,
+  schema: PREDECESSOR_PROPOSAL_SCHEMA,
+  currentVersion: QUALIFIED_CURRENT_VERSION,
+  nextVersion: QUALIFIED_NEXT_VERSION,
+  // A completed .16 advance preserves the entire validated predecessor chain.
+  predecessorFamily: FOLLOW_UP_FAMILY,
+  predecessorStates: Object.freeze(["advance"]),
+});
+const FAMILIES = Object.freeze([LEGACY_FAMILY, CORRECTED_FAMILY, FOLLOW_UP_FAMILY, QUALIFIED_FAMILY]);
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_ARTIFACT_BYTES = 2 * 1024 * 1024 * 1024;
 const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
