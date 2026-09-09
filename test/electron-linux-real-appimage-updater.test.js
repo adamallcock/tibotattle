@@ -4,7 +4,7 @@ import { mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { linuxUpdaterRehearsalVersions, linuxAppImageIdentity } from "../scripts/build-linux-updater-rehearsal.mjs";
-import { validateLinuxRealUpdaterPair, realUpdaterFeed } from "../scripts/smoke-electron-linux-real-appimage-updater.mjs";
+import { validateLinuxRealUpdaterPair, realUpdaterFeed, isLinuxUpdaterSettingsURL, prepareLinuxUpdaterDownload } from "../scripts/smoke-electron-linux-real-appimage-updater.mjs";
 import { readProductionDistribution } from "../apps/electron/main.js";
 import { createProductionDistributionMetadata } from "../apps/electron/desktop-updater.js";
 const revision = "a".repeat(40);
@@ -80,4 +80,30 @@ test("both private versions retain the ordinary stable package authority", async
     assert.equal(actual.channel, "stable");
     assert.equal(actual.updateFeed, pair().feed);
   }
+});
+
+test("real Settings selection accepts ordinary section hashes only on the owned dashboard", () => {
+  assert.equal(isLinuxUpdaterSettingsURL("http://127.0.0.1:1234/electron-settings.html#general", "http://127.0.0.1:1234"), true);
+  for (const url of ["http://127.0.0.1:1235/electron-settings.html#general", "https://example.com/electron-settings.html", "http://127.0.0.1:1234/electron-settings.html?other", "http://127.0.0.1:1234/"]) {
+    assert.equal(isLinuxUpdaterSettingsURL(url, "http://127.0.0.1:1234"), false);
+  }
+});
+test("Settings opening after automatic download still proceeds to install", async () => {
+  const calls = [];
+  const downloaded = { canCheck: false, canDownload: false, canInstall: true, status: "downloaded" };
+  const result = await prepareLinuxUpdaterDownload({ readUpdate: async () => downloaded,
+    click: async (action) => calls.push(action), automaticDownload: true });
+  assert.deepEqual(calls, []);
+  assert.deepEqual(result, { check: "automatic", download: "automatic" });
+});
+test("manual update path clicks each action once while automatic in-flight download needs none", async () => {
+  const downloaded = { canInstall: true, status: "downloaded" };
+  let update = { canCheck: true, status: "ready" }; const calls = [];
+  await prepareLinuxUpdaterDownload({ readUpdate: async () => update, automaticDownload: false,
+    click: async (action) => { calls.push(action); update = action === "check" ? { canDownload: true, status: "available" } : downloaded; } });
+  assert.deepEqual(calls, ["check", "download"]);
+  let reads = 0;
+  const result = await prepareLinuxUpdaterDownload({ readUpdate: async () => ++reads < 3 ? { status: "downloading" } : downloaded,
+    automaticDownload: true, click: async () => assert.fail("automatic download already in progress") });
+  assert.deepEqual(result, { check: "automatic", download: "automatic" });
 });

@@ -41,6 +41,34 @@ export function realUpdaterFeed(pair) {
   const next = pair.images.next;
   return `version: ${next.version}\nfiles:\n  - url: next.AppImage\n    sha512: ${next.sha512}\n    size: ${next.bytes}\npath: next.AppImage\nsha512: ${next.sha512}\nreleaseDate: '2026-09-09T00:00:00.000Z'\n`;
 }
+export function isLinuxUpdaterSettingsURL(value, dashboardOrigin) {
+  try {
+    const url = new URL(value); const dashboard = new URL(dashboardOrigin);
+    return dashboard.protocol === "http:" && dashboard.hostname === "127.0.0.1"
+      && url.origin === dashboard.origin && url.pathname === "/electron-settings.html"
+      && url.search === "" && url.username === "" && url.password === "";
+  } catch { return false; }
+}
+
+/** Normal automatic startup may finish before Settings opens. Do not wait for
+ * a Check button that correctly stays disabled after a completed download. */
+export async function prepareLinuxUpdaterDownload({ readUpdate, click, automaticDownload, wait = waitFor }) {
+  let update = await readUpdate();
+  let check = "automatic"; let download = "automatic";
+  if (update.canCheck && !update.canDownload && !update.canInstall) {
+    await click("check"); check = "settings_button";
+  }
+  update = await wait(async () => {
+    const value = await readUpdate();
+    return value.canDownload || value.canInstall || value.status === "downloading" ? value : null;
+  });
+  if (update.canDownload && !automaticDownload) {
+    await click("download"); download = "settings_button";
+  }
+  await wait(async () => (await readUpdate()).canInstall === true, 120000);
+  return { check, download };
+}
+
 function command(name, args, options = {}) {
   const result = spawnSync(name, args, { stdio: "ignore", timeout: 15000, shell: false, ...options });
   if (result.error || result.status !== 0 || result.signal) fail("LOCAL_TRUST_SETUP_FAILED");
@@ -146,21 +174,27 @@ export async function runRealLinuxAppImageUpdater() {
     child = spawn(image, [`--remote-debugging-port=${port}`, "--remote-debugging-address=127.0.0.1", "--disable-gpu"], { env: environment, stdio: "ignore" });
     child.on("error", () => {});
     dashboard = await connectPage(port, (url) => /^http:\/\/127\.0\.0\.1:\d+\/$/u.test(url));
+    stage = "dashboard_ready";
     await waitFor(() => dashboard.evaluate("document.documentElement?.dataset?.localDashboardReady === 'true'"));
     await dashboard.evaluate("globalThis.tibotattleDesktop.openSettings()");
-    settings = await connectPage(port, (url) => url.endsWith("/electron-settings.html"));
-    await waitFor(() => settings.evaluate("document.querySelector('#settings-check-for-updates')?.disabled === false"));
+    stage = "settings_ready";
+    const dashboardOrigin = await dashboard.evaluate("location.origin");
+    settings = await connectPage(port, (url) => isLinuxUpdaterSettingsURL(url, dashboardOrigin));
+    await waitFor(() => settings.evaluate("typeof globalThis.tibotattleDesktop?.getSettings === 'function' && document.querySelector('#settings-tab-about') !== null"));
     stage = "current_preferences";
     const before = await settings.evaluate("globalThis.tibotattleDesktop.getSettings()");
     if (before.about.version !== pair.images.current.version) fail("CURRENT_VERSION_MISMATCH");
     await settings.evaluate("globalThis.tibotattleDesktop.setRefreshInterval(900)");
     if ((await settings.evaluate("globalThis.tibotattleDesktop.getSharingPreference()")).enabled !== false) fail("OPT_OUT_MISSING");
-    stage = "update_check";
-    await settings.evaluate("document.querySelector('#settings-tab-about').click(); document.querySelector('#settings-check-for-updates').click()");
-    await waitFor(async () => (await settings.evaluate("globalThis.tibotattleDesktop.getSettings()")).about.update.canDownload === true);
     stage = "update_download";
-    await settings.evaluate("document.querySelector('#settings-download-update').click()");
-    await waitFor(async () => (await settings.evaluate("globalThis.tibotattleDesktop.getSettings()")).about.update.canInstall === true, 120000);
+    await settings.evaluate("document.querySelector('#settings-tab-about').click()");
+    receipt.updateInitiation = await prepareLinuxUpdaterDownload({
+      readUpdate: async () => (await settings.evaluate("globalThis.tibotattleDesktop.getSettings()")).about.update,
+      automaticDownload: before.about.automaticUpdates.enabled === true,
+      click: async (action) => settings.evaluate(action === "check"
+        ? "document.querySelector('#settings-check-for-updates').click()"
+        : "document.querySelector('#settings-download-update').click()"),
+    });
     const oldPids = new Set(await appPids(image));
     if (!oldPids.size) fail("CURRENT_PROCESS_MISSING");
     stage = "update_install";
