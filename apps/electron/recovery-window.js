@@ -3,8 +3,8 @@
  *
  * This window is deliberately independent from the loopback dashboard. It is
  * loaded from a fixed data URL, uses an in-memory Electron session, and has a
- * one-way IPC vocabulary containing only Retry, Settings, and Quit. That lets
- * the desktop process stay alive when the private companion cannot produce a
+ * one-way IPC vocabulary containing only Retry, Settings, Diagnostics, and Quit.
+ * That lets the desktop process stay alive when the private companion cannot produce a
  * ready line without giving a not-yet-authorized renderer a desktop bridge.
  */
 
@@ -245,9 +245,14 @@ export function installRecoveryWindowPolicy({
   };
   const onWillAttachWebview = (event) => event?.preventDefault?.();
   const onIPCMessage = (event, channel, ...values) => {
-    if (channel !== RECOVERY_ACTION_CHANNEL
+    // Routing IDs are assigned by Chromium and the main frame need not be zero.
+    // Authorize the actual current main frame; detached or missing frames fail
+    // closed instead of relying on a numeric ID or accepting absent metadata.
+    const mainFrame = webContents.mainFrame;
+    if (mainFrame === null || mainFrame === undefined
+        || event?.senderFrame !== mainFrame
+        || channel !== RECOVERY_ACTION_CHANNEL
         || event?.sender !== webContents
-        || event?.frameId !== undefined && event.frameId !== 0
         || values.length !== 1
         || !validAction(values[0])) {
       return;

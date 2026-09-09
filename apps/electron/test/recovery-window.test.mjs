@@ -196,14 +196,17 @@ test("recovery page is fixed, content-free, and never permits remote navigation"
   assert.deepEqual(webContents.windowOpenHandler(), { action: "deny" });
   webContents.emit("ipc-message", {
     sender: webContents,
-    frameId: 0,
+    senderFrame: webContents.mainFrame,
+    frameId: 1,
   }, RECOVERY_ACTION_CHANNEL, "retry");
   webContents.emit("ipc-message", {
     sender: {},
-    frameId: 0,
+    senderFrame: webContents.mainFrame,
+    frameId: 1,
   }, RECOVERY_ACTION_CHANNEL, "quit");
   webContents.emit("ipc-message", {
     sender: webContents,
+    senderFrame: { parent: webContents.mainFrame },
     frameId: 1,
   }, RECOVERY_ACTION_CHANNEL, "quit");
   assert.deepEqual(actions, ["retry"]);
@@ -222,20 +225,47 @@ test("recovery Diagnostics accepts only an authorized main-frame IPC message", (
 
   webContents.emit("ipc-message", {
     sender: webContents,
-    frameId: 0,
+    senderFrame: webContents.mainFrame,
+    frameId: 1,
   }, RECOVERY_ACTION_CHANNEL, "diagnostics");
   webContents.emit("ipc-message", {
     sender: {},
-    frameId: 0,
-  }, RECOVERY_ACTION_CHANNEL, "diagnostics");
-  webContents.emit("ipc-message", {
-    sender: webContents,
+    senderFrame: webContents.mainFrame,
     frameId: 1,
   }, RECOVERY_ACTION_CHANNEL, "diagnostics");
   webContents.emit("ipc-message", {
     sender: webContents,
-    frameId: 0,
+    senderFrame: { parent: webContents.mainFrame },
+    frameId: 1,
+  }, RECOVERY_ACTION_CHANNEL, "diagnostics");
+  webContents.emit("ipc-message", {
+    sender: webContents,
+    senderFrame: webContents.mainFrame,
+    frameId: 1,
   }, RECOVERY_ACTION_CHANNEL, "unknown");
+
+  // A destroyed frame, missing frame metadata, or missing current main frame
+  // cannot authorize even an otherwise valid action.
+  for (const senderFrame of [null, undefined]) {
+    webContents.emit("ipc-message", {
+      sender: webContents,
+      senderFrame,
+      frameId: 0,
+    }, RECOVERY_ACTION_CHANNEL, "diagnostics");
+  }
+  const previousMainFrame = webContents.mainFrame;
+  webContents.mainFrame = { parent: null };
+  webContents.emit("ipc-message", {
+    sender: webContents,
+    senderFrame: previousMainFrame,
+    frameId: 1,
+  }, RECOVERY_ACTION_CHANNEL, "diagnostics");
+  webContents.mainFrame = null;
+  webContents.emit("ipc-message", {
+    sender: webContents,
+    senderFrame: null,
+    frameId: 0,
+  }, RECOVERY_ACTION_CHANNEL, "diagnostics");
 
   assert.deepEqual(actions, ["diagnostics"]);
   policy.remove();
@@ -280,7 +310,8 @@ test("recovery Settings routes only to the supplied main-process action", async 
   const recovery = recoveryWindows(windows)[0];
   recovery.webContents.emit("ipc-message", {
     sender: recovery.webContents,
-    frameId: 0,
+    senderFrame: recovery.webContents.mainFrame,
+    frameId: 1,
   }, RECOVERY_ACTION_CHANNEL, "settings");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(settingsCalls, 1);
@@ -349,7 +380,8 @@ test("failed initial launch leaves a visible recovery surface and Retry promotes
 
   recovery.webContents.emit("ipc-message", {
     sender: recovery.webContents,
-    frameId: 0,
+    senderFrame: recovery.webContents.mainFrame,
+    frameId: 1,
   }, RECOVERY_ACTION_CHANNEL, "retry");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(supervisor.starts, 2);
@@ -368,7 +400,8 @@ test("recovery Quit tears down the companion and app without exposing the error"
   const recovery = recoveryWindows(windows)[0];
   recovery.webContents.emit("ipc-message", {
     sender: recovery.webContents,
-    frameId: 0,
+    senderFrame: recovery.webContents.mainFrame,
+    frameId: 1,
   }, RECOVERY_ACTION_CHANNEL, "quit");
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(app.quitCalls, 1);
@@ -443,7 +476,8 @@ test("createRecoveryWindow exposes only a fixed preload and action surface", () 
   assert.equal(recovery.status, "companion_spawn_failed");
   recovery.window.webContents.emit("ipc-message", {
     sender: recovery.window.webContents,
-    frameId: 0,
+    senderFrame: recovery.window.webContents.mainFrame,
+    frameId: 1,
   }, RECOVERY_ACTION_CHANNEL, "settings");
   assert.deepEqual(actions, ["settings"]);
   recovery.destroy();
