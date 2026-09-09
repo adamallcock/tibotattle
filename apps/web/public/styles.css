@@ -3774,6 +3774,8 @@ footer p { margin: 0; }
 .allowance-model-terra { --allowance-color: #586a3b; }
 .allowance-model-luna { --allowance-color: #676b8c; }
 .allowance-model-classic { --allowance-color: #68665f; }
+.allowance-model-review { --allowance-color: #365f54; }
+.allowance-model-mini { --allowance-color: #68665f; }
 .allowance-series-0 { --allowance-color: #42636c; }
 .allowance-series-1 { --allowance-color: #ac4b16; }
 .allowance-series-2 { --allowance-color: #7542a0; }
