@@ -91,13 +91,24 @@ test('fresh proof cannot substitute a saved user choice or a forged native resul
 });
 
 
-test('fresh-only receipt does not claim the seeded restart or upload journey', async () => {
+test('fresh-install continues the real native-consent process through upload, restart and opt-out', async () => {
   const { readFile } = await import('node:fs/promises');
   const source = await readFile(new URL('../scripts/run-signed-electron-staging.mjs', import.meta.url), 'utf8');
-  assert.match(source, /durableOptOut: false, controlledRestart: false/u);
+  const freshStart = source.indexOf('if (untouched) {');
+  const automaticUpload = source.indexOf("stage = 'automatic_upload'", freshStart);
+  const controlledRestart = source.indexOf("stage = 'credential_restart'", automaticUpload);
+  const durableOptOut = source.indexOf('proof.durableOptOut = true', controlledRestart);
+  assert.ok(freshStart >= 0);
+  assert.ok(automaticUpload > freshStart);
+  assert.ok(controlledRestart > automaticUpload);
+  assert.ok(durableOptOut > controlledRestart);
+  const freshBranch = source.slice(freshStart, automaticUpload);
+  assert.match(freshBranch, /proof\.freshDefaultOnObserved = assertSignedStagingFreshProjection/u);
+  assert.equal(freshBranch.includes('await stop(active)'), false);
+  assert.equal(freshBranch.includes('return proof;'), false);
+  assert.match(source.slice(automaticUpload, controlledRestart), /active \?\?= await launch\(verified, environment\)/u);
   assert.equal((source.match(/proof\.controlledRestart = true/gu) ?? []).length, 1);
-  assert.ok(source.indexOf("stage = 'credential_restart'") < source.indexOf('proof.controlledRestart = true'));
-  assert.ok(source.indexOf('return proof;', source.indexOf('if (untouched) {')) < source.indexOf('proof.controlledRestart = true'));
+  assert.ok(controlledRestart < source.indexOf('proof.controlledRestart = true', controlledRestart));
 });
 
 

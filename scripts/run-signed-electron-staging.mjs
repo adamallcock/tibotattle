@@ -267,13 +267,12 @@ export async function runSignedStagingExecution(options) {
         || metadata.size > 4096 || metadata.nlink !== 1) fail('fresh_classification');
       const receipt = JSON.parse(await readFile(receiptPath, 'utf8'));
       proof.freshDefaultOnObserved = assertSignedStagingFreshProjection(await active.readSharing(), receipt);
-      await stop(active); active = null;
-      proof.ownedProcessesStopped = true;
-      proof.status = 'passed';
-      return proof;
     }
     stage = 'automatic_upload';
-    active = await launch(verified, environment);
+    // Fresh-install reaches this point through the real native Continue path.
+    // Keep that verified owned process alive so the same untouched profile
+    // performs the first automatic upload before the controlled restart below.
+    active ??= await launch(verified, environment);
     const accepted = await waitFor(async () => {
       const value = await active.readSharing();
       return value?.enabled === true && value.basis === 'default_on'
