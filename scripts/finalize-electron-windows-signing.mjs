@@ -82,6 +82,10 @@ const SYSTEM_ENVIRONMENT_ALLOWLIST = Object.freeze([
 ]);
 
 const AZURE_CLI_ACCOUNT_SHOW_COMMAND = "az account show --only-show-errors --output none";
+// The supported GitHub-hosted Windows image provisions this machine-level
+// cache outside USERPROFILE. Preserve only this fixed Azure CLI state path;
+// no token or other ambient Azure credential setting enters the builder.
+const GITHUB_HOSTED_AZURE_CLI_CONFIGURATION_DIRECTORY = "C:\\azureCli";
 const AZURE_CLI_LAUNCH_ERROR_CODES = new Set(["EACCES", "ENOENT"]);
 const AZURE_CLI_AUTHENTICATION_OUTPUT = /(?:please\s+run\s+['"]?az\s+login|not\s+logged\s+in|aadsts)/iu;
 const AZURE_CLI_COMMAND_OUTPUT = /(?:not\s+recognized\s+as\s+(?:an\s+internal\s+or\s+external\s+command|the\s+name\s+of)|command\s+not\s+found)/iu;
@@ -228,6 +232,16 @@ function resourceEnvironmentPresent(environment) {
   return AZURE_RESOURCE_ENVIRONMENT.every((name) => safeString(environment?.[name], 256));
 }
 
+function trustedAzureCliConfigurationDirectory(environment) {
+  const value = environment?.AZURE_CONFIG_DIR;
+  if (!safeString(value, 32 * 1024)) return null;
+  const normalized = win32.normalize(value);
+  if (!win32.isAbsolute(normalized)) return null;
+  const canonical = normalized.replace(/[\\/]+$/u, "").toLowerCase();
+  if (canonical !== GITHUB_HOSTED_AZURE_CLI_CONFIGURATION_DIRECTORY.toLowerCase()) return null;
+  return GITHUB_HOSTED_AZURE_CLI_CONFIGURATION_DIRECTORY;
+}
+
 function createBuilderEnvironment({ candidatePath, candidate, environment }) {
   const selected = {};
   for (const name of SYSTEM_ENVIRONMENT_ALLOWLIST) {
@@ -235,6 +249,10 @@ function createBuilderEnvironment({ candidatePath, candidate, environment }) {
   }
   for (const name of AZURE_RESOURCE_ENVIRONMENT) {
     if (safeString(environment?.[name], 256)) selected[name] = environment[name];
+  }
+  const azureCliConfigurationDirectory = trustedAzureCliConfigurationDirectory(environment);
+  if (azureCliConfigurationDirectory !== null) {
+    selected.AZURE_CONFIG_DIR = azureCliConfigurationDirectory;
   }
   Object.assign(selected, {
     TIBOTATTLE_ELECTRON_BUILD_NUMBER: candidate.buildNumber,
@@ -425,6 +443,9 @@ export async function invokeElectronWindowsSigning({ candidateReceiptPath } = {}
     candidatePath: selectedCandidatePath,
     environment,
   });
+  if (builderEnvironment.AZURE_CONFIG_DIR !== GITHUB_HOSTED_AZURE_CLI_CONFIGURATION_DIRECTORY) {
+    fail("AZURE_CLI_CONFIG_DIRECTORY_UNAVAILABLE");
+  }
   const configurationPath = resolve(repositoryRoot, CONFIGURATION_RELATIVE_PATH);
   if (!successful(run(process.execPath, configValidationArguments(configurationPath), {
     environment: builderEnvironment,

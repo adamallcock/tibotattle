@@ -22,6 +22,7 @@ const RESOURCE_ENVIRONMENT = Object.freeze({
 });
 const WINDOWS_SIGNING_ENVIRONMENT = Object.freeze({
   ...RESOURCE_ENVIRONMENT,
+  AZURE_CONFIG_DIR: "C:\\azureCli",
   SystemRoot: "C:\\Windows",
 });
 
@@ -147,6 +148,8 @@ test("Windows signing invocation is explicit, strips ambient secrets, and keeps 
     const calls = [];
     const environment = {
       ...RESOURCE_ENVIRONMENT,
+      AZURE_CONFIG_DIR: "C:\\azureCli",
+      AZURE_EXTENSION_DIR: "must-not-reach-builder",
       CSC_LINK: "must-not-reach-builder",
       AZURE_CLIENT_SECRET: "must-not-reach-builder",
       PATH: "C:\\Windows\\System32",
@@ -179,9 +182,29 @@ test("Windows signing invocation is explicit, strips ambient secrets, and keeps 
     const builderEnvironment = calls.at(-1).environment;
     assert.equal(builderEnvironment.CSC_LINK, undefined);
     assert.equal(builderEnvironment.AZURE_CLIENT_SECRET, undefined);
+    assert.equal(builderEnvironment.AZURE_EXTENSION_DIR, undefined);
+    assert.equal(builderEnvironment.AZURE_CONFIG_DIR, "C:\\azureCli");
     assert.equal(builderEnvironment.TIBOTATTLE_ELECTRON_TARGET, "win32-x64");
     assert.equal(builderEnvironment.TIBOTATTLE_ELECTRON_WINDOWS_SOURCE_CANDIDATE_RECEIPT, candidatePath);
   });
+});
+
+test("Windows signing preserves only the fixed GitHub-hosted Azure CLI cache directory", async () => {
+  for (const environment of [
+    { ...WINDOWS_SIGNING_ENVIRONMENT, AZURE_CONFIG_DIR: undefined },
+    { ...WINDOWS_SIGNING_ENVIRONMENT, AZURE_CONFIG_DIR: "C:\\untrusted" },
+  ]) {
+    await withFixture(async ({ candidatePath, root }) => {
+      const calls = [];
+      const dependencies = testDependencies({ calls, environment });
+      dependencies.repositoryRoot = root;
+      await assert.rejects(
+        invokeElectronWindowsSigning({ candidateReceiptPath: candidatePath }, dependencies),
+        { code: "ELECTRON_WINDOWS_SIGNING_AZURE_CLI_CONFIG_DIRECTORY_UNAVAILABLE" },
+      );
+      assert.equal(calls.length, 0);
+    });
+  }
 });
 
 test("Windows signing classifies the fixed Azure CLI account probe without retaining its output", async () => {
