@@ -157,7 +157,9 @@ thread ID or Codex link. Name search covers the full report before pagination.
 A matching subworker brings back its task family; a matching project includes
 all its tasks. Search result rows show matching work, while summary totals,
 token mix and share denominators retain the selected period/model scope.
-**Clear search** restores the project list. Names and search terms stay local.
+Results update as you type after two characters and a short pause (300 ms).
+Deleting the text or shortening it below two characters restores the project
+list automatically. Names and search terms stay local.
 
 Small bars beside token and cost shares show their relative size. The token-mix
 strip separates cached and uncached input from recorded output categories;

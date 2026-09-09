@@ -186,6 +186,9 @@ export function mountWorkUsageView({
   let leaseTimer = null;
   let leaseController = null;
   let destroyed = false;
+  let searchTimer = null;
+  let searchPending = false;
+  let composing = false;
   const scheduleLease = windowRef.setTimeout?.bind(windowRef) ?? setTimeout;
   const clearLeaseTimer = windowRef.clearTimeout?.bind(windowRef) ?? clearTimeout;
   const visible = () => !destroyed && !root.inert && documentRef.visibilityState !== "hidden";
@@ -268,6 +271,8 @@ export function mountWorkUsageView({
       () => {
         ancestors = [];
         selectedTitle = null;
+        clearSearchTimer();
+        searchPending = false;
         input.value = "";
         delete query.project;
         delete query.worktree;
@@ -333,25 +338,53 @@ export function mountWorkUsageView({
   input.maxLength = 100;
   input.placeholder = tr("findHint");
   input.setAttribute("aria-label", tr("findHint"));
-  const find = button(tr("find"), () => {});
-  find.type = "submit";
-  const clearSearch = button(tr("clearSearch"), () => {
-    input.value = "";
-    applySearch("");
-    input.focus();
-  }, "button button-quiet compact");
-  clearSearch.hidden = true;
-  form.append(input, find, clearSearch);
+  form.append(input);
+  function clearSearchTimer() {
+    clearLeaseTimer(searchTimer);
+    searchTimer = null;
+  }
+  function searchValue() {
+    const value = input.value.trim();
+    return value.length >= 2 ? value : "";
+  }
+  function deferSearch() {
+    if (destroyed) return;
+    clearSearchTimer();
+    if (!searchPending && statusKey === "snapshot"
+        && searchValue() === (query.search ?? query.findThread ?? "")) return;
+    searchPending = true;
+    // Fence old responses as soon as the text changes, before the debounce fires.
+    serial++;
+    controller?.abort();
+    clearTimeout(timer);
+    stopLease();
+    clearNested();
+    body.hidden = true;
+    setStatus("preparing");
+    if (!composing) searchTimer = scheduleLease(() => load(), 300);
+  }
+  input.addEventListener("input", deferSearch);
+  input.addEventListener("compositionstart", () => {
+    composing = true;
+    deferSearch();
+  });
+  input.addEventListener("compositionend", () => {
+    composing = false;
+    deferSearch();
+  });
   form.addEventListener("submit", (event) => {
     event.preventDefault();
-    applySearch(input.value.trim());
+    if (composing || destroyed) return;
+    searchPending = true;
+    load();
   });
-  function applySearch(value) {
+  function applySearch() {
+    const value = searchValue();
     const exactThread = /^(?:codex:\/\/threads\/)?[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
     if (value.length > 100 || /[\u0000-\u001f\u007f]/u.test(value)
         || (/^codex:\/\//iu.test(value) && !exactThread)) {
       setStatus("invalid");
-      return;
+      return false;
     }
     ancestors = [];
     selectedTitle = null;
@@ -364,12 +397,14 @@ export function mountWorkUsageView({
     else if (value) query.search = value;
     query.grouping = exactThread ? "thread" : "project";
     resetPage();
-    load();
+    return true;
   }
   const message = el("p", "work-usage-status");
   message.setAttribute("role", "status");
   message.setAttribute("aria-live", "polite");
   const cancel = button(tr("cancel"), async () => {
+    clearSearchTimer();
+    searchPending = false;
     stopLease();
     serial++;
     clearNested();
@@ -399,12 +434,6 @@ export function mountWorkUsageView({
   });
   cancel.hidden = true;
   const body = el("div");
-  const footnote = el("div", "work-usage-notes");
-  footnote.append(
-    el("p", null, tr("mapping")),
-    el("p", null, tr("transient")),
-    el("p", null, tr("priceNote")),
-  );
   const eyebrow = el("p", "eyebrow", tr("local"));
   root.replaceChildren(
     heading,
@@ -414,7 +443,6 @@ export function mountWorkUsageView({
     message,
     cancel,
     body,
-    footnote,
   );
   function resetPage() {
     delete query.cursor;
@@ -605,18 +633,6 @@ export function mountWorkUsageView({
       body.append(mix);
     }
     if (query.search) body.append(el("p", "annotation work-usage-search-note", tr("searchNote")));
-    if (response.totals.assumedEvents)
-      body.append(el("p", "annotation", tr("assumedNote", {count: quantity(response.totals.assumedEvents)})));
-    if (response.totals.incompleteEvents)
-      body.append(
-        el(
-          "p",
-          "notice notice-warning",
-          tr("unknownNote", {
-            count: quantity(response.totals.incompleteEvents),
-          }),
-        ),
-      );
     body.append(
       el(
         "p",
@@ -886,8 +902,6 @@ export function mountWorkUsageView({
         totals.append(rows); region.prepend(totals);
       }
       region.append(el("p","annotation",tr("modelBreakdownNote")));
-      if (row.assumedEvents) region.append(el("p","annotation",tr("assumedNote", {count:quantity(row.assumedEvents)})));
-      if (row.incompleteEvents) region.append(el("p","annotation",tr("unknownNote", {count:quantity(row.incompleteEvents)})));
       cell.append(region); detailRow.append(cell); group.append(detailRow);
     };
     for (const row of response.rows) {
@@ -1021,9 +1035,22 @@ export function mountWorkUsageView({
     pendingFocus = null;
   }
   async function load(recoverExpired = true) {
+    if (destroyed || composing) return;
+    clearSearchTimer();
+    if (searchPending) {
+      searchPending = false;
+      if (!applySearch()) {
+        serial++;
+        controller?.abort();
+        clearTimeout(timer);
+        stopLease();
+        cancel.hidden = true;
+        root.removeAttribute("aria-busy");
+        return;
+      }
+    }
     stopLease();
     started = true;
-    clearSearch.hidden = !query.search && !query.findThread;
     clearNested();
     const token = ++serial;
     controller?.abort();
@@ -1167,14 +1194,7 @@ export function mountWorkUsageView({
     refreshButton.textContent = tr("refresh");
     input.placeholder = tr("findHint");
     input.setAttribute("aria-label", tr("findHint"));
-    find.textContent = tr("find");
-    clearSearch.textContent = tr("clearSearch");
     cancel.textContent = tr("cancel");
-    footnote.replaceChildren(
-      ...["mapping", "transient", "priceNote"].map((key) =>
-        el("p", null, tr(key)),
-      ),
-    );
     if (statusKey === "snapshot" && response)
       statusValues = {
         date: formatLocal(new Date(response.toMs).toISOString()),
@@ -1187,6 +1207,7 @@ export function mountWorkUsageView({
     refresh,
     destroy() {
       destroyed = true;
+      clearSearchTimer();
       stopLease();
       serial++;
       clearNested();

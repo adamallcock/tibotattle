@@ -1068,13 +1068,15 @@ test("assumptions stay distinct from missing data and the non-project bucket is 
   await settleMountedView();
   assert.match(root.textContent, /Non-project tasks/);
   assert.match(root.textContent, /Includes assumed counts/);
-  assert.match(root.textContent, /Missing cache-write counts are assumed to be 0 for 1 usage records/);
-  assert.match(root.textContent, /Token counts are missing or incomplete for 1 usage records/);
+  assert.doesNotMatch(root.textContent, /Missing cache-write counts are assumed/);
+  assert.doesNotMatch(root.textContent, /Token counts are missing or incomplete/);
+  assert.doesNotMatch(root.textContent, /Repository groups use|Mappings are read-only|API-equivalent estimates use/);
   view.destroy();
 });
 
 test("name search keeps the report snapshot and nested filter, and clearing restores project view", async () => {
-  const { root, windowRef } = mountedRoot(); const requests = [];
+  const clock = mountedLeaseRoot();
+  const { root, windowRef } = clock; const requests = [];
   const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
     fetchRef: async (_url, init) => {
       const query = JSON.parse(init.body); requests.push(query);
@@ -1095,12 +1097,12 @@ test("name search keeps the report snapshot and nested filter, and clearing rest
     await settleMountedView();
     assert.equal(requests.at(-1).search, "Build café");
     assert.equal(requests.at(-1).project, "project-a");
-    const clear = findMounted(root, n => n.tagName === "BUTTON" && n.textContent === "Clear search")[0];
-    clear.click(); await settleMountedView();
+    input.value = ""; input.dispatchEvent({type:"input"});
+    clock.runTimer(300); await settleMountedView();
     assert.equal(requests.at(-1).search, undefined);
     assert.equal(requests.at(-1).project, undefined);
     assert.equal(input.value, "");
-    assert.equal(clear.hidden, true);
+    assert.equal(findMounted(root, n => n.tagName === "BUTTON" && ["Search", "Clear search"].includes(n.textContent)).length, 0);
     input.value = "codex://threads/not-a-thread";
     const before = requests.length; form.dispatchEvent({type:"submit"});
     await settleMountedView(); assert.equal(requests.length, before);
@@ -1341,4 +1343,65 @@ test("nested expired reports refresh the overview while changed snapshots requir
       }
     });
   }
+});
+
+
+test("live search debounces edits, enforces the minimum, and flushes with filter changes", async () => {
+  const clock = mountedLeaseRoot(); const requests = [];
+  const view = mountWorkUsageView({ ...clock, t: mountedTranslator,
+    fetchRef: async (_url, init) => { requests.push(JSON.parse(init.body)); return httpResponse(PROJECT_ROWS_RESPONSE); } });
+  try {
+    await settleMountedView();
+    const input = findMounted(clock.root, n => n.tagName === "INPUT")[0];
+    const type = value => { input.value = value; input.dispatchEvent({type:"input"}); };
+    type("a");
+    assert.equal([...clock.timers.values()].filter(t => t.delay === 300).length, 0);
+    type("ap"); type("app"); type("application");
+    assert.equal(requests.length, 1);
+    assert.equal([...clock.timers.values()].filter(t => t.delay === 300).length, 1);
+    clock.runTimer(300); await settleMountedView();
+    assert.equal(requests.at(-1).search, "application");
+    assert.equal(requests.at(-1).snapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+    type("edited");
+    findMounted(clock.root, n => n.dataset?.period === "all")[0].click();
+    await settleMountedView();
+    assert.equal(requests.at(-1).search, "edited");
+    assert.equal(requests.at(-1).period, "all");
+    assert.equal([...clock.timers.values()].filter(t => t.delay === 300).length, 0);
+    type("e"); clock.runTimer(300); await settleMountedView();
+    assert.equal(requests.at(-1).search, undefined);
+    assert.equal(requests.at(-1).grouping, "project");
+    type("queued"); view.destroy();
+    assert.equal(clock.timers.size, 0);
+  } finally { view.destroy(); }
+});
+
+test("live search fences old responses during debounce and waits for composed text", async () => {
+  const clock = mountedLeaseRoot(); const requests = []; const stale = deferred();
+  const view = mountWorkUsageView({ ...clock, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const query = JSON.parse(init.body); requests.push({query, signal:init.signal});
+      return query.search === "old" ? stale.promise : httpResponse(PROJECT_ROWS_RESPONSE);
+    } });
+  try {
+    await settleMountedView();
+    const input = findMounted(clock.root, n => n.tagName === "INPUT")[0];
+    input.value = "old"; input.dispatchEvent({type:"input"}); clock.runTimer(300);
+    await settleMountedView();
+    input.value = "new"; input.dispatchEvent({type:"input"});
+    assert.equal(requests.at(-1).signal.aborted, true);
+    const staleReport = structuredClone(PROJECT_ROWS_RESPONSE); staleReport.snapshotId = "stale-report";
+    stale.resolve(httpResponse(staleReport)); await settleMountedView();
+    clock.runTimer(300); await settleMountedView();
+    assert.equal(requests.at(-1).query.search, "new");
+    assert.equal(requests.at(-1).query.snapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+    input.dispatchEvent({type:"compositionstart"});
+    input.value = "项目"; input.dispatchEvent({type:"input", isComposing:true});
+    assert.equal([...clock.timers.values()].filter(t => t.delay === 300).length, 0);
+    const before = requests.length;
+    findMounted(clock.root, n => n.tagName === "FORM")[0].dispatchEvent({type:"submit"});
+    assert.equal(requests.length, before);
+    input.dispatchEvent({type:"compositionend"}); clock.runTimer(300); await settleMountedView();
+    assert.equal(requests.at(-1).query.search, "项目");
+  } finally { view.destroy(); }
 });
