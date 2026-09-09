@@ -121,15 +121,23 @@ Latest continuation, 2026-09-09:
   Commit `57165992` corrects this with 13 tests, preserving both mandatory hash
   checks and rejecting any incorrect supplied size. Exact-source run
   [34396583241](https://github.com/adamallcock/tibotattle/actions/runs/34396583241),
-  build `2026090932`, is now executing the corrected flow. The broader lifecycle correction is
+  build `2026090932`, passed final signing, installation, installed signed-closure
+  and updater-artifact verification. It reached normal app automation but failed
+  at `cdp_version` with `CDP_UNAVAILABLE`. The receipt cannot yet distinguish an
+  early app exit from a missing or inaccessible debug listener. Normal runtime
+  remains unverified; the wrapper records uninstall/cleanup false after handing
+  process ownership to the normal runner. That runner separately confirms its
+  owned profile and firewall rule were removed. No timeout or acceptance threshold
+  is relaxed. The broader lifecycle correction is
   committed separately as `72f357e2`. Five tests against a fresh isolated
   installation of the patched builder pass, including once-only emission after
   deferred final signing and no emission after failure/cancellation. It was not
   included in the first signed run and is included in the `57165992` retry.
 - Windows native modules have passed Azure signing, strict Authenticode
   verification and integrity rebinding. The latest run has passed final
-  installer/evidence verification and installation/cleanup. Normal signed app
-  startup remains open until the metadata-corrected retry passes.
+  installer/evidence verification and installation. Uninstall/cleanup passed in
+  the preceding run, not the latest delegated normal journey. Normal signed app
+  startup remains open after the metadata-corrected retry reached the listener gate.
   Earlier failures are retained in runs
   `34373775022`, `34374830275`, `34376745223`, `34378235956`, `34379698420`
   and `34382343677`; these exposed native-path, read-only-file, PowerShell
@@ -179,9 +187,18 @@ prove import transaction semantics only, not the full migration or resource scal
 The first approved exact-migration test stopped at 0057 with its synthetic rows
 intact. A documented read-only import poll confirmed no current import, permitting
 verified cleanup and recreation of the same approved disposable names. The
-repeat adds bounded owner-private failure capture (`26974199`); the initial
-unsuccessful attempt and recovery evidence remain preserved. No production
-operation occurred.
+repeat with bounded owner-private failure capture (`26974199`) identified a
+foreign-key constraint failure during exact 0058. Both attempts preserved the
+0057 baseline and synthetic fixture; both disposable database pairs were deleted
+and their absence verified. A further controlled staging comparison used identical
+513-statement, 130,155-byte imports with three rows: restoring the parent before
+a 500-statement gap passed; restoring it after the gap failed and fully rolled
+back. All owned probe tables were removed. This reproduces gap-sensitive deferred
+foreign-key behavior without claiming an undocumented batch size. The unchanged
+file-import route is unsuitable for 0058; no further unchanged retry is planned.
+The next engineering step is bounded local storage and transaction timing at
+roughly production size, followed by admission of the normal transaction route
+or a reviewed migration redesign. No production operation occurred.
 Updated public privacy,
 Docs and translated homepage copy are prepared and locally verified, not deployed.
 Production accountless modes remain disabled in source.
