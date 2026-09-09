@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { resolve } from 'node:path';
+import { resolve, win32 } from 'node:path';
+import { readFile } from 'node:fs/promises';
 import {
   parseWindowsSignedInstalledArguments, buildSignedInstalledRegistryArguments,
   buildSignedInstalledSignatureArguments, validateSignedInstalledNormalReceipt,
-  signedInstalledCleanupEligible, runWindowsSignedInstalled,
+  signedInstalledCleanupEligible, runWindowsSignedInstalled, windowsSignedInstalledNormalReceiptPath,
 } from '../scripts/smoke-electron-windows-signed-installed.mjs';
 
 const revision = 'a'.repeat(40);
@@ -82,4 +83,29 @@ test('host refusal happens before file or installer mutation', async () => {
     }), /DISPOSABLE_WINDOWS_REQUIRED/u);
   }
   await assert.rejects(runWindowsSignedInstalled(null, { platform: 'darwin', architecture: 'arm64' }), /DISPOSABLE_WINDOWS_REQUIRED/u);
+});
+
+// Execute the existing runner's actual path guard with filesystem-only doubles.
+// This catches incompatible caller paths without relaxing that runner or writing
+// Windows-looking directories on a non-Windows test host.
+test('signed wrapper receipt satisfies the real normal-runner parent contract', async () => {
+  const source = await readFile(new URL('../scripts/smoke-electron-windows-normal-candidate.mjs', import.meta.url), 'utf8');
+  const exactPath = source.slice(source.indexOf('function exactWindowsPath(value) {'),
+    source.indexOf('function sameWindowsPath('));
+  const parentGuard = source.slice(source.indexOf('async function ensureWindowsNormalCandidateReceiptParent('),
+    source.indexOf('function candidateReceipt('));
+  assert.match(exactPath, /^function exactWindowsPath/u);
+  assert.match(parentGuard, /^async function ensureWindowsNormalCandidateReceiptParent/u);
+  const inspected = [];
+  const guard = new Function('win32', 'lstat', 'mkdir', 'fail',
+    `${exactPath}\n${parentGuard}\nreturn ensureWindowsNormalCandidateReceiptParent;`)(
+    win32, async (target) => { inspected.push(target); return { isDirectory: () => true, isSymbolicLink: () => false }; },
+    () => assert.fail('existing private parent needs no mkdir'),
+    (code) => { throw new Error(code); });
+  const selected = windowsSignedInstalledNormalReceiptPath(String.raw`C:\workspace`);
+  assert.equal(selected, String.raw`C:\workspace\.release-build\electron-windows-normal-candidate\normal-candidate-smoke.json`);
+  assert.equal(await guard(selected), win32.dirname(selected));
+  assert.ok(inspected.length > 0);
+  await assert.rejects(guard(String.raw`C:\receipts\signed-installed.json.normal.json`), /RECEIPT_INVALID/u);
+  assert.throws(() => windowsSignedInstalledNormalReceiptPath('relative'), /PATH_INVALID/u);
 });

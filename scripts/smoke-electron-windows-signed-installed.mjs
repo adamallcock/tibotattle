@@ -53,6 +53,10 @@ export function parseWindowsSignedInstalledArguments(argv) {
   if (win32.join(win32.dirname(result.sourceCandidatePath), 'app') !== result.stagedAppPath) fail('ARGUMENT_INVALID');
   return Object.freeze(result);
 }
+export function windowsSignedInstalledNormalReceiptPath(workspace) {
+  return win32.join(path(workspace), '.release-build', 'electron-windows-normal-candidate',
+    'normal-candidate-smoke.json');
+}
 async function safePath(value, directory = false) {
   path(value);
   let current = win32.parse(value).root;
@@ -143,6 +147,9 @@ export async function runWindowsSignedInstalled(options, {
     '--installer-sha256', options?.installerSha256, '--staged-app', options?.stagedAppPath,
     '--source-candidate', options?.sourceCandidatePath, '--source-revision', options?.sourceRevision,
     '--receipt', options?.receiptPath]);
+  const normalReceiptPath = windowsSignedInstalledNormalReceiptPath(environment.GITHUB_WORKSPACE);
+  await safePath(environment.GITHUB_WORKSPACE, true);
+  if (!await missing(normalReceiptPath)) fail('NORMAL_RECEIPT_EXISTS');
   await safePath(environment.RUNNER_TEMP, true);
   await safePath(win32.dirname(options.receiptPath), true);
   const receiptHandle = await open(options.receiptPath, 'wx', 0o600);
@@ -173,7 +180,7 @@ export async function runWindowsSignedInstalled(options, {
     const appPath = win32.join(installRoot, APP);
     const normalOptions = { appPath, stagedAppPath: options.stagedAppPath,
       sourceCandidatePath: options.sourceCandidatePath, sourceRevision: options.sourceRevision,
-      receiptPath: `${options.receiptPath}.normal.json` };
+      receiptPath: normalReceiptPath };
     const before = await verifyWindowsNormalCandidateSmokePackage(normalOptions);
     const nativeRoot = win32.join(installRoot, 'resources', 'app.asar.unpacked');
     for (const target of [appPath, win32.join(installRoot, UNINSTALLER),
