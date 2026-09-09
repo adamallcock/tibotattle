@@ -4,10 +4,13 @@ import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { createRequire } from "node:module";
 import {
+  chmod,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -4199,6 +4202,11 @@ test("signed staging composes only the accountless native adapter and scrubs hos
     "setPath:userData",
     "setPath:sessionData",
   ]);
+  const signedStagingProfileStats = await lstat(fixture.signedStagingUserData);
+  assert.equal(signedStagingProfileStats.isDirectory(), true);
+  if (process.platform !== "win32") {
+    assert.equal(signedStagingProfileStats.mode & 0o777, 0o700);
+  }
   assert.equal(fixture.paths.get("userData"), fixture.signedStagingUserData);
   assert.equal(fixture.paths.get("sessionData"), fixture.signedStagingUserData);
   assert.ok(nativeFactoryEvent !== null);
@@ -4237,6 +4245,32 @@ test("signed staging composes only the accountless native adapter and scrubs hos
   const dispose = lifecycle.dispose();
   child.emit("exit", 0, null);
   await dispose;
+});
+
+test("signed staging refuses a profile symlink before setting Electron paths", {
+  // Creating directory symlinks needs an extra Windows privilege that the
+  // ordinary cross-platform shell lane intentionally does not require.
+  skip: process.platform === "win32",
+}, async (t) => {
+  const fixture = await createSignedStagingShellFixture(t);
+  await symlink(fixture.userData, fixture.signedStagingUserData, "dir");
+  let nativeFactoryCalls = 0;
+  await assert.rejects(launchElectronShell({
+    electron: signedStagingElectronRuntime(fixture.app),
+    environment: githubHostedMacOSArm64Environment(),
+    platform: "darwin",
+    architecture: "arm64",
+    getuid: () => 501,
+    getUserInfo: () => ({ uid: 501, username: "ci-runner" }),
+    resourcesPath: fixture.resourcesPath,
+    createMacCredentialHandover() {
+      nativeFactoryCalls += 1;
+      return assert.fail("a symlinked staging profile must fail before native setup");
+    },
+  }), errorCode("electron_configuration_invalid"));
+  assert.equal(nativeFactoryCalls, 0);
+  assert.deepEqual(fixture.events, []);
+  assert.equal((await lstat(fixture.signedStagingUserData)).isSymbolicLink(), true);
 });
 
 test("packaged Electron composition keeps the companion in app.asar and uses physical Resources as cwd", async () => {

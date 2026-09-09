@@ -1,5 +1,10 @@
 import { dirname, join, resolve } from "node:path";
-import { readFile } from "node:fs/promises";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  readFile,
+} from "node:fs/promises";
 import { userInfo } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -57,6 +62,7 @@ const MACOS_ELECTRON_SMOKE_OBSERVE_MESSAGE_TYPE =
   "tibotattle-macos-smoke-observe-v1";
 const MACOS_ELECTRON_SMOKE_STATE_MESSAGE_TYPE =
   "tibotattle-macos-smoke-state-v1";
+const ELECTRON_SHELL_BOOTSTRAP = Symbol("electron-shell-bootstrap");
 const WINDOWS_ELECTRON_SMOKE_CONTROL = "windows-v1";
 const WINDOWS_ELECTRON_SMOKE_MESSAGE_TYPE = "windows-electron-smoke-v1";
 const WINDOWS_ELECTRON_SMOKE_COMMAND_MESSAGE = "command-v1";
@@ -216,23 +222,85 @@ export async function readAccountlessSignedStagingRehearsal({
 /**
  * Keep Chromium's own state outside the normal production profile. The
  * package marker is the sole selector; inherited environment values never
- * choose this path. Both Electron path names are set before `whenReady`,
- * since Chromium otherwise binds session data to the normal userData root.
+ * choose this path. The directory is created before either Electron path is
+ * changed because `app.setPath` rejects a missing directory.
  */
-function configureAccountlessSignedStagingProfile(app, metadata) {
+async function configureAccountlessSignedStagingProfile(app, metadata, {
+  expectedOwnerUid,
+} = {}) {
   if (metadata === null) return null;
   if (typeof app?.getPath !== "function" || typeof app?.setPath !== "function") {
     throw shellError("electron_configuration_invalid");
   }
-  const rawAppData = app.getPath("appData");
+  try {
+    if (typeof app.isReady === "function" && app.isReady() === true) {
+      throw shellError("electron_configuration_invalid");
+    }
+  } catch {
+    throw shellError("electron_configuration_invalid");
+  }
+  let rawAppData;
+  try {
+    rawAppData = app.getPath("appData");
+  } catch {
+    throw shellError("electron_configuration_invalid");
+  }
   if (typeof rawAppData !== "string" || rawAppData.length === 0) {
     throw shellError("electron_configuration_invalid");
   }
   const appData = resolve(rawAppData);
   const profile = join(appData, ACCOUNTLESS_SIGNED_STAGING_PROFILE_DIRECTORY);
   if (dirname(profile) !== appData) throw shellError("electron_configuration_invalid");
-  app.setPath("userData", profile);
-  app.setPath("sessionData", profile);
+  let appDataStats;
+  try {
+    appDataStats = await lstat(appData);
+  } catch {
+    throw shellError("electron_configuration_invalid");
+  }
+  if (appDataStats.isSymbolicLink() || !appDataStats.isDirectory()) {
+    throw shellError("electron_configuration_invalid");
+  }
+  let profileStats;
+  try {
+    await mkdir(profile, { recursive: true, mode: 0o700 });
+    profileStats = await lstat(profile);
+  } catch {
+    throw shellError("electron_configuration_invalid");
+  }
+  if (profileStats.isSymbolicLink() || !profileStats.isDirectory()) {
+    throw shellError("electron_configuration_invalid");
+  }
+  const hasExpectedOwner = process.platform !== "darwin"
+    || (Number.isSafeInteger(expectedOwnerUid)
+      && Number.isSafeInteger(profileStats.uid)
+      && profileStats.uid === expectedOwnerUid);
+  if (!hasExpectedOwner) throw shellError("electron_configuration_invalid");
+  try {
+    await chmod(profile, 0o700);
+    profileStats = await lstat(profile);
+  } catch {
+    throw shellError("electron_configuration_invalid");
+  }
+  // Signed staging is macOS-only; Windows' chmod/lstat surface does not
+  // expose POSIX directory bits for the injected cross-platform tests.
+  const hasPrivateMode = process.platform === "win32"
+    || (profileStats.mode & 0o777) === 0o700;
+  const hasFinalExpectedOwner = process.platform !== "darwin"
+    || (Number.isSafeInteger(expectedOwnerUid)
+      && Number.isSafeInteger(profileStats.uid)
+      && profileStats.uid === expectedOwnerUid);
+  if (profileStats.isSymbolicLink()
+      || !profileStats.isDirectory()
+      || !hasPrivateMode
+      || !hasFinalExpectedOwner) {
+    throw shellError("electron_configuration_invalid");
+  }
+  try {
+    app.setPath("userData", profile);
+    app.setPath("sessionData", profile);
+  } catch {
+    throw shellError("electron_configuration_invalid");
+  }
   return profile;
 }
 
@@ -888,6 +956,65 @@ export function createLinuxQualificationSupervisorOptions({
 }
 
 /**
+ * Resolve package authority and complete the one pre-ready Electron setup.
+ * Electron's ESM main loader can emit `ready` while an unawaited async launch
+ * continues, so the signed staging profile must be prepared in an awaited
+ * bootstrap phase before the normal lifecycle composition starts.
+ */
+async function prepareElectronShellBootstrap({
+  electron,
+  environment = process.env,
+  platform = process.platform,
+  architecture = process.arch,
+  getuid = typeof process.getuid === "function" ? process.getuid.bind(process) : undefined,
+  getUserInfo = userInfo,
+} = {}) {
+  const runtime = electron ?? await import("electron");
+  const app = runtime?.app;
+  if (!app || typeof app.on !== "function") {
+    throw new TypeError("Electron app runtime is unavailable");
+  }
+  // Read and validate every package marker before constructing any companion
+  // or platform service. This also preserves the existing mixed-marker gate.
+  const productionDistribution = await readProductionDistribution({ app, platform, architecture });
+  const accountlessHostedRehearsal = await readAccountlessHostedRehearsal({ app, platform, architecture });
+  const accountlessSignedStagingRehearsal = await readAccountlessSignedStagingRehearsal({
+    app,
+    platform,
+    architecture,
+  });
+  if (accountlessSignedStagingRehearsal !== null
+      && environment.USAGE_MONITOR_TEST_LANE !== undefined) {
+    throw shellError("electron_configuration_invalid");
+  }
+  // This guard intentionally precedes the profile redirect and macOS handover
+  // factory. An artifact outside its package-bound OS account and runner
+  // profile cannot read, create, or migrate credential material.
+  const accountContext = assertAccountlessSignedStagingOperatingAccount({
+    metadata: accountlessSignedStagingRehearsal,
+    environment,
+    getuid,
+    getUserInfo,
+    platform,
+    architecture,
+  });
+  const signedStagingProfile = await configureAccountlessSignedStagingProfile(
+    app,
+    accountlessSignedStagingRehearsal,
+    { expectedOwnerUid: accountContext?.expectedTestUID },
+  );
+  return Object.freeze({
+    [ELECTRON_SHELL_BOOTSTRAP]: true,
+    accountlessHostedRehearsal,
+    accountlessSignedStagingRehearsal,
+    app,
+    productionDistribution,
+    runtime,
+    signedStagingProfile,
+  });
+}
+
+/**
  * Compose the real Electron runtime. The function is intentionally separate
  * from module evaluation so all policy/lifecycle code remains plain-Node
  * testable when Electron is not installed in the source checkout.
@@ -911,6 +1038,7 @@ export async function launchElectronShell({
   createMacCredentialHandover = createProductionMacCredentialHandover,
   emitFailureDiagnostic = false,
   writeDiagnostic,
+  startupPreparation = null,
 } = {}) {
   const runtime = electron ?? await import("electron");
   const app = runtime?.app;
@@ -935,34 +1063,24 @@ export async function launchElectronShell({
       ownedDownloadsRegistry,
       notificationBackend,
     });
-    // Read and validate the packaged selection before constructing any
-    // companion or platform service. Linux candidates require an exact stable
-    // Linux/x64 selection; installed lifecycle evidence remains a separate gate.
-    const productionDistribution = await readProductionDistribution({ app, platform, architecture });
-    const accountlessHostedRehearsal = await readAccountlessHostedRehearsal({ app, platform, architecture });
-    const accountlessSignedStagingRehearsal = await readAccountlessSignedStagingRehearsal({
-      app,
+    const preparation = startupPreparation ?? await prepareElectronShellBootstrap({
+      electron: runtime,
+      environment,
       platform,
       architecture,
-    });
-    if (accountlessSignedStagingRehearsal !== null
-        && environment.USAGE_MONITOR_TEST_LANE !== undefined) {
-      throw shellError("electron_configuration_invalid");
-    }
-    // This guard intentionally precedes the macOS handover and native adapter
-    // factory. An artifact outside its package-bound OS account and hosted
-    // runner profile cannot read, create, or migrate credential material.
-    assertAccountlessSignedStagingOperatingAccount({
-      metadata: accountlessSignedStagingRehearsal,
-      environment,
       getuid,
       getUserInfo,
     });
-    // The account guard above fails before either normal-profile path can be
-    // redirected. A valid signed rehearsal uses a fixed sibling of appData
-    // for both userData and Chromium session data before any native factory
-    // or readiness work can observe the normal production profile.
-    configureAccountlessSignedStagingProfile(app, accountlessSignedStagingRehearsal);
+    if (preparation?.[ELECTRON_SHELL_BOOTSTRAP] !== true
+        || preparation.runtime !== runtime
+        || preparation.app !== app) {
+      throw shellError("electron_configuration_invalid");
+    }
+    const {
+      accountlessHostedRehearsal,
+      accountlessSignedStagingRehearsal,
+      productionDistribution,
+    } = preparation;
     assertElectronPlatformGate({
       platform,
       architecture,
@@ -1125,33 +1243,50 @@ export async function launchElectronShell({
 // Node-based tests and repository tooling import this entry without executing
 // a desktop launch. An actual Electron process is the only executable caller.
 if (process.versions.electron) {
-  launchElectronShell({ emitFailureDiagnostic: true })
-    .then((lifecycle) => {
-      if (lifecycle !== null) installMacosSmokeObservation(lifecycle);
-      if (lifecycle !== null) installWindowsNormalCandidateQuitControl(lifecycle);
-      // The Linux GUI smoke needs a deterministic way to exercise the same
-      // main-process shutdown path as the tray's Quit action. Keep that
-      // control test-only, opt-in, and out of the renderer/preload boundary.
-      // SIGUSR2 is not installed on Windows, so this cannot become a Windows
-      // production contract by accident.
-      if (lifecycle !== null
-          && process.platform !== "win32"
-          && process.env.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL === ELECTRON_SMOKE_CONTROL) {
-        // This signal is installed only for the explicit local smoke lane. It
-        // asks the lifecycle to open the validated loopback popup route, so
-        // the harness can inspect the real tray renderer without accepting a
-        // renderer-controlled URL or exposing a production command.
-        process.once("SIGUSR1", () => {
-          lifecycle.showTrayPopover?.();
-        });
-        process.once("SIGUSR2", () => {
-          void lifecycle.requestQuit().catch(() => {
-            process.exitCode = 1;
-          });
-        });
-      }
+  const runtime = await import("electron");
+  let startupPreparation;
+  try {
+    // Keep this small awaited phase ahead of the ordinary launch promise. In
+    // an ESM main process an unawaited launch can lose the race with `ready`.
+    startupPreparation = await prepareElectronShellBootstrap({ electron: runtime });
+  } catch {
+    emitEntryFailureDiagnostic();
+    runtime?.app?.quit?.();
+    process.exitCode = 1;
+  }
+  if (startupPreparation !== undefined) {
+    launchElectronShell({
+      electron: runtime,
+      startupPreparation,
+      emitFailureDiagnostic: true,
     })
-    .catch(() => {
-      process.exitCode = 1;
-    });
+      .then((lifecycle) => {
+        if (lifecycle !== null) installMacosSmokeObservation(lifecycle);
+        if (lifecycle !== null) installWindowsNormalCandidateQuitControl(lifecycle);
+        // The Linux GUI smoke needs a deterministic way to exercise the same
+        // main-process shutdown path as the tray's Quit action. Keep that
+        // control test-only, opt-in, and out of the renderer/preload boundary.
+        // SIGUSR2 is not installed on Windows, so this cannot become a Windows
+        // production contract by accident.
+        if (lifecycle !== null
+            && process.platform !== "win32"
+            && process.env.USAGE_MONITOR_ELECTRON_SMOKE_CONTROL === ELECTRON_SMOKE_CONTROL) {
+          // This signal is installed only for the explicit local smoke lane. It
+          // asks the lifecycle to open the validated loopback popup route, so
+          // the harness can inspect the real tray renderer without accepting a
+          // renderer-controlled URL or exposing a production command.
+          process.once("SIGUSR1", () => {
+            lifecycle.showTrayPopover?.();
+          });
+          process.once("SIGUSR2", () => {
+            void lifecycle.requestQuit().catch(() => {
+              process.exitCode = 1;
+            });
+          });
+        }
+      })
+      .catch(() => {
+        process.exitCode = 1;
+      });
+  }
 }
