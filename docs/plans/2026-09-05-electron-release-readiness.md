@@ -19,25 +19,39 @@ Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
 Latest test-feed and platform continuation:
 
-- Desktop-integration audit: Windows quota notifications are explicitly disabled
-  by `windowsIdentityReady: false` at both notification-delivery construction
-  sites in `desktop-runtime.js`. The runtime needs verified installed Windows
-  notification identity before this can be enabled; the passing candidate runs
-  do not cover it. Linux uses the shared Electron notification delivery path,
-  but visible native desktop delivery remains unproved. The 31 focused policy,
-  coordinator and delivery tests pass using mocked OS delivery. Treat native
-  notifications and actual Windows/Linux current-to-next updates as separate
-  required work, not as completed by packaging or restart checks.
-- Signing audit: the Windows release config selects Azure Trusted Signing, but
-  no protected workflow calls it and no caller reconciles production staging
-  `win32-x64` with its `windows-x64` candidate path. Finish the candidate/finalizer
-  integration and provide the Azure resource configuration and login before
-  signing; permission alone does not supply those dependencies. Linux AppImage
-  preparation currently marks signing unnecessary and has no selected detached
-  signature or repository signer. Existing Windows/Linux development artifacts
-  must not be relabelled as production candidates. The shared updater checks on
-  startup and every four hours and supports automatic downloading; installation
-  deliberately remains a user-triggered Install and Restart operation.
+- Desktop integration is now being completed as independent engineering and
+  user-acceptance tracks. Windows notification identity is implemented: verify
+  the installed Start Menu shortcut's executable and AppUserModelID before
+  configuring Electron's fixed toast activator. Both delivery construction
+  paths use that verified result, including a language change. Development or
+  missing/mismatched shortcut identities still refuse delivery.
+- Settings > Notifications now has **Send test notification**. It accepts no
+  renderer-supplied content, is restricted to the live Settings frame, uses the
+  same main-process delivery adapter as quota alerts, and changes neither alert
+  preferences nor quota history/deduplication. It reports a request, not proof
+  that the operating system displayed a banner. Repeated requests are bounded.
+  The full web suite passed 658 tests; 128 focused contract/controller/delivery,
+  preload and localization tests passed. A synthetic rendered interaction at
+  1000px and 540px widths confirmed the request and preserved alerts off, with
+  no horizontal overflow. The static preview's sole missing resource was the
+  optional favicon; there were no application exceptions.
+- Remaining native banner/tray appearance and notification-center behavior are
+  user acceptance checks, not reasons to stop implementation or packaging.
+  Automatic-update correctness remains an executable engineering check: actual
+  current-to-next replacement, restart, and settings/opt-out preservation.
+  The shared updater checks on startup and every four hours, supports automatic
+  downloading, and installs through **Install and Restart**.
+- Windows signing integration and native Linux AppImage updater qualification
+  are in progress in parallel. No Windows signer is provisioned in the current
+  environment. Existing unsigned development artifacts remain development
+  artifacts; Linux's AppImage distribution does not require adding a new
+  detached-signing authority merely to complete its selected update path.
+- Latest pre-change source `bd60e686` passed both Mac packages, Linux package/
+  runtime, and Windows package/normal-app jobs in run `34348058918`, but its
+  Windows NSIS installer did not settle within 180 seconds before first launch.
+  The failure receipt is preserved, and an unchanged-source failed-job rerun
+  was requested to distinguish runner intermittency from a repeatable defect.
+  Earlier successful NSIS receipts do not erase this failure.
 - Follow-up `.15`/`.16` candidates from frozen runtime `dcf2d6ca` are now
   signed, notarized, stapled and finalized for both Mac architectures. All 24
   retained files and four ZIP-contained ASARs were independently checked;
