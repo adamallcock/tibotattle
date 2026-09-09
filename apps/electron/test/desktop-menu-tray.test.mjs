@@ -90,7 +90,7 @@ test("application menu maps all desktop commands to the injected action interfac
   item(view, "Weekly Allowance").click();
   item(view, "Usage Timeline").click();
   item(view, "Usage and Costs").click();
-  item(view, "Projects & threads").click();
+  item(view, "Projects and Threads").click();
   item(view, "Toggle Sidebar").click();
   item(view, "Show TiboTattle Dev").click();
   item(view, "Focus TiboTattle Dev").click();
@@ -145,7 +145,7 @@ test("desktop menu and tray copy resolves every supported language", () => {
   const expected = {
     "en-US": {
       file: "File",
-      projects: "Projects & threads",
+      projects: "Projects and Threads",
       refresh: "Update Local Usage",
       checkForUpdates: "Check for Updates…",
       tray: "Open TiboTattle Dev",

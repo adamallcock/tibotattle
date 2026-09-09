@@ -3702,7 +3702,7 @@ test("desktop lifecycle owns a bounded Settings window and authorizes only its t
   assert.equal(windows.length, 3);
 
   const projectsMenuItem = applicationMenus[0].template.find((item) => item.label === "View")
-    .submenu.find((item) => item.label === "Projects & threads");
+    .submenu.find((item) => item.label === "Projects and Threads");
   projectsMenuItem.click();
   assert.equal(settings.visible, false);
   assert.deepEqual(dashboardWindowsForTest(windows)[0].webContents.sent.at(-1), {

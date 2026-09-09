@@ -463,7 +463,7 @@ const DESKTOP_MESSAGES = Object.freeze({
     es: "Uso y costos",
   }),
   "electron.menu.projects": Object.freeze({
-    "en-US": "Projects & threads",
+    "en-US": "Projects and Threads",
     "zh-Hans": "项目与会话",
     es: "Proyectos e hilos",
   }),
