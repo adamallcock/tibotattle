@@ -19,6 +19,25 @@ Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
 Latest test-feed and platform continuation:
 
+- Desktop-integration audit: Windows quota notifications are explicitly disabled
+  by `windowsIdentityReady: false` at both notification-delivery construction
+  sites in `desktop-runtime.js`. The runtime needs verified installed Windows
+  notification identity before this can be enabled; the passing candidate runs
+  do not cover it. Linux uses the shared Electron notification delivery path,
+  but visible native desktop delivery remains unproved. The 31 focused policy,
+  coordinator and delivery tests pass using mocked OS delivery. Treat native
+  notifications and actual Windows/Linux current-to-next updates as separate
+  required work, not as completed by packaging or restart checks.
+- Signing audit: the Windows release config selects Azure Trusted Signing, but
+  no protected workflow calls it and no caller reconciles production staging
+  `win32-x64` with its `windows-x64` candidate path. Finish the candidate/finalizer
+  integration and provide the Azure resource configuration and login before
+  signing; permission alone does not supply those dependencies. Linux AppImage
+  preparation currently marks signing unnecessary and has no selected detached
+  signature or repository signer. Existing Windows/Linux development artifacts
+  must not be relabelled as production candidates. The shared updater checks on
+  startup and every four hours and supports automatic downloading; installation
+  deliberately remains a user-triggered Install and Restart operation.
 - Follow-up `.15`/`.16` candidates from frozen runtime `dcf2d6ca` are now
   signed, notarized, stapled and finalized for both Mac architectures. All 24
   retained files and four ZIP-contained ASARs were independently checked;
