@@ -148,10 +148,21 @@ Latest continuation, 2026-09-09:
   source-derived regression and 78 release-trust tests pass, with independent
   review. The corrected signed run is
   [34403971764](https://github.com/adamallcock/tibotattle/actions/runs/34403971764),
-  build `2026090935`; it is in progress. The full local config suite still sees
-  the previously documented stale installed builder patch; the unchanged ledger
-  correction passed its separate fresh frozen/offline five-test qualification.
-  No dependency purge or test weakening was performed.
+  build `2026090935`. Signing, installation, signed closure and final updater
+  artifacts passed. The app now passes the CDP startup gate and fails later at
+  `dashboard_target` with `DASHBOARD_UNAVAILABLE`; dashboard/ingestion remain
+  unverified. Exact extracted-archive inspection confirms the shared contract is
+  present and the 365,832-byte native binding matches its packaged manifest hash.
+  The normal runner removed its profile and firewall rule. Existing closed companion/dashboard observers are now wired to the Windows
+  normal-candidate smoke lane in `02cefa16`, preserving the entry-marker state
+  when dashboard discovery fails. The final diff passed independent review,
+  43 normal-candidate tests, 78 shell-core tests and 78 release-trust tests.
+  Signed build 36 is running in
+  [34406692094](https://github.com/adamallcock/tibotattle/actions/runs/34406692094).
+  No timeout, credential or acceptance rule is relaxed. The active dependency tree still has the previously documented stale builder
+  patch. The current fix and full five-test config suite pass in an isolated
+  workspace using the verified frozen/offline patched runtime. No active
+  dependency purge or test weakening was performed.
   The broader lifecycle correction is
   committed separately as `72f357e2`. Five tests against a fresh isolated
   installation of the patched builder pass, including once-only emission after
@@ -242,9 +253,15 @@ atomic migration path, with unchanged 0057–0059, revision-checked containment,
 fresh bookmarks and explicit success/failure/unknown readback. It avoids exposing
 empty tables between batches. Each migration has its own transaction; this is not
 one all-or-nothing transaction across the three migrations. The proposal adds no
-index wrapper or phased coordinator. Compatibility of the exact deployed Worker
-with each possible completed prefix is being checked before requesting production
-approval. See the [prepared operation](../runbooks/release-migration-rehearsal.md#single-attempt-production-migration-proposal).
+index wrapper or phased coordinator. The exact deployed Worker `32cd6317` now passes nine bounded local
+function/SQL cases at each prefix 0056–0059, with 63 function-issued statements
+per prefix and the exact independent-ledger health query. Its 50 source inputs
+were verified against Git blobs; the SQLite D1 adapter and constant-time shim
+are explicit local substitutions. This covers selected social ownership,
+upload/replay, retained statistics, controls and lifecycle behavior, not hosted
+HTTP, OAuth, R2, concurrency or production timing. The operation passed independent
+review and separate production approval has been requested; no approval is assumed.
+See the [prepared operation](../runbooks/release-migration-rehearsal.md#single-attempt-production-migration-proposal).
 No production operation occurred.
 Updated public privacy,
 Docs and translated homepage copy are prepared and locally verified, not deployed.
