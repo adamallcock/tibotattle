@@ -50,51 +50,41 @@ index d891297..b32d458 100644
 -    [k: string]: string | Nullish;
 +    [k: string]: string | boolean | Nullish;
  }
-diff --git a/out/platformPackager.js b/out/platformPackager.js
-index 8d50874..fa4e401 100644
---- a/out/platformPackager.js
-+++ b/out/platformPackager.js
-@@ -105,8 +105,24 @@ class PlatformPackager {
-         this.packageInDistributableFormat(appOutDir, arch, targets, taskManager);
-     }
-     packageInDistributableFormat(appOutDir, arch, targets, taskManager) {
-+        const finalizeSigningOperationLedger = async () => {
-+            if (this.info.cancellationToken.cancelled) {
-+                return;
-+            }
-+            if (this.platform.buildConfigurationKey !== "win") {
-+                return;
-+            }
-+            if (typeof this.writeWindowsSigningOperationLedger === "function") {
-+                await this.writeWindowsSigningOperationLedger();
-+            }
-+        };
-         if (targets.find(it => !it.isAsyncSupported) == null) {
--            PlatformPackager.buildAsyncTargets(targets, taskManager, appOutDir, arch);
-+            const subTaskManager = new builder_util_1.AsyncTaskManager(this.info.cancellationToken);
-+            PlatformPackager.buildAsyncTargets(targets, subTaskManager, appOutDir, arch);
-+            taskManager.add(async () => {
-+                await subTaskManager.awaitTasks();
-+                await finalizeSigningOperationLedger();
-+            });
-             return;
-         }
-         taskManager.add(async () => {
-@@ -119,6 +135,7 @@ class PlatformPackager {
-                     await target.build(appOutDir, arch);
-                 }
+diff --git a/out/packager.js b/out/packager.js
+--- a/out/packager.js
++++ b/out/packager.js
+@@ -359,6 +359,7 @@
+         var _a;
+         const taskManager = new builder_util_1.AsyncTaskManager(this.cancellationToken);
+         const syncTargetsIfAny = [];
++        const windowsSigningOperationPackagers = new Set();
+         const platformToTarget = new Map();
+         const createdOutDirs = new Set();
+         for (const [platform, archToType] of this.options.targets) {
+@@ -369,6 +370,9 @@
+                 throw new builder_util_1.InvalidConfigurationError("Build for macOS is supported only on macOS, please see https://electron.build/multi-platform-build");
              }
-+            await finalizeSigningOperationLedger();
-         });
+             const packager = await this.createHelper(platform);
++            if (platform === core_1.Platform.WINDOWS && typeof packager.writeWindowsSigningOperationLedger === "function") {
++                windowsSigningOperationPackagers.add(packager);
++            }
+             const nameToTarget = new Map();
+             platformToTarget.set(platform, nameToTarget);
+             let poolCount = Math.floor(((_a = packager.config.concurrency) === null || _a === void 0 ? void 0 : _a.jobs) || 1);
+@@ -420,6 +424,13 @@
+                 break;
+             }
+             await target.finishBuild();
++        }
++        // NSIS may defer installer and uninstaller signing to finishBuild().
++        // Emit once per packager only after every target has completed.
++        if (!this.cancellationToken.cancelled) {
++            for (const packager of windowsSigningOperationPackagers) {
++                await packager.writeWindowsSigningOperationLedger();
++            }
+         }
+         return platformToTarget;
      }
-     static buildAsyncTargets(targets, taskManager, appOutDir, arch) {
-@@ -711,4 +728,4 @@ function chooseNotNull(v1, v2) {
- function capitalizeFirstLetter(text) {
-     return text.charAt(0).toUpperCase() + text.slice(1);
- }
--//# sourceMappingURL=platformPackager.js.map
-\ No newline at end of file
-+//# sourceMappingURL=platformPackager.js.map
 diff --git a/out/targets/appimage/appImageUtil.js b/out/targets/appimage/appImageUtil.js
 index 12f078a..e3e5483 100644
 --- a/out/targets/appimage/appImageUtil.js

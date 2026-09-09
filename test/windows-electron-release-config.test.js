@@ -374,104 +374,57 @@ test("patched Windows runtime rejects builder .node signing and emits one conten
   }
 });
 
-test("patched platform finalizer waits for Windows targets and remains inert elsewhere", async () => {
+test("patched build finalizer includes deferred NSIS signing once across architectures", async () => {
+  const { Packager } = appBuilderRequire("./out/packager");
   const { PlatformPackager } = await loadPatchedPlatformPackagerRuntime();
-  const { AsyncTaskManager } = appBuilderRequire("builder-util");
-  const events = [];
-  let resolveTarget;
-  const targetComplete = new Promise((resolveTargetComplete) => {
-    resolveTarget = resolveTargetComplete;
-  });
-  const cancellationToken = { cancelled: false };
-  const taskManager = new AsyncTaskManager(cancellationToken);
-  const receiver = {
-    info: { cancellationToken },
-    platform: { buildConfigurationKey: "win" },
-    writeWindowsSigningOperationLedger: async () => { events.push("ledger"); },
-  };
-  PlatformPackager.prototype.packageInDistributableFormat.call(receiver, "out", "x64", [{
-    isAsyncSupported: true,
-    build: async () => {
-      events.push("target-start");
-      await targetComplete;
-      events.push("target-complete");
-    },
-  }], taskManager);
-  assert.deepEqual(events, ["target-start"]);
-  resolveTarget();
-  await taskManager.awaitTasks();
-  assert.deepEqual(events, ["target-start", "target-complete", "ledger"]);
-
-  const synchronousEvents = [];
-  let resolveSynchronousTarget;
-  const synchronousTargetComplete = new Promise((resolveTargetComplete) => {
-    resolveSynchronousTarget = resolveTargetComplete;
-  });
-  const synchronousToken = { cancelled: false };
-  const synchronousTasks = new AsyncTaskManager(synchronousToken);
-  PlatformPackager.prototype.packageInDistributableFormat.call({
-    info: { cancellationToken: synchronousToken },
-    platform: { buildConfigurationKey: "win" },
-    writeWindowsSigningOperationLedger: async () => { synchronousEvents.push("ledger"); },
-  }, "out", "x64", [{
-    isAsyncSupported: false,
-    build: async () => {
-      synchronousEvents.push("target-start");
-      await synchronousTargetComplete;
-      synchronousEvents.push("target-complete");
-    },
-  }], synchronousTasks);
-  await new Promise((resolveTurn) => { setImmediate(resolveTurn); });
-  assert.deepEqual(synchronousEvents, ["target-start"]);
-  resolveSynchronousTarget();
-  await synchronousTasks.awaitTasks();
-  assert.deepEqual(synchronousEvents, ["target-start", "target-complete", "ledger"]);
-
-  const cancelledEvents = [];
-  let resolveCancelledTarget;
-  const cancelledTargetComplete = new Promise((resolveCancelledTargetComplete) => {
-    resolveCancelledTarget = resolveCancelledTargetComplete;
-  });
-  let observeCancelledTargetComplete;
-  const cancelledTargetFinished = new Promise((resolveTargetComplete) => {
-    observeCancelledTargetComplete = resolveTargetComplete;
-  });
-  const cancelledToken = { cancelled: false };
-  const cancelledTasks = new AsyncTaskManager(cancelledToken);
-  PlatformPackager.prototype.packageInDistributableFormat.call({
-    info: { cancellationToken: cancelledToken },
-    platform: { buildConfigurationKey: "win" },
-    writeWindowsSigningOperationLedger: async () => { cancelledEvents.push("ledger"); },
-  }, "out", "x64", [{
-    isAsyncSupported: true,
-    build: async () => {
-      cancelledEvents.push("target-start");
-      await cancelledTargetComplete;
-      cancelledEvents.push("target-complete");
-      observeCancelledTargetComplete();
-    },
-  }], cancelledTasks);
-  cancelledToken.cancelled = true;
-  resolveCancelledTarget();
-  await cancelledTargetFinished;
-  await new Promise((resolveTurn) => { setImmediate(resolveTurn); });
-  assert.deepEqual(cancelledEvents, ["target-start", "target-complete"]);
-
-  const nonWindowsEvents = [];
-  const nonWindowsToken = { cancelled: false };
-  const nonWindowsTasks = new AsyncTaskManager(nonWindowsToken);
-  PlatformPackager.prototype.packageInDistributableFormat.call({
-    info: { cancellationToken: nonWindowsToken },
-    platform: { buildConfigurationKey: "linux" },
-    writeWindowsSigningOperationLedger: async () => { nonWindowsEvents.push("ledger"); },
-  }, "out", "x64", [{
-    isAsyncSupported: true,
-    build: async () => { nonWindowsEvents.push("target"); },
-  }], nonWindowsTasks);
-  await nonWindowsTasks.awaitTasks();
-  assert.deepEqual(nonWindowsEvents, ["target"]);
+  const { Platform } = appBuilderRequire("./out/core");
+  const { Arch } = appBuilderRequire("builder-util");
+  const output = await fsPromises.mkdtemp(join(tmpdir(), "windows-ledger-lifecycle-"));
+  try {
+    for (const scenario of ["complete", "sync-failure", "async-failure", "cancelled", "linux"]) {
+      const events = [], cancellationToken = { cancelled: false };
+      const platform = scenario === "linux" ? Platform.LINUX : Platform.WINDOWS;
+      const targets = [false, true].map((isAsyncSupported) => ({
+        name: isAsyncSupported ? "async-fixture" : "nsis-fixture", outDir: output, isAsyncSupported,
+        build: async (_directory, arch) => { events.push(`build-${arch}`); },
+        finishBuild: async () => {
+          events.push(isAsyncSupported ? "async-finish" : "installer-sign");
+          await new Promise((done) => setImmediate(done));
+          if (scenario === (isAsyncSupported ? "async-failure" : "sync-failure")) throw new Error("synthetic target failure");
+          if (scenario === "cancelled") cancellationToken.cancelled = true;
+          events.push(isAsyncSupported ? "async-finished" : "uninstaller-sign");
+        },
+      }));
+      const helper = {
+        info: { cancellationToken }, platform, config: { directories: { output } },
+        expandMacro: () => output, defaultTarget: targets.map((target) => target.name),
+        createTargets: (_names, mapper) => { for (const target of targets) mapper(target.name, () => target); },
+        writeWindowsSigningOperationLedger: async () => { events.push("ledger"); },
+        pack: async (_out, arch, selected, tasks) => {
+          PlatformPackager.prototype.packageInDistributableFormat.call(helper, output, arch, selected, tasks);
+        },
+      };
+      const receiver = { cancellationToken, projectDir: output,
+        config: { directories: { output } },
+        options: { targets: new Map([[platform, new Map([[Arch.x64, helper.defaultTarget], [Arch.arm64, helper.defaultTarget]])]]) },
+        createHelper: async () => helper,
+      };
+      if (scenario.endsWith("failure")) {
+        await assert.rejects(Packager.prototype.doBuild.call(receiver), /synthetic target failure/u);
+        assert.equal(events.includes("ledger"), false, scenario);
+      } else {
+        await Packager.prototype.doBuild.call(receiver);
+        assert.equal(events.filter((event) => event === "ledger").length, scenario === "complete" ? 1 : 0, scenario);
+        if (scenario === "complete") {
+          assert.equal(events.at(-1), "ledger");
+          assert.ok(events.indexOf("ledger") > events.indexOf("async-finished"));
+          assert.ok(events.indexOf("ledger") > events.indexOf("uninstaller-sign"));
+          assert.equal(events.filter((event) => event.startsWith("build-")).length, 4);
+        }
+      }
+    }
+  } finally { await fsPromises.rm(output, { recursive: true, force: true }); }
 });
-
 
 test("Windows branding contains all taskbar and installer icon sizes", async () => {
   const bytes = await fsPromises.readFile(resolve("apps/electron/assets/tibotattle.ico"));
