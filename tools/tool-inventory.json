@@ -1504,7 +1504,9 @@
         "test/windows-filesystem-manifest.test.js",
         "apps/electron/test/shell-core.test.mjs",
         "test/electron-development-artifact-verifier.test.js",
-        "test/windows-filesystem-loader.test.js"
+        "test/windows-filesystem-loader.test.js",
+        "scripts/rebind-electron-windows-native-modules.mjs",
+        "test/electron-windows-native-rebinding.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/goals/2026-08-17-windows-security-credentials-goal.md",
@@ -1953,7 +1955,9 @@
         "test/electron-development-artifact-verifier.test.js",
         "test/electron-package-layout.test.js",
         "scripts/package-electron-production.mjs",
-        "test/electron-production-distribution.test.js"
+        "test/electron-production-distribution.test.js",
+        "scripts/rebind-electron-windows-native-modules.mjs",
+        "test/electron-windows-native-rebinding.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-04-desktop-convergence.md",
@@ -2381,7 +2385,8 @@
         "test/electron-development-package.test.js",
         "test/electron-macos-production-finalization.test.js",
         "test/electron-windows-production-signing.test.js",
-        "test/windows-electron-release-config.test.js"
+        "test/windows-electron-release-config.test.js",
+        "test/electron-windows-native-rebinding.test.js"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2459,7 +2464,8 @@
       "stableAliasReason": "Validate one canonical Windows source candidate without writes, then require explicit Azure-signing confirmation for the non-publishing builder pass.",
       "additionalAliases": [],
       "callers": [
-        "test/electron-windows-production-signing.test.js"
+        "test/electron-windows-production-signing.test.js",
+        "scripts/rebind-electron-windows-native-modules.mjs"
       ],
       "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
@@ -2479,6 +2485,22 @@
         "test/electron-production-distribution.test.js"
       ],
       "decision": "retain_as_internal_release_support",
+      "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
+      "provenanceReason": null,
+      "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/rebind-electron-windows-native-modules.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Inspect or journal one exact Windows candidate, then explicitly rebind verified signed native bytes without changing runtime qualification.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-windows-native-rebinding.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
       "provenanceReason": null,
       "legacyPaths": []

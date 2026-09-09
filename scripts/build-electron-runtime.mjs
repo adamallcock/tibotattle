@@ -1587,6 +1587,15 @@ export async function validateElectronRuntimeOutput({
   return validateOutputDestination(output, REPOSITORY_ROOT, replace);
 }
 
+/** Read-only exact inventory validation for candidate finalization tooling. */
+export async function verifyStagedElectronRuntime({ output, target, version } = {}) {
+  if (typeof output !== "string" || !Object.hasOwn(TARGET_SPECS, target)
+      || typeof version !== "string" || version.length === 0) {
+    fail("EXISTING_OUTPUT_INVALID", "Exact staged runtime identity is required");
+  }
+  return validateExistingRuntime(output, target, version);
+}
+
 /**
  * Stage the reviewed companion runtime. The returned manifest is also written
  * to `electron-runtime-manifest.json` inside the destination.
