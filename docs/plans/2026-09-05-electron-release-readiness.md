@@ -16,7 +16,7 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-08 (supersedes the historical entries below):
 
-Latest continuation checkpoint (Windows diagnostics integrated at `e9389f04`):
+Latest continuation checkpoint (Mac fix `1a9e8913`; Windows diagnostics `5319fc3d`):
 
 - Linux targeted run [34288818674](https://github.com/adamallcock/tibotattle/actions/runs/34288818674)
   passed at `34087112`. Its normal packaged receipt verifies package execution,
@@ -49,7 +49,15 @@ Latest continuation checkpoint (Windows diagnostics integrated at `e9389f04`):
   Completion classifier failures now leave polling immediately and retain a
   fixed phase/status/reason/controller-step diagnostic, including when cleanup
   overrides the top-level error. The 28 focused tests pass; deadlines and
-  accepted terminal states are unchanged. The earlier full `34290262917` NSIS installed
+  accepted terminal states are unchanged. Run `34293724035` at `ffeec20c`
+  reports one request and a degraded unified-index result rejected as
+  `degraded_invalid`; this is an indexing contract failure, not an unobserved
+  request or simple timeout. The next diagnostic retains only the reviewed
+  unified-index failure vocabulary and the precise unmet degraded-contract
+  checks; 28 focused tests include coherent degraded success plus all 20
+  individual contract violations. Full run `34293690719` passes Linux, both
+  Mac package targets, Windows development packaging and the NSIS lifecycle;
+  ordinary Windows indexing is its sole failing job. The earlier full `34290262917` NSIS installed
   lifecycle subsequently passed.
 - Corrected Mac `.5` arm64/x64 and `.6` arm64 from frozen `ba1e7cba` have complete
   signing, notarization and artifact receipts. `.6` x64 subsequently completed;
@@ -81,7 +89,18 @@ Latest continuation checkpoint (Windows diagnostics integrated at `e9389f04`):
   journal is unchanged. The prior r5 attempt stopped before bundle exchange
   on its full-migration space reserve; r6 is a distinct read-only transaction
   with a backup plus full-restore reserve. Full migration keeps its original
-  capacity guard. Legacy preference compatibility is the next concrete repair.
+  capacity guard. A disposable same-identity Foundation bundle reproduced the
+  preference failure: a named suite cannot be opened using the current app ID.
+  Repair `1a9e8913` uses `UserDefaults.standard`, preserving strict value
+  validation. Integrated tests pass 19/19. Private `.9` arm64 from frozen
+  `1a9e8913` is signed, notarized and independently archive-verified. Installed
+  read-only r7 passes `preflight_ready`, leaves the journal unchanged, and
+  restores native 0.1.18 with verified equality to its fresh APFS-cloned backup.
+  The clone has an independent inode, no fallback and full content verification;
+  this remains preparation proof, not a completed state migration. Full migration additionally
+  needs disk headroom: approximately 56 GiB is free against a 105 GiB reserve.
+  Verified lossless archival preparation of historical task backups is underway;
+  originals remain preserved and no capacity rule has been relaxed.
 - The signed staging scheduler remains unqualified. Source review confirms the
   unsigned hosted profile uses generic safeStorage; reusing the production native
   binary would share fixed production identity/services. Two unimplemented
