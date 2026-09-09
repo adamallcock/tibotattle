@@ -26,3 +26,15 @@ test('synthetic rehearsal uses only content-free source records with increasing 
   assert.equal(JSON.stringify(records).includes('prompt'), false);
   assert.equal(JSON.stringify(records).includes('response'), false);
 });
+
+test('signed intake binds reviewed runner separately and ignores ambient downloader configuration', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const workflow = await readFile(new URL('../.github/workflows/electron-signed-staging.yml', import.meta.url), 'utf8');
+  assert.ok(workflow.includes("runner==os.environ['GITHUB_SHA']"));
+  assert.ok(workflow.includes("['/usr/bin/curl','--disable','--fail'"));
+  assert.ok(workflow.includes("assert result.stdout=='200'"));
+  assert.ok(workflow.includes('assert h.hexdigest()==digest'));
+  assert.ok(workflow.includes("'runnerRevision':runner,'sourceRevision':revision"));
+  assert.ok(workflow.includes('--source-revision "$SELECTED_SOURCE" --asar-sha256 "$SELECTED_ASAR"'));
+  assert.equal(workflow.includes("'--location'"), false);
+});

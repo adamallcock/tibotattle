@@ -80,8 +80,10 @@ launcher must carry the verified artifact binding into preparation and launch.
 
 `electron-signed-staging.yml` is a manual disposable macOS arm64 consumer.
 Probe mode records the runner account so the package can bind its numeric UID
-and login name. Execute mode requires the exact source, archive and ASAR
-hashes. It downloads only from the isolated test-artifact namespace, refuses
+and login name. Execute mode requires the exact signed source, archive and ASAR
+hashes, plus the independently reviewed runner revision. The selected workflow
+commit must match that runner revision. Both identities are retained so a test
+harness repair does not require signing unchanged application code again. It downloads only from the isolated test-artifact namespace, refuses
 redirects, verifies the ZIP before extraction, and validates Developer ID and
 the package marker before profile creation or launch.
 

@@ -13,6 +13,9 @@ on:
       source_revision:
         description: Exact signed source commit (required for execution)
         type: string
+      runner_revision:
+        description: Exact reviewed workflow and rehearsal-runner commit (required for execution)
+        type: string
       archive_sha256:
         description: Exact signed ZIP SHA-256 (required for execution)
         type: string
@@ -34,6 +37,7 @@ jobs:
     env:
       SELECTED_MODE: ${{ inputs.mode }}
       SELECTED_SOURCE: ${{ inputs.source_revision }}
+      SELECTED_RUNNER: ${{ inputs.runner_revision }}
       SELECTED_ARCHIVE: ${{ inputs.archive_sha256 }}
       SELECTED_ASAR: ${{ inputs.asar_sha256 }}
     steps:
@@ -63,19 +67,23 @@ jobs:
         if: inputs.mode == 'execute'
         run: |
           python3 - <<'PY'
-          import os,re,hashlib,urllib.request,pathlib,zipfile,subprocess
+          import os,re,hashlib,json,pathlib,zipfile,subprocess
           revision=os.environ['SELECTED_SOURCE']; digest=os.environ['SELECTED_ARCHIVE']; asar=os.environ['SELECTED_ASAR']
           assert re.fullmatch('[0-9a-f]{40}',revision) and re.fullmatch('[0-9a-f]{64}',digest) and re.fullmatch('[0-9a-f]{64}',asar)
-          assert revision==os.environ['GITHUB_SHA'], 'signed source must equal reviewed workflow source'
+          runner=os.environ['SELECTED_RUNNER']
+          assert re.fullmatch('[0-9a-f]{40}',runner) and runner==os.environ['GITHUB_SHA'], 'runner must equal reviewed workflow source'
+          # The sealed app and test harness have separate immutable identities.
+          # Harness repairs must not require signing unchanged application code again.
           url='https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/signed-staging/'+revision+'/'+digest+'.zip'
-          class NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self,*args,**kwargs): raise RuntimeError('redirect refused')
-          opener=urllib.request.build_opener(NoRedirect)
           root=pathlib.Path(os.environ['RUNNER_TEMP'])/'signed-staging-intake';root.mkdir(mode=0o700)
-          archive=root/'app.zip';h=hashlib.sha256();size=0
-          with opener.open(url,timeout=30) as response,archive.open('xb') as out:
-            while data:=response.read(1024*1024):
-              size+=len(data);assert size<=1024**3;h.update(data);out.write(data)
+          archive=root/'app.zip'
+          # No redirects, no caller-controlled origin, bounded download and exact digest.
+          result=subprocess.run(['/usr/bin/curl','--disable','--fail','--silent','--show-error',
+            '--proto','=https','--max-time','120','--max-filesize',str(1024**3),
+            '--output',str(archive),'--write-out','%{http_code}',url],
+            capture_output=True,text=True,check=True,timeout=130)
+          assert result.stdout=='200' and archive.stat().st_size<=1024**3
+          with archive.open('rb') as stream: h=hashlib.file_digest(stream,'sha256')
           assert h.hexdigest()==digest
           with zipfile.ZipFile(archive) as z:
             assert len(z.infolist())<20000 and sum(x.file_size for x in z.infolist())<3*1024**3
@@ -84,6 +92,9 @@ jobs:
               assert not path.is_absolute() and '..' not in path.parts and path.parts[0]=='TiboTattle.app'
           extracted=root/'verified';extracted.mkdir(mode=0o700)
           subprocess.run(['/usr/bin/ditto','-x','-k',str(archive),str(extracted)],check=True,timeout=120)
+          pathlib.Path('staging-receipts/intake.json').write_text(json.dumps({
+            'runnerRevision':runner,'sourceRevision':revision,'archiveSha256':digest,
+            'asarSha256':asar,'archiveVerified':True})+'\n')
           PY
       - name: Run real signed scheduler, credential restart and opt-out rehearsal
         if: inputs.mode == 'execute'
