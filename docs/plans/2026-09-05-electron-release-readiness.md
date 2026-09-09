@@ -16,7 +16,7 @@ visible notices before activation for existing undecided installations.
 
 Current checkpoint, 2026-09-08 (supersedes the historical entries below):
 
-Latest continuation checkpoint (Mac fix `1a9e8913`; Windows diagnostics `5319fc3d`):
+Latest continuation checkpoint (Mac fix `1a9e8913`; Windows publication fix `102a3dbe`):
 
 - Linux targeted run [34288818674](https://github.com/adamallcock/tibotattle/actions/runs/34288818674)
   passed at `34087112`. Its normal packaged receipt verifies package execution,
@@ -57,7 +57,15 @@ Latest continuation checkpoint (Mac fix `1a9e8913`; Windows diagnostics `5319fc3
   checks; 28 focused tests include coherent degraded success plus all 20
   individual contract violations. Full run `34293690719` passes Linux, both
   Mac package targets, Windows development packaging and the NSIS lifecycle;
-  ordinary Windows indexing is its sole failing job. The earlier full `34290262917` NSIS installed
+  ordinary Windows indexing is its sole failing job. Run `34295189921`
+  identifies `local_unified_index_publication_durability_uncertain`: the index
+  was renamed, then the private directory-fsync operation failed on Windows.
+  Fix `102a3dbe` uses the existing public platform filesystem contract, retaining
+  POSIX directory sync and the staged/published file flushes on Windows. Tests
+  prove exact flush order and preserve the failure receipt when the published
+  file itself cannot sync. Unified-index tests pass 134/134, companion refresh
+  96/96, and integrated architecture checks retain zero debt. Native runtime
+  verification of this concrete repair is next. The earlier full `34290262917` NSIS installed
   lifecycle subsequently passed.
 - Corrected Mac `.5` arm64/x64 and `.6` arm64 from frozen `ba1e7cba` have complete
   signing, notarization and artifact receipts. `.6` x64 subsequently completed;
