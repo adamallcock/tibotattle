@@ -8,6 +8,7 @@ import { lstat, mkdtemp, open, readFile, readdir, rmdir, unlink } from 'node:fs/
 import { win32, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import distribution from '../config/electron-production-distribution.cjs';
+import { verifyWindowsUpdateArtifacts } from './verify-electron-windows-update-artifacts.mjs';
 import {
   assertPinnedNsisSilentInstallDoesNotAutoRun, buildWindowsNsisInstallArguments,
   buildWindowsNsisUninstallArguments, buildWindowsNsisRegistryInspectionArguments,
@@ -156,6 +157,7 @@ export async function runWindowsSignedInstalled(options, {
   const receipt = { schemaVersion: 'tibotattle-windows-signed-installed-v1', status: 'failed',
     sourceRevision: options.sourceRevision, installerSha256: options.installerSha256,
     signedInstallerVerified: false, signedInstalledClosureVerified: false,
+    updaterArtifacts: null,
     installation: false, normalJourney: false, uninstall: false, cleanup: false,
     credentialPersistence: 'not_requalified_by_this_normal_journey',
     hostedEnrollment: 'not_exercised', notificationDelivery: 'requires_user_test', productionReady: false };
@@ -189,6 +191,12 @@ export async function runWindowsSignedInstalled(options, {
       await verifySignature(target, environment, runProgram);
     }
     receipt.signedInstalledClosureVerified = true;
+    // The package verifier above binds this version to the installed ASAR.
+    const stagedManifest = JSON.parse(await readFile(win32.join(options.stagedAppPath, 'package.json'), 'utf8'));
+    receipt.updaterArtifacts = await verifyWindowsUpdateArtifacts({
+      installerPath: options.installerPath, installerSha256: options.installerSha256,
+      installedAppPath: appPath, version: stagedManifest.version,
+    });
     safeToUninstall = false; // Only the normal runner can establish process quiescence.
     await runNormal(normalOptions);
     const normal = validateSignedInstalledNormalReceipt(JSON.parse(await readFile(normalOptions.receiptPath, 'utf8')), options.sourceRevision);
