@@ -22,9 +22,32 @@ test('final manifest proof states its native-signature and replacement boundarie
   const proof = validateWindowsUpdateArtifactMetadata(fixture());
   assert.equal(proof.status, 'passed');
   assert.equal(proof.finalManifestMatchesInstaller, true);
+  assert.equal(proof.manifestSizeVerified, true);
   assert.equal(proof.signature, 'separate_native_check');
   assert.equal(proof.installedReplacement, 'not_exercised');
   assert.equal(proof.publication, 'not_performed');
+});
+
+test('standard non-differential NSIS metadata omits optional size while both hashes remain mandatory', () => {
+  const value = fixture();
+  delete value.manifest.files[0].size;
+  const proof = validateWindowsUpdateArtifactMetadata(value);
+  assert.equal(proof.finalManifestMatchesInstaller, true);
+  assert.equal(proof.installerBytes, exe.length);
+  assert.equal(proof.manifestSizeVerified, false);
+  for (const size of [null, String(exe.length), exe.length + 1, exe.length + 0.5, 0]) {
+    assert.throws(() => validateWindowsUpdateArtifactMetadata({ ...value,
+      manifest: { ...value.manifest, files: [{ ...value.manifest.files[0], size }] },
+    }), /FINAL_BYTES_MISMATCH/u);
+  }
+  for (const field of ['file', 'legacy']) {
+    for (const hash of [undefined, 'x'.repeat(86) + '==']) {
+      const bad = structuredClone(value);
+      if (field === 'file') bad.manifest.files[0].sha512 = hash;
+      else bad.manifest.sha512 = hash;
+      assert.throws(() => validateWindowsUpdateArtifactMetadata(bad), /FINAL_BYTES_MISMATCH/u);
+    }
+  }
 });
 
 test('final byte binding refuses stale presigning hashes, wrong sizes, version and redirected artifact', () => {

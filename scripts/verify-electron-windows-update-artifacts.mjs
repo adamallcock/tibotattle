@@ -41,7 +41,11 @@ export function validateWindowsUpdateArtifactMetadata({ manifest, appUpdate, ins
   if (!record(manifest) || manifest.version !== version || !Array.isArray(manifest.files)
       || manifest.files.length !== 1 || !record(manifest.files[0])) fail('MANIFEST_INVALID');
   const file = manifest.files[0];
-  if (file.url !== installer.name || file.sha512 !== installer.sha512 || file.size !== installer.bytes
+  // Pinned builder omits size for non-differential NSIS updates. Both required
+  // SHA-512 fields still bind the complete final bytes; validate size if supplied.
+  const manifestSizePresent = Object.hasOwn(file, 'size');
+  if (file.url !== installer.name || file.sha512 !== installer.sha512
+      || (manifestSizePresent && file.size !== installer.bytes)
       || manifest.path !== installer.name || manifest.sha512 !== installer.sha512
       || Object.hasOwn(manifest, 'packages')) fail('FINAL_BYTES_MISMATCH');
   const publishers = Array.isArray(appUpdate?.publisherName) ? appUpdate.publisherName : [appUpdate?.publisherName];
@@ -54,6 +58,7 @@ export function validateWindowsUpdateArtifactMetadata({ manifest, appUpdate, ins
   return Object.freeze({ schemaVersion: 'tibotattle-windows-update-artifacts-v1', status: 'passed',
     target: 'win32-x64', version, installerSha256: installer.sha256,
     installerSha512: installer.sha512, installerBytes: installer.bytes,
+    manifestSizeVerified: manifestSizePresent,
     finalManifestMatchesInstaller: true, fixedFeedAndPublisher: true,
     signature: 'separate_native_check', installedReplacement: 'not_exercised', publication: 'not_performed' });
 }
