@@ -4117,7 +4117,9 @@ test("stable and Dev packages leave Electron profile paths unchanged", async (t)
   }
 });
 
-test("signed staging composes only the accountless native adapter and scrubs hostile child authority", async (t) => {
+test(process.platform === "win32"
+  ? "signed staging simulation refuses Windows storage before a companion can start"
+  : "signed staging composes only the accountless native adapter and scrubs hostile child authority", async (t) => {
   RuntimeWindow.instances = [];
   const fixture = await createSignedStagingShellFixture(t);
   const child = new RuntimeChild();
@@ -4143,8 +4145,14 @@ test("signed staging composes only the accountless native adapter and scrubs hos
     USERPROFILE: "/host/profile",
   });
   let nativeFactoryEvent = null;
+  const runtime = signedStagingElectronRuntime(fixture.app);
+  const dialogs = [];
+  runtime.dialog.showMessageBox = async (options) => {
+    dialogs.push(options);
+    return { response: 0 };
+  };
   const launch = launchElectronShell({
-    electron: signedStagingElectronRuntime(fixture.app),
+    electron: runtime,
     environment,
     platform: "darwin",
     architecture: "arm64",
@@ -4197,6 +4205,20 @@ test("signed staging composes only the accountless native adapter and scrubs hos
   assert.equal(handoverCalls, 1);
   assert.equal(accountlessFactoryCalls, 1);
   assert.equal(brokerCalls, 0);
+  if (process.platform === "win32") {
+    // This test injects Darwin package policy but deliberately uses the host's
+    // real filesystem. Windows cannot provide the POSIX protected first-run
+    // store, so that gate must refuse before spawn. Do not relax its mode/owner
+    // checks to make an emulated Mac launch succeed on Windows.
+    assert.equal(lifecycle, null);
+    assert.equal(spawnCalls.length, 0);
+    assert.deepEqual(dialogs.map(({ type }) => type), ["info", "error"]);
+    assert.equal(fixture.app.quitCalls, 1);
+    assert.equal(brokerCalls, 0);
+    assert.equal(fixture.paths.get("userData"), fixture.signedStagingUserData);
+    assert.equal(fixture.paths.get("sessionData"), fixture.signedStagingUserData);
+    return;
+  }
   assert.equal(spawnCalls.length, 1);
   assert.deepEqual(fixture.events.slice(0, 2), [
     "setPath:userData",
