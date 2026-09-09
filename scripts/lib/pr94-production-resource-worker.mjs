@@ -187,15 +187,19 @@ function validateProjection(value) {
   const input = value.weeklyInput;
   exact(input, ["status", "encoding", "source", "retainedUsageEvents", "retainedWeeklySnapshots", "estimatedRetainedBytes", "limits"]);
   if (input.status !== "complete" || input.source !== "unified_index"
-      || !["accounting_compact_v2", "accounting_compact_v3"].includes(input.encoding)) fail();
+      || !["accounting_compact_v2", "accounting_compact_v3", "accounting_streamed_v1"].includes(input.encoding)) fail();
   exact(input.limits, INPUT_LIMITS);
   INPUT_LIMITS.forEach((key) => integer(input.limits[key], 1));
-  integer(input.retainedUsageEvents, 0, input.limits.usageEvents);
+  integer(input.retainedUsageEvents, 0, input.encoding === "accounting_streamed_v1"
+    ? Number.MAX_SAFE_INTEGER : input.limits.usageEvents);
   integer(input.retainedWeeklySnapshots, 0, input.limits.weeklySnapshots);
   integer(input.estimatedRetainedBytes, 0, input.limits.retainedBytes);
-  integer(input.retainedUsageEvents + input.retainedWeeklySnapshots, 0, input.limits.combinedInputs);
+  if (input.encoding !== "accounting_streamed_v1") {
+    integer(input.retainedUsageEvents + input.retainedWeeklySnapshots, 0, input.limits.combinedInputs);
+  }
   // Each revision's public validator owns its retained-byte formula: v2 and
-  // v3 intentionally charge different per-usage retained sizes.
+  // v3 intentionally charge different per-usage retained sizes. Streamed v1
+  // accounts typed metadata; its row ceiling applies per derivation batch.
   exact(value.rows, CACHE_ARRAYS);
   CACHE_ARRAYS.forEach((key) => integer(value.rows[key]));
   return value;

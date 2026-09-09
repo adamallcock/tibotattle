@@ -2222,6 +2222,58 @@ test("the unified index supplies the full-history calibration corpus with no sca
   assert.equal(cache.schemaVersion, REPLAY_SAFE_ACCOUNTING_SCHEMA_VERSION);
 });
 
+
+test("streamed calibration keeps older resets beyond the per-batch usage ceiling", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-streamed-history-"));
+  const indexFile = join(directory, "local-unified-index-v1.sqlite");
+  await writeUnifiedCalibrationFixture(indexFile, {
+    resets: ["2025-05-01", "2025-05-08", "2025-05-15"].map((date) => Date.parse(`${date}T00:00:00Z`)),
+  });
+  const options = {
+    now: () => Date.parse("2026-08-20T12:00:00Z"),
+    unifiedIndexFile: indexFile,
+    scan: scanner([]),
+  };
+  const oracle = await buildReplaySafeAccountingCache(options);
+  const bounded = await buildReplaySafeAccountingCache({
+    ...options,
+    transitionResourceLimits: { usageEvents: 12 },
+  });
+  assert.equal(bounded.weeklyCalibrationInput.encoding, "accounting_streamed_v1");
+  assert.equal(bounded.weeklyCalibrationInput.retainedUsageEvents, 27);
+  assert.equal(bounded.weeklyCalibrationInput.limits.usageEvents, 12);
+  assert.deepEqual(bounded.weeklyCalibrationInput.coveredAt, oracle.weeklyCalibrationInput.coveredAt);
+  assert.deepEqual(bounded.weeklyCalibration.recentResets, oracle.weeklyCalibration.recentResets);
+  assert.deepEqual(bounded.weeklyCalibration.estimate, oracle.weeklyCalibration.estimate);
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(bounded));
+  // Byte claims are exact buffer sizes and cannot be forged to bypass limits.
+  const invalid = structuredClone(bounded);
+  invalid.weeklyCalibrationInput.usageMetadataBytes -= 1;
+  assert.throws(() => assertReplaySafeAccountingCache(invalid), { code: "cache_invalid" });
+  const legacy = structuredClone(oracle);
+  legacy.weeklyCalibrationInput.encoding = "accounting_compact_v3";
+  delete legacy.weeklyCalibrationInput.usageMetadataCapacity;
+  delete legacy.weeklyCalibrationInput.usageMetadataBytes;
+  legacy.weeklyCalibrationInput.estimatedRetainedBytes =
+    legacy.weeklyCalibrationInput.retainedUsageEvents * 352
+      + legacy.weeklyCalibrationInput.retainedWeeklySnapshots * 192;
+  assert.doesNotThrow(() => assertReplaySafeAccountingCache(legacy), "old compact cache remains readable");
+});
+
+test("streamed calibration refuses a metadata budget miss instead of shortening history", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "usage-monitor-streamed-budget-"));
+  const indexFile = join(directory, "local-unified-index-v1.sqlite");
+  await writeUnifiedCalibrationFixture(indexFile, {
+    resets: ["2025-05-01", "2025-05-08", "2025-05-15"].map((date) => Date.parse(`${date}T00:00:00Z`)),
+  });
+  await assert.rejects(buildReplaySafeAccountingCache({
+    now: () => Date.parse("2026-08-20T12:00:00Z"),
+    unifiedIndexFile: indexFile,
+    scan: scanner([]),
+    transitionResourceLimits: { retainedBytes: 400 },
+  }), { code: "accounting_transition_memory_budget_exceeded" });
+});
+
 test("the exact-ledger fast lane reproduces the decimal-string fold to the digit", async () => {
   // Deterministic pseudo-random quantities: a fixed LCG, no wall clock.
   let seed = 0x9e3779b9;
@@ -2552,7 +2604,7 @@ async function writeUnifiedCorpusFixture(indexFile, { usageEvents, quotaRows }) 
   await writer.close({ integrityCheck: true, fsyncPath: indexFile });
 }
 
-test("the unified usage read refuses incrementally when resident rows project past the byte budget", async () => {
+test("streamed timestamp ties cannot bypass a single-reset derivation ceiling", async () => {
   const directory = await mkdtemp(
     join(tmpdir(), "usage-monitor-unified-usage-budget-"),
   );
@@ -2567,13 +2619,10 @@ test("the unified usage read refuses incrementally when resident rows project pa
     })),
   });
 
-  // Retention keeps the newest 5 usage rows, but every row shares one
-  // timestamp, so the batched read walks all 40 before trimming. The
-  // post-trim corpus (5 usage rows + 3 collapsed snapshots = 1,856 projected
-  // bytes) FITS the injected 2,560-byte budget, so this refusal can only
-  // come from the incremental accounting inside the batch loop noticing the
-  // resident working set (40 rows = 10,240 projected bytes) — the residency
-  // the after-the-fact gate never saw.
+  // Full history retains all 40 tied stamps (1,200 bytes including the
+  // attribution memo), not an arbitrary newest five. This reset needs all
+  // forty decoded rows at once, so it must refuse the five-row batch limit
+  // before decoding rather than truncate its evidence.
   await assert.rejects(
     buildReplaySafeAccountingCache({
       now: () => NOW,
@@ -2581,7 +2630,7 @@ test("the unified usage read refuses incrementally when resident rows project pa
       transitionResourceLimits: { usageEvents: 5, retainedBytes: 2_560 },
       scan: scanner([]),
     }),
-    (error) => error?.code === "accounting_calibration_corpus_unavailable",
+    (error) => error?.code === "accounting_transition_derivation_limit_exceeded",
   );
 });
 
