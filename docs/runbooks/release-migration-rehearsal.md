@@ -189,7 +189,9 @@ completion. This is small-fixture hosted proof, not production-size admission.
 
 Any uncertain mutation stops. In this optional mode the tool retains its
 owner-only temporary target configuration, SQL and fixture and reports its
-`recoveryDirectory` in the closed error receipt. Keep that receipt private.
+`recoveryDirectory` in the closed error receipt. A bounded `last-command-private.json`
+retains the exact failed call's phase, status/signal/error code and captured output;
+it never captures the process environment. Keep that receipt private.
 Reconcile provider terminal status and exact remote ledgers/schema before
 choosing any retry or deletion. A client timeout is not cancellation; rerunning
 the command refuses occupied targets. Do not delete the new databases while an

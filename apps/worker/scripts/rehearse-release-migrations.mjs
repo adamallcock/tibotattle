@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { spawn as spawnChild, spawnSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { chmod, lstat, mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -405,6 +406,20 @@ export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, t
   }
   const directory = await mkdtemp(join(tmpdir(), "tibotattle-remote-syntax-")); await chmod(directory, 0o700);
   let attempted = false, retainDirectory = false;
+  // Keep bounded evidence for the exact last call; never capture the environment.
+  // This private directory is retained only for the explicit import experiment.
+  const trackedSpawn = importMigration === null ? spawn : (command, args, options) => {
+    const result = spawn(command, args, options);
+    writeFileSync(join(directory, "last-command-private.json"), JSON.stringify({
+      phase: args.includes("--file") ? (args[args.indexOf("--file") + 1].endsWith("ownership-migration-import.sql") ? "ownership_import" : "synthetic_seed")
+        : args[1] === "migrations" ? "migrations_apply" : "readback",
+      args, status: result.status ?? null, signal: result.signal ?? null,
+      errorCode: result.error?.code ?? null,
+      stdout: String(result.stdout ?? "").slice(0, 2 * 1024 * 1024),
+      stderr: String(result.stderr ?? "").slice(0, 2 * 1024 * 1024),
+    }), { mode: 0o600 });
+    return result;
+  };
   try {
     const configPath = join(directory, "wrangler.json");
     await writeFile(configPath, JSON.stringify({ name: "tibotattle-rehearsal", compatibility_date: config.compatibility_date,
@@ -414,21 +429,21 @@ export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, t
     // Only the admitted fresh pair is queried; these are tiny generated fixtures.
     const capture = (binding, previous = null) => {
       const infos = wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--command",
-        PRESERVED_TABLES.map(table => `PRAGMA table_info(${quote(table)});`).join("\n"), "--json"], spawn);
+        PRESERVED_TABLES.map(table => `PRAGMA table_info(${quote(table)});`).join("\n"), "--json"], trackedSpawn);
       if (!Array.isArray(infos) || infos.length !== PRESERVED_TABLES.length || infos.some(row => row.success !== true || !Array.isArray(row.results))) fail("REMOTE_REHEARSAL_PRESERVATION_FAILED");
       const shape = previous ?? Object.fromEntries(infos.flatMap((row, i) => row.results.length ? [[PRESERVED_TABLES[i], {
         columns: row.results.map(column => column.name), order: row.results.filter(column => column.pk > 0).sort((a, b) => a.pk - b.pk).map(column => column.name),
       }]] : []));
       const tables = Object.keys(shape);
       const rows = wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--command",
-        tables.map(table => `SELECT ${shape[table].columns.map(quote).join(",")} FROM ${quote(table)} ORDER BY ${(shape[table].order.length ? shape[table].order : shape[table].columns).map(quote).join(",")} LIMIT 257;`).join("\n"), "--json"], spawn);
+        tables.map(table => `SELECT ${shape[table].columns.map(quote).join(",")} FROM ${quote(table)} ORDER BY ${(shape[table].order.length ? shape[table].order : shape[table].columns).map(quote).join(",")} LIMIT 257;`).join("\n"), "--json"], trackedSpawn);
       if (!Array.isArray(rows) || rows.length !== tables.length || rows.some(row => row.success !== true || !Array.isArray(row.results) || row.results.length > 256)) fail("REMOTE_REHEARSAL_PRESERVATION_FAILED");
       return { shape, digests: Object.fromEntries(tables.map((table, i) => [table, { count: rows[i].results.length, sha256: sha(JSON.stringify(rows[i].results)) }])) };
     };
     // Query both before any mutation; an occupied or unknown target never receives SQL.
     for (const binding of Object.keys(STREAMS)) {
       const rows = resultRows(wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--command",
-        "SELECT COUNT(*) AS n FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%';", "--json"], spawn));
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%';", "--json"], trackedSpawn));
       if (rows.length !== 1 || rows[0].n !== 0) fail("REMOTE_REHEARSAL_TARGET_NOT_EMPTY");
     }
     for (const binding of Object.keys(STREAMS)) {
@@ -438,7 +453,7 @@ export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, t
       const apply = () => {
         attempted = true;
         // migrations apply has human output; avoid logging it and do not parse it as JSON.
-        const result = spawn(join(workerRoot, "node_modules/.bin/wrangler"), ["d1", "migrations", "apply", binding, ...args, "--remote"],
+        const result = trackedSpawn(join(workerRoot, "node_modules/.bin/wrangler"), ["d1", "migrations", "apply", binding, ...args, "--remote"],
           { cwd: workerRoot, encoding: "utf8", input: "y\n", timeout: 120_000, maxBuffer: 2 * 1024 * 1024,
             env: { ...process.env, CI: "true", WRANGLER_SEND_METRICS: "false" } });
         if (result.error || result.status !== 0) fail("REMOTE_REHEARSAL_OUTCOME_UNCERTAIN");
@@ -446,7 +461,7 @@ export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, t
       apply();
       const seed = join(directory, `${binding}-seed.sql`);
       await writeFile(seed, [...seedStatements(binding, 2, 20, binding === "USAGE_MONITOR_DB" || start >= 2)].join("\n"), { mode: 0o600 });
-      wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--file", seed, "--yes", "--json"], spawn);
+      wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--file", seed, "--yes", "--json"], trackedSpawn);
       const before = importMigration ? capture(binding) : null;
       if (importMigration && binding === "USAGE_MONITOR_DB") {
         for (const migration of sources[binding].slice(start)) {
@@ -455,7 +470,7 @@ export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, t
           const sql = `${migration.sql}\nINSERT INTO d1_migrations (name) values ('${migration.name}');`;
           const path = join(directory, "ownership-migration-import.sql");
           await writeFile(path, sql, { mode: 0o600 });
-          const [result] = wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--file", path, "--yes", "--json"], spawn);
+          const [result] = wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--file", path, "--yes", "--json"], trackedSpawn);
           importReceipts.push({ name: migration.name, sha256: migration.sha256, importSha256: sha(sql), durationMs: result.meta.duration, terminalResultVerified: true });
         }
       } else {
@@ -472,7 +487,7 @@ export async function rehearseRemoteSyntax({ workerRoot = WORKER_ROOT, prefix, t
         telemetry_v1_device_consents: 2, telemetry_v1_records: 20, telemetry_records: 20, identity_reenrollment_cooldowns: 2 }
         : { deletion_tombstones: 2, identity_reenrollment_cooldowns: start >= 2 ? 2 : 0 };
       const sql = `SELECT ${Object.keys(expected).map(table => `(SELECT COUNT(*) FROM ${table}) AS ${table}`).join(",")};`;
-      const rows = resultRows(wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--command", sql, "--json"], spawn));
+      const rows = resultRows(wranglerRun(workerRoot, ["d1", "execute", binding, ...args, "--remote", "--command", sql, "--json"], trackedSpawn));
       if (rows.length !== 1 || !exact(rows[0], Object.keys(expected))
           || Object.entries(expected).some(([key, count]) => rows[0][key] !== count)) fail("REMOTE_REHEARSAL_PRESERVATION_FAILED");
     }

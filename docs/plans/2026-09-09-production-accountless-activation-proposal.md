@@ -274,7 +274,7 @@ reconciliation and never authorize retry or remote deletion.
 The source-focused suite passed 26 tests, including actual in-memory SQLite
 routing/preservation, same-count row corruption, forbidden admission and malformed
 terminal output. An independent read-only source review found no blocker. This
-is source/local evidence; the new disposable resources do not exist yet.
+is source/local evidence; hosted execution status is recorded below.
 
 The concrete owner-only inputs are in
 `production-activation-preparation-20260909/disposable-import58-plan/`:
@@ -286,12 +286,33 @@ UUID placeholders intentionally refuse execution until exact new creation
 receipts are bound. The complete import-file SHA-256 is
 `e0795f0a1823d79d89522ba317f7462079c70c06e43c96a12568476c91f126d4`.
 
-The requested approval covers creating those two resources, the small exact
+The user subsequently approved creating those two resources, the small exact
 migration rehearsal/readbacks and deleting only the newly created UUIDs after
 known terminal results and ownership verification. Production, existing staging,
 real records, deployment, collection activation and multi-gigabyte fixtures are
-excluded. Unknown creation/import/deletion stops for reconciliation. No new
-remote resource or exact-migration hosted run has been performed.
+excluded. Both exact names were absent before creation; fresh UUID/name readbacks
+passed at `2026-09-09T19:30:36Z`. Private ownership receipts bind the created pair.
+
+The first hosted run stopped at the 0058 import with
+`REMOTE_REHEARSAL_OUTCOME_UNCERTAIN` at `19:31:36Z`; no retry or deletion occurred.
+Read-only reconciliation at `19:33:12Z` found the primary ledger exactly through
+0057, both participants and all 20 records in each synthetic telemetry table
+intact, no 0058 snapshot tables and no foreign-key violations. The deletion
+stream had not started. This proves current intact state, not provider
+cancellation or a final import status. The exact owned Wrangler log sanitized
+response bodies and retained no ingest bookmark or terminal status. The pair
+remained preserved while recovering provider status. At `19:39:11Z`, a single
+read-only documented import poll, bound to the created UUID and its current
+Time Travel bookmark, returned `Not currently importing anything.` That proves
+no current import, while the retained 0057 readback proves intact data; it is not
+a successful 0058 receipt or an explanation of the first failure. The pair remains
+preserved pending reviewed cleanup/recreation with improved diagnostics.
+Exact-migration hosted qualification and resource cleanup are **unfinished**.
+
+The maintained optional mode now retains bounded owner-private failed-call
+phase/status/output alongside its generated SQL/config to prevent another opaque
+failure. Nine focused remote/import tests passed for that diagnostic addition.
+No production or existing staging resource was changed by this experiment.
 
 # Live configuration and recovery preparation
 

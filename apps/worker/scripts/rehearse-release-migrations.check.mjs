@@ -321,6 +321,9 @@ test("file import refuses malformed, partial, false and arbitrary progress resul
           assert.match(error.code, /OUTCOME_UNCERTAIN/);
           assert.ok(readFileSync(join(error.recoveryDirectory, "wrangler.json"), "utf8").includes("tibotattle-rehearsal"));
           assert.ok(readFileSync(join(error.recoveryDirectory, "USAGE_MONITOR_DB-seed.sql"), "utf8").includes("synthetic-rehearsal"));
+          const diagnostic = JSON.parse(readFileSync(join(error.recoveryDirectory, "last-command-private.json"), "utf8"));
+          assert.equal(diagnostic.stdout, badOutput); assert.equal(diagnostic.phase, "synthetic_seed"); assert.ok(diagnostic.args.includes("--file"));
+          assert.equal("env" in diagnostic, false);
           return true;
         });
       assert.equal(fake.imported.length, 1);
