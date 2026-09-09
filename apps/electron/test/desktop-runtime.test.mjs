@@ -803,6 +803,16 @@ test("macOS production runtime connects updater controls to protected preference
     assert.equal(app.quitCalls, 0);
     installs += 1;
     if (rejectInstall) throw new Error("synthetic installer handover failure");
+    // Native macOS updater closes windows before app.before-quit. Verify the
+    // production composition forwards the earlier native updater signal.
+    nativeAutoUpdater.emit("before-quit-for-update");
+    const windows = FakeWindow.instances.filter((window) => !window.isDestroyed());
+    assert.ok(windows.length > 0);
+    for (const window of windows) {
+      let prevented = false;
+      window.emit("close", { preventDefault() { prevented = true; } });
+      assert.equal(prevented, false);
+    }
   };
   t.after(async () => {
     await fixture?.desktop.lifecycle.requestQuit();

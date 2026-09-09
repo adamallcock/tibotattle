@@ -1632,6 +1632,7 @@ export async function launchDesktopRuntime({
   try {
     lifecycle = createDesktopLifecycle({
       app,
+      nativeAutoUpdater: runtime.autoUpdater,
       BrowserWindow: runtime.BrowserWindow,
       Tray: runtime.Tray,
       Menu: runtime.Menu,

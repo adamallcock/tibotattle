@@ -92,6 +92,7 @@ function assertFunction(value, label) {
  */
 export function createDesktopLifecycle({
   app,
+  nativeAutoUpdater,
   BrowserWindow,
   Tray,
   Menu,
@@ -125,6 +126,10 @@ export function createDesktopLifecycle({
   openDashboardExternal,
 } = {}) {
   if (!app || typeof app.on !== "function") throw new TypeError("app is required");
+  if (nativeAutoUpdater !== undefined
+      && (nativeAutoUpdater === null || typeof nativeAutoUpdater.on !== "function")) {
+    throw new TypeError("nativeAutoUpdater must be an event emitter");
+  }
   assertFunction(BrowserWindow, "BrowserWindow");
   assertFunction(supervisor?.start, "supervisor.start");
   assertFunction(supervisor?.stop, "supervisor.stop");
@@ -1410,6 +1415,15 @@ export function createDesktopLifecycle({
       else if (started) createWindow();
       else showRecoveryWindow(startupFailureStatus ?? "starting");
     });
+    if (nativeAutoUpdater !== undefined) {
+      // Electron emits this updater-specific signal before it closes any
+      // BrowserWindows. The app `before-quit` event follows those close
+      // events for quitAndInstall(), so it is too late to release the
+      // ordinary close-to-tray guards there.
+      listen(nativeAutoUpdater, "before-quit-for-update", () => {
+        if (!quitting && updatePreparing) updateQuitRequested = true;
+      });
+    }
     listen(app, "before-quit", (event) => {
       // electron-updater owns the native installer hand-off after the
       // companion has been stopped. Its quit must not be converted back into

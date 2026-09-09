@@ -104,6 +104,7 @@ class FakeTray extends EventEmitter {
 
 function makeLifecycle({
   starts,
+  nativeAutoUpdater,
   desktopLocale = "system",
   desktopSystemLocales,
   desktopActions,
@@ -137,6 +138,7 @@ function makeLifecycle({
   }
   const lifecycle = createDesktopLifecycle({
     app,
+    nativeAutoUpdater,
     BrowserWindow: Window,
     Tray: FakeTray,
     Menu: { buildFromTemplate: (template) => ({ template }) },
@@ -462,7 +464,7 @@ test("recovery window keeps the same sandboxed renderer constraints", () => {
   });
 });
 
-test("prepared updater quit releases each desktop window only after Electron before-quit", async () => {
+test("native updater signal releases each desktop window before Electron closes it", async () => {
   const scenarios = [
     {
       name: "recovery",
@@ -499,7 +501,11 @@ test("prepared updater quit releases each desktop window only after Electron bef
   ];
 
   for (const scenario of scenarios) {
-    const { app, lifecycle, windows } = makeLifecycle({ starts: scenario.starts });
+    const nativeAutoUpdater = new EventEmitter();
+    const { app, lifecycle, windows } = makeLifecycle({
+      starts: scenario.starts,
+      nativeAutoUpdater,
+    });
     const target = await scenario.selectWindow({ lifecycle, windows });
     assert.notEqual(target, undefined, `${scenario.name} window should exist`);
     assert.equal(target.visible, true, `${scenario.name} window should be visible`);
@@ -517,13 +523,10 @@ test("prepared updater quit releases each desktop window only after Electron bef
     assert.equal(preparationClosePrevented, true, `${scenario.name} close remains tray-safe`);
     target.show();
 
-    let beforeQuitPrevented = false;
-    app.emit("before-quit", {
-      preventDefault() {
-        beforeQuitPrevented = true;
-      },
-    });
-    assert.equal(beforeQuitPrevented, false, `${scenario.name} updater quit is allowed`);
+    // Electron's before-quit-for-update signal is emitted on its native
+    // autoUpdater before it starts closing BrowserWindows. app before-quit
+    // arrives only after those close events for quitAndInstall().
+    nativeAutoUpdater.emit("before-quit-for-update");
 
     let updateClosePrevented = false;
     target.emit("close", {
@@ -533,6 +536,14 @@ test("prepared updater quit releases each desktop window only after Electron bef
     });
     assert.equal(updateClosePrevented, false, `${scenario.name} updater close is allowed`);
     assert.equal(target.visible, true, `${scenario.name} close is not hidden by tray handler`);
+
+    let beforeQuitPrevented = false;
+    app.emit("before-quit", {
+      preventDefault() {
+        beforeQuitPrevented = true;
+      },
+    });
+    assert.equal(beforeQuitPrevented, false, `${scenario.name} updater quit is allowed`);
 
     await lifecycle.dispose();
   }
