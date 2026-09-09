@@ -152,7 +152,10 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
   // except the owner-approved 0043 repair and expression-parentheses-only
   // remote-parser compatibility repair of unapplied 0044/0045. The
   // Disabled accountless ledger, direct ownership, and same-graph renewal are
-  // appended after the canonical prefix at 0057 through 0059. The displaced
+  // appended after the canonical prefix at 0057 through 0059. The 0059 pin
+  // includes the reviewed social parent-erasure repair, which preserves
+  // social-only graph invalidation and progress cleanup through FK cascades.
+  // The displaced
   // staging-only 0046–0048 SQL is retained separately as immutable evidence.
   // Never change
   // already-applied SQL or silently update these historical pins.
@@ -164,7 +167,7 @@ test("reconciled migration lineage pins historical SQL and reviewed unapplied re
     "0045_attribution_domain_activation.sql": "89f0df9e95eb98fa7ae8cb00dc82fe19f8933689a8002e647e638fdc870990fe",
     "0057_accountless_enrollment_ledger.sql": "5cbf718449688bffc0fc5cf63d1de17351acb915f44459f1b32f3202c7378cd5",
     "0058_accountless_upload_ownership.sql": "b435fd92d41e7ce8067cc183d7ac153359a9c130a971cba2e1b8b8c1c9cab61b",
-    "0059_accountless_upload_renewal.sql": "20173d5beb46bfb8b8b91cea103071134c9a1e1486f7202b43f105068ac3b022",
+    "0059_accountless_upload_renewal.sql": "98afb99dd91e56a96960e6d99096e44c41eec0cd52d5a1e2969dea4ddee3d312",
   };
   const legacyDigests = {
     "0046_accountless_enrollment_ledger.sql": "aa8b6542a3d5fcadad24a5c7be59f2ed0b727e491c454705f37b9d00502a4b6c",

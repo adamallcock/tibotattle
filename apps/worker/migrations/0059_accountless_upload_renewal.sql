@@ -595,10 +595,20 @@ END;
 
 DROP TRIGGER IF EXISTS community_model_history_participant_delete;
 CREATE TRIGGER community_model_history_participant_delete
-BEFORE DELETE ON participants FOR EACH ROW
+BEFORE DELETE ON participants FOR EACH ROW WHEN OLD.owner_kind='social'
 BEGIN
-  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL AND OLD.owner_kind='social';
-  DELETE FROM admin_community_allowance_preview_cache WHERE OLD.owner_kind='social';
+  -- A foreign-key cascade removes the parent before child DELETE triggers can
+  -- consult participants.owner_kind. Delete social heads while that evidence
+  -- is still present so the existing exact counter trigger observes the same
+  -- removal it observes for direct social-head deletion.
+  DELETE FROM community_prepared_source_days WHERE participant_id=OLD.id;
+  DELETE FROM community_model_composition_days WHERE history_method_version IS NOT NULL;
+  DELETE FROM admin_community_allowance_preview_cache;
+  -- Child telemetry cascades are intentionally social-gated and run after
+  -- this root is no longer queryable. A social owner erasure is nevertheless
+  -- a hard graph invalidation, exactly once at the root boundary.
+  UPDATE community_snapshot_mutation_control SET mutation_epoch=mutation_epoch+1
+    WHERE singleton_id=1;
 END;
 
 DROP TRIGGER IF EXISTS community_model_history_participant_state;

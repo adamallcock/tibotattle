@@ -153,7 +153,7 @@ test("occupied disposable target refuses before mutation, malformed response als
 });
 
 test("remote syntax uses only isolated config and generated synthetic SQL, validates ledgers and counts", async () => {
-  const p = await prefix(53, 2), final = await prefix(56, 2), calls = [];
+  const p = await prefix(53, 2), final = await prefix(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER), calls = [];
   const result = await rehearseRemoteSyntax({ prefix: p, target, confirmation: confirm, spawn: (_cmd, args) => {
     calls.push(args);
     assert.ok(args.includes("--config")); assert.ok(args.includes("--remote")); assert.ok(!args.includes("--env"));
