@@ -605,6 +605,21 @@ test("production source candidate requires an explicit numeric build number and 
   ]), (error) => error?.code === "ELECTRON_PRODUCTION_ARGUMENT_INVALID");
 });
 
+test("production and handover plans retain the closed finalization receipt shape", () => {
+  for (const target of ["darwin-arm64", "darwin-x64", "win32-x64", "linux-x64"]) {
+    const plan = productionElectronCandidatePlan({ target, sourceRevision: SOURCE_REVISION, buildNumber: BUILD_NUMBER });
+    assert.equal(Object.hasOwn(plan, "packagingProfile"), false, target);
+    assert.equal(Object.hasOwn(plan, "accountlessSignedStagingRehearsal"), false, target);
+  }
+  for (const target of ["darwin-arm64", "darwin-x64"]) {
+    for (const rehearsal of ["current", "next"]) {
+      const plan = productionElectronCandidatePlan({ target, sourceRevision: SOURCE_REVISION, buildNumber: BUILD_NUMBER,
+        rehearsal, rehearsalCurrentVersion: REHEARSAL_CURRENT_VERSION, rehearsalNextVersion: REHEARSAL_NEXT_VERSION });
+      assert.equal(Object.hasOwn(plan, "packagingProfile"), false, `${target} ${rehearsal}`);
+    }
+  }
+});
+
 test("signed staging source binds the hosted macOS account and disables the updater", () => {
   const options = parseProductionCandidateArguments([
     "--target", "darwin-arm64",

@@ -270,9 +270,11 @@ export function productionElectronCandidatePlan({
   return Object.freeze({
     schemaVersion: SCHEMA_VERSION,
     buildNumber,
-    packagingProfile: accountlessSignedStagingRehearsal
-      ? "accountless-signed-staging-rehearsal"
-      : "production",
+    // Keep the established production/handover receipt shape byte-compatible.
+    // Only the separate signed staging profile carries this additional marker.
+    ...(accountlessSignedStagingRehearsal
+      ? { packagingProfile: "accountless-signed-staging-rehearsal" }
+      : {}),
     sourceRevision,
     version,
     target,
@@ -560,7 +562,7 @@ export async function prepareProductionElectronCandidate(options = {}) {
     output: targetOutput(plan),
     target: plan.target,
     replace: options.replaceStaging === true,
-    packagingProfile: plan.packagingProfile,
+    packagingProfile: plan.packagingProfile ?? "production",
     packageVersion: plan.version,
     ...(signedStaging
       ? { signedStagingRehearsalMetadata: metadata }
