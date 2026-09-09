@@ -49,7 +49,7 @@ export function validateWorkUsageQuery(value) {
     ...value,
   };
   if (
-    !["query", "cancel"].includes(q.action) ||
+    !["query", "cancel", "touch"].includes(q.action) ||
     !Object.hasOwn(PERIODS, q.period) ||
     !["project", "thread", "worktree"].includes(q.grouping) ||
     !["tokens", "cost", "recent"].includes(q.sort) ||
@@ -95,6 +95,10 @@ export function validateWorkUsageQuery(value) {
   if (q.cursor && !q.snapshotId)
     throw workUsageError("work_usage_query_invalid");
   if (q.action === "cancel" && !q.snapshotId)
+    throw workUsageError("work_usage_query_invalid");
+  if (q.action === "touch" && (!q.snapshotId || Object.keys(value).some(
+    key => !["schemaVersion", "action", "snapshotId"].includes(key),
+  )))
     throw workUsageError("work_usage_query_invalid");
   return q;
 }
@@ -170,7 +174,7 @@ export function createWorkUsageService({
         return { schemaVersion: WORK_USAGE_SCHEMA, status: "cancelled" };
       }
       if (
-        entry &&
+        entry && q.action !== "touch" &&
         (entry.period !== q.period ||
           (q.scope !== undefined && entry.requestedScope !== q.scope))
       )
@@ -263,7 +267,9 @@ export function createWorkUsageService({
         toMs: entry.toMs,
         errorCode: entry.errorCode ?? null,
       };
-      if (entry.status !== "available") return base;
+      // A visible report renews its idle lease without repeating aggregation,
+      // name enrichment, or cursor allocation. Expired reports stay expired.
+      if (q.action === "touch" || entry.status !== "available") return base;
       const result = entry.result;
       const selected = { ...q, offset: 0 };
       if (q.findThread)

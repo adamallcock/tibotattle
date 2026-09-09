@@ -444,6 +444,74 @@ test("idle snapshots expire and maximum snapshot capacity evicts the oldest", as
   );
 });
 
+test("touch renews a cached report lease without reading accounting cells or enriching names", async (t) => {
+  let now = 10_000;
+  let builds = 0;
+  let enrichments = 0;
+  let cellReads = 0;
+  const result = availableResult([
+    event({ tokens: { output_text_tokens: 1 } }),
+  ]);
+  const service = createWorkUsageService({
+    clock: () => now,
+    idleMs: 100,
+    build: async () => { builds += 1; return result; },
+    enrich: async () => { enrichments += 1; return {}; },
+  });
+  t.after(() => service.close());
+  const first = await waitForAvailable(service, { schemaVersion: WORK_USAGE_SCHEMA, period: "all" });
+  const cells = result.cells;
+  Object.defineProperty(result, "cells", { get() { cellReads += 1; return cells; } });
+  const request = { schemaVersion: WORK_USAGE_SCHEMA, action: "touch", snapshotId: first.snapshotId };
+  for (let touch = 0; touch < 3; touch += 1) {
+    now += 90;
+    assert.deepEqual(await service.query(request), {
+      schemaVersion: WORK_USAGE_SCHEMA,
+      status: "available",
+      snapshotId: first.snapshotId,
+      fromMs: first.fromMs,
+      toMs: first.toMs,
+      errorCode: null,
+    });
+  }
+  assert.equal(builds, 1);
+  assert.equal(enrichments, 1);
+  assert.equal(cellReads, 0);
+  now += 101;
+  await assert.rejects(service.query(request), { code: "work_usage_snapshot_expired" });
+  await assert.rejects(service.query({ ...request, snapshotId: "unknown-snapshot" }), { code: "work_usage_snapshot_expired" });
+  assert.equal(builds, 1, "touch cannot rebuild an expired or unknown report");
+});
+
+test("touch has a closed request contract and preserves in-flight cancellation", async (t) => {
+  let builds = 0;
+  let resolveBuild;
+  let signal;
+  const service = createWorkUsageService({
+    build: (_range, options) => {
+      builds += 1;
+      signal = options.signal;
+      return new Promise(resolve => { resolveBuild = resolve; });
+    },
+    enrich: async () => assert.fail("touch must not enrich a pending report"),
+  });
+  t.after(() => service.close());
+  const first = await service.query({ schemaVersion: WORK_USAGE_SCHEMA, period: "all" });
+  const request = { schemaVersion: WORK_USAGE_SCHEMA, action: "touch", snapshotId: first.snapshotId };
+  const touched = await service.query(request);
+  assert.equal(touched.status, "preparing");
+  assert.equal(touched.snapshotId, first.snapshotId);
+  assert.equal(builds, 1);
+  for (const extra of [{ period: "all" }, { search: "name" }, { cursor: "cursor" }, { sourceSnapshotId: "source" }, { unexpected: true }])
+    assertQueryError({ ...request, ...extra });
+  for (const snapshotId of [undefined, "", "/private/path", null, 1])
+    assertQueryError({ ...request, snapshotId });
+  await service.query({ ...request, action: "cancel" });
+  assert.equal(signal.aborted, true);
+  await assert.rejects(service.query(request), { code: "work_usage_snapshot_expired" });
+  resolveBuild(availableResult([]));
+});
+
 test("thread model breakdown conserves filtered totals across worktrees and keeps output representations distinct", () => {
   const base = {input_uncached_tokens:10,input_cache_read_tokens:20,input_cache_write_tokens:0,output_text_tokens:3,output_reasoning_tokens:2};
   const report = reportFrom([

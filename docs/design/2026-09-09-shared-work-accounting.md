@@ -479,3 +479,32 @@ The bundled production dashboard was checked against the isolated real-data
 copy: project-name and task-name search, preserved global totals, nested task
 families, clearing search, share bars, token mix, and Sol/Terra icons in expanded
 model rows. This remains a local development build, not an installed release.
+
+
+## Visible report lifetime repair, 2026-09-09
+
+The five-minute service idle limit discarded a report while the user was reading
+it: browser visibility did not renew the lease. Later searches and expansions
+received an expired snapshot response despite the cached figures still being
+on screen. Keep the existing bounded, process-local cache and idle eviction,
+but renew the visible report every minute through a closed touch action. Renewal
+must not build, aggregate, enrich names, or scan logs. Stop on hidden/destroyed
+views, bound and cancel in-flight renewals, preserve displayed data on transient
+network failures, and automatically reacquire genuinely expired snapshots.
+A query retries expiry once; changed-snapshot errors remain explicit.
+This repairs browsing lifetime; it does not introduce durable incremental
+accounting or eliminate valid recomputation on explicit refresh.
+
+Validation passed: 20 service tests, 532 browser-unit tests and 329 local
+integration tests, including actual HTTP touch rejection/renewal checks.
+Regression coverage verifies zero build/enrichment calls on renewal, preserved
+expanded rows, hidden/destroyed view cleanup, transient failure preservation,
+filter-preserving bounded expiry recovery and rejection of changed snapshots.
+Architecture, documentation and preflight checks passed. The development bundle
+payload digest is
+`50feaf00a5781134c10527ea1e4db110b3bae7573e1df7acc3ad6396e7bcb4cf`.
+The bundled dashboard was reloaded against the isolated real-data copy. Browser
+qualification confirmed all-history search and project expansion, followed by
+navigation away and back with the search, expanded row and as-of time preserved.
+The observed touch returned HTTP 200 in 8 ms; this is one local observation, not a
+latency guarantee. The installed app and release remain unchanged.

@@ -183,6 +183,54 @@ export function mountWorkUsageView({
   let nextNestedId = 0;
   let statusKey = "preparing";
   let statusValues;
+  let leaseTimer = null;
+  let leaseController = null;
+  let destroyed = false;
+  const scheduleLease = windowRef.setTimeout?.bind(windowRef) ?? setTimeout;
+  const clearLeaseTimer = windowRef.clearTimeout?.bind(windowRef) ?? clearTimeout;
+  const visible = () => !destroyed && !root.inert && documentRef.visibilityState !== "hidden";
+  function stopLease() {
+    clearLeaseTimer(leaseTimer);
+    leaseTimer = null;
+    leaseController?.abort();
+    leaseController = null;
+  }
+  function queueLease() {
+    clearLeaseTimer(leaseTimer);
+    if (visible() && statusKey === "snapshot") {
+      leaseTimer = scheduleLease(keepReportAlive, 60_000);
+      leaseTimer?.unref?.();
+    }
+  }
+  async function keepReportAlive() {
+    if (!visible() || statusKey !== "snapshot" || !query.snapshotId || leaseController) return;
+    const snapshotId = query.snapshotId;
+    const token = serial;
+    const requestController = new AbortController();
+    leaseController = requestController;
+    const timeout = scheduleLease(() => requestController.abort(), 10_000);
+    try {
+      const http = await fetchRef("/api/local/work-usage/query", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-usage-monitor-local": "1" },
+        cache: "no-store",
+        body: JSON.stringify({ schemaVersion: SCHEMA, action: "touch", snapshotId }),
+        signal: requestController.signal,
+      });
+      if (http.status === 409 && token === serial && !requestController.signal.aborted && visible()) {
+        const error = await http.json();
+        if (error.error?.code === "work_usage_snapshot_expired" && token === serial
+            && !requestController.signal.aborted && visible()) refresh();
+      }
+    } catch {} // A transient lease failure must not erase the displayed report.
+    finally {
+      clearLeaseTimer(timeout);
+      if (leaseController === requestController) {
+        leaseController = null;
+        queueLease();
+      }
+    }
+  }
   const setStatus = (key, values) => {
     statusKey = key;
     statusValues = values;
@@ -322,6 +370,7 @@ export function mountWorkUsageView({
   message.setAttribute("role", "status");
   message.setAttribute("aria-live", "polite");
   const cancel = button(tr("cancel"), async () => {
+    stopLease();
     serial++;
     clearNested();
     controller?.abort();
@@ -459,6 +508,14 @@ export function mountWorkUsageView({
         body: JSON.stringify(childQuery),
         signal: controller.signal,
       });
+      if (http.status === 409) {
+        const error = await http.json();
+        if (error.error?.code === "work_usage_snapshot_expired" && token === serial
+            && nested === entry && !controller.signal.aborted) {
+          refresh();
+          return;
+        }
+      }
       if (!http.ok)
         throw new Error(http.status === 409 ? "expired" : "unavailable");
       const result = validateWorkUsageResponse(await http.json());
@@ -963,7 +1020,8 @@ export function mountWorkUsageView({
     focusTarget?.focus();
     pendingFocus = null;
   }
-  async function load() {
+  async function load(recoverExpired = true) {
+    stopLease();
     started = true;
     clearSearch.hidden = !query.search && !query.findThread;
     clearNested();
@@ -997,6 +1055,16 @@ export function mountWorkUsageView({
         body: JSON.stringify(query),
         signal: controller.signal,
       });
+      if (!http.ok && http.status === 409 && recoverExpired) {
+        const error = await http.json();
+        if (token !== serial) return;
+        if (error.error?.code === "work_usage_snapshot_expired") {
+          delete query.snapshotId;
+          delete query.sourceSnapshotId;
+          resetPage();
+          return load(false);
+        }
+      }
       if (!http.ok)
         throw new Error(http.status === 409 ? "expired" : "unavailable");
       const result = validateWorkUsageResponse(await http.json());
@@ -1004,7 +1072,7 @@ export function mountWorkUsageView({
       query.snapshotId = result.snapshotId;
       delete query.sourceSnapshotId;
       if (result.status === "preparing") {
-        timer = setTimeout(load, 750);
+        timer = setTimeout(() => load(recoverExpired), 750);
         return;
       }
       if (result.status !== "available") {
@@ -1044,6 +1112,7 @@ export function mountWorkUsageView({
       body.hidden = false;
       body.inert = false;
       render();
+      queueLease();
     } catch (error) {
       if (token !== serial || error.name === "AbortError") return;
       setStatus(error.message === "expired" ? "expired" : "unavailable");
@@ -1057,14 +1126,20 @@ export function mountWorkUsageView({
       }
     }
   }
-  const observer = new windowRef.MutationObserver(() => {
-    if (!root.inert && !started) load();
-  });
+  function visibilityChanged() {
+    stopLease();
+    if (!visible()) return;
+    if (!started) load();
+    else keepReportAlive();
+  }
+  const observer = new windowRef.MutationObserver(visibilityChanged);
   observer.observe(root, {
     attributes: true,
     attributeFilter: ["aria-hidden"],
   });
   if (!root.inert) load();
+  documentRef.addEventListener?.("visibilitychange", visibilityChanged);
+  windowRef.addEventListener("pageshow", visibilityChanged);
   function relocalize() {
     eyebrow.textContent = tr("local");
     title.textContent = tr("title");
@@ -1111,11 +1186,15 @@ export function mountWorkUsageView({
   return {
     refresh,
     destroy() {
+      destroyed = true;
+      stopLease();
       serial++;
       clearNested();
       controller?.abort();
       clearTimeout(timer);
       observer.disconnect();
+      documentRef.removeEventListener?.("visibilitychange", visibilityChanged);
+      windowRef.removeEventListener("pageshow", visibilityChanged);
       windowRef.removeEventListener("tibotattle:locale-change", relocalize);
     },
   };

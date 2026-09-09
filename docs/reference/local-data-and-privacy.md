@@ -381,7 +381,13 @@ report. It expires or is evicted with the report. Search matches are applied
 before pagination and family/project summation, preserving global share
 denominators. Neither search text nor the lookup is serialized, exported or
 uploaded. Refreshing creates a new lookup when names need to be reread.
-Attribution reports are immutable and expiring. A serial local projection worker
+Attribution reports are immutable and expire after five minutes without a query
+or lease renewal, with at most two retained per process. The visible Projects &
+threads page renews its lease every minute through a closed, content-free
+`touch` request containing only the schema, action and snapshot handle. This
+performs no aggregation, enrichment or source scan, stops when the page is hidden
+or destroyed, and does not extend the separate worker cache lifetime. Returning
+to an expired report automatically obtains a new snapshot. A serial local projection worker
 may reuse extracted workspace observations and quota-status offsets in private
 memory across refreshes, under a 32 MiB estimated payload budget and a 25,000-source
 limit. It holds no database connection between jobs. The cache is scoped to one

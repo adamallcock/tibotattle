@@ -170,6 +170,11 @@ observed values. Other missing counts remain labelled partial.
 **Refresh report** updates this view from the existing local index. Use the app's
 main **Refresh** to collect new usage first. Each report displays its own as-of
 time; opening another section does not rewrite an existing report's snapshot.
+While Projects & threads is visible, a lightweight keep-alive preserves its
+cached report without recalculating usage. Reports may be released after five
+minutes away from the page; returning automatically rebuilds an expired report.
+A fresh refresh can still require accounting work when the underlying cache
+is no longer valid.
 This feature is qualified in a local development build and has not been released.
 
 ## Refresh, progress, and recovery

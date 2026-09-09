@@ -197,6 +197,7 @@ test("work-usage route rejects foreign origin/host, method, media, oversize, and
 
 test("work-usage route accepts no Origin with the local capability and keeps a stable snapshot across pagination", async () => {
   let builds = 0;
+  let enrichments = 0;
   let sourceEvents = [
     event({ project: "repo-a", tokens: 30 }),
     event({ project: "repo-b", tokens: 20 }),
@@ -206,7 +207,7 @@ test("work-usage route accepts no Origin with the local capability and keeps a s
       builds += 1;
       return buildResult(sourceEvents, builds);
     },
-    workUsageEnrich: async () => ({}),
+    workUsageEnrich: async () => { enrichments += 1; return {}; },
   });
   try {
     const { app } = fixture;
@@ -239,6 +240,35 @@ test("work-usage route accepts no Origin with the local capability and keeps a s
     assert.equal(first.json.rows[0].id, "repo-a");
     assert.ok(first.json.nextCursor);
     assert.equal(first.json.totals.tokens, 50);
+
+    const enrichmentCount = enrichments;
+    const touched = await jsonRequest({
+      port: app.port, headers,
+      body: requestBody({ action: "touch", snapshotId: first.json.snapshotId }),
+    });
+    assert.equal(touched.status, 200);
+    assert.deepEqual(touched.json, {
+      schemaVersion: WORK_USAGE_SCHEMA,
+      status: "available",
+      snapshotId: first.json.snapshotId,
+      fromMs: first.json.fromMs,
+      toMs: first.json.toMs,
+      errorCode: null,
+    });
+    assert.equal(builds, 1);
+    assert.equal(enrichments, enrichmentCount);
+    const unknown = await jsonRequest({
+      port: app.port, headers,
+      body: requestBody({ action: "touch", snapshotId: "unknown-snapshot" }),
+    });
+    assert.equal(unknown.status, 409);
+    assert.equal(unknown.json.error.code, "work_usage_snapshot_expired");
+    const invalidTouch = await jsonRequest({
+      port: app.port, headers,
+      body: requestBody({ action: "touch", snapshotId: first.json.snapshotId, search: "not-a-query" }),
+    });
+    assert.equal(invalidTouch.status, 400);
+    assert.equal(invalidTouch.json.error.code, "work_usage_query_invalid");
 
     sourceEvents = [event({ project: "repo-new", tokens: 100 }), ...sourceEvents];
     const second = await jsonRequest({

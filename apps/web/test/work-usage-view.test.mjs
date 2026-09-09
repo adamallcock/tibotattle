@@ -445,6 +445,43 @@ function mountedRoot() {
   return { documentRef, root, windowRef: new MountedWindow() };
 }
 
+function mountedLeaseRoot() {
+  const mounted = mountedRoot();
+  const { documentRef, windowRef } = mounted;
+  const timers = new Map();
+  const observers = [];
+  let nextTimer = 0;
+  windowRef.setTimeout = (callback, delay) => {
+    const id = ++nextTimer;
+    timers.set(id, { callback, delay });
+    return id;
+  };
+  windowRef.clearTimeout = id => timers.delete(id);
+  windowRef.MutationObserver = class {
+    constructor(callback) { this.callback = callback; observers.push(this); }
+    observe() { this.connected = true; }
+    disconnect() { this.connected = false; }
+  };
+  documentRef.visibilityState = "visible";
+  documentRef.listeners = new Map();
+  documentRef.addEventListener = MountedWindow.prototype.addEventListener;
+  documentRef.removeEventListener = MountedWindow.prototype.removeEventListener;
+  const dispatch = (target, type) => {
+    for (const listener of target.listeners.get(type) ?? []) listener({ type });
+  };
+  return {
+    ...mounted, timers, observers,
+    dispatch,
+    changed: () => observers.filter(observer => observer.connected).forEach(observer => observer.callback()),
+    runTimer(delay) {
+      const next = [...timers].find(([, timer]) => timer.delay === delay);
+      assert.ok(next, `expected a ${delay}ms timer`);
+      timers.delete(next[0]);
+      return next[1].callback();
+    },
+  };
+}
+
 function findMounted(root, predicate, seen = new Set()) {
   if (seen.size > 1000)
     throw new Error(`mounted tree too large near ${root.tagName}`);
@@ -1113,4 +1150,195 @@ test("primary and expanded model names reuse decorative model icons without extr
     const detail=findMounted(root,n=>n.classList.contains("work-usage-model-detail"))[0];
     assert.equal(findMounted(detail,n=>n.classList.contains("allowance-model-sol")).length,1);
   } finally {view.destroy();}
+});
+
+test("visible reports renew their lease without redrawing expanded rows and resume after hidden or inert periods", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef, documentRef } = harness;
+  const requests = [];
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      if (body.action === "touch") return httpResponse({ status: "available" });
+      return httpResponse(body.grouping === "thread" ? THREAD_A_RESPONSE : PROJECT_ROWS_RESPONSE);
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  findMounted(root, node => node.classList.contains("work-usage-project-toggle"))[0].click();
+  await settleMountedView();
+  const children = findMounted(root, node => node.classList.contains("work-usage-children"))[0];
+  const before = requests.length;
+  await harness.runTimer(60_000);
+  assert.deepEqual(requests.at(-1), {
+    schemaVersion: WORK_USAGE_SCHEMA, action: "touch", snapshotId: PROJECT_ROWS_RESPONSE.snapshotId,
+  });
+  assert.equal(requests.length, before + 1);
+  assert.strictEqual(findMounted(root, node => node.classList.contains("work-usage-children"))[0], children);
+  assert.equal(findMounted(root, node => node.classList.contains("work-usage-project-toggle"))[0].getAttribute("aria-expanded"), "true");
+  documentRef.visibilityState = "hidden";
+  harness.dispatch(documentRef, "visibilitychange");
+  assert.equal(harness.timers.size, 0);
+  harness.dispatch(windowRef, "pageshow");
+  assert.equal(requests.length, before + 1, "hidden documents do not renew");
+  documentRef.visibilityState = "visible";
+  harness.dispatch(documentRef, "visibilitychange");
+  await settleMountedView();
+  assert.equal(requests.length, before + 2);
+  root.inert = true;
+  harness.changed();
+  assert.equal(harness.timers.size, 0);
+  harness.dispatch(windowRef, "pageshow");
+  assert.equal(requests.length, before + 2, "inactive dashboard panels do not renew");
+  root.inert = false;
+  harness.changed();
+  await settleMountedView();
+  assert.equal(requests.length, before + 3);
+  harness.dispatch(windowRef, "pageshow");
+  await settleMountedView();
+  assert.equal(requests.length, before + 4);
+  assert.strictEqual(findMounted(root, node => node.classList.contains("work-usage-children"))[0], children);
+});
+
+test("transient touch failures preserve the report and an expired touch refreshes once", async (t) => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef } = harness;
+  const requests = [];
+  let expire = false;
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      if (body.action === "touch") {
+        if (!expire) throw new Error("temporary connection failure");
+        return { ok: false, status: 409, json: async () => ({ error: { code: "work_usage_snapshot_expired" } }) };
+      }
+      return httpResponse(PROJECT_ROWS_RESPONSE);
+    },
+  });
+  t.after(() => view.destroy());
+  await settleMountedView();
+  const table = findMounted(root, node => node.tagName === "TABLE")[0];
+  const text = root.textContent;
+  await harness.runTimer(60_000);
+  assert.strictEqual(findMounted(root, node => node.tagName === "TABLE")[0], table);
+  assert.equal(root.textContent, text);
+  assert.equal(requests.length, 2);
+  expire = true;
+  await harness.runTimer(60_000);
+  await settleMountedView();
+  assert.equal(requests.length, 4, "one touch and one fresh query follow the transient failure");
+  assert.equal(requests[2].action, "touch");
+  assert.equal(requests[3].snapshotId, undefined);
+  assert.equal(requests[3].sourceSnapshotId, undefined);
+  assert.equal(requests[3].action, undefined);
+  assert.match(root.textContent, /Project A/);
+});
+
+test("destroy aborts an in-flight touch and removes timers, observers and lifecycle listeners", async () => {
+  const harness = mountedLeaseRoot();
+  const { root, windowRef, documentRef } = harness;
+  let calls = 0;
+  let touchSignal;
+  const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+    fetchRef: async (_url, init) => {
+      calls += 1;
+      if (JSON.parse(init.body).action !== "touch") return httpResponse(PROJECT_ROWS_RESPONSE);
+      touchSignal = init.signal;
+      return new Promise((_resolve, reject) => init.signal.addEventListener("abort", () => {
+        const error = new Error("aborted"); error.name = "AbortError"; reject(error);
+      }, { once: true }));
+    },
+  });
+  await settleMountedView();
+  const pending = harness.runTimer(60_000);
+  assert.equal(touchSignal.aborted, false);
+  view.destroy();
+  await pending;
+  assert.equal(touchSignal.aborted, true);
+  assert.equal(harness.timers.size, 0);
+  assert.ok(harness.observers.every(observer => !observer.connected));
+  assert.equal(documentRef.listeners.get("visibilitychange").length, 0);
+  assert.equal(windowRef.listeners.get("pageshow").length, 0);
+  harness.dispatch(windowRef, "pageshow");
+  harness.dispatch(documentRef, "visibilitychange");
+  harness.changed();
+  assert.equal(calls, 2);
+});
+
+test("expired searched pages retry once with selected filters and without the old snapshot or cursor", async (t) => {
+  for (const code of ["work_usage_snapshot_expired", "work_usage_snapshot_changed"]) {
+    await t.test(code, async (t) => {
+      const harness = mountedLeaseRoot();
+      const { root, windowRef } = harness;
+      const requests = [];
+      let fail = false;
+      const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+        fetchRef: async (_url, init) => {
+          const body = JSON.parse(init.body); requests.push(body);
+          if (fail) return { ok: false, status: 409, json: async () => ({ error: { code } }) };
+          return httpResponse({ ...PROJECT_ROWS_RESPONSE, rowCount: 50, nextCursor: "next-page" });
+        },
+      });
+      t.after(() => view.destroy());
+      await settleMountedView();
+      findMounted(root, node => node.dataset?.period === "all")[0].click();
+      await settleMountedView();
+      const model = findMounted(root, node => node.tagName === "SELECT" && node.options.some(option => option.value === "model-mounted"))[0];
+      model.value = "model-mounted";
+      model.dispatchEvent({ type: "change" });
+      await settleMountedView();
+      findMounted(root, node => node.tagName === "INPUT")[0].value = "Project name";
+      findMounted(root, node => node.tagName === "FORM")[0].dispatchEvent({ type: "submit" });
+      await settleMountedView();
+      fail = true;
+      const before = requests.length;
+      findMounted(root, node => node.tagName === "BUTTON" && node.textContent === "Next")[0].click();
+      await settleMountedView();
+      assert.equal(requests[before].cursor, "next-page");
+      assert.equal(requests[before].snapshotId, PROJECT_ROWS_RESPONSE.snapshotId);
+      assert.equal(requests.length, before + (code === "work_usage_snapshot_expired" ? 2 : 1));
+      if (code === "work_usage_snapshot_expired") {
+        const retried = requests.at(-1);
+        assert.equal(retried.snapshotId, undefined);
+        assert.equal(retried.sourceSnapshotId, undefined);
+        assert.equal(retried.cursor, undefined);
+        assert.equal(retried.search, "Project name");
+        assert.equal(retried.model, "model-mounted");
+        assert.equal(retried.period, "all");
+      }
+      assert.match(root.textContent, /report expired/i, "a failed request remains explicit instead of looping");
+    });
+  }
+});
+
+test("nested expired reports refresh the overview while changed snapshots require explicit recovery", async (t) => {
+  for (const code of ["work_usage_snapshot_expired", "work_usage_snapshot_changed"]) {
+    await t.test(code, async (t) => {
+      const { root, windowRef } = mountedLeaseRoot();
+      const requests = [];
+      const view = mountWorkUsageView({ root, windowRef, t: mountedTranslator,
+        fetchRef: async (_url, init) => {
+          const body = JSON.parse(init.body); requests.push(body);
+          if (body.grouping === "thread") return { ok: false, status: 409, json: async () => ({ error: { code } }) };
+          return httpResponse(PROJECT_ROWS_RESPONSE);
+        },
+      });
+      t.after(() => view.destroy());
+      await settleMountedView();
+      findMounted(root, node => node.classList.contains("work-usage-project-toggle"))[0].click();
+      await settleMountedView();
+      assert.equal(requests[1].project, "project-a");
+      if (code === "work_usage_snapshot_expired") {
+        assert.equal(requests.length, 3);
+        assert.equal(requests[2].snapshotId, undefined);
+        assert.equal(requests[2].project, undefined);
+        assert.equal(requests[2].grouping, "project");
+      } else {
+        assert.equal(requests.length, 2);
+        assert.match(root.textContent, /report expired/i);
+      }
+    });
+  }
 });
