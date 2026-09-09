@@ -455,10 +455,37 @@ local 5 GiB padding-heavy fixture does not prove the real 5.33 GB allocation has
 the same copy pressure, but hosted execution/storage failure remains plausible.
 The runbook specifies exact source/prefix admission, commands, readback criteria
 and stop conditions. Prior failed imports and local stress evidence remain
-unchanged. This operation has not run in production. The exact deployed Worker still needs a small-fixture
-compatibility matrix at prefixes 0056/0057/0058/0059 before the migration
-approval request; preservation tests alone do not establish old-runtime
-compatibility or safe conditional reopening.
+unchanged. This operation has not run in production. The bounded
+exact-deployed-source compatibility admission now passes: source
+`32cd6317622c9aef9b7bf015b376b4cdb93c91fc`, primary prefixes 0056–0059,
+deletion-ledger schema 0002, nine cases and 63 function-issued SQL statements
+per primary prefix. The final local run took 228 ms with 78,675,968 bytes
+peak process RSS. Private evidence:
+`production-activation-preparation-20260909/deployed-prefix-compatibility-01/receipt.json`,
+with reproducible `compatibility.mjs` and `provenance.json` verifying 50 exact
+git source inputs plus pinned runtime dependencies. Earlier local harness
+adapter/header failures are retained separately; no product source was changed.
+
+This executes the deployed functions for social enrollment/reattachment,
+device pairing/authentication, upload ownership and replay refusal, contribution
+insert/receipt replay, retained v1 personal statistics, four control refusals
+and restoration, and lifecycle disconnect/purge. It checks the exact health
+storage SQL against both schema families. Local SQLite emulates the narrow D1
+interface and Node supplies constant-time byte comparison; this is not a full
+HTTP/OAuth/R2/Durable Object or hosted concurrency/performance qualification.
+The scope removes the selected social-path schema compatibility gap without
+claiming exhaustive old-runtime coverage. Source drift requires a fresh bound
+check before approval/execution.
+
+The immutable old-reader constraints remain: preserve canonical table, view,
+column and explicit index names (including `INDEXED BY` queries); preserve
+social defaults and participant/device foreign-key ownership; expose only whole
+migration states. Old scheduled lifecycle work and external-object cleanup
+are not completely fenced by the four collection flags, so the pause is not a
+drain guarantee. Accountless collection stays disabled until the new Worker
+is deployed and separately verified; passing old social functions does not
+qualify them to manage accountless owners. These limits reinforce the single
+normal atomic attempt rather than an intermediate evacuation/view overlay.
 
 # Live configuration and recovery preparation
 

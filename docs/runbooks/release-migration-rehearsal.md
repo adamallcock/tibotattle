@@ -213,15 +213,29 @@ admits only the already observed revision 1/all-enabled/initial state. Any drift
 stops preparation for a revised exact operation; do not substitute a new
 revision silently.
 
-**Outstanding pre-approval admission:** qualify the exact still-running
-production Worker source/configuration against primary prefixes 0056, 0057,
-0058 and 0059 with the deletion ledger at 0002. The observed production source
-is `32cd6317622c9aef9b7bf015b376b4cdb93c91fc`; refresh that identity before using
-it. Existing local migration preservation tests do not prove this old runtime's
-behavior at every possible stopped prefix. Require its ordinary health/storage,
-authenticated contribution and lifecycle paths to pass against small synthetic
-fixtures without enabling accountless modes. Until that matrix is verified,
-this document is prepared but not ready for a production approval request.
+**Bounded deployed-source compatibility admission passed (2026-09-09):**
+exact Worker `32cd6317622c9aef9b7bf015b376b4cdb93c91fc` passed nine local
+function/SQL cases at each primary prefix 0056, 0057, 0058 and 0059, with the
+independent deletion-ledger schema at 0002. The private receipt and reproducible
+fixture are in `production-activation-preparation-20260909/deployed-prefix-compatibility-01/`
+under the existing release evidence root. `provenance.json` verifies all 50
+bundled Worker/workspace-package source inputs against that commit; runtime
+package pins are jsonc-parser 3.3.1 and runcost 0.2.1.
+
+These calls exercise social enrollment/identity reattachment, device pairing
+and authentication, upload ownership and consumed-authorization replay refusal,
+accepted contribution insertion and receipt replay, retained v1 personal
+statistics, collection-control refusals/restoration, and device lifecycle
+maintenance. Health coverage is its exact primary/deletion-ledger SQL shapes.
+The fixture uses a local SQLite D1 adapter and Node constant-time comparison;
+it does not qualify full HTTP health, OAuth, R2, Durable Objects, concurrency,
+provider query limits or every old runtime path. Refresh the deployed source
+identity before admitting the operation; drift invalidates this binding.
+Keep accountless modes disabled while this old Worker remains deployed: its
+social-only readers/lifecycle functions do not establish compatibility with
+new accountless owners. All canonical old table/view/index names and social
+ownership semantics must remain intact; do not substitute phased evacuation
+or read-through views for the proposed atomic migration.
 
 ### Approved pause, then fresh recovery bookmarks
 
