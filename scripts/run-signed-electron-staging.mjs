@@ -154,7 +154,7 @@ export async function runSignedStagingExecution(options) {
     sourceRevision: options.sourceRevision, asarSha256: options.asarSha256,
     signedArtifactVerified: false, seededDefaultOn: false, automaticAcceptedUpload: false,
     credentialReuseAfterRestart: false, durableOptOut: false, controlledRestart: true,
-    nativeCleanQuitQualified: false, ownedProcessesStopped: false, failureStage: null };
+    nativeCleanQuitQualified: false, ownedProcessesStopped: false, failureStage: null, failureCode: null };
   let active;
   let stage = 'artifact';
   try {
@@ -200,6 +200,9 @@ export async function runSignedStagingExecution(options) {
     proof.ownedProcessesStopped = true;
     proof.status = 'passed';
   } catch (error) {
+    const knownCodes = ['ACCOUNT_CONTEXT_INVALID', 'APP_INVALID', 'ARCHIVE_INVALID', 'ARTIFACT_DIGEST_INVALID', 'ARTIFACT_INVALID', 'INPUT_INVALID', 'METADATA_INVALID', 'OPT_OUT_INVALID', 'PROFILE_NOT_FRESH', 'PROFILE_UNSAFE', 'SIGNATURE_INVALID', 'TARGET_INVALID'];
+    const prefix = 'ELECTRON_SIGNED_STAGING_CONSUMER_';
+    proof.failureCode = knownCodes.map((code) => prefix + code).includes(error?.code) ? error.code : null;
     proof.failureStage = ['arguments', 'account', 'process_inventory', 'preexisting_app', 'binding', 'binding_changed', 'opt_out_restart'].includes(error?.stage) ? error.stage : stage;
   } finally {
     if (active) { try { proof.ownedProcessesStopped = await stop(active); } catch { proof.ownedProcessesStopped = false; proof.status = 'failed'; } }

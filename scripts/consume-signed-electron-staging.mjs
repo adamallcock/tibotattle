@@ -642,9 +642,9 @@ async function readDisabledProjection(shareBackend, createCoordinator, destinati
 export async function prepareSignedStagingDisposableProfile({
   initialSharing = "off",
   metadata,
-  environment = process.env,
+  environment = { ...process.env },
   getuid = typeof process.getuid === "function" ? process.getuid.bind(process) : undefined,
-  getUserInfo = userInfo,
+  getUserInfo = () => ({ ...userInfo() }),
   platform = process.platform,
   architecture = process.arch,
 } = {}, {

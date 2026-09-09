@@ -543,3 +543,39 @@ test("signed staging default-on preparation is explicit and uses the policy defa
     ...preseedInputs({ home, metadata: signedMetadata() }), initialSharing: "anything",
   }), { code: "ELECTRON_SIGNED_STAGING_CONSUMER_INPUT_INVALID" });
 });
+
+
+test("native Node account objects are normalized before strict profile validation", async () => {
+  let checked = false;
+  await assert.rejects(prepareSignedStagingDisposableProfile({
+    metadata: signedMetadata(),
+    environment: cleanRunnerEnvironment(),
+    platform: "darwin",
+    architecture: "arm64",
+  }, {
+    assertOperatingAccount({ getUserInfo }) {
+      const information = getUserInfo();
+      assert.equal(Object.getPrototypeOf(information), Object.prototype);
+      assert.equal(information.uid, process.getuid());
+      checked = true;
+      throw new Error("stop before any profile write");
+    },
+  }), { code: "ELECTRON_SIGNED_STAGING_CONSUMER_ACCOUNT_CONTEXT_INVALID" });
+  assert.equal(checked, true);
+});
+
+
+test("default environment uses real process.env without rejecting its native prototype", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const moduleURL = new URL("../scripts/consume-signed-electron-staging.mjs", import.meta.url).href;
+  const script = `import { prepareSignedStagingDisposableProfile } from ${JSON.stringify(moduleURL)};
+    let reached = false;
+    try { await prepareSignedStagingDisposableProfile({ metadata: ${JSON.stringify(signedMetadata())}, platform: "darwin", architecture: "arm64" }, {
+      assertOperatingAccount() { reached = true; throw new Error("stop before any write"); }
+    }); } catch {}
+    process.stdout.write(JSON.stringify({ reached }));`;
+  const output = execFileSync(process.execPath, ["--input-type=module", "-e", script], {
+    encoding: "utf8", timeout: 10000, env: cleanRunnerEnvironment(),
+  });
+  assert.deepEqual(JSON.parse(output), { reached: true });
+});
