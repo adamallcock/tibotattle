@@ -26,11 +26,25 @@ remote operation.
 
 Current reviewed source `10657851` passes the complete Worker check: **1,001
 Vitest tests in 79 files**, script/type/contract checks and both production and
-staging dry deployments. Its 178-step hosted manifest is frozen with SHA-256
-`7a0e325aa6cabfc78274522ee77f04c9ad570365e09d32ca72f82ca40e2730db`;
+staging dry deployments. The later fixture-only update `9fceb72e` passes seven replay/runner checks and
+covers 20,929,052 retained logical bytes versus 19,496,905 observed in production.
+Its 178-step hosted manifest is frozen with SHA-256
+`194a4b0b3fe3b7b2a427e6b0358e204b030adf1e809a989c8cf0a6ae5079bfec`;
 execution still requires the separately requested disposable-database approval.
 The ordinary production service remains healthy on source `32cd6317`, rechecked
-after these local changes.
+after these local changes. All 15 bounded live inspection batches succeeded: the
+primary/deletion ledgers, 91 table column/FK definitions and canonical product
+schema reconcile. Provider storage is 5,328,547,840 bytes; recovery bookmarks
+were captured privately. These pre-fence observations will need rechecking at
+execution admission.
+
+Temporary fence candidate `81a0a592`, derived from `10657851` with one constant
+change, passes typecheck, 33 deployment-contract checks, production dry build and
+the exact pending-0058/0059 acknowledgement simulation. It is local only. Its
+future deployment would update the public asset tree as well as the Worker, so
+that asset set is part of the exact production operation review. The existing
+signed production-canary workflow can be reused, and its matching RSA cleanup
+key has been verified locally. No production canary has run.
 
 - **Throughput path prepared:** metadata-only indexed production probes found up
   to 4,616,226 row slots in the dominant v1 record table (an upper bound, not
