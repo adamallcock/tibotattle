@@ -194,14 +194,85 @@ describe("accountless migration mutation barrier", () => {
     expect(mutationBarrierSkipsScheduledMaintenance()).toBe(false);
   });
 
-  it("uses the real request and cron gates before any storage access", async () => {
-    const dynamic = await handleRequest(
+  it("serves only a source-bound storage-free health response while the migration gate is enabled", async () => {
+    const accessed: string[] = [];
+    const fencedEnv = new Proxy({
+      DEPLOYMENT_SOURCE_COMMIT: SOURCE_REVISION,
+    } as Partial<Env>, {
+      get(target, property, receiver) {
+        const name = String(property);
+        accessed.push(name);
+        if (name === "DEPLOYMENT_SOURCE_COMMIT" || name === "PUBLIC_ORIGIN") {
+          return Reflect.get(target, property, receiver);
+        }
+        throw new Error(`unexpected binding access: ${name}`);
+      },
+    }) as Env;
+    const health = await handleRequest(
       new Request("https://example.test/api/health"),
+      fencedEnv,
+      true,
+    );
+    expect(health.status).toBe(200);
+    expect(health.headers.get("cache-control")).toBe("no-store");
+    expect(health.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(health.headers.get("x-content-type-options")).toBe("nosniff");
+    await expect(health.json()).resolves.toEqual({
+      status: "ok",
+      mode: "migration-mutation-barrier",
+      maintenance: {
+        state: "fenced",
+        storageQualified: false,
+      },
+      deployment: { sourceCommit: SOURCE_REVISION },
+    });
+    expect(accessed).toEqual([
+      "PUBLIC_ORIGIN",
+      "DEPLOYMENT_SOURCE_COMMIT",
+    ]);
+
+    const unboundHealth = await handleRequest(
+      new Request("https://example.test/api/health"),
+      new Proxy({} as Partial<Env>, {
+        get(target, property, receiver) {
+          const name = String(property);
+          if (name === "DEPLOYMENT_SOURCE_COMMIT" || name === "PUBLIC_ORIGIN") {
+            return Reflect.get(target, property, receiver);
+          }
+          throw new Error(`unexpected binding access: ${name}`);
+        },
+      }) as Env,
+      true,
+    );
+    expect(unboundHealth.status).toBe(503);
+    await expect(unboundHealth.json()).resolves.toEqual({
+      status: "unavailable",
+      mode: "migration-mutation-barrier",
+      maintenance: {
+        state: "fenced",
+        storageQualified: false,
+      },
+    });
+  });
+
+  it("keeps every other dynamic request and cron behind the real gates before storage access", async () => {
+    const dynamic = await handleRequest(
+      new Request("https://example.test/api/ready"),
       {} as Env,
       true,
     );
     expect(dynamic.status).toBe(503);
     expect(await dynamic.json()).toMatchObject({
+      error: { code: "MUTATION_BARRIER_ACTIVE" },
+    });
+
+    const healthMethod = await handleRequest(
+      new Request("https://example.test/api/health", { method: "POST" }),
+      {} as Env,
+      true,
+    );
+    expect(healthMethod.status).toBe(503);
+    await expect(healthMethod.json()).resolves.toMatchObject({
       error: { code: "MUTATION_BARRIER_ACTIVE" },
     });
 
@@ -212,6 +283,16 @@ describe("accountless migration mutation barrier", () => {
     );
     expect(adminAsset.status).toBe(503);
     expect(await adminAsset.json()).toMatchObject({
+      error: { code: "MUTATION_BARRIER_ACTIVE" },
+    });
+
+    const adminHealth = await handleRequest(
+      new Request("https://admin.tibotattle.com/api/health"),
+      { PUBLIC_ORIGIN: "https://tibotattle.com" } as Env,
+      true,
+    );
+    expect(adminHealth.status).toBe(503);
+    await expect(adminHealth.json()).resolves.toMatchObject({
       error: { code: "MUTATION_BARRIER_ACTIVE" },
     });
 

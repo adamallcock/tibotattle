@@ -1,6 +1,7 @@
 /** Pure migration plans and local SQLite wrappers. No remote transport or maintenance authority. */
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { usesRangeRecordBatch } from './accountless-migration-range.mjs';
 const hash = value => createHash('sha256').update(value).digest('hex');
 const quote = value => '"' + value.replaceAll('"', '""') + '"';
 const prefix = '_accountless_move_';
@@ -38,10 +39,11 @@ const readback = () => ({sql:`SELECT metadata FROM ${prefix}journal WHERE id=1`,
 function executePlan(db,plan) { for(const statement of plan.statements) { if(statement.compound) {check(statement.params.length===0,'PARAM_INVALID');db.exec(statement.sql);} else db.prepare(statement.sql).run(...statement.params); } }
 
 /** Metadata must already be admitted against the exact source/schema/operation. */
-export function planAccountlessMovementSetup({sources,schemaObjects,foreignKeys,tableInfo,sequences,permission=null,retainObjectReferences=false}) {
+export function planAccountlessMovementSetup({sources,schemaObjects,foreignKeys,tableInfo,sequences,permission=null,retainObjectReferences=false,rangeRecordBatches=false}) {
   const digest=verifySource(sources), all=schemaObjects;
   check(!all.some(o=>o.name.startsWith(prefix)), 'OWNED_OBJECT_COLLISION');
   check(typeof retainObjectReferences==='boolean','RETAIN_MODE_INVALID');
+  check(typeof rangeRecordBatches==='boolean'&&(!rangeRecordBatches||retainObjectReferences),'RANGE_MODE_INVALID');
   const canonicalTables=[...sources[57].sql.matchAll(/CREATE TABLE (\w+)_0058_save AS/g)].map(m=>m[1]);
   check(canonicalTables.length===52&&new Set(canonicalTables).size===52,'TABLE_SET_INVALID');
   const tables=canonicalTables.filter(t=>!retainObjectReferences||!retainedObjectTables.includes(t));
@@ -59,7 +61,7 @@ export function planAccountlessMovementSetup({sources,schemaObjects,foreignKeys,
   }));
   const savedSequences=sequences.filter(r=>tables.includes(r.name)).map(({name,seq})=>{check(typeof seq==='string'&&/^(0|[1-9][0-9]*)$/.test(seq)&&BigInt(seq)<=9223372036854775807n,'SEQUENCE_INVALID');return {name,seq};});
   check(new Set(savedSequences.map(r=>r.name)).size===savedSequences.length,'SEQUENCE_INVALID');
-  const current={digest,phase:'evacuate',revision:0,tableIndex:0,cursor:0,order,descriptors,sequences:savedSequences,canonicalObjects:null,...(retainObjectReferences?{retainedObjectTables:[...retainedObjectTables]}:{})};
+  const current={digest,phase:'evacuate',revision:0,tableIndex:0,cursor:0,order,descriptors,sequences:savedSequences,canonicalObjects:null,...(rangeRecordBatches?{rangeRecordBatches:true}:{}),...(retainObjectReferences?{retainedObjectTables:[...retainedObjectTables]}:{})};
   const w=planWriter(permission);
   w.add(`CREATE TABLE ${prefix}journal(id INTEGER PRIMARY KEY CHECK(id=1), metadata TEXT NOT NULL)`);
   w.add(`CREATE TABLE ${prefix}assertion(id INTEGER PRIMARY KEY CHECK(id=1), ok INTEGER NOT NULL CHECK(ok=1))`);
@@ -71,20 +73,22 @@ export function planAccountlessMovementSetup({sources,schemaObjects,foreignKeys,
   return {statements:w.statements,current,readback:readback()};
 }
 
-export function prepareAccountlessMovement(db,sources,{retainObjectReferences=false}={}) {
+export function prepareAccountlessMovement(db,sources,{retainObjectReferences=false,rangeRecordBatches=false}={}) {
   check(typeof retainObjectReferences==='boolean','RETAIN_MODE_INVALID');
+  check(typeof rangeRecordBatches==='boolean'&&(!rangeRecordBatches||retainObjectReferences),'RANGE_MODE_INVALID');
   const digest=verifySource(sources);check(get(db,'PRAGMA foreign_keys').foreign_keys===1,'FOREIGN_KEYS_REQUIRED');
-  if(get(db,'SELECT 1 FROM sqlite_master WHERE name=?',`${prefix}journal`)){const current=state(db);check(current.digest===digest,'SOURCE_DRIFT');check(isDeepStrictEqual(current.retainedObjectTables??[],retainObjectReferences?retainedObjectTables:[]),'RETAIN_MODE_DRIFT');return current;}
+  if(get(db,'SELECT 1 FROM sqlite_master WHERE name=?',`${prefix}journal`)){const current=state(db);check(current.digest===digest,'SOURCE_DRIFT');check(isDeepStrictEqual(current.retainedObjectTables??[],retainObjectReferences?retainedObjectTables:[]),'RETAIN_MODE_DRIFT');check((current.rangeRecordBatches===true)===rangeRecordBatches,'RANGE_MODE_DRIFT');return current;}
   ledger(db,sources,57);check(empty(db,'accountless_enrollment_ledger'),'ACCOUNTLESS_LEDGER_NOT_EMPTY');
   const schemaObjects=db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all();
   const tables=schemaObjects.filter(o=>o.type==='table');
-  const plan=planAccountlessMovementSetup({sources,schemaObjects,retainObjectReferences,foreignKeys:Object.fromEntries(tables.map(o=>[o.name,db.prepare(`PRAGMA foreign_key_list(${quote(o.name)})`).all()])),tableInfo:Object.fromEntries(tables.map(o=>[o.name,db.prepare(`PRAGMA table_info(${quote(o.name)})`).all()])),sequences:readKeyRows(db,'SELECT name,seq FROM sqlite_sequence').map(r=>({name:r.name,seq:String(r.seq)}))});
+  const plan=planAccountlessMovementSetup({sources,schemaObjects,retainObjectReferences,rangeRecordBatches,foreignKeys:Object.fromEntries(tables.map(o=>[o.name,db.prepare(`PRAGMA foreign_key_list(${quote(o.name)})`).all()])),tableInfo:Object.fromEntries(tables.map(o=>[o.name,db.prepare(`PRAGMA table_info(${quote(o.name)})`).all()])),sequences:readKeyRows(db,'SELECT name,seq FROM sqlite_sequence').map(r=>({name:r.name,seq:String(r.seq)}))});
   return atomic(db,()=>{executePlan(db,plan);return state(db);});
 }
 
 /** Read only bounded key/length metadata; integer keys remain exact through D1 JSON. */
 export function accountlessMovementSelection(current, { maxRows = 32 } = {}) {
   check(Number.isSafeInteger(maxRows) && maxRows > 0 && maxRows <= 64, 'LIMIT_INVALID');
+  check(!usesRangeRecordBatch(current),'RANGE_BATCH_REQUIRED');
   const { from, keys, integerKeys, d } = batchContext(current);
   return { sql: `SELECT ${keys.map((k,i) => `${integerKeys.includes(k) ? `CAST(${quote(k)} AS TEXT)` : quote(k)} AS _key${i}`).join(',')},(${rowBytes(d)}) AS _bytes FROM ${quote(from)} ORDER BY ${keys.map(quote).join(',')} LIMIT ${maxRows}`, params: [] };
 }

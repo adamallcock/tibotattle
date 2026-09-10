@@ -24,6 +24,23 @@ remote operation.
 
 # Evidence held
 
+- **Throughput path prepared:** metadata-only indexed production probes found up
+  to 4,616,226 row slots in the dominant v1 record table (an upper bound, not
+  an exact count). Its explicit range mode transfers up to 8,192 rows using
+  indexed group copy/compare/delete; other tables retain the existing small
+  batches. The operator defaults to 1,024 rows / 1 MiB, shrinks selections
+  before dispatch, preserves exact large integer keys, and forbids switching
+  between range and row modes after setup. Five range checks, two operator
+  journey checks and a local D1 batch test cover this addition.
+- **Larger hosted rehearsal prepared, not executed:** a frozen 178-step local
+  replay keeps all 11 reference tables visible, adds 26,000 authorizations and
+  26,000 chunks, and preserves 8,212 v1 records through canonical 0057→0059.
+  It includes real mutation guards, rollback/replay refusals, 1,024-row then
+  larger range timing samples, and a query above 200 KiB. The runner admits
+  one fresh disposable database, uses the pinned normal-query launcher, and
+  deletes only that database after every exact readback succeeds. Unknown
+  results retain the database and evidence. This is not production admission.
+
 - **Signed fresh-install contributions:** the actual introduction, default-on
   enrollment/upload, credential reuse after restart and persistent opt-out pass
   in the isolated staging journey. The
@@ -62,7 +79,7 @@ remote operation.
   launcher and transport checks, TypeScript, and both clean-tree production and
   staging dry runs. Documentation/preflight checks pass. No deployment occurred.
 
-None of these results measures sustained production throughput or admits the
+None of these local range results measures sustained production throughput or admits the
 remaining reference tables for a hosted canonical transaction.
 
 # Implemented tools
@@ -76,7 +93,11 @@ The phase operator requires exact operation permission and an exact persisted
 starting checkpoint. It copies, compares, deletes and advances its journal in
 one atomic transaction. It checks full readbacks, bounds rows/bytes/SQL/time,
 reduces oversized batches locally before dispatch, and never retries an
-uncertain write. Production metadata must be admitted before using these helpers.
+uncertain write. Production metadata must be admitted before using these helpers. The dedicated
+range planner selects the first bounded set of remaining v1 rows; each atomic
+batch removes those rows, so the next selection progresses through the index
+without OFFSET or a full-table scan. Its checkpoint cursor counts moved rows;
+source rowids remain exact decimal keys and are restored unchanged.
 
 A pinned Wrangler launcher loads private hash-checked SQL through a Node preload
 and preserves the normal `--command` query path. It avoids OS argument-size

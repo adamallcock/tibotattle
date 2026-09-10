@@ -4,6 +4,8 @@ import { accountlessMovementSelection, planAccountlessMovementBatch, type Moveme
 import { buildMutationBarrierSetupStatements, buildMutationBarrierPermissionStatements,
   MUTATION_BARRIER_PERMISSION_TABLE, MUTATION_BARRIER_ABORT_CODE } from "../src/mutation-barrier";
 
+import { accountlessRangeSelection, planAccountlessRangeBatch } from "../scripts/accountless-migration-range.mjs";
+
 type MovementState = Parameters<typeof accountlessMovementSelection>[0];
 type Statement = { readonly sql: string; readonly params: readonly unknown[] };
 const db = () => env.USAGE_MONITOR_DB;
@@ -118,4 +120,35 @@ describe("bounded movement through the real local D1 batch API", () => {
     expect(await db().prepare("SELECT COUNT(*) FROM _accountless_move_movement_child").first("COUNT(*)")).toBe(0);
     expect(await db().prepare("SELECT allowed FROM movement_permission").first("allowed")).toBe(0);
   });
+});
+
+
+it("range transfers through local D1 preserve exact keys across batches and rollback late failures", async () => {
+  await batch([
+    {sql:"CREATE TABLE telemetry_v1_records(id INTEGER PRIMARY KEY,note TEXT)",params:[]},
+    {sql:"INSERT INTO telemetry_v1_records VALUES(-7,NULL),(9007199254741007,'synthetic'),(9007199254741011,'last')",params:[]},
+    {sql:"CREATE TABLE _accountless_move_telemetry_v1_records(_move_key INTEGER PRIMARY KEY,_original_rowid INTEGER,id,note)",params:[]},
+  ]);
+  let current: MovementState = {...initialState(),rangeRecordBatches:true,order:["telemetry_v1_records"],descriptors:{telemetry_v1_records:{columns:["id","note"],hasRowid:true,keys:["rowid"],integerKeys:["rowid"]}}};
+  await db().prepare("UPDATE _accountless_move_journal SET metadata=?").bind(JSON.stringify(current)).run();
+  async function rangePlan() {
+    const selection=accountlessRangeSelection(current,{maxRows:2});
+    const rows=await db().prepare(selection.sql).all<{selected_rows:number;first_key:string|null;last_key:string|null;selected_bytes:number;max_row_bytes:number}>();
+    return planAccountlessRangeBatch({current,selection:rows.results[0]!,expectedRevision:current.revision,maxRows:2,permission});
+  }
+  const first=await rangePlan();
+  await expect(batch([...first.statements,{sql:"INSERT INTO _accountless_move_assertion VALUES(1,0)",params:[]}])).rejects.toThrow();
+  expect(await readState()).toEqual(current);
+  expect(await db().prepare("SELECT COUNT(*) FROM telemetry_v1_records").first("COUNT(*)")).toBe(3);
+  await batch(first.statements);
+  await expect(batch(first.statements)).rejects.toThrow();
+  current=await readState();await batch((await rangePlan()).statements);current=await readState();
+  expect(current.tableIndex).toBe(1);
+  current={...current,phase:"restore",tableIndex:0,cursor:0};
+  await db().prepare("UPDATE _accountless_move_journal SET metadata=?").bind(JSON.stringify(current)).run();
+  await batch((await rangePlan()).statements);current=await readState();await batch((await rangePlan()).statements);
+  expect((await db().prepare("SELECT CAST(id AS TEXT) AS id,note FROM telemetry_v1_records ORDER BY id").all()).results).toEqual([
+    {id:"-7",note:null},{id:"9007199254741007",note:"synthetic"},{id:"9007199254741011",note:"last"}
+  ]);
+  expect(await db().prepare("SELECT allowed FROM movement_permission").first("allowed")).toBe(0);
 });

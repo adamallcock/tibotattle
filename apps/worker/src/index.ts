@@ -251,6 +251,7 @@ import {
 export { UploadIngressBudget } from "./ingress-budget";
 
 const DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{7,64}$/u;
+const EXACT_DEPLOYMENT_SOURCE_COMMIT_PATTERN = /^[a-f0-9]{40}$/u;
 
 function configuredDeploymentSourceCommit(env: Env): string | null {
   const configured = (env as Env & {
@@ -262,6 +263,42 @@ function configuredDeploymentSourceCommit(env: Env): string | null {
     throw new ApiError(503, "DEPLOYMENT_SOURCE_COMMIT_INVALID");
   }
   return configured;
+}
+
+/**
+ * The reviewed migration-only snapshot has one deliberately storage-free
+ * liveness response. It lets the normal deployment wrapper bind the immutable
+ * source it just installed, while its explicit maintenance shape prevents the
+ * response from being interpreted as a D1/R2/DO qualification. Every other
+ * dynamic route remains behind the mutation barrier.
+ */
+function migrationMutationBarrierHealthResponse(env: Env): Response {
+  const configured = (env as Env & {
+    DEPLOYMENT_SOURCE_COMMIT?: unknown;
+  }).DEPLOYMENT_SOURCE_COMMIT;
+  const sourceCommit = typeof configured === "string"
+    && EXACT_DEPLOYMENT_SOURCE_COMMIT_PATTERN.test(configured)
+    ? configured
+    : null;
+  if (sourceCommit === null) {
+    return noStore(jsonResponse({
+      status: "unavailable",
+      mode: "migration-mutation-barrier",
+      maintenance: {
+        state: "fenced",
+        storageQualified: false,
+      },
+    }, 503));
+  }
+  return noStore(jsonResponse({
+    status: "ok",
+    mode: "migration-mutation-barrier",
+    maintenance: {
+      state: "fenced",
+      storageQualified: false,
+    },
+    deployment: { sourceCommit },
+  }));
 }
 
 function telemetryContributionLimitError(
@@ -3722,14 +3759,21 @@ export async function handleRequest(
   const url = new URL(request.url);
   const route = matchWorkerRoute(url.pathname);
   const configuredAdminHostname = adminHostname(env);
+  const adminSurface = isAdminSurfacePath(url.pathname)
+    || configuredAdminHostname === url.hostname;
+  if (testMutationBarrierEnabled
+      && route.id === "health"
+      && request.method === "GET"
+      && !adminSurface) {
+    return migrationMutationBarrierHealthResponse(env);
+  }
   // A migration-only source snapshot changes the constant in mutation-barrier.
   // This return intentionally precedes redirect, admin identity, and every
   // D1/R2/DO path. It fences new dynamic work but cannot prove an older
   // already-admitted reader has finished.
   if (mutationBarrierBlocksDynamicRequest(
     route.id,
-    isAdminSurfacePath(url.pathname)
-      || configuredAdminHostname === url.hostname,
+    adminSurface,
     testMutationBarrierEnabled,
   )) {
     return noStore(errorResponse(

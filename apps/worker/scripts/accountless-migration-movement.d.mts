@@ -2,7 +2,7 @@ export type MovementStatement = { sql: string; params: readonly (string | number
 export type MovementDescriptor = { columns: string[]; hasRowid: boolean; keys: string[]; integerKeys: string[] };
 export type MovementState = {
   digest: string; phase: 'evacuate' | 'restore' | 'complete'; revision: number; tableIndex: number; cursor: number;
-  retainedObjectTables?: string[];
+  retainedObjectTables?: string[]; rangeRecordBatches?: true;
   order: string[]; descriptors: Record<string, MovementDescriptor>;
   sequences: Array<{ name: string; seq: string }>;
   canonicalObjects: null | Array<{ type: string; name: string; tbl_name: string; sql: string }>;
@@ -29,6 +29,7 @@ export function planAccountlessMovementSetup(options: {
   permission?: MovementPermission | null;
   /** Requires separate admission of the residual journal size before remote execution. */
   retainObjectReferences?: boolean;
+  rangeRecordBatches?: boolean;
 }): MovementPhasePlan;
 export function planAccountlessMovementTransition(options: {
   sources: MovementSource[]; current: MovementState; expectedRevision: number;

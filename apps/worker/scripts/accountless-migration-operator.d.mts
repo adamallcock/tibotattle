@@ -12,7 +12,7 @@ export type MovementTransport = {
 export function renderMovementSql(statements: readonly MovementPhaseStatement[]): string;
 export function runAccountlessMovementPhase(options: {
  startJournal: MovementState; operationId: string; permission: MovementPermission; transport: MovementTransport;
- maxRows?: number; maxBytes?: number; maxSqlBytes?: number; maxBatches?: number; timeoutMs?: number;
+ maxRows?: number; maxBytes?: number; rangeMaxRows?: number; rangeMaxBytes?: number; maxSqlBytes?: number; maxBatches?: number; timeoutMs?: number;
  now?: () => number;
  /** Synchronous content-free progress sink; exact private checkpoint is returned separately. */
  onProgress?: (receipt: Readonly<MovementPhaseReceipt>) => void;

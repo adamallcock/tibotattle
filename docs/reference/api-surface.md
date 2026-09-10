@@ -46,7 +46,7 @@ site.
 | Method | Path | Caller | Authority | Storage or network effect | Owner |
 | --- | --- | --- | --- | --- | --- |
 | all | `/.well-known/apple-developer-domain-association.txt` | Legacy crawler | None | Always returns 404 so the SPA cannot masquerade as configuration. | Worker |
-| `GET` | `/api/health` | App and operator probes | Public | Reads D1, deletion ledger, R2, ingress state, controls, and contract configuration; no mutation. | Worker operations |
+| `GET` | `/api/health` | App and operator probes | Public | Reads D1, deletion ledger, R2, controls and contract configuration; ingress-budget probing persists its lease housekeeping. A source-bound temporary migration fence serves storage-free liveness with `storageQualified: false`. | Worker operations |
 | `GET` | `/api/ready` | Deployment probes | Public | Reads lifecycle, retention, reconciliation, and rebuild readiness; no mutation. | Worker operations |
 | `POST` | `/api/v1/enroll` | Website or loopback relay | Enrollment | Validates identity/consent, creates or reattaches a D1 participant, and may bootstrap a device pairing. | Identity and contribution |
 | `POST` | `/api/v1/accountless/enrollment` | Native installation | Accountless enrollment | When the separately configured accountless enrollment gate is enabled, atomically records one versioned enrollment-only ledger row keyed by device ID and a 256-bit device-secret hash. It creates no participant, session, pairing, device credential, upload authority, identity link, or community eligibility. | Accountless enrollment pilot |

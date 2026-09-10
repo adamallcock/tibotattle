@@ -4,7 +4,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { accountlessMovementSelection, planAccountlessMovementBatch } from './accountless-migration-movement.mjs';
 import { runAccountlessMovementPhase, renderMovementSql } from './accountless-migration-operator.mjs';
 import { buildMutationBarrierSetupStatements, buildMutationBarrierPermissionStatements } from '../src/mutation-barrier.ts';
-function fixture() {
+function fixture(range=false) {
  const db=new DatabaseSync(':memory:'); db.exec('PRAGMA foreign_keys=ON');
  const state={digest:'a'.repeat(64),phase:'evacuate',revision:0,tableIndex:0,cursor:0,order:['sample'],descriptors:{sample:{columns:['id','payload'],hasRowid:true,keys:['rowid'],integerKeys:['rowid']}},sequences:[],canonicalObjects:null};
  db.exec(`CREATE TABLE sample(id INTEGER PRIMARY KEY,payload TEXT); INSERT INTO sample VALUES(9007199254741007,'private-key-never-log'),(9007199254741011,'two'),(9007199254741013,'three');
@@ -12,8 +12,13 @@ function fixture() {
  CREATE TABLE _accountless_move_journal(id INTEGER PRIMARY KEY CHECK(id=1),metadata TEXT NOT NULL);
  CREATE TABLE _accountless_move_assertion(id INTEGER PRIMARY KEY CHECK(id=1),ok INTEGER NOT NULL CHECK(ok=1));`);
  db.prepare('INSERT INTO _accountless_move_journal VALUES(1,?)').run(JSON.stringify(state));
+ if(range){
+  db.exec('ALTER TABLE sample RENAME TO telemetry_v1_records; ALTER TABLE _accountless_move_sample RENAME TO _accountless_move_telemetry_v1_records');
+  state.order=['telemetry_v1_records'];state.descriptors={telemetry_v1_records:state.descriptors.sample};state.rangeRecordBatches=true;
+  db.prepare('UPDATE _accountless_move_journal SET metadata=?').run(JSON.stringify(state));
+ }
  const operation='operator-fixture-20260909';
- const setup=buildMutationBarrierSetupStatements({operationId:operation,sourceRevision:'b'.repeat(40),createdAt:'2026-09-09T00:00:00.000Z',productTables:['sample']});
+ const setup=buildMutationBarrierSetupStatements({operationId:operation,sourceRevision:'b'.repeat(40),createdAt:'2026-09-09T00:00:00.000Z',productTables:[range?'telemetry_v1_records':'sample']});
  db.exec(renderMovementSql(setup));
  let calls=0; const plans=[];
  const transport={read:async({sql,params})=>db.prepare(sql).all(...params),batch:async({statements,sql})=>{
@@ -107,3 +112,29 @@ test('failed progress sink reports a known completed checkpoint and stops before
  assert.equal(result.receipt.batches,1);assert.equal(result.checkpoint.revision,1);assert.equal(f.calls,1);
  assert.doesNotMatch(JSON.stringify(result.receipt),/private sink/);
 }));
+
+
+test('range operator shrinks oversized metadata selections before dispatch and restores exact rows',async()=>{
+ const f=fixture(true);try{
+  let selections=0;const original=f.transport.read;
+  f.transport.read=(statement,options)=>{if(statement.sql.includes(' AS selected_rows'))selections++;return original(statement,options)};
+  const result=await run(f,{rangeMaxRows:4,rangeMaxBytes:45});
+  assert.equal(result.receipt.outcome,'complete');assert.equal(result.receipt.rows,3);assert.ok(selections>result.receipt.batches);
+  assert.equal(f.calls,result.receipt.batches);assert.ok(f.calls>1);
+  assert.equal(f.db.prepare('SELECT COUNT(*) AS n FROM telemetry_v1_records').get().n,0);
+  const restore={...result.checkpoint,phase:'restore',revision:result.checkpoint.revision+1,tableIndex:0,cursor:0};
+  f.db.prepare('UPDATE _accountless_move_journal SET metadata=?').run(JSON.stringify(restore));
+  const back=await run(f,{startJournal:restore,rangeMaxRows:8192,rangeMaxBytes:16*1024*1024});
+  assert.equal(back.receipt.outcome,'complete');assert.equal(back.receipt.batches,1);
+  assert.deepEqual(f.db.prepare('SELECT CAST(rowid AS TEXT) AS id,payload FROM telemetry_v1_records ORDER BY rowid').all().map(r=>({...r})),[
+   {id:'9007199254741007',payload:'private-key-never-log'},{id:'9007199254741011',payload:'two'},{id:'9007199254741013',payload:'three'}]);
+ }finally{f.db.close()}
+});
+test('range operator never replays a lost committed response and refuses invalid limits before transport',async()=>{
+ const f=fixture(true);try{
+  assert.equal((await run(f,{rangeMaxRows:8193})).receipt.code,'LIMIT_INVALID');assert.equal(f.calls,0);
+  const original=f.transport.batch;f.transport.batch=async packet=>{await original(packet);throw Error('lost')};
+  const result=await run(f,{rangeMaxRows:2});assert.equal(result.receipt.outcome,'uncertain');assert.equal(f.calls,1);
+  assert.equal((await run(f)).receipt.code,'START_DRIFT');assert.equal(f.calls,1);
+ }finally{f.db.close()}
+});

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { buildMutationBarrierPermissionStatements } from '../src/mutation-barrier.ts';
 import { accountlessMovementSelection, planAccountlessMovementBatch } from './accountless-migration-movement.mjs';
+import { usesRangeRecordBatch, accountlessRangeSelection, planAccountlessRangeBatch } from './accountless-migration-range.mjs';
 const journal = 'SELECT metadata FROM _accountless_move_journal WHERE id=1';
 const hash = value => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const quote = value => '"' + value.replaceAll('"', '""') + '"';
@@ -46,7 +47,7 @@ export function renderMovementSql(statements) {
  * Any transport exception, timeout or invalid batch response is an unknown outcome.
  */
 export async function runAccountlessMovementPhase({ startJournal, operationId, permission, transport,
-  maxRows = 32, maxBytes = 256*1024, maxSqlBytes = 96*1024,
+  maxRows = 32, maxBytes = 256*1024, rangeMaxRows = 1024, rangeMaxBytes = 1024*1024, maxSqlBytes = 96*1024,
   maxBatches = 100, timeoutMs = 60000, now = () => performance.now(), onProgress = () => {} } = {}) {
   const start = now(); let checkpoint = structuredClone(startJournal), uncertain = false;
   const receipt = { schemaVersion: 'accountless-movement-phase-v1', outcome: 'stopped', code: null,
@@ -69,7 +70,7 @@ export async function runAccountlessMovementPhase({ startJournal, operationId, p
   }
   try {
     requireThat(bounded(maxRows,64) && bounded(maxBytes,1024*1024) && bounded(maxSqlBytes,100*1024)
-      && bounded(maxBatches,10000) && bounded(timeoutMs,600000), 'LIMIT_INVALID');
+      && bounded(rangeMaxRows,8192) && bounded(rangeMaxBytes,16*1024*1024) && bounded(maxBatches,10000) && bounded(timeoutMs,600000), 'LIMIT_INVALID');
     requireThat(transport && typeof transport.read === 'function' && typeof transport.batch === 'function', 'TRANSPORT_INVALID');
     requireThat(typeof operationId === 'string' && permission?.begin && Array.isArray(permission.end) && permission.end.length === 2, 'PERMISSION_REQUIRED');
     requireThat(isDeepStrictEqual(permission,buildMutationBarrierPermissionStatements(operationId)), 'PERMISSION_REQUIRED');
@@ -80,6 +81,24 @@ export async function runAccountlessMovementPhase({ startJournal, operationId, p
     while (checkpoint.tableIndex < checkpoint.order.length) {
       requireThat(receipt.batches < maxBatches, 'BATCH_BUDGET');
       requireThat(elapsed() < timeoutMs, 'TIME_BUDGET');
+      let candidate;
+      if (usesRangeRecordBatch(checkpoint)) {
+        let count=rangeMaxRows, selected;
+        // Re-read a smaller bounded selection before dispatch if its payload
+        // exceeds admission. This loop never retries a mutation.
+        for (;;) {
+          const rows=await call(remaining => transport.read(accountlessRangeSelection(checkpoint,{maxRows:count}),{timeoutMs:remaining}));
+          requireThat(Array.isArray(rows)&&rows.length===1,'SELECTION_INVALID');
+          selected=rows[0];
+          requireThat(Number.isSafeInteger(selected.selected_bytes)&&selected.selected_bytes>=0&&Number.isSafeInteger(selected.max_row_bytes)&&selected.max_row_bytes>=0,'SELECTION_INVALID');
+          requireThat(selected.max_row_bytes<=1024*1024,'ROW_BUDGET');
+          if(selected.selected_bytes<=rangeMaxBytes)break;
+          requireThat(count>1,'ROW_BUDGET');count=Math.max(1,Math.floor(count/2));
+        }
+        const plan=planAccountlessRangeBatch({current:checkpoint,selection:selected,expectedRevision:checkpoint.revision,maxRows:count,maxBytes:rangeMaxBytes,permission});
+        const sql=renderMovementSql(plan.statements);
+        candidate={plan,sql,sqlBytes:Buffer.byteLength(sql)};
+      } else {
       const selection = accountlessMovementSelection(checkpoint,{maxRows});
       const selectedRows = await call(remaining => transport.read(selection,{timeoutMs:remaining}));
       requireThat(Array.isArray(selectedRows) && selectedRows.every(row => Object.keys(row).every(k => k === '_bytes' || /^_key[0-9]+$/.test(k))), 'SELECTION_INVALID');
@@ -89,7 +108,7 @@ export async function runAccountlessMovementPhase({ startJournal, operationId, p
         const sql = renderMovementSql(plan.statements);
         return {plan,sql,sqlBytes:Buffer.byteLength(sql)};
       };
-      let candidate = prepare(selectedRows.length);
+      candidate = prepare(selectedRows.length);
       if (candidate.sqlBytes > maxSqlBytes && selectedRows.length > 1) {
         // Search only local plans for the largest fitting prefix. No transport
         // call or write has occurred, so this is never a remote mutation retry.
@@ -100,6 +119,7 @@ export async function runAccountlessMovementPhase({ startJournal, operationId, p
           else high=count-1;
         }
         if (fitting) candidate=fitting;
+      }
       }
       requireThat(candidate.sqlBytes <= maxSqlBytes, 'SQL_BUDGET');
       const {plan,sql}=candidate;
@@ -128,7 +148,7 @@ export async function runAccountlessMovementPhase({ startJournal, operationId, p
     receipt.outcome='complete'; receipt.code='PHASE_COMPLETE';
   } catch (error) {
     const allowed = new Set(['LIMIT_INVALID','TRANSPORT_INVALID','PERMISSION_REQUIRED','START_INVALID','START_DRIFT',
-      'PROGRESS_SINK_FAILED','JOURNAL_INVALID','SELECTION_INVALID','BATCH_BUDGET','TIME_BUDGET','SQL_BUDGET','BATCH_ROLLED_BACK',
+      'ROW_BUDGET','PROGRESS_SINK_FAILED','JOURNAL_INVALID','SELECTION_INVALID','BATCH_BUDGET','TIME_BUDGET','SQL_BUDGET','BATCH_ROLLED_BACK',
       'BATCH_OUTCOME_UNKNOWN','READ_OUTCOME_UNKNOWN','CHECKPOINT_DRIFT']);
     receipt.outcome=uncertain?'uncertain':'stopped'; receipt.code=allowed.has(error.message)?error.message:
       error.message === 'ACCOUNTLESS_MOVEMENT_ROW_TOO_LARGE' ? 'ROW_BUDGET' : 'OPERATOR_REFUSED';
