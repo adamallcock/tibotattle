@@ -2611,6 +2611,22 @@
       "provenance": "docs/plans/2026-09-05-electron-release-readiness.md",
       "provenanceReason": null,
       "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/prepare-electron-stable-publication.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Local stable final-byte preparation and explicit GET-only readback; no publication writer.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-stable-publication.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
     }
   ]
 }

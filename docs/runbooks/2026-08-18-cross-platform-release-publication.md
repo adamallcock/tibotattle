@@ -672,3 +672,71 @@ source/build evidence only when independently verified against the exact
 repository, source ref/digest, signer workflow, and runner constraints. None
 is a universal safety or vulnerability guarantee. See verify-release.md for
 the user-facing explanation and commands.
+
+## Normal Electron stable feed preparation
+
+`scripts/prepare-electron-stable-publication.mjs` prepares a local, journaled
+four-target publication contract. It does not upload, sign, deploy, create a
+release or change any feed. Its optional public verification mode performs only
+bounded, no-redirect HTTPS GETs. Native trust and source provenance remain separate
+reviewed gates; merely supplying an evidence file does not establish either.
+
+Use one final source, stable version and build across `darwin-arm64`,
+`darwin-x64`, `win32-x64` and `linux-x64`. The normal source-candidate receipt must
+match the existing production planner. The Mac metadata finalizer above also
+accepts that ordinary receipt: it selects `latest-mac.yml` and the fixed stable
+feed. Rehearsal receipts retain their existing transport name and recovery rules.
+The two manifest kinds cannot coexist in one finalization directory.
+
+The input JSON is closed: `schemaVersion` is
+`tibotattle-electron-stable-publication-v1`, followed by `sourceRevision`,
+`version`, `buildNumber` and `targets`. Each target contains exactly `target`,
+`sourceCandidate`, `appUpdate`, `manifest`, `artifacts`, `predecessor` and
+`evidence`. Every file reference contains `path` relative to the artifact root,
+`sha256` and `bytes`. `artifacts` and `evidence` are arrays; `predecessor` is either
+an exact saved older stable manifest or null for a separately verified absent
+feed. Retain original evidence files; this planner checks their bytes, not their
+native trust claims. Use the app-update configuration extracted from the verified
+final package, not a separately invented configuration.
+
+Required final artifacts are both Mac ZIP/DMG pairs and their two blockmaps,
+Windows NSIS EXE (plus its blockmap if emitted), and the Linux AppImage. Their
+existing final `latest-mac.yml`, `latest.yml` and `latest-linux.yml` must bind
+those exact bytes. Windows configuration also retains its exact publisher gate.
+No absent installer, stale signature or rehearsal build can be replaced by a
+synthetic fixture to prepare an actual release.
+
+```sh
+node scripts/prepare-electron-stable-publication.mjs \
+  --artifact-root <verified-artifacts> --proposal <proposal.json> \
+  --operation-directory <new-private-operation>
+```
+
+The resulting private operation journal records exact target-scoped object keys,
+MIME types, cache policies and hashes. The publication contract is: verify saved
+predecessors; create or verify immutable artifacts; verify all artifact bytes;
+recheck each exact predecessor immediately before its feed replacement; then
+verify all feeds. R2 CLI writes lack compare-and-swap, so a separately approved
+writer must have exclusive operator control and retain partial-operation evidence.
+This tool deliberately has no writer or automatic retry. Native `appcast.xml`,
+`intel/appcast.xml`, preview/rehearsal routes and all previous installers remain
+untouched. Website/download publication is a separate existing release gate.
+
+After an independently authorized publication, or before it to verify the saved
+predecessors, use the same inputs and existing operation directory:
+
+```sh
+node scripts/prepare-electron-stable-publication.mjs \
+  --verify-public published \
+  --artifact-root <verified-artifacts> --proposal <proposal.json> \
+  --operation-directory <existing-private-operation>
+```
+
+`predecessor`, `published` and `rollback` are the only verification phases.
+Verification never performs a write. A rollback contract restores only the exact
+saved predecessor feed, or removes only the exact newly published feed when the
+previous state was absent; it preserves all installer objects. Before any rollback
+write, verify the feed still has this operation's proposed bytes and stop on drift.
+A restored feed controls discovery only: it does not downgrade installed apps or
+reverse schema migration. The rollback readback checks exact predecessor bytes
+(or a definitive 404); authentication errors and redirects never mean absence.

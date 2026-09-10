@@ -20,6 +20,7 @@ import {
   parseElectronMacOSMetadataRecoveryArguments,
   recoverElectronMacOSPreFinalization,
 } from "../scripts/finalize-electron-macos-update-metadata.mjs";
+import { RELEASE_VERSION } from "../config/release-manifest.js";
 import { productionElectronCandidatePlan } from "../scripts/package-electron-production.mjs";
 
 const require = createRequire(import.meta.url);
@@ -76,9 +77,9 @@ function candidateReceipt({
     buildNumber,
     hostArchitecture,
     hostPlatform: "darwin",
-    rehearsal: candidate,
-    rehearsalCurrentVersion: CURRENT_VERSION,
-    rehearsalNextVersion: NEXT_VERSION,
+    rehearsal: candidate === "stable" ? null : candidate,
+    rehearsalCurrentVersion: candidate === "stable" ? undefined : CURRENT_VERSION,
+    rehearsalNextVersion: candidate === "stable" ? undefined : NEXT_VERSION,
     sourceRevision: SOURCE_REVISION,
     target,
   });
@@ -94,7 +95,7 @@ function candidateReceipt({
     },
     runtimeManifest: "app/electron-runtime-manifest.json",
     stagedManifest: "app/package.json",
-    status: "native_to_electron_handover_rehearsal_source_staged",
+    status: candidate === "stable" ? "production_source_staged" : "native_to_electron_handover_rehearsal_source_staged",
   };
 }
 
@@ -131,7 +132,8 @@ async function createFixture(root, {
   hostArchitecture = "arm64",
   target = "darwin-arm64",
 } = {}) {
-  const version = candidate === "next" ? NEXT_VERSION : CURRENT_VERSION;
+  const version = candidate === "stable" ? RELEASE_VERSION : candidate === "next" ? NEXT_VERSION : CURRENT_VERSION;
+  const transportManifest = candidate === "stable" ? "latest-mac.yml" : TRANSPORT_MANIFEST;
   const architecture = target.split("-").at(-1);
   const candidateDirectory = join(root, `mirrored-${candidate}`);
   const artifactDirectory = join(candidateDirectory, "artifacts");
@@ -144,8 +146,8 @@ async function createFixture(root, {
   const zipFile = `${stem}.zip`;
   const dmgPath = join(artifactDirectory, dmgFile);
   const zipPath = join(artifactDirectory, zipFile);
-  const manifestPath = join(artifactDirectory, TRANSPORT_MANIFEST);
-  const preManifestPath = join(evidenceDirectory, TRANSPORT_MANIFEST);
+  const manifestPath = join(artifactDirectory, transportManifest);
+  const preManifestPath = join(evidenceDirectory, transportManifest);
   const preDmgBlockmapPath = join(evidenceDirectory, `${dmgFile}.blockmap`);
   const operationJournalPath = join(evidenceDirectory, FINALIZATION_OPERATION);
   const dmgBlockmapPath = `${dmgPath}.blockmap`;
@@ -717,4 +719,34 @@ test("accepts only the closed candidate receipt CLI shape", () => {
       (error) => error?.code === "ELECTRON_MACOS_METADATA_FINALIZATION_ARGUMENT_INVALID",
     );
   }
+});
+
+for (const target of ["darwin-arm64", "darwin-x64"]) {
+  test(`stable ${target} finalizes ordinary latest metadata without relabelling rehearsal`, async () => {
+    await withFixture(async (fixture) => {
+      const receipt = await finalizeElectronMacOSUpdateMetadata({ candidateReceiptPath: fixture.candidateReceiptPath });
+      assert.equal(receipt.distribution.logicalChannel, "stable");
+      assert.equal(receipt.distribution.manifest, "latest-mac.yml");
+      assert.equal(receipt.candidate.kind, "stable");
+      assert.equal(receipt.candidate.version, RELEASE_VERSION);
+      const manifest = yaml.load(await readFile(fixture.manifestPath, "utf8"));
+      assert.equal(manifest.files[1].sha512, sha512(fixture.finalDmgBytes));
+      assert.equal(await fileAbsent(join(fixture.artifactDirectory, TRANSPORT_MANIFEST)), true);
+    }, { candidate: "stable", target });
+  });
+}
+
+test('stable finalization interruption recovers exact latest sidecars and refuses rehearsal conflict', async () => {
+  await withFixture(async fixture => {
+    const before = await outputSnapshot(fixture);
+    const interrupted = new Error('synthetic stable interruption');
+    await assert.rejects(finalizeElectronMacOSUpdateMetadata({ candidateReceiptPath: fixture.candidateReceiptPath }, {
+      afterManifestCommit: async () => { throw interrupted; },
+    }), error => error === interrupted);
+    const recovery = await recoverElectronMacOSPreFinalization({ candidateReceiptPath: fixture.candidateReceiptPath });
+    assert.equal(recovery.status, 'pre_finalization_restored');
+    await assertRecoveredPreFinalization(fixture, before);
+    await writeFile(join(fixture.artifactDirectory, TRANSPORT_MANIFEST), 'conflict');
+    await assert.rejects(finalizeElectronMacOSUpdateMetadata({ candidateReceiptPath: fixture.candidateReceiptPath }), /TRANSPORT_MANIFEST_CONFLICT/);
+  }, { candidate: 'stable' });
 });

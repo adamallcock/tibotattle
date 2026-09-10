@@ -436,7 +436,7 @@ async function readAndValidateBlockmap(path, expectedArtifactBytes) {
   return Object.freeze({ ...metadata, fingerprint, raw: value.bytes });
 }
 
-function candidateKeys() {
+function candidateKeys(stable = false) {
   return [
     "schemaVersion",
     "buildNumber",
@@ -456,7 +456,7 @@ function candidateKeys() {
     "publishingPerformed",
     "nativeHandoverHelper",
     "nativeMacOSKeychainAdapter",
-    "rehearsal",
+    ...(stable ? [] : ["rehearsal"]),
     "windowsRuntimeQualification",
     "status",
     "stagedManifest",
@@ -465,14 +465,15 @@ function candidateKeys() {
 }
 
 function validateCandidateReceipt(value) {
-  if (!hasExactKeys(value, candidateKeys())
+  const stable = isPlainRecord(value) && !Object.hasOwn(value, "rehearsal");
+  if (!hasExactKeys(value, candidateKeys(stable))
       || value.schemaVersion !== CANDIDATE_SCHEMA
       || !hasExactKeys(value.host, ["platform", "architecture"])
-      || !hasExactKeys(value.rehearsal, [
+      || (!stable && (!hasExactKeys(value.rehearsal, [
         "candidate", "currentVersion", "id", "nextVersion", "releaseStatus", "hostedUploads",
       ])
       || !Object.hasOwn(distribution.PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CANDIDATES,
-        value.rehearsal.candidate)) {
+        value.rehearsal.candidate)))) {
     fail("CANDIDATE_RECEIPT_INVALID");
   }
   const targetSpec = PRODUCTION_ELECTRON_TARGETS[value.target];
@@ -488,9 +489,9 @@ function validateCandidateReceipt(value) {
       target: value.target,
       sourceRevision: value.sourceRevision,
       buildNumber: value.buildNumber,
-      rehearsal: value.rehearsal.candidate,
-      rehearsalCurrentVersion: value.rehearsal.currentVersion,
-      rehearsalNextVersion: value.rehearsal.nextVersion,
+      rehearsal: stable ? null : value.rehearsal.candidate,
+      rehearsalCurrentVersion: stable ? undefined : value.rehearsal.currentVersion,
+      rehearsalNextVersion: stable ? undefined : value.rehearsal.nextVersion,
       hostPlatform: value.host.platform,
       hostArchitecture: value.host.architecture,
     });
@@ -513,7 +514,7 @@ function validateCandidateReceipt(value) {
         : expected[key];
     if (!isDeepStrictEqual(value[key], expectedValue)) fail("CANDIDATE_RECEIPT_INVALID");
   }
-  if (value.status !== SOURCE_STATUS
+  if (value.status !== (stable ? "production_source_staged" : SOURCE_STATUS)
       || value.stagedManifest !== "app/package.json"
       || value.runtimeManifest !== "app/electron-runtime-manifest.json") {
     fail("CANDIDATE_RECEIPT_INVALID");
@@ -522,9 +523,9 @@ function validateCandidateReceipt(value) {
   try {
     distributionMetadata = createProductionDistributionMetadata({
       buildNumber: value.buildNumber,
-      rehearsal: value.rehearsal.candidate,
-      rehearsalCurrentVersion: value.rehearsal.currentVersion,
-      rehearsalNextVersion: value.rehearsal.nextVersion,
+      rehearsal: stable ? null : value.rehearsal.candidate,
+      rehearsalCurrentVersion: stable ? undefined : value.rehearsal.currentVersion,
+      rehearsalNextVersion: stable ? undefined : value.rehearsal.nextVersion,
       sourceRevision: value.sourceRevision,
       target: value.target,
     });
@@ -532,15 +533,17 @@ function validateCandidateReceipt(value) {
     fail("CANDIDATE_RECEIPT_INVALID");
   }
   if (distributionMetadata.channel
-        !== PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CHANNEL
-      || distributionMetadata.semanticVersion !== value.version
+        !== (stable ? distribution.PRODUCTION_ELECTRON_CHANNEL : PRODUCTION_ELECTRON_NATIVE_TO_ELECTRON_HANDOVER_REHEARSAL_CHANNEL)
+      || (stable ? RELEASE_VERSION : distributionMetadata.semanticVersion) !== value.version
       || distributionMetadata.updateFeed !== value.updateFeed) {
     fail("CANDIDATE_RECEIPT_INVALID");
   }
   const artifactStem = `${PRODUCT_BRAND.displayName}-${value.version}-mac-${targetSpec.architecture}`;
   return Object.freeze({
     buildNumber: value.buildNumber,
-    candidate: value.rehearsal.candidate,
+    candidate: stable ? "stable" : value.rehearsal.candidate,
+    transportManifest: stable ? "latest-mac.yml" : TRANSPORT_MANIFEST,
+    transportChannel: stable ? "latest" : TRANSPORT_CHANNEL,
     distributionMetadata,
     dmgFile: `${artifactStem}.dmg`,
     sourceRevision: value.sourceRevision,
@@ -620,11 +623,11 @@ function finalizationOperationPaths(artifactDirectory, candidate) {
     dmgBlockmapPath: `${dmgPath}.blockmap`,
     dmgPath,
     finalReceiptPath: join(artifactDirectory, FINALIZATION_RECEIPT),
-    manifestPath: join(artifactDirectory, TRANSPORT_MANIFEST),
+    manifestPath: join(artifactDirectory, candidate.transportManifest),
     operationJournalPath: join(preFinalizationDirectory, FINALIZATION_OPERATION),
     preFinalizationDirectory,
     preFinalizationDmgBlockmapPath: join(preFinalizationDirectory, `${candidate.dmgFile}.blockmap`),
-    preFinalizationManifestPath: join(preFinalizationDirectory, TRANSPORT_MANIFEST),
+    preFinalizationManifestPath: join(preFinalizationDirectory, candidate.transportManifest),
     zipBlockmapPath: `${zipPath}.blockmap`,
     zipPath,
   });
@@ -771,7 +774,7 @@ async function preservePreFinalizationSidecars({
 } = {}) {
   const evidenceDirectory = join(artifactDirectory, "evidence");
   const preFinalizationDirectory = join(evidenceDirectory, "pre-finalization");
-  const preFinalizationManifestPath = join(preFinalizationDirectory, TRANSPORT_MANIFEST);
+  const preFinalizationManifestPath = join(preFinalizationDirectory, basename(manifestPath));
   const preFinalizationDmgBlockmapPath = join(
     preFinalizationDirectory,
     basename(dmgBlockmapPath),
@@ -1203,8 +1206,8 @@ function createFinalizationReceipt({
     }),
     distribution: Object.freeze({
       logicalChannel: candidate.distributionMetadata.channel,
-      manifest: TRANSPORT_MANIFEST,
-      transportChannel: TRANSPORT_CHANNEL,
+      manifest: candidate.transportManifest,
+      transportChannel: candidate.transportChannel,
       updateFeed: candidate.distributionMetadata.updateFeed,
     }),
     builder: Object.freeze({ version: builderVersion }),
@@ -1242,7 +1245,7 @@ function createFinalizationReceipt({
       }),
       manifest: Object.freeze({
         bytes: preFinalization.manifest.bytes,
-        file: `${EVIDENCE_DIRECTORY.join("/")}/${TRANSPORT_MANIFEST}`,
+        file: `${EVIDENCE_DIRECTORY.join("/")}/${candidate.transportManifest}`,
         sha256: preFinalization.manifest.sha256,
       }),
     }),
@@ -1288,7 +1291,7 @@ export async function finalizeElectronMacOSUpdateMetadata({
       zipBlockmapPath,
       zipPath,
     } = paths;
-    const legacyManifestPath = join(artifactDirectory, "latest-mac.yml");
+    const legacyManifestPath = join(artifactDirectory, candidate.candidate === "stable" ? TRANSPORT_MANIFEST : "latest-mac.yml");
 
     await assertAbsent(legacyManifestPath, "TRANSPORT_MANIFEST_CONFLICT");
     await assertAbsent(finalReceiptPath, "FINALIZATION_RECEIPT_EXISTS");
@@ -1325,7 +1328,7 @@ export async function finalizeElectronMacOSUpdateMetadata({
     temporaryDirectory = await mkdtemp(join(artifactDirectory, ".electron-update-metadata-"));
     const temporaryDmgBlockmapPath = join(temporaryDirectory, `${candidate.dmgFile}.blockmap`);
     const temporaryZipBlockmapPath = join(temporaryDirectory, `${candidate.zipFile}.blockmap`);
-    const temporaryManifestPath = join(temporaryDirectory, TRANSPORT_MANIFEST);
+    const temporaryManifestPath = join(temporaryDirectory, candidate.transportManifest);
     let generatedDmg;
     let generatedZip;
     try {
@@ -1729,7 +1732,7 @@ export async function recoverElectronMacOSPreFinalization({
       currentBytes: currentManifest.bytes,
       path: paths.manifestPath,
       preBytes: preManifest.bytes,
-      temporaryPath: join(temporaryDirectory, TRANSPORT_MANIFEST),
+      temporaryPath: join(temporaryDirectory, candidate.transportManifest),
       code: "RECOVERY_RESTORE_FAILED",
       maximumBytes: MAX_MANIFEST_BYTES,
     });
