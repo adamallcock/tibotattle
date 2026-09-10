@@ -843,6 +843,12 @@ test("macOS production runtime connects updater controls to protected preference
   assert.equal(autoUpdater.autoInstallOnAppQuit, false);
   assert.equal(autoUpdater.autoDownload, true);
   assert.equal(nativeAutoUpdater.listenerCount("checking-for-update"), 0);
+  assert.equal(fixture.desktop.lifecycle.showSettingsWindow("about"), true);
+  const settings = FakeWindow.instances.find((candidate) => (
+    candidate.webContents.url.endsWith("/electron-settings.html#about")
+  ));
+  assert.notEqual(settings, undefined);
+  const settingsURL = settings.webContents.url;
   await fixture.desktop.controller.handlers.setAutomaticDownload({ enabled: false });
   assert.equal(autoUpdater.autoDownload, false);
   const saved = JSON.parse(await readFile(join(profile, "desktop-settings", "update-preferences-v1.json"), "utf8"));
@@ -850,6 +856,11 @@ test("macOS production runtime connects updater controls to protected preference
   await fixture.desktop.controller.handlers.checkForUpdates({});
   assert.ok(checks >= 1);
   await fixture.desktop.controller.handlers.downloadUpdate({});
+  assert.deepEqual(settings.webContents.commands.at(-1), {
+    channel: "tibotattle:desktop-command:v1",
+    value: { command: "refresh" },
+  });
+  assert.equal(settings.webContents.url, settingsURL, "an updater status change must not reload Settings");
   await fixture.desktop.controller.handlers.installUpdateAndRestart({});
   assert.equal(installs, 1);
   assert.equal(fixture.desktop.lifecycle.state.preparingForUpdate, false);

@@ -3756,6 +3756,12 @@ test("desktop lifecycle owns a bounded Settings window and authorizes only its t
     { command: "refresh" },
   ]);
   assert.equal(settingsCommands.length, 1, "refresh must remain dashboard-only");
+  assert.equal(lifecycle.refreshSettings(), true);
+  assert.deepEqual(settingsCommands.at(-1), [
+    "tibotattle:desktop-command:v1",
+    { command: "refresh" },
+  ]);
+  assert.equal(dashboardCommands.length, 2, "Settings refresh must not broadcast to the dashboard");
 
   let closePrevented = false;
   settings.emit("close", {

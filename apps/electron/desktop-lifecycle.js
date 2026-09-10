@@ -435,6 +435,19 @@ export function createDesktopLifecycle({
     return delivered;
   }
 
+  // An updater state change carries no renderer-provided data. Refresh only an
+  // already-open trusted Settings surface, using the existing fixed command;
+  // do not reload, focus, or broadcast it to the dashboard.
+  function refreshSettings() {
+    if (!isLiveBrowserWindow(settingsWindow)
+        || typeof settingsWindow.webContents?.send !== "function") return false;
+    settingsWindow.webContents.send(
+      DESKTOP_COMMAND_CHANNEL,
+      validateDesktopCommand({ command: "refresh" }),
+    );
+    return true;
+  }
+
   // Keep native dashboard navigation bounded to the shell's fixed views. The
   // renderer owns the page state and existing projections; the main process
   // only requests a fixed hash after bringing the dashboard window to the
@@ -1723,6 +1736,7 @@ export function createDesktopLifecycle({
     hideWindow,
     toggleWindow,
     sendDashboardCommand,
+    refreshSettings,
     navigateDashboardSection,
     setDesktopLanguage,
     setDesktopTrayPreferences,

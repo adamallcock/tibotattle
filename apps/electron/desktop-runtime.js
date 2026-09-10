@@ -1768,6 +1768,7 @@ export async function launchDesktopRuntime({
         }),
         prepareForUpdate: () => lifecycle.prepareForUpdate(),
         cancelPreparedUpdate: () => lifecycle.cancelUpdatePreparation(),
+        onStatus: () => lifecycle.refreshSettings(),
       });
       await updater.start();
     }

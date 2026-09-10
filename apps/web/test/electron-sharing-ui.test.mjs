@@ -434,6 +434,118 @@ test("the singleton default chooser refreshes the rendered folder card after sel
   mounted.teardown();
 });
 
+test("Settings coalesces trusted updater status refreshes and renders a later download", async () => {
+  const element = (tagName = "div", className = "") => ({
+    tagName,
+    className,
+    childNodes: [],
+    dataset: {},
+    attributes: new Map(),
+    textContent: "",
+    value: "",
+    checked: false,
+    disabled: false,
+    hidden: false,
+    classList: { toggle() {} },
+    append(...children) { this.childNodes.push(...children); },
+    replaceChildren(...children) { this.childNodes = children; },
+    setAttribute(name, value) { this.attributes.set(name, value); },
+    getAttribute(name) { return this.attributes.get(name) ?? null; },
+    removeAttribute(name) { this.attributes.delete(name); },
+    addEventListener(type, handler) { this.listeners ??= new Map(); this.listeners.set(type, handler); },
+    removeEventListener(type, handler) { if (this.listeners?.get(type) === handler) this.listeners.delete(type); },
+  });
+  const selectors = [
+    "#settings-bridge-status", "#settings-language", "#settings-appearance",
+    "#settings-codex-folder-status", "#settings-codex-roots",
+    "#settings-codex-roots-status", "#settings-add-codex-root",
+    "#settings-use-default-codex-folder", "#settings-refresh-interval",
+    "#settings-start-at-login", "#settings-start-at-login-summary",
+    "#settings-open-login-items", "#settings-refresh-login-status",
+    "#settings-notifications-enabled", "#settings-notifications-detail",
+    "#settings-notification-status", "#settings-open-notification-settings",
+    "#settings-automatic-updates", "#settings-check-for-updates",
+    "#settings-download-update", "#settings-install-update",
+    "#settings-open-dashboard-browser", "#settings-show-diagnostics",
+    "#settings-reveal-local-data", "#settings-version", "#settings-build",
+    "#settings-updates-status", "#settings-operation-status",
+  ];
+  const elements = new Map(selectors.map((selector) => [selector, element()]));
+  const documentRef = {
+    documentElement: { dataset: {}, classList: { toggle() {} } },
+    createElement: element,
+    querySelector(selector) { return elements.get(selector) ?? null; },
+    querySelectorAll() { return []; },
+  };
+  const rootId = "00000000-0000-4000-8000-000000000001";
+  let downloaded = false;
+  let refreshCommand = null;
+  let reads = 0;
+  let activeReads = 0;
+  let maximumActiveReads = 0;
+  let resolveStaleRefresh = null;
+  const snapshot = () => ({
+    settings: {
+      language: "en", appearance: "system", refreshIntervalSeconds: 300,
+      codexHomes: { activityRoots: [{ rootId, kind: "default", path: null, enabled: true }], primaryRootId: rootId },
+      codexFolder: { kind: "default" },
+      startAtLogin: { status: "disabled", canSet: false },
+      notifications: { enabled: false, threshold: "off", canSet: false },
+    },
+    about: {
+      version: "0.1.18", build: "test",
+      update: downloaded
+        ? { status: "downloaded", canCheck: false, canDownload: false, canInstall: true, error: "none" }
+        : { status: "available", canCheck: false, canDownload: true, canInstall: false, error: "none" },
+      automaticUpdates: { enabled: true, available: true, canSet: true },
+    },
+  });
+  const bridge = {
+    version: "v1",
+    onCommand(listener) {
+      refreshCommand = listener;
+      return () => { refreshCommand = null; };
+    },
+    getSettings: async () => {
+      reads += 1;
+      activeReads += 1;
+      maximumActiveReads = Math.max(maximumActiveReads, activeReads);
+      const response = snapshot();
+      if (reads === 2) {
+        return await new Promise((resolve) => {
+          resolveStaleRefresh = () => { activeReads -= 1; resolve(response); };
+        });
+      }
+      activeReads -= 1;
+      return response;
+    },
+  };
+  const mounted = await mountSettingsPage({
+    documentRef,
+    windowRef: { tibotattleDesktop: bridge, location: { hash: "#about" } },
+    bridge,
+  });
+  const install = elements.get("#settings-install-update");
+  assert.equal(install.hidden, true);
+  assert.equal(install.disabled, true);
+  refreshCommand({ command: "refresh" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reads, 2);
+  assert.equal(activeReads, 1);
+  downloaded = true;
+  refreshCommand({ command: "refresh" });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reads, 2, "a later status is retained instead of starting a concurrent read");
+  assert.equal(maximumActiveReads, 1);
+  resolveStaleRefresh();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(reads, 3, "the trailing refresh re-reads current main-process status");
+  assert.equal(install.hidden, false);
+  assert.equal(install.disabled, false);
+  mounted.teardown();
+});
+
 test("Settings restores its saved language when the language bridge rejects", async () => {
   const element = (tagName = "div", className = "") => ({
     tagName,
