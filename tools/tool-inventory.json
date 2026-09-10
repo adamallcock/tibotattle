@@ -2627,6 +2627,22 @@
       "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
       "provenanceReason": null,
       "legacyPaths": []
+    },
+    {
+      "classification": "build_release_operation",
+      "owner": "electron_packaging",
+      "canonicalPath": "scripts/publish-electron-stable-feed.mjs",
+      "stableAlias": null,
+      "stableAliasReason": "Protected exact-plan stable R2 publication and explicit rollback require a held shared coordination lock.",
+      "additionalAliases": [],
+      "callers": [
+        "test/electron-stable-writer.test.js",
+        "docs/runbooks/2026-08-18-cross-platform-release-publication.md"
+      ],
+      "decision": "retain_as_release_qualification_entrypoint",
+      "provenance": "docs/runbooks/2026-08-18-cross-platform-release-publication.md",
+      "provenanceReason": null,
+      "legacyPaths": []
     }
   ]
 }

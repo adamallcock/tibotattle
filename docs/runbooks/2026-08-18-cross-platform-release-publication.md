@@ -718,7 +718,8 @@ predecessors; create or verify immutable artifacts; verify all artifact bytes;
 recheck each exact predecessor immediately before its feed replacement; then
 verify all feeds. R2 CLI writes lack compare-and-swap, so a separately approved
 writer must have exclusive operator control and retain partial-operation evidence.
-This tool deliberately has no writer or automatic retry. Native `appcast.xml`,
+This preparation tool has no writer or automatic retry; the separate explicit
+writer below consumes its exact reviewed plan. Native `appcast.xml`,
 `intel/appcast.xml`, preview/rehearsal routes and all previous installers remain
 untouched. Website/download publication is a separate existing release gate.
 
@@ -740,3 +741,48 @@ write, verify the feed still has this operation's proposed bytes and stop on dri
 A restored feed controls discovery only: it does not downgrade installed apps or
 reverse schema migration. The rollback readback checks exact predecessor bytes
 (or a definitive 404); authentication errors and redirects never mean absence.
+
+
+### Explicit stable writes and rollback
+
+`scripts/publish-electron-stable-feed.mjs` is the separate protected write
+entrypoint. It is not part of normal preparation or readback. Before invoking it,
+review the native trust/source evidence and exact plan, authorize the concrete
+publication, and obtain the existing production deployment coordination lock
+through `createProductionDeploymentLock` in
+`apps/worker/scripts/production-deployment-lock.mjs`. The writer requires that
+lock's exact owner commit, checks ownership before/after I/O, and never acquires,
+steals, expires or releases it. The lock coordinates compliant release tooling;
+R2 itself still supplies no conditional write through this CLI path.
+
+Compute the approved digest with the maintained `identityDigest(plan)` helper,
+where `plan` is the result of `prepareElectronStablePublication` for the exact
+inputs above. Preserve the already-created private preparation operation.
+
+```sh
+node scripts/publish-electron-stable-feed.mjs \
+  --artifact-root <verified-artifacts> --proposal <proposal.json> \
+  --operation-directory <existing-private-operation> \
+  --approved-plan-sha256 <reviewed-plan-digest> \
+  --coordination-owner <held-owner-commit> --phase publish
+```
+
+The writer snapshots and rehashes local payloads, records durable per-object
+intent before dispatch, checks authoritative R2 preimages/readbacks and verifies
+all immutable artifacts before changing any feed. Final public readback also
+checks MIME and cache policy. It retains the coordination lock after success;
+release it separately after the completed receipt has been reviewed.
+
+Only `publish` and `rollback` are accepted phases. Rollback requires a prior
+completed or definitely failed publication in that exact journal, matching plan
+and lock owner. It restores/deletes only feeds whose successful replacement was
+durably recorded by that publication; matching remote bytes alone confer no
+ownership. Existing installers and untouched target feeds are never deleted.
+For an explicitly approved rollback, use the same command with `--phase rollback`.
+
+A lost write response or failed post-write readback leaves an unknown intent and
+retains the private upload copy. Neither publication nor rollback retries that
+operation. Reconcile its exact journal/preimage/current bytes under the held lock
+before any separately reviewed recovery. Do not clear intent, delete the journal
+or release an uncertain owner's lock to force a rerun. Passing synthetic tests or
+an earlier release receipt cannot qualify final artifacts of another source.
