@@ -24,6 +24,14 @@ remote operation.
 
 # Evidence held
 
+Current reviewed source `10657851` passes the complete Worker check: **1,001
+Vitest tests in 79 files**, script/type/contract checks and both production and
+staging dry deployments. Its 178-step hosted manifest is frozen with SHA-256
+`7a0e325aa6cabfc78274522ee77f04c9ad570365e09d32ca72f82ca40e2730db`;
+execution still requires the separately requested disposable-database approval.
+The ordinary production service remains healthy on source `32cd6317`, rechecked
+after these local changes.
+
 - **Throughput path prepared:** metadata-only indexed production probes found up
   to 4,616,226 row slots in the dominant v1 record table (an upper bound, not
   an exact count). Its explicit range mode transfers up to 8,192 rows using
