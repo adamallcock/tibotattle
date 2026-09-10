@@ -46,15 +46,20 @@ The larger frozen fixture covers 20,929,052 retained logical bytes versus
   the harness's 256 KiB capture bound. This was an uncertain transport result,
   not a SQL rejection. The harness stopped without retry or cleanup. Independent
   read-only reconciliation **matches the expected post-0058 checkpoint and
-  retained reference counts**. The database is retained. A five-check locally
-  validated continuation prepares only steps 130–177 with a 1 MiB process
+  retained reference counts**. The separately approved, five-check locally
+  validated continuation executed only steps 130–177 with a 1 MiB process
   capture bound, unchanged 128 KiB retained streams and fresh checkpoint
-  admission; its execution and conditional cleanup await explicit approval.
+  admission. **All 48 remaining checks passed in 58,788 ms**, including
+  restoration, 0059, final foreign keys/schema and cleanup. The exact temporary
+  database was deleted and both its ID and name were confirmed absent. The
+  original failure remains unchanged; a hash-linked composed receipt binds
+  129 original steps, the reconciled 0058 step and 48 continuation steps.
 
 The `56b0e37b` manifest SHA-256 is
 `c0ba03b5b0016617deb0392eb648009a22baa409a28bf891cb81c0b067327646`.
-The current run proves hosted canonical-0058 completion against the padded
-reference fixture, but **does not yet prove restoration, 0059 or final cleanup**.
+The composed result proves the complete 178-step hosted rehearsal against the
+padded reference fixture, including restoration, 0059 and exact cleanup. It is
+not an uninterrupted-run claim or production migration authorization.
 The ordinary production service remains healthy on source `32cd6317`, rechecked
 after these local changes. All 15 bounded live inspection batches succeeded: the
 primary/deletion ledgers, 91 table column/FK definitions and canonical product
@@ -84,7 +89,7 @@ explicitly open in source.
   before dispatch, preserves exact large integer keys, and forbids switching
   between range and row modes after setup. Five range checks, two operator
   journey checks and a local D1 batch test cover this addition.
-- **Larger hosted rehearsal partly reconciled:** a frozen 178-step local
+- **Larger hosted rehearsal completed with reconciled continuation:** a frozen 178-step local
   replay keeps all 11 reference tables visible, adds 26,000 authorizations and
   26,000 chunks, and preserves 8,212 v1 records through canonical 0057→0059.
   It includes real mutation guards, rollback/replay refusals, 1,024-row then
@@ -132,8 +137,12 @@ explicitly open in source.
   staging dry runs. Documentation/preflight checks pass. No deployment occurred.
 
 The reconciled hosted canonical transaction covers the padded reference fixture.
-It does not establish sustained production throughput; the remaining restore
-steps and final admitted production operation are still required.
+It does not establish sustained production throughput. The 7,188-row samples
+took 929 ms to evacuate and 1,032 ms to restore, plus 508/463 ms for readback;
+selection, other tables and production scale add work. The exact admitted
+production operation is still required. Before production, carry the verified
+1 MiB process-capture bound into its transport and complete the phase runner
+with durable intent before dispatch; its unfinished draft is not admitted.
 
 # Implemented tools
 

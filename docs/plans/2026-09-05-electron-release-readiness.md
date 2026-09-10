@@ -22,11 +22,14 @@ Latest continuation, 2026-09-10:
 - The corrected larger hosted rehearsal reached canonical 0058. Its CLI output
   exceeded the harness capture bound, but independent readback confirms the
   expected post-migration checkpoint and retained reference counts. The remaining
-  48 synthetic steps and conditional cleanup are prepared and locally checked;
-  execution awaits the specific continuation approval. Production is unchanged.
+  48 synthetic steps passed under the explicit continuation approval, including
+  restoration, 0059 and final integrity checks. The temporary database was
+  deleted and its exact absence verified. The complete 178-step evidence chain
+  preserves the earlier capture failure and its reconciliation. Production and
+  staging are unchanged.
 - All 1,001 Worker tests and the clean-tree production/staging dry builds pass
-  for the corrected migration tooling. Full restoration and production activation
-  remain the immediate work; the [bounded plan](./2026-09-09-bounded-accountless-migration.md)
+  for the corrected migration tooling. Production operation completion and
+  activation remain the immediate work; the [bounded plan](./2026-09-09-bounded-accountless-migration.md)
   owns exact rehearsal outcomes.
 - Protected R7 regeneration completed: all ten receipts validate on both pinned
   runtimes and are committed at `3264c018`. Its existing `release_open` resource
