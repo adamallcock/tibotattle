@@ -6,7 +6,7 @@
  * traffic; these D1 triggers stop writes that reach the primary database.
  */
 
-export const MIGRATION_MUTATION_BARRIER_ENABLED = false;
+export const MIGRATION_MUTATION_BARRIER_ENABLED = true;
 export const MUTATION_BARRIER_ERROR_CODE = "MUTATION_BARRIER_ACTIVE";
 export const MUTATION_BARRIER_ABORT_CODE =
   "ACCOUNTLESS_MIGRATION_MUTATION_BARRIER";
