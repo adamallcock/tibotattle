@@ -1,4 +1,6 @@
 import test from 'node:test';
+import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, writeFile, chmod, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -20,7 +22,11 @@ function fakeCli(manifest,queries,{corruptReadback=false,absence='absent'}={}){
   if(args[1]==='info')return success({uuid:id,name:QUALIFICATION_NAME});
   if(args[1]==='list'){assert.equal(deleted,true);return absence==='error'?{status:1,stdout:'',stderr:'synthetic network error'}:success(absence==='present'?[{uuid:id,name:QUALIFICATION_NAME}]:[{uuid:'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',name:'unrelated-private-resource'}]);}
   if(args[1]==='delete'){deleted=true;return {status:0,stdout:'',stderr:''};}
-  assert.equal(args[1],'execute');const sql=args[args.indexOf('--command')+1];
+  assert.equal(args[1],'execute');
+  const command=args.find(arg=>arg.startsWith('--command='));
+  // Pinned Wrangler/yargs treats a separate leading '-- comment' value as an option.
+  if(!command)return {status:1,stdout:'',stderr:'Unknown arguments: Mandatory'};
+  assert.equal(args.filter(arg=>arg.startsWith('--command=')).length,1);const sql=command.slice('--command='.length);
   if(sql.includes("name NOT LIKE '_cf_%'"))return success([{success:true,results:[{n:0}]}]);
   const step=manifest.steps[index];
   if(reading){assert.equal(sql,step.readback);reading=false;index++;return success([{success:true,results:corruptReadback?[{incorrect:true}]:step.expectedRows}]);}
@@ -65,4 +71,25 @@ test('successful delete acknowledgement still requires verified exact absence',a
   const receipt=await runBoundedQualification({manifestPath,expectedManifestSha256:digest,databaseId:id,confirmation:EXECUTION_CONFIRMATION,spawn:cli.spawn});
   assert.equal(receipt.sqlQualified,true);assert.equal(receipt.ok,false);assert.equal(receipt.deleted,false);assert.equal(cli.deleted,true);assert.equal(receipt.failureStage,'cleanup');assert.equal(receipt.cleanup.status,absence==='present'?'still_present':'unknown');assert.equal(receipt.operation.kind,'cleanup_absence');
  });
+});
+
+
+test('pinned Wrangler parses leading SQL comments only when command and value are one argument',async()=>{
+ const dir=await mkdtemp(join(tmpdir(),'bounded-wrangler-parser-'));
+ try{
+  const require=createRequire(import.meta.url),packagePath=require.resolve('wrangler/package.json');
+  const {dirname}=await import('node:path');const worker=dirname(dirname(packagePath));
+  const cli=join(dirname(packagePath),'bin/wrangler.js'),config=join(dir,'wrangler.json');
+  await writeFile(config,JSON.stringify({name:'bounded-parser-local-only',compatibility_date:'2026-09-01',d1_databases:[]}),{mode:0o600});
+  const sql='-- Mandatory leading SQL comment\nSELECT 42 AS parser_sentinel;';
+  const base=['d1','execute','PARSER_DB','--local','--config',config,'--persist-to',join(dir,'state'),'--json'];
+  const options={cwd:worker,encoding:'utf8',timeout:30000,maxBuffer:1024*1024,env:{...process.env,CI:'true',WRANGLER_SEND_METRICS:'false',WRANGLER_LOG_PATH:join(dir,'wrangler.log')}};
+  const before=spawnSync(process.execPath,[cli,...base,'--command',sql],options);
+  assert.equal(before.error,undefined);assert.notEqual(before.status,0);assert.match(before.stderr,/Unknown argument/i);
+  const after=spawnSync(process.execPath,[cli,...base,`--command=${sql}`],options);
+  assert.equal(after.error,undefined);assert.notEqual(after.status,0);
+  // Stop at the fixed missing-binding refusal after argument parsing: no server,
+  // credentials or local database is needed to test the real CLI parser.
+  const parsedFailure=JSON.parse(after.stdout);assert.equal(parsedFailure.error.text,"Couldn't find a D1 DB with the name or binding 'PARSER_DB' in your wrangler.json file.");assert.doesNotMatch(after.stderr,/Unknown argument/i);
+ }finally{await rm(dir,{recursive:true,force:true});}
 });

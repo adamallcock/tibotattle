@@ -39,7 +39,15 @@ The frozen 108-step hosted bundle is bound to source `b287c57d` and manifest
 SHA-256 `c5bc4a9ba1fb6d7edf717bb74fe9d9b735cbf06d01dedfa949e2a36497409a7c`.
 Its exact disposable target is `tibotattle-bounded58-20260909-70c70f1d`;
 the suffix labels the operation baseline, not the implementation commit.
-Creation, execution and success-only cleanup approval are pending.
+The user approved creation, execution and success-only cleanup. The hosted run
+completed 15 steps (canonical prefix 0014), then the CLI rejected 0015 before
+SQL dispatch because its opening `--` comment was parsed as an option. Read-only
+reconciliation confirmed exactly prefix 0014 and absence of 0015's identity
+column. The database remains retained, with no retry or cleanup. This has not
+yet exercised hosted 0058 or the movement probes. The correction uses a single
+`--command=<SQL>` argument while preserving every SQL byte. A clean rerun of this
+synthetic qualification requires explicitly approved deletion/recreation of the
+retained test database; the original failure receipts remain preserved.
 
 The implementation uses a temporary source-bound dynamic HTTP/admin and cron
 pause plus database mutation guards, rather than permanent request tracking.

@@ -69,7 +69,7 @@ export async function runBoundedQualification({manifestPath,expectedManifestSha2
   return {result,durationMs};
  }
  function jsonSuccess(result){check(!result.error&&result.status===0,'REMOTE_CALL_FAILED');try{return JSON.parse(result.stdout)}catch{fail('REMOTE_JSON_INVALID')}}
- function query(sql,operation){return invoke(['d1','execute','QUALIFICATION_DB','--remote','--command',sql,'--json'],{...operation,querySha256:sha(sql)});}
+ function query(sql,operation){return invoke(['d1','execute','QUALIFICATION_DB','--remote',`--command=${sql}`,'--json'],{...operation,querySha256:sha(sql)});}
  function rows(result){const value=jsonSuccess(result);check(Array.isArray(value)&&value.length===1&&value[0].success===true&&Array.isArray(value[0].results),'READBACK_INVALID');return value[0].results;}
  try{
   const info=jsonSuccess((await invoke(['d1','info','QUALIFICATION_DB','--json'],{kind:'target_identity'})).result);
