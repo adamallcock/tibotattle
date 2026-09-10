@@ -30,7 +30,19 @@ staging dry deployments. The later fixture-only update `9fceb72e` passes seven r
 covers 20,929,052 retained logical bytes versus 19,496,905 observed in production.
 Its 178-step hosted manifest is frozen with SHA-256
 `194a4b0b3fe3b7b2a427e6b0358e204b030adf1e809a989c8cf0a6ae5079bfec`;
-execution still requires the separately requested disposable-database approval.
+Its approved hosted execution stopped after 57 successful steps: Cloudflare
+rejected the first seed request with code 7500 because generated SQL contained
+empty statements between duplicate delimiters. The stopped database is retained;
+read-only reconciliation found all ten tables targeted by that request empty.
+No migration-range or canonical-0058 timing was reached. Source `89c3c588` fixes
+both the fixture grouping and shared operator rendering, preserving canonical
+SQL bytes and avoiding redundant terminators. All 22 operator/transport checks,
+seven fixture/runner checks, and 1,001 Worker tests pass. The complete check
+reached the final dry-deployment stage, which correctly refused the then-uncommitted
+status document; the dry checks require a clean committed tree separately.
+The corrected 178-step manifest is frozen
+with SHA-256 `f0829eeb311c498b37bd96e84685b60455a5615b771c25bb9d137466f20bf108`;
+a reset and corrected hosted run have not been executed.
 The ordinary production service remains healthy on source `32cd6317`, rechecked
 after these local changes. All 15 bounded live inspection batches succeeded: the
 primary/deletion ledgers, 91 table column/FK definitions and canonical product
@@ -44,7 +56,11 @@ the exact pending-0058/0059 acknowledgement simulation. It is local only. Its
 future deployment would update the public asset tree as well as the Worker, so
 that asset set is part of the exact production operation review. The existing
 signed production-canary workflow can be reused, and its matching RSA cleanup
-key has been verified locally. No production canary has run.
+key has been verified locally. Existing production encryption/identity secret
+bindings were reconfirmed without reading values after the approved CLI login
+renewal. No production canary has run. The separately authorized local protected
+R7 generation is running against an unchanged desktop workload closure; these
+Worker-only repairs do not change that closure.
 
 - **Throughput path prepared:** metadata-only indexed production probes found up
   to 4,616,226 row slots in the dominant v1 record table (an upper bound, not
