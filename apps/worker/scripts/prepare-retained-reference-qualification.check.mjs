@@ -33,6 +33,9 @@ test('freezes and independently replays retained11 guarded movement, range recor
   for(const migration of manifest.migrations)assert.equal(sha(await readFile(join(directory,'canonical',migration.name))),migration.sha256);
   for(const step of manifest.steps){
    const path=join(directory,step.file),sql=await readFile(path,'utf8');assert.equal((await stat(path)).mode&0o777,0o600);assert.equal(sha(sql),step.sqlSha256);assert.equal(Buffer.byteLength(sql),step.sqlBytes);
+   // SQLite accepts empty statements but hosted D1 rejects them with API7500.
+   // Inspect the emitted query bytes, including real seeded/guard/phase groups.
+   assert.doesNotMatch(sql,/;\s*;/,step.name+' contains an empty D1 statement');
    db.exec('BEGIN IMMEDIATE');let rejected=false;
    try{db.exec(sql);db.exec('COMMIT');}catch(error){db.exec('ROLLBACK');assert.equal(step.expectedFailure,true,step.name);assert.match(error.message,step.expectedError==='MUTATION_BARRIER'?/ACCOUNTLESS_MIGRATION_MUTATION_BARRIER/:/CHECK constraint failed/);rejected=true;failures++;}
    assert.equal(rejected,step.expectedFailure,step.name);assert.deepEqual(plain(db.prepare(step.readback).all()),step.expectedRows,step.name);

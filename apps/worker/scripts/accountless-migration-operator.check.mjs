@@ -78,9 +78,23 @@ test('time budget checked before write and hanging batch returns uncertain once'
 }));
 test('SQL rendering keeps comments/quoted marks and compound migration bytes',()=>{
  assert.equal(renderMovementSql([{sql:"SELECT '?' AS x,? AS y -- ?",params:["O'Reilly"]}]),"SELECT '?' AS x,'O''Reilly' AS y -- ?\n;");
- const sql='-- Canonical\nCREATE TABLE t(x TEXT);';assert.equal(renderMovementSql([{sql,params:[],compound:true}]),sql+'\n;');
+ const sql='-- Canonical\nCREATE TABLE t(x TEXT);';assert.equal(renderMovementSql([{sql,params:[],compound:true}]),sql);
  assert.throws(()=>renderMovementSql([{sql:'SELECT ?1',params:[1]}]),/NUMBERED/);
  assert.throws(()=>renderMovementSql([{sql:'SELECT ?',params:[1],compound:true}]),/COMPOUND/);
+});
+
+test('SQL rendering terminates statements without adding empty D1 statements',()=>{
+ for(const compound of [false,true]) {
+  for(const suffix of ['', '\n', ' -- trailing ; comment', ' /* trailing ; comment */']) {
+   const sql='SELECT 1;'+suffix;
+   assert.equal(renderMovementSql([{sql,params:[],compound}]),sql);
+  }
+  assert.equal(renderMovementSql([{sql:"SELECT ';' -- ;",params:[],compound}]),"SELECT ';' -- ;\n;");
+  assert.throws(()=>renderMovementSql([{sql:'-- comment only ;',params:[],compound}]),/STATEMENT_EMPTY/);
+ }
+ assert.equal(renderMovementSql([{sql:'SELECT ?; -- done',params:["semi;colon"]},{sql:'SELECT 2;',params:[]}]),"SELECT 'semi;colon'; -- done\nSELECT 2;");
+ const trigger='CREATE TRIGGER guarded AFTER INSERT ON t BEGIN SELECT 1; SELECT 2; END;\n';
+ assert.equal(renderMovementSql([{sql:trigger,params:[],compound:true}]),trigger);
 });
 
 test('oversized multi-row SQL adapts locally to fitting prefixes without mutation retry or lost rows',()=>using(async f=>{

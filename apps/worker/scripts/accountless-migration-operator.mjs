@@ -18,8 +18,8 @@ export function renderMovementSql(statements) {
   requireThat(Array.isArray(statements) && statements.length > 0, 'STATEMENTS_INVALID');
   return statements.map(({ sql, params, compound }) => {
     requireThat(typeof sql === 'string' && Array.isArray(params), 'STATEMENTS_INVALID');
-    if (compound) { requireThat(params.length === 0, 'COMPOUND_BINDINGS_REFUSED'); return sql + '\n;'; }
-    let index = 0, result = '', mode = null;
+    if (compound) requireThat(params.length === 0, 'COMPOUND_BINDINGS_REFUSED');
+    let index = 0, result = '', mode = null, lastToken = null;
     for (let i = 0; i < sql.length; i++) {
       const c = sql[i], n = sql[i+1];
       if (mode === 'line') { result += c; if (c === '\n') mode = null; continue; }
@@ -27,18 +27,22 @@ export function renderMovementSql(statements) {
       if (mode) { result += c; if (c === mode) { if (n === mode) { result += n; i++; } else mode = null; } continue; }
       if (c === '-' && n === '-') { result += c+n; i++; mode = 'line'; }
       else if (c === '/' && n === '*') { result += c+n; i++; mode = 'block'; }
-      else if (c === "'" || c === '"' || c === '`') { result += c; mode = c; }
-      else if (c === '?') {
+      else if (c === "'" || c === '"' || c === '`') { result += c; mode = c; lastToken = c; }
+      else if (c === '?' && !compound) {
+        lastToken = c;
         requireThat(!/[0-9]/.test(n ?? ''), 'NUMBERED_BINDING_REFUSED');
         requireThat(index < params.length, 'BINDING_COUNT'); const value = params[index++];
         if (value === null) result += 'NULL';
         else if (typeof value === 'number' && Number.isSafeInteger(value)) result += String(value);
         else if (typeof value === 'string' && !value.includes('\0')) result += "'" + value.replaceAll("'", "''") + "'";
         else reject('BINDING_INVALID');
-      } else result += c;
+      } else { result += c; if (!/\s/.test(c)) lastToken = c; }
     }
     requireThat(index === params.length && (!mode || mode === 'line'), 'BINDING_COUNT');
-    return result + '\n;';
+    requireThat(lastToken !== null, 'STATEMENT_EMPTY');
+    // D1 rejects empty statements between delimiters, even though SQLite accepts
+    // them. Keep canonical bytes intact and add only a missing final delimiter.
+    return lastToken === ';' ? result : result + '\n;';
   }).join('\n');
 }
 

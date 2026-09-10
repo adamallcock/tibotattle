@@ -51,7 +51,18 @@ export async function prepareRetainedReferenceQualification({outputDirectory}={}
   if(references)check(JSON.stringify(db.prepare(referenceRead).all())===references,'REFERENCE_DRIFT');
   const expectedRows=db.prepare(readback).all();steps.push({name,sql,sqlSha256:sha(sql),sqlBytes:Buffer.byteLength(sql),readback,expectedRows,expectedFailure:Boolean(expectedError),expectedError,localDurationMs:Math.ceil(performance.now()-start)});
  }
- function groups(name,statements,readback=ledgerRead){let sql='',index=0;for(const statement of statements){check(Buffer.byteLength(statement)<64*1024,'FIXTURE_STATEMENT_BOUND');if(sql&&Buffer.byteLength(sql+statement)>64*1024){step(`${name}-${index++}`,sql,readback);sql='';}sql+=statement+'\n;\n';}if(sql)step(`${name}-${index}`,sql,readback);}
+ function groups(name,statements,readback=ledgerRead){
+  let sql='',index=0;
+  for(const statement of statements){
+   // Seed statements and the shared renderer already terminate their SQL.
+   // Adding another delimiter emits an empty statement rejected by D1.
+   const terminated=renderMovementSql([{sql:statement,params:[],compound:true}])+'\n';
+   check(Buffer.byteLength(terminated)<64*1024,'FIXTURE_STATEMENT_BOUND');
+   if(sql&&Buffer.byteLength(sql+terminated)>64*1024){step(`${name}-${index++}`,sql,readback);sql='';}
+   sql+=terminated;
+  }
+  if(sql)step(`${name}-${index}`,sql,readback);
+ }
  function insert(table,overrides){const info=db.prepare(`PRAGMA table_info(${q(table)})`).all();const fields=Object.fromEntries(info.filter(c=>c.notnull&&c.dflt_value===null).map(c=>[c.name,c.type==='BLOB'?null:['INTEGER','REAL'].includes(c.type)?0:'synthetic']));Object.assign(fields,overrides);return `INSERT INTO ${q(table)}(${Object.keys(fields).map(q).join(',')}) VALUES(${Object.entries(fields).map(([key,value])=>value===null&&info.find(c=>c.name===key).type==='BLOB'?'zeroblob(32)':literal(value)).join(',')});`;}
  try {
   step('create-ledger','CREATE TABLE d1_migrations(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE,applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL);');
