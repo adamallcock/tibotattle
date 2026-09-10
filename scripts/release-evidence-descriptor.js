@@ -49,6 +49,7 @@ import {
   validateStoreDeliveryReceipt,
   normalizeUpdater,
   validateAssurances,
+  normalizeCleanInstallAcceptance,
   validateCanonicalManifest,
   validateDistribution,
   validateSpdxJson,
@@ -231,7 +232,7 @@ async function normalizeArtifact(descriptor, release, productName, baseDir, cont
   assertAllowedKeys(selected, [
     "platform", "channel", "architecture", "format", "version", "path", "file", "fileName",
     "bytes", "sha256", "source", "distribution", "downloadUrl", "nativeTrust", "build",
-    "sbom", "provenance", "assurances", "platformAssurances", "store", "updater",
+    "sbom", "provenance", "assurances", "platformAssurances", "store", "updater", "cleanInstallAcceptance",
   ], "artifact", "RELEASE_EVIDENCE_ARTIFACT_INVALID");
   const platform = assertPlatform(selected.platform);
   const channel = assertChannel(selected.channel);
@@ -302,11 +303,13 @@ async function normalizeArtifact(descriptor, release, productName, baseDir, cont
   }
   const updater = normalizeUpdater(updaterInput, platform, channel,
     "updater", updaterMetadata);
+  const cleanInstallAcceptance = normalizeCleanInstallAcceptance(selected.cleanInstallAcceptance, { platform, channel, architecture, source, assurances: selected.assurances ?? selected.platformAssurances });
   const assurances = validateAssurances(
     selected.assurances === undefined ? selected.platformAssurances : selected.assurances,
     platform,
     channel,
     "artifact.assurances",
+    cleanInstallAcceptance,
   );
   let store = normalizeStore(selected.store, platform, channel, "artifact.store", {
     artifactDigest: artifactFile.sha256,
@@ -332,7 +335,7 @@ async function normalizeArtifact(descriptor, release, productName, baseDir, cont
     store,
     label: "artifact.nativeTrust",
   });
-  const build = normalizeBuild(selected.build, channel, "artifact.build");
+  const build = normalizeBuild(selected.build, channel, "artifact.build", artifactFile.sha256, { platform, architecture, updater });
   const distribution = validateDistribution({
     value: selected.distribution,
     channel,
@@ -360,6 +363,7 @@ async function normalizeArtifact(descriptor, release, productName, baseDir, cont
     sbom,
     provenance,
     assurances,
+    ...(cleanInstallAcceptance === undefined ? {} : { cleanInstallAcceptance }),
     store,
     updater,
   };

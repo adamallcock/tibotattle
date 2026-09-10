@@ -181,7 +181,7 @@ export const RELEASE_EVIDENCE_RUN_URL_PATTERN =
   /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/runs\/[1-9][0-9]*(?:\/attempt\/[1-9][0-9]*)?$/u;
 
 export const RELEASE_EVIDENCE_DEFAULT_UPDATER_MECHANISMS = Object.freeze({
-  macos: Object.freeze(["sparkle", "none", "store-managed"]),
+  macos: Object.freeze(["sparkle", "electron-updater", "none", "store-managed"]),
   windows: Object.freeze(["electron-updater", "none", "store-managed"]),
-  linux: Object.freeze(["none", "store-managed"]),
+  linux: Object.freeze(["electron-updater", "none", "store-managed"]),
 });

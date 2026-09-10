@@ -11,6 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { readElectronSitePublication, renderElectronSiteDownloads, renderElectronSiteDocumentation } from "./lib/electron-public-site.mjs";
 import { isIP } from "node:net";
 import { homedir } from "node:os";
 import {
@@ -232,6 +233,10 @@ function usage() {
     "     --intel-installer-url https://downloads.approved.example/TiboTattle-1.2.3-macOS-x64.dmg \\",
     "     --intel-minimum-macos 14.0]",
     "    Intel requires the same canonical cross-platform release manifest as Apple silicon.",
+    "    [--electron-publication-plan /absolute/plan.json --electron-publication-root /absolute/artifacts",
+    "     --electron-approved-plan-sha256 <reviewed identityDigest(plan)>]",
+    "    Electron mode requires a copy of the 1024x1024 public brand icon as --social-image.",
+    "    Electron mode excludes native installer arguments; final trust is separately reviewed.",
     "    [--replace]",
   ].join("\n");
 }
@@ -240,6 +245,9 @@ export function parseArgs(argv) {
   const parsed = { replace: false, source: DEFAULT_SOURCE };
   const keys = {
     "--output": "output",
+    "--electron-publication-plan": "electronPublicationPlan",
+    "--electron-publication-root": "electronPublicationRoot",
+    "--electron-approved-plan-sha256": "electronApprovedPlanSha256",
     "--source": "source",
     "--site-url": "siteUrl",
     "--installer-path": "installerPath",
@@ -487,6 +495,14 @@ function validateInputs(args) {
     const value = args[key];
     return value !== undefined && value !== null && value !== "";
   });
+  const electronKeys = ['electronPublicationPlan', 'electronPublicationRoot', 'electronApprovedPlanSha256'];
+  const electronConfigured = electronKeys.some(key => args[key] !== undefined);
+  if (electronConfigured && (electronKeys.some(key => !args[key]) || installerConfigured
+      || INTEL_INSTALLER_OPTION_KEYS.some(key => args[key])
+      || !isAbsolute(args.electronPublicationPlan) || !isAbsolute(args.electronPublicationRoot)
+      || !/^[a-f0-9]{64}$/u.test(args.electronApprovedPlanSha256))) {
+    throw new TypeError('Electron publication requires all three explicit inputs and excludes native installer inputs');
+  }
   const intelInstallerConfigured = INTEL_INSTALLER_OPTION_KEYS.some((key) =>
     args[key] !== undefined && args[key] !== null && args[key] !== "");
   if (intelInstallerConfigured && (!installerConfigured
@@ -530,7 +546,7 @@ function validateInputs(args) {
     architectures: ["x64"],
     architecturesText: "x64",
   } : null;
-  const releaseInputs = [installerPath, installerReleaseManifest, intelInstaller?.installerPath].filter(Boolean);
+  const releaseInputs = [installerPath, installerReleaseManifest, intelInstaller?.installerPath, ...(electronConfigured ? [args.electronPublicationPlan, args.electronPublicationRoot] : [])].filter(Boolean);
   if (output === source
       || output === REPOSITORY_ROOT
       || output === homedir()
@@ -572,6 +588,8 @@ function validateInputs(args) {
     supportUrl: validatedPublicHttpsUrl(args.supportUrl, "Support URL"),
     replace: args.replace,
     installerConfigured,
+    electronPublication: electronConfigured ? { planPath: args.electronPublicationPlan,
+      artifactRoot: args.electronPublicationRoot, approvedPlanSha256: args.electronApprovedPlanSha256 } : null,
     intelInstaller,
   };
   if (!installerConfigured) return options;
@@ -721,7 +739,11 @@ async function assertReleaseSitePathBoundaries(options) {
     );
   const intelInstallerPath = options.intelInstaller === null ? null
     : await canonicalReleasePath(options.intelInstaller.installerPath, "Intel installer artifact");
-  const releaseInputs = [installerPath, installerManifest, intelInstallerPath].filter(Boolean);
+  const electronInputs = options.electronPublication ? [
+    await canonicalReleasePath(options.electronPublication.planPath, 'Electron publication plan'),
+    await canonicalReleasePath(options.electronPublication.artifactRoot, 'Electron artifact root', { directory: true }),
+  ] : [];
+  const releaseInputs = [installerPath, installerManifest, intelInstallerPath, ...electronInputs].filter(Boolean);
   if (output === source
       || isWithin(output, source)
       || isWithin(source, output)
@@ -752,7 +774,7 @@ async function regularFile(path, label, maximumBytes = Number.MAX_SAFE_INTEGER) 
   return stats;
 }
 
-function inspectPng(bytes) {
+function inspectPng(bytes, { electronIcon = false } = {}) {
   const signature = Buffer.from([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
   ]);
@@ -795,8 +817,8 @@ function inspectPng(bytes) {
   if (!sawIdat || !sawIend) {
     throw new TypeError("Social preview must contain PNG image data and an end marker");
   }
-  if (width !== 1200 || height !== 630) {
-    throw new TypeError("Social preview must be exactly 1200x630 pixels");
+  if (electronIcon ? width !== 1024 || height !== 1024 : width !== 1200 || height !== 630) {
+    throw new TypeError(electronIcon ? "Electron social preview must be the 1024x1024 brand icon" : "Social preview must be exactly 1200x630 pixels");
   }
   return { width, height };
 }
@@ -966,6 +988,11 @@ function injectReleaseMetadata(html, values, canonicalUrl) {
   ]) {
     output = replaceExactlyOnce(output, token, replacement, label);
   }
+  if (values.electronRelease) {
+    output = output.replace('<meta property="og:image:width" content="1200">', '<meta property="og:image:width" content="1024">')
+      .replace('<meta property="og:image:height" content="630">', '<meta property="og:image:height" content="1024">')
+      .replace('<meta name="twitter:card" content="summary_large_image">', '<meta name="twitter:card" content="summary">');
+  }
   return injectCanonicalMetadata(
     output,
     canonicalUrl,
@@ -1115,8 +1142,8 @@ function assertNoForbiddenPublicReferences(contents, label, errorType = Error) {
  * macOS client. This makes both accidental app-client imports and symlink
  * escapes release-time failures.
  */
-function renderAuxiliaryPublicHtml(sourceHtml) {
-  return sourceHtml.replace(
+function renderAuxiliaryPublicHtml(sourceHtml, electronRelease = null) {
+  return (electronRelease ? renderElectronSiteDocumentation(sourceHtml) : sourceHtml).replace(
     /\bhref\s*=\s*(?:"(\.\/community\.html(?:[?#][^"]*)?)"|'(\.\/community\.html(?:[?#][^']*)?)'|(\.\/community\.html(?:[?#][^\s"'=<>`]*)?))/gu,
     (_attribute, doubleQuoted, singleQuoted, unquoted) => {
       const value = doubleQuoted ?? singleQuoted ?? unquoted;
@@ -1217,10 +1244,13 @@ async function verifyPublishedSourceClosure({
       rendered = expected.path === SITE_INDEX_SOURCE_BASENAME
         ? injectReleaseMetadata(sourceText.text, releaseValues, canonicalUrl)
         : injectCanonicalMetadata(
-          renderAuxiliaryPublicHtml(sourceText.text),
+          renderAuxiliaryPublicHtml(sourceText.text, releaseValues.electronRelease),
           canonicalUrl,
           `Public auxiliary page ${expected.path}`,
         );
+      if (expected.path === SITE_INDEX_SOURCE_BASENAME && releaseValues.electronRelease) {
+        rendered = renderElectronSiteDownloads(rendered, releaseValues.electronRelease);
+      }
       if (expected.path === SITE_INDEX_SOURCE_BASENAME
           && rendered !== releaseHtml) {
         throw new TypeError(
@@ -1508,6 +1538,8 @@ export async function buildPublicReleaseSite(rawArgs, {
     `Public release source ${SITE_INDEX_SOURCE_BASENAME}`,
     TypeError,
   );
+  const electronRelease = options.electronPublication
+    ? await readElectronSitePublication({ ...options.electronPublication, verifyPublishedInstaller }) : null;
   let installerEvidence = null;
   let intelInstallerEvidence = null;
   if (options.installerConfigured) {
@@ -1601,10 +1633,15 @@ export async function buildPublicReleaseSite(rawArgs, {
     MAXIMUM_SOCIAL_PREVIEW_BYTES,
   );
   const socialBytes = await readFile(options.socialImage);
-  const socialDimensions = inspectPng(socialBytes);
+  const socialDimensions = inspectPng(socialBytes, { electronIcon: electronRelease !== null });
+  if (electronRelease) {
+    const brandIcon = await readFile(join(options.source, 'tibotattle-icon.png'));
+    if (!socialBytes.equals(brandIcon)) throw new TypeError('Electron social preview must match the reviewed public brand icon');
+  }
   const socialSha256 = createHash("sha256").update(socialBytes).digest("hex");
   const releaseValues = {
     ...options,
+    electronRelease,
     installerBytes: installerEvidence?.artifact.bytes ?? null,
     installerSha256: installerEvidence?.artifact.sha256 ?? null,
     intelInstaller: intelInstallerEvidence ? {
@@ -1613,11 +1650,12 @@ export async function buildPublicReleaseSite(rawArgs, {
       installerSha256: intelInstallerEvidence.artifact.sha256,
     } : null,
   };
-  const releaseHtml = injectReleaseMetadata(
+  let releaseHtml = injectReleaseMetadata(
     sourceHtml,
     releaseValues,
     canonicalUrlBySourceBasename.get(SITE_INDEX_SOURCE_BASENAME),
   );
+  if (electronRelease) releaseHtml = renderElectronSiteDownloads(releaseHtml, electronRelease);
 
   if (await pathExists(options.output)) {
     if (!options.replace) {
@@ -1642,7 +1680,7 @@ export async function buildPublicReleaseSite(rawArgs, {
         );
       }
       const auxiliaryHtml = injectCanonicalMetadata(
-        renderAuxiliaryPublicHtml(await readFile(sourceFile, "utf8")),
+        renderAuxiliaryPublicHtml(await readFile(sourceFile, "utf8"), electronRelease),
         canonicalUrl,
         `Public auxiliary page ${sourceBasename}`,
       );
@@ -1738,6 +1776,11 @@ export async function buildPublicReleaseSite(rawArgs, {
   }
   const manifest = {
     schemaVersion: PUBLIC_RELEASE_MANIFEST_SCHEMA,
+    ...(electronRelease ? { electronRelease: {
+      version: electronRelease.version, buildNumber: electronRelease.buildNumber,
+      publishedInstallersVerified: electronRelease.publishedInstallersVerified,
+      verificationScope: electronRelease.verificationScope, downloads: electronRelease.downloads,
+    } } : {}),
     source: sourceProvenance,
     site: {
       canonicalUrl: options.siteUrl,

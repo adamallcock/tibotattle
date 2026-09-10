@@ -1,0 +1,121 @@
+/** Consume an explicitly reviewed final publication plan; never rebuild or sign. */
+import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
+import { lstat, open, readFile, realpath } from 'node:fs/promises';
+import { basename, resolve, sep } from 'node:path';
+import distribution from '../../config/electron-production-distribution.cjs';
+import { EN_US_CATALOG } from '../../packages/i18n/index.js';
+import { identityDigest } from './release-operation.mjs';
+
+const fail = () => { throw new TypeError('Electron site requires the exact reviewed stable publication plan and unchanged artifacts'); };
+const HASH = /^[a-f0-9]{64}$/u;
+const targets = Object.keys(distribution.PRODUCTION_ELECTRON_TARGETS);
+export async function readElectronSitePublication({ planPath, artifactRoot, approvedPlanSha256, verifyPublishedInstaller }) {
+  if (!HASH.test(approvedPlanSha256 ?? '')) fail();
+  const planStat = await lstat(planPath);
+  if (!planStat.isFile() || planStat.isSymbolicLink() || planStat.size > 128 * 1024) fail();
+  const plan = JSON.parse(await readFile(planPath, 'utf8'));
+  if (identityDigest(plan) !== approvedPlanSha256
+      || plan.schemaVersion !== 'tibotattle-electron-stable-publication-plan-v1'
+      || plan.origin !== distribution.PRODUCTION_ELECTRON_UPDATE_ORIGIN
+      || plan.status !== 'local_bytes_bound' || plan.published !== false
+      || !/^[a-f0-9]{40}$/u.test(plan.sourceRevision ?? '')
+      || !/^\d+\.\d+\.\d+$/u.test(plan.version ?? '')
+      || !Array.isArray(plan.targets) || plan.targets.length !== 4
+      || plan.targets.map(t => t.target).sort().join() !== [...targets].sort().join()) fail();
+  const root = await realpath(artifactRoot);
+  const downloads = [];
+  let publishedInstallersVerified = true;
+  for (const target of plan.targets) {
+    const feedURL = distribution.PRODUCTION_ELECTRON_TARGETS[target.target].feedURL;
+    if (target.feedURL !== feedURL || !Array.isArray(target.artifacts)) fail();
+    const arch = target.target.slice(7);
+    const name = target.target.startsWith('darwin-') ? `TiboTattle-${plan.version}-mac-${arch}.dmg`
+      : target.target === 'win32-x64' ? `TiboTattle-${plan.version}-Windows-x64.exe`
+        : `TiboTattle-${plan.version}-linux-x86_64.AppImage`;
+    const selected = target.artifacts.filter(a => basename(a.objectKey) === name);
+    if (selected.length !== 1) fail();
+    for (const object of [...target.artifacts, target.feed]) {
+      if (typeof object.localPath !== 'string' || object.localPath.includes('\\')
+          || object.localPath.split('/').some(p => !/^[A-Za-z0-9][A-Za-z0-9._-]*$/u.test(p))
+          || !HASH.test(object.sha256 ?? '') || !Number.isSafeInteger(object.bytes)
+          || object.bytes < 1 || object.bytes > 2 * 1024 ** 3
+          || object.objectKey !== `${new URL(feedURL).pathname.slice(1)}/${basename(object.localPath)}`) fail();
+      const path = resolve(root, object.localPath);
+      if (!path.startsWith(root + sep) || await realpath(path) !== path) fail();
+      const before = await lstat(path);
+      if (!before.isFile() || before.nlink !== 1 || before.size !== object.bytes) fail();
+      const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const opened = await handle.stat();
+        if (opened.ino !== before.ino || opened.dev !== before.dev) fail();
+        let bytes = 0; const hash = createHash('sha256');
+        for await (const chunk of handle.createReadStream({ autoClose: false })) {
+          bytes += chunk.length; if (bytes > object.bytes) fail(); hash.update(chunk);
+        }
+        const after = await handle.stat(); const named = await lstat(path);
+        if (bytes !== object.bytes || hash.digest('hex') !== object.sha256
+            || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs
+            || named.ino !== before.ino || named.dev !== before.dev || named.isSymbolicLink()) fail();
+      } finally { await handle.close(); }
+    }
+    const object = selected[0];
+    const url = `${plan.origin}/${object.objectKey}`;
+    const verified = await verifyPublishedInstaller({ installerUrl: url, expectedBytes: object.bytes, expectedSha256: object.sha256 });
+    if (verified?.bytes !== object.bytes || verified?.sha256 !== object.sha256) fail();
+    if (verified.published === false) publishedInstallersVerified = false;
+    downloads.push({ target: target.target, url, bytes: object.bytes, sha256: object.sha256 });
+  }
+  return { version: plan.version, buildNumber: plan.buildNumber, sourceRevision: plan.sourceRevision,
+    approvedPlanSha256, publishedInstallersVerified, verificationScope: ['reviewed-publication-plan', 'local-artifact-bytes', ...(publishedInstallersVerified ? ['published-installer-bytes'] : [])], downloads };
+}
+
+const escape = value => String(value).replace(/[&<>"']/gu, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+const text = key => `<span data-i18n="${key}">${escape(EN_US_CATALOG[key])}</span>`;
+export function renderElectronSiteDownloads(html, release) {
+  let output = html.replace('</head>', '<meta name="usage-monitor-electron-stable" content="true">\n</head>');
+  const description = 'TiboTattle is a private desktop app for macOS, Windows and Linux that estimates your seven-day Codex allowance locally and shows delayed aggregate community activity when published.';
+  let descriptions = 0;
+  output = output.replace(/<meta\s+(property|name)="(og:description|twitter:description|description)"\s+content="[^"]*"\s*>/gu,
+    (_match, attribute, name) => { descriptions++; return `<meta ${attribute}="${name}" content="${escape(description)}">`; });
+  if (descriptions !== 3) throw new TypeError('Missing exact social description slots');
+  output = output.replace(/<meta property="og:image:alt" content="[^"]*">/u,
+    '<meta property="og:image:alt" content="TiboTattle logo">');
+  for (const item of release.downloads) {
+    const platform = { 'darwin-arm64': 'macos', 'darwin-x64': 'macos-intel', 'win32-x64': 'windows', 'linux-x64': 'linux' }[item.target];
+    const mac = item.target.startsWith('darwin-');
+    const pattern = new RegExp(`<section\\b[^>]*data-platform-panel="${platform}"[^>]*>[\\s\\S]*?<\\/section>`, 'u');
+    if (!pattern.test(output)) throw new TypeError('Missing exact platform panel');
+    const handover = mac ? `<details class="electron-handover"><summary>${text('electron.site.handoverTitle')}</summary>
+      <p>${text('electron.site.handoverIntro')}</p><p>${text('electron.site.handoverOlder')}</p><ol>
+      <li>${text('electron.site.handoverQuit')}</li>
+      <li>${text('electron.site.handoverFolder')} <code>~/Library/Application Support/TiboTattle Native Handover/native-app</code></li>
+      <li>${text('electron.site.handoverPreserve')}</li>
+      <li>${text('electron.site.handoverInstall')}</li>
+      <li>${text('electron.site.handoverKeep')}</li></ol></details>` : '';
+    output = output.replace(pattern, `<section class="platform-panel" id="platform-panel-${platform}" role="tabpanel" aria-labelledby="platform-tab-${platform}" data-platform-panel="${platform}" tabindex="0"${platform === 'macos' ? '' : ' hidden'}>
+      ${release.publishedInstallersVerified ? '' : '<p><strong>Local preview — publication has not been verified.</strong></p>'}
+      <a class="button mac-download-button" href="${escape(item.url)}" data-electron-download="${item.target}">${text(`electron.site.download.${platform}`)}</a>
+      <p>${escape(release.version)} · ${text(`electron.site.requirements.${platform}`)}</p>
+      <p>${text(mac ? 'electron.site.macTrust' : item.target === 'win32-x64' ? 'electron.site.windowsTrust' : 'electron.site.linuxInstall')}</p>
+      <details><summary>${text('electron.site.verify')}</summary><p>${escape(item.bytes)} bytes</p><code style="overflow-wrap:anywhere">${escape(item.sha256)}</code></details>
+      ${handover}
+      </section>`);
+  }
+  return output;
+}
+
+export function renderElectronSiteDocumentation(html) {
+  // Only the existing documentation page has these source-owned sections.
+  if (!html.includes('id="download-security"')) return html;
+  let output = html.replace(/<article\b[^>]*id="start"[^>]*>[\s\S]*?<\/article>/u,
+    `<article class="resource-card" id="start"><h2>Install TiboTattle</h2>
+    <p>Choose the matching platform on the <a href="./index.html#download">download page</a>. The app includes its runtime.</p>
+    <p>For an existing native Mac installation, follow the guided handover on the download page before replacing the old app. Keep the old signed app, history and backups. Native Sparkle updates and Homebrew remain separate native-release channels.</p>
+    <p>On first launch, read the complete local-source and automatic-sharing explanation and select Continue. Sharing can stay off; Settings keeps your choice. This public website never scans local files or accepts contributions.</p></article>`);
+  output = output.replace(/<article\b[^>]*id="platforms"[^>]*>[\s\S]*?<\/article>/u,
+    `<article class="resource-card" id="platforms"><h2>Platform support</h2><p>Electron downloads are available for macOS 14 or later on Apple silicon and Intel, Windows 10 or later on x64, and Linux x86_64 as an AppImage. See the download page for platform-specific installation requirements.</p></article>`);
+  output = output.replace(/macOS is the currently available lane\.[\s\S]*?repository or a checksum\./u,
+    'The download page lists the exact final Electron artifacts. macOS installers are Developer ID signed and notarized; the Windows installer is signed. The Linux AppImage is identified by its checksum. Source/build provenance is never inferred from a public repository or a checksum.');
+  return output;
+}

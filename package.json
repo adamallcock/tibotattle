@@ -91,7 +91,7 @@
     "product:prepare-contribution": "node ./scripts/build-telemetry-contributions.js",
     "product:release-site": "node ./scripts/build-public-release-site.js",
     "product:release-site:preview": "node ./scripts/preview-public-release-site.js",
-    "product:release-site:test": "node --test test/public-release-site.test.js test/public-release-site-preview.test.js test/web-release-lane.test.js",
+    "product:release-site:test": "node --test test/public-release-site.test.js test/public-release-site-preview.test.js test/web-release-lane.test.js test/electron-public-site.test.js",
     "product:social-preview": "node ./scripts/generate-social-preview.js",
     "product:staging:check": "npm --prefix apps/worker run staging:check",
     "product:staging:deploy": "npm --prefix apps/worker run staging:deploy --",

@@ -263,6 +263,8 @@ export function setPublicDailyPresentation(documentRef, state, {
 }
 
 export function renderPublicInstallerJourney(documentRef = document) {
+  // Static Electron links are generated from the reviewed four-target plan.
+  if (documentRef.querySelector('meta[name="usage-monitor-electron-stable"]')?.content === "true") return null;
   const select = (selector) => documentRef.querySelector(selector);
   const renderArchitecture = (architecture) => {
     const prefix = architecture === "x64" ? "intel-" : "";
