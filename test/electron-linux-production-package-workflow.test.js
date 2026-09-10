@@ -36,7 +36,7 @@ test('receipt-selected native builder is closed and final bytes are independentl
  assert.match(run,/shell:false,stdio:'inherit',timeout:1200000/);
  assert.match(run,/\.\.\.receipt\.builderEnvironment/);
  assert.match(run,/linuxAppImageIdentity\(/);assert.match(run,/assert\.equal\(manifest\.sha512,image\.sha512\)/);
- assert.match(run,/assert\.deepEqual\(manifest\.files\[0\],\{url:artifactName,sha512:image\.sha512,size:image\.bytes\}\)/);
+ assert.match(run,/validateLinuxFile\(manifest\.files\[0\],\{url:artifactName,sha512:image\.sha512,size:image\.bytes\}\)/);
  assert.match(run,/sourceCandidateSha256:hash\(receiptBytes\)/);assert.match(run,/workflowRunnerRevision:process\.env\.WORKFLOW_RUNNER_REVISION/);assert.match(run,/linux-x86_64\.AppImage/);assert.doesNotMatch(run,/linux-x64\.AppImage/);assert.match(run,/published:false,nativeRuntimeQualification:'separate_evidence_required'/);
  const program=run.slice(run.indexOf("<<'NODE'\n")+9,run.lastIndexOf('\nNODE'));
  const checked=spawnSync(process.execPath,['--input-type=module','--check'],{input:program,encoding:'utf8'});assert.equal(checked.status,0,checked.stderr);
@@ -57,4 +57,23 @@ test('source-only Linux lane builds the required native binding before staging',
  const native=source.steps.findIndex(s=>s.run?.includes('stage-linux-credential-mutex-binding.mjs'));
  const stage=source.steps.findIndex(s=>s.run?.includes('node scripts/package-electron-production.mjs'));
  const prereq=source.steps.findIndex(s=>s.run?.includes('apt-get install --yes --no-install-recommends libsecret-1-dev pkg-config'));assert.ok(prereq>=0&&prereq<native);assert.ok(native>=0&&native<stage);assert.match(source.steps[native].run,/build-linux-credential-mutex-manifest/);assert.match(source.steps[native].run,/qualify-linux-credential-mutex/);
+});
+
+test('actual builder file shape accepts bounded embedded blockMapSize and rejects unexpected metadata',()=>{
+ // Public artifact metadata observed in failed hosted run34477522133; no installer/runtime success is inferred.
+ const observed={url:'TiboTattle-0.1.19-linux-x86_64.AppImage',sha512:'Emmawzx46HsR/7WBKLT6vnAKOWKEbbkUpl7HwZgEoHk4TDh3ApMmiHG232S5WFtNwzSqjd8P0b55vUbkE6MdRQ==',size:130426949,blockMapSize:137305};
+ const run=step('Package exact receipt and bind final AppImage bytes').run;
+ const start=run.indexOf('function validateLinuxFile('),end=run.indexOf('\nassert.equal(manifest.files.length',start);
+ assert.ok(start>=0&&end>start);const validate=Function('assert',`return (${run.slice(start,end).trim()});`)(assert);
+ const expected={url:observed.url,sha512:observed.sha512,size:observed.size};validate(observed,expected);validate(expected,expected);
+ for(const value of [0,-1,1.5,'137305',observed.size-3,Number.MAX_SAFE_INTEGER])assert.throws(()=>validate({...observed,blockMapSize:value},expected));
+ for(const diff of [{unexpected:true},{url:'wrong.AppImage'},{sha512:'wrong'},{size:observed.size+1}])assert.throws(()=>validate({...observed,...diff},expected));
+});
+test('failed packaging always retains bounded metadata without labeling an installer qualified',()=>{
+ const capture=step('Capture bounded package metadata for diagnosis'),retain=step('Retain diagnostic metadata independently of qualification');
+ assert.equal(capture.if,'always()');assert.equal(retain.if,'always()');assert.equal(capture.env.PACKAGE_OUTCOME,'${{ steps.package-bytes.outcome }}');
+ assert.match(capture.run,/131072/);assert.match(capture.run,/info\.isSymbolicLink\(\)/);assert.match(capture.run,/qualifiedInstaller:false/);
+ assert.doesNotMatch(capture.run,/readFile\([^\n]*AppImage/);assert.doesNotMatch(retain.with.path,/AppImage|artifacts/);
+ const program=capture.run.slice(capture.run.indexOf("<<'NODE'\n")+9,capture.run.lastIndexOf('\nNODE'));
+ const checked=spawnSync(process.execPath,['--input-type=module','--check'],{input:program,encoding:'utf8'});assert.equal(checked.status,0,checked.stderr);
 });

@@ -102,6 +102,7 @@ jobs:
           node scripts/package-electron-production.mjs --target linux-x64 \
             --source-revision "$SOURCE_REVISION" --build-number "$BUILD_NUMBER" --replace-staging
       - name: Package exact receipt and bind final AppImage bytes
+        id: package-bytes
         run: |
           node --input-type=module <<'NODE'
           import assert from 'node:assert/strict';
@@ -128,7 +129,13 @@ jobs:
           const manifestBytes=await readFile(`${receipt.artifactDirectory}/latest-linux.yml`);
           const manifest=parseWindowsUpdaterYaml(manifestBytes);
           assert.equal(manifest.version,receipt.version);assert.equal(manifest.path,artifactName);assert.equal(manifest.sha512,image.sha512);
-          assert.equal(manifest.files.length,1);assert.deepEqual(manifest.files[0],{url:artifactName,sha512:image.sha512,size:image.bytes});
+          function validateLinuxFile(file,expected) {
+            assert.ok(file && typeof file==='object' && !Array.isArray(file));
+            assert.ok(Object.keys(file).every(k=>['url','sha512','size','blockMapSize'].includes(k)));
+            assert.equal(file.url,expected.url);assert.equal(file.sha512,expected.sha512);assert.equal(file.size,expected.size);
+            if(Object.hasOwn(file,'blockMapSize')) assert.ok(Number.isSafeInteger(file.blockMapSize) && file.blockMapSize>0 && file.blockMapSize<=expected.size-4);
+          }
+          assert.equal(manifest.files.length,1);validateLinuxFile(manifest.files[0],{url:artifactName,sha512:image.sha512,size:image.bytes});
           assert.equal(Object.hasOwn(manifest,'packages'),false);
           const appUpdateBytes=await readFile(`${receipt.artifactDirectory}/linux-unpacked/resources/app-update.yml`);
           const appUpdate=parseWindowsUpdaterYaml(appUpdateBytes);
@@ -140,6 +147,36 @@ jobs:
           await writeFile(`${root}/linux-production-package-receipt.json`,JSON.stringify(proof,null,2)+'\n',{flag:'wx',mode:0o600});
           console.log('LINUX_PRODUCTION_PACKAGE_BYTES_VERIFIED');
           NODE
+      - name: Capture bounded package metadata for diagnosis
+        if: always()
+        env:
+          PACKAGE_OUTCOME: ${{ steps.package-bytes.outcome }}
+        run: |
+          node --input-type=module <<'NODE'
+          import {mkdir,lstat,readFile,writeFile} from 'node:fs/promises';
+          import {createHash} from 'node:crypto';
+          const source='.release-build/electron-production/linux-x64',out='.release-build/linux-production-diagnostics';
+          await mkdir(out,{recursive:true,mode:0o700});
+          const files=[];
+          for(const [file,name,limit] of [['production-source-candidate.json','production-source-candidate.json',131072],['artifacts/latest-linux.yml','latest-linux.yml',131072],['artifacts/linux-unpacked/resources/app-update.yml','app-update.yml',16384]]) {
+            try {
+              const info=await lstat(`${source}/${file}`);
+              if(!info.isFile()||info.isSymbolicLink()||info.nlink!==1||info.size>limit) { files.push({file:name,status:'refused'});continue; }
+              const bytes=await readFile(`${source}/${file}`);if(bytes.length>limit)throw new Error('size');
+              await writeFile(`${out}/${name}`,bytes,{flag:'wx',mode:0o600});
+              files.push({file:name,status:'captured',bytes:bytes.length,sha256:createHash('sha256').update(bytes).digest('hex')});
+            } catch(error) { files.push({file:name,status:error.code==='ENOENT'?'absent':'unavailable'}); }
+          }
+          await writeFile(`${out}/diagnostic-receipt.json`,JSON.stringify({schemaVersion:'tibotattle-linux-package-diagnostic-v1',workflowRunnerRevision:process.env.WORKFLOW_RUNNER_REVISION,requestedSourceRevision:process.env.SOURCE_REVISION,packageStepOutcome:process.env.PACKAGE_OUTCOME,qualifiedInstaller:false,published:false,files})+'\n',{flag:'wx',mode:0o600});
+          NODE
+      - name: Retain diagnostic metadata independently of qualification
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: electron-linux-production-diagnostic-${{ github.run_id }}
+          path: .release-build/linux-production-diagnostics/
+          if-no-files-found: error
+          retention-days: 14
       - name: Retain final package and exact source evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

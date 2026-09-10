@@ -60,6 +60,10 @@ function validateManifest(manifest, version, artifacts, target) {
       || Object.hasOwn(manifest, 'packages') || new Set(manifest.files.map(f => f?.url)).size !== artifacts.length) fail('MANIFEST_INVALID');
   for (const entry of manifest.files) {
     const artifact = artifacts.find(a => a.name === entry?.url);
+    if (target === 'linux-x64' && (!entry || typeof entry !== 'object' || Array.isArray(entry)
+        || Object.keys(entry).some(key => !['url', 'sha512', 'size', 'blockMapSize'].includes(key))
+        || (Object.hasOwn(entry, 'blockMapSize') && (!Number.isSafeInteger(entry.blockMapSize)
+          || entry.blockMapSize <= 0 || entry.blockMapSize > (artifact?.bytes ?? 0) - 4)))) fail('MANIFEST_INVALID');
     if (!artifact || entry.sha512 !== artifact.sha512 || (Object.hasOwn(entry, 'size') && entry.size !== artifact.bytes)) fail('MANIFEST_BYTES_MISMATCH');
   }
   const primary = artifacts.find(a => a.name === manifest.path);

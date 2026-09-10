@@ -94,3 +94,11 @@ test('explicit readback journals only verified results; network and publication 
   assert.equal(child.status, 1); assert.match(child.stderr, /ELECTRON_STABLE_PUBLICATION_ARGUMENT_INVALID/);
   assert.equal(child.stdout, '');
 }));
+
+test('Linux publication validates optional embedded block map size and refuses other file fields',async()=>fixture(async({root,proposal})=>{
+ const target=proposal.targets.find(t=>t.target==='linux-x64');const original=JSON.parse(await readFile(join(root,target.manifest.path)));
+ async function setFile(diff){const doc=structuredClone(original);Object.assign(doc.files[0],diff);const bytes=Buffer.from(JSON.stringify(doc));await writeFile(join(root,target.manifest.path),bytes);target.manifest={...target.manifest,sha256:sha(bytes),bytes:bytes.length};}
+ await setFile({blockMapSize:12});await prepareElectronStablePublication({artifactRoot:root,proposal});
+ for(const value of [0,-1,1.5,'12',original.files[0].size-3,Number.MAX_SAFE_INTEGER]){await setFile({blockMapSize:value});await assert.rejects(prepareElectronStablePublication({artifactRoot:root,proposal}),/MANIFEST_INVALID/);}
+ await setFile({blockMapSize:12,unknown:true});await assert.rejects(prepareElectronStablePublication({artifactRoot:root,proposal}),/MANIFEST_INVALID/);
+}));
