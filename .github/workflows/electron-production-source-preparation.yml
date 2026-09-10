@@ -245,6 +245,11 @@ jobs:
           test "$(pnpm --version)" = "11.9.0"
           node -e "if(process.version!=='v26.2.0'||process.platform!=='linux'||process.arch!=='x64')process.exit(1)"
           pnpm install --frozen-lockfile --ignore-scripts
+      - name: Install native Linux credential build prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends libsecret-1-dev pkg-config
       - name: Build and qualify the native Linux credential mutex
         run: |
           set -euo pipefail

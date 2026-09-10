@@ -96,7 +96,7 @@ export async function prepareElectronStablePublication({ artifactRoot, proposal 
     for (const spec of input.artifacts) artifacts.push(await file(root, spec));
     const names = input.target.startsWith('darwin-')
       ? ['dmg', 'zip'].flatMap(ext => [`TiboTattle-${proposal.version}-mac-${input.target.slice(7)}.${ext}`, `TiboTattle-${proposal.version}-mac-${input.target.slice(7)}.${ext}.blockmap`])
-      : [input.target === 'win32-x64' ? `TiboTattle-${proposal.version}-Windows-x64.exe` : `TiboTattle-${proposal.version}-linux-x64.AppImage`];
+      : [input.target === 'win32-x64' ? `TiboTattle-${proposal.version}-Windows-x64.exe` : `TiboTattle-${proposal.version}-linux-x86_64.AppImage`];
     const actual = artifacts.map(a => a.name).sort();
     const allowed = input.target === 'win32-x64' && actual.length === 2 ? [...names, `${names[0]}.blockmap`] : names;
     if (actual.join() !== allowed.sort().join()) fail('ARTIFACT_SET_INVALID');
@@ -117,7 +117,7 @@ export async function prepareElectronStablePublication({ artifactRoot, proposal 
           || parsed.sha512 !== parsed.files.find(f => f.url === parsed.path)?.sha512 || Object.hasOwn(parsed, 'packages')) fail('PREDECESSOR_INVALID');
       const previousNames = input.target.startsWith('darwin-')
         ? ['zip', 'dmg'].map(ext => `TiboTattle-${parsed.version}-mac-${input.target.slice(7)}.${ext}`)
-        : [input.target === 'win32-x64' ? `TiboTattle-${parsed.version}-Windows-x64.exe` : `TiboTattle-${parsed.version}-linux-x64.AppImage`];
+        : [input.target === 'win32-x64' ? `TiboTattle-${parsed.version}-Windows-x64.exe` : `TiboTattle-${parsed.version}-linux-x86_64.AppImage`];
       if (parsed.path !== previousNames[0] || parsed.files.map(f => f.url).sort().join() !== [...previousNames].sort().join()) fail('PREDECESSOR_INVALID');
       predecessor = { sha256: old.sha256, bytes: old.bytes, localPath: input.predecessor.path };
     }

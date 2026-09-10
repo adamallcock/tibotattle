@@ -18,16 +18,16 @@ test('Linux production packaging is dispatch-only with harmless registration and
  assert.deepEqual(workflow.permissions,{contents:'read'});assert.equal(workflow.concurrency['cancel-in-progress'],false);
  assert.doesNotMatch(text,/secrets\.|id-token:|contents: write|gh release|wrangler|publish-electron/u);
  for(const s of job.steps.filter(s=>s.uses))assert.match(s.uses,/@[a-f0-9]{40}$/);
- assert.equal(job.steps[0].with.ref,'${{ github.sha }}');assert.equal(job.steps[0].with['persist-credentials'],false);
+ const checkout=step('Check out exact requested application source');assert.equal(checkout.with.ref,'${{ inputs.source_revision }}');assert.equal(checkout.with['persist-credentials'],false);assert.ok(job.steps.indexOf(step('Validate explicit source selection before checkout'))<job.steps.indexOf(checkout));
  assert.equal(job.env.SOURCE_REVISION,'${{ inputs.source_revision }}');
  assert.equal(job.env.BUILD_NUMBER,'${{ inputs.build_number }}');
  for(const s of job.steps.filter(s=>s.run))assert.doesNotMatch(s.run,/\$\{\{.*inputs\./);
 });
 test('actual shell admission refuses malformed, mismatched and dirty source before packaging',()=>{
- const source='a'.repeat(40), admission=step('Bind requested source and build number').run;
- const run=overrides=>spawnSync('/bin/bash',['--noprofile','--norc','-c',`git(){ if [ "$1" = rev-parse ]; then printf '%s' "$TEST_HEAD"; else printf '%s' "$TEST_DIRTY"; fi; };\n${admission}`],{encoding:'utf8',env:{PATH:process.env.PATH,SOURCE_REVISION:source,EXPECTED_DISPATCH_SHA:source,BUILD_NUMBER:'2026091001',TEST_HEAD:source,TEST_DIRTY:'',...overrides}});
- assert.equal(run({}).status,0);
- for(const input of [{SOURCE_REVISION:'x'},{SOURCE_REVISION:'b'.repeat(40)},{EXPECTED_DISPATCH_SHA:'b'.repeat(40)},{BUILD_NUMBER:'0'},{BUILD_NUMBER:'1; exit 0'},{TEST_DIRTY:' M source'}])assert.notEqual(run(input).status,0,JSON.stringify(input));
+ const source='a'.repeat(40), admission=step('Validate explicit source selection before checkout').run+'\n'+step('Bind requested source and build number').run;
+ const run=overrides=>spawnSync('/bin/bash',['--noprofile','--norc','-c',`git(){ if [ "$1" = rev-parse ]; then printf '%s' "$TEST_HEAD"; else printf '%s' "$TEST_DIRTY"; fi; };\n${admission}`],{encoding:'utf8',env:{PATH:process.env.PATH,SOURCE_REVISION:source,WORKFLOW_RUNNER_REVISION:'b'.repeat(40),BUILD_NUMBER:'2026091001',TEST_HEAD:source,TEST_DIRTY:'',...overrides}});
+ assert.equal(run({}).status,0,'a different exact workflow revision may package the explicitly selected application source');
+ for(const input of [{SOURCE_REVISION:'x'},{SOURCE_REVISION:'b'.repeat(40)},{WORKFLOW_RUNNER_REVISION:'invalid'},{BUILD_NUMBER:'0'},{BUILD_NUMBER:'1; exit 0'},{TEST_DIRTY:' M source'}])assert.notEqual(run(input).status,0,JSON.stringify(input));
 });
 test('receipt-selected native builder is closed and final bytes are independently bound',()=>{
  const run=step('Package exact receipt and bind final AppImage bytes').run;
@@ -37,7 +37,7 @@ test('receipt-selected native builder is closed and final bytes are independentl
  assert.match(run,/\.\.\.receipt\.builderEnvironment/);
  assert.match(run,/linuxAppImageIdentity\(/);assert.match(run,/assert\.equal\(manifest\.sha512,image\.sha512\)/);
  assert.match(run,/assert\.deepEqual\(manifest\.files\[0\],\{url:artifactName,sha512:image\.sha512,size:image\.bytes\}\)/);
- assert.match(run,/sourceCandidateSha256:hash\(receiptBytes\)/);assert.match(run,/published:false,nativeRuntimeQualification:'separate_evidence_required'/);
+ assert.match(run,/sourceCandidateSha256:hash\(receiptBytes\)/);assert.match(run,/workflowRunnerRevision:process\.env\.WORKFLOW_RUNNER_REVISION/);assert.match(run,/linux-x86_64\.AppImage/);assert.doesNotMatch(run,/linux-x64\.AppImage/);assert.match(run,/published:false,nativeRuntimeQualification:'separate_evidence_required'/);
  const program=run.slice(run.indexOf("<<'NODE'\n")+9,run.lastIndexOf('\nNODE'));
  const checked=spawnSync(process.execPath,['--input-type=module','--check'],{input:program,encoding:'utf8'});assert.equal(checked.status,0,checked.stderr);
 });
@@ -49,12 +49,12 @@ test('native runtime, final artifact and manifest retention remain explicit',()=
  const retain=step('Retain final package and exact source evidence');assert.equal(retain.if,undefined);
  assert.equal(retain.with['if-no-files-found'],'error');assert.match(retain.with.path,/artifacts\/\*\.AppImage/);
  assert.match(retain.with.path,/latest-linux\.yml/);assert.match(retain.with.path,/linux-production-package-receipt\.json/);
- assert.equal(retain.with.name,'electron-linux-production-package-${{ github.sha }}');
+ assert.equal(retain.with.name,'electron-linux-production-package-${{ inputs.source_revision }}-runner-${{ github.sha }}');
 });
 
 test('source-only Linux lane builds the required native binding before staging',async()=>{
  const source=yaml.load(await readFile(new URL('../.github/workflows/electron-production-source-preparation.yml',import.meta.url),'utf8')).jobs['linux-x64'];
  const native=source.steps.findIndex(s=>s.run?.includes('stage-linux-credential-mutex-binding.mjs'));
  const stage=source.steps.findIndex(s=>s.run?.includes('node scripts/package-electron-production.mjs'));
- assert.ok(native>=0&&native<stage);assert.match(source.steps[native].run,/build-linux-credential-mutex-manifest/);assert.match(source.steps[native].run,/qualify-linux-credential-mutex/);
+ const prereq=source.steps.findIndex(s=>s.run?.includes('apt-get install --yes --no-install-recommends libsecret-1-dev pkg-config'));assert.ok(prereq>=0&&prereq<native);assert.ok(native>=0&&native<stage);assert.match(source.steps[native].run,/build-linux-credential-mutex-manifest/);assert.match(source.steps[native].run,/qualify-linux-credential-mutex/);
 });

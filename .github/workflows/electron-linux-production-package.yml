@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       source_revision:
-        description: Exact immutable dispatch source revision to package
+        description: Exact immutable application source revision to package
         required: true
         type: string
       build_number:
@@ -42,13 +42,19 @@ jobs:
       CI: "1"
       CSC_IDENTITY_AUTO_DISCOVERY: "false"
       SOURCE_REVISION: ${{ inputs.source_revision }}
-      EXPECTED_DISPATCH_SHA: ${{ github.sha }}
+      WORKFLOW_RUNNER_REVISION: ${{ github.sha }}
       BUILD_NUMBER: ${{ inputs.build_number }}
     steps:
-      - name: Check out exact dispatch source
+      - name: Validate explicit source selection before checkout
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$WORKFLOW_RUNNER_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]] || exit 1
+      - name: Check out exact requested application source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.source_revision }}
           persist-credentials: false
           fetch-depth: 1
       - name: Bind requested source and build number
@@ -57,7 +63,6 @@ jobs:
           [[ "$SOURCE_REVISION" =~ ^[0-9a-f]{40}$ ]] || exit 1
           [[ "$BUILD_NUMBER" =~ ^[1-9][0-9]{0,9}$ ]] || exit 1
           test "$(git rev-parse HEAD)" = "$SOURCE_REVISION"
-          test "$SOURCE_REVISION" = "$EXPECTED_DISPATCH_SHA"
           test -z "$(git status --porcelain=v1 --untracked-files=all)"
       - name: Set up pinned native Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -116,7 +121,7 @@ jobs:
           assert.equal(receipt.builderConfiguration,'apps/electron/electron-builder.production.config.cjs');
           const build=spawnSync(process.execPath,[require.resolve('electron-builder/cli.js'),'--config',receipt.builderConfiguration,...receipt.builderArguments],{env:{...process.env,...receipt.builderEnvironment},shell:false,stdio:'inherit',timeout:1200000});
           assert.equal(build.error,undefined);assert.equal(build.status,0);
-          const artifactName=`TiboTattle-${receipt.version}-linux-x64.AppImage`;
+          const artifactName=`TiboTattle-${receipt.version}-linux-x86_64.AppImage`;
           const images=(await readdir(receipt.artifactDirectory)).filter(n=>n.endsWith('.AppImage'));
           assert.deepEqual(images,[artifactName]);
           const image=await linuxAppImageIdentity(`${receipt.artifactDirectory}/${artifactName}`);
@@ -131,14 +136,14 @@ jobs:
           assert.ok(Object.keys(appUpdate).every(k=>['provider','url','updaterCacheDirName'].includes(k)));
           await writeFile(`${root}/app-update.yml`,appUpdateBytes,{flag:'wx',mode:0o600});
           const hash=bytes=>createHash('sha256').update(bytes).digest('hex');
-          const proof={schemaVersion:'tibotattle-linux-production-package-v1',sourceRevision:receipt.sourceRevision,version:receipt.version,buildNumber:receipt.buildNumber,target:receipt.target,sourceCandidateSha256:hash(receiptBytes),appUpdate:{file:'app-update.yml',bytes:appUpdateBytes.length,sha256:hash(appUpdateBytes)},artifact:{file:artifactName,...image},manifest:{file:'latest-linux.yml',bytes:manifestBytes.length,sha256:hash(manifestBytes)},signingRequired:false,published:false,nativeRuntimeQualification:'separate_evidence_required'};
+          const proof={schemaVersion:'tibotattle-linux-production-package-v1',workflowRunnerRevision:process.env.WORKFLOW_RUNNER_REVISION,sourceRevision:receipt.sourceRevision,version:receipt.version,buildNumber:receipt.buildNumber,target:receipt.target,sourceCandidateSha256:hash(receiptBytes),appUpdate:{file:'app-update.yml',bytes:appUpdateBytes.length,sha256:hash(appUpdateBytes)},artifact:{file:artifactName,...image},manifest:{file:'latest-linux.yml',bytes:manifestBytes.length,sha256:hash(manifestBytes)},signingRequired:false,published:false,nativeRuntimeQualification:'separate_evidence_required'};
           await writeFile(`${root}/linux-production-package-receipt.json`,JSON.stringify(proof,null,2)+'\n',{flag:'wx',mode:0o600});
           console.log('LINUX_PRODUCTION_PACKAGE_BYTES_VERIFIED');
           NODE
       - name: Retain final package and exact source evidence
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: electron-linux-production-package-${{ github.sha }}
+          name: electron-linux-production-package-${{ inputs.source_revision }}-runner-${{ github.sha }}
           path: |
             .release-build/electron-production/linux-x64/artifacts/*.AppImage
             .release-build/electron-production/linux-x64/artifacts/latest-linux.yml
