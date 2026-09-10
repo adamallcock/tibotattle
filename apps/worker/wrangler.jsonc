@@ -297,6 +297,9 @@
         // containment-era "disabled" default was never a product choice, and
         // the operator collection-control row remains the incident brake.
         "ENROLLMENT_MODE": "open",
+        // Activate only after canonical 0059 and the reviewed production canary admission.
+        "ACCOUNTLESS_ENROLLMENT_MODE": "enabled",
+        "ACCOUNTLESS_OWNERSHIP_MODE": "enabled",
         "ACCOUNT_SCOPED_INGEST_MODE": "disabled",
         "UPLOAD_INGRESS_QUEUE_MODE": "disabled",
         "UPLOAD_INGRESS_MAX_CONCURRENT": "64",
