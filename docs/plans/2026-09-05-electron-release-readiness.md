@@ -45,6 +45,14 @@ Latest continuation, 2026-09-09:
   public health passed. No retry, database restore, accountless activation or
   release publication occurred. The next migration must bound the actual row
   work; another whole-database attempt is not planned.
+- **Bounded migration implementation now has local preservation and isolation proof.**
+  The shared batch planner preserves exact row identities and original values,
+  rolls back late failures and refuses replay. Four local D1 tests cover the
+  real transaction path; six Worker tests cover the temporary HTTP/admin/cron
+  pause and database mutation guards. The committed-source SQL qualification
+  builder and gated disposable runner are prepared. Hosted SQL viability,
+  production throughput and R2 protection remain open; ordinary production
+  remains unchanged. See the [bounded migration plan](./2026-09-09-bounded-accountless-migration.md).
 - **Release priority narrowed by the user:** Windows/Linux notification appearance
   and remaining physical desktop acceptance are deferred. The immediate path is
   the bounded production migration, accountless activation and one production

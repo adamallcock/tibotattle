@@ -12,6 +12,38 @@ the selected migration bytes can upgrade a populated synthetic predecessor; it
 does not authorize migrations, prove current production state, or replace final
 Worker qualification and production recovery checks.
 
+## Bounded 0058 SQL qualification
+
+The single production attempt recorded on 2026-09-09 completed 0057 and failed
+0058 with CPU/reset 7429. Its reconciled outcome and restored collection are
+recorded in the [activation proposal](../plans/2026-09-09-production-accountless-activation-proposal.md).
+Do not repeat that populated migration. The
+[bounded migration plan](../plans/2026-09-09-bounded-accountless-migration.md)
+tracks the replacement design and its unfinished production protection.
+
+From a clean committed checkout, prepare the tiny synthetic SQL qualification:
+
+```sh
+node apps/worker/scripts/prepare-bounded-migration-qualification.mjs \
+  --output /private/tmp/reviewed-bounded-migration
+```
+
+This runs only local SQLite and writes immutable SQL plus a hashed manifest.
+The manifest pins migration and code bytes, bounded queries, expected failures
+and exact readbacks. It is not permission to create a database or execute SQL
+remotely. The companion `run-bounded-migration-qualification.mjs` defaults to
+plan-only; execution additionally requires the exact manifest digest, explicit
+confirmation and a newly created disposable database with the recorded name.
+It rejects configured production/staging identifiers and nonempty targets,
+uses ordinary queries without automatic retries, and cleans up only that exact
+target after every proof succeeds. Failed or uncertain operations retain their
+private evidence for reconciliation.
+
+Hosted qualification requires approval for the exact temporary resource,
+synthetic operations and success-only cleanup. Passing it establishes SQL
+viability, not production throughput, existing-request completion, R2 mutation
+protection or permission for a production migration.
+
 ## Observe the deployed prefix
 
 From the repository root, the following operation only reads the migration

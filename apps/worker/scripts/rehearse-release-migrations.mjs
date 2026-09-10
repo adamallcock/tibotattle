@@ -178,7 +178,7 @@ export async function observeMigrationPrefix({ workerRoot = WORKER_ROOT, environ
   return prefix;
 }
 
-function* seedStatements(binding, accounts, events, cooldowns = true) {
+export function* seedStatements(binding, accounts, events, cooldowns = true) {
   const at = "2026-09-01T00:00:00.000Z", expiry = "9999-01-01T00:00:00.000Z", secret = Buffer.alloc(32, 1);
   const insert = (table, fields) => `INSERT INTO ${quote(table)} (${Object.keys(fields).map(quote).join(",")}) VALUES (${Object.values(fields).map(literal).join(",")});`;
   for (let account = 0; account < accounts; account++) {

@@ -128,6 +128,12 @@ import {
   jsonResponse,
 } from "./errors";
 import {
+  MIGRATION_MUTATION_BARRIER_ENABLED,
+  MUTATION_BARRIER_ERROR_CODE,
+  mutationBarrierBlocksDynamicRequest,
+  mutationBarrierSkipsScheduledMaintenance,
+} from "./mutation-barrier";
+import {
   contributionCount,
   contributionForResponse,
   enroll,
@@ -3706,10 +3712,31 @@ async function routeApi(
   return unreachableApiRoute(routeId);
 }
 
-export async function handleRequest(request: Request, env: Env): Promise<Response> {
+/** The optional override is test-only; deployed fetch always uses the constant. */
+export async function handleRequest(
+  request: Request,
+  env: Env,
+  testMutationBarrierEnabled = MIGRATION_MUTATION_BARRIER_ENABLED,
+): Promise<Response> {
   const requestId = crypto.randomUUID();
   const url = new URL(request.url);
   const route = matchWorkerRoute(url.pathname);
+  const configuredAdminHostname = adminHostname(env);
+  // A migration-only source snapshot changes the constant in mutation-barrier.
+  // This return intentionally precedes redirect, admin identity, and every
+  // D1/R2/DO path. It fences new dynamic work but cannot prove an older
+  // already-admitted reader has finished.
+  if (mutationBarrierBlocksDynamicRequest(
+    route.id,
+    isAdminSurfacePath(url.pathname)
+      || configuredAdminHostname === url.hostname,
+    testMutationBarrierEnabled,
+  )) {
+    return noStore(errorResponse(
+      new ApiError(503, MUTATION_BARRIER_ERROR_CODE),
+      requestId,
+    ));
+  }
   try {
     const canonicalRedirectUrl = canonicalPublicRedirectUrl(url, env);
     if (canonicalRedirectUrl !== null) {
@@ -3721,7 +3748,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // carry a verifiable Cf-Access-Jwt-Assertion (defense in depth beneath
     // the edge policy), and the public origin keeps its deliberate 404s.
     // Development environments pin no PUBLIC_ORIGIN and are unchanged.
-    const configuredAdminHostname = adminHostname(env);
     if (configuredAdminHostname !== null) {
       if (url.hostname === configuredAdminHostname) {
         // Authenticate + owner-pin ONCE, at the chokepoint, before the UI or
@@ -3940,6 +3966,21 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }));
       return noStore(errorResponse(apiError, requestId));
     }
+    // A migration snapshot deliberately still serves ordinary public assets,
+    // but an asset-layer failure must not turn that permitted read into a D1
+    // diagnostic write while the mutation barrier is active.
+    if (testMutationBarrierEnabled && route.id === "asset") {
+      console.warn(JSON.stringify({
+        level: "warn",
+        event: "migration_barrier_static_asset_unavailable",
+        requestId,
+        method: request.method,
+        routeClass: route.routeClass,
+        code: apiError.code,
+        status: apiError.status,
+      }));
+      return noStore(errorResponse(apiError, requestId));
+    }
     const expectedContainment = [
       "COLLECTION_ENROLLMENT_DISABLED",
       "ACCOUNTLESS_ENROLLMENT_DISABLED",
@@ -3977,7 +4018,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 interface ScheduledMaintenanceLog {
   level: "info" | "error";
   event: "scheduled_backend_maintenance";
-  outcome: "success" | "failure";
+  outcome: "success" | "failure" | "skipped";
   code: string;
   lifecycleComplete: boolean;
   quarantineRetentionComplete: boolean;
@@ -4061,7 +4102,39 @@ async function ownsRenewedMaintenanceLease(
 export async function runScheduledMaintenance(
   env: Env,
   scheduledTime: number,
+  testMutationBarrierEnabled = MIGRATION_MUTATION_BARRIER_ENABLED,
 ): Promise<ScheduledMaintenanceLog> {
+  if (mutationBarrierSkipsScheduledMaintenance(testMutationBarrierEnabled)) {
+    const log: ScheduledMaintenanceLog = {
+      level: "info",
+      event: "scheduled_backend_maintenance",
+      outcome: "skipped",
+      code: MUTATION_BARRIER_ERROR_CODE,
+      lifecycleComplete: false,
+      quarantineRetentionComplete: false,
+      restoreReplayComplete: false,
+      quarantineReconciliationComplete: false,
+      expiredIdentityHandoffsPurged: 0,
+      expiredIdentityHandoffPurgeComplete: false,
+      expiredDeletionTombstonesPurged: 0,
+      deletionTombstonePurgeComplete: false,
+      expiredPrimaryIdentityReenrollmentCooldownsPurged: 0,
+      primaryIdentityReenrollmentCooldownPurgeComplete: false,
+      expiredIdentityReenrollmentCooldownsPurged: 0,
+      identityReenrollmentCooldownPurgeComplete: false,
+      expiredSignInAdmissionsPurged: 0,
+      signInAdmissionPurgeComplete: false,
+      staleDevicePairingsRevoked: 0,
+      staleDeviceCredentialsRevoked: 0,
+      staleDeviceUploadAuthorizationsRevoked: 0,
+      expiredDeviceCredentialRotationsPurged: 0,
+      expiredDevicePairingEventsPurged: 0,
+      aggregateRebuildComplete: false,
+      publicationEnabled: null,
+    };
+    console.warn(JSON.stringify(log));
+    return log;
+  }
   const reconstructionMode = allowanceReconstructionMode(env);
   const queryMeter = createD1InvocationBudget();
   queryMeter.reserveQueries = 1;
