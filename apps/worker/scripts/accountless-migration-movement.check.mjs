@@ -274,3 +274,29 @@ test('retained-reference mode moves41 while all11 R2 ancestors and exact cleanup
   for(const t of keep)assert.notDeepEqual(bigRows(db,`SELECT rowid,id FROM ${q(t)} ORDER BY id`),retainedRowids[t]);
  }finally{reader?.close();db.close();control?.close();rmSync(dir,{recursive:true,force:true});}
 });
+
+test('wide-row plans compare every nullable/blob/tail column and roll back same-byte corruption in both directions',()=>{
+ const db=new DatabaseSync(':memory:'),columns=['id',...Array.from({length:63},(_,i)=>'c'+(i+1))];
+ db.exec(`CREATE TABLE telemetry_records(id INTEGER PRIMARY KEY,${columns.slice(1).map(q).join(',')});CREATE TABLE _accountless_move_telemetry_records(_move_key INTEGER PRIMARY KEY,_original_rowid INTEGER,${columns.map(q).join(',')});CREATE TABLE _accountless_move_journal(id INTEGER PRIMARY KEY,metadata TEXT NOT NULL);CREATE TABLE _accountless_move_assertion(id INTEGER PRIMARY KEY,ok INTEGER NOT NULL CHECK(ok=1));`);
+ const values=columns.map((_,i)=>i===0?9007199254742001n:i===63?'original':i%4===0?null:i%4===1?new Uint8Array([0,255]):i%4===2?'é':i);
+ db.prepare(`INSERT INTO telemetry_records VALUES(${columns.map(()=>'?').join(',')})`).run(...values);
+ let current={digest:'synthetic-wide-row',phase:'evacuate',revision:0,tableIndex:0,cursor:0,order:['telemetry_records'],descriptors:{telemetry_records:{columns,hasRowid:true,keys:['rowid'],integerKeys:['rowid']}},sequences:[],canonicalObjects:null};
+ const save=()=>db.prepare('INSERT OR REPLACE INTO _accountless_move_journal VALUES(1,?)').run(JSON.stringify(current));save();
+ const original=bigRows(db,'SELECT rowid,* FROM telemetry_records');
+ try{
+  for(const phase of ['evacuate','restore']){
+   if(phase==='restore'){current={...current,phase,tableIndex:0,cursor:0};save();}
+   const selection=accountlessMovementSelection(current,{maxRows:1}),rows=db.prepare(selection.sql).all(),plan=planAccountlessMovementBatch({current,selectedRows:rows,expectedRevision:current.revision,maxRows:1,maxBytes:1048576});
+   assert.equal(rows.length,1);assert.ok(rows[0]._bytes>0);
+   const destination=phase==='evacuate'?'_accountless_move_telemetry_records':'telemetry_records',prior=JSON.stringify(current);
+   for(const tamper of ["c63='tampered'","c4=''","c1=X'01FE'"]){
+    db.exec('BEGIN');try{for(const statement of plan.statements){db.prepare(statement.sql).run(...statement.params);if(statement.sql.startsWith(`INSERT INTO ${q(destination)} `))db.exec(`UPDATE ${q(destination)} SET ${tamper}`);}assert.fail('full-column equality must reject changed values');}
+    catch(error){db.exec('ROLLBACK');assert.match(error.message,/CHECK constraint failed/);}
+    assert.equal(db.prepare('SELECT metadata FROM _accountless_move_journal').get().metadata,prior);
+    assert.equal(db.prepare(`SELECT COUNT(*) AS n FROM ${q(destination)}`).get().n,0);
+   }
+   db.exec('BEGIN');for(const statement of plan.statements)db.prepare(statement.sql).run(...statement.params);db.exec('COMMIT');current=JSON.parse(db.prepare(plan.readback.sql).get().metadata);
+  }
+  assert.deepEqual(bigRows(db,'SELECT rowid,* FROM telemetry_records'),original);
+ }finally{db.close();}
+});

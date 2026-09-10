@@ -10,3 +10,5 @@ export function planAccountlessRangeBatch(options: {
   current: RangeMovementState; selection: RangeMovementSelection; expectedRevision: number;
   maxRows?: number; maxBytes?: number; permission?: MovementPermission | null;
 }): {statements: MovementStatement[]; result: MovementResult; readback: MovementStatement};
+
+export function balancedSqlExpression(terms: readonly string[], operator: "+" | "AND"): string;
