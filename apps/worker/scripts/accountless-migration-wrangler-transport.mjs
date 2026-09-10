@@ -9,6 +9,9 @@ import {renderMovementSql} from './accountless-migration-operator.mjs';
 const sha=value=>createHash('sha256').update(value).digest('hex');
 const fail=code=>{throw new Error('ACCOUNTLESS_TRANSPORT_'+code);};
 const check=(ok,code)=>{if(!ok)fail(code);};
+// Canonical transitions return one metadata entry per SQL statement. Keep the
+// complete bounded response for validation; failure artifacts retain less.
+const PROCESS_CAPTURE_BYTES=1024*1024;
 const CAPTURE_BYTES=256*1024;
 const capture=value=>Buffer.from(typeof value==='string'?value:Buffer.isBuffer(value)?value:[]).subarray(0,CAPTURE_BYTES);
 function retainBoundedLog(path) {
@@ -42,9 +45,9 @@ export function createAccountlessWranglerTransport({cliPath,configPath,binding,d
       const remaining=Math.floor(timeoutMs-(performance.now()-startedAt));check(remaining>0,'DEADLINE');
       writeFileSync(logPath,'',{mode:0o600,flag:'wx'});
       attempted=true;
-      result=spawn(invocation.command,invocation.args,{cwd:root,encoding:'utf8',timeout:Math.min(45000,remaining),killSignal:'SIGKILL',maxBuffer:CAPTURE_BYTES,env:{...process.env,CI:'true',WRANGLER_SEND_METRICS:'false',WRANGLER_SEND_ERROR_REPORTS:'false',WRANGLER_LOG_PATH:logPath}});
+      result=spawn(invocation.command,invocation.args,{cwd:root,encoding:'utf8',timeout:Math.min(45000,remaining),killSignal:'SIGKILL',maxBuffer:PROCESS_CAPTURE_BYTES,env:{...process.env,CI:'true',WRANGLER_SEND_METRICS:'false',WRANGLER_SEND_ERROR_REPORTS:'false',WRANGLER_LOG_PATH:logPath}});
       check(result&&!result.error&&result.status===0&&!result.signal,'EXECUTION_UNKNOWN');
-      check(Buffer.byteLength(result.stdout??'')<=CAPTURE_BYTES&&Buffer.byteLength(result.stderr??'')<=CAPTURE_BYTES,'CAPTURE_LIMIT');
+      check(Buffer.byteLength(result.stdout??'')<=PROCESS_CAPTURE_BYTES&&Buffer.byteLength(result.stderr??'')<=PROCESS_CAPTURE_BYTES,'CAPTURE_LIMIT');
       let parsed;try{parsed=JSON.parse(result.stdout);}catch{fail('RESPONSE_INVALID');}
       check(Array.isArray(parsed)&&parsed.length>0&&parsed.every(r=>r&&r.success===true&&Array.isArray(r.results)&&!r.error&&(!Array.isArray(r.errors)||r.errors.length===0)),'RESPONSE_INVALID');
       if(kind==='read')check(parsed.length===1,'READ_RESPONSE_INVALID');

@@ -16,7 +16,7 @@ async function fixture(){
 function fake({badIdentity=false,notFresh=false,failStep=null,rawFailure=false,stillPresent=false}={}){
  const calls=[];const okay=value=>({status:0,stdout:JSON.stringify(value),stderr:''}),rows=value=>okay([{success:true,results:value,meta:{duration:1}}]);
  return {calls,spawn:(command,args,options)=>{
-  calls.push(args);assert.equal(command,process.execPath);assert.ok(options.timeout>0&&options.timeout<=45000);assert.equal(options.maxBuffer,262144);assert.equal(options.killSignal,'SIGKILL');
+  calls.push(args);assert.equal(command,process.execPath);assert.ok(options.timeout>0&&options.timeout<=45000);assert.equal(options.maxBuffer,1048576);assert.equal(options.killSignal,'SIGKILL');
   if(args.includes('info'))return okay({uuid:badIdentity?'00000000-0000-4000-8000-000000000001':databaseId,name:RETAINED_QUALIFICATION_NAME});
   if(args.includes('delete'))return {status:0,stdout:'Deleted synthetic database',stderr:''};
   if(args.includes('list'))return okay(stillPresent?[{uuid:databaseId,name:RETAINED_QUALIFICATION_NAME}]:[]);

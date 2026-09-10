@@ -10,7 +10,7 @@ const okay=rows=>({status:0,signal:null,stdout:JSON.stringify([{success:true,res
 
 test('adapter validates every result, uses bounded exact launch and removes successful private artifacts',async()=>{
  const f=setup();let calls=0;try {
-  const transport=createAccountlessWranglerTransport({...f.options,spawn:(command,args,options)=>{calls++;assert.equal(command,process.execPath);assert.ok(args.includes('--require'));assert.ok(args.includes('--command=__TIBOTATTLE_FROZEN_QUERY__'));assert.ok(!args.some(a=>a.includes("'synthetic'")));assert.ok(options.timeout>0&&options.timeout<=45000);assert.equal(options.maxBuffer,262144);assert.equal(options.killSignal,'SIGKILL');return okay([{value:'synthetic'}]);}});
+  const transport=createAccountlessWranglerTransport({...f.options,spawn:(command,args,options)=>{calls++;assert.equal(command,process.execPath);assert.ok(args.includes('--require'));assert.ok(args.includes('--command=__TIBOTATTLE_FROZEN_QUERY__'));assert.ok(!args.some(a=>a.includes("'synthetic'")));assert.ok(options.timeout>0&&options.timeout<=45000);assert.equal(options.maxBuffer,1048576);assert.equal(options.killSignal,'SIGKILL');return okay([{value:'synthetic'}]);}});
   assert.deepEqual(await transport.read(statement),[{value:'synthetic'}]);
   const statements=[{sql:'INSERT INTO synthetic VALUES(?)',params:[1]}];assert.deepEqual(await transport.batch({statements,sql:renderMovementSql(statements)}),{outcome:'committed'});
   assert.equal(calls,2);assert.deepEqual(readdirSync(f.options.directory),[]);assert.equal(statSync(f.options.directory).mode&0o777,0o700);
@@ -87,4 +87,23 @@ test('failed private Wrangler debug log is precreated privately and truncated af
   assert.deepEqual(receipt.logRetention,{status:'retained',bytesBefore:300*1024,retainedBytes:256*1024,truncated:true});
   assert.ok(readFileSync(join(f.options.directory,'active-query.sql'),'utf8').includes('SELECT'));
  }finally{rmSync(f.root,{recursive:true,force:true});}
+});
+
+
+test('large transition response is fully validated while failure captures stay bounded',async()=>{
+ const entries=Array.from({length:600},()=>({success:true,results:[],meta:{padding:'x'.repeat(512)}}));
+ const valid=JSON.stringify(entries);assert.ok(Buffer.byteLength(valid)>256*1024&&Buffer.byteLength(valid)<1024*1024);
+ for(const variant of ['valid','late_error','over_limit']){
+  const f=setup();let calls=0;try{
+   const response=variant==='valid'?valid:variant==='late_error'?JSON.stringify([...entries,{success:false,results:[]}]):'x'.repeat(1024*1024+1);
+   const transport=createAccountlessWranglerTransport({...f.options,spawn:()=>{calls++;return {status:0,stdout:response,stderr:''};}});
+   const statements=[{sql:'SELECT 1',params:[]}],sql=renderMovementSql(statements);
+   if(variant==='valid'){assert.deepEqual(await transport.batch({statements,sql}),{outcome:'committed'});assert.deepEqual(readdirSync(f.options.directory),[]);}
+   else{
+    await assert.rejects(transport.batch({statements,sql}),variant==='late_error'?/RESPONSE_INVALID/:/CAPTURE_LIMIT/);
+    assert.equal(statSync(join(f.options.directory,'failed-stdout.bin')).size,256*1024);
+    await assert.rejects(transport.batch({statements,sql}),/STOPPED/);assert.equal(calls,1);
+   }
+  }finally{rmSync(f.root,{recursive:true,force:true});}
+ }
 });
