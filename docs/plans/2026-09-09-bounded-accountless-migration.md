@@ -24,7 +24,15 @@ remote operation.
 
 # Evidence held
 
-Source `56b0e37b` passes **1,001 Worker tests in 79 files**, the script,
+Source `d77cf16a` passes the complete Worker gate, including **1,001 tests in
+79 files**, script/type/contract checks and both clean-tree dry deployments.
+Its 1 MiB process-response bound is separate from the unchanged 256 KiB failed
+artifact retention; all response entries are still validated, including errors
+after the old capture boundary. Thirteen focused checks cover these limits,
+stop-after-failure behavior and actual local Wrangler queries. No canonical SQL
+or movement semantics changed.
+
+Earlier source `56b0e37b` passes **1,001 Worker tests in 79 files**, the script,
 type and contract checks. After committing the separately regenerated R7
 receipts at `3264c018`, production and staging dry-deployment checks pass too.
 The first full command stopped at its clean-tree guard while those receipts
@@ -140,9 +148,9 @@ The reconciled hosted canonical transaction covers the padded reference fixture.
 It does not establish sustained production throughput. The 7,188-row samples
 took 929 ms to evacuate and 1,032 ms to restore, plus 508/463 ms for readback;
 selection, other tables and production scale add work. The exact admitted
-production operation is still required. Before production, carry the verified
-1 MiB process-capture bound into its transport and complete the phase runner
-with durable intent before dispatch; its unfinished draft is not admitted.
+production operation is still required. The transport capture repair is complete
+at `d77cf16a`. Finish and validate the concrete phase runner with durable intent
+before dispatch; its unfinished draft is not admitted.
 
 # Implemented tools
 

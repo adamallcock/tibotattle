@@ -27,8 +27,10 @@ Latest continuation, 2026-09-10:
   deleted and its exact absence verified. The complete 178-step evidence chain
   preserves the earlier capture failure and its reconciliation. Production and
   staging are unchanged.
-- All 1,001 Worker tests and the clean-tree production/staging dry builds pass
-  for the corrected migration tooling. Production operation completion and
+- Source `d77cf16a` passes all 1,001 Worker tests and the complete owning gate,
+  including clean-tree production/staging dry builds. The larger complete CLI
+  response bound is now integrated, with failed artifact retention unchanged
+  and late-response errors still rejected. Production operation completion and
   activation remain the immediate work; the [bounded plan](./2026-09-09-bounded-accountless-migration.md)
   owns exact rehearsal outcomes.
 - Protected R7 regeneration completed: all ten receipts validate on both pinned
