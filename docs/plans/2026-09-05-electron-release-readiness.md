@@ -49,10 +49,15 @@ Latest continuation, 2026-09-09:
   The shared batch planner preserves exact row identities and original values,
   rolls back late failures and refuses replay. Four local D1 tests cover the
   real transaction path; six Worker tests cover the temporary HTTP/admin/cron
-  pause and database mutation guards. The committed-source SQL qualification
-  builder and gated disposable runner are prepared. Hosted SQL viability,
-  production throughput and R2 protection remain open; ordinary production
-  remains unchanged. See the [bounded migration plan](./2026-09-09-bounded-accountless-migration.md).
+  pause and database mutation guards. The corrected, committed-source disposable hosted rehearsal at `79d6bb19`
+  passed all 108 checks in 130,990 ms, including canonical 0058/0059, rollback,
+  stale replay, mutation guards and exact synthetic row preservation. Both the
+  earlier parser-failure fixture and the successful replacement were deleted
+  under the approved reset/cleanup, with absence verified. Production throughput,
+  the final admitted operator and migration-time storage isolation remain open;
+  the approved disposable R2 test now proves existing/new object retention under
+  lock and successful exact cleanup after unlocking. Ordinary production remains
+  unchanged. See the [bounded migration plan](./2026-09-09-bounded-accountless-migration.md).
 - **Release priority narrowed by the user:** Windows/Linux notification appearance
   and remaining physical desktop acceptance are deferred. The immediate path is
   the bounded production migration, accountless activation and one production

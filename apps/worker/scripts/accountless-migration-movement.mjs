@@ -1,16 +1,18 @@
-/** Local SQLite candidate only. No remote transport or maintenance authority. */
+/** Pure migration plans and local SQLite wrappers. No remote transport or maintenance authority. */
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 const hash = value => createHash('sha256').update(value).digest('hex');
 const quote = value => '"' + value.replaceAll('"', '""') + '"';
 const prefix = '_accountless_move_';
+// Keep these source-pinned journals and their FK ancestors visible to older
+// upload cleanup reads. Canonical 0058 rebuilds them in one atomic transaction.
+const retainedObjectTables = ['contributions','device_credentials','device_pairings','device_upload_authorizations','participants','telemetry_contributions','telemetry_v11_chunks','telemetry_v11_day_manifests','telemetry_v1_chunks','upload_authorizations','web_sessions'];
 const fail = code => { throw new Error(`ACCOUNTLESS_MOVEMENT_${code}`); };
 const check = (condition, code) => { if (!condition) fail(code); };
 const get = (db, sql, ...args) => db.prepare(sql).get(...args);
 const atomic = (db, action) => { db.exec('BEGIN IMMEDIATE'); try { const result = action(); db.exec('COMMIT'); return result; } catch (error) { try { db.exec('ROLLBACK'); } catch {} throw error; } };
 const empty = (db, table) => !get(db, `SELECT 1 AS present FROM ${quote(table)} LIMIT 1`);
 const state = db => JSON.parse(get(db, `SELECT metadata FROM ${prefix}journal WHERE id=1`).metadata);
-const save = (db, old, next) => check(db.prepare(`UPDATE ${prefix}journal SET metadata=? WHERE id=1 AND metadata=?`).run(JSON.stringify(next), JSON.stringify(old)).changes === 1, 'REVISION_CONFLICT');
 const schema = db => db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '_accountless_move_%' ORDER BY type,name").all();
 function verifySource(sources) {
   check(Array.isArray(sources) && sources.length === 59, 'SOURCE_INVALID');
@@ -19,44 +21,65 @@ function verifySource(sources) {
   return hash(JSON.stringify(sources.map(({ name, sql }) => [name, hash(sql)])));
 }
 function ledger(db, sources, count) { check(isDeepStrictEqual(db.prepare('SELECT name FROM d1_migrations ORDER BY id').all().map(r => r.name), sources.slice(0, count).map(r => r.name)), 'PREFIX_DRIFT'); }
-function apply(db, source) { db.exec(source.sql); db.prepare('INSERT INTO d1_migrations(name) VALUES(?)').run(source.name); }
-function dropReplayObjects(db, sources) { db.exec([...sources[57].sql.matchAll(/^DROP (?:TRIGGER|VIEW) IF EXISTS \w+;$/gm)].map(m => m[0]).join('\n')); }
 function readKeyRows(db, sql) { const stmt = db.prepare(sql); stmt.setReadBigInts(true); return stmt.all(); }
 
-export function prepareAccountlessMovement(db, sources) {
-  const digest = verifySource(sources);
-  check(get(db, 'PRAGMA foreign_keys').foreign_keys === 1, 'FOREIGN_KEYS_REQUIRED');
-  if (get(db, "SELECT 1 FROM sqlite_master WHERE name=?", `${prefix}journal`)) {
-    const current = state(db); check(current.digest === digest, 'SOURCE_DRIFT'); return current;
-  }
-  ledger(db, sources, 57);
-  check(empty(db, 'accountless_enrollment_ledger'), 'ACCOUNTLESS_LEDGER_NOT_EMPTY');
-  check(!get(db, "SELECT 1 FROM sqlite_master WHERE name GLOB '_accountless_move_*' LIMIT 1"), 'OWNED_OBJECT_COLLISION');
-  const tables = [...sources[57].sql.matchAll(/CREATE TABLE (\w+)_0058_save AS/g)].map(m => m[1]);
-  check(tables.length === 52 && new Set(tables).size === 52, 'TABLE_SET_INVALID');
-  const all = schema(db), refs = Object.fromEntries(all.filter(o => o.type === 'table').map(o => [o.name, db.prepare(`PRAGMA foreign_key_list(${quote(o.name)})`).all().map(r => r.table)]));
-  check(!Object.entries(refs).some(([name, parents]) => !tables.includes(name) && parents.some(p => tables.includes(p))), 'DEPENDENCY_DRIFT');
-  const order = [], visiting = new Set();
-  function visit(table) { if (order.includes(table)) return; check(!visiting.has(table), 'DEPENDENCY_CYCLE'); visiting.add(table); for (const parent of refs[table]) if (tables.includes(parent)) visit(parent); visiting.delete(table); order.push(table); }
+function replayDrops(sources) { return [...new Map([...sources[57].sql.matchAll(/^DROP (TRIGGER|VIEW) IF EXISTS (\w+);$/gm)].map(m => [m[2],{sql:m[0],type:m[1].toLowerCase(),name:m[2]}])).values()]; }
+function planWriter(permission) {
+  const statements=[];
+  if(permission) { check(permission.begin?.sql && Array.isArray(permission.begin.params) && Array.isArray(permission.end) && permission.end.length===2 && permission.end.every(s=>typeof s.sql==='string'&&Array.isArray(s.params)), 'PERMISSION_INVALID'); statements.push(permission.begin); }
+  return { statements, add:(sql,...params)=>statements.push({sql,params}),
+    assertion:(condition,...params)=>statements.push({sql:`INSERT OR REPLACE INTO ${prefix}assertion(id,ok) VALUES(1,(${condition}))`,params}),
+    finish:()=>{if(permission)statements.push(...permission.end);} };
+}
+function ledgerAssertion(writer,sources,count) {
+  writer.assertion(`(SELECT COUNT(*) FROM d1_migrations)=? AND NOT EXISTS(SELECT 1 FROM (SELECT name,ROW_NUMBER() OVER(ORDER BY id) AS position FROM d1_migrations) actual JOIN json_each(?) expected ON actual.position=CAST(expected.key AS INTEGER)+1 WHERE actual.name<>expected.value)`,count,JSON.stringify(sources.slice(0,count).map(s=>s.name)));
+}
+const readback = () => ({sql:`SELECT metadata FROM ${prefix}journal WHERE id=1`,params:[]});
+function executePlan(db,plan) { for(const statement of plan.statements) { if(statement.compound) {check(statement.params.length===0,'PARAM_INVALID');db.exec(statement.sql);} else db.prepare(statement.sql).run(...statement.params); } }
+
+/** Metadata must already be admitted against the exact source/schema/operation. */
+export function planAccountlessMovementSetup({sources,schemaObjects,foreignKeys,tableInfo,sequences,permission=null,retainObjectReferences=false}) {
+  const digest=verifySource(sources), all=schemaObjects;
+  check(!all.some(o=>o.name.startsWith(prefix)), 'OWNED_OBJECT_COLLISION');
+  check(typeof retainObjectReferences==='boolean','RETAIN_MODE_INVALID');
+  const canonicalTables=[...sources[57].sql.matchAll(/CREATE TABLE (\w+)_0058_save AS/g)].map(m=>m[1]);
+  check(canonicalTables.length===52&&new Set(canonicalTables).size===52,'TABLE_SET_INVALID');
+  const tables=canonicalTables.filter(t=>!retainObjectReferences||!retainedObjectTables.includes(t));
+  check(!retainObjectReferences || (tables.length===41&&retainedObjectTables.every(t=>canonicalTables.includes(t)&&! /AUTOINCREMENT/i.test(all.find(o=>o.type==='table'&&o.name===t)?.sql??'AUTOINCREMENT'))),'RETAIN_SCHEMA_INVALID');
+  const refs=Object.fromEntries(all.filter(o=>o.type==='table').map(o=>[o.name,foreignKeys[o.name].map(r=>r.table)]));
+  check(!Object.entries(refs).some(([name,parents])=>!tables.includes(name)&&parents.some(p=>tables.includes(p))),'DEPENDENCY_DRIFT');
+  const order=[],visiting=new Set();
+  function visit(table) {if(order.includes(table))return;check(!visiting.has(table),'DEPENDENCY_CYCLE');visiting.add(table);for(const parent of refs[table])if(tables.includes(parent))visit(parent);visiting.delete(table);order.push(table);}
   tables.forEach(visit);
-  const descriptors = Object.fromEntries(tables.map(table => {
-    const info = db.prepare(`PRAGMA table_info(${quote(table)})`).all(), columns = info.map(r => r.name);
-    check(!columns.some(c => ['_move_key', '_original_rowid', 'rowid', '_rowid_', 'oid'].includes(c)), 'COLUMN_COLLISION');
-    const hasRowid = !/WITHOUT\s+ROWID/i.test(all.find(o => o.name === table).sql);
-    return [table, { columns, hasRowid, keys: hasRowid ? ['rowid'] : info.filter(r => r.pk).sort((a,b) => a.pk-b.pk).map(r => r.name), integerKeys: hasRowid ? ['rowid'] : info.filter(r => r.pk && r.type === 'INTEGER').map(r => r.name) }];
+  const descriptors=Object.fromEntries(tables.map(table=>{
+    const info=tableInfo[table],columns=info.map(r=>r.name);
+    check(!columns.some(c=>['_move_key','_original_rowid','rowid','_rowid_','oid'].includes(c)),'COLUMN_COLLISION');
+    const hasRowid=!/WITHOUT\s+ROWID/i.test(all.find(o=>o.type==='table'&&o.name===table).sql);
+    return [table,{columns,hasRowid,keys:hasRowid?['rowid']:info.filter(r=>r.pk).sort((a,b)=>a.pk-b.pk).map(r=>r.name),integerKeys:hasRowid?['rowid']:info.filter(r=>r.pk&&r.type==='INTEGER').map(r=>r.name)}];
   }));
-  const sequences = readKeyRows(db, 'SELECT name,seq FROM sqlite_sequence').filter(r => tables.includes(r.name)).map(r => ({ name: r.name, seq: String(r.seq) }));
-  return atomic(db, () => {
-    db.exec(`CREATE TABLE ${prefix}journal(id INTEGER PRIMARY KEY CHECK(id=1), metadata TEXT NOT NULL); CREATE TABLE ${prefix}assertion(id INTEGER PRIMARY KEY CHECK(id=1), ok INTEGER NOT NULL CHECK(ok=1))`);
-    for (const table of tables) {
-      const columns = descriptors[table].columns.map(quote).join(',');
-      db.exec(`CREATE TABLE ${quote(prefix+table)} (_move_key INTEGER PRIMARY KEY, _original_rowid INTEGER, ${columns})`);
-    }
-    const current = { digest, phase: 'evacuate', revision: 0, tableIndex: 0, cursor: 0, order, descriptors, sequences, canonicalObjects: null };
-    db.prepare(`INSERT INTO ${prefix}journal VALUES(1,?)`).run(JSON.stringify(current));
-    dropReplayObjects(db, sources);
-    return state(db);
-  });
+  const savedSequences=sequences.filter(r=>tables.includes(r.name)).map(({name,seq})=>{check(typeof seq==='string'&&/^(0|[1-9][0-9]*)$/.test(seq)&&BigInt(seq)<=9223372036854775807n,'SEQUENCE_INVALID');return {name,seq};});
+  check(new Set(savedSequences.map(r=>r.name)).size===savedSequences.length,'SEQUENCE_INVALID');
+  const current={digest,phase:'evacuate',revision:0,tableIndex:0,cursor:0,order,descriptors,sequences:savedSequences,canonicalObjects:null,...(retainObjectReferences?{retainedObjectTables:[...retainedObjectTables]}:{})};
+  const w=planWriter(permission);
+  w.add(`CREATE TABLE ${prefix}journal(id INTEGER PRIMARY KEY CHECK(id=1), metadata TEXT NOT NULL)`);
+  w.add(`CREATE TABLE ${prefix}assertion(id INTEGER PRIMARY KEY CHECK(id=1), ok INTEGER NOT NULL CHECK(ok=1))`);
+  ledgerAssertion(w,sources,57);w.assertion('NOT EXISTS(SELECT 1 FROM accountless_enrollment_ledger LIMIT 1)');
+  for(const table of tables)w.add(`CREATE TABLE ${quote(prefix+table)} (_move_key INTEGER PRIMARY KEY, _original_rowid INTEGER, ${descriptors[table].columns.map(quote).join(',')})`);
+  w.add(`INSERT INTO ${prefix}journal VALUES(1,?)`,JSON.stringify(current));
+  for(const drop of replayDrops(sources))w.add(drop.sql);
+  w.add(`DELETE FROM ${prefix}assertion WHERE id=1`);w.finish();
+  return {statements:w.statements,current,readback:readback()};
+}
+
+export function prepareAccountlessMovement(db,sources,{retainObjectReferences=false}={}) {
+  check(typeof retainObjectReferences==='boolean','RETAIN_MODE_INVALID');
+  const digest=verifySource(sources);check(get(db,'PRAGMA foreign_keys').foreign_keys===1,'FOREIGN_KEYS_REQUIRED');
+  if(get(db,'SELECT 1 FROM sqlite_master WHERE name=?',`${prefix}journal`)){const current=state(db);check(current.digest===digest,'SOURCE_DRIFT');check(isDeepStrictEqual(current.retainedObjectTables??[],retainObjectReferences?retainedObjectTables:[]),'RETAIN_MODE_DRIFT');return current;}
+  ledger(db,sources,57);check(empty(db,'accountless_enrollment_ledger'),'ACCOUNTLESS_LEDGER_NOT_EMPTY');
+  const schemaObjects=db.prepare("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name").all();
+  const tables=schemaObjects.filter(o=>o.type==='table');
+  const plan=planAccountlessMovementSetup({sources,schemaObjects,retainObjectReferences,foreignKeys:Object.fromEntries(tables.map(o=>[o.name,db.prepare(`PRAGMA foreign_key_list(${quote(o.name)})`).all()])),tableInfo:Object.fromEntries(tables.map(o=>[o.name,db.prepare(`PRAGMA table_info(${quote(o.name)})`).all()])),sequences:readKeyRows(db,'SELECT name,seq FROM sqlite_sequence').map(r=>({name:r.name,seq:String(r.seq)}))});
+  return atomic(db,()=>{executePlan(db,plan);return state(db);});
 }
 
 /** Read only bounded key/length metadata; integer keys remain exact through D1 JSON. */
@@ -132,26 +155,58 @@ export function moveAccountlessBatch(db, {expectedRevision,maxRows=32,maxBytes=2
   });
 }
 
-export function transitionAccountlessMovement(db, sources, expectedRevision) {
-  const digest = verifySource(sources);
-  return atomic(db, () => {
-    const old = state(db); check(old.digest === digest && old.revision === expectedRevision, 'REVISION_CONFLICT');
-    check(old.tableIndex === old.order.length, 'PHASE_INCOMPLETE');
-    const next = structuredClone(old);
-    if (old.phase === 'evacuate') {
-      ledger(db, sources, 57); old.order.forEach(t => check(empty(db,t), 'SOURCE_NOT_EMPTY'));
-      apply(db, sources[57]); next.canonicalObjects = schema(db).filter(o => ['trigger','view'].includes(o.type));
-      dropReplayObjects(db, sources); next.phase = 'restore'; next.tableIndex = 0; next.cursor = 0;
-    } else {
-      check(old.phase === 'restore', 'PHASE_INVALID'); ledger(db, sources, 58);
-      old.order.forEach(t => check(empty(db,prefix+t), 'STAGING_NOT_EMPTY'));
-      const existing = new Set(schema(db).map(o => o.name));
-      for (const object of old.canonicalObjects) if (!existing.has(object.name)) db.exec(object.sql);
-      for (const { name, seq } of old.sequences) { db.prepare('UPDATE sqlite_sequence SET seq=MAX(seq,?) WHERE name=?').run(BigInt(seq),name); if (!get(db,'SELECT 1 FROM sqlite_sequence WHERE name=?',name)) db.prepare('INSERT INTO sqlite_sequence(name,seq) VALUES(?,?)').run(name,BigInt(seq)); }
-      check(empty(db, 'accountless_enrollment_ledger'), 'ACCOUNTLESS_LEDGER_NOT_EMPTY'); apply(db, sources[58]);
-      for (const table of old.order) db.exec(`DROP TABLE ${quote(prefix+table)}`);
-      next.phase = 'complete';
+/** Canonical objects are from an admitted empty schema-58 fixture, never live barrier DDL. */
+export function planAccountlessMovementTransition({sources,current,expectedRevision,canonicalObjects=null,permission=null,guardStatements=[]}) {
+  const digest=verifySource(sources),old=current;
+  check(old.digest===digest&&old.revision===expectedRevision,'REVISION_CONFLICT');
+  check(old.tableIndex===old.order.length,'PHASE_INCOMPLETE');
+  check(['evacuate','restore'].includes(old.phase),'PHASE_INVALID');
+  const next=structuredClone(old),w=planWriter(permission);
+  ledgerAssertion(w,sources,old.phase==='evacuate'?57:58);
+  const drops=replayDrops(sources);
+  check(Array.isArray(canonicalObjects),'CANONICAL_OBJECTS_REQUIRED');
+  check(canonicalObjects.every(o=>o && typeof o.type==='string' && typeof o.name==='string' && typeof o.sql==='string'),'CANONICAL_OBJECTS_INVALID');
+  const objectKey=o=>o.type+'\0'+o.name;
+  check(new Set(canonicalObjects.map(objectKey)).size===canonicalObjects.length,'CANONICAL_OBJECTS_INVALID');
+  const replayObjects=drops.map(drop=>canonicalObjects.find(o=>o.name===drop.name&&o.type===drop.type)).filter(Boolean);
+  // Derived from the empty canonical 0001–0058 fixture whose migration bytes
+  // are pinned above. A partial list must never silently omit replay guards.
+  const replayManifest=replayObjects.map(({type,name,sql})=>({type,name,sql})).sort((a,b)=>objectKey(a)<objectKey(b)?-1:objectKey(a)>objectKey(b)?1:0);
+  check(replayManifest.length===90&&hash(JSON.stringify(replayManifest))==='659563de82b31bbb8cd5b5488d29c46847dd16ff51904ecf7d159dad00f33d60','CANONICAL_OBJECTS_INVALID');
+  next.canonicalObjects=null;
+  if(old.phase==='evacuate') {
+    w.assertion(old.order.map(table=>`NOT EXISTS(SELECT 1 FROM ${quote(table)} LIMIT 1)`).join(' AND '));
+    w.statements.push({sql:sources[57].sql,params:[],compound:true});
+    w.add('INSERT INTO d1_migrations(name) VALUES(?)',sources[57].name);
+    for(const drop of drops)w.add(drop.sql);
+    next.phase='restore';next.tableIndex=0;next.cursor=0;
+  } else {
+    w.assertion(old.order.map(table=>`NOT EXISTS(SELECT 1 FROM ${quote(prefix+table)} LIMIT 1)`).join(' AND '));
+    for(const object of replayObjects)w.add(object.sql);
+    for(const {name,seq} of old.sequences) {
+      check(typeof seq==='string'&&/^(0|[1-9][0-9]*)$/.test(seq)&&BigInt(seq)<=9223372036854775807n,'SEQUENCE_INVALID');
+      w.add('UPDATE sqlite_sequence SET seq=MAX(seq,CAST(? AS INTEGER)) WHERE name=?',seq,name);
+      w.add('INSERT INTO sqlite_sequence(name,seq) SELECT ?,CAST(? AS INTEGER) WHERE NOT EXISTS(SELECT 1 FROM sqlite_sequence WHERE name=?)',name,seq,name);
     }
-    next.revision++; save(db, old, next); return state(db);
-  });
+    w.assertion('NOT EXISTS(SELECT 1 FROM accountless_enrollment_ledger LIMIT 1)');
+    w.statements.push({sql:sources[58].sql,params:[],compound:true});
+    w.add('INSERT INTO d1_migrations(name) VALUES(?)',sources[58].name);
+    for(const table of old.order)w.add(`DROP TABLE ${quote(prefix+table)}`);
+    next.phase='complete';
+  }
+  w.statements.push(...guardStatements);
+  next.revision++;check(Number.isSafeInteger(next.revision),'COUNTER_EXHAUSTED');
+  w.add(`UPDATE ${prefix}journal SET metadata=json_set(metadata,'$.phase',?,'$.revision',CAST(? AS INTEGER),'$.tableIndex',CAST(? AS INTEGER),'$.cursor',CAST(? AS INTEGER),'$.canonicalObjects',NULL) WHERE id=1 AND metadata=?`,next.phase,next.revision,next.tableIndex,next.cursor,JSON.stringify(old));w.assertion('changes()=1');w.add(`DELETE FROM ${prefix}assertion WHERE id=1`);w.finish();
+  return {statements:w.statements,current:next,readback:readback()};
+}
+
+export function transitionAccountlessMovement(db,sources,expectedRevision) {
+  check(get(db,'PRAGMA foreign_keys').foreign_keys===1,'FOREIGN_KEYS_REQUIRED');
+  const current=state(db);let canonicalObjects=null;
+  if(['evacuate','restore'].includes(current.phase)) {
+    const fixture=new db.constructor(':memory:');
+    try {fixture.exec('PRAGMA foreign_keys=ON');for(const source of sources.slice(0,58))fixture.exec(source.sql);canonicalObjects=schema(fixture).filter(o=>['trigger','view'].includes(o.type));}finally{fixture.close();}
+  }
+  const plan=planAccountlessMovementTransition({sources,current,expectedRevision,canonicalObjects});
+  return atomic(db,()=>{executePlan(db,plan);return state(db);});
 }
