@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { RELEASE_VERSION } from '../config/release-manifest.js';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, privateDecrypt, createDecipheriv } from 'node:crypto';
 import { parseProductionCanaryArguments, validateCanaryHost, validateCanaryManifest, sealCanaryCleanup } from '../scripts/run-signed-electron-production-canary.mjs';
@@ -31,11 +32,24 @@ test('a normal local account or forged HOME cannot authorize production canary l
 
 test('ordinary signed manifest validation refuses staging or source confusion', () => {
   const metadata = createProductionDistributionMetadata({ target: 'darwin-arm64', sourceRevision: 'a'.repeat(40), buildNumber: '2026090920' });
-  const manifest = { name: 'app-usagemonitor', version: '0.1.18', tibotattleDistribution: metadata };
+  const manifest = { name: 'app-usagemonitor', version: RELEASE_VERSION, tibotattleDistribution: metadata };
   assert.equal(validateCanaryManifest(manifest, 'a'.repeat(40)).target, 'darwin-arm64');
   assert.throws(() => validateCanaryManifest(manifest, 'd'.repeat(40)));
   assert.throws(() => validateCanaryManifest({ ...manifest, tibotattleAccountlessSignedStagingRehearsal: {} }, 'a'.repeat(40)));
   assert.throws(() => validateCanaryManifest({ ...manifest, tibotattleDistribution: { ...metadata, updateFeed: 'https://other.test' } }, 'a'.repeat(40)));
+});
+
+test('signed handover fixtures cannot stand in for a production enrollment canary', () => {
+  // The installed .18 handover app has this valid distribution family, but
+  // main.js intentionally selects no accountless production scheduler for it.
+  const futureCore = RELEASE_VERSION.replace(/\d+$/u, patch => String(Number(patch) + 1));
+  const metadata = createProductionDistributionMetadata({ target: 'darwin-arm64',
+    sourceRevision: 'a'.repeat(40), buildNumber: '2026090920', rehearsal: 'next',
+    rehearsalCurrentVersion: `${futureCore}-native-to-electron-handover.17`,
+    rehearsalNextVersion: `${futureCore}-native-to-electron-handover.18` });
+  assert.throws(() => validateCanaryManifest({ name: 'app-usagemonitor',
+    version: metadata.semanticVersion, tibotattleDistribution: metadata }, 'a'.repeat(40)),
+  { canaryStage: 'artifact_uploads_disabled' });
 });
 
 test('cleanup handoff encrypts only the exact synthetic target and authenticates ciphertext', () => {
