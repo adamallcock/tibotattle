@@ -4482,3 +4482,25 @@ test("Claude usage shadow failure is contained and abort releases a non-cooperat
   assert.equal(result.rolloutRecordsWritten, 1);
   assert.equal(Object.hasOwn(result, "claudeShadow"), false);
 });
+
+test("quick polling omits reset details only after a successful startup read; detailed refreshes retain them", async () => {
+  const optionsSeen = [];
+  let succeeds = false;
+  const makeRunner = () => createLocalCollectorRefreshRunner({
+    accountingSourceMode: "unified",
+    selectAccountObservationSecret: () => ({ loadAccountObservationSecret: null }),
+    runCollector: async (options) => {
+      optionsSeen.push(options.excludeResetCreditDetails);
+      return { refresh: { attempted: true, recordWritten: succeeds, errorCode: succeeds ? null : "app_server_unavailable" } };
+    },
+    readAccountingCache: async () => null,
+  });
+  const runner = makeRunner();
+  await runner({ mode: "quick" });
+  succeeds = true;
+  await runner({ mode: "quick" });
+  await runner({ mode: "quick" });
+  await runner({ mode: "detailed" });
+  await makeRunner()({ mode: "quick" });
+  assert.deepEqual(optionsSeen, [false, false, true, false, false]);
+});

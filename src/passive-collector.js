@@ -1348,6 +1348,7 @@ function quotaWindowIdentityProjection(windows) {
 
 export function appServerSnapshotRecord(payload, { source, receivedAt }) {
   const accountSnapshot = payload?.accountScope ? payload : null;
+  const accountScope = sanitizeAccountScope(accountSnapshot?.accountScope);
   const windows = windowsFromAppPayload(accountSnapshot?.byLimitId ? {
     rateLimits: accountSnapshot.canonical,
     rateLimitsByLimitId: accountSnapshot.byLimitId,
@@ -1363,7 +1364,13 @@ export function appServerSnapshotRecord(payload, { source, receivedAt }) {
     source,
     windows,
     providerSurface: "account_shared_unallocated",
-    accountScope: sanitizeAccountScope(accountSnapshot?.accountScope),
+    accountScope,
+    // Historical permission at observedAt, never authorization to resume now.
+    // Sparse notifications and unscoped observations cannot carry permission.
+    ordinaryUsageAllowed: source === "app_server_read"
+      && accountScope.status === "available"
+      && typeof accountSnapshot.ordinaryUsageAllowed === "boolean"
+      ? accountSnapshot.ordinaryUsageAllowed : null,
     officialDailyTokens: source === "app_server_read" ? (accountSnapshot?.officialDailyTokens ?? []) : [],
     officialUsageSummary: source === "app_server_read" ? (accountSnapshot?.officialUsageSummary ?? null) : null,
     controlledState: "unknown",
@@ -1491,11 +1498,11 @@ function matchingCapturedBinding(before, after) {
 }
 
 async function readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret,
-  readAccountAttributionBinding = null, clock = () => Date.now()) {
+  readAccountAttributionBinding = null, clock = () => Date.now(), excludeResetCreditDetails = false) {
   const bindingBefore = await captureAttributionBinding(readAccountAttributionBinding);
   const accountBefore = await readOptionalAccount(client);
   const [rateLimits, accountUsage] = await Promise.all([
-    client.readRateLimits(),
+    client.readRateLimits({ excludeResetCreditDetails }),
     typeof client.readAccountUsage === "function" ? client.readAccountUsage().catch(() => null) : Promise.resolve(null),
   ]);
   const accountAfter = await readOptionalAccount(client);
@@ -1614,6 +1621,7 @@ export async function runCollectorOnce({
   stateFile = defaultCollectorStateFile(),
   staleAfterMs = 60_000,
   refreshStale = true,
+  excludeResetCreditDetails = false,
   backfill = false,
   backfillSinceAt = null,
   // Unified-index authority does not need the legacy rollout ledger. This
@@ -1728,6 +1736,7 @@ export async function runCollectorOnce({
             loadAccountObservationSecret,
             readAccountAttributionBinding,
             clock,
+            excludeResetCreditDetails,
           );
           if (signal?.aborted) throw new Error("collector_aborted");
           const record = await appendAppRecord({
@@ -1944,7 +1953,7 @@ export async function runCollectorOnce({
         if (signal?.aborted) throw new Error("collector_aborted");
         const capturedAt = new Date(clock()).toISOString();
         const payload = await readSanitizedAppServerSnapshot(client, capturedAt, loadAccountObservationSecret,
-          readAccountAttributionBinding, clock);
+          readAccountAttributionBinding, clock, excludeResetCreditDetails);
         if (signal?.aborted) throw new Error("collector_aborted");
         const record = await appendAppRecord({
           payload,

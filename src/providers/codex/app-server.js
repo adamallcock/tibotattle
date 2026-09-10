@@ -154,6 +154,7 @@ export class CodexAppServerClient extends EventEmitter {
     this.stderr = "";
     this.closed = false;
     this.malformedMessages = 0;
+    this.rateLimitParamsSupported = true;
   }
 
   async start() {
@@ -204,8 +205,11 @@ export class CodexAppServerClient extends EventEmitter {
       const pending = this.pending.get(message.id);
       this.pending.delete(message.id);
       clearTimeout(pending.timer);
-      if (message.error) pending.reject(new CodexAppServerError("request_failed", message.error.message ?? "Codex app-server request failed"));
-      else pending.resolve(message.result);
+      if (message.error) {
+        const error = new CodexAppServerError("request_failed", message.error.message ?? "Codex app-server request failed");
+        error.rpcCode = Number.isInteger(message.error.code) ? message.error.code : null;
+        pending.reject(error);
+      } else pending.resolve(message.result);
       return;
     }
     if (message.method === "account/rateLimits/updated") {
@@ -229,7 +233,7 @@ export class CodexAppServerClient extends EventEmitter {
     this.emit("disconnect", { code });
   }
 
-  request(method, params = {}, { requestId = null } = {}) {
+  request(method, params, { requestId = null } = {}) {
     if (!this.child?.stdin?.writable) {
       return Promise.reject(new CodexAppServerError("temporary_disconnect", "Codex app-server is not writable"));
     }
@@ -250,8 +254,21 @@ export class CodexAppServerClient extends EventEmitter {
     return true;
   }
 
-  readRateLimits() {
-    return this.request("account/rateLimits/read", {});
+  async readRateLimits({ excludeResetCreditDetails = false } = {}) {
+    // Passive readers must never advertise automatic Luna Reserve fallback.
+    const params = excludeResetCreditDetails === true && this.rateLimitParamsSupported
+      ? { excludeResetCreditDetails: true }
+      : undefined;
+    try {
+      return await this.request("account/rateLimits/read", params);
+    } catch (error) {
+      // Older servers can reject object params. Retry that protocol failure
+      // once, without params; auth, timeout and transport failures propagate.
+      if (params === undefined || error.code !== "request_failed"
+          || ![-32600, -32602].includes(error.rpcCode)) throw error;
+      this.rateLimitParamsSupported = false;
+      return this.request("account/rateLimits/read");
+    }
   }
 
   readAccount() {
@@ -365,6 +382,8 @@ export function sanitizeCodexAccountSnapshot(snapshot, capturedAt, {
   return {
     capturedAt,
     accountScope,
+    ordinaryUsageAllowed: accountScope.status === "available"
+      && typeof raw.ordinaryUsageAllowed === "boolean" ? raw.ordinaryUsageAllowed : null,
     canonical,
     byLimitId,
     officialDailyTokens: dailyUsageBuckets,
@@ -455,6 +474,7 @@ export async function sanitizeBracketedCodexAccountSnapshotWithSecretLoader(snap
     const after = result.accountScope;
     if (before.status !== "available" || after.status !== "available") {
       result.accountScope = after.status === "unavailable" ? after : before;
+      result.ordinaryUsageAllowed = null;
       return result;
     }
     const knownPlans = new Set([
@@ -465,6 +485,7 @@ export async function sanitizeBracketedCodexAccountSnapshotWithSecretLoader(snap
     ].filter((plan) => plan !== null && plan !== "unknown"));
     if (before.scopeId !== after.scopeId || knownPlans.size > 1) {
       result.accountScope = sanitizeAccountScope(null);
+      result.ordinaryUsageAllowed = null;
     }
     return result;
   } finally {

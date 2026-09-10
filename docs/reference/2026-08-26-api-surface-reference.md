@@ -622,6 +622,23 @@ the `initialized` notification and accepts the
 disconnects, and authentication failures are collapsed into fixed local error
 classes before the dashboard sees a projection.
 
+The rate-limit reader uses `excludeResetCreditDetails: true` for automatic quick
+refreshes after the companion's first successful quota read. Startup, detailed
+user refreshes, and standalone collector reads keep full reads by default.
+Servers rejecting object parameters with JSON-RPC invalid-request/invalid-params
+receive one retry with omitted parameters; subsequent reads on that client stay
+parameter-free. Authentication, transport, timeout, and other server failures
+are not retried by this compatibility path. `supportsLunaReserve` is never sent.
+
+`ordinaryUsageAllowed` is an optional backend permission observation, normalized
+to boolean or `null`. A missing local account scope or disagreeing bracketed
+account/plan reads clears it to `null`. Local collector snapshots retain it with
+`observedAt`; sparse notifications cannot supply it or carry a previous value
+forward. Historical permission is not current authorization, and percentages or
+reset schedules never supply a replacement. This integration adds no permission
+badge, resume action, reset-credit persistence, or contribution field.
+The upstream contract is [Codex PR #42358](https://github.com/openai/codex/pull/42358).
+
 This is a local Codex subprocess contract, **not** a call to the OpenAI API.
 Likewise, Claude Desktop support reads allowlisted local application-support,
 status-line, and transcript sources and does **not** call the Anthropic API.

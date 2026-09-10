@@ -142,7 +142,7 @@ test("bracketed account sanitation uses one disposable root lease and preserves 
   const snapshot = {
     accountBefore: account,
     accountAfter: { account: { email: "BRACKET.FIXTURE@example.test", planType: "pro" } },
-    rateLimits: { rateLimits: {
+    rateLimits: { ordinaryUsageAllowed: true, rateLimits: {
       limitId: "codex", planType: "pro",
       primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 123 },
     } },
@@ -156,6 +156,7 @@ test("bracketed account sanitation uses one disposable root lease and preserves 
   assert.equal(loads, 1);
   assert.deepEqual(disposable, Buffer.alloc(32));
   assert.equal(result.accountScope.status, "available");
+  assert.equal(result.ordinaryUsageAllowed, true);
   assert.equal(result.accountScope.planType, "pro");
   assert.equal(result.canonical.primary.usedPercent, 25);
   assert.deepEqual(result.officialDailyTokens, [{ date: "2026-07-23", tokens: 10 }]);
@@ -178,6 +179,7 @@ test("bracketed account sanitation uses one disposable root lease and preserves 
       loadAccountObservationSecret: async () => Buffer.alloc(32, 77),
     });
     assert.equal(result.accountScope.status, "unavailable");
+    assert.equal(result.ordinaryUsageAllowed, null);
     assert.equal(result.accountScope.scopeId, null);
     assert.equal(result.canonical.primary.usedPercent, 25, "account uncertainty must not discard the quota evidence");
     assert.deepEqual(result.officialDailyTokens, [{ date: "2026-07-23", tokens: 10 }]);

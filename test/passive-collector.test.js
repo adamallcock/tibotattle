@@ -2817,3 +2817,47 @@ test("a truncated fork file re-arms the replay boundary on rescan", async () => 
     await rm(fixture.root, { recursive: true });
   }
 });
+
+test("permission is retained only on scoped direct observations, without credit details or notification carry-forward", async () => {
+  for (const skipRolloutIngestion of [false, true]) {
+    const fixture = await collectorFixture();
+    const optionsSeen = [];
+    let permission = false;
+    class PermissionClient {
+      async start() {}
+      async readAccount() { return { account: { email: "permission.fixture@example.test", planType: "pro" } }; }
+      async readRateLimits(options) {
+        optionsSeen.push(options);
+        return { ...appPayload(0), ordinaryUsageAllowed: permission,
+          rateLimitResetCredits: { availableCount: 2, credits: [{ id: "DO-NOT-RETAIN" }] } };
+      }
+      close() {}
+    }
+    let now = Date.parse("2026-07-23T00:01:00.000Z");
+    const options = { ...fixture, skipRolloutIngestion, staleAfterMs: 0,
+      clock: () => now, appServerFactory: () => new PermissionClient(),
+      loadAccountObservationSecret: async () => Buffer.alloc(32, 71) };
+    try {
+      await runCollectorOnce(options);
+      now += 1000;
+      permission = undefined;
+      await runCollectorOnce({ ...options, excludeResetCreditDetails: true });
+      assert.deepEqual(optionsSeen, [{ excludeResetCreditDetails: false }, { excludeResetCreditDetails: true }]);
+      const records = (await readLines(fixture.dataFile)).filter((row) => row.kind === "codex_quota_snapshot");
+      assert.deepEqual(records.map((row) => row.ordinaryUsageAllowed), [false, null]);
+      assert.equal(records[1].observedAt, new Date(now).toISOString());
+      assert.equal(JSON.stringify(records).includes("DO-NOT-RETAIN"), false);
+      assert.equal(JSON.stringify(records).includes("rateLimitResetCredits"), false);
+      const payload = { accountScope: records[0].accountScope, canonical: appPayload().rateLimits,
+        byLimitId: { codex: appPayload().rateLimits }, ordinaryUsageAllowed: true };
+      for (const [source, accountScope, expected] of [
+        ["app_server_read", payload.accountScope, true],
+        ["app_server_notification", payload.accountScope, null],
+        ["app_server_read", { status: "unavailable" }, null],
+        ["app_server_read", { status: "available", scopeId: "malformed" }, null],
+      ]) {
+        assert.equal(appServerSnapshotRecord({ ...payload, accountScope }, { source, receivedAt: new Date(now).toISOString() }).ordinaryUsageAllowed, expected);
+      }
+    } finally { await rm(fixture.root, { recursive: true }); }
+  }
+});
