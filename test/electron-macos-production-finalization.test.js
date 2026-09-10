@@ -29,8 +29,9 @@ const { buildBlockMap } = builderRequire("app-builder-lib/out/targets/blockmap/b
 const yaml = builderRequire("js-yaml");
 const SOURCE_REVISION = "a".repeat(40);
 const BUILD_NUMBER = "2026090701";
-const CURRENT_VERSION = "0.1.19-native-to-electron-handover.1";
-const NEXT_VERSION = "0.1.19-native-to-electron-handover.2";
+const REHEARSAL_VERSION_CORE = RELEASE_VERSION.replace(/\d+$/u, (patch) => String(Number(patch) + 1));
+const CURRENT_VERSION = `${REHEARSAL_VERSION_CORE}-native-to-electron-handover.1`;
+const NEXT_VERSION = `${REHEARSAL_VERSION_CORE}-native-to-electron-handover.2`;
 const TRANSPORT_MANIFEST = "native-to-electron-handover-mac.yml";
 const FINALIZATION_RECEIPT = "electron-update-metadata-finalization-receipt.json";
 const FINALIZATION_OPERATION = "electron-update-metadata-finalization-operation.json";

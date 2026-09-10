@@ -34,8 +34,9 @@ const PRODUCTION_SOURCE_WORKFLOW_PATH = resolve(
 );
 const SOURCE_REVISION = "a".repeat(40);
 const BUILD_NUMBER = "20260906";
-const REHEARSAL_CURRENT_VERSION = "0.1.19-native-to-electron-handover.1";
-const REHEARSAL_NEXT_VERSION = "0.1.19-native-to-electron-handover.2";
+const REHEARSAL_VERSION_CORE = RELEASE_VERSION.replace(/\d+$/u, (patch) => String(Number(patch) + 1));
+const REHEARSAL_CURRENT_VERSION = `${REHEARSAL_VERSION_CORE}-native-to-electron-handover.1`;
+const REHEARSAL_NEXT_VERSION = `${REHEARSAL_VERSION_CORE}-native-to-electron-handover.2`;
 
 async function withTemporaryDirectory(run) {
   const root = await mkdtemp(join(tmpdir(), "tibotattle-electron-production-"));
@@ -372,7 +373,7 @@ test("native-to-Electron rehearsal accepts only an ordered macOS prerelease pair
   assert.equal(POLICY.productionElectronMacOSBundleShortVersionForTarget({
     target: "darwin-arm64",
     version: REHEARSAL_CURRENT_VERSION,
-  }), "0.1.19");
+  }), REHEARSAL_VERSION_CORE);
   assert.throws(() => POLICY.productionElectronMacOSBundleShortVersionForTarget({
     target: "darwin-arm64",
     version: "0.1.19-preview.1",
@@ -483,7 +484,7 @@ test("rehearsal builder config binds semantic updater versions to numeric macOS 
     assert.equal(config.extraMetadata.version, version, candidate);
     assert.equal(config.extraMetadata.tibotattleSourceReleaseVersion, RELEASE_VERSION, candidate);
     assert.deepEqual(config.extraMetadata.tibotattleDistribution, metadata, candidate);
-    assert.equal(config.mac.bundleShortVersion, "0.1.19", candidate);
+    assert.equal(config.mac.bundleShortVersion, REHEARSAL_VERSION_CORE, candidate);
     assert.equal(config.mac.bundleVersion, buildNumber, candidate);
     assert.equal(config.buildVersion, buildNumber, candidate);
     assert.deepEqual(config.publish, [{
@@ -770,14 +771,18 @@ test("production source plans reserve a thin adapter for both macOS architecture
 
 test("manual production source workflow has no default candidate or finalization command", async () => {
   const workflow = await readFile(PRODUCTION_SOURCE_WORKFLOW_PATH, "utf8");
-  assert.match(workflow, /^on:\n  workflow_dispatch:\n    inputs:\n      build_number:/mu);
+  assert.match(workflow, /^  workflow_dispatch:\n    inputs:\n      build_number:/mu);
+  assert.match(workflow, /^  push:\n    branches: \[codex\/unified-desktop-accountless\]/mu);
+  assert.match(workflow, /^  registration:\n    if: github\.event_name == 'push'/mu);
+  assert.equal((workflow.match(/if: github\.event_name == 'workflow_dispatch'/gu) ?? []).length, 4);
   assert.match(workflow, /build_number:\n(?:.*\n){0,3}\s+required: true\n(?:.*\n){0,2}\s+type: string/mu);
-  assert.doesNotMatch(workflow, /^\s+(?:push|pull_request|schedule):/mu);
+  assert.doesNotMatch(workflow, /^\s+(?:pull_request|schedule):/mu);
   assert.doesNotMatch(workflow, /^\s+default:/mu);
   assert.doesNotMatch(workflow, /\belectron-builder\b/u);
   assert.doesNotMatch(workflow, /--publish\b/u);
   assert.equal((workflow.match(/test\/electron-macos-keychain-adapter\.test\.js/gu) ?? []).length, 2);
   for (const target of Object.keys(POLICY.PRODUCTION_ELECTRON_TARGETS)) {
+    assert.match(workflow, new RegExp(`^  ${target}:\\n    if: github\\.event_name == 'workflow_dispatch'`, "mu"), target);
     assert.match(workflow, new RegExp(`--target ${target}`, "u"), target);
     assert.match(workflow,
       new RegExp(`electron-production-source-${target}-\\$\\{\\{ github\\.sha \\}\\}`, "u"), target);

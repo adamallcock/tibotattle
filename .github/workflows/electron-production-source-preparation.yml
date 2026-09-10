@@ -5,6 +5,10 @@ name: Electron four-target production source preparation
 # update feed. A build number has no default so a fixture value cannot become a
 # release allocation through automation.
 on:
+  # Register this manual preparer from the integration branch; no source build
+  # runs on push. The four candidate jobs remain dispatch-only.
+  push:
+    branches: [codex/unified-desktop-accountless]
   workflow_dispatch:
     inputs:
       build_number:
@@ -20,7 +24,16 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  registration:
+    if: github.event_name == 'push'
+    name: Register manual production source preparer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Record registration only
+        run: printf '%s\n' 'ELECTRON_SOURCE_PREPARATION_WORKFLOW_REGISTERED'
   darwin-arm64:
+    if: github.event_name == 'workflow_dispatch'
     name: darwin-arm64 unsigned production source
     runs-on: macos-26
     timeout-minutes: 30
@@ -73,6 +86,7 @@ jobs:
           retention-days: 7
 
   darwin-x64:
+    if: github.event_name == 'workflow_dispatch'
     name: darwin-x64 unsigned production source
     runs-on: macos-26-intel
     timeout-minutes: 30
@@ -125,6 +139,7 @@ jobs:
           retention-days: 7
 
   win32-x64:
+    if: github.event_name == 'workflow_dispatch'
     name: win32-x64 unsigned production source
     runs-on: windows-2025
     timeout-minutes: 30
@@ -196,6 +211,7 @@ jobs:
           retention-days: 7
 
   linux-x64:
+    if: github.event_name == 'workflow_dispatch'
     name: linux-x64 unsigned production source
     runs-on: ubuntu-24.04
     timeout-minutes: 30

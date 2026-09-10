@@ -34,10 +34,10 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-Adds customizable menu-bar/tray displays and popup sections, with immediate
-preview, undo and defaults. The Electron implementation remains on its
-[development branch](https://github.com/adamallcock/tibotattle/pull/111);
-these controls are not part of the installed 0.1.18 release.
+The [0.1.19 candidate](./release-notes/0.1.19.md) prepares the Electron desktop
+cutover for macOS, Windows and Linux, with customizable tray displays, clearer
+usage views and durable sharing preferences. Final stable installers and feeds
+are not yet published. The existing native 0.1.18 release remains available.
 
 ## [0.1.18](./release-notes/0.1.18.md) - 2026-09-05
 
