@@ -245,6 +245,15 @@ jobs:
           test "$(pnpm --version)" = "11.9.0"
           node -e "if(process.version!=='v26.2.0'||process.platform!=='linux'||process.arch!=='x64')process.exit(1)"
           pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build and qualify the native Linux credential mutex
+        run: |
+          set -euo pipefail
+          node_gyp_script="$(npm root --global)/npm/node_modules/node-gyp/bin/node-gyp.js"
+          test -f "$node_gyp_script"
+          node "$node_gyp_script" rebuild --directory native/linux-credential-mutex
+          node scripts/stage-linux-credential-mutex-binding.mjs
+          node scripts/build-linux-credential-mutex-manifest.mjs
+          node scripts/qualify-linux-credential-mutex.mjs
       - name: Validate production source contracts
         run: node --test test/electron-production-distribution.test.js
       - name: Prepare unsigned production source only
