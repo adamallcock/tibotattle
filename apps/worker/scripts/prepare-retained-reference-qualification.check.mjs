@@ -39,6 +39,9 @@ test('freezes and independently replays retained11 guarded movement, range recor
   }
   assert.ok(failures>=4);assert.equal(db.prepare('SELECT COUNT(*) AS n FROM d1_migrations').get().n,59);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM telemetry_v1_records').get().n,8212);
+  assert.equal(manifest.fixture.syntheticAuthorizationIdLength,96);assert.equal(manifest.fixture.syntheticR2KeyPaddingBytes,64);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM device_upload_authorizations WHERE id LIKE 'synthetic-residual-%' AND length(id)=96").get().n,26000);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM telemetry_v1_chunks WHERE id LIKE 'synthetic-residual-%' AND substr(r2_key,-64)=?").get('x'.repeat(64)).n,26000);
   assert.equal(db.prepare('SELECT CAST(rowid AS TEXT) AS id FROM telemetry_v11_records').get().id,'9007199254742001');
   assert.deepEqual(db.prepare('PRAGMA foreign_key_check').all(),[]);
   assert.equal(db.prepare('SELECT COUNT(*) AS n FROM _accountless_migration_barrier_permission_v1').get().n,0);
