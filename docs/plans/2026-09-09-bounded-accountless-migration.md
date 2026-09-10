@@ -26,6 +26,21 @@ the permission marker, and refusal of stale selection. Six real Worker tests cov
 the early HTTP/admin/cron barrier and database guards. These are local results,
 not hosted throughput.
 
+Commit `b287c57d` passes all 999 Worker tests (79 files), workspace-copy,
+endpoint, generated-type, TypeScript and script checks. Both deployment dry runs
+pass after generating the missing local public-site bundle without installer
+metadata; that bundle is for local validation and is not a publication candidate.
+The first full run observed an intermediate barrier-source snapshot and failed
+one error-message assertion; the final committed run passes unchanged assertions.
+The ten focused movement/qualification script checks also pass. No hosted SQL,
+production fence, deployment or release is implied.
+
+The frozen 108-step hosted bundle is bound to source `b287c57d` and manifest
+SHA-256 `c5bc4a9ba1fb6d7edf717bb74fe9d9b735cbf06d01dedfa949e2a36497409a7c`.
+Its exact disposable target is `tibotattle-bounded58-20260909-70c70f1d`;
+the suffix labels the operation baseline, not the implementation commit.
+Creation, execution and success-only cleanup approval are pending.
+
 The implementation uses a temporary source-bound dynamic HTTP/admin and cron
 pause plus database mutation guards, rather than permanent request tracking.
 Guard coverage includes product, lifecycle, control, publication/cache and migration
@@ -45,7 +60,7 @@ and [Worker duration limits](https://developers.cloudflare.com/workers/platform/
 
 # Smallest proposed sequence
 
-1. **Admit and fence.** Pin the deployed Worker, exact migration hashes, schema baseline and operation identifier. Confirm prefix 0057/0002, no unknown operation, and the newly introduced accountless ledger remains empty. Block new dynamic HTTP/admin and scheduled/lifecycle work with the temporary deployment gate. Install database-enforced mutation guards and separately establish R2 mutation protection before movement. The four collection flags alone do not provide this barrier; a new empty activity ledger would not prove old invocations drained. Keep the independent deletion ledger unchanged. A durable operation record must retain the fence through process interruption and migration-ledger advancement.
+1. **Admit and fence.** Pin the deployed Worker, exact migration hashes, schema baseline and operation identifier. Confirm prefix 0057/0002, no unknown operation, and the newly introduced accountless ledger remains empty. Block new dynamic HTTP/admin and scheduled/lifecycle work with the temporary deployment gate. Establish and read back R2 mutation protection before installing database-enforced mutation guards, so destructive object operations are protected before their following database state transitions are fenced. Resolve the pre-activation in-flight-delete race before movement. The four collection flags alone do not provide this barrier; a new empty activity ledger would not prove old invocations drained. Keep the independent deletion ledger unchanged. A durable operation record must retain the fence through process interruption and migration-ledger advancement.
 2. **Prepare empty staging tables.** Derive the exact 52-table set and foreign-key topology from the admitted schema. Refuse new dependencies, cycles or column drift. Create private operation-owned tables with explicit original columns and an indexed movement key; create indexes while these tables are empty. Capture required identity and high-water metadata, including externally exposed implicit rowids and `sqlite_sequence`. Do not use a full-table snapshot or export.
 3. **Evacuate children first.** Each call selects a small indexed batch, copies it within D1, verifies copied values/counts, deletes exactly those original keys, and advances a compare-and-swap journal in the same transaction. Use one row only for the initial hosted cost probe, then adapt bounded batch sizes from measured cost; millions of single-row API calls are not the proposed execution strategy. Bound row count, admitted row size, statement count and request duration. Before admitting a run, record an explicit elapsed-time budget and minimum sustained rows/bytes per second; stop between committed batches if measured progress cannot meet that budget. Keep payloads inside D1; receipts contain only phase, revision and counts. A transport error means reconcile the same operation revision before any retry.
 4. **Require empty source tables.** Use one indexed `SELECT 1 ... LIMIT 1` per table, not whole-table counts. Every descendant must be empty before dropping a parent. This is the decisive cascade guard.
