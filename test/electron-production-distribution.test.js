@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, posix, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 
@@ -659,8 +659,7 @@ test("signed staging source binds the hosted macOS account and disables the upda
   assert.equal(config.forceCodeSigning, true);
   assert.equal(config.publish, undefined);
   assert.equal(Object.hasOwn(config.extraMetadata, "tibotattleDistribution"), false);
-  assert.match(config.directories.app,
-    /electron-production\/rehearsal\/accountless-signed-staging-rehearsal-v1\/darwin-arm64\/app$/u);
+  assert.equal(config.directories.app, resolve(plan.stagingDirectory));
   assert.throws(() => loadSignedStagingBuilderConfig({ expectedTestUsername: "ci runner" }));
   for (const argv of [
     ["--target", "darwin-arm64", "--source-revision", SOURCE_REVISION,
@@ -812,7 +811,7 @@ test("production staging carries the exact app metadata and updater closure whil
     assert.equal(Object.hasOwn(developmentPackage, "tibotattleDistribution"), false);
     for (const name of Object.keys(ELECTRON_UPDATER_RUNTIME_PACKAGE_PINS)) {
       const segments = name.split("/");
-      const packagePath = join("node_modules", ...segments, "package.json");
+      const packagePath = posix.join("node_modules", ...segments, "package.json");
       assert.ok(production.manifest.files.some(({ path }) => path === packagePath), packagePath);
       assert.ok(development.manifest.files.some(({ path }) => path === packagePath), packagePath);
     }
