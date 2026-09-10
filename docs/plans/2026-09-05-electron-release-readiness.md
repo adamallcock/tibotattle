@@ -17,6 +17,24 @@ visible notices before activation for existing undecided installations.
 Current checkpoint, 2026-09-09 (supersedes the historical entries below):
 
 
+Latest continuation, 2026-09-10:
+
+- The corrected larger hosted rehearsal reached canonical 0058. Its CLI output
+  exceeded the harness capture bound, but independent readback confirms the
+  expected post-migration checkpoint and retained reference counts. The remaining
+  48 synthetic steps and conditional cleanup are prepared and locally checked;
+  execution awaits the specific continuation approval. Production is unchanged.
+- All 1,001 Worker tests and the clean-tree production/staging dry builds pass
+  for the corrected migration tooling. Full restoration and production activation
+  remain the immediate work; the [bounded plan](./2026-09-09-bounded-accountless-migration.md)
+  owns exact rehearsal outcomes.
+- Protected R7 regeneration completed: all ten receipts validate on both pinned
+  runtimes and are committed at `3264c018`. Its existing `release_open` resource
+  decision is preserved. Runtime-pair and engineering-rounding decisions are
+  explicitly open in the current implementation; another unchanged long run
+  would not resolve them. Receipt freshness is now proven, not resource promotion
+  or public release approval.
+
 Latest continuation, 2026-09-09:
 
 - **Automatic contributions now pass one continuous signed fresh-install journey.**

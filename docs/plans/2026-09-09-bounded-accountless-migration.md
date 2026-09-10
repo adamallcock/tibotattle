@@ -24,25 +24,37 @@ remote operation.
 
 # Evidence held
 
-Current reviewed source `10657851` passes the complete Worker check: **1,001
-Vitest tests in 79 files**, script/type/contract checks and both production and
-staging dry deployments. The later fixture-only update `9fceb72e` passes seven replay/runner checks and
-covers 20,929,052 retained logical bytes versus 19,496,905 observed in production.
-Its 178-step hosted manifest is frozen with SHA-256
-`194a4b0b3fe3b7b2a427e6b0358e204b030adf1e809a989c8cf0a6ae5079bfec`;
-Its approved hosted execution stopped after 57 successful steps: Cloudflare
-rejected the first seed request with code 7500 because generated SQL contained
-empty statements between duplicate delimiters. The stopped database is retained;
-read-only reconciliation found all ten tables targeted by that request empty.
-No migration-range or canonical-0058 timing was reached. Source `89c3c588` fixes
-both the fixture grouping and shared operator rendering, preserving canonical
-SQL bytes and avoiding redundant terminators. All 22 operator/transport checks,
-seven fixture/runner checks, and 1,001 Worker tests pass. The complete check
-reached the final dry-deployment stage, which correctly refused the then-uncommitted
-status document; the dry checks require a clean committed tree separately.
-The corrected 178-step manifest is frozen
-with SHA-256 `f0829eeb311c498b37bd96e84685b60455a5615b771c25bb9d137466f20bf108`;
-a reset and corrected hosted run have not been executed.
+Source `56b0e37b` passes **1,001 Worker tests in 79 files**, the script,
+type and contract checks. After committing the separately regenerated R7
+receipts at `3264c018`, production and staging dry-deployment checks pass too.
+The first full command stopped at its clean-tree guard while those receipts
+were uncommitted; the test suite itself passed and was not repeated.
+
+The larger frozen fixture covers 20,929,052 retained logical bytes versus
+19,496,905 observed in production. Its three hosted outcomes are preserved:
+
+- `9fceb72e`: stopped after 57 successful steps because duplicate SQL
+  terminators produced an empty statement. Source `89c3c588` corrected the
+  shared renderer. Reconciliation and authorized deletion/absence checks passed.
+- `89c3c588`: stopped after 117 successful steps at D1's expression-depth limit
+  of 100. Source `56b0e37b` balances byte sums and comparisons without changing
+  their values or canonical migrations. The exact old query reproduces the
+  failure locally at depth 100; all 178 corrected queries pass at that limit.
+  The prior checkpoint/reference counts matched; authorized deletion and exact
+  absence were verified after renewing the existing CLI login.
+- `56b0e37b`: completed 129 steps before the canonical-0058 CLI response exceeded
+  the harness's 256 KiB capture bound. This was an uncertain transport result,
+  not a SQL rejection. The harness stopped without retry or cleanup. Independent
+  read-only reconciliation **matches the expected post-0058 checkpoint and
+  retained reference counts**. The database is retained. A five-check locally
+  validated continuation prepares only steps 130–177 with a 1 MiB process
+  capture bound, unchanged 128 KiB retained streams and fresh checkpoint
+  admission; its execution and conditional cleanup await explicit approval.
+
+The `56b0e37b` manifest SHA-256 is
+`c0ba03b5b0016617deb0392eb648009a22baa409a28bf891cb81c0b067327646`.
+The current run proves hosted canonical-0058 completion against the padded
+reference fixture, but **does not yet prove restoration, 0059 or final cleanup**.
 The ordinary production service remains healthy on source `32cd6317`, rechecked
 after these local changes. All 15 bounded live inspection batches succeeded: the
 primary/deletion ledgers, 91 table column/FK definitions and canonical product
@@ -58,9 +70,11 @@ that asset set is part of the exact production operation review. The existing
 signed production-canary workflow can be reused, and its matching RSA cleanup
 key has been verified locally. Existing production encryption/identity secret
 bindings were reconfirmed without reading values after the approved CLI login
-renewal. No production canary has run. The separately authorized local protected
-R7 generation is running against an unchanged desktop workload closure; these
-Worker-only repairs do not change that closure.
+renewal. No production canary has run. The separately authorized protected R7 generation completed and all ten
+receipts validate on both pinned Node runtimes. Their existing `release_open`
+decision remains explicit. Worker-only repairs do not change the desktop
+workload closure; rerunning it cannot resolve the decision rules that are
+explicitly open in source.
 
 - **Throughput path prepared:** metadata-only indexed production probes found up
   to 4,616,226 row slots in the dominant v1 record table (an upper bound, not
@@ -70,7 +84,7 @@ Worker-only repairs do not change that closure.
   before dispatch, preserves exact large integer keys, and forbids switching
   between range and row modes after setup. Five range checks, two operator
   journey checks and a local D1 batch test cover this addition.
-- **Larger hosted rehearsal prepared, not executed:** a frozen 178-step local
+- **Larger hosted rehearsal partly reconciled:** a frozen 178-step local
   replay keeps all 11 reference tables visible, adds 26,000 authorizations and
   26,000 chunks, and preserves 8,212 v1 records through canonical 0057→0059.
   It includes real mutation guards, rollback/replay refusals, 1,024-row then
@@ -117,8 +131,9 @@ Worker-only repairs do not change that closure.
   launcher and transport checks, TypeScript, and both clean-tree production and
   staging dry runs. Documentation/preflight checks pass. No deployment occurred.
 
-None of these local range results measures sustained production throughput or admits the
-remaining reference tables for a hosted canonical transaction.
+The reconciled hosted canonical transaction covers the padded reference fixture.
+It does not establish sustained production throughput; the remaining restore
+steps and final admitted production operation are still required.
 
 # Implemented tools
 
