@@ -49,7 +49,9 @@ Latest continuation, 2026-09-09:
   The shared batch planner preserves exact row identities and original values,
   rolls back late failures and refuses replay. Four local D1 tests cover the
   real transaction path; six Worker tests cover the temporary HTTP/admin/cron
-  pause and database mutation guards. The corrected, committed-source disposable hosted rehearsal at `79d6bb19`
+  pause and database mutation guards. Final tooling source `53dcf8ed` passes
+  38 focused checks, TypeScript and both clean-tree dry-deployment checks.
+  The corrected, committed-source disposable hosted rehearsal at `79d6bb19`
   passed all 108 checks in 130,990 ms, including canonical 0058/0059, rollback,
   stale replay, mutation guards and exact synthetic row preservation. Both the
   earlier parser-failure fixture and the successful replacement were deleted

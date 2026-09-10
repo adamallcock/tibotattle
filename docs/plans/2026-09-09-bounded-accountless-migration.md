@@ -58,8 +58,9 @@ remote operation.
   bindings, multipart or old-invocation termination.
 - **Worker regression:** all 999 tests in 79 files passed on the integrated
   movement/operator/launcher changes before the final focused refinements.
-  Dry-deployment validation requires the final clean committed tree; it is a
-  separate check. Earlier committed source `b287c57d` also passed both dry runs.
+  Final committed source `53dcf8ed` passes all 38 focused migration, operator,
+  launcher and transport checks, TypeScript, and both clean-tree production and
+  staging dry runs. Documentation/preflight checks pass. No deployment occurred.
 
 None of these results measures sustained production throughput or admits the
 remaining reference tables for a hosted canonical transaction.
