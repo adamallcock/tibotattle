@@ -9,6 +9,11 @@ import { identityDigest } from './release-operation.mjs';
 
 const fail = () => { throw new TypeError('Electron site requires the exact reviewed stable publication plan and unchanged artifacts'); };
 const HASH = /^[a-f0-9]{64}$/u;
+const supportsAutomaticNativeReplacement = version => {
+  if (!/^\d+\.\d+\.\d+$/u.test(version ?? '')) return false;
+  const [major, minor, patch] = version.split('.').map(Number);
+  return major > 0 || minor > 1 || (minor === 1 && patch >= 20);
+};
 const targets = Object.keys(distribution.PRODUCTION_ELECTRON_TARGETS);
 export async function readElectronSitePublication({ planPath, artifactRoot, approvedPlanSha256, verifyPublishedInstaller }) {
   if (!HASH.test(approvedPlanSha256 ?? '')) fail();
@@ -20,7 +25,7 @@ export async function readElectronSitePublication({ planPath, artifactRoot, appr
       || plan.origin !== distribution.PRODUCTION_ELECTRON_UPDATE_ORIGIN
       || plan.status !== 'local_bytes_bound' || plan.published !== false
       || !/^[a-f0-9]{40}$/u.test(plan.sourceRevision ?? '')
-      || !/^\d+\.\d+\.\d+$/u.test(plan.version ?? '')
+      || !supportsAutomaticNativeReplacement(plan.version)
       || !Array.isArray(plan.targets) || plan.targets.length !== 4
       || plan.targets.map(t => t.target).sort().join() !== [...targets].sort().join()) fail();
   const root = await realpath(artifactRoot);
@@ -73,6 +78,7 @@ export async function readElectronSitePublication({ planPath, artifactRoot, appr
 const escape = value => String(value).replace(/[&<>"']/gu, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const text = key => `<span data-i18n="${key}">${escape(EN_US_CATALOG[key])}</span>`;
 export function renderElectronSiteDownloads(html, release) {
+  if (!supportsAutomaticNativeReplacement(release.version)) fail();
   let output = html.replace('</head>', '<meta name="usage-monitor-electron-stable" content="true">\n</head>');
   const description = 'TiboTattle is a private desktop app for macOS, Windows and Linux that estimates your seven-day Codex allowance locally and shows delayed aggregate community activity when published.';
   let descriptions = 0;
@@ -87,12 +93,10 @@ export function renderElectronSiteDownloads(html, release) {
     const pattern = new RegExp(`<section\\b[^>]*data-platform-panel="${platform}"[^>]*>[\\s\\S]*?<\\/section>`, 'u');
     if (!pattern.test(output)) throw new TypeError('Missing exact platform panel');
     const handover = mac ? `<details class="electron-handover"><summary>${text('electron.site.handoverTitle')}</summary>
-      <p>${text('electron.site.handoverIntro')}</p><p>${text('electron.site.handoverOlder')}</p><ol>
+      <p>${text('electron.site.handoverIntro')}</p><ol>
       <li>${text('electron.site.handoverQuit')}</li>
-      <li>${text('electron.site.handoverFolder')} <code>~/Library/Application Support/TiboTattle Native Handover/native-app</code></li>
-      <li>${text('electron.site.handoverPreserve')}</li>
       <li>${text('electron.site.handoverInstall')}</li>
-      <li>${text('electron.site.handoverKeep')}</li></ol></details>` : '';
+      </ol><p>${text('electron.site.handoverKeep')}</p></details>` : '';
     output = output.replace(pattern, `<section class="platform-panel" id="platform-panel-${platform}" role="tabpanel" aria-labelledby="platform-tab-${platform}" data-platform-panel="${platform}" tabindex="0"${platform === 'macos' ? '' : ' hidden'}>
       ${release.publishedInstallersVerified ? '' : '<p><strong>Local preview — publication has not been verified.</strong></p>'}
       <a class="button mac-download-button" href="${escape(item.url)}" data-electron-download="${item.target}">${text(`electron.site.download.${platform}`)}</a>
@@ -111,7 +115,7 @@ export function renderElectronSiteDocumentation(html) {
   let output = html.replace(/<article\b[^>]*id="start"[^>]*>[\s\S]*?<\/article>/u,
     `<article class="resource-card" id="start"><h2>Install TiboTattle</h2>
     <p>Choose the matching platform on the <a href="./index.html#download">download page</a>. The app includes its runtime.</p>
-    <p>For an existing native Mac installation, follow the guided handover on the download page before replacing the old app. Keep the old signed app, history and backups. Native Sparkle updates and Homebrew remain separate native-release channels.</p>
+    <p>To update an existing Mac installation, quit TiboTattle, replace it in Applications and open the new app. TiboTattle automatically transfers retained history and settings while preserving existing data and credentials. No manual backup or intermediate update is needed.</p>
     <p>On first launch, read the complete local-source and automatic-sharing explanation and select Continue. Sharing can stay off; Settings keeps your choice. This public website never scans local files or accepts contributions.</p></article>`);
   output = output.replace(/<article\b[^>]*id="platforms"[^>]*>[\s\S]*?<\/article>/u,
     `<article class="resource-card" id="platforms"><h2>Platform support</h2><p>Electron downloads are available for macOS 14 or later on Apple silicon and Intel, Windows 10 or later on x64, and Linux x86_64 as an AppImage. See the download page for platform-specific installation requirements.</p></article>`);

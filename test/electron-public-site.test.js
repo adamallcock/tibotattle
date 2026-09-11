@@ -14,11 +14,11 @@ async function fixture(t) {
   const origin='https://updates.tibotattle.com', targets=[];
   for (const target of ['darwin-arm64','darwin-x64','win32-x64','linux-x64']) {
     await mkdir(join(root,target));
-    const name=target.startsWith('darwin-') ? `TiboTattle-0.1.19-mac-${target.slice(7)}.dmg` : target==='win32-x64' ? 'TiboTattle-0.1.19-Windows-x64.exe' : 'TiboTattle-0.1.19-linux-x86_64.AppImage';
+    const name=target.startsWith('darwin-') ? `TiboTattle-0.1.20-mac-${target.slice(7)}.dmg` : target==='win32-x64' ? 'TiboTattle-0.1.20-Windows-x64.exe' : 'TiboTattle-0.1.20-linux-x86_64.AppImage';
     const object=async name=>{const bytes=Buffer.from('synthetic '+name);await writeFile(join(root,target,name),bytes);return {objectKey:`electron/stable/${target}/${name}`,localPath:`${target}/${name}`,sha256:hash(bytes),bytes:bytes.length};};
     targets.push({target,feedURL:`${origin}/electron/stable/${target}`,artifacts:[await object(name)],feed:await object('latest.yml')});
   }
-  const plan={schemaVersion:'tibotattle-electron-stable-publication-plan-v1',origin,version:'0.1.19',buildNumber:'2026091002',sourceRevision:'1'.repeat(40),status:'local_bytes_bound',published:false,targets};
+  const plan={schemaVersion:'tibotattle-electron-stable-publication-plan-v1',origin,version:'0.1.20',buildNumber:'2026091002',sourceRevision:'1'.repeat(40),status:'local_bytes_bound',published:false,targets};
   const planPath=join(root,'plan.json');await writeFile(planPath,JSON.stringify(plan));
   return {root,plan,planPath,options:{planPath,artifactRoot:root,approvedPlanSha256:identityDigest(plan)}};
 }
@@ -35,20 +35,20 @@ test('Electron intake refuses foreign feed and symlink artifacts before a downlo
   const g=await fixture(t);const path=join(g.root,g.plan.targets[0].artifacts[0].localPath);await rm(path);await symlink(g.planPath,path);
   await assert.rejects(readElectronSitePublication({...g.options,verifyPublishedInstaller:async()=>{}}),/exact reviewed/u);
 });
-test('actual public generator renders four targets and guided handover, keeps aliases and updates docs without dashboard assets',async t=>{
+test('actual public generator renders four targets and automatic native replacement, keeps aliases and updates docs without dashboard assets',async t=>{
   const f=await fixture(t);const social=join(f.root,'social.png');await writeFile(social,await readFile(new URL('../apps/web/public/tibotattle-icon.png',import.meta.url)));
   const output=join(f.root,'output'); // Root contains output, but output never contains any intake file.
-  const args={output,siteUrl:'https://tibotattle.com/',releaseNotesUrl:'https://github.com/adamallcock/tibotattle/releases/tag/v0.1.19',privacyUrl:'https://tibotattle.com/privacy',securityUrl:'https://tibotattle.com/docs',supportUrl:'https://github.com/adamallcock/tibotattle/issues',socialImage:social,electronPublicationPlan:f.planPath,electronPublicationRoot:f.root,electronApprovedPlanSha256:f.options.approvedPlanSha256};
+  const args={output,siteUrl:'https://tibotattle.com/',releaseNotesUrl:'https://github.com/adamallcock/tibotattle/releases/tag/v0.1.20',privacyUrl:'https://tibotattle.com/privacy',securityUrl:'https://tibotattle.com/docs',supportUrl:'https://github.com/adamallcock/tibotattle/issues',socialImage:social,electronPublicationPlan:f.planPath,electronPublicationRoot:f.root,electronApprovedPlanSha256:f.options.approvedPlanSha256};
   let calls=0;await buildPublicReleaseSite(args,{verifyPublishedInstaller:async value=>{calls++;return {bytes:value.expectedBytes,sha256:value.expectedSha256,published:false};}});
   assert.equal(calls,4);const html=await readFile(join(output,'index.html'),'utf8');
   assert.equal((html.match(/data-electron-download=/gu)||[]).length,4);
-  assert.match(html,/Native Handover\/native-app/u);
-  assert.match(html,/Using native 0\.1\.16/u);assert.match(html,/install native 0\.1\.18/u);
+  assert.match(html,/automatically carries over your retained history and settings/u);
+  assert.doesNotMatch(html,/native-app|Keep the old app|install native 0\.1\.18/u);
   assert.equal((html.match(/private desktop app for macOS, Windows and Linux/gu)||[]).length,3);
   assert.match(html,/<meta property="og:image:width" content="1024">/u);
   assert.match(html,/<meta property="og:image:height" content="1024">/u);
   assert.match(html,/<meta name="twitter:card" content="summary">/u);
-  assert.match(html,/<meta property="og:image:alt" content="TiboTattle logo">/u);assert.match(html,/do not replace that backup/u);
+  assert.match(html,/<meta property="og:image:alt" content="TiboTattle logo">/u);assert.match(html,/Your existing data and credentials are preserved/u);
   assert.doesNotMatch(html,/brew install|not available yet|src="\.\/app.js"/u);
   assert.equal(await readFile(join(output,'community.html'),'utf8'),html);
   const docs=await readFile(join(output,'docs.html'),'utf8');assert.match(docs,/Electron downloads are available/u);assert.doesNotMatch(docs,/macOS is the currently available lane/u);
@@ -58,4 +58,10 @@ test('actual public generator renders four targets and guided handover, keeps al
 test('CLI accepts only explicit complete Electron intake flags',()=>{
   const args=parseArgs(['--electron-publication-plan','/plan.json','--electron-publication-root','/root','--electron-approved-plan-sha256','a'.repeat(64)]);
   assert.equal(args.electronPublicationPlan,'/plan.json');assert.equal(args.electronApprovedPlanSha256,'a'.repeat(64));
+});
+
+test('automatic replacement copy cannot be built against the legacy 0.1.19 release', async t => {
+  const f = await fixture(t); f.plan.version = '0.1.19';
+  await writeFile(f.planPath, JSON.stringify(f.plan));
+  await assert.rejects(readElectronSitePublication({...f.options, approvedPlanSha256: identityDigest(f.plan), verifyPublishedInstaller: async () => assert.fail('legacy release must fail before any download')}), /exact reviewed/u);
 });
