@@ -205,7 +205,8 @@ and actual statement counts. The lifecycle `last_completed_at` stamp precedes
 optional work and must not be mistaken for the whole invocation duration.
 Calculation failures also expose a closed `failureReason`: prepared-source
 revision, saved-control or day-count validation, other unavailable evidence,
-source change, query budget, database constraint/error, type error, or unknown
+source change, query budget, database or account storage full, database
+constraint/error, type error, or unknown
 error. These labels never include error messages, stack traces or identifiers.
 Use the classified failure and saved checkpoint movement together; a successful
 maintenance result does not prove that its calculations succeeded.

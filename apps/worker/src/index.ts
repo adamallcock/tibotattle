@@ -4159,6 +4159,8 @@ function reconstructionFailureReason(error: unknown): string {
   if (error instanceof Error) {
     if (error.message === "v1 source changed during analysis") return "source_changed";
     if (/\bD1_(?:EXEC_)?ERROR\b/u.test(error.message)) {
+      if (/Exceeded maximum DB size|SQLITE_FULL|database or disk is full/iu.test(error.message)) return "database_full";
+      if (/maximum account storage limit/iu.test(error.message)) return "account_storage_full";
       return /SQLITE_CONSTRAINT|constraint failed/iu.test(error.message)
         ? "database_constraint" : "database_error";
     }
