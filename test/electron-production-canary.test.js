@@ -2,9 +2,10 @@ import test from 'node:test';
 import { RELEASE_VERSION } from '../config/release-manifest.js';
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, privateDecrypt, createDecipheriv } from 'node:crypto';
-import { parseProductionCanaryArguments, validateCanaryHost, validateCanaryManifest, sealCanaryCleanup } from '../scripts/run-signed-electron-production-canary.mjs';
+import { parseProductionCanaryArguments, validateCanaryHost, validateCanaryManifest, sealCanaryCleanup, acceptedDefaultOnSharing, validateCanaryReleaseIdentity, refreshCanaryLocalUsage } from '../scripts/run-signed-electron-production-canary.mjs';
 import { createProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
-const identity = ['--app', '/tmp/TiboTattle.app', '--source-revision', 'a'.repeat(40), '--asar-sha256', 'b'.repeat(64),
+import distributionPolicy from '../config/electron-production-distribution.cjs';
+const identity = ['--build-number','2026091111','--archive-sha256','d'.repeat(64),'--app', '/tmp/TiboTattle.app', '--source-revision', 'a'.repeat(40), '--asar-sha256', 'b'.repeat(64),
   '--cleanup-public-key', '/tmp/canary.pem', '--cleanup-public-key-sha256', 'c'.repeat(64)];
 
 test('production canary defaults to preparation and requires a closed explicit execution confirmation', () => {
@@ -82,8 +83,13 @@ test('dispatch intake rejects unapproved source, destination, key and execution 
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const workflow = await readFile(new URL('../.github/workflows/electron-production-canary.yml', import.meta.url), 'utf8');
-  const python = workflow.match(/python3 - <<'PY'\n([\s\S]*?)\n          PY/u)?.[1].replace(/^          /gmu, '');
-  assert.ok(python);
+  const unfilledPython = workflow.match(/python3 - <<'PY'\n([\s\S]*?)\n          PY/u)?.[1].replace(/^          /gmu, '');
+  assert.ok(unfilledPython);
+  for (const name of ['source','build','archive','asar']) assert.ok(unfilledPython.includes(`approved_${name}=None`));
+  const python=unfilledPython.replace('approved_source=None', `approved_source='${'a'.repeat(40)}'`)
+    .replace('approved_build=None', "approved_build='2026091111'")
+    .replace('approved_archive=None', `approved_archive='${'b'.repeat(64)}'`)
+    .replace('approved_asar=None', `approved_asar='${'c'.repeat(64)}'`);
   execFileSync('python3', ['-c', 'import sys; compile(sys.stdin.read(), "intake", "exec")'], { input: python });
   assert.equal(workflow.includes('secrets.'), false);
   assert.ok(workflow.includes("canary:\n    if: github.event_name == 'workflow_dispatch'"));
@@ -93,15 +99,50 @@ test('dispatch intake rejects unapproved source, destination, key and execution 
   assert.equal(workflow.includes('--location'), false);
   const directory = await mkdtemp(join(tmpdir(), 'canary-intake-refusal-'));
   const environment = { PATH: process.env.PATH, RUNNER_TEMP: directory, GITHUB_SHA: 'a'.repeat(40),
-    SELECTED_RUNNER: 'a'.repeat(40), SELECTED_SOURCE: '178315c49f432c8c1ed84f8c982d1c57aed8a094', SELECTED_ARCHIVE: 'b85988831c5d0efd5750ed027e651d29942c268158949f76f9e497ef26f81f6b',
-    SELECTED_ASAR: 'd850f0b13ba116b43b36c4e6a5fedabdfe25af35b072dd7b0b5d7fd535319dc3', CLEANUP_KEY_SHA256: 'e'.repeat(64), SELECTED_MODE: 'execute',
+    SELECTED_RUNNER: 'a'.repeat(40), SELECTED_SOURCE: 'a'.repeat(40), SELECTED_BUILD:'2026091111', SELECTED_ARCHIVE: 'b'.repeat(64),
+    SELECTED_ASAR: 'c'.repeat(64), CLEANUP_KEY_SHA256: 'e'.repeat(64), SELECTED_MODE: 'execute',
     EXECUTION_CONFIRMATION: 'RUN_ONE_SYNTHETIC_PRODUCTION_CANARY', CLEANUP_PUBLIC_KEY: 'aW52YWxpZA==',
-    SELECTED_URL: 'https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/production-canary/178315c49f432c8c1ed84f8c982d1c57aed8a094/b85988831c5d0efd5750ed027e651d29942c268158949f76f9e497ef26f81f6b.zip' };
+    SELECTED_URL: `https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/production-canary/${'a'.repeat(40)}/${'b'.repeat(64)}.zip` };
   try {
-    for (const changed of [ { SELECTED_RUNNER: 'f'.repeat(40) }, { SELECTED_SOURCE: 'f'.repeat(40) }, { SELECTED_ARCHIVE: 'f'.repeat(64) }, { SELECTED_ASAR: 'f'.repeat(64) }, { SELECTED_URL: 'https://other.test/app.zip' },
+    assert.throws(() => execFileSync('python3',['-c',unfilledPython],{env:environment,stdio:'ignore',timeout:3000}));
+    assert.deepEqual(await readdir(directory),[]);
+    for (const changed of [ { SELECTED_BUILD:'2026091112' }, { SELECTED_RUNNER: 'f'.repeat(40) }, { SELECTED_SOURCE: 'f'.repeat(40) }, { SELECTED_ARCHIVE: 'f'.repeat(64) }, { SELECTED_ASAR: 'f'.repeat(64) }, { SELECTED_URL: 'https://other.test/app.zip' },
       { EXECUTION_CONFIRMATION: '' }, { CLEANUP_PUBLIC_KEY: Buffer.from('-----BEGIN PRIVATE KEY-----\n').toString('base64') } ]) {
       assert.throws(() => execFileSync('python3', ['-c', python], { env: { ...environment, ...changed }, stdio: 'ignore', timeout: 3000 }));
       assert.deepEqual(await readdir(directory), []);
     }
   } finally { await rm(directory, { recursive: true }); }
+});
+
+
+test('fresh acceptance excludes cached timestamps, partial uploads and explicit opt-in', () => {
+  const value={enabled:true,basis:'default_on',transportStatus:'up_to_date',lastAcceptedAt:'2026-09-11T12:00:01.000Z'};
+  assert.equal(acceptedDefaultOnSharing(value),true);
+  assert.equal(acceptedDefaultOnSharing(value,'2026-09-11T12:00:00.000Z'),true);
+  for(const changed of [{lastAcceptedAt:null},{lastAcceptedAt:'invalid'},{enabled:false},{basis:'explicit_on'},{transportStatus:'pending'}])assert.equal(acceptedDefaultOnSharing({...value,...changed}),false);
+  assert.equal(acceptedDefaultOnSharing(value,value.lastAcceptedAt),false);
+});
+
+test('canary release identity binds provenance build, Mac allocation, incoming key and OS floor', () => {
+  const sourceRevision='a'.repeat(40),buildNumber='2026091111';
+  const metadata=createProductionDistributionMetadata({target:'darwin-arm64',sourceRevision,buildNumber});
+  const manifest={name:'app-usagemonitor',version:'0.1.22',tibotattleDistribution:metadata};
+  const plist={CFBundleIdentifier:distributionPolicy.PRODUCTION_ELECTRON_APP_ID,CFBundleExecutable:'TiboTattle',CFBundleShortVersionString:'0.1.22',CFBundleVersion:'1029',LSMinimumSystemVersion:'14.0',SUPublicEDKey:distributionPolicy.PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY};
+  assert.equal(validateCanaryReleaseIdentity(manifest,plist,{sourceRevision,buildNumber}).target,'darwin-arm64');
+  for(const changed of [{CFBundleVersion:'1028'},{CFBundleShortVersionString:'0.1.21'},{LSMinimumSystemVersion:'12.0'},{SUPublicEDKey:'wrong'}])assert.throws(()=>validateCanaryReleaseIdentity(manifest,{...plist,...changed},{sourceRevision,buildNumber}));
+  assert.throws(()=>validateCanaryReleaseIdentity(manifest,plist,{sourceRevision,buildNumber:'2026091112'}));
+});
+
+test('ordinary restart refresh waits for a new completed refresh, not an old success', async () => {
+  let clicked=false,reads=0;
+  const dashboard={evaluate:async code=>{
+    if(code.includes('.disabled'))return true;
+    if(code.includes('.click()')){clicked=true;return;}
+    assert.ok(code.includes("fetch('/api/local/refresh'"));
+    assert.equal(code.includes('POST'),false);
+    reads++;
+    return {status:'succeeded',refreshId:clicked?'new':'old'};
+  }};
+  assert.equal(await refreshCanaryLocalUsage({sessions:[dashboard]}),true);
+  assert.equal(clicked,true);assert.equal(reads,2);
 });

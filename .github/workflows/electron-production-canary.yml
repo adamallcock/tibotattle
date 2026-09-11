@@ -1,7 +1,7 @@
 name: Electron production synthetic canary
 on:
   push:
-    branches: [codex/unified-desktop-accountless]
+    branches: [codex/unified-desktop-accountless, codex/electron-release-tooling-022]
   workflow_dispatch:
     inputs:
       mode:
@@ -16,6 +16,10 @@ on:
         required: true
       source_revision:
         description: Exact signed application source commit
+        type: string
+        required: true
+      build_number:
+        description: Exact final signed application provenance build number
         type: string
         required: true
       archive_url:
@@ -64,6 +68,7 @@ jobs:
       SELECTED_MODE: ${{ inputs.mode }}
       SELECTED_RUNNER: ${{ inputs.runner_revision }}
       SELECTED_SOURCE: ${{ inputs.source_revision }}
+      SELECTED_BUILD: ${{ inputs.build_number }}
       SELECTED_URL: ${{ inputs.archive_url }}
       SELECTED_ARCHIVE: ${{ inputs.archive_sha256 }}
       SELECTED_ASAR: ${{ inputs.asar_sha256 }}
@@ -102,11 +107,17 @@ jobs:
           assert e['SELECTED_MODE'] in ['plan','execute']
           assert e['EXECUTION_CONFIRMATION']==('RUN_ONE_SYNTHETIC_PRODUCTION_CANARY' if e['SELECTED_MODE']=='execute' else '')
           url=e['SELECTED_URL']
-          # One reviewed archive only. Inputs bind approval; they do not select arbitrary signed payloads.
-          assert source=='178315c49f432c8c1ed84f8c982d1c57aed8a094'
-          assert digest=='b85988831c5d0efd5750ed027e651d29942c268158949f76f9e497ef26f81f6b'
-          assert asar=='d850f0b13ba116b43b36c4e6a5fedabdfe25af35b072dd7b0b5d7fd535319dc3'
-          assert url=='https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/production-canary/178315c49f432c8c1ed84f8c982d1c57aed8a094/b85988831c5d0efd5750ed027e651d29942c268158949f76f9e497ef26f81f6b.zip'
+          # Final022 pins are deliberately unfilled. A reviewed runner commit must
+          # bind final bytes before either plan or execute may contact the host.
+          approved_source=None
+          approved_build=None
+          approved_archive=None
+          approved_asar=None
+          assert all(v is not None for v in [approved_source,approved_build,approved_archive,approved_asar]), 'FINAL_022_INPUTS_PENDING'
+          assert source==approved_source and e['SELECTED_BUILD']==approved_build
+          assert re.fullmatch('[0-9]{10}',e['SELECTED_BUILD'])
+          assert digest==approved_archive and asar==approved_asar
+          assert url==f'https://updates.tibotattle.com/electron/rehearsal/native-to-electron-handover-v1/production-canary/{source}/{digest}.zip'
           assert re.fullmatch(r'https://updates\.tibotattle\.com/electron/rehearsal/native-to-electron-handover-v1/production-canary/[0-9a-f]{40}/[0-9a-f]{64}\.zip',url)
           key=base64.b64decode(e['CLEANUP_PUBLIC_KEY'],validate=True)
           assert len(key)<=16384 and key.startswith(b'-----BEGIN PUBLIC KEY-----\n') and hashlib.sha256(key).hexdigest()==key_digest
@@ -134,7 +145,7 @@ jobs:
           extracted=root/'verified';extracted.mkdir(mode=0o700)
           subprocess.run(['/usr/bin/ditto','-x','-k',str(archive),str(extracted)],check=True,timeout=120)
           pathlib.Path('canary-receipts/intake.json').write_text(json.dumps({'runnerRevision':runner,'sourceRevision':source,
-            'archiveUrl':url,'archiveSha256':digest,'asarSha256':asar,'cleanupKeySha256':key_digest,'archiveVerified':True})+'\n')
+            'version':'0.1.22','buildNumber':e['SELECTED_BUILD'],'archiveUrl':url,'archiveSha256':digest,'asarSha256':asar,'cleanupKeySha256':key_digest,'archiveVerified':True})+'\n')
           PY
       - name: Verify or execute the approved single synthetic source
         run: |
@@ -145,7 +156,8 @@ jobs:
           fi
           node scripts/run-signed-electron-production-canary.mjs "${args[@]}" \
             --app "$RUNNER_TEMP/production-canary-intake/verified/TiboTattle.app" \
-            --source-revision "$SELECTED_SOURCE" --asar-sha256 "$SELECTED_ASAR" \
+            --source-revision "$SELECTED_SOURCE" --build-number "$SELECTED_BUILD" \
+            --archive-sha256 "$SELECTED_ARCHIVE" --asar-sha256 "$SELECTED_ASAR" \
             --cleanup-public-key "$RUNNER_TEMP/production-canary-intake/cleanup-public.pem" \
             --cleanup-public-key-sha256 "$CLEANUP_KEY_SHA256" > canary-receipts/execution.json
       - name: Retain closed evidence and encrypted owner cleanup target only

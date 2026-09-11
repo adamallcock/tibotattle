@@ -27,19 +27,21 @@ const sha = (value) => createHash('sha256').update(value).digest('hex');
 export function parseProductionCanaryArguments(argv) {
   const mode = argv[0];
   if (!['--plan', '--execute-production-canary'].includes(mode)) fail('arguments');
-  const allowed = new Set(['--app', '--source-revision', '--asar-sha256', '--cleanup-public-key', '--cleanup-public-key-sha256', '--confirm']);
+  const allowed = new Set(['--app', '--source-revision', '--build-number', '--archive-sha256', '--asar-sha256', '--cleanup-public-key', '--cleanup-public-key-sha256', '--confirm']);
   const values = {};
   for (let i = 1; i < argv.length; i += 2) {
     if (!allowed.has(argv[i]) || Object.hasOwn(values, argv[i]) || typeof argv[i + 1] !== 'string' || argv[i + 1].startsWith('--')) fail('arguments');
     values[argv[i]] = argv[i + 1];
   }
-  const required = ['--app', '--source-revision', '--asar-sha256', '--cleanup-public-key', '--cleanup-public-key-sha256'];
+  const required = ['--app', '--source-revision', '--build-number', '--archive-sha256', '--asar-sha256', '--cleanup-public-key', '--cleanup-public-key-sha256'];
   if (required.some((key) => !values[key]) || !/^[0-9a-f]{40}$/u.test(values['--source-revision'])
+    || !/^[0-9]{10}$/u.test(values['--build-number']) || !SHA.test(values['--archive-sha256'])
     || !SHA.test(values['--asar-sha256']) || !SHA.test(values['--cleanup-public-key-sha256'])
     || !isAbsolute(values['--app']) || basename(values['--app']) !== 'TiboTattle.app'
     || !isAbsolute(values['--cleanup-public-key'])) fail('arguments');
   if (mode === '--plan' ? values['--confirm'] !== undefined : values['--confirm'] !== CONFIRMATION) fail('confirmation');
   return { execute: mode !== '--plan', appPath: resolve(values['--app']), sourceRevision: values['--source-revision'],
+    buildNumber: values['--build-number'], archiveSha256: values['--archive-sha256'],
     asarSha256: values['--asar-sha256'], cleanupKeyPath: resolve(values['--cleanup-public-key']), cleanupKeySha256: values['--cleanup-public-key-sha256'] };
 }
 
@@ -107,6 +109,34 @@ export function sealCanaryCleanup(publicKey, payload) {
       iv: iv.toString('base64'), tag: cipher.getAuthTag().toString('base64'), ciphertext: ciphertext.toString('base64') };
   } finally { aes.fill(0); plaintext.fill(0); }
 }
+export function acceptedDefaultOnSharing(value, after = null) {
+  const stamp = typeof value?.lastAcceptedAt === 'string' ? Date.parse(value.lastAcceptedAt) : NaN;
+  return value?.enabled === true && value.basis === 'default_on' && value.transportStatus === 'up_to_date'
+    && Number.isFinite(stamp) && (after === null || (Number.isFinite(Date.parse(after)) && stamp > Date.parse(after)));
+}
+export async function refreshCanaryLocalUsage(active) {
+  const dashboard = active.sessions[0];
+  const read = () => dashboard.evaluate(`fetch('/api/local/refresh', {cache:'no-store',redirect:'error'}).then(r => {
+    if (!r.ok) throw Error('refresh unavailable'); return r.json(); }).then(v => ({status:v.refresh.status,refreshId:v.refresh.refreshId}))`);
+  await waitFor(() => dashboard.evaluate(`Boolean(document.querySelector('#refresh-button') && !document.querySelector('#refresh-button').disabled)`), 60000, 'ordinary refresh available');
+  const before = await read();
+  await dashboard.evaluate(`document.querySelector('#refresh-button').click()`);
+  await waitFor(async () => { const value = await read();
+    if (value.refreshId === before.refreshId) return false;
+    if (['failed','cancelled'].includes(value.status)) fail('restart_local_refresh');
+    return value.status === 'succeeded'; }, 6 * 60000, 'ordinary local refresh completed');
+  return true;
+}
+export function validateCanaryReleaseIdentity(manifest, plist, { sourceRevision, buildNumber }) {
+  const metadata = validateCanaryManifest(manifest, sourceRevision);
+  if (manifest.version !== '0.1.22' || metadata.buildNumber !== buildNumber
+      || plist.CFBundleIdentifier !== distributionPolicy.PRODUCTION_ELECTRON_APP_ID
+      || plist.LSMinimumSystemVersion !== '14.0' || plist.CFBundleExecutable !== 'TiboTattle') fail('artifact_release_identity');
+  distributionPolicy.assertProductionElectronMacOSBundleMetadata({target:'darwin-arm64',version:'0.1.22',buildNumber,
+    bundleVersion:plist.CFBundleVersion,bundleShortVersion:plist.CFBundleShortVersionString});
+  distributionPolicy.assertProductionElectronMacOSIncomingUpgradeMetadata({target:'darwin-arm64',publicEDKey:plist.SUPublicEDKey});
+  return metadata;
+}
 async function verifyArtifact(options) {
   const keyBytes = await boundedFile(options.cleanupKeyPath, 16384);
   if (sha(keyBytes) !== options.cleanupKeySha256) fail('cleanup_key_digest');
@@ -128,7 +158,12 @@ async function verifyArtifact(options) {
   const api = loaded?.default ?? loaded;
   if (api.statFile(asar, 'package.json').size > 128 * 1024) fail('artifact_metadata');
   const manifest = JSON.parse(api.extractFile(asar, 'package.json').toString('utf8'));
-  const distribution = validateCanaryManifest(manifest, options.sourceRevision);
+  const plist = JSON.parse(execFileSync('/usr/bin/plutil', ['-convert','json','-o','-',join(options.appPath,'Contents/Info.plist')], {encoding:'utf8',stdio:['ignore','pipe','ignore'],timeout:30000}));
+  const distribution = validateCanaryReleaseIdentity(manifest, plist, options);
+  const architecture = execFileSync('/usr/bin/lipo', ['-archs',join(options.appPath,'Contents/MacOS/TiboTattle')], {encoding:'utf8',stdio:['ignore','pipe','ignore'],timeout:30000}).trim();
+  if (architecture !== 'arm64') fail('artifact_architecture');
+  execFileSync('/usr/bin/xcrun', ['stapler','validate',options.appPath], {timeout:30000,stdio:'ignore'});
+  execFileSync('/usr/sbin/spctl', ['--assess','--type','execute',options.appPath], {timeout:30000,stdio:'ignore'});
   return { appPath: options.appPath, executable: join(options.appPath, 'Contents', 'MacOS', 'TiboTattle'), keyBytes, distribution, packageVersion: manifest.version };
 }
 async function readBinding(profile) {
@@ -143,10 +178,10 @@ async function readBinding(profile) {
 
 export async function runProductionCanary(options) {
   const proof = { schemaVersion: SCHEMA, status: 'failed', origin: ORIGIN,
-    sourceRevision: options.sourceRevision, asarSha256: options.asarSha256, cleanupKeySha256: options.cleanupKeySha256,
+    sourceRevision: options.sourceRevision, version:'0.1.22', buildNumber:options.buildNumber, archiveSha256:options.archiveSha256, asarSha256: options.asarSha256, cleanupKeySha256: options.cleanupKeySha256,
     operationId: randomUUID(), artifactVerified: false, untouchedProfile: false, nativeIntroContinued: false,
     controlledRestart: false, nativeCleanQuitQualified: false, automaticAcceptedUpload: false,
-    restartBindingRetained: false, durableOptOut: false, ownedProcessesStopped: false,
+    restartBindingRetained: false, restartLocalRefresh: false, restartAcceptedUpload: false, durableOptOut: false, ownedProcessesStopped: false,
     hostedCleanup: 'not_started', cleanupHandoffWritten: false, productionReadiness: false,
     failureStage: null };
   let active, profile, evidenceRoot, verified, launched = false, handoff = false;
@@ -183,18 +218,27 @@ export async function runProductionCanary(options) {
     active = await launchVerifiedMacSharingApp(verified, environment, { untouched: true });
     proof.nativeIntroContinued = active.nativeIntroContinued === true;
     stage = 'accepted_upload';
-    await waitFor(async () => { const v = await active.readSharing(); return v?.enabled === true && v.basis === 'default_on'
-      && v.transportStatus === 'up_to_date' && typeof v.lastAcceptedAt === 'string'; }, 6 * 60000, 'automatic accepted upload');
+    const accepted = await waitFor(async () => { const value = await active.readSharing();
+      return acceptedDefaultOnSharing(value) ? value : null; }, 6 * 60000, 'automatic accepted upload');
     proof.automaticAcceptedUpload = true;
     const initial = await readBinding(profile);
     await writeFile(join(evidenceRoot, 'cleanup-target.encrypted.json'), JSON.stringify(sealCanaryCleanup(verified.keyBytes, {
       ...proof, deviceId: initial.deviceId })) + '\n', { mode: 0o600, flag: 'wx' });
     handoff = proof.cleanupHandoffWritten = true;
     proof.ownedProcessesStopped = await stopOwnedMacSharingApp(active); active = null;
+    // A second tiny synthetic source requires a fresh ordinary scheduled acceptance;
+    // a persisted up-to-date label alone cannot establish credential reuse.
+    await writeFile(join(sessions, 'rollout-production-restart-synthetic.jsonl'),
+      signedStagingFixture().replaceAll('signed-staging-synthetic','signed-production-restart-synthetic'), {mode:0o600,flag:'wx'});
     stage = 'restart_binding';
     proof.ownedProcessesStopped = false;
     active = await launchVerifiedMacSharingApp(verified, environment);
-    await waitFor(async () => (await active.readSharing())?.transportStatus === 'up_to_date', 6 * 60000, 'restart status');
+    proof.restartLocalRefresh = await refreshCanaryLocalUsage(active);
+    proof.ownedProcessesStopped = await stopOwnedMacSharingApp(active); active = null;
+    proof.ownedProcessesStopped = false;
+    active = await launchVerifiedMacSharingApp(verified, environment);
+    await waitFor(async () => acceptedDefaultOnSharing(await active.readSharing(), accepted.lastAcceptedAt), 6 * 60000, 'fresh authenticated restart acceptance');
+    proof.restartAcceptedUpload = true;
     if ((await readBinding(profile)).digest !== initial.digest) fail('binding_changed');
     proof.restartBindingRetained = true;
     proof.controlledRestart = true;
