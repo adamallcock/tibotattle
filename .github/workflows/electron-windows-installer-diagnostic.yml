@@ -1,0 +1,85 @@
+name: Electron Windows installer diagnostic
+run-name: Windows frozen installer diagnostic (${{ inputs.source_revision }})
+on:
+  push:
+    branches: [codex/electron-direct-upgrade]
+  workflow_dispatch:
+    inputs:
+      source_revision:
+        description: Exact signed application source revision
+        required: true
+        type: string
+      signing_run_id:
+        description: Existing signing run ID; no rebuild or signing occurs
+        required: true
+        type: string
+      artifact_id:
+        description: Exact retained signing artifact ID
+        required: true
+        type: string
+      installer_sha256:
+        description: Exact previously signed installer SHA-256
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+jobs:
+  registration:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: printf '%s\n' 'WINDOWS_INSTALLER_DIAGNOSTIC_REGISTERED'
+  diagnose:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 12
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      SOURCE_REVISION: ${{ inputs.source_revision }}
+      SIGNING_RUN_ID: ${{ inputs.signing_run_id }}
+      ARTIFACT_ID: ${{ inputs.artifact_id }}
+      INSTALLER_SHA256: ${{ inputs.installer_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Bind immutable signing evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SOURCE_REVISION -cnotmatch '^[0-9a-f]{40}$' -or $env:INSTALLER_SHA256 -cnotmatch '^[0-9a-f]{64}$' -or $env:SIGNING_RUN_ID -notmatch '^[1-9][0-9]+$' -or $env:ARTIFACT_ID -notmatch '^[1-9][0-9]+$') { throw 'DIAGNOSTIC_INPUT_INVALID' }
+          $run = gh api "repos/adamallcock/tibotattle/actions/runs/$env:SIGNING_RUN_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $run.head_sha -cne $env:SOURCE_REVISION -or $run.event -ne 'workflow_dispatch' -or $run.path -ne '.github/workflows/electron-windows-signing.yml') { throw 'DIAGNOSTIC_SOURCE_RUN_INVALID' }
+          $artifact = gh api "repos/adamallcock/tibotattle/actions/artifacts/$env:ARTIFACT_ID" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0 -or $artifact.expired -or $artifact.workflow_run.id -ne [long]$env:SIGNING_RUN_ID -or $artifact.name -cne "electron-windows-signed-$env:SIGNING_RUN_ID") { throw 'DIAGNOSTIC_ARTIFACT_INVALID' }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          artifact-ids: ${{ inputs.artifact_id }}
+          run-id: ${{ inputs.signing_run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/signed-input
+          merge-multiple: true
+      - name: Observe the existing signed installer in a disposable VM
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP 'signed-input/electron-production/win32-x64'
+          $proof = Get-Content -LiteralPath (Join-Path $root 'evidence/windows-signed-installed.json') -Raw | ConvertFrom-Json
+          if ($proof.sourceRevision -cne $env:SOURCE_REVISION -or $proof.installerSha256 -cne $env:INSTALLER_SHA256 -or $proof.signedInstallerVerified -ne $true) { throw 'DIAGNOSTIC_SIGNED_BYTES_UNBOUND' }
+          $installers = @(Get-ChildItem -LiteralPath (Join-Path $root 'artifacts') -Filter 'TiboTattle-*-Windows-x64.exe' -File)
+          if ($installers.Count -ne 1) { throw 'DIAGNOSTIC_INSTALLER_AMBIGUOUS' }
+          & ./scripts/diagnose-electron-windows-installer.ps1 -Installer $installers[0].FullName -InstallerSha256 $env:INSTALLER_SHA256 -SourceRevision $env:SOURCE_REVISION -Receipt (Join-Path $env:RUNNER_TEMP 'installer-diagnostic.json')
+          if ($LASTEXITCODE -ne 0) { throw 'DIAGNOSTIC_PROBE_FAILED' }
+      - name: Retain content-free diagnostic
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-installer-diagnostic-${{ github.run_id }}
+          path: ${{ runner.temp }}/installer-diagnostic.json
+          if-no-files-found: error
+          retention-days: 14
