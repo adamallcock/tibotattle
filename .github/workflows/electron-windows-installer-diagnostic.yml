@@ -5,6 +5,11 @@ on:
     branches: [codex/electron-direct-upgrade]
   workflow_dispatch:
     inputs:
+      qualify_installed:
+        description: Run the complete maintained installed journey against these frozen bytes
+        required: true
+        default: false
+        type: boolean
       source_revision:
         description: Exact signed application source revision
         required: true
@@ -34,7 +39,7 @@ jobs:
   diagnose:
     if: github.event_name == 'workflow_dispatch'
     runs-on: windows-2025
-    timeout-minutes: 12
+    timeout-minutes: 20
     defaults:
       run:
         shell: pwsh
@@ -66,6 +71,7 @@ jobs:
           path: ${{ runner.temp }}/signed-input
           merge-multiple: true
       - name: Observe the existing signed installer in a disposable VM
+        if: inputs.qualify_installed != true
         run: |
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:RUNNER_TEMP 'signed-input/electron-production/win32-x64'
@@ -75,11 +81,47 @@ jobs:
           if ($installers.Count -ne 1) { throw 'DIAGNOSTIC_INSTALLER_AMBIGUOUS' }
           & ./scripts/diagnose-electron-windows-installer.ps1 -Installer $installers[0].FullName -InstallerSha256 $env:INSTALLER_SHA256 -SourceRevision $env:SOURCE_REVISION -Receipt (Join-Path $env:RUNNER_TEMP 'installer-diagnostic.json')
           if ($LASTEXITCODE -ne 0) { throw 'DIAGNOSTIC_PROBE_FAILED' }
+      - name: Set up pinned qualification runtime
+        if: inputs.qualify_installed == true
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 26.2.0
+          architecture: x64
+          check-latest: false
+          package-manager-cache: false
+      - name: Install locked qualification dependencies
+        if: inputs.qualify_installed == true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          npm install --global corepack@0.34.0 --force --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_INSTALL_FAILED' }
+          corepack enable
+          if ($LASTEXITCODE -ne 0) { throw 'COREPACK_ENABLE_FAILED' }
+          corepack prepare pnpm@11.9.0 --activate
+          if ($LASTEXITCODE -ne 0) { throw 'PNPM_PREPARE_FAILED' }
+          pnpm install --frozen-lockfile --ignore-scripts
+          if ($LASTEXITCODE -ne 0) { throw 'QUALIFICATION_DEPENDENCIES_FAILED' }
+      - name: Qualify the existing signed installer without rebuilding
+        if: inputs.qualify_installed == true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          node scripts/qualify-electron-windows-frozen-installer.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'FROZEN_INSTALLED_QUALIFICATION_FAILED' }
       - name: Retain content-free diagnostic
-        if: always()
+        if: ${{ always() && inputs.qualify_installed != true }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-installer-diagnostic-${{ github.run_id }}
           path: ${{ runner.temp }}/installer-diagnostic.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Retain frozen installed qualification evidence
+        if: ${{ always() && inputs.qualify_installed == true }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-frozen-installed-${{ github.run_id }}
+          path: |
+            .release-build/electron-production/win32-x64/evidence/
+            .release-build/electron-windows-normal-candidate/normal-candidate-smoke.json
           if-no-files-found: error
           retention-days: 14

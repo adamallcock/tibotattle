@@ -85,3 +85,5 @@ finally {
  Write-Host 'WINDOWS_INSTALLER_DIAGNOSTIC_RECORDED'
 }
 if($null -ne $result.errorCode){exit 1}
+
+exit 0

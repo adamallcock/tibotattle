@@ -174,7 +174,10 @@ export async function runWindowsSignedInstalled(options, {
     if (await registry(installRoot, environment, runProgram) !== 'absent-v1') fail('REGISTRY_DIRTY');
     if (await digest(options.installerPath) !== options.installerSha256) fail('INSTALLER_CHANGED');
     installAttempted = true;
-    const result = await runProgram(options.installerPath, buildWindowsNsisInstallArguments(installRoot), { environment, timeoutMs: 180_000 });
+    // The frozen signed installer completed successfully at 196 seconds on
+    // windows-2025 (2026-09-11). Keep the operation bounded while allowing the
+    // observed installer work; signature, ownership and postconditions stay strict.
+    const result = await runProgram(options.installerPath, buildWindowsNsisInstallArguments(installRoot), { environment, timeoutMs: 300_000 });
     installSettled = result?.settled === true && result.timedOut === false;
     if (!successful(result)) fail('INSTALL_FAILED');
     if (await registry(installRoot, environment, runProgram) !== 'expected-v1') fail('INSTALL_REGISTRY_INVALID');
