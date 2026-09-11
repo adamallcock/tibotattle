@@ -543,6 +543,19 @@ test("deployment CLI separates exact predecessor deployment from stopped-executo
   }
 });
 
+test("deployment CLI captures the current clean candidate when no candidate override is supplied", async () => {
+  const configured = readyOptions();
+  delete configured.expectedSourceCommit;
+  Object.assign(configured, parseProductionDeploymentArgs([
+    "--confirm", "DEPLOY_PRODUCTION", "--expected-previous-source", FIXTURE_PREVIOUS_COMMIT,
+  ]));
+  const result = await runProductionDeployment(configured);
+  assert.equal(result.ok, true);
+  const journal = await readOperation(configured.operationDirectory);
+  assert.equal(journal.state.sourceCommit, FIXTURE_SOURCE_COMMIT);
+  assert.equal(journal.state.outcome, "verified");
+});
+
 test("dependency digest ignores only root Wrangler runtime state", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "usage-monitor-dependency-digest-"));
   t.after(() => rm(root, { recursive: true, force: true }));
