@@ -1,5 +1,5 @@
 ---
-title: macOS native-to-Electron guided handover
+title: macOS native-to-Electron replacement and update transition
 date: 2026-09-07
 type: runbook
 status: draft
@@ -7,10 +7,9 @@ status: draft
 
 # Status and boundary
 
-The automatic replacement path is implemented for the 0.1.20 candidate. Signed
-installed qualification and publication must complete before presenting it as
-available. Released 0.1.19 requires the earlier guided procedure; it is not proof
-of ordinary replacement compatibility.
+Ordinary replacement shipped in 0.1.20. Native Sparkle Check for Updates requires
+the separate installed transition qualification below. Released 0.1.19 required
+the earlier guided procedure; it is not proof of ordinary replacement compatibility.
 
 The required user journey is: quit the old app, replace TiboTattle in Applications
 with the new signed app, and open it. The app transfers compatible retained state
@@ -288,3 +287,75 @@ Electron main process; unknown registration remains untouched. The settings UI
 reads current OS status rather than treating an unapplied local default as a
 confirmed user choice. The helper confirms only writer shutdown and native preferences;
 its `native_writer_prepared` reply carries no startup-setting claims.
+
+## Native 0.1.18 Check for Updates transition
+
+Manual replacement and native Sparkle installation are separate qualification
+journeys. Do not activate `appcast.xml` or `intel/appcast.xml` on the strength of
+manual replacement evidence alone. Electron's outgoing `electron-updater` feeds
+remain separate from these incoming native feeds.
+
+Use the maintained `generate-sparkle-appcast.js --electron-transition` path with
+the existing stable public key, exact signed DMG, actual Apple-compatible
+`CFBundleVersion`, matching short version and pinned Sparkle tools. The generator
+runs official `generate_appcast`, signs the exact archive with official
+`sign_update`, adds that checked enclosure signature, then signs the XML with
+`sign_update`. Both signatures and the content-addressed URL are verified before
+the output is adopted. It never edits the application or notarized archive.
+
+For the Intel Sparkle namespace, copy the final Electron DMG to the native alias
+`TiboTattle-<version>-macOS-x64.dmg` and verify the copy has exactly the same bytes,
+size and SHA-256 as the final `TiboTattle-<version>-mac-x64.dmg`. The alias is not a
+second build. Keep manual GitHub download and Electron updater names unchanged.
+
+Before installed qualification, generate an isolated rehearsal using
+`--electron-transition-test-source <exact-source-commit> --skip-retain` in addition
+to `--electron-transition`. This fixes the enclosure namespace to
+`https://updates.tibotattle.com/electron/test/native-sparkle/<source>/<bundle-version>/<dmg-sha256>/`.
+Only the approved test objects are staged; no stable appcast is activated.
+The rehearsal still uses the native fleet's existing stable verification key.
+The production publisher refuses this test namespace.
+
+Production publication uses the existing `publish-sparkle-update.js` entrypoint,
+previous native 0.1.18 manifest, key-continuity checks and atomic appcast guard.
+Supply a `tibotattle-electron-sparkle-transition-v1` receipt containing:
+
+- `application`: bundle identifier, architecture, actual bundle version and
+  short version; the Mac bundle allocation is validated independently of the
+  timestamp used for build provenance.
+- `artifact`: exact native-alias filename, byte count and final DMG SHA-256.
+- `source` and `channel`: canonical repository, annotated tag, commit and
+  existing stable channel publication contract.
+- `sparkle`: incoming appcast URL and existing public-key fingerprint.
+- `electron`: provenance `buildNumber`, signed `asarSha256`, and
+  `updaterConfigurationSha256` for the packaged outgoing updater configuration.
+- `evidence`: `scope: "local_qualification"` and `nativeSparkleJourney` with a
+  sibling JSON `localPath`, exact bytes and SHA-256 of the retained installed
+  journey receipt. This is local qualification provenance, not a public
+  downloadable path; retain that proof with the release operation.
+
+The journey schema is `tibotattle-signed-macos-sparkle-transition-v1`, with
+`status: "passed"`, exact `target`, `version`, `buildNumber`, `bundleVersion`,
+`sourceRevision`, `dmgSha256`, `asarSha256`, `feedSha256`,
+`feedScope: "isolated_test_feed"`, `productionFeedVerified: false`,
+`candidateCopiedByRunner: false`,
+`nativeVersion: "0.1.18"`, `nativeDmgSha256`, and true results for
+`nativeSparkleUpdateCompleted`, `migrationCompleted`, `retainedRowsPreserved`,
+`saltPreserved`, `preferencesPreserved`, `optOutPreserved`,
+`restartNoDuplicates`, `sourceUntouched`, `ownedProcessesStopped`,
+`signedArtifactVerified`, `disposableAccountVerified`, `checkForUpdatesClicked`,
+`installUpdateClicked`, `updaterRelaunchedCandidate`, and `feedOverrideApplied`.
+The native DMG must match the retained native predecessor manifest. A manual
+replacement receipt cannot substitute for this evidence.
+
+The publisher mounts and inspects final Electron bytes, checks Developer ID,
+hardened runtime, notarization tickets, Gatekeeper, architecture, minimum OS,
+sealed distribution/source metadata, migration helpers and the outgoing updater.
+The transition receipt does not claim an embedded Sparkle framework, native build
+manifest or native updater settings. Native receipt validation remains unchanged.
+
+First run the publisher without `--publish`; retain the local validated plan.
+Only after exact installed qualification and existing release approval use its
+normal protected publication options. Preserve the native prior manifests and
+verify the live signed feeds and downloaded bytes after activation. Do not
+substitute a direct R2 write for the atomic guard.

@@ -497,3 +497,48 @@ test("Intel generation retains the ARM archive and signs its own namespace", asy
     assert.throws(() => validateCandidateAppcastShape(written, "stable"));
   } finally { await fixture.cleanup(); }
 });
+
+test('Electron transition uses official signing tools for archive and feed without changing app bytes', async () => {
+  const fixture = await createStableFixture({ bundleVersion: '1028', shortVersion: '0.1.21' });
+  const calls = [];
+  try {
+    const plistPath = join(fixture.appPath, 'Contents/Info.plist');
+    const plist = (await readFile(plistPath, 'utf8')).replace('<key>SURequireSignedFeed</key><true/>', '');
+    await writeFile(plistPath, plist);
+    const options = stableOptions(fixture, ['--electron-transition', '--account', 'ed25519', '--skip-retain',
+      '--electron-transition-test-source', 'b'.repeat(40)]);
+    const result = await generateSparkleAppcast({ ...options,
+      runGenerateAppcastTool: fakeGenerateAppcastTool(fixture, { mutateOutput: text => text
+        .replace(/<!-- sparkle-sign-warning:[\s\S]*?-->/u, '')
+        .replace(/<!-- sparkle-signatures:[\s\S]*$/u, '')
+        .replace(/ sparkle:edSignature="[^"]+"/u, '') }),
+      runSignUpdate: async (_path, args) => {
+        calls.push(args);
+        const path = args.at(-1);
+        if (args.includes('-p')) return sign(null, await readFile(path), TEST_KEY_PAIR.privateKey).toString('base64');
+        const text = (await readFile(path, 'utf8')).replace('<?xml version="1.0" standalone="yes"?>',
+          '<?xml version="1.0" standalone="yes"?><!-- sparkle-sign-warning:\nOfficial fixture signing warning\n-->');
+        const signature = sign(null, Buffer.from(text), TEST_KEY_PAIR.privateKey).toString('base64');
+        await writeFile(path, `${text}<!-- sparkle-signatures:\nedSignature: ${signature}\nlength: ${Buffer.byteLength(text)}\n-->\n`);
+      } });
+    assert.equal(result.feedSigned, true);
+    assert.equal(result.retained, null);
+    assert.equal(calls.length, 2);
+    assert.deepEqual(calls.map(call => call.slice(0, 2)), [['--account', 'ed25519'], ['--account', 'ed25519']]);
+    assert.equal(result.full.url, `https://updates.tibotattle.com/electron/test/native-sparkle/${'b'.repeat(40)}/1028/${sha256(fixture.dmgBytes)}/${fixture.dmgFileName}`);
+    assert.equal(await readFile(plistPath, 'utf8'), plist);
+    assert.deepEqual(await readFile(fixture.dmgPath), fixture.dmgBytes);
+  } finally { await fixture.cleanup(); }
+});
+
+test('transition rehearsal refuses arbitrary destinations, missing stable key, retention and non-Apple version', async () => {
+  const fixture = await createStableFixture();
+  try {
+    for (const args of [['--electron-transition-test-source', 'b'.repeat(40)],
+      ['--electron-transition', '--electron-transition-test-source', 'b'.repeat(40)],
+      ['--electron-transition', '--skip-retain', '--electron-transition-test-source', '../stable'],
+      ['--electron-transition', '--download-url-prefix', 'https://elsewhere.invalid']]) {
+      assert.throws(() => stableOptions(fixture, args));
+    }
+  } finally { await fixture.cleanup(); }
+});
