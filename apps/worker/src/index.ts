@@ -78,7 +78,7 @@ import {
 import { authorizeAdminEmail, verifyAdminAccessAssertion } from "./admin-access";
 import { readAdminReconstructionProgress } from "./admin-reconstruction-progress";
 import { readAdminGraphRefreshProgress } from "./admin-graph-refresh-progress";
-import { retireV1PreparedEvidence } from "./prepared-v1-evidence";
+import { retireV1PreparedEvidence, V1PreparedEvidenceUnavailableError } from "./prepared-v1-evidence";
 import { readDistributionAnalytics } from "./distribution-analytics";
 import {
   githubUnavailable,
@@ -4144,6 +4144,31 @@ async function ownsRenewedMaintenanceLease(
   }
 }
 
+// Emit only a closed classification. Error messages, causes, stack traces and
+// participant/source identifiers must never enter scheduled diagnostics.
+function reconstructionFailureReason(error: unknown): string {
+  if (error instanceof V1PreparedEvidenceUnavailableError) {
+    switch (error.reason) {
+      case "source_not_current": return "prepared_source_not_current";
+      case "control_invalid": return "prepared_control_invalid";
+      case "day_count_mismatch": return "prepared_day_count_mismatch";
+      default: return "prepared_invalid_evidence";
+    }
+  }
+  if (error instanceof D1InvocationBudgetExceededError) return "query_budget";
+  if (error instanceof Error) {
+    if (error.message === "v1 source changed during analysis") return "source_changed";
+    if (/\bD1_(?:EXEC_)?ERROR\b/u.test(error.message)) {
+      if (/Exceeded maximum DB size|SQLITE_FULL|database or disk is full/iu.test(error.message)) return "database_full";
+      if (/maximum account storage limit/iu.test(error.message)) return "account_storage_full";
+      return /SQLITE_CONSTRAINT|constraint failed/iu.test(error.message)
+        ? "database_constraint" : "database_error";
+    }
+    if (error instanceof TypeError) return "type_error";
+  }
+  return "unknown_error";
+}
+
 export async function runScheduledMaintenance(
   env: Env,
   scheduledTime: number,
@@ -4190,7 +4215,10 @@ export async function runScheduledMaintenance(
     return Reflect.get(target, property);
   } });
   const maintenanceStartedMs = Date.now();
-  const optionalDeadlineMs = maintenanceStartedMs + 40_000;
+  let optionalDeadlineMs = maintenanceStartedMs;
+  let preGraphPhase = "lease";
+  const preGraphTiming = { identityLifecycleMs: 0, retentionMs: 0,
+    preparedRetirementMs: 0, reconciliationMs: 0, collectionControlsMs: 0, weeklyPublicationMs: 0 };
   const phaseTiming = () => {
     const nowMs = Date.now();
     return { queriesUsed: queryMeter.queriesUsed,
@@ -4283,6 +4311,8 @@ export async function runScheduledMaintenance(
     // Keep a non-null token for callback capture. The outer variable remains
     // available to the unconditional, best-effort final release below.
     const ownedMaintenanceLease = maintenanceLease;
+    preGraphPhase = "identity_lifecycle";
+    let requiredPhaseStartedMs = Date.now();
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     await pruneDiagnosticErrors(env.USAGE_MONITOR_DB);
     // Required lifecycle work runs before optional analytics and diagnostics.
@@ -4331,6 +4361,9 @@ export async function runScheduledMaintenance(
     staleDeviceUploadAuthorizationsRevoked = deviceLifecycle.uploadsRevoked;
     expiredDeviceCredentialRotationsPurged = deviceLifecycle.rotationsPurged;
     expiredDevicePairingEventsPurged = deviceLifecycle.pairingEventsPurged;
+    preGraphTiming.identityLifecycleMs = Math.max(0, Date.now() - requiredPhaseStartedMs);
+    preGraphPhase = "retention";
+    requiredPhaseStartedMs = Date.now();
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     const lifecycle = await runBackendLifecycle(
       env.USAGE_MONITOR_DB,
@@ -4349,6 +4382,9 @@ export async function runScheduledMaintenance(
     restoreReplayComplete = lifecycle.restoreReplayComplete;
     lifecycleComplete = quarantineRetentionComplete
       && restoreReplayComplete;
+    preGraphTiming.retentionMs = Math.max(0, Date.now() - requiredPhaseStartedMs);
+    preGraphPhase = "prepared_retirement";
+    requiredPhaseStartedMs = Date.now();
 
     // Raw retention revokes derived days immediately via triggers. Drain their
     // private projections independently of publication/reconstruction switches,
@@ -4362,6 +4398,9 @@ export async function runScheduledMaintenance(
         outcome: retirement.status, pages: retirement.pagesRun, queries: retirement.queriesUsed }));
     }
 
+    preGraphTiming.preparedRetirementMs = Math.max(0, Date.now() - requiredPhaseStartedMs);
+    preGraphPhase = "quarantine_reconciliation";
+    requiredPhaseStartedMs = Date.now();
     await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
     const reconciliation = await reconcilePendingQuarantineObjects(
       env.USAGE_MONITOR_DB,
@@ -4371,8 +4410,12 @@ export async function runScheduledMaintenance(
     quarantineReconciliationComplete =
       reconciliation.reconciliationComplete;
 
+    preGraphTiming.reconciliationMs = Math.max(0, Date.now() - requiredPhaseStartedMs);
+    preGraphPhase = "collection_controls";
+    requiredPhaseStartedMs = Date.now();
     const controls = await readCollectionControls(env.USAGE_MONITOR_DB);
     publicationEnabled = controls.publication;
+    preGraphTiming.collectionControlsMs = Math.max(0, Date.now() - requiredPhaseStartedMs);
     // Community aggregates are computed from already-promoted telemetry rows.
     // Quarantine reconciliation (above) is orthogonal R2 orphan housekeeping and
     // drains a bounded batch per pass, so a bulk-upload backlog (e.g. a large
@@ -4382,18 +4425,67 @@ export async function runScheduledMaintenance(
     // designed behavior. Gate only on lifecycle retention + the publication
     // control; `quarantineReconciliationComplete` still flows into the overall
     // `complete`/`code` below so maintenance honestly reports housekeeping lag.
-    if (lifecycleComplete
-        && publicationEnabled === true) {
-      await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
-      await buildCommunityWeeklySnapshot(
-        env.USAGE_MONITOR_DB,
-        scheduledTime,
-      );
-      await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
-      const rebuild = await rebuildPendingCommunityWeeklySnapshots(
-        env.USAGE_MONITOR_DB,
-        scheduledTime,
-      );
+    let weeklyRebuildComplete = false;
+    if (lifecycleComplete && publicationEnabled === true) {
+      preGraphPhase = "weekly_publication";
+      const weeklyStartedMs = Date.now(), weeklyStartedQueries = queryMeter.queriesUsed;
+      const weeklyDeadlineMs = weeklyStartedMs + 40_000;
+      const previousReserve = queryMeter.reserveQueries;
+      // Weekly publication retains its cadence, but cannot spend the current
+      // path's 249-query admission plus bootstrap/finalization headroom. This
+      // is a reservation within the same invocation meter, never a new budget.
+      if (reconstructionMode !== "paused") {
+        queryMeter.reserveQueries = Math.max(previousReserve,
+          Math.min(320, queryMeter.remainingQueries + previousReserve));
+      }
+      let weeklyProcessed = 0, weeklyCode = "WEEKLY_PUBLICATION_BUDGET_DEFERRED";
+      try {
+        if (queryMeter.remainingQueries >= 64) {
+          await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
+          const snapshot = await buildCommunityWeeklySnapshot(env.USAGE_MONITOR_DB, scheduledTime);
+          if (snapshot.state === "lease_unavailable") {
+            weeklyCode = "WEEKLY_PUBLICATION_LEASE_DEFERRED";
+          } else if (Date.now() >= weeklyDeadlineMs) {
+            weeklyCode = "WEEKLY_PUBLICATION_DEADLINE_DEFERRED";
+          } else if (queryMeter.remainingQueries >= 64) {
+            await renewMaintenanceLease(env.USAGE_MONITOR_DB, maintenanceLease);
+            const weekly = await rebuildPendingCommunityWeeklySnapshots(env.USAGE_MONITOR_DB, scheduledTime, 1);
+            weeklyProcessed = weekly.processed;
+            weeklyRebuildComplete = !weekly.remaining;
+            weeklyCode = "BOUNDED_WEEKLY_PUBLICATION_PROGRESS";
+          }
+        }
+      } catch (error) {
+        // A lost outer lease still ends this invocation. A weekly source race
+        // or failed build keeps its existing atomic fences and pending work,
+        // but must not prevent independent resumable graph work from running.
+        if (error instanceof ApiError && error.code === "LIFECYCLE_STATE_CONFLICT") throw error;
+        weeklyCode = error instanceof D1InvocationBudgetExceededError
+          ? error.code : "WEEKLY_PUBLICATION_UNAVAILABLE";
+      } finally {
+        queryMeter.reserveQueries = previousReserve;
+      }
+      preGraphTiming.weeklyPublicationMs = Math.max(0, Date.now() - weeklyStartedMs);
+      console.log(JSON.stringify({level:"info",event:"scheduled_weekly_publication",
+        outcome:weeklyRebuildComplete ? "complete" : "deferred",code:weeklyCode,processed:weeklyProcessed,
+        phaseQueries:queryMeter.queriesUsed-weeklyStartedQueries,
+        phaseElapsedMs:preGraphTiming.weeklyPublicationMs,queriesUsed:queryMeter.queriesUsed,
+        elapsedMs:Math.max(0,Date.now()-maintenanceStartedMs),
+        deadlineRemainingMs:Math.max(0,weeklyDeadlineMs-Date.now())}));
+    }
+    // Lifecycle/reconciliation and bounded weekly publication may take longer
+    // than the graph budget. Start the graph's clock at actual admission while
+    // retaining every query already spent in the shared invocation meter.
+    preGraphPhase = "complete";
+    const optionalStartedMs = Date.now();
+    optionalDeadlineMs = optionalStartedMs + 40_000;
+    console.log(JSON.stringify({level:"info",event:"scheduled_graph_admission",
+      outcome:lifecycleComplete && publicationEnabled && reconstructionMode !== "paused" ? "ready" : "skipped",
+      code:lifecycleComplete && publicationEnabled && reconstructionMode !== "paused" ? "GRAPH_BUDGET_STARTED" : "GRAPH_WORK_GATED",
+      lifecycleComplete,publicationEnabled,reconstructionMode,
+      preGraphElapsedMs:Math.max(0,optionalStartedMs-maintenanceStartedMs),
+      ...preGraphTiming,...phaseTiming()}));
+    if (lifecycleComplete && publicationEnabled === true) {
       if (reconstructionMode !== "paused") {
         queryMeter.reserveQueries = 12;
         try {
@@ -4430,6 +4522,7 @@ export async function runScheduledMaintenance(
               } catch (error) {
                 console.warn(JSON.stringify({level:"warn",event:"scheduled_model_history",phase,outcome:"deferred",
                   code:error instanceof D1InvocationBudgetExceededError ? error.code : "MODEL_HISTORY_UNAVAILABLE",
+                  failureReason:reconstructionFailureReason(error),
                   ...timing()}));
               }
             };
@@ -4485,6 +4578,7 @@ export async function runScheduledMaintenance(
               // publishing other already-complete evidence or new activity.
               console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
                 stage:"analysis",code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
+                failureReason:reconstructionFailureReason(error),
                 ...phaseTiming()}));
             }
             if (priorPreview === null || priorPreview.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
@@ -4501,14 +4595,14 @@ export async function runScheduledMaintenance(
               await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
                 4, undefined, {mode:"activity-only",budget:phaseBudget(),maintenanceLease:ownedMaintenanceLease});
             }
-            rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+            rebuildComplete = weeklyRebuildComplete && !dailyRebuild.remaining;
             // Use spare resources in the other slots, but never retry an early
             // history attempt in this invocation, including after a failure.
             if (!historyFirst) await rebuildModelHistory("after_publication");
           } else {
             const dailyRebuild = await rebuildPendingCommunityDailyAggregates(env.USAGE_MONITOR_DB, scheduledTime,
               24, undefined, undefined, ownedMaintenanceLease);
-            rebuildComplete = !rebuild.remaining && !dailyRebuild.remaining;
+            rebuildComplete = weeklyRebuildComplete && !dailyRebuild.remaining;
             const allowanceCache = await warmAdminCommunityAllowancePreviewCache(env.USAGE_MONITOR_DB, scheduledTime);
             if (allowanceCache.code === "ALLOWANCE_PREVIEW_CACHE_UNAVAILABLE") {
               console.warn(JSON.stringify({level:"warn",event:"admin_allowance_preview_cache",outcome:"failure",code:allowanceCache.code}));
@@ -4519,6 +4613,7 @@ export async function runScheduledMaintenance(
           // All incomplete work/cache/publication writes are independently fenced.
           console.warn(JSON.stringify({level:"warn",event:"scheduled_allowance_reconstruction",outcome:"deferred",
             code:error instanceof D1InvocationBudgetExceededError ? error.code : "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE",
+            failureReason:reconstructionFailureReason(error),
             queriesUsed:queryMeter.queriesUsed}));
         }
       } else {
@@ -4608,6 +4703,11 @@ export async function runScheduledMaintenance(
       aggregateRebuildComplete: rebuildComplete,
       publicationEnabled,
     };
+    if (preGraphPhase !== "complete") {
+      console.warn(JSON.stringify({level:"warn",event:"scheduled_graph_admission",
+        outcome:"failure",code:"GRAPH_ADMISSION_UNAVAILABLE",phase:preGraphPhase,
+        ...preGraphTiming,...phaseTiming()}));
+    }
     console.error(JSON.stringify(log));
     throw error;
   } finally {

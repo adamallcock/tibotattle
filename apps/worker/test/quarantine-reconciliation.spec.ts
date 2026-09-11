@@ -1170,11 +1170,27 @@ describe("backend readiness and scheduled observability", () => {
     }
     const logs = messages.map(message => JSON.parse(message) as Record<string, unknown>);
     expect(logs.map(log => log.event)).toEqual([
+      "scheduled_weekly_publication", "scheduled_graph_admission",
       "admin_metrics_snapshot", "admin_metrics_history_cache", "scheduled_backend_maintenance",
     ]);
+    expect(logs[0]).toEqual({
+      level: "info", event: "scheduled_weekly_publication", outcome: "complete",
+      code: "BOUNDED_WEEKLY_PUBLICATION_PROGRESS", processed: 0,
+      phaseQueries: expect.any(Number), phaseElapsedMs: expect.any(Number),
+      queriesUsed: expect.any(Number), elapsedMs: expect.any(Number), deadlineRemainingMs: expect.any(Number),
+    });
+    expect(logs[1]).toEqual({
+      level: "info", event: "scheduled_graph_admission", outcome: "ready", code: "GRAPH_BUDGET_STARTED",
+      lifecycleComplete: true, publicationEnabled: true, reconstructionMode: "legacy",
+      preGraphElapsedMs: expect.any(Number), identityLifecycleMs: expect.any(Number),
+      retentionMs: expect.any(Number), preparedRetirementMs: expect.any(Number),
+      reconciliationMs: expect.any(Number), collectionControlsMs: expect.any(Number),
+      weeklyPublicationMs: expect.any(Number), queriesUsed: expect.any(Number),
+      elapsedMs: expect.any(Number), deadlineRemainingMs: expect.any(Number),
+    });
     for (const [index, event, code, phaseQueries] of [
-      [0, "admin_metrics_snapshot", "SNAPSHOT_CAPTURED", 5],
-      [1, "admin_metrics_history_cache", "HISTORY_CACHE_REFRESHED", 18],
+      [2, "admin_metrics_snapshot", "SNAPSHOT_CAPTURED", 5],
+      [3, "admin_metrics_history_cache", "HISTORY_CACHE_REFRESHED", 18],
     ] as const) {
       expect(logs[index]).toEqual({
         level: "info", event, outcome: "success", code, phase: "after_analysis", phaseQueries,
@@ -1183,7 +1199,7 @@ describe("backend readiness and scheduled observability", () => {
       expect(logs[index]!.elapsedMs).toBeGreaterThanOrEqual(0);
       expect(logs[index]!.deadlineRemainingMs).toBeGreaterThanOrEqual(0);
     }
-    expect(logs[2]).toEqual({
+    expect(logs[4]).toEqual({
       level: "info",
       event: "scheduled_backend_maintenance",
       outcome: "success",

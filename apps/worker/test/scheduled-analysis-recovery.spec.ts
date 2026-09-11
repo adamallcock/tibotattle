@@ -6,7 +6,23 @@ import type { D1InvocationBudget } from "../src/d1-invocation-budget";
 const inspection = vi.hoisted(() => ({
   limit: 900, meter: null as D1InvocationBudget | null,
   rawFits: vi.fn(), rawModels: vi.fn(), backfill: vi.fn(), modelHistory: vi.fn(),
+  afterReconciliation: vi.fn(), beforeWeekly: vi.fn(),
 }));
+vi.mock("../src/quarantine-reconciliation", async original => {
+  const actual = await original<typeof import("../src/quarantine-reconciliation")>();
+  return { ...actual, reconcilePendingQuarantineObjects: async (...args: Parameters<typeof actual.reconcilePendingQuarantineObjects>) => {
+    const result = await actual.reconcilePendingQuarantineObjects(...args);
+    inspection.afterReconciliation();
+    return result;
+  } };
+});
+vi.mock("../src/community-snapshots", async original => {
+  const actual = await original<typeof import("../src/community-snapshots")>();
+  return { ...actual, buildCommunityWeeklySnapshot: (...args: Parameters<typeof actual.buildCommunityWeeklySnapshot>) => {
+    inspection.beforeWeekly();
+    return actual.buildCommunityWeeklySnapshot(...args);
+  } };
+});
 vi.mock("../src/d1-invocation-budget", async original => {
   const actual = await original<typeof import("../src/d1-invocation-budget")>();
   return { ...actual, createD1InvocationBudget: () => {
@@ -41,6 +57,7 @@ import { putTrackedQuarantineObject } from "../src/quarantine-reconciliation";
 import { createV11DeviceFixture } from "./helpers/telemetry-v11";
 import { authenticateDevice, createDeviceUploadAuthorization, claimDeviceUploadAuthorization } from "../src/device-auth";
 import { V1_PLAN_QUOTA_PAGE_SQL, V1_FIT_QUOTA_PAGE_SQL, V1_QUOTA_PROJECTION_BACKFILL_INSERT_SQL } from "../src/quota-fit-projection";
+import { V1PreparedEvidenceUnavailableError } from "../src/prepared-v1-evidence";
 
 interface Bindings extends Env { TEST_MIGRATIONS: D1Migration[]; TEST_DELETION_LEDGER_MIGRATIONS: D1Migration[] }
 const runtime = env as Bindings, db = () => runtime.USAGE_MONITOR_DB;
@@ -143,6 +160,7 @@ beforeEach(async () => {
   await reset(); await migrations(); inspection.limit = 900; inspection.meter = null;
   vi.clearAllMocks();
   inspection.backfill.mockReset(); inspection.modelHistory.mockReset();
+  inspection.afterReconciliation.mockReset(); inspection.beforeWeekly.mockReset();
   inspection.rawFits.mockImplementation(() => { throw new Error("raw graph fit analyzer forbidden"); });
   inspection.rawModels.mockImplementation(() => { throw new Error("raw graph model analyzer forbidden"); });
   vi.spyOn(console, "log").mockImplementation(() => {});
@@ -151,6 +169,46 @@ beforeEach(async () => {
 afterEach(() => { vi.restoreAllMocks(); });
 
 describe("actual scheduled resumable analysis recovery", () => {
+  it.each(["reconciliation", "weekly"])("gives historical reconstruction its full window after 65 seconds of %s work", async phase => {
+    await seedQuota(200); await queue();
+    const started = Date.now(); let currentTime = started;
+    vi.spyOn(Date, "now").mockImplementation(() => currentTime);
+    const delay = () => { currentTime = started + 65_000; };
+    (phase === "reconciliation" ? inspection.afterReconciliation : inspection.beforeWeekly).mockImplementation(delay);
+    const observation = observe();
+    const result = await runScheduledMaintenance(bindings(observation), NOW + 120_000);
+    expect(currentTime).toBe(started + 65_000);
+    expect(result).toMatchObject({ outcome: "success", lifecycleComplete: true });
+    expect(inspection.modelHistory).toHaveBeenCalledExactlyOnceWith(expect.anything(), NOW + 120_000,
+      { meter: inspection.meter, deadlineMs: started + 105_000, maintenanceLease: expect.any(String) });
+    expect(inspection.backfill).toHaveBeenCalled();
+    expect(await db().prepare("SELECT count(*) AS n FROM community_allowance_fit_cache").first()).toEqual({ n: 1 });
+    assertMeter(observation); await released();
+  });
+
+  it("isolates a weekly finalization failure and still checkpoints reconstruction", async () => {
+    await seedQuota(200); await queue();
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    inspection.beforeWeekly.mockImplementation(() => {
+      throw new Error("synthetic private weekly failure detail");
+    });
+    const observation = observe();
+    const result = await runScheduledMaintenance(bindings(observation), NOW + 120_000);
+    expect(result).toMatchObject({ outcome: "success", lifecycleComplete: true, aggregateRebuildComplete: false });
+    expect(inspection.beforeWeekly).toHaveBeenCalledOnce();
+    expect(inspection.modelHistory).toHaveBeenCalledOnce();
+    expect(inspection.backfill).toHaveBeenCalled();
+    expect(await db().prepare("SELECT count(*) AS n FROM community_allowance_fit_cache").first()).toEqual({ n: 1 });
+    expect(await db().prepare("SELECT count(*) AS n FROM community_daily_aggregate_rebuilds").first()).toEqual({ n: 0 });
+    const logs = [...logSpy.mock.calls, ...warnSpy.mock.calls]
+      .map(([message]) => JSON.parse(String(message)) as { event: string });
+    expect(logs).toContainEqual(expect.objectContaining({ event: "scheduled_weekly_publication",
+      outcome: "deferred", code: "WEEKLY_PUBLICATION_UNAVAILABLE" }));
+    expect(JSON.stringify(logs)).not.toContain("synthetic private weekly failure detail");
+    assertMeter(observation); await released();
+  });
+
   it.each([0, 120_000])("finishes required device, identity and real R2 lifecycle work before optional reconstruction failure at offset %i", async offset => {
     const fixture = await seedQuota(200);
     const principal = await authenticateDevice(db(), fixture.authorization);
@@ -328,10 +386,52 @@ describe("actual scheduled resumable analysis recovery", () => {
       .map(([message]) => JSON.parse(String(message)) as { event: string });
     expect(logs.filter(log => log.event === "scheduled_model_history")).toEqual([
       { level: "warn", event: "scheduled_model_history", phase: "before_analysis", outcome: "deferred",
-        code: "MODEL_HISTORY_UNAVAILABLE", phaseQueries: 0, phaseElapsedMs: expect.any(Number),
+        code: "MODEL_HISTORY_UNAVAILABLE", failureReason: "unknown_error", phaseQueries: 0, phaseElapsedMs: expect.any(Number),
         queriesUsed: expect.any(Number), elapsedMs: expect.any(Number), deadlineRemainingMs: expect.any(Number) },
     ]);
     expect(JSON.stringify(logs)).not.toContain("synthetic private historical detail");
+    assertMeter(observation); await released();
+  });
+
+  it.each([
+    [() => new V1PreparedEvidenceUnavailableError("source_not_current"), "prepared_source_not_current"],
+    [() => new V1PreparedEvidenceUnavailableError("control_invalid"), "prepared_control_invalid"],
+    [() => new V1PreparedEvidenceUnavailableError("day_count_mismatch"), "prepared_day_count_mismatch"],
+    [() => new V1PreparedEvidenceUnavailableError(), "prepared_invalid_evidence"],
+    [() => new Error("v1 source changed during analysis"), "source_changed"],
+    [() => new Error("D1_ERROR: UNIQUE constraint failed: synthetic-private-detail"), "database_constraint"],
+    [() => new Error("D1_ERROR: Exceeded maximum DB size. synthetic-private-detail"), "database_full"],
+    [() => new Error("D1_EXEC_ERROR: database or disk is full: SQLITE_FULL synthetic-private-detail"), "database_full"],
+    [() => new Error("D1_ERROR: Your account has exceeded D1's maximum account storage limit, synthetic-private-detail"), "account_storage_full"],
+    [() => new Error("D1_ERROR: synthetic-private-detail"), "database_error"],
+    [() => new TypeError("synthetic-private-detail"), "type_error"],
+    [() => Object.assign(new Error("synthetic-private-detail"), { reason: "control_invalid" }), "unknown_error"],
+  ] as const)("classifies both calculation failures as %s without exposing error contents", async (makeError, reason) => {
+    await seedQuota(200); await queue();
+    const fail = () => { throw makeError(); };
+    inspection.modelHistory.mockImplementation(fail);
+    inspection.backfill.mockImplementation(fail);
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const observation = observe();
+    const result = await runScheduledMaintenance(bindings(observation), NOW + 120_000);
+    expect(result).toMatchObject({ outcome: "success", lifecycleComplete: true, aggregateRebuildComplete: false });
+    expect(inspection.modelHistory).toHaveBeenCalledOnce();
+    expect(inspection.backfill).toHaveBeenCalledOnce();
+    const logs = [...logSpy.mock.calls, ...warnSpy.mock.calls].map(([message]) => JSON.parse(String(message)));
+    const failures = logs.filter(log => log.code === "MODEL_HISTORY_UNAVAILABLE" || log.code === "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE");
+    expect(failures).toEqual(expect.arrayContaining([
+      { level: "warn", event: "scheduled_model_history", phase: "before_analysis", outcome: "deferred",
+        code: "MODEL_HISTORY_UNAVAILABLE", failureReason: reason, phaseQueries: 0,
+        phaseElapsedMs: expect.any(Number), queriesUsed: expect.any(Number), elapsedMs: expect.any(Number),
+        deadlineRemainingMs: expect.any(Number) },
+      { level: "warn", event: "scheduled_allowance_reconstruction", stage: "analysis", outcome: "deferred",
+        code: "ALLOWANCE_RECONSTRUCTION_UNAVAILABLE", failureReason: reason, queriesUsed: expect.any(Number),
+        elapsedMs: expect.any(Number), deadlineRemainingMs: expect.any(Number) },
+    ]));
+    expect(failures).toHaveLength(2);
+    expect(JSON.stringify(logs)).not.toContain("synthetic-private-detail");
+    expect(JSON.stringify(logs)).not.toContain(PARTICIPANT);
     assertMeter(observation); await released();
   });
 
@@ -401,10 +501,12 @@ describe("actual scheduled resumable analysis recovery", () => {
     // metadata read before optional reconstruction; no retained rows are scanned.
     expect(second.queries.slice(0, fixedSetupQueries).filter(entry =>
       entry.sql.includes("FROM community_public_source_bootstrap b JOIN community_snapshot_mutation_control"))).toHaveLength(1);
-    expect(setupReceipt).toEqual({ fixedSetupQueries: 60, primary: 57, ledger: 3 });
+    // Reserving graph capacity defers weekly publication in the 350-query first
+    // pass; its first build now adds eight statements to this recovery pass.
+    expect(setupReceipt).toEqual({ fixedSetupQueries: 68, primary: 65, ledger: 3 });
     // Worst legal 1024-part head:384 reads,3 final pin/head checks,407 finish
     // reserve,24 combined warmer/scheduler headroom. Heavy sustained required
-    // housekeeping can exceed the remaining 22 queries and safely defer finish.
+    // housekeeping can exceed the remaining 14 queries and safely defer finish.
     expect(fixedSetupQueries + 384 + 3 + 407 + 24).toBeLessThanOrEqual(900);
     expect(await db().prepare("SELECT fixed_now,run_id,phase FROM community_analysis_work WHERE participant_id=?").bind(PARTICIPANT).first())
       .toMatchObject({ fixed_now: before!.fixed_now, run_id: before!.run_id, phase: "complete" });
@@ -594,26 +696,27 @@ describe("actual scheduled resumable analysis recovery", () => {
     assertMeter(observation); await released();
   });
 
-  it.each([0, 60_000, 120_000])("does not start optional reconstruction once required maintenance has consumed the deadline at offset %i", async offset => {
-    await seedQuota(200); const queued = await queue();
+  it.each([0, 60_000, 120_000])("admits each graph priority after required maintenance exceeds 40 seconds at offset %i", async offset => {
+    await seedQuota(200); await queue();
     const started = Date.now(); let crossed = false;
     vi.spyOn(Date, "now").mockImplementation(() => started + (crossed ? 40_001 : 0));
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     const observation = observe(async (entry, moment) => {
       if (moment === "after" && entry.sql.includes("FROM collection_controls")) crossed = true;
     });
-    expect(await runScheduledMaintenance(bindings(observation), NOW + offset)).toMatchObject({ outcome: "success", lifecycleComplete: true, aggregateRebuildComplete: false });
-    expect(crossed).toBe(true); expect(inspection.backfill).not.toHaveBeenCalled();
-    expect(inspection.modelHistory).not.toHaveBeenCalled();
+    expect(await runScheduledMaintenance(bindings(observation), NOW + offset)).toMatchObject({ outcome: "success", lifecycleComplete: true });
+    expect(crossed).toBe(true); expect(inspection.backfill).toHaveBeenCalled();
+    expect(inspection.modelHistory).toHaveBeenCalledOnce();
     const historyLogs = logSpy.mock.calls.map(([message]) => JSON.parse(String(message)) as { event: string })
       .filter(log => log.event === "scheduled_model_history");
     expect(historyLogs).toEqual([expect.objectContaining({
       phase: offset === 120_000 ? "before_analysis" : "after_publication",
-      outcome: "deferred", code: "MODEL_HISTORY_DEADLINE_DEFERRED", phaseQueries: 0,
-      elapsedMs: 40_001, deadlineRemainingMs: 0,
+      outcome: "deferred", code: "BOUNDED_MODEL_HISTORY_PROGRESS", phaseQueries: expect.any(Number),
+      elapsedMs: 40_001, deadlineRemainingMs: 40_000,
     })]);
-    expect(observation.queries.some(entry => entry.sql.includes("community_analysis_work"))).toBe(false);
-    expect((await db().prepare("SELECT * FROM community_daily_aggregate_rebuilds ORDER BY day").all()).results).toEqual(queued);
+    expect(observation.queries.some(entry => entry.sql.includes("community_analysis_work"))).toBe(true);
+    expect(await db().prepare("SELECT count(*) AS n FROM community_allowance_fit_cache").first()).toEqual({ n: 1 });
+    expect(await db().prepare("SELECT count(*) AS n FROM community_daily_aggregate_rebuilds").first()).toEqual({ n: 0 });
     assertMeter(observation); await released();
   });
 
