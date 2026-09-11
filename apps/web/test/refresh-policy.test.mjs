@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { createContext, runInContext } from "node:vm";
 import { SUPPORTED_LOCALES, translate } from "../public/localization.js";
+import { refreshAccountingStatus, refreshQuickResultStatus } from "../public/lib.js";
+import { createDomHelpers } from "../public/ui-format.js";
 
 const source = await readFile(new URL("../public/app.js", import.meta.url), "utf8");
 
@@ -14,18 +16,50 @@ function productionFunction(name) {
   return match[0];
 }
 
+function refreshElement(tagName = "button") {
+  const attributes = new Map();
+  const classes = new Set();
+  return {
+    tagName,
+    children: [],
+    style: {},
+    classList: {
+      add: (name) => classes.add(name),
+      remove: (name) => classes.delete(name),
+      contains: (name) => classes.has(name),
+    },
+    get textContent() { return this.children.map((child) => child.textContent).join(""); },
+    set textContent(value) { this.children = [{ textContent: String(value) }]; },
+    get title() { return attributes.get("title") ?? ""; },
+    set title(value) { attributes.set("title", String(value)); },
+    setAttribute: (name, value) => attributes.set(name, String(value)),
+    getAttribute: (name) => attributes.get(name) ?? null,
+    removeAttribute: (name) => attributes.delete(name),
+    append(...children) { this.children.push(...children); },
+    replaceChildren(...children) { this.children = children; },
+    addEventListener(name, handler) { this[name] = handler; },
+  };
+}
+
 function refreshHarness({
   rejection = null,
   native = false,
   electron = false,
   bridge = undefined,
   detailedSnapshot = false,
+  refreshStates = [],
 } = {}) {
   const calls = [];
   const routes = [];
   const notices = [];
   const timers = [];
   const buttons = new Map();
+  const pendingRefreshStates = [...refreshStates];
+  const progressFrames = [];
+  const document = {
+    createElement: refreshElement,
+    createTextNode: (textContent) => ({ textContent }),
+  };
   const priorDashboard = {
     mode: "local",
     state: "stale",
@@ -51,11 +85,21 @@ function refreshHarness({
     activeLocalDashboardLoad: null,
     ELECTRON_REFRESH_LIFECYCLE_SIGNAL_TIMEOUT_MS: 1_000,
     tibotattleDesktop: bridge,
+    document,
+    ...createDomHelpers(document),
     $: (selector) => {
-      if (!buttons.has(selector)) buttons.set(selector, {
-        textContent: "Refresh",
-        addEventListener(name, handler) { this[name] = handler; },
-      });
+      if (!buttons.has(selector)) {
+        const button = refreshElement();
+        const replaceChildren = button.replaceChildren;
+        button.replaceChildren = function (...children) {
+          replaceChildren.call(this, ...children);
+          if (selector === "#refresh-button") progressFrames.push({
+            slots: children.map((child) => child.textContent),
+            description: this.getAttribute("aria-label"),
+          });
+        };
+        buttons.set(selector, button);
+      }
       return buttons.get(selector);
     },
     localClient: {
@@ -69,7 +113,10 @@ function refreshHarness({
         routes.push("/api/local/refresh");
         if (rejection) throw rejection;
       },
-      async refreshStatus() { calls.push("status"); return { refresh: { status: "succeeded" } }; },
+      async refreshStatus() {
+        calls.push("status");
+        return { refresh: pendingRefreshStates.shift() ?? { status: "succeeded" } };
+      },
     },
     createRefreshPollingBudget: () => ({ hasTime: () => true }),
     historyProgressReceipt: () => "prior-generation",
@@ -77,7 +124,8 @@ function refreshHarness({
     localAnalysisAllowed: () => true,
     runsInsideNativeDashboard: () => native,
     runsInsideElectronDashboard: () => electron,
-    updateLocalActionButtons() {},
+    refreshAccountingStatus,
+    refreshQuickResultStatus,
     setGlobalState() {},
     setTimeout: (resolve) => resolve(),
     clearTimeout() {},
@@ -89,11 +137,70 @@ function refreshHarness({
     describeFailure: async () => { calls.push("diagnostic"); return { text: "An update could not be started." }; },
     t: (key) => translate(key, {}, "en-US"),
   });
+  for (const name of ["localAnalysisLabel", "renderRefreshProgress", "updateLocalActionButtons"]) {
+    runInContext(productionFunction(name), context);
+  }
   runInContext(productionFunction("signalElectronRefreshLifecycle"), context);
   runInContext(productionFunction("requestRefresh"), context);
   runInContext(productionFunction("scheduleReturningUserRefresh"), context);
-  return { context, calls, routes, notices, timers, buttons, priorDashboard };
+  return { context, calls, routes, notices, timers, buttons, priorDashboard, progressFrames };
 }
+
+test("refresh progress reserves distinct count and timer slots and clears them when idle", () => {
+  const harness = refreshHarness();
+  const button = harness.context.$("#refresh-button");
+  harness.context.localActionBusy = true;
+  harness.context.localRefreshInProgress = true;
+  harness.context.renderRefreshProgress(button, "Starting detailed accounting…");
+  assert.deepEqual(button.children.map((child) => child.textContent), [
+    "Starting detailed accounting…", "", "",
+  ]);
+  for (const [processed, seconds, expectedTime] of [[9, 59, "0:59"], [10, 60, "1:00"]]) {
+    harness.context.renderRefreshProgress(button, "Analyzing files…", {
+      processed, selected: 100, elapsedSeconds: seconds,
+    });
+    assert.deepEqual(button.children.map((child) => child.className), [
+      "refresh-progress-phase", "refresh-progress-count", "refresh-progress-time",
+    ]);
+    assert.deepEqual(button.children.map((child) => child.textContent), [
+      "Analyzing files…", `${processed}/100`, expectedTime,
+    ]);
+    assert.equal(button.children[1].children[0].style.minWidth, "3ch");
+    assert.equal(button.getAttribute("aria-label"), `Analyzing files… · ${processed}/100 · ${expectedTime}`);
+    assert.equal(button.title, button.getAttribute("aria-label"));
+  }
+  assert.equal(button.classList.contains("refresh-progress"), true);
+  harness.context.localActionBusy = false;
+  harness.context.localRefreshInProgress = false;
+  harness.context.updateLocalActionButtons();
+  assert.equal(button.classList.contains("refresh-progress"), false);
+  assert.equal(button.getAttribute("aria-label"), null);
+  assert.equal(button.getAttribute("title"), null);
+  assert.equal(button.textContent, "Update local usage");
+  assert.equal(harness.context.$("#cancel-refresh").hidden, true);
+});
+
+test("refresh polling preserves counted indexing and count-free accounting phases", async () => {
+  const harness = refreshHarness({ refreshStates: [
+    { status: "running", progress: {
+      kind: "unified_index", status: "scanning", phase: "rollout_index",
+      filesProcessed: 9, filesSelected: 100,
+    } },
+    { status: "running", progress: { kind: "accounting", status: "calculating" } },
+  ] });
+  await harness.context.requestRefresh({ detailed: true });
+  const indexed = harness.progressFrames.find((frame) => frame.slots[0] === "Analyzing files…");
+  const accounting = harness.progressFrames.find((frame) => frame.slots[0] === "Calculating accounting…");
+  assert.ok(indexed, "the indexed-file progress reaches the production renderer");
+  assert.equal(indexed.slots[1], "9/100");
+  assert.match(indexed.slots[2], /^\d+:\d{2}$/u);
+  assert.ok(accounting, "accounting remains a distinct work phase");
+  assert.equal(accounting.slots[1], "", "accounting cannot inherit an earlier source count");
+  assert.match(accounting.slots[2], /^\d+:\d{2}$/u);
+  assert.equal(accounting.description, `Calculating accounting… · ${accounting.slots[2]}`);
+  assert.deepEqual(harness.calls, ["detailed", "status", "status", "status", "reload", "continuation-check"]);
+  assert.deepEqual(harness.notices, []);
+});
 
 test("both visible manual refresh controls request detailed accounting once", async (t) => {
   for (const selector of ["#refresh-button", "#setup-refresh"]) {

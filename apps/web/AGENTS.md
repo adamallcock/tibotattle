@@ -37,8 +37,12 @@ Scope: all files under `apps/web/`. Apply the repository root guidance first.
 - Escape untrusted text and prefer DOM APIs that do not interpret HTML. Keep
   credentials, opaque capabilities, identifiers, paths, and raw errors out of
   markup, URLs, storage, clipboard text, and screenshots.
-  The owner-approved cache-drop **Thread name** links are a narrow exception
-  for transient local UI names and canonical Codex UUID links; never propagate
+  The owner-approved cache-drop **Thread name** links and Projects & threads
+  display (2026-09-08) are narrow exceptions
+  for transient local UI names, project basenames and canonical Codex UUID links;
+  the owner additionally approved bounded Codex title fallbacks exclusively for
+  Projects & threads local display on 2026-09-08. Render them as text only;
+  project/worktree join handles remain process-local and content-free. Never propagate
   them to accounting DTOs, reports, share cards, diagnostics, or contributions.
 - Preserve restrictive network and content-security assumptions. A local preview
   convenience must not weaken the packaged or public surface.

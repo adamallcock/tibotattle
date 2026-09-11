@@ -23,7 +23,7 @@ export {
   readCodexConfigServiceTier,
 } from "./codex-config-service-tier.js";
 export { createLocalCodexLogPorts } from "./local-codex-log-ports.js";
-export { readCodexLocalThreadMetadata } from "./local-codex-thread-store.js";
+export { readCodexLocalThreadMetadata, readCodexLocalThreadAncestry, readCodexLocalRepositoryOrigins } from "./local-codex-thread-store.js";
 export {
   createLocalExportSourcePorts,
   localIsProxy,
@@ -213,3 +213,7 @@ export {
   rotateParticipantSecret,
   withParticipantSecretLease,
 } from "./participant-identity.js";
+export { createWorkUsageProjectResolver, normalizeWorkUsageRepositoryOrigin } from "./work-usage-projects.js";
+
+export { openTimingStore, ingestTimingFile, timingReport, readTimingRows } from './inference-timing-store.js';
+export { forEachRolloutLine, ROLLOUT_LINE_BYTES } from './rollout-line-reader.js';

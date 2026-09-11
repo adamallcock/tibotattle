@@ -27,6 +27,8 @@ const SIGNED_MACOS_BUNDLE_VERSION_PLAN = Object.freeze({
   // First native-Sparkle-to-Electron stable allocation. Timestamp buildNumber
   // remains independent artifact provenance, never an Apple bundle version.
   "0.1.21": Object.freeze({ stable: "1028" }),
+  // Combined desktop follow-up; preserve native and Electron update ordering.
+  "0.1.22": Object.freeze({ stable: "1029" }),
 });
 
 module.exports = { SIGNED_MACOS_BUNDLE_VERSION_PLAN };

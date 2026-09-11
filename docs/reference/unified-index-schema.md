@@ -27,7 +27,7 @@ one another:
 | Stable filename | `local-unified-index-v1.sqlite` | Machine path continuity across app releases. |
 | Schema-family metadata | `local-unified-index-v2` | Logical family stored in `meta.schema_version`. |
 | SQLite `PRAGMA user_version` | `11` | Physical table/index/migration generation. |
-| Parser version | `unified-rollout-typed-v15` | Meaning and provenance of facts extracted from rollout sources, including ordinal-bearing compaction headers and settings pinned to paginated history boundaries. |
+| Parser version | `unified-rollout-typed-v16` | Meaning and provenance of facts extracted from rollout sources, including ordinal-bearing compaction headers and settings pinned to paginated history boundaries. |
 | Source identity version | `codex-immutable-rollout-v1` | Rules for physical rollout identity/generation. |
 
 The application id is a separate SQLite format guard. A file with the wrong
@@ -100,17 +100,27 @@ keep the default; custom/unreviewed selections block a previously reviewed model
 An exact history base, including an unknown model, retains its prior semantics.
 Tier, effort, cumulative counters and replay admission are unchanged.
 
-The per-event parser stamps `unified-rollout-typed-v15-parent-model` and
-`unified-rollout-typed-v15-parent-model-partial` record the inherited assumption;
-other records retain the base and `-partial` v15 stamps. These suffixes
+The per-event parser stamps `unified-rollout-typed-v16-parent-model` and
+`unified-rollout-typed-v16-parent-model-partial` record the inherited assumption;
+other records retain the base and `-partial` v16 stamps. These suffixes
 identify the new fallback; they do not reclassify legacy inline inheritance.
 These are local provenance variants, not new physical schemas or telemetry
-fields. Cursor/generation stamps remain the base v15 so warm refresh does not
+fields. Cursor/generation stamps remain the base v16 so warm refresh does not
 mistake an assumed-model row for an obsolete parser. Model lookup retains at
 most 128 timelines of 4,096 transitions and traverses at most 128 ancestors.
 Missing/ambiguous parents, invalid metadata, clock regression and exceeded
 bounds leave the model unavailable. The resolver caches only reviewed identities
 and timestamps during one physically guarded discovery pass.
+
+Parser v16 adds the owner's explicit 2026-09-09 assumption that an omitted or
+null cache-write count is zero when the selected usage has valid, nonnegative
+integer input and cache-read counts, with cache reads no greater than input.
+Malformed or contradictory counters remain unknown. Raw cumulative counters and
+replay decisions remain unchanged. The per-event `-cache-write-zero` suffix is
+appended after any parent-model/partial provenance; report `assumedEvents` counts
+these records independently of remaining incomplete records. No physical schema
+or telemetry field changes. Present sources reparse; unavailable historical
+sources keep their original facts and parser stamps.
 
 Parser v12 additionally preserves omitted or null usage counters as SQL NULL,
 including the cumulative cursor carried across refreshes. Explicit zero remains
@@ -142,7 +152,7 @@ effort. No effective-effort carry is inferred across compaction, fork or resume.
 Actual application/eligible-mode and installed-client evidence remains a
 qualification gate, separate from catalogue recognition.
 
-The foreground companion treats verified published v10/v11/v12/v13/v14-to-v15 parser
+The foreground companion treats verified published v10/v11/v12/v13/v14/v15-to-v16 parser
 upgrades as cold work even when the physical schema is already 11. The target
 and predecessor set are deliberately closed; current, unknown, malformed and
 future parser evidence cannot obtain a longer deadline. That run receives the

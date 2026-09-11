@@ -35,7 +35,19 @@ remains accountable for release wording, validation, signing, and publication.
 
 ## [Unreleased]
 
-No further changes recorded.
+No changes yet.
+
+## [0.1.22](./release-notes/0.1.22.md) - 2026-09-11
+
+**Provenance:** [GitHub release](https://github.com/adamallcock/tibotattle/releases/tag/v0.1.22) ·
+[annotated source tag](https://github.com/adamallcock/tibotattle/tree/v0.1.22) ·
+[changes since v0.1.21](https://github.com/adamallcock/tibotattle/compare/v0.1.21...v0.1.22)
+
+Add Projects & threads and local model-performance views, with scoped cached
+results during refresh. Repair large-history contribution preparation and
+resumption, current-parser accounting compatibility, completed-history status
+and cache-drop thread links. Keep refresh and allowance-history controls stable.
+See the [release notes](./release-notes/0.1.22.md).
 
 ## [0.1.21](./release-notes/0.1.21.md) - 2026-09-11
 

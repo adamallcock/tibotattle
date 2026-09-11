@@ -1,4 +1,6 @@
 import { modelUsagePresentation, modelThemeIcon } from "./model-visuals.js";
+import { mountWorkUsageView } from "./work-usage-view.js";
+import { mountModelPerformance } from "./model-performance.js";
 import {
   CommunityClient,
   isPrimaryCodexQuotaWindow,
@@ -54,6 +56,9 @@ import {
 } from "./telemetry-shared.generated.js";
 import {
   compact,
+  formatCodexThreadParts,
+  formatApiMoney,
+  formatSharePercent,
   adaptiveChartTickCount,
   classifyTimelineEvidence,
   createDomHelpers,
@@ -197,6 +202,7 @@ let dashboard = null;
 const cacheDropThreadLinks = {
   dashboard: null,
   generation: null,
+  generationFingerprint: null,
   requestToken: 0,
   loadToken: 0,
   requested: false,
@@ -650,13 +656,37 @@ function localAnalysisLabel() {
     : "Analyze local usage";
 }
 
+// Keep phase, count and elapsed time in stable slots across refresh updates.
+function renderRefreshProgress(button, phase, { processed = null, selected = null, elapsedSeconds = null } = {}) {
+  button.classList.add("refresh-progress");
+  const label = node("span", "refresh-progress-phase", phase);
+  const count = node("span", "refresh-progress-count");
+  if (processed !== null && selected !== null) {
+    const current = node("span", "refresh-progress-current", String(processed));
+    current.style.minWidth = `${String(selected).length}ch`;
+    count.append(current, document.createTextNode(`/${selected}`));
+  }
+  const elapsed = elapsedSeconds === null ? "" :
+    `${Math.floor(elapsedSeconds / 60)}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
+  const timer = node("span", "refresh-progress-time", elapsed);
+  const description = [phase, count.textContent, elapsed].filter(Boolean).join(" · ");
+  button.title = description;
+  button.setAttribute("aria-label", description);
+  button.replaceChildren(label, count, timer);
+}
+
 function updateLocalActionButtons() {
   const allowed = localAnalysisAllowed();
   const label = localAnalysisLabel();
   for (const selector of ["#refresh-button", "#setup-refresh"]) {
     const button = $(selector);
     button.disabled = localActionBusy || !allowed;
-    if (!localActionBusy) button.textContent = label;
+    if (!localActionBusy) {
+      button.textContent = label;
+      button.classList.remove("refresh-progress");
+      button.removeAttribute("aria-label");
+      button.removeAttribute("title");
+    }
   }
   const setupCheck = $("#setup-check-again");
   if (setupCheck) setupCheck.disabled = localActionBusy;
@@ -695,25 +725,6 @@ function formatMoney(value, digits = 0) {
     });
 }
 
-function formatApiMoney(value) {
-  const number = finite(value);
-  if (number === null) return "—";
-  if (number > 0 && number < .01) {
-    return `<${formatNumber(.01, {
-      style: "currency",
-      currency: "USD",
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    })}`;
-  }
-  return formatNumber(number, {
-    style: "currency",
-    currency: "USD",
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  });
-}
-
 /**
  * A percentage near an end of the scale must not be printed as if it were at
  * that end. `Intl` rounds 99.96 to "100%" and 0.04 to "0%", and on this
@@ -748,37 +759,6 @@ function formatPercent(value, digits = 0) {
   const rendered = format(number);
   if (number > 0 && rendered === format(0)) return `<${format(step)}`;
   if (number < 100 && rendered === format(100)) return `>${format(100 - step)}`;
-  return rendered;
-}
-
-/**
- * A share for a table column, always at one decimal place.
- *
- * `formatPercent` drops to whole numbers whenever the value happens to be an
- * integer, which is right for a sentence and wrong for a column: it renders
- * "20%" directly above "20.9%", so the decimal point moves down the page and
- * two figures that exist to be compared have to be read digit by digit. Here
- * the precision is fixed, and the same bounded "<" idiom keeps a sliver from
- * rendering as an exact zero it is not.
- *
- * Returns `null` when the denominator cannot carry a share at all, so callers
- * withhold the cell rather than printing a share of nothing.
- */
-function formatSharePercent(part, whole) {
-  const numerator = finite(part);
-  const denominator = finite(whole);
-  if (numerator === null || denominator === null || denominator <= 0) return null;
-  if (numerator < 0) return null;
-  const percentFormatter = numberFormatter({
-    maximumFractionDigits: 1,
-    minimumFractionDigits: 1,
-    style: "percent",
-  });
-  const format = (amount) => percentFormatter.format(amount / 100);
-  const value = numerator / denominator * 100;
-  const rendered = format(value);
-  if (value > 0 && rendered === format(0)) return `<${format(.1)}`;
-  if (value < 100 && rendered === format(100)) return `>${format(99.9)}`;
   return rendered;
 }
 
@@ -934,7 +914,9 @@ function renderHistoryIndexBadge(data) {
   const total = finite(history?.sourceCount, null);
   const complete = history?.status === "complete"
     || (indexed !== null && total !== null && total > 0 && indexed >= total);
-  const partialTerminal = history?.phase === "partial_terminal";
+  const partialTerminal = history?.phase === "partial_terminal"
+    || (history?.phase === "aggregate_unavailable"
+      && finite(history?.skippedSourceCount, 0) > 0);
   if (data?.mode === "demo" || complete
       || indexed === null || total === null || total <= 0) {
     badge.hidden = true;
@@ -1541,9 +1523,11 @@ function renderLocalOnboarding(value) {
 function renderDashboard(data) {
   dashboardUnavailableState = null;
   dashboard = data;
-  if (!isCacheDropThreadDashboard(data) || data?.accounting?.generationMatched !== true
+  if (!isCacheDropThreadDashboard(data) || !data?.accounting?.cacheDiagnosticsSource
       || cacheDropThreadLinks.dashboard !== data
-      || cacheDropThreadLinks.generation !== data?.accounting?.generation) {
+      || cacheDropThreadLinks.generation !== data?.accounting?.cacheDiagnosticsSource?.generation
+      || cacheDropThreadLinks.generationFingerprint
+        !== data?.accounting?.cacheDiagnosticsSource?.generationFingerprint) {
     resetCacheDropThreadLinks(data);
   }
   if (data.mode === "demo") {
@@ -1958,8 +1942,8 @@ function formatBytes(value) {
  * sources it discovered and how many it has indexed, and the share is that
  * division. Nothing estimates a finish time, because none is known — a
  * progress bar that implied one would be the same invention this product
- * refuses everywhere else. The block is absent entirely once the index is
- * complete, and absent when there is no denominator to divide by.
+ * refuses everywhere else. The block is absent once both indexed history and
+ * its accounting summary are available, or there is no measured denominator.
  *
  * It sits with the API-price-equivalent total because that total, and every
  * figure derived from it, covers only the indexed share.
@@ -1973,6 +1957,7 @@ function renderHistoryProgress(data) {
   const total = finite(history?.sourceCount, 0);
   const indexed = finite(history?.indexedSourceCount, 0);
   const partialTerminal = history?.phase === "partial_terminal";
+  const aggregateUnavailable = history?.phase === "aggregate_unavailable";
   if (history === null || history.status === "complete" || total <= 0) {
     container.hidden = true;
     return false;
@@ -1985,7 +1970,12 @@ function renderHistoryProgress(data) {
     skippedSourceCount,
     { count: formatNumber(skippedSourceCount) },
   );
-  if (partialTerminal) {
+  if (aggregateUnavailable) {
+    setLocalizedText(
+      $("#history-progress-headline"),
+      "dashboard.history.scanFinished",
+    );
+  } else if (partialTerminal) {
     setRawText(
       $("#history-progress-headline"),
       t("dashboard.history.partialHeadline", {
@@ -2003,12 +1993,17 @@ function renderHistoryProgress(data) {
       { percent: formatPercent(percent, 1) },
     );
   }
-  container.classList.toggle("active", archiveHistoryScanActive);
+  container.classList.toggle(
+    "active", archiveHistoryScanActive && !aggregateUnavailable,
+  );
   const track = $("#history-progress-track");
   track.setAttribute("aria-valuenow", String(Math.round(percent)));
   const coverageKey = partialTerminal
+      || (aggregateUnavailable && skippedSourceCount > 0)
     ? "dashboard.history.partialSources"
-    : "dashboard.history.indexingSources";
+    : aggregateUnavailable
+      ? "dashboard.history.indexedSources"
+      : "dashboard.history.indexingSources";
   const coverageValues = {
     bytesIndexed: formatBytes(history.indexedBytes),
     bytesTotal: formatBytes(history.sourceBytes),
@@ -2024,7 +2019,12 @@ function renderHistoryProgress(data) {
   $("#history-progress-fill").style.width =
     `${indexed > 0 ? Math.max(1.5, percent) : 0}%`;
   setLocalizedText($("#history-progress-detail"), coverageKey, coverageValues);
-  if (partialTerminal) {
+  if (aggregateUnavailable) {
+    setLocalizedText(
+      $("#history-progress-note"),
+      "dashboard.history.summaryUnavailable",
+    );
+  } else if (partialTerminal) {
     const affectedThreads = finite(history?.skippedThreadCount, 0);
     setRawText(
       $("#history-progress-note"),
@@ -8757,60 +8757,8 @@ function isCacheDropThreadDashboard(data) {
 
 const CACHE_DROP_AUTO_REVIEW_LABEL = "Auto review";
 
-function cacheDropThreadId(value) {
-  return typeof value === "string"
-      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
-    ? value.toLowerCase()
-    : null;
-}
-
-function cacheDropThreadName(thread) {
-  return typeof thread?.name === "string" && thread.name.trim()
-    ? thread.name.trim()
-    : t("accounting.cacheDropThread.fallback", {
-      id: cacheDropThreadId(thread?.id)?.slice(0, 8) ?? "",
-    });
-}
-
 function cacheDropThreadParts(thread) {
-  const id = cacheDropThreadId(thread?.id);
-  if (id === null) return [];
-  const parentId = cacheDropThreadId(thread.parent?.id);
-  const parent = parentId !== null && parentId !== id ? thread.parent : null;
-  if (thread?.origin === "auto_review") {
-    // The internal guardian-review thread has no user-visible conversation of
-    // its own. Its resolver supplies a parent only after Codex metadata proves
-    // that parent remains accessible; do not fall back to the internal UUID.
-    return parent === null ? [{
-      name: CACHE_DROP_AUTO_REVIEW_LABEL,
-      href: null,
-      autoReview: true,
-    }] : [{
-      name: cacheDropThreadName(parent),
-      href: `codex://threads/${parentId}`,
-      worker: false,
-      autoReview: true,
-    }];
-  }
-  const nickname = typeof thread.nickname === "string"
-    ? thread.nickname.trim()
-    : "";
-  const worker = parent !== null || nickname !== "";
-  const parts = parent === null ? [] : [{
-    name: cacheDropThreadName(parent),
-    href: `codex://threads/${parentId}`,
-    worker: false,
-  }];
-  parts.push({
-    name: worker
-      ? t("accounting.cacheDropThread.subworker", {
-        name: nickname || cacheDropThreadName(thread),
-      })
-      : cacheDropThreadName(thread),
-    href: `codex://threads/${id}`,
-    worker,
-  });
-  return parts;
+  return formatCodexThreadParts(thread, t);
 }
 
 function fillCacheDropThreadCell(cell, thread, observedAt) {
@@ -8923,16 +8871,24 @@ function cacheDropThreadKeys(data) {
 
 function resetCacheDropThreadLinks(data = null) {
   const sameDashboard = cacheDropThreadLinks.dashboard === data;
+  const previousGeneration = cacheDropThreadLinks.generation;
+  const previousFingerprint = cacheDropThreadLinks.generationFingerprint;
   cacheDropThreadLinks.requestToken += 1;
   cacheDropThreadLinks.dashboard = data;
   cacheDropThreadLinks.generation = isCacheDropThreadDashboard(data)
-      && typeof data.accounting?.generation === "string"
-    ? data.accounting.generation
+      && typeof data.accounting?.cacheDiagnosticsSource?.generation === "string"
+    ? data.accounting.cacheDiagnosticsSource.generation
     : null;
+  cacheDropThreadLinks.generationFingerprint =
+    data?.accounting?.cacheDiagnosticsSource?.generationFingerprint ?? null;
   cacheDropThreadLinks.requested = false;
-  // A new accounting generation does not change an already resolved thread.
-  // Reuse only exact event-pair keys still present in the local snapshot, across
-  // all selectable periods. New/changed rows must resolve independently.
+  // An unchanged tuple can become ambiguous when another source is indexed.
+  // Reuse navigation only within the same attested diagnostic publication;
+  // a changed or missing proof requires a new successful identity lookup.
+  if (previousGeneration !== cacheDropThreadLinks.generation
+      || previousFingerprint !== cacheDropThreadLinks.generationFingerprint) {
+    cacheDropThreadLinks.entries.clear();
+  }
   const retainedKeys = cacheDropThreadKeys(data);
   for (const key of cacheDropThreadLinks.entries.keys()) {
     if (!retainedKeys.has(key)) cacheDropThreadLinks.entries.delete(key);
@@ -8943,10 +8899,13 @@ function resetCacheDropThreadLinks(data = null) {
 
 async function loadCacheDropThreadLinks(data) {
   const generation = cacheDropThreadLinks.generation;
+  const fingerprint = cacheDropThreadLinks.generationFingerprint;
   if (data !== dashboard || data !== cacheDropThreadLinks.dashboard
       || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
       || generation === null || generation === ""
-      || data.accounting?.generationMatched !== true
+      || fingerprint === null
+      || generation !== data.accounting?.cacheDiagnosticsSource?.generation
+      || fingerprint !== data.accounting?.cacheDiagnosticsSource?.generationFingerprint
       || cacheDropThreadLinks.requested
       || typeof localClient.cacheDropThreadLinks !== "function") return;
   cacheDropThreadLinks.requested = true;
@@ -8959,17 +8918,18 @@ async function loadCacheDropThreadLinks(data) {
         || loadToken !== cacheDropThreadLinks.loadToken
         || data !== dashboard || data !== cacheDropThreadLinks.dashboard
         || !isCacheDropThreadDashboard(data) || !isLoopbackDashboard()
-        || generation !== data.accounting?.generation
-        || data.accounting?.generationMatched !== true
+        || generation !== data.accounting?.cacheDiagnosticsSource?.generation
+        || fingerprint !== data.accounting?.cacheDiagnosticsSource?.generationFingerprint
         || result?.status !== "available"
         || result.generation !== generation) return;
     const selectedKeys = cacheDropThreadKeys(data);
+    const resolvedEntries = new Map();
     for (const { key, thread } of result.entries) {
       if (!selectedKeys.has(key)) continue;
       const previous = cacheDropThreadLinks.entries.get(key);
       // Optional name-store failures must not erase details already known for
       // this UUID. A newly resolved identity replaces the old entry outright.
-      cacheDropThreadLinks.entries.set(key, previous?.id === thread.id ? {
+      resolvedEntries.set(key, previous?.id === thread.id ? {
         ...thread,
         name: thread.name ?? previous.name,
         nickname: thread.nickname ?? previous.nickname,
@@ -8980,6 +8940,9 @@ async function loadCacheDropThreadLinks(data) {
         },
       } : thread);
     }
+    // A qualified empty/partial result withdraws unresolved identities. It is
+    // different from a failed lookup, which leaves same-publication UI intact.
+    cacheDropThreadLinks.entries = resolvedEntries;
     completed = true;
     updateCacheDropThreadCells();
   } catch {
@@ -11960,7 +11923,8 @@ async function loadLocalDashboard() {
   let primaryAvailable = false;
   localActionBusy = true;
   const button = $("#refresh-button");
-  button.textContent = "Connecting…";
+  if (localRefreshInProgress) renderRefreshProgress(button, "Loading evidence…");
+  else button.textContent = "Connecting…";
   updateLocalActionButtons();
   try {
     const loadDashboardData = async () => {
@@ -12229,9 +12193,9 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
   localRefreshInProgress = true;
   localRefreshCancelRequested = false;
   archiveHistoryScanActive = false;
-  button.textContent = detailed
+  renderRefreshProgress(button, detailed
     ? "Starting detailed accounting…"
-    : "Starting local analysis…";
+    : "Starting local analysis…");
   updateLocalActionButtons();
   setGlobalState("updating");
   try {
@@ -12268,7 +12232,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         consecutiveStatusFailures = 0;
       } catch (error) {
         consecutiveStatusFailures += 1;
-        button.textContent = "Update running; reconnecting…";
+        renderRefreshProgress(button, "Update running; reconnecting…");
         if (consecutiveStatusFailures >= 8) throw error;
         continue;
       }
@@ -12302,11 +12266,8 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
         0,
         Math.floor((Date.now() - activePassStartedMs) / 1_000),
       );
-      const elapsedLabel = elapsedSeconds >= 60
-        ? `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s`
-        : `${elapsedSeconds}s`;
       const accountingStatus = outcome === "running"
-        ? refreshAccountingStatus({ progress, elapsedLabel })
+        ? refreshAccountingStatus({ progress })
         : null;
       const countedProgress = collectorProgress || unifiedIndexScanning;
       const processed = countedProgress
@@ -12315,24 +12276,24 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       const selected = countedProgress
           && Number.isSafeInteger(progress?.filesSelected)
         ? progress.filesSelected : null;
-      button.textContent = outcome === "cancelling"
+      const phase = outcome === "cancelling"
         ? "Stopping safely…"
         : accountingStatus !== null
           ? accountingStatus
         : archiveScanning
-          ? `Indexing archive history… ${elapsedLabel}`
+          ? "Indexing archive history…"
         : collectorProgress && progress?.phase === "quick_result"
           ? refreshQuickResultStatus({
               dashboardLoaded: quickResultLoaded,
-              elapsedLabel,
             })
         : unifiedIndexScanning && (selected === null || selected === 0)
-          ? `Scanning local history… ${elapsedLabel}`
+          ? "Scanning local history…"
         : processed !== null && selected !== null
         ? selected > 0 && processed >= selected
-          ? `Calculating usage and allowance… ${elapsedLabel}`
-          : `Analyzing ${processed}/${selected} files… ${elapsedLabel}`
-        : pollCount < 3 ? "Analyzing local evidence…" : `Analyzing… ${elapsedLabel}`;
+          ? "Calculating usage and allowance…"
+          : "Analyzing files…"
+        : pollCount < 3 ? "Analyzing local evidence…" : "Analyzing…";
+      renderRefreshProgress(button, phase, { processed, selected, elapsedSeconds });
       if (refreshNeedsContinuation({
         outcome,
         errorCode: refresh.errorCode,
@@ -12349,7 +12310,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
           pollingBudget.noteContinuation();
           activePassStartedMs = Date.now();
           timeoutSettlementNoted = false;
-          button.textContent = "Continuing local analysis…";
+          renderRefreshProgress(button, "Continuing local analysis…");
         } catch (error) {
           // A 409 means a timed-out pass is still finishing its durable
           // checkpoint. Keep polling until it becomes resumable.
@@ -12364,7 +12325,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       }
       if (outcome === "failed"
           && refresh.errorCode === "refresh_timed_out") {
-        button.textContent = "Finalizing bounded pause…";
+        renderRefreshProgress(button, "Finalizing bounded pause…");
         if (!timeoutSettlementNoted) {
           pollingBudget.noteSettling();
           timeoutSettlementNoted = true;
@@ -12374,7 +12335,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     cancelled = outcome === "cancelled";
     if (cancelled) {
-      button.textContent = "Loading saved results…";
+      renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
         title: "Local analysis cancelled",
@@ -12385,7 +12346,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
     }
     if (outcome === "failed"
         && finalErrorCode === "refresh_resource_limited") {
-      button.textContent = "Loading saved results…";
+      renderRefreshProgress(button, "Loading saved results…");
       await loadLocalDashboard();
       showConnectionNotice({
         title: "This scan paused to protect your Mac",
@@ -12395,7 +12356,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       return;
     }
     if (outcome === "degraded") {
-      button.textContent = t("refresh.degradedLoading");
+      renderRefreshProgress(button, t("refresh.degradedLoading"));
       await loadLocalDashboard();
       lastReindexProgressReceipt = historyProgressReceipt();
       const history = dashboard?.pricing?.historyCoverage
@@ -12444,7 +12405,7 @@ async function requestRefresh({ autoContinue = false, detailed = false } = {}) {
       throw failure;
     }
     archiveHistoryScanActive = false;
-    button.textContent = "Loading updated evidence…";
+    renderRefreshProgress(button, "Loading updated evidence…");
     await loadLocalDashboard();
     if (detailed) scheduleReindexAutoContinuation();
   } catch (error) {
@@ -15957,6 +15918,13 @@ document.addEventListener("scroll", () => {
   const current = activeInformationPopover;
   if (current) positionInformationPopover(current.popover, current.button);
 }, true);
+
+mountWorkUsageView({ root: document.querySelector("#projects"), t });
+const modelPerformance = mountModelPerformance({
+  root: document.querySelector("#performance"), client: localClient,
+  t, locale: () => localization.formatLocale(),
+});
+window.addEventListener("tibotattle:locale-change", () => modelPerformance.render());
 
 mountDashboardNavigation({
   documentRef: document,

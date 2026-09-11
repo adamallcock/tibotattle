@@ -22,6 +22,7 @@ const DASHBOARD_SECTION_HASHES = Object.freeze({
   weekly: "#weekly",
   timeline: "#timeline",
   accounting: "#accounting",
+  projects: "#projects",
   community: "#community",
 });
 const mountedDocuments = new WeakMap();

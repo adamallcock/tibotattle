@@ -85,6 +85,24 @@ blob downloads. Provider identity pages open in the system browser. Native/web
 bridge messages use a closed vocabulary documented in
 [`api-surface.md`](./api-surface.md).
 
+## Independent model performance diagnostics
+
+The development source adds web/native `#performance` navigation and a fixed
+loopback timing route. The page reads validated aggregates; it never parses
+Codex logs. A separate page-leased worker composes the application timing
+facade, Codex reconstruction owner, reporting projection, and platform sidecar
+adapter. Its diagnostic population spans the selected device-local Codex
+sources across accounts, independently of account-scoped accounting.
+
+The worker starts on a timing-page read and stops after a 60-second idle lease.
+It scans plain session/archive JSONL in bounded, checkpointed passes and stores
+one aggregate per turn in an owner-only, capped version-2 timing database.
+Neither timing data nor failures enter accounting or contribution; no network
+service is involved. Incompatible storage is preserved and refused. See the
+[privacy inventory](./local-data-and-privacy.md#model-performance-timing-in-development-source)
+for limits and retained fields. Windows permission support and installed-native
+qualification remain separate gates.
+
 ## Source boundary
 
 Normal refresh reads narrowly defined local sources:

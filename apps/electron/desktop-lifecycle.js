@@ -63,6 +63,7 @@ const DASHBOARD_SECTIONS = Object.freeze([
   "weekly",
   "timeline",
   "accounting",
+  "projects",
   "community",
 ]);
 
@@ -810,6 +811,7 @@ export function createDesktopLifecycle({
       weekly: suppliedActions.weekly ?? (() => navigateDashboardSection("weekly")),
       timeline: suppliedActions.timeline ?? (() => navigateDashboardSection("timeline")),
       accounting: suppliedActions.accounting ?? (() => navigateDashboardSection("accounting")),
+      projects: suppliedActions.projects ?? (() => navigateDashboardSection("projects")),
       toggleSidebar: suppliedActions.toggleSidebar ?? (() => false),
       retry: suppliedActions.retry ?? (() => retry()),
       settings: suppliedActions.settings ?? (() => showSettingsWindow()),

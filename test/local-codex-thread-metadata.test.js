@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import {
+import fsPromises, {
   chmod, link, mkdir, mkdtemp, readFile, rm, symlink, writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { readCodexLocalThreadMetadata } from "../src/platform/index.js";
+import { readCodexLocalRepositoryOrigins, readCodexLocalThreadAncestry, readCodexLocalThreadMetadata } from "../src/platform/index.js";
 
 const ROOT = "11111111-1111-4111-8111-111111111111";
 const WORKER = "22222222-2222-4222-8222-222222222222";
@@ -87,6 +88,43 @@ test("selected metadata resolves display names and explicit worker parents witho
   ]);
   assert.doesNotMatch(JSON.stringify([...result]), new RegExp(PRIVATE_PROMPT_CANARY, "u"));
   assert.deepEqual(await Promise.all([readFile(databaseFile), readFile(namesFile)]), before);
+});
+
+test("accounting ancestry follows nested workers without reading guardian rollout parents", async (t) => {
+  const { home, databaseFile, rolloutPath } = await addAutoReview(t);
+  const grandchild = "55555555-5555-4555-8555-555555555555";
+  const database = new DatabaseSync(databaseFile);
+  database.prepare(`INSERT INTO threads(
+    id, title, source, thread_source, agent_nickname, rollout_path)
+    VALUES (?, ?, ?, ?, ?, ?)`)
+    .run(grandchild, PRIVATE_PROMPT_CANARY,
+      JSON.stringify({ subagent: { thread_spawn: { parent_thread_id: WORKER } } }),
+      "subagent", null, null);
+  database.close();
+
+  // This is a valid guardian navigation fixture, not a malformed log that
+  // would hide an accidental ancestry read behind normal rejection.
+  const displayed = await readCodexLocalThreadMetadata(home, [AUTO_REVIEW]);
+  assert.equal(displayed.get(AUTO_REVIEW).parent.id, ROOT);
+
+  const opened = [];
+  const originalOpen = fsPromises.open;
+  const mockedOpen = t.mock.method(fsPromises, "open", async function (path, ...args) {
+    opened.push(path);
+    return originalOpen.call(this, path, ...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    // Request only the leaf, forcing both explicit ancestors to be loaded.
+    const ancestry = await readCodexLocalThreadAncestry(home, [grandchild, AUTO_REVIEW]);
+    assert.deepEqual([...ancestry], [[grandchild, ROOT], [AUTO_REVIEW, AUTO_REVIEW]]);
+    assert.equal(opened.includes(rolloutPath), false,
+      "guardian session metadata must never be opened for accounting ancestry");
+    assert.deepEqual(opened, [], "ancestry does not open display-name or rollout files");
+  } finally {
+    mockedOpen.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 test("guardian review uses only its own verified session parent and an accessible local parent record", async (t) => {
@@ -376,4 +414,117 @@ test("Codex-home, database, and SQLite sidecar links cannot redirect display met
   assert.equal(result.get(WORKER).parent, null);
   assert.equal(result.get(WORKER).nickname, null);
   assert.deepEqual(await readFile(databaseFile), databaseBytes);
+});
+
+test("approved local title fallback is explicit, bounded and respects saved names and parent links", async (t) => {
+  const {home,databaseFile,namesFile}=await fixture(t,{explicitName:true});
+  await rm(namesFile);
+  const db=new DatabaseSync(databaseFile);
+  db.prepare('UPDATE threads SET title=? WHERE id=?').run('  Synthetic\nCodex\t title <b>literal</b>  ',WORKER);
+  db.close();
+  const before=await readFile(databaseFile);
+  const enabled=await readCodexLocalThreadMetadata(home,[ROOT,WORKER],{allowTitleFallback:true});
+  assert.equal(enabled.get(ROOT).name,'Explicit root name');
+  assert.equal(enabled.get(WORKER).name,'Synthetic Codex title <b>literal</b>');
+  assert.equal(enabled.get(WORKER).parent.name,'Explicit root name');
+  assert.equal((await readCodexLocalThreadMetadata(home,[WORKER])).get(WORKER).name,null);
+  assert.equal((await readCodexLocalThreadMetadata(home,[WORKER],{allowTitleFallback:'true'})).get(WORKER).name,null);
+  assert.deepEqual(await readFile(databaseFile),before);
+
+  const update=new DatabaseSync(databaseFile);
+  update.prepare('UPDATE threads SET name=NULL, title=? WHERE id=?').run('Synthetic parent title',ROOT);
+  update.prepare('UPDATE threads SET title=? WHERE id=?').run('x'.repeat(100_000),WORKER);
+  update.close();
+  const bounded=await readCodexLocalThreadMetadata(home,[WORKER],{allowTitleFallback:true});
+  assert.equal(bounded.get(WORKER).name.length,512);
+  assert.equal(bounded.get(WORKER).parent.name,'Synthetic parent title');
+  await writeFile(namesFile,`${named(WORKER,'Saved session name')}\n`);
+  assert.equal((await readCodexLocalThreadMetadata(home,[WORKER],{allowTitleFallback:true})).get(WORKER).name,'Saved session name');
+});
+
+test("title fallback rejects nontext and control-containing values", async (t) => {
+  const {home,databaseFile,namesFile}=await fixture(t);
+  await rm(namesFile);
+  for (const title of ['bad\u0000title','bad\u0007title','   ',null]) {
+    const db=new DatabaseSync(databaseFile);db.prepare('UPDATE threads SET title=? WHERE id=?').run(title,ROOT);db.close();
+    assert.equal((await readCodexLocalThreadMetadata(home,[ROOT],{allowTitleFallback:true})).get(ROOT).name,null);
+  }
+});
+
+
+test("repository hints read bounded local metadata, normalize origins and preserve ambiguity", async (t) => {
+  const { home, databaseFile } = await fixture(t);
+  const db = new DatabaseSync(databaseFile);
+  db.exec("ALTER TABLE threads ADD COLUMN cwd TEXT; ALTER TABLE threads ADD COLUMN git_origin_url TEXT;");
+  db.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?").run("/gone/repo", "git@example.test:owner/repo.git", ROOT);
+  db.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?").run("/gone/repo/", "https://user:private@example.test/owner/repo.git?secret=hidden", WORKER);
+  db.close();
+  const before = await readFile(databaseFile);
+  assert.deepEqual([...await readCodexLocalRepositoryOrigins(home)], [["/gone/repo", "https://example.test/owner/repo"]]);
+  assert.deepEqual(await readFile(databaseFile), before);
+  const update = new DatabaseSync(databaseFile);
+  update.prepare("UPDATE threads SET git_origin_url = ? WHERE id = ?").run("https://example.test/other/repo", WORKER);
+  update.close();
+  assert.deepEqual([...await readCodexLocalRepositoryOrigins(home)], [["/gone/repo", null]]);
+  await chmod(databaseFile, 0o666);
+  assert.equal((await readCodexLocalRepositoryOrigins(home)).size, 0);
+});
+
+test("repository hints fail closed for absent columns and invalid locations", async (t) => {
+  const { home, databaseFile } = await fixture(t);
+  assert.equal((await readCodexLocalRepositoryOrigins(home)).size, 0);
+  const db = new DatabaseSync(databaseFile);
+  db.exec("ALTER TABLE threads ADD COLUMN cwd TEXT; ALTER TABLE threads ADD COLUMN git_origin_url TEXT;");
+  db.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?").run("relative/repo", "https://example.test/owner/repo", ROOT);
+  db.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?").run("/valid/repo", "file:///private/repo", WORKER);
+  db.close();
+  assert.deepEqual([...await readCodexLocalRepositoryOrigins(home)], [["/valid/repo", null]]);
+});
+
+
+test("repository hints reject oversized values and fail closed above the row bound", async (t) => {
+  const { home, databaseFile } = await fixture(t);
+  const db = new DatabaseSync(databaseFile);
+  db.exec("ALTER TABLE threads ADD COLUMN cwd TEXT; ALTER TABLE threads ADD COLUMN git_origin_url TEXT;");
+  const update = db.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?");
+  update.run("/gone/repo", "https://example.test/owner/" + "x".repeat(4096), ROOT);
+  update.run("/" + "x".repeat(4096), "https://example.test/owner/repo", WORKER);
+  db.close();
+  assert.deepEqual([...await readCodexLocalRepositoryOrigins(home)], [["/gone/repo", null]]);
+  const fill = new DatabaseSync(databaseFile);
+  fill.exec(`WITH RECURSIVE rows(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM rows WHERE n<24999)
+    INSERT INTO threads(id,cwd,git_origin_url) SELECT 'bounded-' || n, '/gone/repo', 'https://example.test/owner/repo' FROM rows;`);
+  fill.close();
+  assert.equal((await readCodexLocalRepositoryOrigins(home)).size, 0);
+});
+
+
+test("present rejected repository origins block historical attribution in either row order", async (t) => {
+  const { home, databaseFile } = await fixture(t);
+  const db = new DatabaseSync(databaseFile);
+  db.exec("ALTER TABLE threads ADD COLUMN cwd TEXT; ALTER TABLE threads ADD COLUMN git_origin_url TEXT;");
+  db.close();
+  for (const invalid of ["file:///different/repo", "https://example.test/" + "x".repeat(4096)]) {
+    for (const origins of [[invalid, "https://example.test/owner/repo"], ["https://example.test/owner/repo", invalid]]) {
+      const update = new DatabaseSync(databaseFile);
+      const row = update.prepare("UPDATE threads SET cwd = ?, git_origin_url = ? WHERE id = ?");
+      row.run("/gone/repo", origins[0], ROOT);
+      row.run("/gone/repo", origins[1], WORKER);
+      update.close();
+      assert.deepEqual([...await readCodexLocalRepositoryOrigins(home)], [["/gone/repo", null]]);
+    }
+  }
+});
+
+test("name-search opt-in reads beyond one displayed page while ordinary metadata retains its small bound", async (t) => {
+  const { home, databaseFile } = await fixture(t);
+  const ids = Array.from({ length: 161 }, (_, i) => `${String(i + 1).padStart(8, "0")}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`);
+  const db = new DatabaseSync(databaseFile);
+  db.prepare("INSERT INTO threads(id, title, source) VALUES (?, ?, ?)").run(ids.at(-1), "Saved searchable café title", '"cli"');
+  db.close();
+  assert.equal((await readCodexLocalThreadMetadata(home, ids, { allowTitleFallback: true })).size, 0);
+  const search = await readCodexLocalThreadMetadata(home, ids, { allowTitleFallback: true, forNameSearch: true });
+  assert.equal(search.get(ids.at(-1)).name, "Saved searchable café title");
+  assert.equal((await readCodexLocalThreadMetadata(home, Array(25_001).fill(ROOT), { forNameSearch: true })).size, 0);
+  assert.equal((await readCodexLocalThreadMetadata(home, [...ids, "invalid-id"], { forNameSearch: true })).size, 0);
 });

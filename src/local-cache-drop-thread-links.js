@@ -26,7 +26,7 @@ const CURRENT_PARSERS = new Set([
   LOCAL_UNIFIED_INDEX_PARSER_VERSION, LOCAL_UNIFIED_INDEX_PARTIAL_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION,
   LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARTIAL_PARSER_VERSION,
-]);
+].flatMap((version) => [version, `${version}-cache-write-zero`]));
 const EFFORTS = new Set(REASONING_EFFORTS.filter((value) => value !== "unknown"));
 const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
 const POSITIVE_INPUT = `COALESCE(tokens_in_uncached, 0)
@@ -303,8 +303,16 @@ export async function buildLocalCacheDropThreadLinks({
   openIndex = openLocalUnifiedIndex,
   readThreadMetadata = readCodexLocalThreadMetadata,
 } = {}) {
-  const generation = generationNumber(overview?.accounting?.generation);
-  if (generation === null || overview.accounting.generationMatched !== true
+  // These rows originate in the unified diagnostic projection. The replay
+  // accounting cache has a separate readiness/identity contract and may be
+  // missing even when this exact generation is fully available for lookup.
+  const source = overview?.accounting?.cacheDiagnosticsSource;
+  const generation = generationNumber(source?.generation);
+  if (!object(source)
+      || Object.keys(source).sort().join(",") !== "generation,generationFingerprint"
+      || generation === null
+      || typeof source.generationFingerprint !== "string"
+      || !/^generation-v2-[a-f0-9]{64}$/u.test(source.generationFingerprint)
       || !count(nowMs) || typeof indexFile !== "string" || indexFile.length === 0) {
     return unavailable();
   }
@@ -319,8 +327,7 @@ export async function buildLocalCacheDropThreadLinks({
           && ["tool_provenance_incomplete", "codex_rollout_sources_quarantined"]
             .includes(descriptor.blockReason)))
         || !descriptor.discoveryComplete || !descriptor.diagnosticsComplete
-        || (overview.accounting.generationFingerprint != null
-          && overview.accounting.generationFingerprint !== descriptor.fingerprint)) {
+        || source.generationFingerprint !== descriptor.fingerprint) {
       return unavailable();
     }
     matches = await readSelectedMatches(

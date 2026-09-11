@@ -2079,11 +2079,18 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       now: () => Date.parse("2026-07-25T12:00:00.000Z"),
     });
     assert.equal(partialSnapshot.overview.timeline.history.status, "partial");
+    assert.equal(partialSnapshot.overview.accounting.cacheDiagnosticsSource, null,
+      "an incomplete diagnostic generation cannot authorize thread lookup");
     assert.equal(
       partialSnapshot.overview.timeline.history.reason,
       "unified_index_partial",
     );
     assert.equal(partialSnapshot.overview.timeline.source, "insufficient_evidence");
+    assert.notEqual(
+      partialSnapshot.overview.accounting.historyCoverage.phase,
+      "aggregate_unavailable",
+      "indexed counts alone do not prove a validated generation is complete",
+    );
     assert.equal(
       partialSnapshot.overview.accounting.accountingSource,
       "insufficient_evidence",
@@ -2229,6 +2236,32 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
     );
     await writeFile(archiveIndexFile, "rollback-sentinel", { mode: 0o600 });
     const archiveBefore = await stat(archiveIndexFile);
+    const beforeSummary = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      archiveIndexFile,
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const pendingHistory = beforeSummary.overview.accounting.historyCoverage;
+    assert.equal(pendingHistory.phase, "aggregate_unavailable");
+    assert.equal(pendingHistory.status, "partial");
+    assert.equal(pendingHistory.errorCode, "cache_missing");
+    assert.equal(pendingHistory.indexedSourceCount, pendingHistory.sourceCount);
+    assert.equal(pendingHistory.indexedBytes, pendingHistory.sourceBytes);
+    assert.equal(beforeSummary.overview.accounting.generationMatched, false);
+    assert.equal(beforeSummary.overview.accounting.historyPeriodStatus, "unavailable");
+    assert.equal(beforeSummary.overview.accounting.projection.status, "available");
+    assert.equal(beforeSummary.overview.usage.find((period) => period.id === "all").events, 3);
+    assert.ok(beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("history scan is complete")
+      && warning.includes("accounting summary is unavailable")
+    )));
+    assert.ok(!beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("History indexing is still advancing")
+      || warning.includes("Complete historical totals stay hidden")
+    )));
     await refreshReplaySafeAccountingCache({
       stateFile: collectorStateFile,
       sourceMode: "unified",
@@ -2314,6 +2347,22 @@ test("the unified index removes the 31-day ceiling and keeps fork replay out of 
       toolPartialDatabase,
     );
     toolPartialDatabase.close();
+    // The current diagnostic projection remains independently attested while
+    // the prior replay cache no longer matches the changed generation proof.
+    const beforeReplayRebuild = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      archiveIndexFile,
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    assert.equal(beforeReplayRebuild.overview.accounting.generationMatched, false);
+    assert.equal(beforeReplayRebuild.overview.accounting.cacheSwitchImpact.status, "available");
+    assert.deepEqual(beforeReplayRebuild.overview.accounting.cacheDiagnosticsSource, {
+      generation: toolPartialGeneration.id,
+      generationFingerprint: toolPartialGeneration.fingerprint,
+    });
     await refreshReplaySafeAccountingCache({
       stateFile: collectorStateFile,
       sourceMode: "unified",
@@ -2702,6 +2751,30 @@ test("an attested rollout quarantine publishes verified totals as a terminal gap
     });
     assert.equal(built.generation.status, "partial");
     assert.equal(built.generation.skippedSourceCount, 2);
+
+    const beforeSummary = await buildLocalCompanionSnapshot({
+      root,
+      accountingSourceMode: "unified",
+      unifiedIndexFile,
+      allowDevelopmentArtifactFallback: false,
+      now: () => Date.parse("2026-07-25T12:00:00.000Z"),
+    });
+    const pendingHistory = beforeSummary.overview.accounting.historyCoverage;
+    assert.equal(pendingHistory.phase, "aggregate_unavailable");
+    assert.equal(pendingHistory.status, "partial");
+    assert.equal(pendingHistory.pendingSourceCount, 0);
+    assert.equal(pendingHistory.indexedSourceCount, 1);
+    assert.equal(pendingHistory.skippedSourceCount, 2);
+    assert.equal(pendingHistory.skippedThreadCount, 1);
+    assert.equal(beforeSummary.overview.accounting.historyPeriodStatus, "unavailable");
+    assert.equal(beforeSummary.overview.usage.find((period) => period.id === "all").events, 1);
+    assert.ok(beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("2 sources across 1 thread")
+      && warning.includes("did not pass local validation")
+    )));
+    assert.ok(!beforeSummary.overview.warnings.some((warning) => (
+      warning.includes("History indexing is still advancing")
+    )));
 
     await refreshReplaySafeAccountingCache({
       stateFile: join(

@@ -5204,6 +5204,7 @@ async function createDashboardStartupHarness({
     cacheDropThreadLinks: { loadToken: 0 },
     activeLocalDashboardLoad: null,
     localActionBusy: initialBusy,
+    localRefreshInProgress: false,
     electronStartupRefreshDeferred: false,
     localCompanionHealth: initialHealth,
     localOnboarding: null,
@@ -5755,7 +5756,8 @@ test("local analysis exposes quick results and cancel-safe progress", async () =
   assert.match(appSource, /await loadQuickResultDashboard\(\)/u);
   assert.match(appSource, /renderDashboard\(data\)/u);
   assert.match(appSource, /refreshQuickResultStatus\(\{/u);
-  assert.match(appSource, /refreshAccountingStatus\(\{ progress, elapsedLabel \}\)/u);
+  assert.match(appSource, /refreshAccountingStatus\(\{ progress \}\)/u);
+  assert.match(appSource, /renderRefreshProgress\(button, phase, \{ processed, selected, elapsedSeconds \}\)/u);
   assert.match(appSource, /const accountingStatus = outcome === "running"/u);
   assert.match(appSource, /const collectorProgress = progress\?\.kind === undefined/u);
   assert.match(appSource, /if \(collectorProgress\s*&& progress\?\.phase === "quick_result"/u);

@@ -491,6 +491,7 @@ export function historyIndexContinuationDecision({
     && safeHistory?.phase === "partial_terminal";
   const incomplete = safeHistory?.status !== "complete"
     && !terminalGap
+    && safeHistory?.phase !== "aggregate_unavailable"
     && indexedSourceCount !== null
     && sourceCount !== null
     && sourceCount > 0

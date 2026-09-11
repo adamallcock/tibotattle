@@ -3724,6 +3724,7 @@ private enum NativeDashboardDestination: String, CaseIterable {
     case overview
     case weekly
     case trends
+    case performance
     case method
     case community
 
@@ -3735,6 +3736,8 @@ private enum NativeDashboardDestination: String, CaseIterable {
             return TiboTattleLocalization.string(.nativeDashboardAllowance)
         case .trends:
             return TiboTattleLocalization.string(.nativeDashboardTrends)
+        case .performance:
+            return TiboTattleLocalization.string(.nativeDashboardPerformance)
         case .method:
             return TiboTattleLocalization.string(.nativeDashboardHowItWorks)
         case .community:
@@ -3747,6 +3750,7 @@ private enum NativeDashboardDestination: String, CaseIterable {
         case .overview: return "rectangle.grid.1x2"
         case .weekly: return "chart.bar.xaxis"
         case .trends: return "chart.xyaxis.line"
+        case .performance: return "speedometer"
         case .method: return "function"
         case .community: return "person.3"
         }

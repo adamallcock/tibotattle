@@ -365,3 +365,21 @@ test("browser and companion key helpers reject the same malformed event-pair evi
     assert.equal(companionLookupKey(kind, null), null);
   }
 });
+
+
+test("diagnostic source provenance is closed and independent from replay cache availability", () => {
+  const generationFingerprint = `generation-v2-${"a".repeat(64)}`;
+  const source = { generation: 35, generationFingerprint };
+  const accounting = normalizeDashboardPayload({ accounting: {
+    generationMatched: false, cacheDiagnosticsSource: source,
+  } }).accounting;
+  assert.equal(accounting.generationMatched, false);
+  assert.deepEqual(accounting.cacheDiagnosticsSource, { generation: "35", generationFingerprint });
+  for (const value of [null, undefined, [], {}, { ...source, extra: true },
+    { ...source, generation: 0 }, { ...source, generation: "35.1" },
+    { ...source, generationFingerprint: null }, { ...source, generationFingerprint: "private-name" }]) {
+    assert.equal(normalizeDashboardPayload({ accounting: {
+      generationMatched: true, cacheDiagnosticsSource: value,
+    } }).accounting.cacheDiagnosticsSource, null);
+  }
+});

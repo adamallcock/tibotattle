@@ -30,6 +30,10 @@ test("desktop commands contain only the fixed presentation vocabulary", () => {
     command: "dashboardSection",
     section: "accounting",
   });
+  assert.deepEqual(createDesktopCommand("dashboardSection", "projects"), {
+    command: "dashboardSection",
+    section: "projects",
+  });
   assert.deepEqual(createDesktopCommand("dashboardSection", "community"), {
     command: "dashboardSection",
     section: "community",
@@ -67,6 +71,8 @@ test("desktop commands reject selectors, paths, URLs, extra keys, and prototypes
     { command: "automaticRefresh", mode: "quick", reason: "unexpected" },
     { command: "automaticRefresh", mode: "background" },
     { command: "dashboardSection", section: "#weekly" },
+    { command: "dashboardSection", section: "#projects" },
+    { command: "dashboardSection", section: "projects", search: "unexpected" },
     { command: "dashboardSection", section: "community", extra: true },
     { command: "dashboardSection", section: "weekly", path: "/private/secret" },
     { command: "navigate", value: "https://attacker.example" },

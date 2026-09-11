@@ -314,16 +314,19 @@ function parserCompatibility(database, contractVersion, generationId) {
   }
   const uniqueParserVersions = [...new Set(parserVersions)];
   const uniqueContractVersions = [...new Set(contractVersions)];
-  // The inherited-model stamp records row provenance within the current
-  // parser, not a different counter/replay algorithm. Preserve both stamps
-  // in the receipt while accepting that exact pair. Mixed sets containing
-  // partial salvage stamps, older parsers or unknown variants stay blocked.
-  const currentModelProvenanceOnly = uniqueParserVersions.every((version) => (
+  // The current writer stamps inherited models and the approved missing
+  // cache-write zero assumption independently. These four exact variants use
+  // the same counter/replay algorithm; preserve them in the receipt. Partial
+  // salvage stamps (including suffixed ones), older parsers and unknown mixed
+  // variants remain incompatible.
+  const currentUsageProvenanceOnly = uniqueParserVersions.every((version) => (
     version === LOCAL_UNIFIED_INDEX_PARSER_VERSION
       || version === LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION
+      || version === `${LOCAL_UNIFIED_INDEX_PARSER_VERSION}-cache-write-zero`
+      || version === `${LOCAL_UNIFIED_INDEX_PARENT_MODEL_PARSER_VERSION}-cache-write-zero`
   ));
   return {
-    status: uniqueParserVersions.length === 1 || currentModelProvenanceOnly
+    status: uniqueParserVersions.length === 1 || currentUsageProvenanceOnly
       ? "compatible"
       : "mixed_parser_versions",
     parserVersions: uniqueParserVersions,
@@ -1590,8 +1593,7 @@ export function createLocalUnifiedAccountingSource({
           provenContractVersion,
           proven.generationId,
         );
-        if (provenCompatibility.status !== "compatible"
-            && proven.status === "complete") {
+        if (provenCompatibility.status !== "compatible") {
           proven.status = "partial";
           proven.generationProof = false;
           proven.blockReason = "mixed_parser_versions";

@@ -294,12 +294,70 @@ test("staged lifecycle and ungranted devices stop before projection or staging",
   for (const grant of [false, true]) {
     const fixture = server({ capabilitiesChange: { consentCurrent: grant } });
     if (grant) fixture.capability.formats.at(-1).lifecycle = "staged";
-    const result = await runTelemetryV11Sync({ ...fixture.options, readDay: () => assert.fail("must not read") });
+    const result = await runTelemetryV11Sync({ ...fixture.options, readDay: () => assert.fail("must not read"),
+      preparePublication: () => assert.fail("must not prepare before admission") });
     assert.equal(result.status, "failed");
     assert.equal(result.failure.code, "consent_rejected");
     assert.equal(result.networkActivity, true);
     assert.equal(result.acknowledgedThroughDay, null);
     assert.equal(fixture.calls.length, 1);
+  }
+});
+
+test("projection evidence is bound to admitted capabilities before any durable prefix is read", async () => {
+  const fixture = server();
+  const journal = progressJournal();
+  const port = journal.port();
+  let publicationPrepared = false;
+  let preparations = 0;
+  const result = await runTelemetryV11Sync({ ...fixture.options,
+    preparePublication: async ({ binding }) => {
+      assert.equal(++preparations, 1);
+      assert.deepEqual(fixture.calls.map((call) => call.path), ["/api/v1/device/sync-capabilities"]);
+      assert.deepEqual(binding, { destinationOrigin: origin, enrollmentNamespace: fixture.capability.enrollmentNamespace });
+      assert.ok(Object.isFrozen(binding));
+      publicationPrepared = true;
+      return { fingerprint: "synthetic-pinned-projection", parserVersion: "synthetic-v11-sync" };
+    },
+    progressStore: { ...port, read: async () => {
+      assert.equal(publicationPrepared, true);
+      return port.read();
+    } },
+  });
+  assert.equal(result.status, "complete");
+  assert.equal(preparations, 1);
+  assert.equal(journal.read(), null);
+});
+
+test("invalid or unavailable projection evidence cannot read or activate a saved prefix", async () => {
+  for (const change of ["unavailable", "changed", "invalid"]) {
+    const fixture = server();
+    const result = await runTelemetryV11Sync({ ...fixture.options,
+      progressStore: { read: () => assert.fail("must not trust old progress"), write: () => {} },
+      preparePublication: () => {
+        if (change === "invalid") return { fingerprint: "synthetic", parserVersion: "synthetic-v11-sync", private: "forbidden" };
+        const error = new Error("private synthetic projection failure");
+        error.code = change === "changed" ? "local_index_changed" : "local_telemetry_v11_index_unavailable";
+        throw error;
+      },
+    });
+    assert.equal(result.status, "failed");
+    assert.equal(result.failure.code, change === "changed" ? "local_index_changed" : "index_unavailable");
+    assert.equal(result.failure.retryable, true);
+    assert.equal(result.acknowledgedThroughDay, null);
+    assert.equal(fixture.active(), null);
+    assert.deepEqual(fixture.calls.map((call) => call.path), ["/api/v1/device/sync-capabilities"]);
+    assert.doesNotMatch(JSON.stringify(result), /private|forbidden/iu);
+  }
+  for (const options of [
+    { preparePublication: {} },
+    { preparePublication: () => ({}), sourcePublication: { fingerprint: "static", parserVersion: "synthetic-v11-sync" } },
+  ]) {
+    const fixture = server();
+    await assert.rejects(runTelemetryV11Sync({ ...fixture.options, ...options }), {
+      code: "contribution_incremental_sync_invalid_configuration",
+    });
+    assert.equal(fixture.calls.length, 0);
   }
 });
 
@@ -329,6 +387,45 @@ test("partial chunk budgets retain no watermark, and a retry skips the exact sta
   assert.equal(second.chunksSkipped, 1);
   assert.equal(second.recordsUploaded, 1);
   assert.equal(fixture.manifests.size, 1);
+});
+
+test("one large day advances over bounded restarts without probing or reposting each stored chunk", async () => {
+  const fixture = server({ count: 1_001 });
+  const journal = progressJournal();
+  let time = now;
+  const outcomes = [];
+  for (let pass = 0; pass < 8; pass += 1) {
+    const start = fixture.calls.length;
+    const result = await runTelemetryV11Sync({ ...fixture.options,
+      sourcePublication: { fingerprint: "synthetic-large-day", parserVersion: "synthetic-v11-sync" },
+      progressStore: journal.port(), clock: () => time, maxDurationMs: 60_000, maxChunks: 500,
+      fetchImpl: async (url, options) => {
+        // A single pass cannot send the day. Present chunks come from one
+        // validated manifest response, without a network probe per chunk.
+        time += 10_000;
+        return fixture.options.fetchImpl(url, options);
+      },
+    });
+    const calls = fixture.calls.slice(start);
+    outcomes.push(result);
+    assert.ok(calls.filter((call) => call.path.endsWith("/day-manifests")).length <= 1);
+    assert.equal(calls.filter((call) => call.path === "/api/v1/contributions").length, result.chunksUploaded);
+    if (result.status === "complete") break;
+    assert.equal(result.status, "partial");
+    assert.equal(result.failure, null);
+    assert.equal(result.acknowledgedThroughDay, null);
+    assert.equal(result.chunksUploaded, 1);
+    assert.equal(result.chunksSkipped, pass);
+    assert.equal(fixture.active(), null);
+  }
+  assert.equal(outcomes.length, 7);
+  assert.equal(outcomes.at(-1).status, "complete");
+  assert.equal(outcomes.at(-1).acknowledgedThroughDay, day);
+  assert.equal(fixture.manifests.size, 1);
+  assert.equal([...fixture.manifests.values()][0].chunks.size, 6);
+  assert.equal(fixture.calls.filter((call) => call.path === "/api/v1/contributions").length, 6);
+  assert.equal(outcomes.reduce((sum, result) => sum + result.recordsUploaded, 0), 1_001);
+  assert.equal(journal.read(), null);
 });
 
 test("a durable day cursor lets 62 days finish across bounded passes and process restarts", async () => {

@@ -168,6 +168,8 @@ function interpolate(message, values = {}) {
 export const WEB_MESSAGES = Object.freeze({
   ...Object.fromEntries(Object.keys(CATALOGS[DEFAULT_LOCALE])
     .filter((key) => key.startsWith("contribution.")
+      || key.startsWith("workUsage.")
+      || key.startsWith("performance.")
       || key.startsWith("appearance.")
       || key.startsWith("electron.")
       || key.startsWith("weekly.controls.")
@@ -277,6 +279,21 @@ export const WEB_MESSAGES = Object.freeze({
     "Your older history has not been indexed yet",
     "尚未索引你更早的历史记录",
     "Tu historial anterior aún no se ha indexado",
+  ],
+  "dashboard.history.scanFinished": [
+    "History scan finished",
+    "历史记录扫描已完成",
+    "Exploración del historial finalizada",
+  ],
+  "dashboard.history.indexedSources": [
+    "{indexed} of {total} discovered sources indexed ({bytesIndexed} of {bytesTotal}).",
+    "已索引 {total} 个已发现来源中的 {indexed} 个（{bytesIndexed}/{bytesTotal}）。",
+    "{indexed} de {total} fuentes descubiertas indexadas ({bytesIndexed} de {bytesTotal}).",
+  ],
+  "dashboard.history.summaryUnavailable": [
+    "The current accounting summary is unavailable. Update local usage to retry.",
+    "当前核算摘要不可用。请更新本地使用情况以重试。",
+    "El resumen contable actual no está disponible. Actualiza el uso local para reintentarlo.",
   ],
   "dashboard.history.partialHeadline": [
     "Local history available · {sources} unavailable",

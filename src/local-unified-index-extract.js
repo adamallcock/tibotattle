@@ -31,7 +31,9 @@ import { forEachRolloutLine, ROLLOUT_LINE_BYTES } from "./rollout-line-reader.js
 // cannot leak in by default. Note in particular that `turn_context` carries `cwd`,
 // `workspace_roots` and a
 // `collaboration_mode.settings.developer_instructions` block: all three are
-// content or filesystem paths, and none of them is read here.
+// content or filesystem paths, and none is used by accounting extraction.
+// The separate optional metadata-only traversal below reads only bounded cwd
+// for the owner-approved transient local Projects & threads view.
 
 // Byte-level needles. Matching on the raw Buffer avoids decoding the ~99% of
 // lines that are irrelevant. The response-item marker is exact and is decoded
@@ -461,6 +463,16 @@ export async function extractRolloutUsage(path, {
   // continuity lens compares positive-input requests, so only the next one is
   // a meaningful boundary.
   function emitUsage(event, rawUsage) {
+    // Product-approved assumption: historical Codex counters can omit cache
+    // writes. Apply it only after choosing the charged usage, keeping raw
+    // cumulative counters unchanged for replay and delta decisions.
+    if (rawUsage != null && rawUsage.cache_write_input_tokens == null
+        && Number.isSafeInteger(rawUsage.input_tokens) && rawUsage.input_tokens >= 0
+        && Number.isSafeInteger(rawUsage.cached_input_tokens) && rawUsage.cached_input_tokens >= 0
+        && rawUsage.cached_input_tokens <= rawUsage.input_tokens) {
+      event.components = canonicalComponents({ ...rawUsage, cache_write_input_tokens: 0 });
+      event.cacheWriteAssumedZero = true;
+    }
     if (event.model === null && parentModelAt !== null) {
       event.model = parentModelAt(event.observedAtMs);
       event.modelInherited = event.model !== null;
@@ -997,4 +1009,64 @@ export function createLineageSnapshots(members) {
       return total;
     },
   };
+}
+
+/** Metadata-only traversal using the index's bounded line reader. Never derives usage. */
+export async function extractRolloutWorkContexts(path, { end, onContext, onQuotaOnly = null, signal = null } = {}) {
+  if (typeof onContext !== "function") throw new TypeError("onContext is required");
+  const sessionMetaKind = Buffer.from('"session_meta"');
+  let previousReportedTotal = null;
+  const completeConsistentTotal = (value) => value !== null
+    && TOKEN_KEYS.every((key) => Number.isSafeInteger(value[key]) && value[key] >= 0)
+    && value.input_tokens + value.output_tokens === value.total_tokens
+    && value.cached_input_tokens + value.cache_write_input_tokens <= value.input_tokens
+    && value.reasoning_output_tokens <= value.output_tokens;
+  return forEachRolloutLine(path, { end, signal, onLine(line, offset, partial) {
+    if (onQuotaOnly && line.includes(NEEDLE_TOKEN_COUNT)) {
+      if (partial) { previousReportedTotal = null; return; }
+      let record;
+      try { record = JSON.parse(line.toString("utf8")); } catch { previousReportedTotal = null; return; }
+      // Classify only a verified status update. Ambiguous, malformed or
+      // incomplete usage objects remain unknown even when quota is present.
+      // This observes record kind; it never calculates or replays token deltas.
+      if (record?.type === "event_msg" && record.payload?.type === "token_count") {
+        const total = normalizeUsage(record.payload.info?.total_token_usage);
+        // A repeated complete cumulative snapshot is another status reading,
+        // not a new usage change. Compare exact observed counters using the
+        // owner's normalization; do not calculate or admit any token delta.
+        const unchanged = completeConsistentTotal(total) && completeConsistentTotal(previousReportedTotal)
+          && TOKEN_KEYS.every((key) => total[key] === previousReportedTotal[key]);
+        if (record.payload.info != null) previousReportedTotal = total;
+        const at = Date.parse(record.timestamp);
+        if ((record.payload.info == null || unchanged) && Number.isFinite(at)
+            && quotaSnapshot(record.payload.rate_limits, at)?.windows.length > 0) {
+          return onQuotaOnly({ offset });
+        }
+      }
+    }
+    if (!line.includes(NEEDLE_TURN_CONTEXT)
+        && !line.includes(sessionMetaKind)
+        && !line.includes(NEEDLE_THREAD_SETTINGS)) return;
+    // A malformed context invalidates the carry; it cannot silently retain an
+    // earlier workspace across a context change we could not interpret.
+    if (partial) return onContext({ offset, cwd: null });
+    let record;
+    try { record = JSON.parse(line.toString("utf8")); } catch { return onContext({ offset, cwd: null }); }
+    let settings;
+    if (record?.type === "session_meta" || record?.type === "turn_context") {
+      settings = record.payload;
+    } else if (record?.type === "event_msg"
+        && record.payload?.type === "thread_settings_applied") {
+      settings = record.payload.thread_settings;
+    } else return;
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+      return onContext({ offset, cwd: null });
+    }
+    // The initial session directory applies before the first turn. Later
+    // applied settings can move it; sparse settings leave it unchanged.
+    // Never fill earlier usage backwards from a later directory observation.
+    if (!Object.hasOwn(settings, "cwd")) return;
+    const cwd = settings.cwd;
+    return onContext({ offset, cwd: typeof cwd === "string" && cwd.length <= 4096 && !/[\u0000-\u001f\u007f]/u.test(cwd) ? cwd : null });
+  } });
 }

@@ -451,3 +451,112 @@ export function createDomHelpers(documentRef) {
     },
   };
 }
+
+// Shared accounting-table formats: fixed precision and honest endpoint bounds.
+export function formatApiMoney(value) {
+  // Decimal accounting strings stay exact through Intl display rounding.
+  const exact = typeof value === "string" && /^\d+(?:\.\d+)?$/u.test(value) && value.length <= 100;
+  const number = exact ? Number(value) : finite(value);
+  if (number === null) return "—";
+  if (number > 0 && number < .01) {
+    return `<${formatNumber(.01, {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })}`;
+  }
+  return formatNumber(exact ? value : number, {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
+}
+
+/**
+ * A share for a table column, always at one decimal place.
+ *
+ * `formatPercent` drops to whole numbers whenever the value happens to be an
+ * integer, which is right for a sentence and wrong for a column: it renders
+ * "20%" directly above "20.9%", so the decimal point moves down the page and
+ * two figures that exist to be compared have to be read digit by digit. Here
+ * the precision is fixed, and the same bounded "<" idiom keeps a sliver from
+ * rendering as an exact zero it is not.
+ *
+ * Returns `null` when the denominator cannot carry a share at all, so callers
+ * withhold the cell rather than printing a share of nothing.
+ */
+export function formatSharePercent(part, whole) {
+  const numerator = finite(part);
+  const denominator = finite(whole);
+  if (numerator === null || denominator === null || denominator <= 0) return null;
+  if (numerator < 0) return null;
+  const percentFormatter = numberFormatter({
+    maximumFractionDigits: 1,
+    minimumFractionDigits: 1,
+    style: "percent",
+  });
+  const format = (amount) => percentFormatter.format(amount / 100);
+  const value = numerator / denominator * 100;
+  const rendered = format(value);
+  if (value > 0 && rendered === format(0)) return `<${format(.1)}`;
+  if (value < 100 && rendered === format(100)) return `>${format(99.9)}`;
+  return rendered;
+}
+
+// Shared local thread labels; explicit collaboration parents stay separate links.
+function cacheDropThreadId(value) {
+  return typeof value === "string"
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value)
+    ? value.toLowerCase()
+    : null;
+}
+
+function cacheDropThreadName(thread, t) {
+  return typeof thread?.name === "string" && thread.name.trim()
+    ? thread.name.trim()
+    : t("accounting.cacheDropThread.fallback", {
+      id: cacheDropThreadId(thread?.id)?.slice(0, 8) ?? "",
+    });
+}
+
+export function formatCodexThreadParts(thread, t) {
+  const id = cacheDropThreadId(thread?.id);
+  if (id === null) return [];
+  const parentId = cacheDropThreadId(thread.parent?.id);
+  const parent = parentId !== null && parentId !== id ? thread.parent : null;
+  if (thread?.origin === "auto_review") {
+    // Internal reviews open only an explicitly resolved, accessible parent.
+    // Never fall back to the internal review session's UUID.
+    return parent === null ? [{
+      name: "Auto review",
+      href: null,
+      autoReview: true,
+    }] : [{
+      name: cacheDropThreadName(parent, t),
+      href: `codex://threads/${parentId}`,
+      worker: false,
+      autoReview: true,
+    }];
+  }
+  const nickname = typeof thread.nickname === "string"
+    ? thread.nickname.trim()
+    : "";
+  const worker = parent !== null || nickname !== "";
+  const parts = parent === null ? [] : [{
+    name: cacheDropThreadName(parent, t),
+    href: `codex://threads/${parentId}`,
+    worker: false,
+  }];
+  parts.push({
+    name: worker
+      ? t("accounting.cacheDropThread.subworker", {
+        name: nickname || cacheDropThreadName(thread, t),
+      })
+      : cacheDropThreadName(thread, t),
+    href: `codex://threads/${id}`,
+    worker,
+  });
+  return parts;
+}

@@ -356,11 +356,11 @@ test("refresh timeout classifier grants the cold window only to missing or prove
   }
 });
 
-test("published v10 v11 v12 v13 v14 upgrades to v15 receive a cold deadline without extending current or uncertain state", async () => {
+test("published v10 v11 v12 v13 v14 v15 upgrades to v16 receive a cold deadline without extending current or uncertain state", async () => {
   const root = await mkdtemp(join(tmpdir(), "local-timeout-parser-upgrade-"));
   // Deliberately pin the target: another parser release must review its
   // predecessor set, not silently keep passing a generic mismatch test.
-  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v15");
+  assert.equal(LOCAL_UNIFIED_INDEX_PARSER_VERSION, "unified-rollout-typed-v16");
   const fixtures = [
     { name: "complete", cold: true },
     { name: "quarantine-partial", cold: true, generation: {
@@ -372,7 +372,7 @@ test("published v10 v11 v12 v13 v14 upgrades to v15 receive a cold deadline with
     // Every fixture retains an older parser/generation row. Only publication
     // provenance may select the deadline, so this stays an ordinary refresh.
     { name: "current-with-old-history", parserVersion: LOCAL_UNIFIED_INDEX_PARSER_VERSION },
-    { name: "future", parserVersion: "unified-rollout-typed-v16" },
+    { name: "future", parserVersion: "unified-rollout-typed-v17" },
     { name: "unknown", parserVersion: "unknown-parser" },
     { name: "empty", parserVersion: "" },
     { name: "malformed-version", parserVersion: "unified-rollout-typed-v011" },
@@ -382,7 +382,9 @@ test("published v10 v11 v12 v13 v14 upgrades to v15 receive a cold deadline with
     { name: "v12-partial-parser", parserVersion: "unified-rollout-typed-v12-partial" },
     { name: "v14-partial-parser", parserVersion: "unified-rollout-typed-v14-partial" },
     { name: "v13-partial-parser", parserVersion: "unified-rollout-typed-v13-partial" },
-    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v15-partial" },
+    { name: "v15-partial-parser", parserVersion: "unified-rollout-typed-v15-partial" },
+    { name: "current-partial-parser", parserVersion: "unified-rollout-typed-v16-partial" },
+    { name: "current-assumed-parser", parserVersion: "unified-rollout-typed-v16-cache-write-zero" },
     { name: "unreviewed-predecessor", parserVersion: "unified-rollout-typed-v9" },
     { name: "missing-publication", metadata: { current_generation_id: undefined } },
     { name: "unknown-publication", metadata: { current_generation_id: "99" } },
@@ -413,7 +415,7 @@ test("published v10 v11 v12 v13 v14 upgrades to v15 receive a cold deadline with
       .map((key) => ({ name: `incomplete-${key}`, generation: { [key]: 0 } })),
   ];
   try {
-    for (const predecessor of [10, 11, 12, 13, 14]) {
+    for (const predecessor of [10, 11, 12, 13, 14, 15]) {
       for (const fixture of fixtures) {
         const name = `v${predecessor}-${fixture.name}`;
         const indexFile = join(root, `${name}.sqlite`);
@@ -819,6 +821,8 @@ async function fixture() {
   await writeFile(join(staticRoot, "app.js"), "export const app = true;");
   await writeFile(join(staticRoot, "data-client.js"), "export const client = true;");
   await writeFile(join(staticRoot, "lib.js"), "export const lib = true;");
+  await writeFile(join(staticRoot, "model-performance.js"), "export const performance = true;");
+  await writeFile(join(staticRoot, "model-performance.css"), ".model-performance { color: black; }");
   await writeFile(
     join(staticRoot, "localization.js"),
     "export const localization = true;",
@@ -1125,6 +1129,14 @@ test("loopback server exposes only fixed API, static, and report routes", async 
     assert.doesNotMatch(pageBody, new RegExp(SEMANTIC_OPEN_TARGET_PLACEHOLDER, "u"));
     assert.equal((await fetch(`${base}/data-client.js`)).status, 200);
     assert.equal((await fetch(`${base}/localization.js`)).status, 200);
+    for (const [path, type] of [
+      ["model-performance.js", "text/javascript; charset=utf-8"],
+      ["model-performance.css", "text/css; charset=utf-8"],
+    ]) {
+      const asset = await fetch(`${base}/${path}`);
+      assert.equal(asset.status, 200, path);
+      assert.equal(asset.headers.get("content-type"), type, path);
+    }
     assert.equal(
       (await fetch(`${base}/telemetry-shared.generated.js`)).status,
       200,

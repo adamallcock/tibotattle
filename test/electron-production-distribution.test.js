@@ -89,8 +89,31 @@ test("signed Mac allocation is independent of candidate provenance and advances 
         }), /reviewed production allocation/u);
       }
       assert.throws(() => POLICY.productionElectronBuildVersionForTarget({
-        ...input, version: "0.1.22",
+        ...input, version: "0.1.23",
       }), /explicit signed bundle version allocation/u);
+    }
+  }
+});
+
+test("022 allocation advances released021 on both Mac architectures without accepting timestamp aliases", () => {
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.22", "stable"), "1029");
+  assert.equal(compareAppleMacOSBundleVersions("1028", "1029"), -1);
+  assert.equal(isAppleMacOSBundleVersion("1029"), true);
+  for (const target of ["darwin-arm64", "darwin-x64"]) {
+    for (const buildNumber of ["2026091108", "2026091201"]) {
+      const input = { target, version: "0.1.22", buildNumber };
+      assert.equal(POLICY.productionElectronBuildVersionForTarget(input), "1029");
+      assert.deepEqual(POLICY.assertProductionElectronMacOSBundleMetadata({
+        ...input, bundleVersion: "1029", bundleShortVersion: "0.1.22",
+      }), { bundleVersion: "1029", bundleShortVersion: "0.1.22" });
+      for (const bundleVersion of [undefined, "1028", "1029.0", buildNumber]) {
+        assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({
+          ...input, bundleVersion, bundleShortVersion: "0.1.22",
+        }), /reviewed production allocation/u);
+      }
+      assert.throws(() => POLICY.assertProductionElectronMacOSBundleMetadata({
+        ...input, bundleVersion: "1029", bundleShortVersion: "0.1.21",
+      }), /reviewed production allocation/u);
     }
   }
 });
@@ -103,7 +126,7 @@ test("historical Electron receipts keep their frozen bundle ordering without all
   }
   assert.equal(resolveSignedMacOSBundleVersion("0.1.19", "stable"), null);
   assert.equal(resolveSignedMacOSBundleVersion("0.1.20", "stable"), null);
-  assert.equal(resolveSignedMacOSBundleVersion("0.1.22", "stable"), null);
+  assert.equal(resolveSignedMacOSBundleVersion("0.1.23", "stable"), null);
   const { AppUpdater } = require("electron-updater/out/AppUpdater");
   const updaterRequire = createRequire(require.resolve("electron-updater/package.json"));
   const updaterSemver = updaterRequire("semver");

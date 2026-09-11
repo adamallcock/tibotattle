@@ -39,14 +39,14 @@ Those remain separate verification gates in the relevant runbooks.
 
 | Surface | Boundary | Implemented surface |
 |---|---|---:|
-| Local companion API | Browser/native shell → loopback Node companion | 27 paths, 29 method/path operations |
+| Local companion API | Browser/native shell → loopback Node companion | 29 paths, 31 method/path operations |
 | Local report pages | Browser → fixed loopback report allowlist | 4 `GET` paths |
 | Central public relay | Loopback companion → configured hosted origin | 1 fixed `GET` path |
 | Participant relay | Loopback companion → configured hosted origin | 9 paths, 9 method/path operations |
 | Hosted Worker API | Internet/native collector → Cloudflare Worker | 39 API paths, 40 method/path operations |
 | Deliberate negative Worker route | Internet → fixed non-API interception | 1 always-`404` path |
 | Native/browser bridge | WKWebView ↔ macOS shell | 4 message handlers, 4 DOM events, 1 fixed URL scheme |
-| Process protocols | Native shell, companion, analysis owners ↔ child/worker | 8 explicit runtime protocol families |
+| Process protocols | Native shell, companion, analysis owners ↔ child/worker | 9 explicit runtime protocol families |
 | Cloudflare service bindings | Worker → platform-managed resources | 3 D1 bindings, 3 production R2 bindings, 1 Durable Object, 8 rate limiters, 1 assets binding, 1 cron schedule |
 | Reviewed code APIs | App/source owners → reusable modules | 5 workspace packages and 24 reviewed source-owner entrypoints |
 | JSON/wire contracts | Collectors, exports, release tooling, hosted intake | Closed versioned families, including generated staged v1.1 and frozen code-defined telemetry v1.0; see schema lifecycle inventory |
@@ -146,10 +146,12 @@ permission. Non-`GET` local mutations require the same origin and the fixed
 `X-Usage-Monitor-Local: 1` header; handlers that accept bodies additionally
 enforce their closed JSON shape and byte ceiling.
 
-`GET /api/local/timeline/window-breakdown` is the sole local API route that
-accepts a query string, and only `from` and `to` as bounded base-ten safe
-integers. Health, desktop status, contribution diagnostics, diagnostic notes, and the
-hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
+`GET /api/local/timeline/window-breakdown` accepts only `from` and `to` as
+bounded base-ten safe integers. `GET /api/local/model-performance` requires
+exactly one `period` parameter with value `7`, `30`, or `all`; other query
+shapes are rejected. Health, desktop status, contribution diagnostics, diagnostic notes, the
+hosted-sign-in handoff, and model performance can answer without a completed
+Codex accounting snapshot.
 
 ### Local route inventory
 
@@ -163,6 +165,8 @@ hosted-sign-in handoff can answer without a completed Codex dashboard snapshot.
 | `GET` | `/api/local/onboarding` | Local installation and evidence-source readiness |
 | `GET` | `/api/local/overview` | Personal dashboard headline and evidence coverage |
 | `GET` | `/api/local/cache-drop-thread-links` | Optional, generation-bound local thread-name/parent lookup for the two recent cache-drop tables; requires `X-Usage-Monitor-Local: 1` and no foreign Origin |
+| `POST` | `/api/local/work-usage/query` | Read-only local project/worktree/thread reports; closed JSON, local header and Origin/Host checks; bounded cancellable snapshots with lightweight `touch` lease renewal, transient names and bounded project/task name search before pagination |
+| `GET` | `/api/local/model-performance` | Independent device-local Codex timing aggregates for `period=7`, `period=30`, or `period=all`; reads renew a 60-second background-worker lease |
 | `GET` | `/api/local/gradient` | Quota-versus-cost gradient report data |
 | `GET` | `/api/local/weekly` | Weekly calibration report data |
 | `GET` | `/api/local/weekly-pace-outlook` | Privacy-safe weekly allowance pace projection bound to the current observed window |
@@ -755,6 +759,7 @@ module facades, but their message shapes are security- and resource-relevant:
 | Owner / source | Input boundary | Output boundary |
 |---|---|---|
 | [Replay-safe accounting rebuild child](../../src/replay-safe-accounting-rebuild-child.js) | Two owner-private temporary paths on argv: versioned JSON request and exclusive result target; parent-held stdin is the death watchdog | Canonical result file plus one bounded stdout envelope containing status and either byte count/SHA-256 or a fixed error code |
+| [Model performance worker](../../apps/local/model-performance-worker.js) | Fixed private state and Codex-home anchors, then a `stop` message; starts only through a recent timing-page reader | Bounded timing aggregate snapshots for three periods, or a fixed unavailable indication; one independent sidecar, no accounting/contribution data flow |
 | [Unified-index worker](../../src/local-unified-index-worker.js) | `workerData` with bounded lineage components, source paths/sizes, and maximum line bytes | Typed `batch` messages containing minimized events/boundaries/tools/snapshot keys, or one content-free `failed` code |
 | [Local-analysis extraction worker](../../src/local-analysis-extract-worker.js) | `workerData` with an owner-private shard path and bounded source byte-range tasks | One `{ok: true, result}` aggregate or `{ok: false, code}` fixed failure |
 
@@ -920,6 +925,7 @@ The owned local SQLite surfaces are:
 | Domain | Storage owners |
 |---|---|
 | Local evidence and accounting | [`local-collector-state.js`](../../src/local-collector-state.js), [`local-unified-index.js`](../../src/local-unified-index.js), [`local-analysis-index.js`](../../src/local-analysis-index.js), and its private [`local-analysis-extract-worker.js`](../../src/local-analysis-extract-worker.js) shard writer |
+| Model performance timing | [`inference-timing-store.js`](../../src/platform/inference-timing-store.js): owner-only `inference-timing-v2/timing-experiment.sqlite` below the companion state root; method and SQLite user version 2, maximum 256 MiB |
 | Claude shadow pipeline | [`claude-desktop-incremental-canonicalizer.js`](../../src/claude-desktop-incremental-canonicalizer.js), [`claude-desktop-ledger-prototype.js`](../../src/claude-desktop-ledger-prototype.js), [`claude-desktop-pricing-cache.js`](../../src/claude-desktop-pricing-cache.js), [`claude-desktop-shadow-store.js`](../../src/claude-desktop-shadow-store.js) |
 | Contribution and export | [`local-contribution-sync-queue-storage.js`](../../src/platform/local-contribution-sync-queue-storage.js), [`owner-only-export-workspace-storage.js`](../../src/platform/owner-only-export-workspace-storage.js), [`export-set-verification-storage.js`](../../src/platform/export-set-verification-storage.js) |
 | Windows qualification | [`windows-credential-operation-audit.js`](../../src/platform/windows-credential-operation-audit.js), a bounded local audit store rather than a shipping credential backend |
@@ -929,6 +935,13 @@ migration or replacement. Temporary local-analysis shards are part of the
 local-analysis schema contract; the worker is not an independent public
 database API. The replay-safe accounting cache is stored through the local
 collector-state owner rather than creating another general-purpose store.
+
+The timing sidecar stores one aggregate per completed turn, local HMAC keys,
+source cursors, and bounded pending reconstruction state. It retains no raw
+session content or identifiers. Version 1 or otherwise incompatible stores
+are preserved and refused; the accounting index is not migrated. Its POSIX
+permission contract remains unavailable on Windows until a platform adapter
+is qualified. This source inventory does not qualify an installed release.
 
 Generated or mirrored schemas must be changed through their generation/check
 commands rather than edited into divergence:
