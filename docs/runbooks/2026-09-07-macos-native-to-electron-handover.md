@@ -34,14 +34,15 @@ schema.
 The retained-state helper authenticates its current signed Electron parent and
 stops only a running predecessor at the same bundle path whose running code
 matches the parent's designated signing requirement. It refuses other same-ID
-application paths, unregisters the old startup item and reads existing preferences.
+application paths and reads existing preferences. Startup registration is managed
+only by the Electron main process.
 It never copies or resets credentials, broadens Keychain access, or enables sharing.
 
 A verified private backup is checked using the index owner's existing migration
 compatibility policy. SQLite inspection uses a disposable clone so retained WAL
 or shared-memory files cannot change the backup. The normal transaction below
-publishes the copied state and preferences, preserves opt-outs, and claims startup
-ownership. Completed profiles bypass predecessor discovery on subsequent launches.
+publishes the copied state and preferences and preserves opt-outs. It restores
+a known startup choice or leaves unavailable registration untouched. Completed profiles bypass predecessor discovery on subsequent launches.
 
 The normal outcomes remain `no_legacy_state`, `migrated`, and `already_migrated`.
 Unknown data, unavailable credentials, signature failures and incomplete unsafe
@@ -72,8 +73,10 @@ It verifies the enclosing Electron app identity and selected old app, asks
 `NSRunningApplication` to terminate only processes with the exact old bundle
 URL and returns bounded language, appearance and refresh preferences. The
 coordinator durably saves the original startup choice before Electron's main
-process disables and verifies the same-identity login registration. It
-does not accept arbitrary commands, kill by name, receive state paths, query
+process disables and verifies a known same-identity login registration. If macOS
+reports an unavailable or approval-pending registration, a durable null snapshot
+records that it must remain untouched, including across retries. Data import does
+not depend on changing that optional registration. The helper does not accept arbitrary commands, kill by name, receive state paths, query
 Keychain, copy credentials, reset credentials, or enable sharing.
 
 The diagnostic `--prepare-preflight --native-app <absolute bundle path>` checks
@@ -102,13 +105,14 @@ After that result, the coordinator:
    Codex home, language, appearance, refresh interval, login preference, and a
    valid first-run acknowledgement.
 4. Atomically publishes both roots with journal checkpoints, then uses
-   Electron's normal login-item API and confirms Electron owns the requested
-   setting.
-5. Writes `completed-v1.json` only after both roots validate and Electron owns
-   the login item.
+   Electron's normal login-item API to confirm a known requested setting. An
+   unavailable or approval-pending original choice remains untouched instead.
+5. Writes `completed-v1.json` only after both roots validate and the original
+   startup disposition is either verified restored or explicitly preserved.
 
 The journal checkpoints are `started`, `prepared`, `backed_up`, `staged`,
-`published_state`, `published`, `electron_login_owned`, and `completed`. A
+`published_state`, `published`, `electron_login_owned` or
+`electron_login_preserved`, and `completed`. A
 restart resumes only the matching candidate and journal. It removes only
 private staging or backup trees bound to that exact operation. The native
 source state, old bundle, credentials, consent, and backup are never deleted by
@@ -279,6 +283,8 @@ that `updates.tibotattle.com` is access-controlled. Confirm the route and R2
 ACL separately before treating a rehearsal asset as private. Never use the
 Sparkle appcast publisher for this YAML feed.
 
-Startup registration is queried, disabled and verified by the actual Electron
-main process. The helper confirms only writer shutdown and native preferences;
+Known startup registration is queried, disabled and verified by the actual
+Electron main process; unknown registration remains untouched. The settings UI
+reads current OS status rather than treating an unapplied local default as a
+confirmed user choice. The helper confirms only writer shutdown and native preferences;
 its `native_writer_prepared` reply carries no startup-setting claims.
