@@ -193,6 +193,26 @@ test("one feed failure preserves earlier successes and never blindly retries unc
   assert.equal(third.complete, true); assert.equal(server.writes.filter((step) => step === "feed-arm64").length, 1);
 });
 
+test("mutation diagnostics retain only closed error codes without relaxing uncertain recovery", async (t) => {
+  for (const code of ["SPARKLE_UPDATE_ATOMIC_GUARD_TOKEN_REQUIRED", "PRIVATE_SYNTHETIC_SECRET_ABC123"]) {
+    const f = await fixture(t), server = remote(f.plan);
+    server.adapters.publishFeed = async (_prepared, architecture) => {
+      server.writes.push(`feed-${architecture}`);
+      if (architecture === "arm64") { server.state.arm64 = true; return; }
+      throw Object.assign(new Error("private synthetic diagnostics"), { code });
+    };
+    const result = await reconcilePublication(options(f, server));
+    assert.equal(result.code, "RELEASE_PUBLICATION_UNCERTAIN_RECONCILE_REQUIRED");
+    assert.deepEqual(result.mutationFailure, { step: "feed-x64", code: code.startsWith("SPARKLE_") ? code : "RELEASE_PUBLICATION_MUTATION_FAILED" });
+    assert.equal((await readOperation(f.operationDirectory)).state.steps["feed-x64"], "intent");
+    const resumed = await reconcilePublication({ ...options(f, server), resume: true, executorStopped: true });
+    assert.equal(resumed.complete, false);
+    assert.equal(server.writes.filter(step => step === "feed-x64").length, 1);
+    assert.ok(!JSON.stringify(result).includes("private synthetic diagnostics"));
+    assert.ok(!JSON.stringify(result).includes("PRIVATE_SYNTHETIC_SECRET_ABC123"));
+  }
+});
+
 test("asynchronous tap dispatch is recorded once and read back on resume", async (t) => {
   const f = await fixture(t), server = remote(f.plan);
   server.adapters.publishTap = async () => { server.writes.push("tap-dispatch"); };
@@ -324,18 +344,31 @@ test("tap adapter detects stale Intel bytes and dispatches only the pinned exist
 
 test("real feed and website adapters delegate current guarded entrypoint contracts", async (t) => {
   const f = await fixture(t), prepared = await preparePublication(f.plan, f.prepareOptions), feedCalls = [], siteCalls = [];
+  const previousToken = process.env.SPARKLE_APPCAST_GUARD_TOKEN;
+  const token = "synthetic-two-target-guard-token-0123456789";
+  process.env.SPARKLE_APPCAST_GUARD_TOKEN = token;
+  t.after(() => {
+    if (previousToken === undefined) delete process.env.SPARKLE_APPCAST_GUARD_TOKEN;
+    else process.env.SPARKLE_APPCAST_GUARD_TOKEN = previousToken;
+  });
   const adapter = createPublicationAdapters({ publishFeed: async (options) => { feedCalls.push(options); return { verified: true }; },
     deploySite: async (options) => { siteCalls.push(options); return { deployment: { ok: true } }; } });
+  assert.equal(process.env.SPARKLE_APPCAST_GUARD_TOKEN, token); // Read-only construction does not consume it.
+  await adapter.publishFeed(prepared, "arm64");
+  assert.equal(process.env.SPARKLE_APPCAST_GUARD_TOKEN, undefined);
   await adapter.publishFeed(prepared, "x64");
-  assert.equal(feedCalls[0].architecture, "x64"); assert.equal(feedCalls[0].publish, true); assert.equal(feedCalls[0].replaceAppcast, true);
-  assert.equal(feedCalls[0].atomicAppcastGuardEndpoint, "https://tibotattle.com/api/v1/internal/release/appcast");
-  assert.equal(feedCalls[0].atomicAppcastGuardTokenEnv, "SPARKLE_APPCAST_GUARD_TOKEN");
-  assert.equal(feedCalls[0].releaseManifestPath, f.plan.targets[1].feedManifest.path);
+  assert.deepEqual(feedCalls.map(call => call.architecture), ["arm64", "x64"]);
+  assert.equal(feedCalls[1].publish, true); assert.equal(feedCalls[1].replaceAppcast, true);
+  assert.equal(feedCalls[0].atomicAppcastGuard, feedCalls[1].atomicAppcastGuard);
+  assert.equal(typeof feedCalls[1].atomicAppcastGuard.compareAndSwap, "function");
+  assert.equal(feedCalls[1].atomicAppcastGuardTokenEnv, undefined);
+  assert.ok(!JSON.stringify(feedCalls).includes(token));
+  assert.equal(feedCalls[1].releaseManifestPath, f.plan.targets[1].feedManifest.path);
   await adapter.publishWebsite(prepared);
   assert.equal(siteCalls[0].repositoryRoot, f.root); assert.equal(siteCalls[0].receiptPath, f.plan.website.receipt.path);
   assert.ok(siteCalls[0].confirmation.includes("PRODUCTION"));
   await writeFile(f.plan.targets[1].feedManifest.path, "changed local feed manifest");
-  await assert.rejects(adapter.publishFeed(prepared, "x64"), /LOCAL_BYTES_MISMATCH/); assert.equal(feedCalls.length, 1);
+  await assert.rejects(adapter.publishFeed(prepared, "x64"), /LOCAL_BYTES_MISMATCH/); assert.equal(feedCalls.length, 2);
 });
 
 test("website readback checks every prepared file and current healthy deployment source", async (t) => {
