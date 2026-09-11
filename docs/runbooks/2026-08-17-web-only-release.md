@@ -171,8 +171,10 @@ updater transport; never use its object URLs for manual website downloads.
 The download section uses compact platform buttons, requirements, a discreet
 checksum-copy control and accurate platform trust descriptions. It shows no
 file size or migration procedure. Docs explains normal Mac replacement and
-automatic retained-state transfer for 0.1.20 or later. Native Sparkle feeds do
-not perform that move. Keep the Homebrew shortcut absent until the tap points
+automatic retained-state transfer for 0.1.20 or later. The 0.1.21 docs also
+describe native 0.1.18 Check for Updates; publish those instructions only after
+the signed native journey passes and its stable Sparkle feeds are activated.
+Keep the Homebrew shortcut absent until the tap points
 to a qualified automatic-replacement release, rather than the older native app.
 
 A test-injected verifier may explicitly return `published: false` for a local
