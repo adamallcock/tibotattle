@@ -1578,7 +1578,21 @@ export const CURRENT_SCALE_SCHEMA_PROBE_SQL = POST_ACCOUNTLESS_SCALE_SCHEMA_PROB
     + " AND " + socialOwnerGatedTriggerProbe(ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale),
   unaffectedPublicSourceProbe(SCALE_SCHEMA_SQL, ACCOUNTLESS_SOCIAL_OWNER_TRIGGER_NAMES.scale),
 );
-export const PUBLIC_SOURCE_SCHEMA_PROBE_SQL = `SELECT ${exactStoredSchemaProbe(PUBLIC_SOURCE_SCHEMA_SQL)} AS public_source_objects`;
+// Remote D1 preserves these migration comments; local Wrangler removes them.
+// Construct the two exact expected definitions, without normalizing observed SQL.
+const PUBLIC_SOURCE_COUNTER_GAP = "\n  \n  \n  \n  UPDATE community_preparation_progress_counters";
+const PUBLIC_SOURCE_COUNTER_COMMENT = "\n  -- Count only this OLD source's indexed prepared heads while authority is\n  -- still valid. Later ledger/owner/device/grant withdrawals see no eligible\n  -- source and cannot subtract it again. No telemetry or JSON is read.\n  UPDATE community_preparation_progress_counters";
+export const PUBLIC_SOURCE_SCHEMA_PROBE_SQL = `WITH expected(name, type, definition) AS (VALUES
+${Object.entries(PUBLIC_SOURCE_SCHEMA_SQL).map(([name, sql]) => `(${sqlStringLiteral(name)},
+  ${sqlStringLiteral(sql.startsWith("CREATE TABLE") ? "table" : sql.startsWith("CREATE VIEW") ? "view" : "trigger")},
+  ${sqlStringLiteral(sql)})`).join(",\n")}
+) SELECT NOT EXISTS (
+  SELECT 1 FROM expected e WHERE NOT EXISTS (
+    SELECT 1 FROM sqlite_master actual WHERE actual.name=e.name AND actual.type=e.type
+      AND (actual.sql IS e.definition OR actual.sql IS replace(e.definition,
+        ${sqlStringLiteral(PUBLIC_SOURCE_COUNTER_GAP)}, ${sqlStringLiteral(PUBLIC_SOURCE_COUNTER_COMMENT)}))
+  )
+) AS public_source_objects`;
 export const publicSourceSchemaComplete = row => row?.public_source_objects === 1;
 
 export function scaleSchemaComplete(row) {

@@ -2262,6 +2262,7 @@ test("current 0060 readiness binds the exact eligibility, bootstrap and withdraw
     }
     const before = snapshot();
     assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false);
+    database.exec("SAVEPOINT public_source_format;");
     for (const sql of unstable_splitSqlQuery(readFileSync(join(workerDirectory, "migrations", "0060_public_contribution_sources.sql"), "utf8"))) database.exec(sql);
     assert.deepEqual(Object.fromEntries(Object.entries(snapshot()).filter(([name, sql]) => before[name] !== sql)), PUBLIC_SOURCE_SCHEMA_SQL);
     for (const probe of [CURRENT_ATTRIBUTION_SCHEMA_PROBE_SQL, CURRENT_SCALE_SCHEMA_PROBE_SQL, PUBLIC_SOURCE_SCHEMA_PROBE_SQL]) {
@@ -2283,6 +2284,23 @@ test("current 0060 readiness binds the exact eligibility, bootstrap and withdraw
     }
     for (const row of [undefined, {}, { public_source_objects: true }, { public_source_objects: 0 }]) {
       assert.equal(publicSourceSchemaComplete(row), false);
+    }
+    database.exec("ROLLBACK TO public_source_format; RELEASE public_source_format;");
+    // D1's remote migration path keeps inline comments, unlike local Wrangler.
+    database.exec(readFileSync(join(workerDirectory, "migrations", "0060_public_contribution_sources.sql"), "utf8"));
+    assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), true);
+    const remoteDefinitions = Object.fromEntries(Object.entries(snapshot()).filter(([name]) => name in PUBLIC_SOURCE_SCHEMA_SQL));
+    assert.equal(Object.values(remoteDefinitions).filter(sql => sql.includes("-- Count only this OLD source")).length, 11);
+    for (const [name, sql] of Object.entries(remoteDefinitions)) {
+      const type = /^CREATE (TABLE|VIEW|TRIGGER)/u.exec(sql)[1];
+      database.exec(`SAVEPOINT altered_remote_source; DROP ${type} ${name};`);
+      assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false, `remote missing ${name}`);
+      const altered = type === "TRIGGER" ? sql.slice(0, sql.indexOf("BEGIN")) + "BEGIN SELECT 1; END"
+        : type === "VIEW" ? sql.replace("'accountless-opt-out-v1'", "'accountless-opt-out-v1 '")
+        : `CREATE TABLE ${name}(singleton INTEGER PRIMARY KEY)`;
+      database.exec(altered);
+      assert.equal(publicSourceSchemaComplete(database.prepare(PUBLIC_SOURCE_SCHEMA_PROBE_SQL).get()), false, `remote altered ${name}`);
+      database.exec("ROLLBACK TO altered_remote_source; RELEASE altered_remote_source;");
     }
   } finally { database.close(); }
 });
