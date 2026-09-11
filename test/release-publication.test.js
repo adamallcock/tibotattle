@@ -372,7 +372,7 @@ async function electronFixture(t) {
     const metadata = await put(`TiboTattle-1.2.3-darwin-${target.architecture}-update.yml`, 'synthetic Electron updater metadata');
     a.updater = { enabled: true, mechanism: 'electron-updater', metadata: { fileName: metadata.name, bytes: metadata.bytes, sha256: metadata.sha256, subjectSha256: dmg.sha256 } };
     for (const suffix of ['zip', 'zip.blockmap', 'dmg.blockmap']) await put(`TiboTattle-1.2.3-mac-${target.architecture}.${suffix}`, `synthetic ${suffix}`);
-    const manifest = JSON.parse(await readFile(target.feedManifest.path));manifest.schemaVersion = 'tibotattle-electron-sparkle-transition-v1';
+    const manifest = JSON.parse(await readFile(target.feedManifest.path));manifest.schemaVersion = 'tibotattle-electron-sparkle-transition-v1';manifest.electron={buildNumber:'2026091107'};
     target.feedManifest = await file(`feed-manifest-${target.architecture}.json`, JSON.stringify(manifest));
   }
   for (const platform of ['windows', 'linux']) {
@@ -389,7 +389,10 @@ async function electronFixture(t) {
   const { compareArtifactIdentity } = await import('../scripts/release-evidence.js');canonical.artifacts.sort(compareArtifactIdentity);
   await put('release-manifest.json', `${stableStringify(canonical)}\n`);await put('SHA256SUMS',buildSha256Sums(canonical));
   const all = plan.assets.filter(a => !['release-manifest.json','SHA256SUMS','verify-release.md'].includes(a.name)).map(a => `${a.sha256}  ${a.name}`).sort().join('\n')+'\n';await put('SHA256SUMS-ALL-RELEASE-FILES',all);
-  const site = JSON.parse(await readFile(plan.website.manifest.path));for(const row of [site.installer,site.intelInstaller])row.url=row.url.replace('-macOS-','-mac-');
+  const site = JSON.parse(await readFile(plan.website.manifest.path));delete site.installer;delete site.intelInstaller;
+  site.electronRelease={version:'1.2.3',buildNumber:'2026091107',publishedInstallersVerified:true,
+    verificationScope:['reviewed-publication-plan','local-artifact-bytes','published-installer-bytes'],
+    downloads:canonical.artifacts.map(a=>({target:`${{macos:'darwin',windows:'win32',linux:'linux'}[a.platform]}-${a.architecture}`,url:a.downloadUrl,bytes:a.bytes,sha256:a.sha256}))};
   plan.website.manifest=await file('release-site-manifest.json',JSON.stringify(site));plan.website.receipt=await file('web-release-receipt.json',JSON.stringify({sourceCommit:'c'.repeat(40),site:{manifestSha256:plan.website.manifest.sha256}}));
   plan.tap={...await file('tibotattle.rb',(await readFile(plan.tap.path,'utf8')).replace('-macOS-','-mac-')),workflowSha256:plan.tap.workflowSha256};
   return {...f,put};
@@ -411,5 +414,27 @@ test('Electron transition refuses alias substitution, missing incoming XML, unsi
     if(change==='sums')await f.put('SHA256SUMS-ALL-RELEASE-FILES','wrong');
     if(change==='discriminator'){const m=JSON.parse(await readFile(f.plan.targets[0].feedManifest.path));delete m.schemaVersion;f.plan.targets[0].feedManifest=await f.file('feed-manifest-arm64.json',JSON.stringify(m));}
     await assert.rejects(preparePublication(f.plan,f.prepareOptions),/RELEASE_PUBLICATION_/);
+  }
+});
+
+
+test('Electron website binds the actual four-download schema and rejects stale or unverified rows', async t => {
+  for(const change of ['legacy','version','build','unverified','scope','duplicate','missing','extra','windows_hash','linux_url','arm_size','intel_hash']) {
+    const f=await electronFixture(t), site=JSON.parse(await readFile(f.plan.website.manifest.path)), release=site.electronRelease;
+    if(change==='legacy'){delete site.electronRelease;site.installer={version:'1.2.3'};}
+    if(change==='version')release.version='1.2.2';
+    if(change==='build')release.buildNumber='2026091106';
+    if(change==='unverified')release.publishedInstallersVerified=false;
+    if(change==='scope')release.verificationScope.pop();
+    if(change==='duplicate')release.downloads[1]={...release.downloads[0]};
+    if(change==='missing')release.downloads.pop();
+    if(change==='extra')release.downloads[0].unreviewed=true;
+    if(change==='windows_hash')release.downloads.find(r=>r.target==='win32-x64').sha256=sha('wrong');
+    if(change==='linux_url')release.downloads.find(r=>r.target==='linux-x64').url='https://updates.tibotattle.com/wrong';
+    if(change==='arm_size')release.downloads.find(r=>r.target==='darwin-arm64').bytes++;
+    if(change==='intel_hash')release.downloads.find(r=>r.target==='darwin-x64').sha256=sha('wrong');
+    f.plan.website.manifest=await f.file('release-site-manifest.json',JSON.stringify(site));
+    f.plan.website.receipt=await f.file('web-release-receipt.json',JSON.stringify({sourceCommit:'c'.repeat(40),site:{manifestSha256:f.plan.website.manifest.sha256}}));
+    await assert.rejects(preparePublication(f.plan,f.prepareOptions),{code:'RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH'},change);
   }
 });

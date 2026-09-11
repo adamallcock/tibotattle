@@ -174,12 +174,37 @@ export async function preparePublication(plan, { repositoryRoot = ROOT, publishF
       || site.site?.canonicalUrl !== `${DEPLOYMENT_ENDPOINTS.public.origin}/`
       || !Array.isArray(site.files) || site.files.length < 1 || site.files.length > 500) fail("RELEASE_PUBLICATION_SITE_IDENTITY_MISMATCH");
   await verifySite({ repositoryRoot: plan.website.repositoryRoot, receiptPath: plan.website.receipt.path });
-  for (const target of plan.targets) {
-    const row = target.architecture === "arm64" ? site.installer : site.intelInstaller;
-    const dmg = asset(target.dmgName);
-    if (row?.version !== plan.version || row.sha256 !== dmg.sha256 || row.bytes !== dmg.bytes
-        || row.minimumMacos !== "14.0" || !row.architectures?.includes(target.architecture)
-        || row.url !== `https://github.com/${REPOSITORY}/releases/download/${plan.source.tag}/${dmg.name}`) fail("RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH");
+  if (electron) {
+    // The reviewed Electron site generator emits four download rows, not the
+    // native site's legacy installer/intelInstaller objects.
+    const release = site.electronRelease;
+    if (!exact(release, ["version", "buildNumber", "publishedInstallersVerified", "verificationScope", "downloads"])
+        || release.version !== plan.version || release.publishedInstallersVerified !== true
+        || !Array.isArray(release.verificationScope)
+        || release.verificationScope.join() !== "reviewed-publication-plan,local-artifact-bytes,published-installer-bytes"
+        || !Array.isArray(release.downloads) || release.downloads.length !== 4
+        || new Set(release.downloads.map(row => row?.target)).size !== 4) fail("RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH");
+    for (const target of plan.targets) {
+      const manifest = await jsonFile(target.feedManifest);
+      if (release.buildNumber !== manifest.electron?.buildNumber) fail("RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH");
+    }
+    for (const artifact of canonical.artifacts) {
+      const platform = { macos: "darwin", windows: "win32", linux: "linux" }[artifact.platform];
+      const row = release.downloads.find(value => value?.target === `${platform}-${artifact.architecture}`);
+      if (!exact(row, ["target", "url", "bytes", "sha256"])
+          || row.sha256 !== artifact.sha256 || row.bytes !== artifact.bytes
+          || row.url !== `https://github.com/${REPOSITORY}/releases/download/${plan.source.tag}/${artifact.fileName}`) fail("RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH");
+    }
+    // Mac minimum OS and architecture are established by the signed native
+    // publisher validation above, not nonexistent download-row fields.
+  } else {
+    for (const target of plan.targets) {
+      const row = target.architecture === "arm64" ? site.installer : site.intelInstaller;
+      const dmg = asset(target.dmgName);
+      if (row?.version !== plan.version || row.sha256 !== dmg.sha256 || row.bytes !== dmg.bytes
+          || row.minimumMacos !== "14.0" || !row.architectures?.includes(target.architecture)
+          || row.url !== `https://github.com/${REPOSITORY}/releases/download/${plan.source.tag}/${dmg.name}`) fail("RELEASE_PUBLICATION_SITE_INSTALLER_MISMATCH");
+    }
   }
   const siteFiles = [];
   for (const file of site.files) {
