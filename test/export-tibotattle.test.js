@@ -54,6 +54,8 @@ test("client exporter creates a history-free, verified allow-list artifact", asy
     // remains supported; this test makes both halves of that boundary explicit.
     for (const path of [
       "config/electron-production-distribution.cjs",
+      "config/macos-bundle-version-plan.cjs",
+      "src/platform/windows-native-unsigned-content.js",
       "src/desktop-shell-status.js",
       "scripts/lib/release-operation.mjs",
       "scripts/macos-release-journal.js",

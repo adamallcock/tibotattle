@@ -48,6 +48,8 @@ export const CLIENT_RUNTIME_FILES = Object.freeze([
   "apps/local/transport/participant-session-cookie-bridge.js",
   "config/deployment-endpoints.js",
   "config/electron-production-distribution.cjs",
+  "config/macos-bundle-version-plan.cjs",
+  "src/platform/windows-native-unsigned-content.js",
   "config/product-brand.js",
   "config/release-channels.js",
   "config/release-manifest.js",
