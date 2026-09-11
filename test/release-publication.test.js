@@ -372,21 +372,46 @@ test("real feed and website adapters delegate current guarded entrypoint contrac
 });
 
 test("website readback checks every prepared file and current healthy deployment source", async (t) => {
-  const f = await fixture(t), prepared = await preparePublication(f.plan, f.prepareOptions);
+  const f = await fixture(t);
+  const site = JSON.parse(await readFile(f.plan.website.manifest.path, "utf8"));
+  for (const path of ["docs.html", "privacy.html", "community.html", "404.html", "styles.css"]) {
+    site.files.push({ ...await f.file(path, `Synthetic ${path} bytes`), path });
+  }
+  f.plan.website.manifest = await f.file("release-site-manifest.json", JSON.stringify(site));
+  f.plan.website.receipt = await f.file("web-release-receipt.json", JSON.stringify({ sourceCommit: "c".repeat(40), site: { manifestSha256: f.plan.website.manifest.sha256 } }));
+  const prepared = await preparePublication(f.plan, f.prepareOptions);
   let healthySource = prepared.websiteSourceCommit;
   const reads = [];
-  const adapter = createPublicationAdapters({ fetchImpl: async (input) => {
+  const adapter = createPublicationAdapters({ fetchImpl: async (input, options) => {
     const url = new URL(input); reads.push(url.pathname);
+    assert.equal(options.redirect, "error");
+    // The live host redirects .html requests; the verifier must request the
+    // canonical route rather than following arbitrary remote locations.
+    if (url.pathname.endsWith(".html")) throw new TypeError("unexpected redirect");
     if (url.pathname === "/api/health") {
       const response = new Response(JSON.stringify({ status: "ok", deployment: { sourceCommit: healthySource } }), { headers: { "content-type": "application/json", "cache-control": "no-store", "referrer-policy": "no-referrer", "x-content-type-options": "nosniff" } });
       Object.defineProperty(response, "url", { value: String(input) }); return response;
     }
-    const path = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
+    const path = url.pathname === "/" ? "index.html"
+      : ["/docs", "/privacy", "/community", "/404"].includes(url.pathname) ? `${url.pathname.slice(1)}.html` : url.pathname.slice(1);
     return new Response(await readFile(join(f.root, path)));
   } });
   assert.equal((await adapter.website(prepared)).status, "matches");
-  assert.deepEqual(reads, ["/release-site-manifest.json", "/", "/api/health"]);
+  assert.deepEqual(reads, ["/release-site-manifest.json", "/", "/docs", "/privacy", "/community", "/404", "/styles.css", "/api/health"]);
   healthySource = "e".repeat(40); assert.equal((await adapter.website(prepared)).status, "pending");
+  healthySource = prepared.websiteSourceCommit;
+  await writeFile(join(f.root, "docs.html"), "Different published documentation");
+  assert.equal((await adapter.website(prepared)).status, "pending");
+});
+
+test("website admission refuses canonical route collisions and transformed dot paths", async (t) => {
+  for (const paths of [["docs", "docs.html"], ["..html"], ["...html"]]) {
+    const f = await fixture(t), site = JSON.parse(await readFile(f.plan.website.manifest.path, "utf8"));
+    for (const path of paths) site.files.push({ ...await f.file(path, `Synthetic ${path}`), path });
+    f.plan.website.manifest = await f.file("release-site-manifest.json", JSON.stringify(site));
+    f.plan.website.receipt = await f.file("web-release-receipt.json", JSON.stringify({ sourceCommit: "c".repeat(40), site: { manifestSha256: f.plan.website.manifest.sha256 } }));
+    await assert.rejects(preparePublication(f.plan, f.prepareOptions), /SITE_FILES_INVALID/);
+  }
 });
 
 async function electronFixture(t) {

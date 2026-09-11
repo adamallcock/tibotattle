@@ -213,7 +213,11 @@ export async function preparePublication(plan, { repositoryRoot = ROOT, publishF
         || !Number.isSafeInteger(file.bytes) || file.bytes < 1 || file.bytes > 16 * MAX_SMALL) fail("RELEASE_PUBLICATION_SITE_FILES_INVALID");
     const spec = { ...file, path: join(dirname(plan.website.manifest.path), file.path) };
     await verifyFile(spec);
-    siteFiles.push({ ...file, url: `${DEPLOYMENT_ENDPOINTS.public.origin}/${file.path === "index.html" ? "" : file.path}` });
+    // Workers Assets serves HTML at canonical extensionless routes. Read those
+    // directly so unexpected redirects still fail closed in publicBytes.
+    const publicPath = file.path.replace(/(^|\/)index\.html$/, "$1").replace(/\.html$/, "");
+    if (publicPath.split("/").some((part) => part === "." || part === "..")) fail("RELEASE_PUBLICATION_SITE_FILES_INVALID");
+    siteFiles.push({ ...file, url: `${DEPLOYMENT_ENDPOINTS.public.origin}/${publicPath}` });
   }
   if (new Set(siteFiles.map((file) => file.url)).size !== siteFiles.length || !site.files.some((file) => file.path === "index.html")) fail("RELEASE_PUBLICATION_SITE_FILES_INVALID");
   const cask = await readFile(plan.tap.path, "utf8");
