@@ -3181,7 +3181,8 @@ footer p { margin: 0; }
   font-size: .6rem;
   line-height: 1.35;
   scrollbar-width: none;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 .community-site .homebrew-install code::-webkit-scrollbar {
   display: none;
