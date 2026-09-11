@@ -48,8 +48,9 @@ push, signing, notarization and release authorizations remain applicable.
   and website sequence; verify exact assets and installed update behavior.
 
 The hosted public-source policy is separately deployed at 03d4217f with 0060
-applied. Its derived public rebuild has begun; this does not prove the new app
-is released or that an accountless installation has yet published measurements.
+applied. Its scheduled public rebuild has completed and the recent daily API
+returns ready results. This does not prove that the new app is released or that
+the private canary has completed a public analytical domain.
 Do not repeat the completed 0057-0059 migration. Do not put real profile records,
 credentials, account identifiers or private source paths into test fixtures.
 
@@ -62,10 +63,38 @@ synthetic child. Broader source validation exposed pre-existing fixture and
 closure mismatches. Original failures are preserved; their owning reruns pass.
 The four accounting corpus failures also reproduce on released 0.1.21; all 19
 corrected corpus tests pass without changing product code or resource limits.
-The remaining retained R7 receipts require current-workload regeneration.
+The retained R7 receipts were regenerated for the integrated baseline: both
+runtime decisions report `release_open`, and both retained-evidence tests pass.
 Early synthetic release admission passed 168 tests on the exact current inputs;
 the changed profile is not marked reusable.
-These results do not yet qualify new signed artifacts or actual hosted uploads.
+These results cover the integrated baseline before the subsequently identified
+upload-resume correction. Any further workload change requires fresh matching
+qualification; do not relabel the baseline receipts.
+
+The private arm64 candidate at 46ad70cf passed signing, notarization, Gatekeeper,
+both enclosed-app checks and final updater-metadata binding. Ordinary replacement
+preserved the stopped profile, predecessor app, installation binding and salt.
+The signed app automatically sent accepted usage and quota records using its
+existing credential. Projects, live search, thread expansion, performance model
+and period controls were also checked in that installed app. A completed public
+domain and the final corrected candidate remain separate pending checks.
+An ordinary quit/relaunch preserved the binding, salt, credential generation and
+sharing choice; a later server observation showed further accepted records.
+
+The live exercise prompted a further liveness review: unchanged nonempty account
+markers force saved prefix validation to restart every pass. If that prefix
+exceeds the pass budget, the remaining backlog cannot complete. The reviewed
+correction is integrated at c2624822: exact pinned projection evidence preserves
+unchanged progress and retains marker/root/source-change invalidation. All 76
+focused tests and 351 local application tests pass; the independent review is
+clear. An independent slow-network, multi-pass day test confirmed that already
+stored chunks are skipped without duplicate uploads. Final R7 regeneration and
+signed qualification must use the corrected source.
+
+Later reviewed PR119 publication tools and their matching schema are reconciled
+in a separate tooling checkout. The app candidate, publication runner and current
+hosted-policy source are pinned independently through the maintained contracts.
+Never package or deploy the tooling checkout as the application or website.
 
 The timing sidecar's existing protected-storage contract supports macOS/Linux.
 Windows immediately reports timing unavailable without starting its worker;
@@ -73,4 +102,5 @@ all three locales state this limitation. Do not replace its owner checks with a
 platform conditional or broaden native security APIs as a quick release fix.
 
 Version 0.1.22, Mac bundle 1029 and artifact provenance build 2026091108 are
-allocated locally. No signed candidate has yet been produced.
+allocated locally. The signed private candidate is intermediate and unpublished;
+final artifacts must bind the corrected, qualified application source.
