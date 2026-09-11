@@ -129,6 +129,13 @@ function productionUpdateProcesses() {
     return { pid: +match[1], parent: +match[2], group: +match[3], command: match[4] };
   });
 }
+export function refreshProductionUpdateArchiveIndex(appPath) {
+  const loaded = createRequire(require.resolve('electron-builder'))('@electron/asar'), api = loaded?.default ?? loaded;
+  // ASAR 3.4.1 caches headers by pathname. An in-place updater replaces this
+  // archive after predecessor inspection; reread its actual signed header.
+  if (typeof api.uncache !== 'function') fail('archive_cache_api');
+  api.uncache(join(appPath, 'Contents', 'Resources', 'app.asar'));
+}
 async function verifyPredecessor(input, appPath) {
   const asar = join(appPath, 'Contents', 'Resources', 'app.asar');
   if (hash(await bytes(asar, 512 * 1024 ** 2)) !== input.predecessorAsarSha256) fail('predecessor_asar');
@@ -255,6 +262,7 @@ export async function runProductionUpdate(options) {
     stage = 'successor_archive_verification';
     input.candidateCodeDirectoryHash = await assertExtractedSignedMacBundle(candidateDmg, app, join(input.directory, 'successor-verification-mount'));
     stage = 'successor_signed_verification';
+    refreshProductionUpdateArchiveIndex(app);
     await verifySparkleTransitionCandidate(input, app);
     stage = 'successor_process_capture';
     captureMacTransitionProcesses(app, successor, knownProcesses);
@@ -280,6 +288,7 @@ export async function runProductionUpdate(options) {
       try {
         proof.ownedProcessesStopped = await stopVerifiedMacTransitionProcesses({ appPath: app, knownProcesses,
           verifyApp: async path => {
+            refreshProductionUpdateArchiveIndex(path);
             try { return await verifySparkleTransitionCandidate(input, path); }
             catch { return verifyPredecessor(input, path); }
           } });
