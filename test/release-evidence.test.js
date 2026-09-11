@@ -1179,3 +1179,67 @@ test("bounded JSON reads fail before accepting oversized metadata", async () => 
     await value.close();
   }
 });
+
+test("Mac and Linux Electron updater metadata validates without relaxing native trust", async () => {
+  const v = await buildBaseFixture();
+  try {
+    const schema = JSON.parse(await readFile(new URL("../schemas/release-evidence-v1/manifest.schema.json", import.meta.url), "utf8"));
+    const validate = new Ajv2020({ strict: false }).compile(schema);
+    for (const [platform, architecture] of [["macos", "arm64"], ["macos", "x64"], ["linux", "x64"]]) {
+      const input = structuredClone(v.input), a = input.artifacts[0]; a.platform = platform; a.architecture = architecture; a.updater.mechanism = "electron-updater";
+      if (platform === "linux") { a.nativeTrust = { scheme: "none" }; a.assurances = { ...ASSURANCES.linux.direct }; }
+      const manifest = await generateReleaseEvidence({ descriptor: input, baseDir: v.root });
+      assert.equal(manifest.artifacts[0].updater.mechanism, "electron-updater"); assert.equal(validate(manifest), true, JSON.stringify(validate.errors));
+      await validateReleaseEvidenceManifest(manifest, { artifactRoot: v.root });
+      delete a.assurances[platform === "linux" ? "artifactIntegrityVerified" : "developerIdSigned"];
+      await assert.rejects(generateReleaseEvidence({ descriptor: input, baseDir: v.root }), { code: "RELEASE_EVIDENCE_ASSURANCES_INCOMPLETE" });
+    }
+  } finally { await v.close(); }
+});
+test("owner acceptance is explicit, source-bound and never a passed smoke", async () => {
+  const v = await buildBaseFixture();
+  try {
+    const input = structuredClone(v.input), a = input.artifacts[0]; a.architecture = "x64"; a.assurances.cleanInstallSmokePassed = false;
+    a.cleanInstallAcceptance = { status: "owner_accepted", reason: "Owner accepts unobserved physical Intel execution for this exact candidate.", sourceCommit: RELEASE.commit };
+    const manifest = await generateReleaseEvidence({ descriptor: input, baseDir: v.root });
+    assert.equal(manifest.artifacts[0].assurances.cleanInstallSmokePassed, false); assert.deepEqual(manifest.artifacts[0].cleanInstallAcceptance, a.cleanInstallAcceptance);
+    await validateReleaseEvidenceManifest(manifest, { artifactRoot: v.root });
+    const schema = JSON.parse(await readFile(new URL("../schemas/release-evidence-v1/manifest.schema.json", import.meta.url), "utf8"));
+    assert.equal(new Ajv2020({ strict: false }).compile(schema)(manifest), true);
+    for (const mutate of [x => x.cleanInstallAcceptance.sourceCommit = "f".repeat(40), x => x.cleanInstallAcceptance.reason = "", x => x.assurances.cleanInstallSmokePassed = true, x => x.cleanInstallAcceptance.status = "passed", x => x.architecture = "unreviewed"]) {
+      const changed = structuredClone(input); mutate(changed.artifacts[0]); await assert.rejects(generateReleaseEvidence({ descriptor: changed, baseDir: v.root }));
+    }
+    delete a.cleanInstallAcceptance; await assert.rejects(generateReleaseEvidence({ descriptor: input, baseDir: v.root }), { code: "RELEASE_EVIDENCE_ASSURANCES_INCOMPLETE" });
+  } finally { await v.close(); }
+});
+test("pending evidence can be prepared but final release validation refuses it", async () => {
+  const v = await buildBaseFixture();
+  try {
+    const input = structuredClone(v.input), a = input.artifacts[0]; a.assurances.cleanInstallSmokePassed = false;
+    a.cleanInstallAcceptance = { status: "pending", reason: "Exact signed ARM production canary has not completed.", sourceCommit: RELEASE.commit };
+    const manifest = await generateReleaseEvidence({ descriptor: input, baseDir: v.root });
+    await assert.rejects(validateReleaseEvidenceManifest(manifest, { artifactRoot: v.root }), { code: "RELEASE_EVIDENCE_ACCEPTANCE_PENDING" });
+    const output = await writeReleaseEvidenceFiles({ manifest, manifestPath: join(v.root, "release-manifest.json"), sumsPath: join(v.root, "SHA256SUMS") });
+    assert.equal(JSON.parse(await readFile(output.manifestPath, "utf8")).artifacts[0].cleanInstallAcceptance.status, "pending");
+  } finally { await v.close(); }
+});
+test("final Electron build evidence binds final bytes without claiming an unsigned payload", async () => {
+  const v = await buildBaseFixture();
+  try {
+    const input = structuredClone(v.input), a = input.artifacts[0];
+    a.updater.mechanism = "electron-updater";
+    a.build = { sourceManifestSha256: "2".repeat(64), finalArtifactSha256: digest(await readFile(join(v.root, a.path))) };
+    const manifest = await generateReleaseEvidence({ descriptor: input, baseDir: v.root });
+    assert.deepEqual(manifest.artifacts[0].build, a.build);
+    await validateReleaseEvidenceManifest(manifest, { artifactRoot: v.root });
+    const schema = JSON.parse(await readFile(new URL("../schemas/release-evidence-v1/manifest.schema.json", import.meta.url), "utf8"));
+    assert.equal(new Ajv2020({ strict: false }).compile(schema)(manifest), true);
+    a.updater.mechanism = "sparkle";
+    await assert.rejects(generateReleaseEvidence({ descriptor: input, baseDir: v.root }), { code: "RELEASE_EVIDENCE_BUILD_INVALID" });
+    const nonElectron = structuredClone(manifest); nonElectron.artifacts[0].updater.mechanism = "sparkle";
+    assert.equal(new Ajv2020({ strict: false }).compile(schema)(nonElectron), false);
+    a.updater.mechanism = "electron-updater";
+    a.build.finalArtifactSha256 = "f".repeat(64);
+    await assert.rejects(generateReleaseEvidence({ descriptor: input, baseDir: v.root }), { code: "RELEASE_EVIDENCE_BUILD_INVALID" });
+  } finally { await v.close(); }
+});
