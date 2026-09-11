@@ -60,3 +60,16 @@ Website and Homebrew 0.1.20 changes are prepared but unpublished. Stable 0.1.19
 and its accurate manual migration warning remain in place until replacement is
 verified. Final publication staging is under
 `.release-build/stable020-publication-20260911` (local, ignored evidence).
+
+The signed support-code build `9971e656` (run 34552482636) identified
+`TRANSFER_LOGIN_ITEM_NOT_FOUND`: the embedded helper could not query the main-app
+startup service. Startup snapshot, disabling and verification now belong to the
+actual Electron main process. The helper authenticates/stops the retired writer
+and reads native preferences; it cannot claim to own or disable a login item.
+The repaired boundary passes 91 focused JS tests and 10 compiled helper tests.
+A new signed installed rehearsal remains required.
+
+Windows diagnostic run 34552043838 showed the frozen signed installer completing
+successfully in approximately 196 seconds, beyond the old 180-second harness
+budget. The bounded budget is now 300 seconds; the full signed installed journey
+is rerunning without re-signing or weakening correctness assertions.

@@ -1081,6 +1081,17 @@ export async function runNativeElectronHandover(options = {}) {
       bridge = normalizeBridgeResult(await selected.control.prepareNativeHandover({
         nativeAppPath: selected.nativeAppPath,
         candidate: selected.candidate,
+        checkpointPreferences: async (preferences) => {
+          if (!plainRecord(preferences) || !exactKeys(preferences, [
+            "language", "appearance", "refreshIntervalSeconds", "startAtLogin", "credentialState",
+          ]) || !["unchanged", "unavailable"].includes(preferences.credentialState)) fail("native_bridge_invalid");
+          const normalized = { ...preferencesFromJournal(preferences), credentialState: preferences.credentialState };
+          if (journal.preferences === null) {
+            const checkpoint = { ...journal, preferences: normalized };
+            await writeJournal(journalPath, checkpoint);
+            journal = checkpoint;
+          }
+        },
       }));
     } catch (error) {
       if (isNativeElectronHandoverError(error)) throw error;
@@ -1099,7 +1110,7 @@ export async function runNativeElectronHandover(options = {}) {
       journal = {
         ...journal,
         phase: "prepared",
-        preferences: { ...bridge.preferences, credentialState: bridge.credentialState },
+        preferences: journal.preferences ?? { ...bridge.preferences, credentialState: bridge.credentialState },
       };
       await writeJournal(journalPath, journal);
       await checkpointHook(selected.afterCheckpoint, journal.phase);

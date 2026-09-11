@@ -70,13 +70,14 @@ accepts the legacy `--prepare --native-app <absolute bundle path>` operation and
 the pathless `--prepare-retained-state` replacement operation.
 It verifies the enclosing Electron app identity and selected old app, asks
 `NSRunningApplication` to terminate only processes with the exact old bundle
-URL, unregisters the same-identity native login item and confirms removal, and
-returns bounded language, appearance, refresh, and login-preference values. It
+URL and returns bounded language, appearance and refresh preferences. The
+coordinator durably saves the original startup choice before Electron's main
+process disables and verifies the same-identity login registration. It
 does not accept arbitrary commands, kill by name, receive state paths, query
 Keychain, copy credentials, reset credentials, or enable sharing.
 
 The diagnostic `--prepare-preflight --native-app <absolute bundle path>` checks
-the helper's bundle context, predecessor, login-item status, preference validity
+the helper's bundle context, predecessor and preference validity
 and writer absence without stopping apps, changing registration or writing state.
 Its closed result is a point-in-time observation, not permission or proof that
 preparation will succeed. A running selected predecessor blocks this read-only
@@ -277,3 +278,7 @@ The rehearsal namespace is isolated from stable paths, but it is not evidence
 that `updates.tibotattle.com` is access-controlled. Confirm the route and R2
 ACL separately before treating a rehearsal asset as private. Never use the
 Sparkle appcast publisher for this YAML feed.
+
+Startup registration is queried, disabled and verified by the actual Electron
+main process. The helper confirms only writer shutdown and native preferences;
+its `native_writer_prepared` reply carries no startup-setting claims.

@@ -137,7 +137,7 @@ function validatePreferences(value) {
   });
 }
 
-function validatePrepareReply(value) {
+function validatePrepareReply(value, startAtLogin) {
   if (exactKeys(value, ["schemaVersion", "status", "failureStage"])
       && value.schemaVersion === NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
       && value.status === "failed"
@@ -156,14 +156,13 @@ function validatePrepareReply(value) {
     "schemaVersion",
     "status",
     "nativeWriterStopped",
-    "loginItemDisabled",
     "preferences",
     "credentialState",
   ])
       || value.schemaVersion !== NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
-      || value.status !== "prepared"
+      || value.status !== "native_writer_prepared"
       || value.nativeWriterStopped !== true
-      || value.loginItemDisabled !== true
+      || !exactKeys(value.preferences, ["language", "appearance", "refreshIntervalSeconds"])
       || !["unchanged", "unavailable"].includes(value.credentialState)) {
     throw bridgeFailure("invalid_reply");
   }
@@ -171,7 +170,7 @@ function validatePrepareReply(value) {
     status: "prepared",
     nativeWriterStopped: true,
     loginItemDisabled: true,
-    preferences: validatePreferences(value.preferences),
+    preferences: validatePreferences({ ...value.preferences, startAtLogin }),
     credentialState: value.credentialState,
   });
 }
@@ -331,6 +330,19 @@ function claimedLoginItem(status, startAtLogin) {
     && status.status !== "enabled" && status.executableWillLaunchAtLogin !== true;
 }
 
+// ServiceManagement main-app calls belong to the actual main executable.
+// A bundled command-line helper can resolve the bundle but still get notFound.
+function mainApplicationStartupPreference(electronApp) {
+  let value;
+  try { value = electronApp.getLoginItemSettings(); }
+  catch { throw bridgeFailure("prepare_login_item_status"); }
+  if (value?.status === "requires-approval") throw bridgeFailure("prepare_login_item_requires_approval");
+  if (value?.status === "not-found") throw bridgeFailure("prepare_login_item_not_found");
+  if (value?.status === "enabled" && value.openAtLogin === true) return true;
+  if (value?.status === "not-registered" && value.openAtLogin === false) return false;
+  throw bridgeFailure("prepare_login_item_status_unknown");
+}
+
 /**
  * Construct the real macOS boundary used by a future signed Electron
  * candidate. The helper is intentionally a narrow one-shot command; it does
@@ -353,6 +365,7 @@ export function createMacNativeHandoverAdapter(options = {}) {
           || qualified.electron.appId !== NATIVE_ELECTRON_APP_ID) {
         throw bridgeFailure("identity_mismatch");
       }
+      mainApplicationStartupPreference(configuration.electronApp);
       let reply;
       try {
         reply = await invokeBridge(configuration, retained
@@ -367,7 +380,7 @@ export function createMacNativeHandoverAdapter(options = {}) {
       return validatePreparationPreflightReply(reply);
     },
 
-    async prepareNativeHandover({ nativeAppPath, candidate } = {}) {
+    async prepareNativeHandover({ nativeAppPath, candidate, checkpointPreferences } = {}) {
       const qualified = validateNativeElectronHandoverCandidate(candidate);
       const retained = qualified.route === NATIVE_ELECTRON_RETAINED_STATE_ROUTE;
       if (retained ? nativeAppPath !== null : !validPath(nativeAppPath)) {
@@ -377,6 +390,7 @@ export function createMacNativeHandoverAdapter(options = {}) {
           || qualified.electron.appId !== NATIVE_ELECTRON_APP_ID) {
         throw bridgeFailure("identity_mismatch");
       }
+      const startAtLogin = mainApplicationStartupPreference(configuration.electronApp);
       let reply;
       try {
         reply = await invokeBridge(configuration, retained
@@ -388,7 +402,20 @@ export function createMacNativeHandoverAdapter(options = {}) {
         }
         throw bridgeFailure("unavailable");
       }
-      return validatePrepareReply(reply);
+      const prepared = validatePrepareReply(reply, startAtLogin);
+      if (typeof checkpointPreferences !== "function") throw bridgeFailure("prepare_preferences");
+      // Durable snapshot precedes the OS mutation: a crash after disabling must
+      // not turn the original enabled preference into a new disabled preference.
+      await checkpointPreferences({ ...prepared.preferences, credentialState: prepared.credentialState });
+      // The helper has now verified that the retired writer is stopped. Only
+      // this authenticated Electron main process changes startup registration.
+      try {
+        configuration.electronApp.setLoginItemSettings({ openAtLogin: false });
+      } catch { throw bridgeFailure("prepare_login_item_unregister"); }
+      if (mainApplicationStartupPreference(configuration.electronApp) !== false) {
+        throw bridgeFailure("prepare_login_item_status");
+      }
+      return prepared;
     },
 
     async claimElectronLoginItem({ startAtLogin, candidate } = {}) {

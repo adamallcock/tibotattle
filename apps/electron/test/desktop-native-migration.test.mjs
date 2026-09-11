@@ -464,3 +464,31 @@ test("native bridge refusal retains only a closed support code and does not copy
     } finally { await state.dispose(); }
   }
 });
+
+test("startup preference survives interruption after OS disable before prepared journal phase", async () => {
+  const state = await fixture();
+  let startupEnabled = true;
+  let interrupted = false;
+  const boundary = {
+    async prepareNativeHandover({ checkpointPreferences }) {
+      const reply = bridgeResult({ startAtLogin: startupEnabled });
+      await checkpointPreferences({ ...reply.preferences, credentialState: reply.credentialState });
+      startupEnabled = false;
+      if (!interrupted) { interrupted = true; throw new Error("interrupted after actual disable"); }
+      return reply;
+    },
+    async claimElectronLoginItem({ startAtLogin }) { startupEnabled = startAtLogin; return "owned"; },
+  };
+  try {
+    const options = migrationOptions(state, [], { control: boundary });
+    await assert.rejects(runNativeElectronHandover(options));
+    assert.equal(startupEnabled, false);
+    const journal = JSON.parse(await readFile(join(state.userDataRoot, ".native-electron-handover-v1", NATIVE_ELECTRON_HANDOVER_JOURNAL_FILE)));
+    assert.equal(journal.phase, "started");
+    assert.equal(journal.preferences.startAtLogin, true);
+    assert.equal((await runNativeElectronHandover(options)).status, "migrated");
+    const settings = JSON.parse(await readFile(join(state.userDataRoot, "desktop-settings", "desktop-settings-v1.json")));
+    assert.equal(settings.startAtLogin, true);
+    assert.equal(startupEnabled, true);
+  } finally { await state.dispose(); }
+});

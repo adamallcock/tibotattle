@@ -67,7 +67,7 @@ test("compiled handover helper recognizes the enclosing app only in the producti
   });
 });
 
-test("helper preparation preflight refuses a synthetic service context with only a fixed code", {
+test("helper preparation preflight refuses an unsupported predecessor before reading preferences or processes", {
   skip: process.platform !== "darwin" ? "Requires Apple's Foundation runtime and Swift compiler" : false,
   timeout: 120_000,
 }, async (t) => {
@@ -87,7 +87,7 @@ test("helper preparation preflight refuses a synthetic service context with only
   await writeFile(join(nativeContents, "Info.plist"), `<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0"><dict>
 <key>CFBundleIdentifier</key><string>com.usagemonitor.local</string>
-<key>CFBundleShortVersionString</key><string>0.1.18</string>
+<key>CFBundleShortVersionString</key><string>0.0.0</string>
 <key>CFBundleVersion</key><string>20260905.1</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 </dict></plist>\n`);
@@ -101,7 +101,7 @@ test("helper preparation preflight refuses a synthetic service context with only
   assert.deepEqual(JSON.parse(result.stdout), {
     schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
     status: "failed",
-    failureStage: "login_item_not_found",
+    failureStage: "native_application",
   });
   assert.deepEqual(await readdir(root), before, "preflight must not create a handover state tree");
 });
