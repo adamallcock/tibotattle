@@ -74,7 +74,8 @@ test('both workflow bodies parse as JavaScript and preserve fixed targets withou
     assert.match(script, /env\.SELECTED_RUNNER !== env\.GITHUB_SHA/);
     assert.doesNotMatch(script, /\$\{\{/);
   }
-  assert.match(workflow, /runs-on: macos-26-intel/);
+  assert.match(workflow, /acceptance_x64:[\s\S]*?runs-on: macos-15-intel\n/);
+  assert.doesNotMatch(workflow, /runs-on: macos-26-intel/);
   assert.match(workflow, /runs-on: macos-26\n/);
   assert.doesNotMatch(workflow, /contents: write|secrets\.|pull_request_target/);
 });
