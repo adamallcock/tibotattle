@@ -147,6 +147,19 @@ test('waiting for a delayed About item does not toggle its menu closed', () => {
   ready = true; assert.equal(run('about'), 'clicked'); assert.equal(presses, 1);
 });
 
+test('closing updater windows can be reread, but an uncertain click is never retried as a read', () => {
+  let clicks = 0, closing = true, rejectClick = false;
+  const button = { name: () => 'Install and Relaunch', role: () => 'AXButton', enabled: () => true,
+    click: () => { clicks++; if (rejectClick) throw new Error('Action outcome unavailable'); } };
+  const context = { Application: () => ({ applicationProcesses: { whose: () => () => [{ windows: () => [
+    { entireContents: () => { if (closing) throw new Error('Window no longer exists'); return [button]; } },
+  ] }] } }) };
+  const run = () => runInNewContext(runner.sparkleTransitionUiScript(321, 'relaunch') + '\nrun();', context);
+  assert.equal(run(), 'snapshot_unavailable'); assert.equal(clicks, 0);
+  closing = false; assert.equal(run(), 'clicked'); assert.equal(clicks, 1);
+  rejectClick = true; assert.equal(run(), 'action_unconfirmed'); assert.equal(clicks, 2);
+});
+
 test('synthetic UI diagnostics return closed counts rather than unknown labels or text', () => {
   const element = (name, value) => ({ name: () => name, value: () => value, enabled: () => true });
   const context = { Application: () => ({ applicationProcesses: { whose: () => () => [{

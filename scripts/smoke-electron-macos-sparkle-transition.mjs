@@ -161,19 +161,21 @@ export function sparkleTransitionUiScript(pid, action) {
   if (!Number.isSafeInteger(pid) || pid < 2 || !['activate', 'openmenu', 'about', 'check', 'install', 'relaunch', 'quit', 'inspect'].includes(action)) fail('ui_arguments');
   return [
     'function run() {',
+    'let actionAttempted = false;',
+    'try {',
     'const matches = Application("System Events").applicationProcesses.whose({unixId:' + pid + '})();',
     'if (matches.length !== 1) return "process_absent";',
     'const p = matches[0];',
     'const action = ' + JSON.stringify(action) + ';',
     'function label(e) { try { return String(e.name()); } catch (_) { try { return String(e.title()); } catch (_) { return ""; } } }',
-    'function press(e) { e.click(); return "clicked"; }',
-    'if (action === "activate") { p.frontmost = true; return p.frontmost() ? "activated" : "target_absent"; }',
+    'function press(e) { actionAttempted = true; e.click(); return "clicked"; }',
+    'if (action === "activate") { actionAttempted = true; p.frontmost = true; return p.frontmost() ? "activated" : "target_absent"; }',
     'if (action === "openmenu" || action === "about" || action === "quit") {',
     '  const bars = p.menuBars(); if (bars.length < 1) return "menu_absent";',
     '  const items = bars.flatMap(b => b.menuBarItems()).filter(e => label(e) === "TiboTattle");',
     '  if (items.length !== 1) return "menu_absent";',
     '  if (action === "openmenu") return press(items[0]);',
-    '  if (action === "quit") { p.frontmost = true; items[0].click(); }',
+    '  if (action === "quit") { actionAttempted = true; p.frontmost = true; items[0].click(); }',
     '  const menus = items[0].menus(); if (menus.length !== 1) return "menu_absent";',
     '  const names = action === "about" ? ["About TiboTattle","Acerca de TiboTattle"] : ["Quit TiboTattle","Salir de TiboTattle"];',
     '  const targets = menus[0].menuItems().filter(e => names.includes(label(e)));',
@@ -192,6 +194,7 @@ export function sparkleTransitionUiScript(pid, action) {
     'if (/up.to.date|versión más reciente/i.test(text)) return "no_update";',
     'if (/Keychain|keychain|llavero/.test(text)) return "keychain_dialog";',
     'return "target_absent";',
+    '} catch (_) { return actionAttempted ? "action_unconfirmed" : "snapshot_unavailable"; }',
     '}',
   ].join('\n');
 }
@@ -200,9 +203,9 @@ function ui(executable, pid, action) {
   if (!current || current.pid !== pid) return 'process_absent';
   const result = command('/usr/bin/osascript', ['-l', 'JavaScript', '-e', sparkleTransitionUiScript(pid, action)], 10000);
   const allowed = ['clicked', 'activated', 'process_absent', 'menu_absent', 'target_absent', 'ambiguous_target',
-    'signature_error', 'no_update', 'keychain_dialog'];
+    'signature_error', 'no_update', 'keychain_dialog', 'snapshot_unavailable', 'action_unconfirmed'];
   if (!allowed.includes(result)) fail('ui_result');
-  if (['ambiguous_target', 'signature_error', 'no_update', 'keychain_dialog'].includes(result)) fail(result);
+  if (['ambiguous_target', 'signature_error', 'no_update', 'keychain_dialog', 'action_unconfirmed'].includes(result)) fail(result);
   return result;
 }
 
@@ -458,7 +461,7 @@ export async function runSparkleTransition(options) {
       captureMacTransitionProcesses(installedApp, original.pid, knownProcesses);
       const current = appProcess(installedExecutable);
       if (current && current.pid !== original.pid) return current;
-      if (current) ui(installedExecutable, original.pid, 'relaunch');
+      if (current) interact('relaunch');
       return null;
     }, 180000, 'sparkle_relaunch');
     const relaunched = appProcess(installedExecutable);
