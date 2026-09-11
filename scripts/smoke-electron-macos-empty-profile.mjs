@@ -13,14 +13,14 @@ import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp,
   assertSignedStagingFreshProjection } from './run-signed-electron-staging.mjs';
 
 export const EMPTY_PROFILE_CONFIRMATION = 'RUN_DISPOSABLE_EMPTY_PROFILE';
-const SOURCE = 'a651ea130dd1460e4443a037c4434f57b911fec4';
+const SOURCE = '16a0d4dffad4b1213b28adaae139fc9ee6705837';
 const CANDIDATES = Object.freeze({
   'darwin-arm64': Object.freeze({ architecture: 'arm64',
-    dmgSha256: '0afab510adf250775e1401307b547cee1a7955e1d7ec8dce9852cc4ca143c7e2',
-    asarSha256: '11d053d35ae6e971adc27b3a30a8bb94592e09f5f1466cfb5d9c008634950175', filename: 'TiboTattle-0.1.21-mac-arm64.dmg' }),
+    dmgSha256: 'd013a6d71f4b5bec0d7c3c3347fa35105564acf8f4f71ad5d92fc5e8a81fc938',
+    asarSha256: 'e176d0d763b11f9aa90073b90d0bdd7fbdbb17cc61740331fb47e33899007579', filename: 'TiboTattle-0.1.22-mac-arm64.dmg' }),
   'darwin-x64': Object.freeze({ architecture: 'x64',
-    dmgSha256: '50960e1aac65eb2673a7634a18bf123b604680f2a526822a0ccccc1d3b0b52e4',
-    asarSha256: '8222cd3119e42b24d87adaee6d1a264514517504a12e2b7d728fb53ac81722e1', filename: 'TiboTattle-0.1.21-macOS-x64.dmg' }),
+    dmgSha256: '6d94f6e624972d1ead26fb157f3bd05061dc7db58cee20c0650dd1d1032fcfb9',
+    asarSha256: '573a94cc2bf68b04363cf7ac944bd8618c1036cd1bc981bb74791b85b6dd8121', filename: 'TiboTattle-0.1.22-macOS-x64.dmg' }),
 });
 function fail(stage) { const error = new Error('Empty-profile qualification failed'); error.emptyProfileStage = stage; throw error; }
 export function validateEmptyProfileIntake(input) {
@@ -29,8 +29,12 @@ export function validateEmptyProfileIntake(input) {
     || typeof input.runnerRevision !== 'string' || !/^[a-f0-9]{40}$/u.test(input.runnerRevision)
     || typeof input.target !== 'string' || !Object.hasOwn(CANDIDATES, input.target)) fail('intake');
   const candidate = CANDIDATES[input.target];
-  return Object.freeze({ ...input, ...candidate, sourceRevision: SOURCE, version: '0.1.21', buildNumber: '2026091107', bundleVersion: '1028',
-    url: `https://updates.tibotattle.com/electron/test/native-sparkle/${SOURCE}/1028/${candidate.dmgSha256}/${candidate.filename}` });
+  if (!/^[a-f0-9]{40}$/u.test(SOURCE)
+    || !/^[1-9][0-9]{0,9}$/u.test('2026091108')
+    || !/^[a-f0-9]{64}$/u.test(candidate.dmgSha256)
+    || !/^[a-f0-9]{64}$/u.test(candidate.asarSha256)) fail('candidate_unpinned');
+  return Object.freeze({ ...input, ...candidate, sourceRevision: SOURCE, version: '0.1.22', buildNumber: '2026091108', bundleVersion: '1029',
+    url: `https://updates.tibotattle.com/electron/test/native-sparkle/${SOURCE}/1029/${candidate.dmgSha256}/${candidate.filename}` });
 }
 export function parseEmptyProfileArguments(args) {
   if (!Array.isArray(args) || ![1, 3].includes(args.length) || !['--plan', '--execute'].includes(args[0])) fail('arguments');

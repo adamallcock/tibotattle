@@ -1,7 +1,7 @@
 name: Signed Mac empty-profile clean install
 on:
   push:
-    branches: [codex/electron-sparkle-transition-021]
+    branches: [codex/electron-sparkle-transition-021, codex/electron-022-qualified-runner]
   workflow_dispatch:
     inputs:
       mode:

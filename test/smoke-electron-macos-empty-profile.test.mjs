@@ -7,9 +7,9 @@ import { validateEmptyProfileIntake, parseEmptyProfileArguments, assertEmptyProf
 const intake = { runnerRevision: 'e'.repeat(40), target: 'darwin-arm64' };
 test('intake pins candidate bytes and rejects caller-selected source, paths, origins or extra fields', () => {
   const value = validateEmptyProfileIntake(intake);
-  assert.equal(value.sourceRevision, 'a651ea130dd1460e4443a037c4434f57b911fec4');
-  assert.equal(value.buildNumber, '2026091107');
-  assert.equal(value.bundleVersion, '1028');
+  assert.equal(value.sourceRevision, '16a0d4dffad4b1213b28adaae139fc9ee6705837');
+  assert.equal(value.buildNumber, '2026091108');
+  assert.equal(value.bundleVersion, '1029');
   assert.match(value.url, /^https:\/\/updates\.tibotattle\.com\/electron\/test\/native-sparkle\//u);
   for (const field of ['sourceRevision', 'directory', 'url', 'dmgSha256', 'asarSha256']) assert.throws(() => validateEmptyProfileIntake({ ...intake, [field]: 'different' }));
   for (const target of [[], {}, null, 'darwin-ia32', 'toString']) assert.throws(() => validateEmptyProfileIntake({ ...intake, target }));
@@ -17,7 +17,7 @@ test('intake pins candidate bytes and rejects caller-selected source, paths, ori
   const intel = validateEmptyProfileIntake({ ...intake, target: 'darwin-x64' });
   assert.equal(intel.architecture, 'x64');
   assert.notEqual(intel.dmgSha256, value.dmgSha256);
-  assert.match(intel.url, /TiboTattle-0\.1\.21-macOS-x64\.dmg$/u);
+  assert.match(intel.url, /TiboTattle-0\.1\.22-macOS-x64\.dmg$/u);
 });
 test('execution requires exact explicit confirmation; plan cannot smuggle arguments', () => {
   assert.deepEqual(parseEmptyProfileArguments(['--plan']), { execute: false });
