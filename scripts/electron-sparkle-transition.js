@@ -152,6 +152,10 @@ export async function validateElectronSparkleDMG(path, { manifest, manifestPath,
     distribution.assertProductionElectronMacOSBundleMetadata({ target: `darwin-${manifest.application.architecture}`,
       version: manifest.application.shortVersion, buildNumber: manifest.electron.buildNumber,
       bundleVersion: plist.CFBundleVersion, bundleShortVersion: plist.CFBundleShortVersionString });
+    distribution.assertProductionElectronMacOSIncomingUpgradeMetadata({
+      target: `darwin-${manifest.application.architecture}`, publicEDKey: plist.SUPublicEDKey });
+    if (createHash('sha256').update(Buffer.from(plist.SUPublicEDKey, 'base64')).digest('hex')
+        !== manifest.sparkle.publicEdKeySha256) fail('KEY_MISMATCH');
     const expectedArch = manifest.application.architecture === 'x64' ? 'x86_64' : 'arm64';
     if (run('/usr/bin/lipo', ['-archs', join(app, 'Contents/MacOS/TiboTattle')]).stdout.trim() !== expectedArch) fail('ARCHITECTURE_MISMATCH');
     const asar = join(app, 'Contents/Resources/app.asar');

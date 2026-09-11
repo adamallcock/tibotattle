@@ -8,9 +8,10 @@ import { resolveReleaseChannel } from '../config/release-channels.js';
 import { ELECTRON_SPARKLE_TRANSITION_SCHEMA, validateElectronSparkleTransitionManifest,
   validateElectronSparkleJourney, readElectronSparkleJourney, assertElectronSparkleContinuity,
   validateElectronSparkleDMG } from '../scripts/electron-sparkle-transition.js';
+import distribution from '../config/electron-production-distribution.cjs';
 import { createProductionDistributionMetadata } from '../apps/electron/desktop-updater.js';
 const hash = value => createHash('sha256').update(value).digest('hex');
-const key = 'a'.repeat(64);
+const key = hash(Buffer.from(distribution.PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY, 'base64'));
 function fixture(architecture = 'arm64') {
   const channel = resolveReleaseChannel('stable', { architecture });
   const manifest = { schemaVersion: ELECTRON_SPARKLE_TRANSITION_SCHEMA,
@@ -121,13 +122,13 @@ test('mounted Electron inspector binds signed identity, architecture, ASAR, upda
     await writeFile(join(root, 'journey.json'), proofBytes);
     const pkg = { name: 'app-usagemonitor', version: '0.1.21', tibotattleDistribution:
       createProductionDistributionMetadata({ target: 'darwin-arm64', sourceRevision: manifest.source.commit, buildNumber: manifest.electron.buildNumber }) };
-    let wrongArch = false; const calls = [];
+    let wrongArch = false, publicEDKey = distribution.PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY; const calls = [];
     const commandRunner = (command, args) => {
       calls.push([command, ...args]);
       if (command.endsWith('plutil')) return { stdout: JSON.stringify(args.at(-1) === '-'
         ? { 'system-entities': [{ 'mount-point': mount, 'dev-entry': '/dev/synthetic-test' }] }
         : { CFBundleIdentifier: 'com.usagemonitor.local', CFBundleVersion: '1028', CFBundleShortVersionString: '0.1.21',
-          CFBundleExecutable: 'TiboTattle', LSMinimumSystemVersion: '14.0' }), stderr: '' };
+          CFBundleExecutable: 'TiboTattle', LSMinimumSystemVersion: '14.0', SUPublicEDKey: publicEDKey }), stderr: '' };
       if (command.endsWith('lipo')) return { stdout: wrongArch ? 'x86_64' : 'arm64', stderr: '' };
       return { stdout: '', stderr: args.includes('-dv') ? 'CodeDirectory flags=0x10000(runtime)' : '' };
     };
@@ -135,12 +136,19 @@ test('mounted Electron inspector binds signed identity, architecture, ASAR, upda
     assert.deepEqual(await validateElectronSparkleDMG(dmgPath, options), { source: { commit: manifest.source.commit, tag: 'v0.1.21' } });
     assert(calls.some(call => call[0].endsWith('codesign') && call.some(arg => arg.startsWith('-R=identifier'))));
     assert.equal(calls.filter(call => call.includes('detach')).length, 1);
+    for (const invalid of [undefined, '', Buffer.alloc(32).toString('base64')]) {
+      publicEDKey = invalid;
+      await assert.rejects(validateElectronSparkleDMG(dmgPath, options));
+    }
+    publicEDKey = distribution.PRODUCTION_ELECTRON_NATIVE_SPARKLE_PUBLIC_ED_KEY;
+    const detachedAfterKeys = calls.filter(call => call.includes('detach')).length;
+    assert.equal(detachedAfterKeys, 4);
     wrongArch = true;
     await assert.rejects(validateElectronSparkleDMG(dmgPath, options), { code: 'SPARKLE_ELECTRON_TRANSITION_ARCHITECTURE_MISMATCH' });
-    assert.equal(calls.filter(call => call.includes('detach')).length, 2);
+    assert.equal(calls.filter(call => call.includes('detach')).length, detachedAfterKeys + 1);
     wrongArch = false; pkg.tibotattleDistribution = { ...pkg.tibotattleDistribution, sourceRevision: 'd'.repeat(40) };
     await assert.rejects(validateElectronSparkleDMG(dmgPath, options), { code: 'SPARKLE_ELECTRON_TRANSITION_DISTRIBUTION_MISMATCH' });
-    assert.equal(calls.filter(call => call.includes('detach')).length, 3);
+    assert.equal(calls.filter(call => call.includes('detach')).length, detachedAfterKeys + 2);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
