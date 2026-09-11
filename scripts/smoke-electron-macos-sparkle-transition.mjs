@@ -11,6 +11,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { seedSignedReplacementNativeState,
   readSignedReplacementState, assertSignedReplacementContinuity } from './smoke-electron-macos-replacement.mjs';
+import { retireAutomaticContributionState } from '../src/automatic-contribution-retirement.js';
 import { launchVerifiedMacSharingApp, stopOwnedMacSharingApp } from './run-signed-electron-staging.mjs';
 import { validateSignedSparkleFeed } from './sparkle-signed-feed-validation.js';
 import { inspectNativeElectronHandoverCompletion } from '../apps/electron/desktop-native-migration.js';
@@ -159,7 +160,7 @@ export function sparkleTransitionUiScript(pid, action) {
     '}',
     'let elements = []; for (const w of p.windows()) elements = elements.concat(w.entireContents());',
     'const labels = {check:["Check for Updates…","Buscar actualizaciones…"],',
-    '  install:["Install Update","Instalar actualización"], relaunch:["Install and Relaunch","Instalar y reiniciar"]};',
+    '  install:["Install Update","Instalar actualización"], relaunch:["Install and Relaunch","Instalar y volver a abrir"]};',
     'if (action !== "inspect") {',
     '  const targets = elements.filter(e => { try { return e.role() === "AXButton" && labels[action].includes(label(e)) && e.enabled(); } catch (_) { return false; } });',
     '  if (targets.length === 1) return press(targets[0]);',
@@ -301,6 +302,18 @@ export async function verifySparkleTransitionCandidate(input, appPath) {
 }
 const verifyCandidate = verifySparkleTransitionCandidate;
 
+export async function seedNativeSparkleTransitionState(nativeRoot, codexHome) {
+  await seedSignedReplacementNativeState(nativeRoot, codexHome);
+  // A running native 0.1.18 has already retired the older scheduler settings.
+  // Preserve that disabled intent in its real schema before measuring continuity.
+  const retired = await retireAutomaticContributionState({
+    settingsFile: join(nativeRoot, 'private', 'automatic-contribution-v0.1.json'),
+    now: () => new Date('2026-09-01T00:00:00.000Z'),
+  });
+  if (retired.priorState !== 'disabled' || retired.networkActivity !== false) fail('fixture_opt_out');
+  return readSignedReplacementState(nativeRoot);
+}
+
 export async function runSparkleTransition(options) {
   const proof = { schemaVersion: NATIVE_SPARKLE_TRANSITION_SCHEMA, status: 'failed', nativeVersion: '0.1.18',
     nativeSparkleUpdateCompleted: false, productionFeedVerified: false,
@@ -347,7 +360,7 @@ export async function runSparkleTransition(options) {
     command('/usr/bin/codesign', macOSCredentialApplicationVerificationArguments(installedApp));
     command('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister', ['-f', installedApp]);
     await mkdir(codex, { mode: 0o700 }); await mkdir(join(codex, 'sessions'), { mode: 0o700 });
-    const seeded = await seedSignedReplacementNativeState(nativeRoot, codex);
+    const seeded = await seedNativeSparkleTransitionState(nativeRoot, codex);
     const domain = 'com.usagemonitor.local';
     for (const [key, kind, value] of [['tibotattle.language-preference.v1', '-string', 'es'],
       ['tibotattle.appearance.v1', '-string', 'dark'], ['tibotattle.refresh-interval.v1', '-int', '900'],

@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { runInNewContext } from 'node:vm';
 import * as runner from '../scripts/smoke-electron-macos-sparkle-transition.mjs';
+import { retireAutomaticContributionState } from '../src/automatic-contribution-retirement.js';
+import { readSignedReplacementState } from '../scripts/smoke-electron-macos-replacement.mjs';
 
 const source = 'a'.repeat(40);
 const nativeDigests = {
@@ -90,9 +92,9 @@ test('UI automation is PID-scoped, refuses ambiguous buttons, and returns fixed 
   }
   const code = runner.sparkleTransitionUiScript(321, 'check');
   let clicks = 0;
-  const button = () => ({ name: () => 'Check for Updates…', role: () => 'AXButton', enabled: () => true,
+  const button = (name = 'Check for Updates…') => ({ name: () => name, role: () => 'AXButton', enabled: () => true,
     click: () => { clicks++; } });
-  const evaluate = (buttons) => runInNewContext(code + '\nrun();', {
+  const evaluate = (buttons, selectedCode = code) => runInNewContext(selectedCode + '\nrun();', {
     Application(name) {
       assert.equal(name, 'System Events');
       return { applicationProcesses: { whose(filter) {
@@ -104,6 +106,7 @@ test('UI automation is PID-scoped, refuses ambiguous buttons, and returns fixed 
   assert.equal(evaluate([button()]), 'clicked'); assert.equal(clicks, 1);
   assert.equal(evaluate([button(), button()]), 'ambiguous_target'); assert.equal(clicks, 1);
   assert.equal(evaluate([]), 'target_absent');
+  assert.equal(evaluate([button('Instalar y volver a abrir')], runner.sparkleTransitionUiScript(321, 'relaunch')), 'clicked');
   assert.doesNotMatch(code, /keystroke|keyCode|System Settings|security authorizationdb/u);
 });
 
@@ -142,6 +145,21 @@ test('production proof refuses a user feed override instead of silently testing 
     { error: new Error('failed'), status: null }]) {
     assert.throws(() => evaluate('production_feed', previous), /preexisting_feed_override/u);
   }
+});
+
+test('a running native 0.1.18 keeps the seeded opt-out tombstone unchanged', async () => {
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'sparkle-native-seed-'));
+  try {
+    const nativeRoot = join(root, 'native');
+    const before = await runner.seedNativeSparkleTransitionState(nativeRoot, join(root, 'codex'));
+    assert.equal(before.usageRows, 2); assert.equal(before.quotaRows, 2); assert.equal(before.tokensInUncached, 203);
+    const settingsFile = join(nativeRoot, 'private', 'automatic-contribution-v0.1.json');
+    const retired = await retireAutomaticContributionState({ settingsFile, now: () => new Date('2026-09-11T00:00:00.000Z') });
+    assert.equal(retired.status, 'already_retired'); assert.equal(retired.priorState, 'disabled');
+    assert.equal(retired.networkActivity, false);
+    assert.equal(retired.retiredAt, '2026-09-01T00:00:00.000Z');
+    assert.deepEqual(await readSignedReplacementState(nativeRoot), before);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test('workflow download planning matches the runner for both architectures and scopes', async () => {
