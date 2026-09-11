@@ -78,6 +78,24 @@ All failed receipts and superseded installers remain preserved. The local
 annotated v0.1.21 tag has not been pushed, and public publication remains held
 until the corrected installed journeys succeed.
 
+## Isolated Intel host comparison
+
+The comparison branch changes only the Intel workflow host to
+`macos-15-intel`, which remains an available x64 image in
+[GitHub's runner inventory](https://github.com/actions/runner-images#available-images).
+The Apple Silicon host remains `macos-26`. Signed native 0.1.18 and Electron
+0.1.21 artifacts, source binding, exact UI actions, deadlines, permission
+policy and preservation checks remain unchanged.
+
+Intel macOS 26 run 34563534703 is retained as a failure: the owned app was
+running, active and regular, and the accessibility client was trusted, but
+both menu and window requests returned `cannot_complete`. Core Graphics
+reported five owned windows; that does not establish a usable update UI.
+A successful macOS 15 comparison would qualify only that observed host and
+would not fix or erase the unresolved macOS 26 Intel result. The comparison
+has not yet run. The later Apple Silicon run 34563532865 passed its complete
+installed transition; this is separate from the Intel comparison.
+
 ## Remaining sequence
 
 1. Collect the finalized four-target artifact receipts from the completed
