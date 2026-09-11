@@ -96,20 +96,23 @@ observed dates with arrows/Home/End, and dismiss inspection with Escape.
 
 Newer-log and older-log TPS estimates remain separate series within each model:
 circles versus triangles. The visible legend describes “Median speed” and
-“Middle 50% of turns”; reconstruction details belong in the expandable
-measurement explanation and table. Hover rows retain matching circle/triangle
-symbols and separate median values when both methods occur on the same day.
-Accessible point descriptions retain method identity. The detail explains the
-shapes and their different endpoint evidence.
+“Middle 50% of turns.” Logging-format and timestamp-reconstruction details are
+internal implementation provenance: do not expose them in table headings, row
+labels, tooltips, accessible descriptions, or the user-facing explanation.
+Separate median values may still appear when both internal series occur on the
+same day; never pool those underlying populations merely to simplify the UI.
 Do not imply a logging-format transition is necessarily a model-speed change.
 Do not describe newer logs as inherently more accurate. Both TPS methods are
 estimates. Method distinctions apply only to TPS, not recorded TTFT.
 
-The hover/focus readout shows the date interval, model, method, median and band,
+The hover/focus readout shows the date interval, model, metric, median and band,
 eligible turns. Covered responses are shown in the selected-model coverage strip,
 not fabricated as per-bin counts. For example, use “23 measured turns,” not
 “n = 23.” TTFT gets its own eligible-turn count; the cursor must not imply paired
 observations when populations differ. Support keyboard focus and a table view.
+The table uses user-facing metric names, includes every returned aggregate bin,
+sorts newest first, and renders ten rows at a time with Previous/Next controls.
+Pagination must not cap or truncate the selected row set.
 
 ## Coverage is part of the measurement
 
@@ -120,9 +123,10 @@ current Sol all-history snapshot, a compact example is:
 >
 > First token: 1,724 of 2,078 turns
 
-The explanation says: “First-token latency is recorded once per turn. Output
-speed needs matched token counts and timing for individual responses. Some older
-logs do not contain that timing.” Keep the detailed technical method collapsed.
+The explanation defines output speed and first-token latency, identifies medians,
+variation and missing timing, and states that these are personal observations
+rather than benchmarks. Provider-log formats and reconstruction mechanisms do
+not belong in this user-facing explanation.
 
 Distinguish retained history, the chosen display interval, and the actual measured
 period when they differ. Show missing evidence as unavailable, not zero. Unknown

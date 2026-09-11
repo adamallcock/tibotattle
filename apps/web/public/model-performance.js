@@ -2,6 +2,7 @@
 const DAY = 86_400_000;
 const PERIODS = ["7", "30", "all"];
 const METHODS = ["receipt", "legacy"];
+const TABLE_PAGE_SIZE = 10;
 const MODEL_NAMES = Object.freeze({
   "gpt-5.6-luna": "Luna", "gpt-5.6-terra": "Terra", "gpt-5.6-sol": "Sol",
   "gpt-6-astra": "Astra", "gpt-5.5": "GPT-5.5", "gpt-5.4": "GPT-5.4",
@@ -130,6 +131,15 @@ export function performanceHoverBin(fraction, { start, end }, interval) {
   return Math.max(first, Math.min(last, Math.round((at - anchor) / step))) * step + anchor;
 }
 
+/** All returned bins, newest first. Pagination limits rendering, never selection. */
+export function performanceTableRows(model) {
+  const methodOrder = new Map([["receipt", 0], ["legacy", 1], ["ttft", 2]]);
+  return [...model.speed, { method: "ttft", points: model.ttft }]
+    .flatMap(series => series.points.map(point => ({ method: series.method, point })))
+    .sort((a, b) => b.point.at - a.point.at
+      || methodOrder.get(a.method) - methodOrder.get(b.method));
+}
+
 export function mountModelPerformance({ root, client, t, locale = () => "en-US", windowRef = globalThis.window }) {
   if (!root) return { render() {}, refresh() {} };
   const documentRef = root.ownerDocument;
@@ -142,7 +152,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
   // At most the three fixed periods, retained only for this mounted local view.
   // No measurements or identity-bearing data enter browser storage.
   const readyPeriods = new Map();
-  let tableOpen = false, aboutOpen = false, chartCursors = [];
+  let tableOpen = false, aboutOpen = false, tablePage = 0, tableSignature = "", chartCursors = [];
   let selectedInterval = null;
   const showInterval = (at) => { if (at === selectedInterval) return; selectedInterval = at; for (const update of chartCursors) update(at); };
   const translate = (key, values) => t(`performance.${key}`, values);
@@ -199,7 +209,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     readout.setAttribute("aria-live", "polite");
     const tooltip = element("div", "performance-tooltip"); tooltip.hidden = true;
     tooltip.setAttribute("aria-hidden", "true");
-    const formatPoint = (point, method) => translate("point", { date: fullDateFormat.format(point.at), method: method === "ttft" ? translate("latencyUnit") : `${translate(method)} · ${translate("speedUnit")}`, median: number(point.median), spread: point.p25 === null ? "—" : `${number(point.p25)}–${number(point.p75)}`, count: number(point.n) });
+    const formatPoint = (point, method) => translate("point", { date: fullDateFormat.format(point.at), method: method === "ttft" ? translate("latency") : translate("speed"), median: number(point.median), spread: point.p25 === null ? "—" : `${number(point.p25)}–${number(point.p75)}`, count: number(point.n) });
     const cursor = svgElement("line", { x1: 0, x2: 0, y1: 24, y2: 214, class: "performance-cursor", visibility: "hidden" });
     const markers = [];
     for (const item of series) {
@@ -297,7 +307,7 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     for (const value of PERIODS) {
       const button = element("button", value === period ? "active" : "", translate(value === "all" ? "all" : `days${value}`));
       button.type = "button"; button.setAttribute("aria-pressed", String(period === value)); button.dataset.performanceFocus = `period-${value}`;
-      button.addEventListener("click", () => { if (period === value) return; period = value; payload = readyPeriods.get(value) ?? null; remember(); render(); refresh(); }); periods.append(button);
+      button.addEventListener("click", () => { if (period === value) return; period = value; payload = readyPeriods.get(value) ?? null; tablePage = 0; tableSignature = ""; remember(); render(); refresh(); }); periods.append(button);
     }
     heading.append(title, periods); root.append(heading);
     const status = element("p", "performance-status"); status.setAttribute("role", "status");
@@ -320,12 +330,12 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
       button.style.setProperty("--model-color", COLORS[model.id] ?? "var(--green)");
       button.setAttribute("role", "tab"); button.setAttribute("aria-selected", String(model.id === modelId)); button.setAttribute("aria-controls", "performance-model-panel"); button.tabIndex = model.id === modelId ? 0 : -1;
       button.id = `performance-tab-${model.id}`; button.dataset.performanceFocus = `model-${model.id}`;
-      button.addEventListener("click", () => { modelId = model.id; remember(); render(); });
+      button.addEventListener("click", () => { modelId = model.id; tablePage = 0; tableSignature = ""; remember(); render(); });
       button.addEventListener("keydown", (event) => {
         if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
         event.preventDefault(); const index = models.indexOf(model);
         modelId = models[event.key === "Home" ? 0 : event.key === "End" ? models.length - 1 : (index + (event.key === "ArrowRight" ? 1 : models.length - 1)) % models.length].id;
-        remember(); render(); documentRef.getElementById(`performance-tab-${modelId}`)?.focus();
+        tablePage = 0; tableSignature = ""; remember(); render(); documentRef.getElementById(`performance-tab-${modelId}`)?.focus();
       }); tabs.append(button);
     }
     root.append(tabs);
@@ -356,15 +366,37 @@ export function mountModelPerformance({ root, client, t, locale = () => "en-US",
     const tableSummary = element("summary", "", translate("table")); tableSummary.dataset.performanceFocus = "table";
     const details = element("details", "performance-details"); details.open = tableOpen; details.append(tableSummary);
     const tableWrap = element("div", "performance-table-wrap"), table = element("table", "performance-table"), head = element("thead"), header = element("tr");
+    table.id = "performance-measurement-table";
     table.append(element("caption", "sr-only", `${selected.label} · ${translate("table")}`));
     for (const key of ["date", "metric", "median", "spread", "turns"]) { const cell = element("th", "", translate(key)); cell.scope = "col"; header.append(cell); }
     head.append(header); table.append(head); const body = element("tbody");
-    for (const series of [...selected.speed, { method: "ttft", points: selected.ttft }]) for (const point of series.points) {
+    const rows = performanceTableRows(selected);
+    const signature = `${modelId}:${period}:${rows.map(({ method, point }) => `${method}:${point.at}:${point.n}`).join(",")}`;
+    if (signature !== tableSignature) { tableSignature = signature; tablePage = 0; }
+    const pageCount = Math.max(1, Math.ceil(rows.length / TABLE_PAGE_SIZE));
+    tablePage = Math.min(Math.max(0, tablePage), pageCount - 1);
+    const start = tablePage * TABLE_PAGE_SIZE;
+    const visibleRows = rows.slice(start, start + TABLE_PAGE_SIZE);
+    for (const { method, point } of visibleRows) {
       const row = element("tr");
-      for (const text of [fullDateFormat.format(point.at), series.method === "ttft" ? translate("latencyUnit") : `${translate(series.method)} · ${translate("speedUnit")}`, number(point.median), point.p25 === null ? "—" : `${number(point.p25)}–${number(point.p75)}`, number(point.n)]) row.append(element("td", "", text));
+      for (const text of [fullDateFormat.format(point.at), method === "ttft" ? `${translate("latency")} · ${translate("latencyUnit")}` : `${translate("speed")} · ${translate("speedUnit")}`, number(point.median), point.p25 === null ? "—" : `${number(point.p25)}–${number(point.p75)}`, number(point.n)]) row.append(element("td", "", text));
       body.append(row);
     }
-    table.append(body); tableWrap.append(table); details.append(tableWrap); details.addEventListener("toggle", () => { tableOpen = details.open; }); panel.append(details); root.append(panel);
+    table.append(body); tableWrap.append(table); details.append(tableWrap);
+    if (pageCount > 1) {
+      const pagination = element("nav", "table-pagination");
+      pagination.setAttribute("aria-label", translate("table"));
+      const previous = element("button", "button button-quiet compact", t("table.pagination.previous"));
+      previous.type = "button"; previous.disabled = tablePage === 0; previous.setAttribute("aria-controls", table.id); previous.dataset.performanceFocus = "table-prev";
+      previous.addEventListener("click", () => { if (tablePage > 0) { tablePage--; render(); } });
+      const status = element("span", "table-pagination-status", t("table.pagination.page", { start: number(start + 1), end: number(start + visibleRows.length), total: number(rows.length) }));
+      status.setAttribute("role", "status");
+      const next = element("button", "button button-quiet compact", t("table.pagination.next"));
+      next.type = "button"; next.disabled = tablePage >= pageCount - 1; next.setAttribute("aria-controls", table.id); next.dataset.performanceFocus = "table-next";
+      next.addEventListener("click", () => { if (tablePage < pageCount - 1) { tablePage++; render(); } });
+      pagination.append(previous, status, next); details.append(pagination);
+    }
+    details.addEventListener("toggle", () => { tableOpen = details.open; }); panel.append(details); root.append(panel);
     restoreFocus();
   }
   async function refresh() {

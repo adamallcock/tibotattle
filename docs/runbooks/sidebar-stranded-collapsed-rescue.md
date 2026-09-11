@@ -1,3 +1,10 @@
+---
+title: Rescue a stranded collapsed dashboard sidebar
+date: 2026-08-22
+type: runbook
+status: operational
+---
+
 # Rescue: the dashboard sidebar is collapsed and will not come back
 
 Applies to TiboTattle **0.1.16 and earlier**. Builds after that carry the fix
