@@ -388,6 +388,9 @@ if (INPUTS.targetSpec.platform === "darwin") {
     to: nativeMacOSKeychainAdapterResourcesPath,
   }];
   configuration.mac = {
+    // Match the supported platform floor in the signed bundle metadata, so
+    // macOS and package managers can reject unsupported systems accurately.
+    minimumSystemVersion: "14.0",
     // electron-updater uses the prerelease package version. The guided native
     // handover reads the numeric plist fields, so tie both values to this one
     // reviewed selection rather than letting electron-builder derive one from

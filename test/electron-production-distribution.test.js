@@ -406,6 +406,7 @@ test("production builder source config binds app identity, target-specific build
     if (target.startsWith("darwin-")) {
       assert.equal(config.mac.bundleShortVersion, RELEASE_VERSION, target);
       assert.equal(config.mac.bundleVersion, config.buildVersion, target);
+      assert.equal(config.mac.minimumSystemVersion, "14.0", target);
       assert.equal(config.mac.sign, "./scripts/electron-macos-sign-order.mjs", target);
       assert.deepEqual(config.mac.target, [
         { target: "dmg", arch: [spec.architecture] },
@@ -437,6 +438,16 @@ test("production builder source config binds app identity, target-specific build
       assert.equal(Object.hasOwn(config.extraMetadata, "shortVersion"), false);
     }
   }
+});
+
+test("pinned macOS packager writes the configured supported system floor into Info.plist", () => {
+  const macPackagerSource = readFileSync(
+    ELECTRON_BUILDER_REQUIRE.resolve("app-builder-lib/out/macPackager"), "utf8",
+  );
+  assert.match(macPackagerSource,
+    /const minimumSystemVersion = this\.platformSpecificBuildOptions\.minimumSystemVersion/u);
+  assert.match(macPackagerSource,
+    /appPlist\.LSMinimumSystemVersion = minimumSystemVersion/u);
 });
 
 test("production macOS builder resolves the isolated signing-order hook before signing", async () => {
