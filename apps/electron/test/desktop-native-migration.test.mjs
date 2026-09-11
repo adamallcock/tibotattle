@@ -441,3 +441,26 @@ test("retained candidate rejects invented predecessor identity evidence and path
     { ...valid, native: { ...valid.native, source: "unknown" } },
   ]) assert.throws(() => validateNativeElectronHandoverCandidate(invalid));
 });
+
+test("native bridge refusal retains only a closed support code and does not copy state", async () => {
+  for (const [code, expected] of [
+    ["native_electron_mac_bridge_prepare_identity", "TRANSFER_IDENTITY"],
+    ["native_electron_mac_bridge_prepare_login_item_not_found", "TRANSFER_LOGIN_ITEM_NOT_FOUND"],
+    ["private_path_or_unrecognized_error", undefined],
+  ]) {
+    const state = await fixture();
+    try {
+      await assert.rejects(runNativeElectronHandover(migrationOptions(state, [], {
+        control: { ...control([]), async prepareNativeHandover() {
+          throw Object.assign(new Error("untrusted underlying text"), { code });
+        } },
+      })), (error) => {
+        assert.equal(error.code, "native_electron_handover_native_bridge_unavailable");
+        assert.equal(error.supportCode, expected);
+        assert.doesNotMatch(error.message, /untrusted/);
+        return true;
+      });
+      assert.equal((await readdir(state.backupRoot)).length, 0);
+    } finally { await state.dispose(); }
+  }
+});

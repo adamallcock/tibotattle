@@ -1086,7 +1086,12 @@ export async function launchDesktopRuntime({
           : "TiboTattle could not finish transferring your existing data.",
         detail: credentialPreflightBlocked
           ? "Your existing app data has not been changed. Quit and try again."
-          : "Your history and settings have been preserved. Quit and reopen TiboTattle to try again. If this continues, contact support.",
+          : "Your history and settings have been preserved. Quit and reopen TiboTattle to try again. If this continues, contact support."
+            + (["TRANSFER_IDENTITY", "TRANSFER_NATIVE_APPLICATION", "TRANSFER_LOGIN_ITEM_UNREGISTER",
+              "TRANSFER_LOGIN_ITEM_STATUS", "TRANSFER_LOGIN_ITEM_REQUIRES_APPROVAL", "TRANSFER_LOGIN_ITEM_NOT_FOUND",
+              "TRANSFER_LOGIN_ITEM_STATUS_UNKNOWN", "TRANSFER_NATIVE_WRITER", "TRANSFER_OTHER_SAME_IDENTITY_RUNNING",
+              "TRANSFER_PREFERENCES", "TRANSFER_INVALID_REQUEST", "TRANSFER_UNKNOWN"].includes(handover?.supportCode)
+              ? ` Support code: ${handover.supportCode}.` : ""),
         buttons: ["Quit"], defaultId: 0, cancelId: 0, noLink: true,
       });
       deepLinkIntakeCleanup();

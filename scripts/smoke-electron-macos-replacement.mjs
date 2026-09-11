@@ -208,6 +208,8 @@ export async function runSignedReplacement(options) {
           const matches = Application('System Events').applicationProcesses.whose({ unixId: ${pid} })();
           if (matches.length !== 1) return 'process_absent';
           const content = matches[0].windows().map(w => w.entireContents().map(e => { try { return String(e.value()); } catch { return ''; } }).join(' ')).join(' ');
+          const support = ['IDENTITY', 'NATIVE_APPLICATION', 'LOGIN_ITEM_UNREGISTER', 'LOGIN_ITEM_STATUS', 'LOGIN_ITEM_REQUIRES_APPROVAL', 'LOGIN_ITEM_NOT_FOUND', 'LOGIN_ITEM_STATUS_UNKNOWN', 'NATIVE_WRITER', 'OTHER_SAME_IDENTITY_RUNNING', 'PREFERENCES', 'INVALID_REQUEST', 'UNKNOWN'].find(v => content.includes('Support code: TRANSFER_' + v + '.'));
+          if (support) return 'TRANSFER_' + support;
           if (content.includes('could not finish transferring')) return 'migration_blocked';
           if (content.includes('secure startup checks')) return 'credential_preflight_blocked';
           if (content.includes('Keychain') || content.includes('keychain')) return 'keychain_dialog';
@@ -216,7 +218,7 @@ export async function runSignedReplacement(options) {
         try {
           const result = execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', script],
             { encoding: 'utf8', timeout: 10000, maxBuffer: 4096, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-          proof.dialogClassification = ['process_absent', 'migration_blocked', 'credential_preflight_blocked', 'keychain_dialog', 'unclassified'].includes(result) ? result : 'unavailable';
+          proof.dialogClassification = ['process_absent', 'migration_blocked', 'credential_preflight_blocked', 'keychain_dialog', 'unclassified', ...['IDENTITY', 'NATIVE_APPLICATION', 'LOGIN_ITEM_UNREGISTER', 'LOGIN_ITEM_STATUS', 'LOGIN_ITEM_REQUIRES_APPROVAL', 'LOGIN_ITEM_NOT_FOUND', 'LOGIN_ITEM_STATUS_UNKNOWN', 'NATIVE_WRITER', 'OTHER_SAME_IDENTITY_RUNNING', 'PREFERENCES', 'INVALID_REQUEST', 'UNKNOWN'].map(v => 'TRANSFER_' + v)].includes(result) ? result : 'unavailable';
         } catch { proof.dialogClassification = 'unavailable'; }
       } });
       const sharing = await waitFor(async () => { const value = await active.readSharing(); return value?.available && value?.current ? value : null; }, 30000, 'retained opt out');

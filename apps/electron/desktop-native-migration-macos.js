@@ -12,6 +12,7 @@ import {
   NATIVE_ELECTRON_RETAINED_STATE_ROUTE,
   SUPPORTED_NATIVE_HANDOVER_VERSIONS,
   inspectNativeElectronHandoverCompletion,
+  isNativeElectronHandoverError,
   runNativeElectronHandover,
   validateNativeElectronHandoverCandidate,
 } from "./desktop-native-migration.js";
@@ -848,7 +849,9 @@ export async function runProductionNativeMacHandover({
       control: createMacNativeHandoverAdapter({ helperPath: bridge.path, electronApp }),
     });
     return result;
-  } catch {
-    return Object.freeze({ status: "migration_blocked" });
+  } catch (error) {
+    return Object.freeze({ status: "migration_blocked",
+      ...(isNativeElectronHandoverError(error) && typeof error.supportCode === "string"
+        ? { supportCode: error.supportCode } : {}) });
   }
 }

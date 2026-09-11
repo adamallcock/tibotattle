@@ -1084,7 +1084,16 @@ export async function runNativeElectronHandover(options = {}) {
       }));
     } catch (error) {
       if (isNativeElectronHandoverError(error)) throw error;
-      fail("native_bridge_unavailable");
+      const failure = new NativeElectronHandoverError("native_bridge_unavailable");
+      // Preserve only the helper's fixed, content-free refusal vocabulary.
+      const stage = typeof error?.code === "string" && error.code.startsWith("native_electron_mac_bridge_prepare_")
+        ? error.code.replace(/^native_electron_mac_bridge_prepare_/, "") : null;
+      if (["identity", "native_application", "login_item_unregister", "login_item_status",
+        "login_item_requires_approval", "login_item_not_found", "login_item_status_unknown",
+        "native_writer", "other_same_identity_running", "preferences", "invalid_request", "unknown"].includes(stage)) {
+        failure.supportCode = `TRANSFER_${stage.toUpperCase()}`;
+      }
+      throw failure;
     }
     if (journal.phase === "started") {
       journal = {
