@@ -235,7 +235,8 @@ test('workflow download planning matches the runner for both architectures and s
   const workflow = await readFile(new URL('../.github/workflows/electron-macos-sparkle-transition.yml', import.meta.url), 'utf8');
   const inputBlock = workflow.split('    inputs:\n')[1].split('\npermissions:')[0];
   assert.equal([...inputBlock.matchAll(/^      [a-z0-9_]+:$/gmu)].length, 10);
-  assert.match(workflow, /runs-on: macos-26-intel/u);
+  assert.match(workflow, /runs-on: macos-15-intel/u);
+  assert.doesNotMatch(workflow, /runs-on: macos-26-intel/u);
   assert.match(workflow, /runs-on: macos-26\n/u);
   assert.match(workflow, /architecture: x64/u);
   assert.match(workflow, /architecture: arm64/u);
