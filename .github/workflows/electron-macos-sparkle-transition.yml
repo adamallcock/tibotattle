@@ -121,12 +121,12 @@ jobs:
             '2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae')
           origin='https://updates.tibotattle.com'
           if scope=='isolated_test_feed':
-            base=f"{origin}/electron/test/native-sparkle/{source}/1028/{e['SELECTED_DMG']}"
+            base=f"{origin}/electron/test/native-sparkle/{source}/1029/{e['SELECTED_DMG']}"
             feed=base+'/appcast.xml'
           else:
-            base=f"{origin}/{prefix}releases/1028/{e['SELECTED_DMG']}"
+            base=f"{origin}/{prefix}releases/1029/{e['SELECTED_DMG']}"
             feed=f'{origin}/{prefix}appcast.xml'
-          candidate_name='TiboTattle-0.1.21-macOS-x64.dmg' if intel else 'TiboTattle-0.1.21-mac-arm64.dmg'
+          candidate_name='TiboTattle-0.1.22-macOS-x64.dmg' if intel else 'TiboTattle-0.1.22-mac-arm64.dmg'
           files=[
             ('native.dmg',f'{origin}/{prefix}releases/1026/{native}/TiboTattle-0.1.18-macOS-{architecture}.dmg',native,1024**3),
             ('candidate.dmg',base+'/'+candidate_name,e['SELECTED_DMG'],1024**3),
@@ -152,7 +152,7 @@ jobs:
             finally:
               subprocess.run(['/usr/bin/hdiutil','detach',str(mount)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=90)
           intake={'schemaVersion':'tibotattle-native-sparkle-test-intake-v1','sourceRevision':source,
-            'target':target,'feedScope':scope,'version':'0.1.21','buildNumber':e['SELECTED_BUILD'],'bundleVersion':'1028',
+            'target':target,'feedScope':scope,'version':'0.1.22','buildNumber':e['SELECTED_BUILD'],'bundleVersion':'1029',
             'dmgSha256':e['SELECTED_DMG'],'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],
             'nativeDmgSha256':native,'directory':str(root)}
           (root/'intake.json').write_text(json.dumps(intake)+'\n')
@@ -184,7 +184,7 @@ jobs:
           retention-days: 14
   upgrade_x64:
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-x64'
-    runs-on: macos-26-intel
+    runs-on: macos-15-intel
     timeout-minutes: 25
     env:
       SELECTED_MODE: ${{ inputs.mode }}
@@ -242,12 +242,12 @@ jobs:
             '2ea8eca02df7cc5210b6b6ce3d6e44016bffd9d081544a4efc6fa1afeeb0f1ae')
           origin='https://updates.tibotattle.com'
           if scope=='isolated_test_feed':
-            base=f"{origin}/electron/test/native-sparkle/{source}/1028/{e['SELECTED_DMG']}"
+            base=f"{origin}/electron/test/native-sparkle/{source}/1029/{e['SELECTED_DMG']}"
             feed=base+'/appcast.xml'
           else:
-            base=f"{origin}/{prefix}releases/1028/{e['SELECTED_DMG']}"
+            base=f"{origin}/{prefix}releases/1029/{e['SELECTED_DMG']}"
             feed=f'{origin}/{prefix}appcast.xml'
-          candidate_name='TiboTattle-0.1.21-macOS-x64.dmg' if intel else 'TiboTattle-0.1.21-mac-arm64.dmg'
+          candidate_name='TiboTattle-0.1.22-macOS-x64.dmg' if intel else 'TiboTattle-0.1.22-mac-arm64.dmg'
           files=[
             ('native.dmg',f'{origin}/{prefix}releases/1026/{native}/TiboTattle-0.1.18-macOS-{architecture}.dmg',native,1024**3),
             ('candidate.dmg',base+'/'+candidate_name,e['SELECTED_DMG'],1024**3),
@@ -273,7 +273,7 @@ jobs:
             finally:
               subprocess.run(['/usr/bin/hdiutil','detach',str(mount)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,check=True,timeout=90)
           intake={'schemaVersion':'tibotattle-native-sparkle-test-intake-v1','sourceRevision':source,
-            'target':target,'feedScope':scope,'version':'0.1.21','buildNumber':e['SELECTED_BUILD'],'bundleVersion':'1028',
+            'target':target,'feedScope':scope,'version':'0.1.22','buildNumber':e['SELECTED_BUILD'],'bundleVersion':'1029',
             'dmgSha256':e['SELECTED_DMG'],'asarSha256':e['SELECTED_ASAR'],'feedSha256':e['SELECTED_FEED'],
             'nativeDmgSha256':native,'directory':str(root)}
           (root/'intake.json').write_text(json.dumps(intake)+'\n')

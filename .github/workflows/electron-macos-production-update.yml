@@ -21,7 +21,7 @@ on:
         type: string
         required: true
       identity_json:
-        description: Exact 021 source/build/DMG/ASAR/ZIP/feed and 020 ASAR identity JSON; directory is supplied by the workflow
+        description: Exact 022 source/build/DMG/ASAR/ZIP/feed and 020 ASAR identity JSON; directory is supplied by the workflow
         type: string
         required: true
       confirmation:
@@ -108,7 +108,7 @@ jobs:
           retention-days: 30
   acceptance_x64:
     if: github.event_name == 'workflow_dispatch' && inputs.target == 'darwin-x64'
-    runs-on: macos-26-intel
+    runs-on: macos-15-intel
     timeout-minutes: 25
     env:
       SELECTED_MODE: ${{ inputs.mode }}
