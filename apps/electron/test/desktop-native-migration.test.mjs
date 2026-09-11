@@ -365,3 +365,181 @@ test("future native tray preferences block migration without replacing their sou
   await assert.rejects(runNativeElectronHandover(migrationOptions(state, [])), { code: "native_electron_handover_native_settings_invalid" });
   assert.deepEqual(JSON.parse(await readFile(source, "utf8")), future);
 });
+
+function retainedStateCandidate() {
+  const signed = candidate();
+  return {
+    route: "automatic_retained_state",
+    native: { appId: signed.native.appId, source: "retained_state" },
+    electron: signed.electron,
+    signatureEvidence: {
+      electronCodeHash: signed.signatureEvidence.electronCodeHash,
+      helperCodeHash: signed.signatureEvidence.helperCodeHash,
+    },
+  };
+}
+
+test("replacement migration validates the preserved copy, keeps credentials and resumes without an old app", async (t) => {
+  const state = await fixture();
+  t.after(() => state.dispose());
+  await rm(state.nativeAppPath, { recursive: true });
+  const calls = [];
+  const inspected = [];
+  const options = migrationOptions(state, calls, {
+    nativeAppPath: null,
+    candidate: retainedStateCandidate(),
+    async validateRetainedState(root) {
+      inspected.push(root);
+      assert.notEqual(root, state.nativeStateRoot);
+      assert.ok(root.startsWith(state.backupRoot));
+      assert.equal(await readFile(join(root, "local-unified-index-device-salt-v1")).then((bytes) => bytes.length), 32);
+      return true;
+    },
+    afterCheckpoint(phase) { if (phase === "staged") throw new Error("synthetic interruption"); },
+  });
+  await assert.rejects(runNativeElectronHandover(options));
+  const result = await runNativeElectronHandover({ ...options, afterCheckpoint: undefined });
+  assert.equal(result.status, "migrated");
+  assert.equal(inspected.length, 1);
+  assert.equal(await readFile(join(result.stateRoot, "private", "automatic-contribution-v0.1.json"), "utf8"), '{"enabled":false}\n');
+  assert.equal(await readFile(join(state.nativeStateRoot, "local-unified-index-v1.sqlite"), "utf8"), "sqlite-fixture");
+  assert.equal((await runNativeElectronHandover(options)).status, "already_migrated");
+});
+
+test("retained migration fails before publication on unknown schema or a mutating compatibility probe", async (t) => {
+  for (const behavior of ["unknown", "mutating", "missing"]) {
+    await t.test(behavior, async () => {
+      const state = await fixture();
+      try {
+        const options = migrationOptions(state, [], {
+          nativeAppPath: null,
+          candidate: retainedStateCandidate(),
+          validateRetainedState: behavior === "missing" ? undefined : async (root) => {
+            if (behavior === "unknown") return false;
+            await privateFile(join(root, "mutation"), "unexpected");
+            return true;
+          },
+        });
+        await assert.rejects(runNativeElectronHandover(options), (error) => error.code === (
+          behavior === "missing" ? "native_electron_handover_invalid_configuration"
+            : behavior === "unknown" ? "native_electron_handover_native_state_incompatible"
+              : "native_electron_handover_copy_verification_failed"
+        ));
+        await assert.rejects(lstat(join(state.userDataRoot, "companion-state")), { code: "ENOENT" });
+        assert.equal(await readFile(join(state.nativeStateRoot, "local-unified-index-v1.sqlite"), "utf8"), "sqlite-fixture");
+      } finally { await state.dispose(); }
+    });
+  }
+});
+
+test("retained candidate rejects invented predecessor identity evidence and paths", async () => {
+  const valid = retainedStateCandidate();
+  assert.deepEqual(validateNativeElectronHandoverCandidate(valid), valid);
+  for (const invalid of [
+    { ...valid, native: { ...valid.native, version: "0.1.18" } },
+    { ...valid, signatureEvidence: { ...valid.signatureEvidence, nativeCodeHash: "a".repeat(40) } },
+    { ...valid, native: { ...valid.native, source: "unknown" } },
+  ]) assert.throws(() => validateNativeElectronHandoverCandidate(invalid));
+});
+
+test("native bridge refusal retains only a closed support code and does not copy state", async () => {
+  for (const [code, expected] of [
+    ["native_electron_mac_bridge_prepare_identity", "TRANSFER_IDENTITY"],
+    ["native_electron_mac_bridge_prepare_login_item_not_found", "TRANSFER_LOGIN_ITEM_NOT_FOUND"],
+    ["private_path_or_unrecognized_error", undefined],
+  ]) {
+    const state = await fixture();
+    try {
+      await assert.rejects(runNativeElectronHandover(migrationOptions(state, [], {
+        control: { ...control([]), async prepareNativeHandover() {
+          throw Object.assign(new Error("untrusted underlying text"), { code });
+        } },
+      })), (error) => {
+        assert.equal(error.code, "native_electron_handover_native_bridge_unavailable");
+        assert.equal(error.supportCode, expected);
+        assert.doesNotMatch(error.message, /untrusted/);
+        return true;
+      });
+      assert.equal((await readdir(state.backupRoot)).length, 0);
+    } finally { await state.dispose(); }
+  }
+});
+
+test("startup preference survives interruption after OS disable before prepared journal phase", async () => {
+  const state = await fixture();
+  let startupEnabled = true;
+  let interrupted = false;
+  const boundary = {
+    async prepareNativeHandover({ checkpointPreferences }) {
+      const reply = bridgeResult({ startAtLogin: startupEnabled });
+      await checkpointPreferences({ ...reply.preferences, credentialState: reply.credentialState });
+      startupEnabled = false;
+      if (!interrupted) { interrupted = true; throw new Error("interrupted after actual disable"); }
+      return reply;
+    },
+    async claimElectronLoginItem({ startAtLogin }) { startupEnabled = startAtLogin; return "owned"; },
+  };
+  try {
+    const options = migrationOptions(state, [], { control: boundary });
+    await assert.rejects(runNativeElectronHandover(options));
+    assert.equal(startupEnabled, false);
+    const journal = JSON.parse(await readFile(join(state.userDataRoot, ".native-electron-handover-v1", NATIVE_ELECTRON_HANDOVER_JOURNAL_FILE)));
+    assert.equal(journal.phase, "started");
+    assert.equal(journal.preferences.startAtLogin, true);
+    assert.equal((await runNativeElectronHandover(options)).status, "migrated");
+    const settings = JSON.parse(await readFile(join(state.userDataRoot, "desktop-settings", "desktop-settings-v1.json")));
+    assert.equal(settings.startAtLogin, true);
+    assert.equal(startupEnabled, true);
+  } finally { await state.dispose(); }
+});
+
+test("unknown startup registration stays untouched across interrupted import and restart", async () => {
+  const state = await fixture();
+  let first = true;
+  const preservedFlags = [];
+  const phases = [];
+  const boundary = {
+    async prepareNativeHandover({ checkpointPreferences, preserveStartupRegistration }) {
+      preservedFlags.push(preserveStartupRegistration);
+      const reply = { ...bridgeResult({ startAtLogin: null }), loginItemDisabled: false, startupRegistration: "preserved" };
+      await checkpointPreferences({ ...reply.preferences, credentialState: reply.credentialState });
+      if (first) { first = false; throw new Error("interruption after checkpoint"); }
+      return reply;
+    },
+    async claimElectronLoginItem({ startAtLogin }) {
+      assert.equal(startAtLogin, null);
+      return "preserved";
+    },
+  };
+  try {
+    const options = migrationOptions(state, [], { control: boundary, afterCheckpoint: (phase) => phases.push(phase) });
+    const original = await readFile(join(state.nativeStateRoot, "local-unified-index-v1.sqlite"));
+    await assert.rejects(runNativeElectronHandover(options));
+    assert.equal((await runNativeElectronHandover(options)).status, "migrated");
+    assert.deepEqual(preservedFlags, [false, true]);
+    assert.ok(phases.includes("electron_login_preserved"));
+    assert.ok(!phases.includes("electron_login_owned"));
+    const journal = JSON.parse(await readFile(join(state.userDataRoot, ".native-electron-handover-v1", NATIVE_ELECTRON_HANDOVER_JOURNAL_FILE)));
+    assert.equal(journal.preferences.startAtLogin, null);
+    assert.equal(journal.phase, "completed");
+    assert.deepEqual(await readFile(join(state.userDataRoot, "companion-state", "local-unified-index-v1.sqlite")), original);
+    assert.deepEqual(await readFile(join(state.nativeStateRoot, "local-unified-index-v1.sqlite")), original);
+    assert.equal((await runNativeElectronHandover(options)).status, "already_migrated");
+    assert.equal(preservedFlags.length, 2);
+  } finally { await state.dispose(); }
+});
+
+test("unknown startup choice cannot be passed off as disabled or owned", async () => {
+  for (const extra of [
+    { loginItemDisabled: true },
+    { loginItemDisabled: false },
+    { loginItemDisabled: false, startupRegistration: "preserved", preferences: bridgeResult().preferences },
+  ]) {
+    const state = await fixture();
+    try {
+      const boundary = { ...control([]), async prepareNativeHandover() { return { ...bridgeResult({ startAtLogin: null }), ...extra }; } };
+      await assert.rejects(runNativeElectronHandover(migrationOptions(state, [], { control: boundary })), { code: "native_electron_handover_native_bridge_invalid" });
+      assert.equal((await readdir(state.backupRoot)).length, 0);
+    } finally { await state.dispose(); }
+  }
+});

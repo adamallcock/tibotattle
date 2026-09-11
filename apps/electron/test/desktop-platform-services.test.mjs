@@ -275,6 +275,44 @@ test("login-item state is reread and requires exact confirmation", () => {
   assert.equal(services.setStartAtLogin(false).status, "disabled");
 });
 
+test("macOS missing or contradictory login evidence never becomes a disabled preference", () => {
+  let current;
+  const calls = [];
+  const services = createDesktopPlatformServices({
+    app: {
+      isPackaged: true,
+      getVersion: () => "0.1.20",
+      getLoginItemSettings: () => current,
+      setLoginItemSettings: (value) => calls.push(value),
+    },
+    platform: "darwin",
+    homeDirectory: "/Users/test",
+    dialog: { showOpenDialog: async () => ({ canceled: true, filePaths: [] }) },
+    shell: { openExternal: async () => {} },
+    Notification: { isSupported: () => false },
+  });
+  for (const [evidence, expected] of [
+    [{ status: "not-found", openAtLogin: false }, "unavailable"],
+    [{ status: "not-found", openAtLogin: true }, "unavailable"],
+    [{ status: "not-registered", openAtLogin: true }, "error"],
+    [{ status: "enabled", openAtLogin: false }, "error"],
+    [{ status: "unrecognized", openAtLogin: false }, "error"],
+    [{ openAtLogin: false }, "error"],
+    [{ status: "requires-approval", openAtLogin: false }, "needs-approval"],
+  ]) {
+    current = evidence;
+    const observed = services.loginItemStatus();
+    assert.equal(observed.status, expected);
+    assert.equal(observed.canSet, true, "an explicit user action remains available");
+    assert.doesNotMatch(observed.detail, /will not start/u);
+  }
+  assert.deepEqual(calls, [], "status reads must leave OS registration untouched");
+  current = { status: "not-found", openAtLogin: false };
+  assert.equal(services.setStartAtLogin(false).status, "error",
+    "an unconfirmed explicit change must not manufacture disabled evidence");
+  assert.deepEqual(calls, [{ openAtLogin: false }]);
+});
+
 test("Linux reports unavailable OS-specific settings without pretending support", async () => {
   const services = createDesktopPlatformServices({
     app: { isPackaged: true, getVersion: () => "0.1.16" },

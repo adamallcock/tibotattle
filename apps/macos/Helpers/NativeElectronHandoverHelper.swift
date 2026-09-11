@@ -1,6 +1,6 @@
 import AppKit
 import Foundation
-import ServiceManagement
+import Security
 import Darwin
 
 /// A deliberately narrow bridge carried by a future signed Electron candidate.
@@ -8,7 +8,9 @@ import Darwin
 /// The released native 0.1.17 and 0.1.18 applications do not contain this
 /// executable. It is therefore not a general command channel or a direct
 /// Sparkle replacement: the Electron coordinator invokes it only during a
-/// reviewed guided signed-install handover, before it opens the copied state.
+/// signed-install handover, before it opens the copied state. Ordinary replacement
+/// uses retained state and the current signed app; it never invents evidence
+/// about a predecessor bundle that is no longer present.
 @main
 enum NativeElectronHandoverHelper {
     private static let schemaVersion =
@@ -25,11 +27,6 @@ enum NativeElectronHandoverHelper {
         case identity
         case nativeApplication
         case nativeVersion
-        case loginItemUnregister
-        case loginItemStatus
-        case loginItemRequiresApproval
-        case loginItemNotFound
-        case loginItemStatusUnknown
         case nativeWriter
         case otherSameIdentityRunning
         case preferences
@@ -67,13 +64,20 @@ enum NativeElectronHandoverHelper {
         switch arguments[1] {
         case "--contract-smoke-test":
             guard arguments.count == 2 else { throw BridgeFailure.invalidRequest }
-            // This route deliberately performs no ServiceManagement,
-            // NSWorkspace, UserDefaults, or Keychain operation. It lets source
+            // This route deliberately performs no NSWorkspace, UserDefaults,
+            // startup-service, or Keychain operation. It lets source
             // qualification compile and exercise the closed JSON contract.
             return [
                 "schemaVersion": schemaVersion,
                 "status": "contract_ok",
             ]
+        case "--writer-preparation-contract-smoke-test":
+            guard arguments.count == 2 else { throw BridgeFailure.invalidRequest }
+            // Exercise the actual reply builder with fixed synthetic values;
+            // no preference, process, credential or service API is called.
+            return nativeWriterPreparedResponse(preferences: [
+                "language": "en", "appearance": "dark", "refreshIntervalSeconds": 900,
+            ])
         case "--bundle-context-smoke-test":
             guard arguments.count == 2,
                   Bundle.main.bundleIdentifier == productIdentifier,
@@ -81,7 +85,7 @@ enum NativeElectronHandoverHelper {
                 throw BridgeFailure.identity
             }
             // Read-only validation of the installed executable location. It
-            // never reads preferences or invokes ServiceManagement/Keychain.
+            // never reads preferences or accesses startup services/Keychain.
             return [
                 "schemaVersion": schemaVersion,
                 "status": "bundle_context_ok",
@@ -89,6 +93,9 @@ enum NativeElectronHandoverHelper {
         case "--process-classifier-smoke-test":
             guard arguments.count == 2 else { throw BridgeFailure.invalidRequest }
             return try processClassifierSmokeTest()
+        case "--prepare-retained-state", "--prepare-retained-state-preflight":
+            guard arguments.count == 2 else { throw BridgeFailure.invalidRequest }
+            return try prepareRetainedState(preflight: arguments[1] == "--prepare-retained-state-preflight")
         case "--prepare":
             guard arguments.count == 4, arguments[2] == "--native-app" else {
                 throw BridgeFailure.invalidRequest
@@ -107,64 +114,31 @@ enum NativeElectronHandoverHelper {
     private static func prepare(nativeApplicationPath: String) throws -> [String: Any] {
         // This helper must live in Contents/MacOS: Foundation does not resolve
         // Bundle.main to the app when an executable lives under Resources.
-        // ServiceManagement and preferences must bind to the production app.
+        // Preferences must bind to the production app. Startup-service
+        // ownership belongs to the actual Electron main executable.
         guard Bundle.main.bundleIdentifier == productIdentifier,
               enclosingApplicationBundleIdentifier() == productIdentifier else {
             throw BridgeFailure.identity
         }
         try validateNativeApplication(nativeApplicationPath)
 
-        let service = SMAppService.mainApp
-        let startAtLogin = service.status == .enabled
-        try validatePreparationLoginItemStatus(service)
-        // Preferences are validated before the helper terminates the old writer
-        // or withdraws its login item. The standard reader binds to the same
-        // app-defaults domain used by the released native predecessor.
-        let preferences = try readPreferences(startAtLogin: startAtLogin)
+        // Validate preferences before asking the old writer to exit.
+        let preferences = try readPreferences()
         try assertNoOtherSameIdentityApplications(nativeApplicationPath)
         try stopNativeApplications(nativeApplicationPath)
-        // Withdraw the same-identity native main-app request after the old UI
-        // has exited, so it cannot relaunch after the copied state is staged. A pending
-        // approval/removal is not equivalent to a confirmed release of owner
-        // responsibility and remains a fail-closed result. The old writer has
-        // already exited, so an unsuccessful unregister never races copying.
-        if service.status != .notRegistered {
-            do {
-                try service.unregister()
-            } catch {
-                throw BridgeFailure.loginItemUnregister
-            }
-        }
-        guard service.status == .notRegistered else {
-            throw BridgeFailure.loginItemStatus
-        }
-
-        return [
-            "schemaVersion": schemaVersion,
-            "status": "prepared",
-            "nativeWriterStopped": true,
-            "loginItemDisabled": true,
-            "preferences": preferences,
-            // The helper never queries, copies, resets, or prompts for a
-            // Keychain item. Same-identity credential access is separately
-            // qualified using signed installed artifacts.
-            "credentialState": "unchanged",
-        ]
+        return nativeWriterPreparedResponse(preferences: preferences)
     }
 
     private static func preparePreflight(nativeApplicationPath: String) throws -> [String: Any] {
         // This mirrors every non-mutating prerequisite of --prepare. It does
-        // not terminate an app, alter ServiceManagement, write defaults, or
+        // not terminate an app, access startup services, write defaults, or
         // access Keychain material.
         guard Bundle.main.bundleIdentifier == productIdentifier,
               enclosingApplicationBundleIdentifier() == productIdentifier else {
             throw BridgeFailure.identity
         }
         try validateNativeApplication(nativeApplicationPath)
-        let service = SMAppService.mainApp
-        let startAtLogin = service.status == .enabled
-        try validatePreparationLoginItemStatus(service)
-        _ = try readPreferences(startAtLogin: startAtLogin)
+        _ = try readPreferences()
         try assertNativeApplicationsStopped(nativeApplicationPath)
         try assertNoOtherSameIdentityApplications(nativeApplicationPath)
         return [
@@ -173,16 +147,91 @@ enum NativeElectronHandoverHelper {
         ]
     }
 
-    private static func validatePreparationLoginItemStatus(_ service: SMAppService) throws {
-        switch service.status {
-        case .enabled, .notRegistered:
-            return
-        case .requiresApproval:
-            throw BridgeFailure.loginItemRequiresApproval
-        case .notFound:
-            throw BridgeFailure.loginItemNotFound
-        @unknown default:
-            throw BridgeFailure.loginItemStatusUnknown
+    /// A replaced .app is not required to prove the provenance of the user's
+    /// retained local state. The coordinator separately validates and backs up
+    /// that state. This bridge only stops the old writer and reads preferences.
+    /// The actual Electron main executable owns startup-service changes; the
+    /// helper never reads or changes credentials or login items.
+    private static func prepareRetainedState(preflight: Bool) throws -> [String: Any] {
+        guard Bundle.main.bundleIdentifier == productIdentifier,
+              enclosingApplicationBundleIdentifier() == productIdentifier else {
+            throw BridgeFailure.identity
+        }
+        let appPath = Bundle.main.bundleURL.standardizedFileURL.path
+        let parentRequirement = try validatedParentRequirement(appPath: appPath)
+        let preferences = try readPreferences()
+        try assertNoOtherSameIdentityApplications(appPath)
+        // NSRunningApplication's bundle URL may now refer to the replacement.
+        // Check the running code by PID, never its replaced on-disk executable.
+        for application in nativeApplications(appPath) {
+            try validateRunningCode(application.processIdentifier, requirement: parentRequirement)
+        }
+        if preflight {
+            return ["schemaVersion": schemaVersion, "status": "preflight_ready"]
+        }
+        for application in nativeApplications(appPath) {
+            // Recheck immediately before requesting graceful termination; no
+            // kill-by-name, force termination, or unrelated app is permitted.
+            try validateRunningCode(application.processIdentifier, requirement: parentRequirement)
+            guard application.terminate() else { throw BridgeFailure.nativeWriter }
+        }
+        let deadline = Date().addingTimeInterval(nativeStopTimeout)
+        while !nativeApplications(appPath).isEmpty && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        try assertNativeApplicationsStopped(appPath)
+        try assertNoOtherSameIdentityApplications(appPath)
+        return nativeWriterPreparedResponse(preferences: preferences)
+    }
+
+    private static func nativeWriterPreparedResponse(preferences: [String: Any]) -> [String: Any] {
+        [
+            "schemaVersion": schemaVersion,
+            "status": "native_writer_prepared",
+            "nativeWriterStopped": true,
+            "preferences": preferences,
+            "credentialState": "unchanged",
+        ]
+    }
+
+    private static func runningCode(_ pid: pid_t) throws -> SecCode {
+        var code: SecCode?
+        let attributes = [kSecGuestAttributePid as String: NSNumber(value: pid)] as CFDictionary
+        guard SecCodeCopyGuestWithAttributes(nil, attributes, [], &code) == errSecSuccess,
+              let code else { throw BridgeFailure.identity }
+        return code
+    }
+
+    private static func validatedParentRequirement(appPath: String) throws -> SecRequirement {
+        guard let parent = NSRunningApplication(processIdentifier: getppid()),
+              parent.bundleIdentifier == productIdentifier,
+              parent.bundleURL?.standardizedFileURL.path == appPath else {
+            throw BridgeFailure.identity
+        }
+        let code = try runningCode(getppid())
+        var trustedProduct: SecRequirement?
+        guard SecRequirementCreateWithString(
+            "anchor apple generic and identifier \"com.usagemonitor.local\"" as CFString,
+            [], &trustedProduct
+        ) == errSecSuccess,
+              let trustedProduct,
+              SecCodeCheckValidity(code, [], trustedProduct) == errSecSuccess else {
+            throw BridgeFailure.identity
+        }
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(code, [], &staticCode) == errSecSuccess,
+              let staticCode else { throw BridgeFailure.identity }
+        var requirement: SecRequirement?
+        guard SecCodeCopyDesignatedRequirement(staticCode, [], &requirement) == errSecSuccess,
+              let requirement else { throw BridgeFailure.identity }
+        return requirement
+    }
+
+    private static func validateRunningCode(_ pid: pid_t, requirement: SecRequirement) throws {
+        let code = try runningCode(pid)
+        // Exact current app designated requirement, not merely its Team ID.
+        guard SecCodeCheckValidity(code, [], requirement) == errSecSuccess else {
+            throw BridgeFailure.identity
         }
     }
 
@@ -338,7 +387,7 @@ enum NativeElectronHandoverHelper {
     /// Read the same app-defaults domain as the released native predecessor.
     /// A same-identity `suiteName` is deliberately invalid on macOS; using it
     /// makes a signed helper reject every setting before handover begins.
-    private static func readPreferences(startAtLogin: Bool) throws -> [String: Any] {
+    private static func readPreferences() throws -> [String: Any] {
         let defaults = UserDefaults.standard
         let rawLanguage = defaults.string(forKey: nativeLanguageKey) ?? "system"
         let language: String
@@ -361,7 +410,6 @@ enum NativeElectronHandoverHelper {
             "language": language,
             "appearance": appearance,
             "refreshIntervalSeconds": refreshInterval,
-            "startAtLogin": startAtLogin,
         ]
     }
 
@@ -370,7 +418,8 @@ enum NativeElectronHandoverHelper {
         // response retain it. Preparation alone gets a fixed private stage
         // code; no OS error, path, preference value, PID, or credential data
         // crosses this boundary.
-        guard command == "--prepare" || command == "--prepare-preflight" else {
+        guard command == "--prepare" || command == "--prepare-preflight"
+                || command == "--prepare-retained-state" || command == "--prepare-retained-state-preflight" else {
             return [
                 "schemaVersion": schemaVersion,
                 "status": "failed",
@@ -382,16 +431,6 @@ enum NativeElectronHandoverHelper {
             failureStage = "identity"
         case BridgeFailure.nativeApplication, BridgeFailure.nativeVersion:
             failureStage = "native_application"
-        case BridgeFailure.loginItemUnregister:
-            failureStage = "login_item_unregister"
-        case BridgeFailure.loginItemStatus:
-            failureStage = "login_item_status"
-        case BridgeFailure.loginItemRequiresApproval:
-            failureStage = "login_item_requires_approval"
-        case BridgeFailure.loginItemNotFound:
-            failureStage = "login_item_not_found"
-        case BridgeFailure.loginItemStatusUnknown:
-            failureStage = "login_item_status_unknown"
         case BridgeFailure.nativeWriter:
             failureStage = "native_writer"
         case BridgeFailure.otherSameIdentityRunning:

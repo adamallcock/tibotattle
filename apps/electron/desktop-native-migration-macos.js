@@ -4,11 +4,15 @@ import { lstat as defaultLstat } from "node:fs/promises";
 import { homedir as defaultHomeDirectory } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
+import { validateRetainedNativeState } from "../../src/local-unified-index.js";
+
 import {
   NATIVE_ELECTRON_APP_ID,
   NATIVE_ELECTRON_HANDOVER_ROUTE,
+  NATIVE_ELECTRON_RETAINED_STATE_ROUTE,
   SUPPORTED_NATIVE_HANDOVER_VERSIONS,
   inspectNativeElectronHandoverCompletion,
+  isNativeElectronHandoverError,
   runNativeElectronHandover,
   validateNativeElectronHandoverCandidate,
 } from "./desktop-native-migration.js";
@@ -122,7 +126,7 @@ function validatePreferences(value) {
   if (!["system", "en", "zh-Hans", "es"].includes(language)
       || !["system", "light", "dark"].includes(value.appearance)
       || ![60, 300, 900, 1800].includes(value.refreshIntervalSeconds)
-      || typeof value.startAtLogin !== "boolean") {
+      || (value.startAtLogin !== null && typeof value.startAtLogin !== "boolean")) {
     throw bridgeFailure("invalid_reply");
   }
   return Object.freeze({
@@ -133,7 +137,7 @@ function validatePreferences(value) {
   });
 }
 
-function validatePrepareReply(value) {
+function validatePrepareReply(value, startAtLogin) {
   if (exactKeys(value, ["schemaVersion", "status", "failureStage"])
       && value.schemaVersion === NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
       && value.status === "failed"
@@ -152,22 +156,22 @@ function validatePrepareReply(value) {
     "schemaVersion",
     "status",
     "nativeWriterStopped",
-    "loginItemDisabled",
     "preferences",
     "credentialState",
   ])
       || value.schemaVersion !== NATIVE_ELECTRON_MAC_BRIDGE_SCHEMA_VERSION
-      || value.status !== "prepared"
+      || value.status !== "native_writer_prepared"
       || value.nativeWriterStopped !== true
-      || value.loginItemDisabled !== true
+      || !exactKeys(value.preferences, ["language", "appearance", "refreshIntervalSeconds"])
       || !["unchanged", "unavailable"].includes(value.credentialState)) {
     throw bridgeFailure("invalid_reply");
   }
   return Object.freeze({
     status: "prepared",
     nativeWriterStopped: true,
-    loginItemDisabled: true,
-    preferences: validatePreferences(value.preferences),
+    loginItemDisabled: startAtLogin !== null,
+    ...(startAtLogin === null ? { startupRegistration: "preserved" } : {}),
+    preferences: validatePreferences({ ...value.preferences, startAtLogin }),
     credentialState: value.credentialState,
   });
 }
@@ -321,10 +325,25 @@ function claimedLoginItem(status, startAtLogin) {
   if (!plainRecord(status)) return false;
   if (startAtLogin) {
     return status.openAtLogin === true
-      && (status.status === "enabled" || status.executableWillLaunchAtLogin !== false);
+      && status.status === "enabled" && status.executableWillLaunchAtLogin !== false;
   }
   return status.openAtLogin === false
-    && status.status !== "enabled" && status.executableWillLaunchAtLogin !== true;
+    && status.status === "not-registered" && status.executableWillLaunchAtLogin !== true;
+}
+
+// ServiceManagement main-app calls belong to the actual main executable.
+// A bundled command-line helper can resolve the bundle but still get notFound.
+function mainApplicationStartupPreference(electronApp) {
+  let value;
+  try { value = electronApp.getLoginItemSettings(); }
+  catch { throw bridgeFailure("prepare_login_item_status"); }
+  // Unseen services and pending user approval do not establish a Boolean
+  // startup choice. Preserve the OS registration without trying to normalize it.
+  if (plainRecord(value) && value.openAtLogin === false
+      && ["not-found", "requires-approval"].includes(value.status)) return null;
+  if (value?.status === "enabled" && value.openAtLogin === true) return true;
+  if (value?.status === "not-registered" && value.openAtLogin === false) return false;
+  throw bridgeFailure("prepare_login_item_status_unknown");
 }
 
 /**
@@ -340,15 +359,21 @@ export function createMacNativeHandoverAdapter(options = {}) {
   const configuration = normalizeOptions(options);
   return Object.freeze({
     async preflightNativeHandover({ nativeAppPath, candidate } = {}) {
-      if (!validPath(nativeAppPath)) throw bridgeFailure("invalid_native_app");
       const qualified = validateNativeElectronHandoverCandidate(candidate);
+      const retained = qualified.route === NATIVE_ELECTRON_RETAINED_STATE_ROUTE;
+      if (retained ? nativeAppPath !== null : !validPath(nativeAppPath)) {
+        throw bridgeFailure("invalid_native_app");
+      }
       if (qualified.native.appId !== NATIVE_ELECTRON_APP_ID
           || qualified.electron.appId !== NATIVE_ELECTRON_APP_ID) {
         throw bridgeFailure("identity_mismatch");
       }
+      mainApplicationStartupPreference(configuration.electronApp);
       let reply;
       try {
-        reply = await invokeBridge(configuration, ["--prepare-preflight", "--native-app", nativeAppPath]);
+        reply = await invokeBridge(configuration, retained
+          ? ["--prepare-retained-state-preflight"]
+          : ["--prepare-preflight", "--native-app", nativeAppPath]);
       } catch (error) {
         if (typeof error?.code === "string" && error.code.startsWith("native_electron_mac_bridge_")) {
           throw error;
@@ -358,31 +383,56 @@ export function createMacNativeHandoverAdapter(options = {}) {
       return validatePreparationPreflightReply(reply);
     },
 
-    async prepareNativeHandover({ nativeAppPath, candidate } = {}) {
-      if (!validPath(nativeAppPath)) throw bridgeFailure("invalid_native_app");
+    async prepareNativeHandover({ nativeAppPath, candidate, checkpointPreferences, preserveStartupRegistration = false } = {}) {
+      if (typeof preserveStartupRegistration !== "boolean") throw bridgeFailure("invalid_login_item_request");
       const qualified = validateNativeElectronHandoverCandidate(candidate);
+      const retained = qualified.route === NATIVE_ELECTRON_RETAINED_STATE_ROUTE;
+      if (retained ? nativeAppPath !== null : !validPath(nativeAppPath)) {
+        throw bridgeFailure("invalid_native_app");
+      }
       if (qualified.native.appId !== NATIVE_ELECTRON_APP_ID
           || qualified.electron.appId !== NATIVE_ELECTRON_APP_ID) {
         throw bridgeFailure("identity_mismatch");
       }
+      const startAtLogin = preserveStartupRegistration
+        ? null : mainApplicationStartupPreference(configuration.electronApp);
       let reply;
       try {
-        reply = await invokeBridge(configuration, ["--prepare", "--native-app", nativeAppPath]);
+        reply = await invokeBridge(configuration, retained
+          ? ["--prepare-retained-state"]
+          : ["--prepare", "--native-app", nativeAppPath]);
       } catch (error) {
         if (typeof error?.code === "string" && error.code.startsWith("native_electron_mac_bridge_")) {
           throw error;
         }
         throw bridgeFailure("unavailable");
       }
-      return validatePrepareReply(reply);
+      const prepared = validatePrepareReply(reply, startAtLogin);
+      if (typeof checkpointPreferences !== "function") throw bridgeFailure("prepare_preferences");
+      // Durable snapshot precedes the OS mutation: a crash after disabling must
+      // not turn the original enabled preference into a new disabled preference.
+      await checkpointPreferences({ ...prepared.preferences, credentialState: prepared.credentialState });
+      if (startAtLogin === null) return prepared;
+      // The helper has now verified that the retired writer is stopped. Only
+      // this authenticated Electron main process changes startup registration.
+      try {
+        configuration.electronApp.setLoginItemSettings({ openAtLogin: false });
+      } catch { throw bridgeFailure("prepare_login_item_unregister"); }
+      if (mainApplicationStartupPreference(configuration.electronApp) !== false) {
+        throw bridgeFailure("prepare_login_item_status");
+      }
+      return prepared;
     },
 
     async claimElectronLoginItem({ startAtLogin, candidate } = {}) {
-      if (typeof startAtLogin !== "boolean") throw bridgeFailure("invalid_login_item_request");
+      if (startAtLogin !== null && typeof startAtLogin !== "boolean") {
+        throw bridgeFailure("invalid_login_item_request");
+      }
       const qualified = validateNativeElectronHandoverCandidate(candidate);
       if (qualified.electron.appId !== NATIVE_ELECTRON_APP_ID) {
         throw bridgeFailure("identity_mismatch");
       }
+      if (startAtLogin === null) return "preserved";
       try {
         configuration.electronApp.setLoginItemSettings({ openAtLogin: startAtLogin });
         const status = configuration.electronApp.getLoginItemSettings();
@@ -680,15 +730,40 @@ export async function inspectNativeMacHandover({
       break;
     }
   }
-  if (selectedNativePath === null) return Object.freeze({ status: "no_supported_predecessor" });
-
-  const [native, electron, helper] = await Promise.all([
-    signedApplicationMetadata({ path: selectedNativePath, commandRunner: runner, lstatPath }),
+  const [electron, helper] = await Promise.all([
     signedApplicationMetadata({ path: resolve(electronAppPath), commandRunner: runner, lstatPath }),
     signedCodeMetadata({ path: helperPath, commandRunner: runner, lstatPath }),
   ]);
+  if (helper.teamIdentifier !== electron.teamIdentifier) {
+    return Object.freeze({ status: "signature_or_build_mismatch" });
+  }
+  const retainedCandidate = () => Object.freeze({
+    status: "ready",
+    nativeStateRoot,
+    nativeAppPath: null,
+    candidate: validateNativeElectronHandoverCandidate({
+      route: NATIVE_ELECTRON_RETAINED_STATE_ROUTE,
+      native: { appId: NATIVE_ELECTRON_APP_ID, source: "retained_state" },
+      electron: {
+        appId: electron.identifier,
+        version: electron.version,
+        build: electron.build,
+        signingLineage: electron.signingLineage,
+      },
+      signatureEvidence: { electronCodeHash: electron.codeHash, helperCodeHash: helper.codeHash },
+    }),
+  });
+  if (selectedNativePath === null) return retainedCandidate();
+  const native = await signedApplicationMetadata({ path: selectedNativePath, commandRunner: runner, lstatPath });
   if (!SUPPORTED_NATIVE_HANDOVER_VERSIONS.includes(native.version)) {
-    return Object.freeze({ status: "no_supported_predecessor" });
+    // Compatibility depends on retained schemas, not a guessed app version.
+    // A discovered bundle still has to pass signature checks below.
+    if (native.signingLineage !== electron.signingLineage
+        || native.teamIdentifier !== electron.teamIdentifier
+        || compareBuilds(electron.build, native.build) !== 1) {
+      return Object.freeze({ status: "signature_or_build_mismatch" });
+    }
+    return retainedCandidate();
   }
   if (native.signingLineage !== electron.signingLineage
       || native.teamIdentifier !== electron.teamIdentifier
@@ -737,8 +812,9 @@ function runtimePath(electronApp, name) {
 
 /**
  * Production composition called before Electron opens companion or settings
- * state. It makes no profile write when a bridge, predecessor, or signed-code
- * evidence is absent. It is deliberately unavailable outside macOS.
+ * state. Retained state does not require a predecessor application bundle.
+ * It makes no profile write when the bridge or signed-code evidence is absent.
+ * It is deliberately unavailable outside macOS.
  */
 export async function runProductionNativeMacHandover({
   electronApp,
@@ -805,10 +881,13 @@ export async function runProductionNativeMacHandover({
       backupRoot,
       nativeAppPath: inspection.nativeAppPath,
       candidate: inspection.candidate,
+      validateRetainedState: (stateRoot) => validateRetainedNativeState({ stateRoot }),
       control: createMacNativeHandoverAdapter({ helperPath: bridge.path, electronApp }),
     });
     return result;
-  } catch {
-    return Object.freeze({ status: "migration_blocked" });
+  } catch (error) {
+    return Object.freeze({ status: "migration_blocked",
+      ...(isNativeElectronHandoverError(error) && typeof error.supportCode === "string"
+        ? { supportCode: error.supportCode } : {}) });
   }
 }

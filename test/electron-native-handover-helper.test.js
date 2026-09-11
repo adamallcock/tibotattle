@@ -35,6 +35,17 @@ test("native-to-Electron handover helper compiles and exposes only its no-side-e
     runNativeElectronHandoverHelperContractSmoke({ executable }),
     { status: "contract_ok" },
   );
+  const prepared = spawnSync(executable, ["--writer-preparation-contract-smoke-test"], {
+    encoding: "utf8", timeout: 10_000, maxBuffer: 8 * 1024,
+    env: { PATH: "/usr/bin:/bin:/usr/sbin:/sbin" },
+  });
+  assert.equal(prepared.status, 0);
+  assert.deepEqual(JSON.parse(prepared.stdout), {
+    schemaVersion: "tibotattle-native-electron-handover-bridge-v1",
+    status: "native_writer_prepared", nativeWriterStopped: true,
+    preferences: { language: "en", appearance: "dark", refreshIntervalSeconds: 900 },
+    credentialState: "unchanged",
+  });
 });
 
 test("same-identity Foundation bundles cannot use their own identifier as a defaults suite", {
@@ -140,4 +151,10 @@ test("guided install plan retains the old app at one exact backup path without p
     electronInstallPath: "/Applications/TiboTattle.app",
     backupRoot: "/Users/synthetic/Library/Application Support/TiboTattle Native Handover",
   });
+});
+
+test("the native writer helper cannot read or mutate main-app startup services", async () => {
+  const source = await readFile("apps/macos/Helpers/NativeElectronHandoverHelper.swift", "utf8");
+  assert.doesNotMatch(source, /import ServiceManagement|SMAppService|startAtLogin|loginItemDisabled/u);
+  assert.equal((source.match(/return nativeWriterPreparedResponse\(preferences: preferences\)/gu) ?? []).length, 2);
 });

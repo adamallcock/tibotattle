@@ -943,7 +943,7 @@ test("native handover blocks before settings writes and companion start when exi
       assert.equal(app.ready, true);
       assert.equal(app.lockCalls, 1);
       assert.equal(homeDirectory, profile);
-      return { status: "bridge_unavailable" };
+      return { status: "bridge_unavailable", supportCode: "TRANSFER_IDENTITY" };
     },
   });
   assert.equal(fixture.desktop.status, "native_handover_blocked");
@@ -951,7 +951,8 @@ test("native handover blocks before settings writes and companion start when exi
   assert.equal(settingsReads, 0);
   assert.equal(settingsWrites, 0);
   assert.equal(app.quitCalls, 1);
-  assert.match(notices[0].detail, /existing data has been preserved/u);
+  assert.match(notices[0].detail, /history and settings have been preserved/u);
+  assert.match(notices[0].detail, /Support code: TRANSFER_IDENTITY/u);
 });
 
 test("credential preflight blocks before settings writes without mislabeling it as migration", {

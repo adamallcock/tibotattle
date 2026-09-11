@@ -801,6 +801,65 @@ test("unconfirmed login-item changes are not persisted", async () => {
   assert.equal((await value.store.getSettings()).startAtLogin, false);
 });
 
+test("initialization leaves unknown OS startup state untouched despite a stored false default", async () => {
+  for (const status of ["unavailable", "error", "needs-approval"]) {
+    const calls = [];
+    const value = fixture({
+      settingsLoad: async () => ({ ...DESKTOP_DEFAULT_SETTINGS, startAtLogin: false }),
+      platformOverrides: {
+        loginItemStatus: () => ({ status, canSet: true, detail: status }),
+        setStartAtLogin: (enabled) => { calls.push(enabled); throw new Error("must not apply"); },
+      },
+    });
+    const snapshot = await value.controller.initialize();
+    assert.equal(snapshot.settings.startAtLogin.status, status);
+    assert.equal((await value.store.getSettings()).startAtLogin, false);
+    assert.deepEqual(calls, []);
+    await value.controller.dispose();
+  }
+});
+
+test("startup rollback restores observed enabled state instead of an unapplied false preference", async () => {
+  const calls = [];
+  let osEnabled = true;
+  const value = fixture({
+    settingsSave: async () => { throw new Error("persistence unavailable"); },
+    platformOverrides: {
+      loginItemStatus: () => ({ status: osEnabled ? "enabled" : "disabled", canSet: true }),
+      setStartAtLogin: (enabled) => {
+        calls.push(enabled);
+        osEnabled = enabled;
+        return { status: enabled ? "enabled" : "disabled", canSet: true };
+      },
+    },
+  });
+  assert.equal((await value.store.getSettings()).startAtLogin, false);
+  await assert.rejects(value.controller.handlers.setStartAtLogin({ enabled: false }),
+    (error) => error?.code === "desktop_start_at_login_persistence_failed");
+  assert.deepEqual(calls, [false, true]);
+  assert.equal(osEnabled, true);
+});
+
+test("startup persistence failure never guesses a rollback from unknown OS state", async () => {
+  for (const status of ["unavailable", "error", "needs-approval"]) {
+    const calls = [];
+    const value = fixture({
+      settingsSave: async () => { throw new Error("persistence unavailable"); },
+      platformOverrides: {
+        loginItemStatus: () => ({ status, canSet: true }),
+        setStartAtLogin: (enabled) => {
+          calls.push(enabled);
+          return { status: enabled ? "enabled" : "disabled", canSet: true };
+        },
+      },
+    });
+    await assert.rejects(value.controller.handlers.setStartAtLogin({ enabled: true }),
+      (error) => error?.code === "desktop_start_at_login_rollback_failed");
+    assert.deepEqual(calls, [true], "only the user's requested change is allowed");
+    assert.equal((await value.store.getSettings()).startAtLogin, false);
+  }
+});
+
 test("start-at-login persistence failure restores the prior OS state", async () => {
   const calls = [];
   let persisted = false;
