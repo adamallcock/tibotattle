@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readElectronSitePublication, renderElectronSiteDocumentation } from '../scripts/lib/electron-public-site.mjs';
+import { readElectronSitePublication, renderElectronSiteDocumentation, renderElectronSiteDownloads } from '../scripts/lib/electron-public-site.mjs';
 import { identityDigest } from '../scripts/lib/release-operation.mjs';
 import { buildPublicReleaseSite, parseArgs } from '../scripts/build-public-release-site.js';
 
@@ -53,12 +53,32 @@ test('actual public generator renders four targets and automatic native replacem
   assert.match(html,/<meta property="og:image:height" content="1024">/u);
   assert.match(html,/<meta name="twitter:card" content="summary">/u);
   assert.match(html,/<meta property="og:image:alt" content="TiboTattle logo">/u);assert.doesNotMatch(html,/Your existing data and credentials are preserved/u);
-  assert.doesNotMatch(html,/brew install|not available yet|src="\.\/app.js"/u);
+  assert.doesNotMatch(html,/not available yet|src="\.\/app.js"/u);
+  assert.equal((html.match(/brew install --cask adamallcock\/tap\/tibotattle/gu)||[]).length,2);
+  for (const platform of ['windows','linux']) {
+    const panel=html.match(new RegExp(`<section\\b[^>]*data-platform-panel="${platform}"[^>]*>[\\s\\S]*?<\\/section>`,'u'))[0];
+    assert.doesNotMatch(panel,/homebrew-|brew install/u);
+  }
   assert.equal(await readFile(join(output,'community.html'),'utf8'),html);
   const privacy=await readFile(join(output,'privacy.html'),'utf8');assert.match(privacy,/<body[^>]*data-i18n-root/u);assert.match(privacy,/<script type="module" src="\.\/localization\.js"><\/script>/u);assert.match(privacy,/data-i18n="community\.privacy\.sample"/u);
   const docs=await readFile(join(output,'docs.html'),'utf8');assert.match(docs,/<body[^>]*data-i18n-root/u);assert.match(docs,/<script type="module" src="\.\/localization\.js"><\/script>/u);assert.match(docs,/Electron downloads are available/u);assert.match(docs,/automatically transfers retained history and settings/u);assert.match(docs,/In native Mac version 0\.1\.18, choose Check for Updates to install the Electron app/u);assert.doesNotMatch(docs,/Signed releases use the Sparkle feed|local-first Mac app/);assert.doesNotMatch(docs,/macOS is the currently available lane/u);
   const manifest=JSON.parse(await readFile(join(output,'release-site-manifest.json'),'utf8'));assert.equal(manifest.electronRelease.downloads.length,4);assert.equal(manifest.electronRelease.publishedInstallersVerified,false);assert.doesNotMatch(JSON.stringify(manifest.electronRelease.verificationScope),/published-installer/u);assert.equal(manifest.installer,undefined);
   await assert.rejects(buildPublicReleaseSite({...args,installerUrl:'https://tibotattle.com/a.dmg'}),/excludes native/u);
+});
+test('verified Electron Mac panels retain the existing visible Homebrew actions and copy wiring', async t => {
+  const f=await fixture(t);
+  const release=await readElectronSitePublication({...f.options,verifyPublishedInstaller:async value=>({bytes:value.expectedBytes,sha256:value.expectedSha256})});
+  const source=await readFile(new URL('../apps/web/public/community.html',import.meta.url),'utf8');
+  for (const published of [true,false]) {
+    const html=renderElectronSiteDownloads(source,{...release,publishedInstallersVerified:published});
+    for (const prefix of ['','intel-']) {
+      const opening=html.match(new RegExp(`<div\\b[^>]*id="${prefix}homebrew-install"[^>]*>`,'u'))[0];
+      assert.equal(/\s+hidden(?=[\s>])/u.test(opening),!published);
+      assert.match(html,new RegExp(`id="${prefix}homebrew-install-command"[^>]*>brew install --cask adamallcock/tap/tibotattle<\\/code>`,'u'));
+      assert.match(html,new RegExp(`id="${prefix}homebrew-copy-button"[\\s\\S]*?aria-describedby="${prefix}homebrew-copy-status"`,'u'));
+    }
+  }
+  assert.throws(()=>renderElectronSiteDownloads(source.replace('id="intel-homebrew-install"','id="missing-homebrew-install"'),release),/Missing exact Homebrew install action/u);
 });
 test('CLI accepts only explicit complete Electron intake flags',()=>{
   const args=parseArgs(['--electron-publication-plan','/plan.json','--electron-publication-root','/root','--electron-approved-plan-sha256','a'.repeat(64)]);
