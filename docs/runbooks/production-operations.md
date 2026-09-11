@@ -106,9 +106,18 @@ successful recovery observation. A `canceled` outcome without an exception does
 not establish a database, memory or application-level cause.
 
 One physical-statement meter covers both D1 bindings and all scheduled phases
-(900 statements, with lease-release headroom). Required maintenance runs
-first. Optional calculation has a 40-second admission deadline and yields durable
-progress when it cannot finish. Migration 0054 replaces the current lane's
+(900 statements, with lease-release headroom). Required maintenance runs first.
+Weekly publication then attempts the current period and at most one queued period,
+reserving statement headroom for graph work. Weekly failures are reported
+independently and leave their queue and source/privacy fences intact. The graph's
+40-second admission window starts only after those earlier phases return; slow
+housekeeping cannot exhaust that window before calculation starts. The statement
+meter is never reset. The deadline stops admission and checkpoint work; it cannot
+cancel a database statement already in progress. `scheduled_graph_admission`
+separates the earlier phase durations from the new graph window; existing phase `elapsedMs` fields still
+measure total invocation time. Verify checkpoint changes and publication times,
+not merely a successful maintenance event. Calculation yields durable progress
+when it cannot finish. Migration 0054 replaces the current lane's
 whole-account polling and four-attempt cap with an indexed, coalescing dirty
 queue. Claiming moves an account to the back before work begins; revision,
 window and lease checks make completion restart-safe. The actual remaining

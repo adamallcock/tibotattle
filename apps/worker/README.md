@@ -78,9 +78,13 @@ traffic to a hosted environment. The
 [1,000-contributor qualification review](../../docs/reviews/2026-09-08-thousand-contributor-qualification.md)
 records the workload, measurements and unqualified capacity boundaries.
 
-The shared 900-statement budget, 40-second optional-work admission deadline and
-one-minute scheduled cadence are unchanged. A population of 1,000 is not a
-claim of 1,000 simultaneous imports or 1,000 full recalculations per minute.
+The shared 900-statement budget and one-minute scheduled cadence cover the whole
+invocation. Graph calculations receive a 40-second admission window starting
+after required maintenance and bounded weekly publication finish; earlier
+housekeeping does not consume that window. Weekly publication retains its source
+and privacy fences, reserves query headroom for graph work, and reports failures
+independently. A population of 1,000 is not a claim of 1,000 simultaneous imports
+or 1,000 full recalculations per minute.
 Historical cohort readers still cap eligible contributors at 1,024 and retain
 exact-date publication guards; larger cohorts and sustained arrival rates need
 separate qualification. See the [operations boundary](../../docs/runbooks/production-operations.md)
