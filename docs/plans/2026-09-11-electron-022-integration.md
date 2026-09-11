@@ -23,6 +23,10 @@ push, signing, notarization and release authorizations remain applicable.
   7554aaac, including its uncommitted legend cleanup. Preserve the source copy.
 - Integrate the focused progress-counter patch supplied by the separate task;
   preserve the newer released toolbar actions and refresh behavior.
+- Correct the completed-scan status and cache-drop thread-title regressions
+  reported during installed-app testing. Preserve generation and ambiguity checks.
+- Preserve scoped results when revisiting Model performance and Projects &
+  threads, while their background refresh and existing invalidation rules run.
 
 ## Delivery sequence
 
@@ -90,6 +94,55 @@ focused tests and 351 local application tests pass; the independent review is
 clear. An independent slow-network, multi-pass day test confirmed that already
 stored chunks are skipped without duplicate uploads. Final R7 regeneration and
 signed qualification must use the corrected source.
+
+The corrected private candidate c892542f was signed, notarized and ordinarily
+installed with another verified stopped-profile backup. Its next automatic
+passes preserved the existing credential and sharing choice and added 24,474
+accepted quota records and 11,637 accepted usage records. This remains a
+historical backfill in progress; a current public domain is not yet active.
+
+Installed testing also exposed two presentation/provenance errors: a completed
+source scan was described as unstarted when the separate accounting summary was
+unavailable, and cache-drop titles were incorrectly gated on that summary's
+generation. The fixes keep validated unified totals visible, distinguish summary
+availability from ingestion, and bind local title lookup to the exact diagnostic
+generation and fingerprint. A further review caught inherited stale mappings;
+changed diagnostic proof or a newly ambiguous result now withdraws those links.
+The combined source review found no other actionable regression. Focused
+integration tests passed 127 cases before the additional 17-case stale-link fix.
+
+The second R7 run was interrupted deliberately before completion when these
+additional source fixes became necessary. Its supported recovery completed and
+the earlier successful baseline receipts remain intact. The incomplete run is
+not release evidence; final qualification must cover all these corrections.
+
+The summary miss was traced further to a current-writer compatibility gap:
+the accounting reader rejected the exact cache-write-zero provenance variants
+already emitted by parser v16. The narrow fix at 4269072c admits those current
+stamps without rewriting records or dropping their provenance. Unsupported mixed
+parsers remain blocked, including in quarantined generations. The production
+writer, ordinary accounting subprocess and persisted summary readback passed
+together; all 136 owning tests and 351 local tests passed. A copied real-history
+rebuild remains a separate acceptance check.
+
+The two page controllers now retain only matching results during revalidation.
+Projects respects the existing snapshot lease and disables old drilldown actions
+while a replacement builds. Model performance retains at most three period
+results in memory. Authoritative unavailable results, changed query scope,
+cancellation and late replies are still fenced. All 46 focused tests passed.
+An independent source review and repeat of those 46 tests found no actionable
+regression. The combined browser suite passes 722 tests; documentation and all
+20 preflight checks also pass before final source freeze.
+
+To avoid a serial packaging wait, freeze the final application source once,
+then build all four targets and regenerate R7 concurrently in separate checkouts.
+R7 receipts are outside the packaged runtime and their own workload closure.
+Keep the application/tag commit fixed. Commit new receipts separately, validate
+them with the frozen application's canonical validator, compare every workload
+path and digest, and run the unchanged retained-evidence tests in that evidence
+checkout. The older checked-in receipts at the frozen app commit are not claimed
+as qualification for the new source. Publication requires the new matching
+receipts and all other applicable artifact and installed checks.
 
 Later reviewed PR119 publication tools and their matching schema are reconciled
 in a separate tooling checkout. The app candidate, publication runner and current
